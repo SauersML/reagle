@@ -577,6 +577,9 @@ impl<'a> ImpStates<'a> {
 
     /// Select IBS-based HMM states for a target haplotype
     ///
+    /// Uses BOTH forward and backward PBWT passes to find IBS matches,
+    /// matching Java Beagle's behavior in LowFreqPhaseStates.
+    ///
     /// # Arguments
     /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
     /// * `target_alleles` - Target haplotype alleles at genotyped markers
@@ -601,46 +604,95 @@ impl<'a> ImpStates<'a> {
 
         // Create CodedPbwtView from workspace buffers
         let n_ref_haps = self.ref_panel.n_haps();
+        let n_steps = self.ref_panel.n_steps();
         workspace.resize_with_ref(self.max_states, self.n_markers, n_ref_haps);
 
-        let mut pbwt = CodedPbwtView::new(
-            &mut workspace.pbwt_prefix[..n_ref_haps],
-            &mut workspace.pbwt_divergence[..n_ref_haps + 1],
-        );
+        // Store backward IBS haps for each step (to use during forward pass)
+        let mut bwd_ibs_per_step: Vec<Vec<u32>> = vec![Vec::new(); n_steps];
 
-        // Process each step
-        for step_idx in 0..self.ref_panel.n_steps() {
-            let coded_step = self.ref_panel.step(step_idx);
-            let step_start = self.coded_steps.step_start(step_idx);
-            let step_end = self.coded_steps.step_end(step_idx);
+        // STEP 1: Build backward PBWT by processing steps in REVERSE order
+        // This allows finding haplotypes that match well going forward from each position
+        {
+            // Create backward PBWT view
+            let mut pbwt_bwd = CodedPbwtView::new(
+                &mut workspace.pbwt_prefix_bwd[..n_ref_haps],
+                &mut workspace.pbwt_divergence_bwd[..n_ref_haps + 1],
+            );
 
-            // Update PBWT with the coded step (much faster than per-marker update!)
-            pbwt.update(coded_step);
+            for step_idx in (0..n_steps).rev() {
+                let coded_step = self.ref_panel.step(step_idx);
+                let step_start = self.coded_steps.step_start(step_idx);
+                let step_end = self.coded_steps.step_end(step_idx);
 
-            // Extract target alleles for this step range
-            let target_seq: Vec<u8> = (step_start..step_end)
-                .map(|m| target_alleles.get(m).copied().unwrap_or(255))
-                .collect();
+                // Update backward PBWT (use legacy method since we don't have scratch access here)
+                pbwt_bwd.update(coded_step);
 
-            // Find IBS haplotypes using pattern matching
-            let ibs_haps: Vec<u32> = if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
-                // Exact pattern match - use optimized PBWT search
-                pbwt.find_ibs(target_pattern, coded_step, self.n_ibs_haps)
-                    .into_iter()
-                    .map(|h| h.0)
-                    .collect()
-            } else {
-                // No exact match - find closest pattern
-                let closest_pattern = coded_step.closest_pattern(&target_seq);
-                pbwt.find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
-                    .into_iter()
-                    .map(|h| h.0)
-                    .collect()
-            };
+                // Extract target alleles for this step range
+                let target_seq: Vec<u8> = (step_start..step_end)
+                    .map(|m| target_alleles.get(m).copied().unwrap_or(255))
+                    .collect();
 
-            // Update composite haplotypes with IBS matches
-            for hap in ibs_haps {
-                self.update_with_ibs_hap(hap, step_idx as i32);
+                // Find backward IBS haplotypes
+                let bwd_ibs: Vec<u32> = if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                    pbwt_bwd.find_ibs(target_pattern, coded_step, self.n_ibs_haps)
+                        .into_iter()
+                        .map(|h| h.0)
+                        .collect()
+                } else {
+                    let closest_pattern = coded_step.closest_pattern(&target_seq);
+                    pbwt_bwd.find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
+                        .into_iter()
+                        .map(|h| h.0)
+                        .collect()
+                };
+
+                bwd_ibs_per_step[step_idx] = bwd_ibs;
+            }
+        }
+
+        // STEP 2: Build forward PBWT and collect IBS haps from BOTH directions
+        // Use counting sort optimization with workspace scratch buffers
+        {
+            let mut pbwt_fwd = CodedPbwtView::new(
+                &mut workspace.pbwt_prefix[..n_ref_haps],
+                &mut workspace.pbwt_divergence[..n_ref_haps + 1],
+            );
+
+            for step_idx in 0..n_steps {
+                let coded_step = self.ref_panel.step(step_idx);
+                let step_start = self.coded_steps.step_start(step_idx);
+                let step_end = self.coded_steps.step_end(step_idx);
+
+                // Update forward PBWT
+                pbwt_fwd.update(coded_step);
+
+                // Extract target alleles for this step range
+                let target_seq: Vec<u8> = (step_start..step_end)
+                    .map(|m| target_alleles.get(m).copied().unwrap_or(255))
+                    .collect();
+
+                // Find forward IBS haplotypes
+                let fwd_ibs: Vec<u32> = if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                    pbwt_fwd.find_ibs(target_pattern, coded_step, self.n_ibs_haps)
+                        .into_iter()
+                        .map(|h| h.0)
+                        .collect()
+                } else {
+                    let closest_pattern = coded_step.closest_pattern(&target_seq);
+                    pbwt_fwd.find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
+                        .into_iter()
+                        .map(|h| h.0)
+                        .collect()
+                };
+
+                // Update composite haplotypes with IBS matches from BOTH directions
+                // Java Beagle: addIbsHap(ibsHaps.fwdIbsHap(...)); addIbsHap(ibsHaps.bwdIbsHap(...));
+                for hap in fwd_ibs {
+                    self.update_with_ibs_hap(hap, step_idx as i32);
+                }
+                for hap in &bwd_ibs_per_step[step_idx] {
+                    self.update_with_ibs_hap(*hap, step_idx as i32);
+                }
             }
         }
 

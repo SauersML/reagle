@@ -445,7 +445,83 @@ impl<'a> CodedPbwtView<'a> {
         }
     }
 
-    /// Update PBWT with a coded step
+    /// Update PBWT with a coded step using counting sort
+    ///
+    /// This optimized version avoids allocating Vec<Vec<>> per step by using
+    /// flat counting sort with workspace scratch buffers.
+    pub fn update_counting_sort(
+        &mut self,
+        step: &CodedStep,
+        counts: &mut Vec<usize>,
+        offsets: &mut Vec<usize>,
+        prefix_scratch: &mut [u32],
+        div_scratch: &mut [i32],
+    ) {
+        let n_haps = self.prefix.len();
+        let n_patterns = step.n_patterns();
+        
+        if n_patterns == 0 || n_haps == 0 {
+            self.current_step += 1;
+            return;
+        }
+
+        // Step 1: Count frequency of each pattern
+        counts.clear();
+        counts.resize(n_patterns, 0);
+        for i in 0..n_haps {
+            let hap = self.prefix[i];
+            let pattern = step.pattern(HapIdx::new(hap)) as usize;
+            if pattern < n_patterns {
+                counts[pattern] += 1;
+            }
+        }
+
+        // Step 2: Compute cumulative offsets (where each pattern bucket starts)
+        offsets.clear();
+        offsets.resize(n_patterns + 1, 0);
+        let mut running = 0usize;
+        for (i, &count) in counts.iter().enumerate() {
+            offsets[i] = running;
+            running += count;
+        }
+        offsets[n_patterns] = running;
+
+        // Step 3: Distribute haplotypes to their sorted positions
+        // We need to track current write position for each pattern
+        let mut write_pos: Vec<usize> = offsets[..n_patterns].to_vec();
+        let step_start = self.current_step as i32;
+
+        for i in 0..n_haps {
+            let hap = self.prefix[i];
+            let div = self.divergence[i];
+            let pattern = step.pattern(HapIdx::new(hap)) as usize;
+            
+            if pattern < n_patterns {
+                let bucket_start = offsets[pattern];
+                let pos = write_pos[pattern];
+                
+                prefix_scratch[pos] = hap;
+                // Divergence: first element in bucket gets max(step_start, div)
+                div_scratch[pos] = if pos == bucket_start {
+                    step_start.max(div)
+                } else {
+                    div
+                };
+                
+                write_pos[pattern] += 1;
+            }
+        }
+
+        // Step 4: Copy results back to main arrays
+        self.prefix[..n_haps].copy_from_slice(&prefix_scratch[..n_haps]);
+        self.divergence[..n_haps].copy_from_slice(&div_scratch[..n_haps]);
+        
+        self.current_step += 1;
+    }
+
+    /// Update PBWT with a coded step (legacy bucket sort version)
+    ///
+    /// Kept for compatibility. Use `update_counting_sort` for better performance.
     pub fn update(&mut self, step: &CodedStep) {
         let n_haps = self.prefix.len();
         let n_patterns = step.n_patterns();
