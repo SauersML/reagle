@@ -247,8 +247,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     truth_dosages = []
     imputed_dosages = []
 
+    # For IQS calculation: track per-site concordance and expected concordance
+    site_iqs_values = []
+
     # MAF bins for stratified analysis
-    maf_bins = defaultdict(lambda: {"unphased_concordant": 0, "total": 0, "truth": [], "imputed": []})
+    maf_bins = defaultdict(lambda: {
+        "unphased_concordant": 0, "total": 0, "truth": [], "imputed": [],
+        "iqs_values": []
+    })
 
     common_sites = set(truth_gts.keys()) & set(imputed_gts.keys())
     print(f"Common sites: {len(common_sites)}")
@@ -275,6 +281,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         else:
             maf_bin = "common (>20%)"
 
+        # Track per-site concordance for IQS
+        site_concordant = 0
+        site_total = 0
+
         for sample in truth_site:
             if sample in imputed_site:
                 t_gt, t_dos = truth_site[sample]
@@ -282,6 +292,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
 
                 if t_dos is not None and i_dos is not None:
                     total_compared += 1
+                    site_total += 1
                     truth_dosages.append(t_dos)
                     imputed_dosages.append(i_dos)
 
@@ -294,7 +305,28 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     i_sorted = tuple(sorted(i_gt))
                     if t_sorted == i_sorted:
                         unphased_concordant += 1
+                        site_concordant += 1
                         maf_bins[maf_bin]["unphased_concordant"] += 1
+
+        # Calculate IQS for this site
+        # IQS = (observed - expected) / (1 - expected)
+        # Expected concordance under HWE: P(0/0)^2 + P(0/1)^2 + P(1/1)^2
+        # With p = alt allele freq: (1-p)^4 + 4p^2(1-p)^2 + p^4
+        if site_total > 0 and maf > 0 and maf < 1:
+            p = af  # Use AF not MAF for expected calculation
+            q = 1 - p
+            # HWE genotype frequencies
+            p_00 = q * q
+            p_01 = 2 * p * q
+            p_11 = p * p
+            # Expected concordance by chance
+            expected_conc = p_00 * p_00 + p_01 * p_01 + p_11 * p_11
+            observed_conc = site_concordant / site_total
+
+            if expected_conc < 1.0:  # Avoid division by zero
+                iqs = (observed_conc - expected_conc) / (1.0 - expected_conc)
+                site_iqs_values.append(iqs)
+                maf_bins[maf_bin]["iqs_values"].append(iqs)
 
     # Calculate overall metrics
     metrics = {}
@@ -321,6 +353,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         else:
             metrics["r_squared"] = None
 
+        # Calculate overall IQS (mean across sites)
+        if site_iqs_values:
+            metrics["iqs"] = sum(site_iqs_values) / len(site_iqs_values)
+        else:
+            metrics["iqs"] = None
+
         # Per-MAF bin metrics
         metrics["by_maf"] = {}
         for maf_bin, data in sorted(maf_bins.items()):
@@ -340,6 +378,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     if var_t > 0 and var_i > 0:
                         r = cov / math.sqrt(var_t * var_i)
                         bin_metrics["r_squared"] = r ** 2
+                # IQS per bin
+                if data["iqs_values"]:
+                    bin_metrics["iqs"] = sum(data["iqs_values"]) / len(data["iqs_values"])
                 metrics["by_maf"][maf_bin] = bin_metrics
 
     # Print results
@@ -351,14 +392,16 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         print(f"Sites compared: {metrics.get('sites_compared', 'N/A')}")
         print(f"Genotypes compared: {metrics.get('total_genotypes', 'N/A')}")
         print(f"Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")
-        print(f"Overall R²: {metrics.get('r_squared', 'N/A'):.4f}" if metrics.get('r_squared') else "Overall R²: N/A")
+        print(f"Overall R²: {metrics.get('r_squared'):.4f}" if metrics.get('r_squared') else "Overall R²: N/A")
+        print(f"Overall IQS: {metrics.get('iqs'):.4f}" if metrics.get('iqs') else "Overall IQS: N/A")
 
         if "by_maf" in metrics:
             print("\nBy MAF bin:")
             for maf_bin, bin_metrics in metrics["by_maf"].items():
-                r2_str = f"{bin_metrics.get('r_squared', 0):.4f}" if bin_metrics.get('r_squared') else "N/A"
+                r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
+                iqs_str = f"{bin_metrics.get('iqs'):.4f}" if bin_metrics.get('iqs') else "N/A"
                 print(f"  {maf_bin}: conc={bin_metrics['unphased_concordance']:.4f}, "
-                      f"R²={r2_str}, n={bin_metrics['n_genotypes']}")
+                      f"R²={r2_str}, IQS={iqs_str}, n={bin_metrics['n_genotypes']}")
 
     # Save metrics to file
     metrics_file = f"{output_prefix}_metrics.txt"
@@ -371,11 +414,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             f.write(f"Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}\n")
             if metrics.get('r_squared'):
                 f.write(f"Overall R²: {metrics['r_squared']:.4f}\n")
+            if metrics.get('iqs'):
+                f.write(f"Overall IQS: {metrics['iqs']:.4f}\n")
             f.write("\nBy MAF bin:\n")
             for maf_bin, bin_metrics in metrics.get("by_maf", {}).items():
-                r2_str = f"{bin_metrics.get('r_squared', 0):.4f}" if bin_metrics.get('r_squared') else "N/A"
+                r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
+                iqs_str = f"{bin_metrics.get('iqs'):.4f}" if bin_metrics.get('iqs') else "N/A"
                 f.write(f"  {maf_bin}: conc={bin_metrics['unphased_concordance']:.4f}, "
-                       f"R²={r2_str}, n={bin_metrics['n_genotypes']}\n")
+                       f"R²={r2_str}, IQS={iqs_str}, n={bin_metrics['n_genotypes']}\n")
 
     return metrics
 
@@ -543,6 +589,8 @@ def main():
             print(f"  Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")
             r2 = metrics.get('r_squared')
             print(f"  R²: {r2:.4f}" if r2 else "  R²: N/A")
+            iqs = metrics.get('iqs')
+            print(f"  IQS: {iqs:.4f}" if iqs else "  IQS: N/A")
         else:
             print(f"{name.upper()}: FAILED/SKIPPED")
 
