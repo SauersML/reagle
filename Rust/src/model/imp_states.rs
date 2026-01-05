@@ -11,7 +11,8 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
 
-
+use crate::data::storage::coded_steps::{RefPanelCoded, CodedPbwtView};
+use crate::utils::workspace::ImpWorkspace;
 use crate::model::pbwt::PbwtDivUpdater;
 
 /// A segment of a composite haplotype
@@ -367,10 +368,8 @@ impl ImpIbs {
     }
 }
 
-/// Dynamic HMM state selector for imputation
-///
-/// Matches Java `imp/ImpStates.java`
-pub struct ImpStates {
+/// Legacy HMM state selector for phasing (uses ImpIbs directly)
+pub struct ImpStatesLegacy {
     /// Maximum number of HMM states
     max_states: usize,
     /// IBS haplotype finder
@@ -387,8 +386,262 @@ pub struct ImpStates {
     n_markers: usize,
 }
 
-impl ImpStates {
+/// Dynamic HMM state selector for imputation (optimized with CodedPbwt)
+///
+/// Matches Java `imp/ImpStates.java`
+pub struct ImpStates<'a> {
+    /// Maximum number of HMM states
+    max_states: usize,
+    /// Reference panel with coded steps
+    ref_panel: &'a RefPanelCoded,
+    /// Coded steps configuration
+    coded_steps: CodedSteps,
+    /// Composite haplotypes (the HMM states)
+    comp_haps: Vec<CompositeHap>,
+    /// Map from reference haplotype to last IBS step
+    hap_to_last_ibs: HashMap<u32, i32>,
+    /// Priority queue for managing composite haplotypes
+    queue: BinaryHeap<CompHapEntry>,
+    /// Number of markers
+    n_markers: usize,
+    /// Number of IBS haplotypes to find per step
+    n_ibs_haps: usize,
+}
+
+impl<'a> ImpStates<'a> {
     /// Create a new state selector
+    pub fn new(
+        ref_panel: &'a RefPanelCoded,
+        max_states: usize,
+        gen_positions: &[f64],
+        config: &CodedStepsConfig,
+    ) -> Self {
+        let coded_steps = CodedSteps::new(gen_positions, config);
+        let n_markers = gen_positions.len();
+
+        Self {
+            max_states,
+            ref_panel,
+            coded_steps,
+            comp_haps: Vec::with_capacity(max_states),
+            hap_to_last_ibs: HashMap::with_capacity(max_states),
+            queue: BinaryHeap::with_capacity(max_states),
+            n_markers,
+            n_ibs_haps: config.n_ibs_haps,
+        }
+    }
+
+    /// Select IBS-based HMM states for a target haplotype
+    ///
+    /// # Arguments
+    /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
+    /// * `target_alleles` - Target haplotype alleles at genotyped markers
+    /// * `workspace` - Workspace with PBWT buffers
+    /// * `hap_indices` - Output: reference haplotype for each state at each marker
+    /// * `allele_match` - Output: whether state allele matches target at each marker
+    ///
+    /// # Returns
+    /// Number of states
+    pub fn ibs_states<F>(
+        &mut self,
+        get_ref_allele: F,
+        target_alleles: &[u8],
+        workspace: &mut ImpWorkspace,
+        hap_indices: &mut Vec<Vec<u32>>,
+        allele_match: &mut Vec<Vec<bool>>,
+    ) -> usize
+    where
+        F: Fn(usize, u32) -> u8,
+    {
+        self.initialize();
+
+        // Create CodedPbwtView from workspace buffers
+        let n_ref_haps = self.ref_panel.n_haps();
+        workspace.resize_with_ref(self.max_states, self.n_markers, n_ref_haps);
+
+        let mut pbwt = CodedPbwtView::new(
+            &mut workspace.pbwt_prefix[..n_ref_haps],
+            &mut workspace.pbwt_divergence[..n_ref_haps + 1],
+        );
+
+        // Process each step
+        for step_idx in 0..self.ref_panel.n_steps() {
+            let coded_step = self.ref_panel.step(step_idx);
+            let step_start = self.coded_steps.step_start(step_idx);
+            let step_end = self.coded_steps.step_end(step_idx);
+
+            // Update PBWT with the coded step (much faster than per-marker update!)
+            pbwt.update(coded_step);
+
+            // Extract target alleles for this step range
+            let target_seq: Vec<u8> = (step_start..step_end)
+                .map(|m| target_alleles.get(m).copied().unwrap_or(255))
+                .collect();
+
+            // Find IBS haplotypes using pattern matching
+            let ibs_haps: Vec<u32> = if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                // Exact pattern match - use optimized PBWT search
+                pbwt.find_ibs(target_pattern, coded_step, self.n_ibs_haps)
+                    .into_iter()
+                    .map(|h| h.0)
+                    .collect()
+            } else {
+                // No exact match - find closest pattern
+                let closest_pattern = coded_step.closest_pattern(&target_seq);
+                pbwt.find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
+                    .into_iter()
+                    .map(|h| h.0)
+                    .collect()
+            };
+
+            // Update composite haplotypes with IBS matches
+            for hap in ibs_haps {
+                self.update_with_ibs_hap(hap, step_idx as i32);
+            }
+        }
+
+        // If queue is empty, fill with random haplotypes
+        if self.queue.is_empty() {
+            self.fill_with_random_haps();
+        }
+
+        // Build output arrays
+        let n_states = self.queue.len().min(self.max_states);
+        self.build_output(get_ref_allele, target_alleles, n_states, hap_indices, allele_match);
+
+        n_states
+    }
+
+    fn initialize(&mut self) {
+        self.hap_to_last_ibs.clear();
+        self.comp_haps.clear();
+        self.queue.clear();
+    }
+
+    fn update_with_ibs_hap(&mut self, hap: u32, step: i32) {
+        const NIL: i32 = i32::MIN;
+
+        if self.hap_to_last_ibs.get(&hap).copied().unwrap_or(NIL) == NIL {
+            // Hap not currently tracked
+            self.update_queue_head();
+
+            if self.queue.len() == self.max_states {
+                // Replace oldest composite haplotype
+                if let Some(mut head) = self.queue.pop() {
+                    let mid_step = (head.last_ibs_step + step) / 2;
+                    let start_marker = self.coded_steps.step_start(mid_step.max(0) as usize);
+
+                    self.hap_to_last_ibs.remove(&head.hap);
+
+                    // Update composite haplotype with new segment
+                    if head.comp_hap_idx < self.comp_haps.len() {
+                        self.comp_haps[head.comp_hap_idx].add_segment(
+                            hap,
+                            start_marker,
+                            self.n_markers,
+                        );
+                    }
+
+                    head.hap = hap;
+                    head.last_ibs_step = step;
+                    head.start_marker = start_marker;
+                    self.queue.push(head);
+                }
+            } else {
+                // Add new composite haplotype
+                let comp_hap_idx = self.comp_haps.len();
+                self.comp_haps.push(CompositeHap::new(hap, self.n_markers));
+                self.queue.push(CompHapEntry {
+                    comp_hap_idx,
+                    hap,
+                    last_ibs_step: step,
+                    start_marker: 0,
+                });
+            }
+        }
+
+        self.hap_to_last_ibs.insert(hap, step);
+    }
+
+    fn update_queue_head(&mut self) {
+        // Update the head's last_ibs_step if it has been seen more recently
+        while let Some(head) = self.queue.peek() {
+            let last_ibs = self.hap_to_last_ibs.get(&head.hap).copied().unwrap_or(i32::MIN);
+            if head.last_ibs_step != last_ibs {
+                let mut head = self.queue.pop().unwrap();
+                head.last_ibs_step = last_ibs;
+                self.queue.push(head);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn fill_with_random_haps(&mut self) {
+        use rand::seq::SliceRandom;
+        use rand::rng;
+
+        let n_ref_haps = self.ref_panel.n_haps();
+        let n_states = self.max_states.min(n_ref_haps);
+        let mut rng = rng();
+
+        // Create list of all haplotype indices and shuffle
+        let mut hap_indices: Vec<u32> = (0..n_ref_haps as u32).collect();
+        hap_indices.shuffle(&mut rng);
+
+        // Take first n_states from shuffled list
+        for &h in hap_indices.iter().take(n_states) {
+            let comp_hap_idx = self.comp_haps.len();
+            self.comp_haps.push(CompositeHap::new(h, self.n_markers));
+            self.queue.push(CompHapEntry {
+                comp_hap_idx,
+                hap: h,
+                last_ibs_step: 0,
+                start_marker: 0,
+            });
+        }
+    }
+
+    fn build_output<F>(
+        &mut self,
+        get_ref_allele: F,
+        target_alleles: &[u8],
+        n_states: usize,
+        hap_indices: &mut Vec<Vec<u32>>,
+        allele_match: &mut Vec<Vec<bool>>,
+    ) where
+        F: Fn(usize, u32) -> u8,
+    {
+        // Resize output arrays
+        hap_indices.clear();
+        hap_indices.resize(self.n_markers, vec![0; n_states]);
+        allele_match.clear();
+        allele_match.resize(self.n_markers, vec![false; n_states]);
+
+        // Reset composite haplotypes for iteration
+        for comp_hap in &mut self.comp_haps {
+            comp_hap.reset();
+        }
+
+        // Build output for each marker
+        for m in 0..self.n_markers {
+            let target_allele = target_alleles.get(m).copied().unwrap_or(255);
+
+            for (j, entry) in self.queue.iter().take(n_states).enumerate() {
+                if entry.comp_hap_idx < self.comp_haps.len() {
+                    let hap = self.comp_haps[entry.comp_hap_idx].hap_at(m);
+                    hap_indices[m][j] = hap;
+
+                    let ref_allele = get_ref_allele(m, hap);
+                    allele_match[m][j] = target_allele == 255 || ref_allele == target_allele;
+                }
+            }
+        }
+    }
+}
+
+impl ImpStatesLegacy {
+    /// Create a new state selector (legacy version for phasing)
     pub fn new(
         n_ref_haps: usize,
         max_states: usize,
@@ -409,16 +662,7 @@ impl ImpStates {
         }
     }
 
-    /// Select IBS-based HMM states for a target haplotype
-    ///
-    /// # Arguments
-    /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
-    /// * `target_alleles` - Target haplotype alleles at genotyped markers
-    /// * `hap_indices` - Output: reference haplotype for each state at each marker
-    /// * `allele_match` - Output: whether state allele matches target at each marker
-    ///
-    /// # Returns
-    /// Number of states
+    /// Select IBS-based HMM states for a target haplotype (legacy version)
     pub fn ibs_states<F>(
         &mut self,
         get_ref_allele: F,
@@ -436,7 +680,7 @@ impl ImpStates {
             let step_start = self.coded_steps.step_start(step);
             let step_end = self.coded_steps.step_end(step);
 
-            // Update PBWT for markers in this step
+            // Update PBWT for markers in this step (naive approach)
             for m in step_start..step_end {
                 let mut alleles: Vec<u8> = Vec::with_capacity(self.ibs.n_ref_haps);
                 for h in 0..self.ibs.n_ref_haps as u32 {
@@ -523,9 +767,9 @@ impl ImpStates {
                     start_marker: 0,
                 });
             }
-        }
 
-        self.hap_to_last_ibs.insert(hap, step);
+            self.hap_to_last_ibs.insert(hap, step);
+        }
     }
 
     fn update_queue_head(&mut self) {
@@ -545,14 +789,14 @@ impl ImpStates {
     fn fill_with_random_haps(&mut self) {
         use rand::seq::SliceRandom;
         use rand::rng;
-        
+
         let n_states = self.max_states.min(self.ibs.n_ref_haps);
         let mut rng = rng();
-        
+
         // Create list of all haplotype indices and shuffle
         let mut hap_indices: Vec<u32> = (0..self.ibs.n_ref_haps as u32).collect();
         hap_indices.shuffle(&mut rng);
-        
+
         // Take first n_states from shuffled list
         for &h in hap_indices.iter().take(n_states) {
             let comp_hap_idx = self.comp_haps.len();

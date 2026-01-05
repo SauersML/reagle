@@ -19,9 +19,11 @@ use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
+use crate::data::storage::coded_steps::RefPanelCoded;
 use crate::data::storage::GenotypeMatrix;
 use crate::error::Result;
 use crate::io::vcf::{VcfReader, VcfWriter, ImputationQuality};
+use crate::utils::workspace::ImpWorkspace;
 
 
 use crate::model::imp_states::{CodedStepsConfig, ImpStates};
@@ -375,61 +377,89 @@ impl ImputationPipeline {
             n_ibs_haps: self.config.imp_nsteps,
         };
 
+        // Compute genetic positions at ALL reference markers (for RefPanelCoded)
+        let ref_gen_positions: Vec<f64> = (0..n_ref_markers)
+            .map(|m| {
+                let pos = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
+                gen_maps.gen_pos(chrom, pos)
+            })
+            .collect();
+
+        // Build coded reference panel for efficient PBWT operations
+        eprintln!("Building coded reference panel...");
+        let ref_panel_coded = RefPanelCoded::from_gen_positions(
+            &ref_gt,
+            &ref_gen_positions,
+            self.config.imp_step as f64,
+        );
+        eprintln!(
+            "  {} steps, avg compression ratio: {:.1}x",
+            ref_panel_coded.n_steps(),
+            ref_panel_coded.avg_compression_ratio()
+        );
+
         eprintln!("Running imputation with dynamic state selection...");
         let n_states = self.params.n_states;
 
-        // Run imputation for each target haplotype
+        // Run imputation for each target haplotype with per-thread workspaces
         let state_probs: Vec<StateProbs> = (0..n_target_haps)
             .into_par_iter()
-            .map(|h| {
-                let hap_idx = HapIdx::new(h as u32);
+            .map_init(
+                // Initialize workspace for each thread
+                || ImpWorkspace::with_ref_size(n_states, n_target_markers, n_ref_haps),
+                // Process each haplotype with its thread's workspace
+                |workspace, h| {
+                    let hap_idx = HapIdx::new(h as u32);
 
-                // Get target alleles at genotyped markers
-                let target_alleles: Vec<u8> = (0..n_target_markers)
-                    .map(|m| target_gt.allele(MarkerIdx::new(m as u32), hap_idx))
-                    .collect();
+                    // Get target alleles at genotyped markers
+                    let target_alleles: Vec<u8> = (0..n_target_markers)
+                        .map(|m| target_gt.allele(MarkerIdx::new(m as u32), hap_idx))
+                        .collect();
 
-                // Create ImpStates for dynamic state selection
-                let mut imp_states = ImpStates::new(
-                    n_ref_haps,
-                    n_states,
-                    &gen_positions,
-                    &steps_config,
-                );
+                    // Create ImpStates for dynamic state selection with RefPanelCoded
+                    let mut imp_states = ImpStates::new(
+                        &ref_panel_coded,
+                        n_states,
+                        &gen_positions,
+                        &steps_config,
+                    );
 
-                // Get reference allele closure
-                let get_ref_allele = |m: usize, hap: u32| -> u8 {
-                    let ref_m = alignment.ref_marker(m);
-                    ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
-                };
+                    // Get reference allele closure
+                    let get_ref_allele = |m: usize, hap: u32| -> u8 {
+                        let ref_m = alignment.ref_marker(m);
+                        ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
+                    };
 
-                // Get IBS-based states
-                let mut hap_indices: Vec<Vec<u32>> = Vec::new();
-                let mut allele_match: Vec<Vec<bool>> = Vec::new();
-                let actual_n_states = imp_states.ibs_states(
-                    get_ref_allele,
-                    &target_alleles,
-                    &mut hap_indices,
-                    &mut allele_match,
-                );
+                    // Get IBS-based states using workspace
+                    let mut hap_indices: Vec<Vec<u32>> = Vec::new();
+                    let mut allele_match: Vec<Vec<bool>> = Vec::new();
+                    let actual_n_states = imp_states.ibs_states(
+                        get_ref_allele,
+                        &target_alleles,
+                        workspace,
+                        &mut hap_indices,
+                        &mut allele_match,
+                    );
 
-                // Run forward-backward HMM
-                let hmm_state_probs = run_hmm_forward_backward(
-                    &target_alleles,
-                    &allele_match,
-                    &p_recomb,
-                    self.params.p_mismatch,
-                    actual_n_states,
-                );
+                    // Run forward-backward HMM using workspace buffers
+                    let hmm_state_probs = run_hmm_forward_backward(
+                        &target_alleles,
+                        &allele_match,
+                        &p_recomb,
+                        self.params.p_mismatch,
+                        actual_n_states,
+                        workspace,
+                    );
 
-                // Create StateProbs for interpolation
-                StateProbs::new(
-                    n_target_markers,
-                    actual_n_states,
-                    hap_indices,
-                    hmm_state_probs,
-                )
-            })
+                    // Create StateProbs for interpolation
+                    StateProbs::new(
+                        n_target_markers,
+                        actual_n_states,
+                        hap_indices,
+                        hmm_state_probs,
+                    )
+                },
+            )
             .collect();
 
         eprintln!("Computing dosages with interpolation and quality metrics...");
@@ -519,6 +549,7 @@ fn run_hmm_forward_backward(
     p_recomb: &[f32],
     p_mismatch: f32,
     n_states: usize,
+    workspace: &mut ImpWorkspace,
 ) -> Vec<Vec<f32>> {
     let n_markers = target_alleles.len();
     if n_markers == 0 || n_states == 0 {
@@ -528,10 +559,14 @@ fn run_hmm_forward_backward(
     let p_match = 1.0 - p_mismatch;
     let emit_probs = [p_match, p_mismatch];
 
-    // Forward pass
+    // Ensure workspace is sized correctly
+    workspace.resize(n_states, n_markers);
+
+    // Use pre-allocated forward storage
     let mut fwd: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_markers];
     let mut fwd_sum = 1.0f32;
 
+    // Forward pass using workspace.tmp for temporary calculations
     for m in 0..n_markers {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
@@ -552,8 +587,10 @@ fn run_hmm_forward_backward(
         fwd_sum = new_sum;
     }
 
-    // Backward pass and compute posteriors
-    let mut bwd = vec![1.0 / n_states as f32; n_states];
+    // Backward pass using workspace.bwd buffer
+    let bwd = &mut workspace.bwd;
+    bwd.resize(n_states, 0.0);
+    bwd.fill(1.0 / n_states as f32);
     let mut bwd_sum = 1.0f32;
 
     for m in (0..n_markers).rev() {

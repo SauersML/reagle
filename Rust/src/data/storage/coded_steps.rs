@@ -153,6 +153,45 @@ impl CodedStep {
             self.hap_to_pattern.len() as f32 / self.n_patterns as f32
         }
     }
+
+    /// Match a target allele sequence to a pattern index
+    /// Returns None if the sequence doesn't exist in the reference
+    pub fn match_sequence(&self, alleles: &[u8]) -> Option<u16> {
+        if alleles.len() != self.n_markers() {
+            return None;
+        }
+
+        // Look for exact match in patterns
+        self.patterns.iter()
+            .position(|p| p == alleles)
+            .map(|idx| idx as u16)
+    }
+
+    /// Find closest pattern to target sequence (by Hamming distance)
+    /// Always returns a pattern (never None)
+    pub fn closest_pattern(&self, alleles: &[u8]) -> u16 {
+        if alleles.len() != self.n_markers() {
+            // Return most common pattern (usually index 0)
+            return 0;
+        }
+
+        let mut best_pattern = 0u16;
+        let mut best_distance = usize::MAX;
+
+        for (idx, pattern) in self.patterns.iter().enumerate() {
+            let distance = pattern.iter()
+                .zip(alleles.iter())
+                .filter(|(p, a)| **p != **a && **p != 255 && **a != 255)
+                .count();
+
+            if distance < best_distance {
+                best_distance = distance;
+                best_pattern = idx as u16;
+            }
+        }
+
+        best_pattern
+    }
 }
 
 /// Collection of coded steps for a chromosome
@@ -298,6 +337,123 @@ impl CodedPbwt {
         // Bucket sort by pattern
         let mut buckets: Vec<Vec<(u32, i32)>> = vec![Vec::new(); n_patterns.max(1)];
 
+        for i in 0..n_haps {
+            let hap = self.prefix[i];
+            let div = self.divergence[i];
+            let pattern = step.pattern(HapIdx::new(hap)) as usize;
+            if pattern < buckets.len() {
+                buckets[pattern].push((hap, div));
+            }
+        }
+
+        // Rebuild arrays
+        let mut idx = 0;
+        let step_start = self.current_step as i32;
+
+        for bucket in &buckets {
+            let bucket_start = idx;
+            for &(hap, div) in bucket {
+                self.prefix[idx] = hap;
+                // Divergence is max of previous div and bucket start
+                self.divergence[idx] = if idx == bucket_start {
+                    step_start.max(div)
+                } else {
+                    div
+                };
+                idx += 1;
+            }
+        }
+
+        self.current_step += 1;
+    }
+
+    /// Find IBS haplotypes for a target pattern at current step
+    pub fn find_ibs(&self, target_pattern: u16, step: &CodedStep, n_matches: usize) -> Vec<HapIdx> {
+        // Find position of a haplotype with target pattern
+        let mut target_pos = None;
+        for (i, &hap) in self.prefix.iter().enumerate() {
+            if step.pattern(HapIdx::new(hap)) == target_pattern {
+                target_pos = Some(i);
+                break;
+            }
+        }
+
+        let target_pos = match target_pos {
+            Some(p) => p,
+            None => self.prefix.len() / 2,
+        };
+
+        // Expand from target position
+        let mut result = Vec::with_capacity(n_matches);
+        let mut left = target_pos;
+        let mut right = target_pos + 1;
+
+        while result.len() < n_matches && (left > 0 || right < self.prefix.len()) {
+            if left > 0 {
+                left -= 1;
+                result.push(HapIdx::new(self.prefix[left]));
+            }
+            if right < self.prefix.len() && result.len() < n_matches {
+                result.push(HapIdx::new(self.prefix[right]));
+                right += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Reset PBWT state
+    pub fn reset(&mut self) {
+        for (i, p) in self.prefix.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        self.divergence.fill(0);
+        self.current_step = 0;
+    }
+
+    /// Current step index
+    pub fn current_step(&self) -> usize {
+        self.current_step
+    }
+}
+
+/// PBWT operations on coded steps using external buffers
+///
+/// This version uses workspace buffers to avoid repeated allocations
+pub struct CodedPbwtView<'a> {
+    /// Prefix array (borrowed from workspace)
+    prefix: &'a mut [u32],
+    /// Divergence array (borrowed from workspace)
+    divergence: &'a mut [i32],
+    /// Current coded step
+    current_step: usize,
+}
+
+impl<'a> CodedPbwtView<'a> {
+    /// Create PBWT view from workspace buffers
+    pub fn new(prefix: &'a mut [u32], divergence: &'a mut [i32]) -> Self {
+        // Initialize prefix to identity permutation
+        for (i, p) in prefix.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        divergence.fill(0);
+
+        Self {
+            prefix,
+            divergence,
+            current_step: 0,
+        }
+    }
+
+    /// Update PBWT with a coded step
+    pub fn update(&mut self, step: &CodedStep) {
+        let n_haps = self.prefix.len();
+        let n_patterns = step.n_patterns();
+
+        // Allocate buckets based on pattern count
+        let mut buckets: Vec<Vec<(u32, i32)>> = vec![Vec::new(); n_patterns.max(1)];
+
+        // Bucket sort by pattern
         for i in 0..n_haps {
             let hap = self.prefix[i];
             let div = self.divergence[i];

@@ -232,11 +232,21 @@ pub struct ImpWorkspace {
 
     /// State to allele mapping
     pub state_alleles: Vec<u8>,
+
+    /// PBWT prefix array (for CodedPbwtView)
+    pub pbwt_prefix: Vec<u32>,
+
+    /// PBWT divergence array (for CodedPbwtView)
+    pub pbwt_divergence: Vec<i32>,
 }
 
 impl ImpWorkspace {
     /// Create a new imputation workspace
     pub fn new(n_states: usize, n_markers: usize) -> Self {
+        // Initialize PBWT arrays with identity permutation
+        let pbwt_prefix = (0..n_states as u32).collect();
+        let pbwt_divergence = vec![0; n_states + 1];
+
         Self {
             fwd: vec![0.0; n_states],
             bwd: vec![0.0; n_states],
@@ -244,6 +254,26 @@ impl ImpWorkspace {
             allele_probs: vec![[0.0; 3]; n_markers],
             tmp: vec![0.0; n_states],
             state_alleles: vec![0; n_states],
+            pbwt_prefix,
+            pbwt_divergence,
+        }
+    }
+
+    /// Create workspace with reference panel size
+    pub fn with_ref_size(n_states: usize, n_markers: usize, n_ref_haps: usize) -> Self {
+        // PBWT arrays sized for reference panel
+        let pbwt_prefix = (0..n_ref_haps as u32).collect();
+        let pbwt_divergence = vec![0; n_ref_haps + 1];
+
+        Self {
+            fwd: vec![0.0; n_states],
+            bwd: vec![0.0; n_states],
+            dosages: vec![0.0; n_markers],
+            allele_probs: vec![[0.0; 3]; n_markers],
+            tmp: vec![0.0; n_states],
+            state_alleles: vec![0; n_states],
+            pbwt_prefix,
+            pbwt_divergence,
         }
     }
 
@@ -255,6 +285,27 @@ impl ImpWorkspace {
         self.allele_probs.resize(n_markers, [0.0; 3]);
         self.tmp.resize(n_states, 0.0);
         self.state_alleles.resize(n_states, 0);
+        // PBWT arrays keep their size (based on reference panel)
+    }
+
+    /// Resize including PBWT buffers
+    pub fn resize_with_ref(&mut self, n_states: usize, n_markers: usize, n_ref_haps: usize) {
+        self.fwd.resize(n_states, 0.0);
+        self.bwd.resize(n_states, 0.0);
+        self.dosages.resize(n_markers, 0.0);
+        self.allele_probs.resize(n_markers, [0.0; 3]);
+        self.tmp.resize(n_states, 0.0);
+        self.state_alleles.resize(n_states, 0);
+
+        // Resize PBWT arrays if needed
+        if self.pbwt_prefix.len() != n_ref_haps {
+            self.pbwt_prefix.resize(n_ref_haps, 0);
+            for (i, p) in self.pbwt_prefix.iter_mut().enumerate() {
+                *p = i as u32;
+            }
+        }
+        self.pbwt_divergence.resize(n_ref_haps + 1, 0);
+        self.pbwt_divergence.fill(0);
     }
 
     /// Clear buffers
@@ -266,6 +317,11 @@ impl ImpWorkspace {
             *p = [0.0; 3];
         }
         self.tmp.fill(0.0);
+        // Reset PBWT arrays to identity
+        for (i, p) in self.pbwt_prefix.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        self.pbwt_divergence.fill(0);
     }
 }
 
