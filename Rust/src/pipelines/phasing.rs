@@ -276,53 +276,76 @@ impl PhasingPipeline {
         gen_dists: &[f64],
         workspace: &mut Workspace,
     ) -> Vec<usize> {
-        let _n_markers = alleles1.len();
+        let n_markers = alleles1.len();
         let n_states = ref_alleles.len();
 
         if n_states == 0 || het_markers.is_empty() {
             return Vec::new();
         }
 
-        // Compute forward probabilities for haplotype 1
-        let fwd1 = self.forward_pass(alleles1, ref_alleles, gen_dists, workspace);
-        
-        // Compute forward probabilities for haplotype 2
-        let fwd2 = self.forward_pass(alleles2, ref_alleles, gen_dists, workspace);
+        // Compute forward and backward probabilities for both haplotypes
+        let fwd1 = self.forward_pass(alleles1, ref_alleles, gen_dists);
+        let fwd2 = self.forward_pass(alleles2, ref_alleles, gen_dists);
+        let bwd1 = self.backward_pass(alleles1, ref_alleles, gen_dists);
+        let bwd2 = self.backward_pass(alleles2, ref_alleles, gen_dists);
 
-        // Decide phase switches based on likelihood comparison
         let mut switch_markers = Vec::new();
-        
-        // Simple phase decision: at each het site, check if swapping improves likelihood
+
         for &m in het_markers {
-            // Current assignment likelihood (sum over states)
-            let _curr_ll = fwd1[m].iter().sum::<f32>().ln() + fwd2[m].iter().sum::<f32>().ln();
-            
-            // For swap, we'd need to recompute with swapped alleles
-            // Simplified: use emission probability comparison
-            let a1 = alleles1[m];
-            let a2 = alleles2[m];
-            
-            let mut curr_match = 0.0f32;
-            let mut swap_match = 0.0f32;
-            
-            for (s, ref_hap) in ref_alleles.iter().enumerate() {
-                let ref_a = ref_hap[m];
-                let weight = fwd1[m][s] + fwd2[m][s];
-                
-                if a1 == ref_a {
-                    curr_match += weight;
-                }
-                if a2 == ref_a {
-                    swap_match += weight;
+            // Calculate posterior probabilities for states at marker m
+            let mut post1 = vec![0.0f32; n_states];
+            let mut sum1 = 0.0;
+            for s in 0..n_states {
+                post1[s] = fwd1[m][s] * bwd1[m][s];
+                sum1 += post1[s];
+            }
+            if sum1 > 1e-30 {
+                // Avoid division by zero
+                for s in 0..n_states {
+                    post1[s] /= sum1;
                 }
             }
-            
-            // Random component for exploration (especially in burnin)
-            let rand_val = workspace.next_f32();
-            let threshold = 0.5 + 0.3 * (swap_match - curr_match) / (swap_match + curr_match + 1e-10);
-            
-            if rand_val > threshold && swap_match > curr_match {
-                switch_markers.push(m);
+
+            let mut post2 = vec![0.0f32; n_states];
+            let mut sum2 = 0.0;
+            for s in 0..n_states {
+                post2[s] = fwd2[m][s] * bwd2[m][s];
+                sum2 += post2[s];
+            }
+            if sum2 > 1e-30 {
+                // Avoid division by zero
+                for s in 0..n_states {
+                    post2[s] /= sum2;
+                }
+            }
+
+            // Alleles at heterozygous marker m
+            let a1 = alleles1[m];
+            let a2 = alleles2[m];
+
+            // Calculate likelihoods for no-swap and swap scenarios
+            let mut l_noswap1 = 0.0f32;
+            let mut l_noswap2 = 0.0f32;
+            let mut l_swap1 = 0.0f32;
+            let mut l_swap2 = 0.0f32;
+
+            for s in 0..n_states {
+                let ref_a = ref_alleles[s][m];
+                l_noswap1 += post1[s] * self.emission_prob(a1, ref_a);
+                l_noswap2 += post2[s] * self.emission_prob(a2, ref_a);
+                l_swap1 += post1[s] * self.emission_prob(a2, ref_a);
+                l_swap2 += post2[s] * self.emission_prob(a1, ref_a);
+            }
+
+            let l_noswap = l_noswap1 * l_noswap2;
+            let l_swap = l_swap1 * l_swap2;
+
+            // Gibbs sampling decision
+            if (l_noswap + l_swap) > 1e-30 {
+                let prob_swap = l_swap / (l_noswap + l_swap);
+                if workspace.next_f32() < prob_swap {
+                    switch_markers.push(m);
+                }
             }
         }
 
@@ -335,7 +358,6 @@ impl PhasingPipeline {
         target_alleles: &[u8],
         ref_alleles: &[Vec<u8>],
         gen_dists: &[f64],
-        _workspace: &mut Workspace,
     ) -> Vec<Vec<f32>> {
         let n_markers = target_alleles.len();
         let n_states = ref_alleles.len();
@@ -382,6 +404,54 @@ impl PhasingPipeline {
         }
 
         fwd
+    }
+
+    /// Backward pass of HMM
+    fn backward_pass(
+        &self,
+        target_alleles: &[u8],
+        ref_alleles: &[Vec<u8>],
+        gen_dists: &[f64],
+    ) -> Vec<Vec<f32>> {
+        let n_markers = target_alleles.len();
+        let n_states = ref_alleles.len();
+        let mut bwd = vec![vec![0.0f32; n_states]; n_markers];
+
+        // Initialize
+        for s in 0..n_states {
+            bwd[n_markers - 1][s] = 1.0;
+        }
+
+        // Backward recursion
+        for m in (0..n_markers - 1).rev() {
+            let gen_dist = gen_dists.get(m).copied().unwrap_or(0.01);
+            let p_switch = self.params.switch_prob(gen_dist);
+            let p_stay = 1.0 - p_switch;
+            let p_switch_to = p_switch / n_states as f32;
+
+            let mut weighted_bwd_sum = 0.0;
+            let mut weighted_bwd = vec![0.0f32; n_states];
+            for s in 0..n_states {
+                let emit = self.emission_prob(target_alleles[m + 1], ref_alleles[s][m + 1]);
+                weighted_bwd[s] = bwd[m + 1][s] * emit;
+                weighted_bwd_sum += weighted_bwd[s];
+            }
+
+            for s in 0..n_states {
+                bwd[m][s] =
+                    (p_stay - p_switch_to) * weighted_bwd[s] + p_switch_to * weighted_bwd_sum;
+            }
+
+            // Normalize
+            let sum: f32 = bwd[m].iter().sum();
+            if sum > 0.0 {
+                for p in &mut bwd[m] {
+                    *p /= sum;
+                }
+            }
+        }
+
+        bwd
     }
 
     /// Emission probability
@@ -497,5 +567,59 @@ mod tests {
         // Mismatch should have low probability
         let mismatch_prob = pipeline.emission_prob(0, 1);
         assert!(mismatch_prob < 0.01);
+    }
+
+    #[test]
+    fn test_phase_sample_gibbs() {
+        let config = Config {
+            gt: PathBuf::from("test.vcf"),
+            r#ref: None,
+            out: PathBuf::from("out"),
+            map: None,
+            chrom: None,
+            excludesamples: None,
+            excludemarkers: None,
+            burnin: 3,
+            iterations: 12,
+            phase_states: 2,
+            rare: 0.002,
+            impute: true,
+            imp_states: 1600,
+            imp_segment: 6.0,
+            imp_step: 0.1,
+            imp_nsteps: 7,
+            cluster: 0.005,
+            ap: false,
+            gp: false,
+            ne: 100000.0,
+            err: None,
+            em: true,
+            window: 40.0,
+            window_markers: 4000000,
+            overlap: 2.0,
+            seed: 12345,
+            nthreads: None,
+        };
+        let pipeline = PhasingPipeline::new(config.clone());
+        let mut workspace = Workspace::new(2, 5, 4);
+        workspace.set_seed(config.seed as u64);
+
+        let alleles1 = vec![0, 0, 1, 0, 1];
+        let alleles2 = vec![0, 1, 0, 0, 0];
+        let het_markers = vec![1, 2, 4];
+
+        let ref_alleles = vec![vec![0, 1, 0, 0, 0], vec![0, 0, 1, 0, 1]];
+        let gen_dists = vec![0.01, 0.01, 0.01, 0.01];
+
+        // With seed 12345, the first random number is > 0.5, so we expect a switch
+        let switch_markers = pipeline.phase_sample(
+            &alleles1,
+            &alleles2,
+            &het_markers,
+            &ref_alleles,
+            &gen_dists,
+            &mut workspace,
+        );
+        assert_eq!(switch_markers, vec![1, 4]);
     }
 }
