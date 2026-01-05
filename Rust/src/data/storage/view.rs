@@ -91,6 +91,13 @@ impl<'a> From<(&'a MutableGenotypes, &'a Markers)> for GenotypeView<'a> {
     }
 }
 
+impl<'a> GenotypeView<'a> {
+    /// Create a view over mutable genotypes with associated markers
+    pub fn from_mutable(geno: &'a MutableGenotypes, markers: &'a Markers) -> Self {
+        GenotypeView::Mutable { geno, markers }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

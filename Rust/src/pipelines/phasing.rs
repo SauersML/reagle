@@ -21,9 +21,12 @@ use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes};
 use crate::error::Result;
+use crate::io::streaming::{StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfReader, VcfWriter};
+use crate::model::ibs2::Ibs2;
 use crate::model::imp_states::{CodedStepsConfig, ImpStates};
 use crate::model::parameters::{AtomicParamEstimates, ModelParams, ParamEstimates};
+use crate::utils::workspace::Workspace;
 
 
 
@@ -106,6 +109,17 @@ impl PhasingPipeline {
             pos
         };
 
+        // Compute MAF for each marker (used by IBS2)
+        let maf: Vec<f32> = (0..n_markers)
+            .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+            .collect();
+
+        // Build IBS2 segments for phase consistency (uses PositionMap fallback if no --map)
+        eprintln!("Building IBS2 segments...");
+        let _ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
+        eprintln!("Found {} samples with IBS2 segments",
+            (0..n_samples).filter(|&s| _ibs2.n_segments(crate::data::haplotype::SampleIdx::new(s as u32)) > 0).count());
+
         // Run phasing iterations
         let n_burnin = self.config.burnin;
         let n_iterations = self.config.iterations;
@@ -138,6 +152,103 @@ impl PhasingPipeline {
 
         eprintln!("Phasing complete!");
         Ok(())
+    }
+
+    /// Run the phasing pipeline in streaming mode for large datasets
+    ///
+    /// This processes the data in sliding windows to avoid loading the entire
+    /// chromosome into memory. Use this when markers exceed the window threshold.
+    pub fn run_streaming(&mut self) -> Result<()> {
+        eprintln!("Opening VCF for streaming...");
+
+        // Configure streaming (genetic maps loaded lazily by StreamingVcfReader)
+        let streaming_config = StreamingConfig {
+            window_cm: self.config.window,
+            overlap_cm: self.config.overlap,
+            ..Default::default()
+        };
+
+        // Load genetic maps - use empty maps if no map file provided
+        // The PositionMap fallback (1 cM per Mb) is used automatically
+        let gen_maps = if let Some(ref map_path) = self.config.map {
+            // Load all chromosomes from the map file
+            GeneticMaps::from_plink_file(map_path, &["chr1", "chr2", "chr3", "chr4", "chr5",
+                "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14",
+                "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chrX",
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14",
+                "15", "16", "17", "18", "19", "20", "21", "22", "X"])?
+        } else {
+            GeneticMaps::new()
+        };
+
+        // Open streaming reader
+        let mut reader = StreamingVcfReader::open(&self.config.gt, gen_maps.clone(), streaming_config)?;
+        let samples = reader.samples_arc();
+
+        // Create output writer
+        let output_path = self.config.out.with_extension("vcf.gz");
+        eprintln!("Writing output to {:?}", output_path);
+        let mut writer = VcfWriter::create(&output_path, samples)?;
+
+        let mut window_count = 0;
+        let mut total_markers = 0;
+
+        // Process windows
+        while let Some(window) = reader.next_window()? {
+            window_count += 1;
+            let n_markers = window.genotypes.n_markers();
+            total_markers += window.output_end - window.output_start;
+
+            eprintln!(
+                "Processing window {} ({} markers, output {}..{})",
+                window_count, n_markers, window.output_start, window.output_end
+            );
+
+            // Phase this window
+            let phased = self.phase_in_memory(&window.genotypes, &gen_maps)?;
+
+            // Write header on first window
+            if window.is_first {
+                writer.write_header(phased.markers())?;
+            }
+
+            // Write output region
+            writer.write_phased(&phased, window.output_start, window.output_end)?;
+        }
+
+        writer.flush()?;
+        eprintln!("Streaming phasing complete: {} windows, {} markers", window_count, total_markers);
+        Ok(())
+    }
+
+    /// Automatically select between in-memory and streaming mode based on data size
+    ///
+    /// Uses streaming mode if:
+    /// - `--streaming` flag is explicitly set, OR
+    /// - Estimated marker count exceeds `--window-markers` threshold
+    pub fn run_auto(&mut self) -> Result<()> {
+        // Check if streaming was explicitly requested
+        if self.config.streaming == Some(true) {
+            return self.run_streaming();
+        }
+
+        // Estimate marker count from file size (rough heuristic: ~100 bytes per marker line)
+        let file_size = std::fs::metadata(&self.config.gt)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let estimated_markers = file_size / 100;
+
+        let use_streaming = estimated_markers > self.config.window_markers as u64;
+
+        if use_streaming {
+            eprintln!(
+                "Auto-detected large dataset (~{} markers), using streaming mode",
+                estimated_markers
+            );
+            self.run_streaming()
+        } else {
+            self.run()
+        }
     }
 
     /// Phase a GenotypeMatrix in-memory and return the phased result
@@ -231,79 +342,87 @@ impl PhasingPipeline {
             .map(|h| geno.haplotype(HapIdx::new(h as u32)))
             .collect();
 
-        // Phase each sample in parallel using dynamic ImpStates
+        // Phase each sample in parallel using dynamic ImpStates with thread-local workspaces
         let updates: Vec<(SampleIdx, Vec<usize>)> = (0..n_samples)
             .into_par_iter()
-            .filter_map(|s| {
-                let sample_idx = SampleIdx::new(s as u32);
-                let hap1 = sample_idx.hap1();
-                let hap2 = sample_idx.hap2();
+            .map_init(
+                || Workspace::new(n_states, n_markers, n_haps),
+                |workspace, s| {
+                    let sample_idx = SampleIdx::new(s as u32);
+                    let hap1 = sample_idx.hap1();
+                    let hap2 = sample_idx.hap2();
 
-                // Get current alleles for this sample from snapshot
-                let alleles1 = &geno_snapshot[hap1.0 as usize];
-                let alleles2 = &geno_snapshot[hap2.0 as usize];
+                    // Get current alleles for this sample from snapshot
+                    let alleles1 = &geno_snapshot[hap1.0 as usize];
+                    let alleles2 = &geno_snapshot[hap2.0 as usize];
 
-                // Find heterozygous markers
-                let het_markers: Vec<usize> = (0..n_markers)
-                    .filter(|&m| alleles1[m] != alleles2[m])
-                    .collect();
+                    // Find heterozygous markers
+                    let het_markers: Vec<usize> = (0..n_markers)
+                        .filter(|&m| alleles1[m] != alleles2[m])
+                        .collect();
 
-                if het_markers.is_empty() {
-                    return None; // Nothing to phase
-                }
+                    if het_markers.is_empty() {
+                        return None; // Nothing to phase
+                    }
 
-                // Create ImpStates for dynamic state selection
-                let mut imp_states = ImpStates::new(n_haps, n_states, gen_positions, &steps_config);
+                    // Create ImpStates for dynamic state selection
+                    let mut imp_states = ImpStates::new(n_haps, n_states, gen_positions, &steps_config);
 
-                // Use hap1's alleles as the target for IBS matching
-                let target_alleles: Vec<u8> = alleles1.clone();
+                    // Use hap1's alleles as the target for IBS matching
+                    let target_alleles: Vec<u8> = alleles1.clone();
 
-                // Closure to get reference allele at (marker, hap)
-                let get_ref_allele = |m: usize, h: u32| -> u8 {
-                    geno_snapshot
-                        .get(h as usize)
-                        .and_then(|hap| hap.get(m).copied())
-                        .unwrap_or(255)
-                };
+                    // Closure to get reference allele at (marker, hap)
+                    let get_ref_allele = |m: usize, h: u32| -> u8 {
+                        geno_snapshot
+                            .get(h as usize)
+                            .and_then(|hap| hap.get(m).copied())
+                            .unwrap_or(255)
+                    };
 
-                // Build dynamic state mapping using ImpStates
-                let mut hap_indices: Vec<Vec<u32>> = Vec::new();
-                let mut allele_match: Vec<Vec<bool>> = Vec::new();
-                let actual_n_states = imp_states.ibs_states(
-                    get_ref_allele,
-                    &target_alleles,
-                    &mut hap_indices,
-                    &mut allele_match,
-                );
+                    // Build dynamic state mapping using ImpStates
+                    let mut hap_indices: Vec<Vec<u32>> = Vec::new();
+                    let mut allele_match: Vec<Vec<bool>> = Vec::new();
+                    let actual_n_states = imp_states.ibs_states(
+                        get_ref_allele,
+                        &target_alleles,
+                        &mut hap_indices,
+                        &mut allele_match,
+                    );
 
-                if actual_n_states == 0 {
-                    return None;
-                }
+                    if actual_n_states == 0 {
+                        return None;
+                    }
 
-                // Run phase decision using dynamic state HMM
-                let (switch_markers, local_em) = phase_sample_with_hmm(
-                    alleles1,
-                    alleles2,
-                    &het_markers,
-                    &hap_indices,
-                    &geno_snapshot,
-                    p_recomb,
-                    &self.params,
-                    collect_em,
-                );
+                    // Resize workspace for actual number of states
+                    workspace.resize(actual_n_states, n_markers, n_haps);
 
-                // Collect EM estimates
-                if let (Some(global_em), Some(local)) = (&em_estimates, local_em) {
-                    global_em.add_estimation_data(&local);
-                }
+                    // Run phase decision using dynamic state HMM with workspace
+                    let (switch_markers, local_em) = phase_sample_with_hmm(
+                        alleles1,
+                        alleles2,
+                        &het_markers,
+                        &hap_indices,
+                        &geno_snapshot,
+                        p_recomb,
+                        &self.params,
+                        collect_em,
+                        workspace,
+                    );
 
-                if switch_markers.is_empty() {
-                    None
-                } else {
-                    total_switches.fetch_add(switch_markers.len(), Ordering::Relaxed);
-                    Some((sample_idx, switch_markers))
-                }
-            })
+                    // Collect EM estimates
+                    if let (Some(global_em), Some(local)) = (&em_estimates, local_em) {
+                        global_em.add_estimation_data(&local);
+                    }
+
+                    if switch_markers.is_empty() {
+                        None
+                    } else {
+                        total_switches.fetch_add(switch_markers.len(), Ordering::Relaxed);
+                        Some((sample_idx, switch_markers))
+                    }
+                },
+            )
+            .flatten()
             .collect();
 
         // Apply phase switches
@@ -376,6 +495,7 @@ fn phase_sample_with_hmm(
     p_recomb: &[f32],
     params: &ModelParams,
     collect_em: bool,
+    workspace: &mut Workspace,
 ) -> (Vec<usize>, Option<ParamEstimates>) {
     let n_markers = alleles1.len();
 
@@ -416,13 +536,22 @@ fn phase_sample_with_hmm(
         }
     };
 
-    // Forward pass arrays: fwd_combined[m][s], fwd1[m][s], fwd2[m][s]
+    // Use workspace buffers for forward pass arrays
     // fwd_combined: P(X_1..m | hap1, hap2) regardless of which allele is on which hap
     // fwd1: P(X_1..m | state=s for hap1)
     // fwd2: P(X_1..m | state=s for hap2)
-    let mut fwd_combined = vec![vec![0.0f32; n_states]; n_markers];
-    let mut fwd1 = vec![vec![0.0f32; n_states]; n_markers];
-    let mut fwd2 = vec![vec![0.0f32; n_states]; n_markers];
+    let fwd_combined = &mut workspace.fwd_combined;
+    let fwd1 = &mut workspace.fwd1;
+    let fwd2 = &mut workspace.fwd2;
+
+    // Clear buffers for this sample
+    for m in 0..n_markers {
+        for s in 0..n_states {
+            fwd_combined[m][s] = 0.0;
+            fwd1[m][s] = 0.0;
+            fwd2[m][s] = 0.0;
+        }
+    }
 
     let mut combined_sum = 1.0f32;
     let mut fwd1_sum = 1.0f32;
@@ -693,6 +822,7 @@ mod tests {
             window: 40.0,
             window_markers: 4000000,
             overlap: 2.0,
+            streaming: None,
             seed: 12345,
             nthreads: None,
         };

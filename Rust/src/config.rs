@@ -119,6 +119,10 @@ pub struct Config {
     #[arg(long, default_value = "2.0")]
     pub overlap: f32,
 
+    /// Enable streaming mode for large datasets
+    #[arg(long)]
+    pub streaming: Option<bool>,
+
     /// Random seed for reproducibility
     #[arg(long, default_value = "-99999")]
     pub seed: i64,
@@ -194,38 +198,9 @@ impl Config {
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
     }
 
-    /// Calculate default allele mismatch probability using Li-Stephens formula
-    ///
-    /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
-    pub fn err_rate(&self, n_haps: usize) -> f32 {
-        if let Some(err) = self.err {
-            err
-        } else {
-            Self::li_stephens_p_mismatch(n_haps)
-        }
-    }
-
-    /// Li-Stephens approximation for allele mismatch probability
-    pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
-        let n = n_haps as f64;
-        let theta = 1.0 / (n.ln() + 0.5);
-        (theta / (2.0 * (theta + n))) as f32
-    }
-
     /// Check if imputation mode (reference panel provided)
     pub fn is_imputation_mode(&self) -> bool {
         self.r#ref.is_some()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_li_stephens_mismatch() {
-        // Test with 1000 haplotypes
-        let p = Config::li_stephens_p_mismatch(1000);
-        assert!(p > 0.0 && p < 0.01);
-    }
-}

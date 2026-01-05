@@ -23,6 +23,15 @@ pub struct Workspace {
     /// State probabilities at each marker (n_markers x n_states)
     pub state_probs: Vec<Vec<f32>>,
 
+    /// Forward pass combined (n_markers x n_states) - for phasing HMM
+    pub fwd_combined: Vec<Vec<f32>>,
+
+    /// Forward pass hap1 (n_markers x n_states) - for phasing HMM
+    pub fwd1: Vec<Vec<f32>>,
+
+    /// Forward pass hap2 (n_markers x n_states) - for phasing HMM
+    pub fwd2: Vec<Vec<f32>>,
+
     /// Temporary buffer for state updates
     pub tmp: Vec<f32>,
 
@@ -55,6 +64,9 @@ impl Workspace {
             fwd: vec![0.0; n_states],
             bwd: vec![0.0; n_states],
             state_probs: vec![vec![0.0; n_states]; n_markers],
+            fwd_combined: vec![vec![0.0; n_states]; n_markers],
+            fwd1: vec![vec![0.0; n_states]; n_markers],
+            fwd2: vec![vec![0.0; n_states]; n_markers],
             tmp: vec![0.0; n_states],
             prefix: (0..n_haps as u32).collect(),
             divergence: vec![0; n_haps],
@@ -79,6 +91,18 @@ impl Workspace {
         for probs in &mut self.state_probs {
             probs.resize(n_states, 0.0);
         }
+        self.fwd_combined.resize(n_markers, vec![0.0; n_states]);
+        for probs in &mut self.fwd_combined {
+            probs.resize(n_states, 0.0);
+        }
+        self.fwd1.resize(n_markers, vec![0.0; n_states]);
+        for probs in &mut self.fwd1 {
+            probs.resize(n_states, 0.0);
+        }
+        self.fwd2.resize(n_markers, vec![0.0; n_states]);
+        for probs in &mut self.fwd2 {
+            probs.resize(n_states, 0.0);
+        }
         self.tmp.resize(n_states, 0.0);
 
         if n_haps > self.prefix.len() {
@@ -99,6 +123,15 @@ impl Workspace {
         self.fwd.fill(0.0);
         self.bwd.fill(0.0);
         for probs in &mut self.state_probs {
+            probs.fill(0.0);
+        }
+        for probs in &mut self.fwd_combined {
+            probs.fill(0.0);
+        }
+        for probs in &mut self.fwd1 {
+            probs.fill(0.0);
+        }
+        for probs in &mut self.fwd2 {
             probs.fill(0.0);
         }
         self.tmp.fill(0.0);

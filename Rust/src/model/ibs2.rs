@@ -10,10 +10,11 @@
 
 use std::collections::HashMap;
 
-use crate::data::genetic_map::GeneticMap;
+use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::SampleIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
+use crate::data::ChromIdx;
 
 /// Minimum IBS2 segment length in cM
 const MIN_IBS2_CM: f64 = 2.0;
@@ -56,6 +57,10 @@ impl Ibs2Segment {
 pub struct Ibs2 {
     /// Number of markers
     n_markers: usize,
+    /// Physical positions for each marker (for genetic distance calculations)
+    marker_positions: Vec<u32>,
+    /// Chromosome for genetic distance lookups
+    chrom: ChromIdx,
     /// IBS2 segments for each sample: sample_segs[sample_idx] = Vec<Ibs2Segment>
     sample_segs: Vec<Vec<Ibs2Segment>>,
 }
@@ -65,11 +70,17 @@ impl Ibs2 {
     ///
     /// # Arguments
     /// * `gt` - Genotype matrix (target samples)
-    /// * `gen_map` - Genetic map for distance calculations
+    /// * `gen_maps` - Genetic maps for distance calculations (uses PositionMap fallback if no map loaded)
+    /// * `chrom` - Chromosome index for genetic distance lookups
     /// * `maf` - Minor allele frequencies for each marker
-    pub fn new(gt: &GenotypeMatrix, gen_map: &GeneticMap, maf: &[f32]) -> Self {
+    pub fn new(gt: &GenotypeMatrix, gen_maps: &GeneticMaps, chrom: ChromIdx, maf: &[f32]) -> Self {
         let n_markers = gt.n_markers();
         let n_samples = gt.n_samples();
+
+        // Extract physical positions from markers
+        let marker_positions: Vec<u32> = (0..n_markers)
+            .map(|m| gt.marker(MarkerIdx::new(m as u32)).pos)
+            .collect();
 
         // First pass: find initial IBS2 sets using informative markers
         let ibs2_markers = Ibs2Markers::new(gt, maf);
@@ -79,19 +90,23 @@ impl Ibs2 {
         let sample_segs: Vec<Vec<Ibs2Segment>> = (0..n_samples)
             .map(|s| {
                 let sample = SampleIdx::new(s as u32);
-                Self::build_sample_segments(gt, gen_map, &ibs2_sets, sample)
+                Self::build_sample_segments(gt, gen_maps, chrom, &marker_positions, &ibs2_sets, sample)
             })
             .collect();
 
         Self {
             n_markers,
+            marker_positions,
+            chrom,
             sample_segs,
         }
     }
 
     fn build_sample_segments(
         gt: &GenotypeMatrix,
-        gen_map: &GeneticMap,
+        gen_maps: &GeneticMaps,
+        chrom: ChromIdx,
+        marker_positions: &[u32],
         ibs2_sets: &Ibs2Sets,
         sample: SampleIdx,
     ) -> Vec<Ibs2Segment> {
@@ -101,21 +116,26 @@ impl Ibs2 {
         segments.sort_by_key(|s| s.other_sample.0);
 
         // Merge adjacent segments
-        segments = Self::merge_segments(segments, gen_map);
+        segments = Self::merge_segments(segments, gen_maps, chrom, marker_positions);
 
         // Extend segments through homozygous regions
         segments = Self::extend_segments(gt, sample, segments);
 
         // Merge again after extension
-        segments = Self::merge_segments(segments, gen_map);
+        segments = Self::merge_segments(segments, gen_maps, chrom, marker_positions);
 
         // Filter by minimum length
-        segments = Self::filter_by_length(segments, gen_map);
+        segments = Self::filter_by_length(segments, gen_maps, chrom, marker_positions);
 
         segments
     }
 
-    fn merge_segments(segments: Vec<Ibs2Segment>, gen_map: &GeneticMap) -> Vec<Ibs2Segment> {
+    fn merge_segments(
+        segments: Vec<Ibs2Segment>,
+        gen_maps: &GeneticMaps,
+        chrom: ChromIdx,
+        marker_positions: &[u32],
+    ) -> Vec<Ibs2Segment> {
         if segments.len() < 2 {
             return segments;
         }
@@ -125,7 +145,7 @@ impl Ibs2 {
 
         for next in segments.into_iter().skip(1) {
             if prev.other_sample == next.other_sample {
-                let gap_cm = Self::gap_cm(&prev, &next, gen_map);
+                let gap_cm = Self::gap_cm(&prev, &next, gen_maps, chrom, marker_positions);
                 if gap_cm <= MAX_IBS2_GAP_CM {
                     // Merge segments
                     prev = Ibs2Segment::new(
@@ -144,10 +164,17 @@ impl Ibs2 {
         merged
     }
 
-    fn gap_cm(prev: &Ibs2Segment, next: &Ibs2Segment, gen_map: &GeneticMap) -> f64 {
-        let pos1 = prev.incl_end as u32;
-        let pos2 = next.start as u32;
-        gen_map.gen_dist(pos1, pos2)
+    fn gap_cm(
+        prev: &Ibs2Segment,
+        next: &Ibs2Segment,
+        gen_maps: &GeneticMaps,
+        chrom: ChromIdx,
+        marker_positions: &[u32],
+    ) -> f64 {
+        // Use physical positions from markers, not marker indices
+        let pos1 = marker_positions.get(prev.incl_end).copied().unwrap_or(0);
+        let pos2 = marker_positions.get(next.start).copied().unwrap_or(0);
+        gen_maps.gen_dist(chrom, pos1, pos2)
     }
 
     fn extend_segments(
@@ -179,13 +206,19 @@ impl Ibs2 {
             .collect()
     }
 
-    fn filter_by_length(segments: Vec<Ibs2Segment>, gen_map: &GeneticMap) -> Vec<Ibs2Segment> {
+    fn filter_by_length(
+        segments: Vec<Ibs2Segment>,
+        gen_maps: &GeneticMaps,
+        chrom: ChromIdx,
+        marker_positions: &[u32],
+    ) -> Vec<Ibs2Segment> {
         segments
             .into_iter()
             .filter(|seg| {
-                let start_pos = seg.start as u32;
-                let end_pos = seg.incl_end as u32;
-                let len_cm = gen_map.gen_dist(start_pos, end_pos);
+                // Use physical positions from markers, not marker indices
+                let start_pos = marker_positions.get(seg.start).copied().unwrap_or(0);
+                let end_pos = marker_positions.get(seg.incl_end).copied().unwrap_or(0);
+                let len_cm = gen_maps.gen_dist(chrom, start_pos, end_pos);
                 len_cm >= MIN_IBS2_CM
             })
             .collect()

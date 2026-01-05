@@ -16,6 +16,7 @@ pub use dictionary::DictionaryColumn;
 pub use matrix::GenotypeMatrix;
 pub use mutable::MutableGenotypes;
 pub use sparse::SparseColumn;
+pub use view::GenotypeView;
 
 use crate::data::HapIdx;
 
@@ -142,6 +143,49 @@ impl GenotypeColumn {
 impl Default for GenotypeColumn {
     fn default() -> Self {
         Self::Dense(DenseColumn::new(0, 1))
+    }
+}
+
+/// Compress a block of markers using dictionary encoding when beneficial
+///
+/// Dictionary compression groups haplotypes by their allele patterns across
+/// multiple markers. This is effective when many haplotypes share the same
+/// local sequence (common in reference panels with LD structure).
+///
+/// Returns `Some(DictionaryColumn)` if compression ratio is favorable (< 0.5),
+/// otherwise returns `None`.
+pub fn compress_block<F>(
+    get_allele: F,
+    n_markers: usize,
+    n_haplotypes: usize,
+    bits_per_allele: u8,
+) -> Option<DictionaryColumn>
+where
+    F: Fn(usize, HapIdx) -> u8,
+{
+    // Only compress if block has enough markers
+    if n_markers < 4 || n_haplotypes == 0 {
+        return None;
+    }
+
+    // Build closures for each marker
+    let columns: Vec<Box<dyn Fn(HapIdx) -> u8>> = (0..n_markers)
+        .map(|m| {
+            let get_allele_ref = &get_allele;
+            Box::new(move |h: HapIdx| get_allele_ref(m, h)) as Box<dyn Fn(HapIdx) -> u8>
+        })
+        .collect();
+
+    // Create wrapper closures that the compress function can use
+    let column_fns: Vec<_> = columns.iter().map(|f| |h: HapIdx| f(h)).collect();
+
+    let dict = DictionaryColumn::compress(&column_fns, n_markers, n_haplotypes, bits_per_allele);
+
+    // Only use if compression ratio is favorable (< 0.5 = 2x compression)
+    if dict.compression_ratio() < 0.5 {
+        Some(dict)
+    } else {
+        None
     }
 }
 
