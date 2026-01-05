@@ -18,11 +18,10 @@ use noodles::bgzf;
 
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::Samples;
-use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
+use crate::data::marker::{Allele, Marker, Markers};
 use crate::data::ChromIdx;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::error::{ReagleError, Result};
-use crate::io::vcf::VcfWriter;
 
 /// Configuration for streaming window processing
 #[derive(Clone, Debug)]
@@ -448,66 +447,6 @@ fn parse_allele_char(s: &str) -> u8 {
     s.parse().unwrap_or(255)
 }
 
-/// Streaming pipeline processor that handles windows
-pub struct StreamingPipeline<F>
-where
-    F: FnMut(&StreamWindow) -> Result<Vec<u8>>,
-{
-    reader: StreamingVcfReader,
-    processor: F,
-}
-
-impl<F> StreamingPipeline<F>
-where
-    F: FnMut(&StreamWindow) -> Result<Vec<u8>>,
-{
-    /// Create a new streaming pipeline
-    pub fn new(reader: StreamingVcfReader, processor: F) -> Self {
-        Self { reader, processor }
-    }
-
-    /// Process all windows and write output
-    pub fn run(&mut self, output_path: &Path) -> Result<()> {
-        let samples = self.reader.samples_arc();
-        let mut first_window = true;
-        let mut all_markers = Markers::new();
-        let mut all_output = Vec::new();
-
-        while let Some(window) = self.reader.next_window()? {
-            eprintln!(
-                "Processing window {} ({} markers, output {}..{})",
-                window.window_num,
-                window.genotypes.n_markers(),
-                window.output_start,
-                window.output_end
-            );
-
-            // Process window
-            let output = (self.processor)(&window)?;
-
-            // Collect output
-            if first_window {
-                all_markers = window.genotypes.markers().clone();
-                first_window = false;
-            } else {
-                // Append markers from output region
-                for m in window.output_start..window.output_end {
-                    let marker_idx = MarkerIdx::new(m as u32);
-                    all_markers.push(window.genotypes.marker(marker_idx).clone());
-                }
-            }
-
-            all_output.extend(output);
-        }
-
-        // Write final output
-        let mut writer = VcfWriter::create(output_path, samples)?;
-        writer.write_header(&all_markers)?;
-        writer.flush()?;
-
-        Ok(())
-    }
-}
 
 #[cfg(test)]
 mod tests {

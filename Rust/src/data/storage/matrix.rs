@@ -3,7 +3,6 @@
 //! The main data structure: a matrix of genotypes (markers x haplotypes).
 //! Replaces `vcf/RefGT.java`, `vcf/BasicGT.java`, and related classes.
 
-use std::ops::Range;
 use std::sync::Arc;
 
 use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
@@ -213,51 +212,6 @@ impl GenotypeMatrix {
     }
 }
 
-/// A view into a GenotypeMatrix (for windowing without copying)
-pub struct GenotypeMatrixView<'a> {
-    matrix: &'a GenotypeMatrix,
-    marker_range: Range<usize>,
-}
-
-impl<'a> GenotypeMatrixView<'a> {
-    /// Create a view into a matrix
-    pub fn new(matrix: &'a GenotypeMatrix, marker_range: Range<usize>) -> Self {
-        Self { matrix, marker_range }
-    }
-
-    /// Number of markers in this view
-    pub fn n_markers(&self) -> usize {
-        self.marker_range.len()
-    }
-
-    /// Number of haplotypes
-    pub fn n_haplotypes(&self) -> usize {
-        self.matrix.n_haplotypes()
-    }
-
-    /// Get allele at (marker_offset, haplotype)
-    pub fn allele(&self, marker_offset: usize, hap: HapIdx) -> u8 {
-        let marker_idx = MarkerIdx::new((self.marker_range.start + marker_offset) as u32);
-        self.matrix.allele(marker_idx, hap)
-    }
-
-    /// Get marker at offset
-    pub fn marker(&self, marker_offset: usize) -> &Marker {
-        let marker_idx = MarkerIdx::new((self.marker_range.start + marker_offset) as u32);
-        self.matrix.marker(marker_idx)
-    }
-
-    /// Get column at offset
-    pub fn column(&self, marker_offset: usize) -> &GenotypeColumn {
-        let marker_idx = MarkerIdx::new((self.marker_range.start + marker_offset) as u32);
-        self.matrix.column(marker_idx)
-    }
-
-    /// Convert to owned matrix
-    pub fn to_owned(&self) -> GenotypeMatrix {
-        self.matrix.restrict(self.marker_range.start, self.marker_range.end)
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -120,51 +120,6 @@ impl SparseColumn {
     }
 }
 
-/// Sparse storage for multi-allelic rare variants
-#[derive(Clone, Debug)]
-pub struct SparseMultiAllelic {
-    /// (haplotype_index, allele) pairs, sorted by haplotype
-    entries: Vec<(HapIdx, u8)>,
-
-    /// Total number of haplotypes
-    n_haplotypes: u32,
-}
-
-impl SparseMultiAllelic {
-    /// Create from entries
-    pub fn from_entries(mut entries: Vec<(HapIdx, u8)>, n_haplotypes: u32) -> Self {
-        entries.sort_unstable_by_key(|(h, _)| *h);
-        Self {
-            entries,
-            n_haplotypes,
-        }
-    }
-
-    /// Get allele for haplotype
-    #[inline]
-    pub fn get(&self, hap: HapIdx) -> u8 {
-        match self.entries.binary_search_by_key(&hap, |(h, _)| *h) {
-            Ok(idx) => self.entries[idx].1,
-            Err(_) => 0, // REF
-        }
-    }
-
-    /// Number of haplotypes
-    pub fn n_haplotypes(&self) -> usize {
-        self.n_haplotypes as usize
-    }
-
-    /// Number of non-REF entries
-    pub fn n_entries(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Memory usage in bytes
-    pub fn size_bytes(&self) -> usize {
-        self.entries.len() * std::mem::size_of::<(HapIdx, u8)>()
-            + std::mem::size_of::<Self>()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -196,20 +151,5 @@ mod tests {
         for (i, &expected) in alleles.iter().enumerate() {
             assert_eq!(col.get(HapIdx::new(i as u32)), expected);
         }
-    }
-
-    #[test]
-    fn test_sparse_multiallelic() {
-        let entries = vec![
-            (HapIdx::new(1), 1),
-            (HapIdx::new(3), 2),
-            (HapIdx::new(5), 1),
-        ];
-        let col = SparseMultiAllelic::from_entries(entries, 10);
-
-        assert_eq!(col.get(HapIdx::new(0)), 0);
-        assert_eq!(col.get(HapIdx::new(1)), 1);
-        assert_eq!(col.get(HapIdx::new(3)), 2);
-        assert_eq!(col.get(HapIdx::new(5)), 1);
     }
 }

@@ -57,10 +57,6 @@ impl Ibs2Segment {
 pub struct Ibs2 {
     /// Number of markers
     n_markers: usize,
-    /// Physical positions for each marker (for genetic distance calculations)
-    marker_positions: Vec<u32>,
-    /// Chromosome for genetic distance lookups
-    chrom: ChromIdx,
     /// IBS2 segments for each sample: sample_segs[sample_idx] = Vec<Ibs2Segment>
     sample_segs: Vec<Vec<Ibs2Segment>>,
 }
@@ -96,8 +92,6 @@ impl Ibs2 {
 
         Self {
             n_markers,
-            marker_positions,
-            chrom,
             sample_segs,
         }
     }

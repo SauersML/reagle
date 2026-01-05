@@ -554,15 +554,6 @@ impl GeneticMaps {
         self.maps.get(chrom.as_usize()).and_then(|m| m.as_ref())
     }
 
-    /// Add a genetic map
-    pub fn insert(&mut self, chrom: ChromIdx, map: GeneticMap) {
-        let idx = chrom.as_usize();
-        if idx >= self.maps.len() {
-            self.maps.resize_with(idx + 1, || None);
-        }
-        self.maps[idx] = Some(map);
-    }
-
     /// Get genetic position, falling back to default rate if no map
     pub fn gen_pos(&self, chrom: ChromIdx, phys_pos: u32) -> f64 {
         match self.get(chrom) {
