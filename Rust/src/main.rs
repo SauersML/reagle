@@ -83,6 +83,6 @@ mod tests {
         let _ = io::vcf::VcfReader::open;
         let _ = model::parameters::ModelParams::new;
         let _ = pipelines::PhasingPipeline::new;
-        let _ = utils::workspace::Workspace::new;
+
     }
 }

@@ -31,4 +31,3 @@ pub use model::hmm::LiStephensHmm;
 pub use model::parameters::ModelParams;
 pub use model::pbwt::PbwtUpdater;
 pub use pipelines::{ImputationPipeline, PhasingPipeline};
-pub use utils::workspace::Workspace;

@@ -544,10 +544,10 @@ impl ImpStates {
 
     fn fill_with_random_haps(&mut self) {
         use rand::seq::SliceRandom;
-        use rand::thread_rng;
+        use rand::rng;
         
         let n_states = self.max_states.min(self.ibs.n_ref_haps);
-        let mut rng = thread_rng();
+        let mut rng = rng();
         
         // Create list of all haplotype indices and shuffle
         let mut hap_indices: Vec<u32> = (0..self.ibs.n_ref_haps as u32).collect();
