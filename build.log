@@ -33,11 +33,11 @@
 [1m[94m23[0m [1m[94m|[0m     DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, MutableGenotypes, SparseColumn,
    [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: unused imports: `VcfReader` and `VcfWriter`[0m
- [1m[94m--> [0msrc/io/mod.rs:9:15
+[1m[33mwarning[0m[1m: unused import: `VcfWriter`[0m
+ [1m[94m--> [0msrc/io/mod.rs:9:26
   [1m[94m|[0m
 [1m[94m9[0m [1m[94m|[0m pub use vcf::{VcfReader, VcfWriter};
-  [1m[94m|[0m               [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m
+  [1m[94m|[0m                          [1m[33m^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: unused imports: `SlidingWindowIterator`, `WindowBuilder`, and `Window`[0m
   [1m[94m--> [0msrc/io/mod.rs:10:18
@@ -51,23 +51,23 @@
 [1m[94m14[0m [1m[94m|[0m pub use hmm::{LiStephensHmm, HmmResult};
    [1m[94m|[0m               [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: unused import: `parameters::ModelParams`[0m
-  [1m[94m--> [0msrc/model/mod.rs:15:9
-   [1m[94m|[0m
-[1m[94m15[0m [1m[94m|[0m pub use parameters::ModelParams;
-   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
-
 [1m[33mwarning[0m[1m: unused imports: `PbwtDivUpdater` and `PbwtUpdater`[0m
   [1m[94m--> [0msrc/model/mod.rs:16:16
    [1m[94m|[0m
 [1m[94m16[0m [1m[94m|[0m pub use pbwt::{PbwtUpdater, PbwtDivUpdater};
    [1m[94m|[0m                [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: unused import: `VcfWriter`[0m
- [1m[94m--> [0msrc/io/mod.rs:9:26
+[1m[33mwarning[0m[1m: unused imports: `VcfReader` and `VcfWriter`[0m
+ [1m[94m--> [0msrc/io/mod.rs:9:15
   [1m[94m|[0m
 [1m[94m9[0m [1m[94m|[0m pub use vcf::{VcfReader, VcfWriter};
-  [1m[94m|[0m                          [1m[33m^^^^^^^^^[0m
+  [1m[94m|[0m               [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused import: `parameters::ModelParams`[0m
+  [1m[94m--> [0msrc/model/mod.rs:15:9
+   [1m[94m|[0m
+[1m[94m15[0m [1m[94m|[0m pub use parameters::ModelParams;
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m: `reagle` (lib test) generated 1 warning (run `cargo fix --lib -p reagle --tests` to apply 1 suggestion)
 [1m[33mwarning[0m[1m: associated items `err_rate` and `li_stephens_p_mismatch` are never used[0m
@@ -912,7 +912,6 @@
 [1m[94m228[0m [1m[94m|[0m     pub fn clear(&mut self) {
     [1m[94m|[0m            [1m[33m^^^^^[0m
 
-[1m[33mwarning[0m: `reagle` (bin "reagle") generated 61 warnings (run `cargo fix --bin "reagle" -p reagle` to apply 9 suggestions)
 [1m[33mwarning[0m[1m: method `err_rate` is never used[0m
    [1m[94m--> [0msrc/config.rs:200:12
     [1m[94m|[0m
@@ -1281,8 +1280,9 @@
 [1m[94m84[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 52 warnings (31 duplicates) (run `cargo fix --bin "reagle" -p reagle --tests` to apply 1 suggestion)
-[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 0.86s
+[1m[33mwarning[0m: `reagle` (bin "reagle") generated 61 warnings (7 duplicates) (run `cargo fix --bin "reagle" -p reagle` to apply 2 suggestions)
+[1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 52 warnings (24 duplicates) (run `cargo fix --bin "reagle" -p reagle --tests` to apply 8 suggestions)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 0.84s
 [1m[92m   Compiling[0m reagle v0.1.0 (/home/runner/work/reagle/reagle/Rust)
 [1m[33mwarning[0m[1m: unused variable: `m`[0m
    [1m[94m--> [0msrc/data/storage/mutable.rs:134:57
@@ -2012,41 +2012,41 @@ test config::tests::test_li_stephens_mismatch ... ok
 test data::genetic_map::tests::test_gen_dist ... ok
 test data::genetic_map::tests::test_interpolation ... ok
 test data::haplotype::tests::test_hap_sample_index ... ok
+test data::haplotype::tests::test_samples_n_haps ... ok
 test data::haplotype::tests::test_sample_hap_indices ... ok
 test data::haplotype::tests::test_samples_lookup ... ok
-test data::haplotype::tests::test_samples_n_haps ... ok
 test data::marker::tests::test_allele_from_char ... ok
 test data::marker::tests::test_bits_per_allele ... ok
 test data::marker::tests::test_marker_is_snv ... ok
 test data::storage::dense::tests::test_biallelic ... ok
 test data::storage::dense::tests::test_multiallelic ... ok
-test data::storage::dictionary::tests::test_dictionary_compression ... ok
 test data::storage::dense::tests::test_set ... ok
 test data::storage::matrix::tests::test_genotype ... ok
+test data::storage::dictionary::tests::test_dictionary_compression ... ok
 test data::storage::matrix::tests::test_matrix_access ... ok
-test data::storage::mutable::tests::test_mutable_genotypes ... ok
-test data::storage::mutable::tests::test_swap ... ok
 test data::storage::matrix::tests::test_matrix_restrict ... ok
 test data::storage::mutable::tests::test_haplotype ... ok
+test data::storage::mutable::tests::test_mutable_genotypes ... ok
+test data::storage::mutable::tests::test_swap ... ok
 test data::storage::sparse::tests::test_sparse_column ... ok
-test data::storage::tests::test_maf_calculation ... ok
-test data::storage::sparse::tests::test_sparse_multiallelic ... ok
 test data::storage::sparse::tests::test_sparse_inverted ... ok
+test data::storage::sparse::tests::test_sparse_multiallelic ... ok
+test data::storage::tests::test_maf_calculation ... ok
 test io::vcf::tests::test_parse_genotype ... ok
 test io::vcf::tests::test_parse_genotype_multiallelic ... ok
 test data::storage::tests::test_storage_selection ... ok
 test io::window::tests::test_single_window ... ok
 test model::hmm::tests::test_emission_prob ... ok
 test model::hmm::tests::test_hmm_forward_backward ... ok
-test model::parameters::tests::test_emit_probs ... ok
-test model::parameters::tests::test_switch_prob ... ok
 test io::window::tests::test_window_builder ... ok
-test model::pbwt::tests::test_pbwt_div_update ... ok
+test model::parameters::tests::test_emit_probs ... ok
 test model::parameters::tests::test_li_stephens_p_mismatch ... ok
-test pipelines::phasing::tests::test_emission_prob ... ok
 test model::pbwt::tests::test_pbwt_ibs_select ... ok
+test model::parameters::tests::test_switch_prob ... ok
+test model::pbwt::tests::test_pbwt_div_update ... ok
 test model::pbwt::tests::test_pbwt_update ... ok
 test pipelines::imputation::tests::test_impute_haplotype ... ok
+test pipelines::phasing::tests::test_emission_prob ... ok
 test pipelines::phasing::tests::test_pipeline_creation ... ok
 test utils::workspace::tests::test_workspace_creation ... ok
 test utils::workspace::tests::test_workspace_resize ... ok
@@ -2063,48 +2063,48 @@ test data::genetic_map::tests::test_extrapolation ... ok
 test data::genetic_map::tests::test_gen_dist ... ok
 test data::genetic_map::tests::test_interpolation ... ok
 test data::haplotype::tests::test_hap_sample_index ... ok
-test data::haplotype::tests::test_samples_n_haps ... ok
 test data::haplotype::tests::test_sample_hap_indices ... ok
+test data::haplotype::tests::test_samples_n_haps ... ok
 test data::haplotype::tests::test_samples_lookup ... ok
 test data::marker::tests::test_allele_from_char ... ok
 test data::marker::tests::test_bits_per_allele ... ok
-test data::marker::tests::test_marker_is_snv ... ok
+test data::storage::dense::tests::test_multiallelic ... ok
 test data::storage::dense::tests::test_biallelic ... ok
 test data::storage::dense::tests::test_set ... ok
+test data::marker::tests::test_marker_is_snv ... ok
 test data::storage::dictionary::tests::test_dictionary_compression ... ok
-test data::storage::dense::tests::test_multiallelic ... ok
 test data::storage::matrix::tests::test_genotype ... ok
 test data::storage::matrix::tests::test_matrix_access ... ok
-test data::storage::matrix::tests::test_matrix_restrict ... ok
 test data::storage::mutable::tests::test_haplotype ... ok
+test data::storage::matrix::tests::test_matrix_restrict ... ok
 test data::storage::mutable::tests::test_mutable_genotypes ... ok
 test data::storage::mutable::tests::test_swap ... ok
-test data::storage::sparse::tests::test_sparse_column ... ok
 test data::storage::sparse::tests::test_sparse_inverted ... ok
 test data::storage::sparse::tests::test_sparse_multiallelic ... ok
+test data::storage::sparse::tests::test_sparse_column ... ok
 test data::storage::tests::test_maf_calculation ... ok
 test io::vcf::tests::test_parse_genotype ... ok
+test data::storage::tests::test_storage_selection ... ok
 test io::vcf::tests::test_parse_genotype_multiallelic ... ok
 test io::window::tests::test_single_window ... ok
-test data::storage::tests::test_storage_selection ... ok
-test io::window::tests::test_window_builder ... ok
-test model::hmm::tests::test_emission_prob ... ok
 test model::parameters::tests::test_emit_probs ... ok
-test model::hmm::tests::test_hmm_forward_backward ... ok
 test model::parameters::tests::test_li_stephens_p_mismatch ... ok
 test model::parameters::tests::test_switch_prob ... ok
 test model::pbwt::tests::test_pbwt_div_update ... ok
+test io::window::tests::test_window_builder ... ok
 test model::pbwt::tests::test_pbwt_ibs_select ... ok
+test model::hmm::tests::test_emission_prob ... ok
 test model::pbwt::tests::test_pbwt_update ... ok
-test pipelines::phasing::tests::test_pipeline_creation ... ok
-test tests::test_module_imports ... ok
-test pipelines::imputation::tests::test_impute_haplotype ... ok
+test model::hmm::tests::test_hmm_forward_backward ... ok
 test pipelines::phasing::tests::test_emission_prob ... ok
+test pipelines::phasing::tests::test_pipeline_creation ... ok
+test pipelines::imputation::tests::test_impute_haplotype ... ok
+test tests::test_module_imports ... ok
 test utils::workspace::tests::test_workspace_creation ... ok
 test utils::workspace::tests::test_workspace_resize ... ok
 test utils::workspace::tests::test_random_sampling ... ok
 
-test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 [1m[92m   Doc-tests[0m reagle
 
