@@ -324,8 +324,8 @@ impl<'a> PhasingHmm<'a> {
             return (alleles1.to_vec(), alleles2.to_vec());
         }
 
-        let n_markers = alleles1.len();
-        let n_states = ref_haps.len();
+        let _n_markers = alleles1.len();
+        let _n_states = ref_haps.len();
 
         // Create HMM for haplotype 1
         let hmm = LiStephensHmm::new(self.ref_gt, self.params, ref_haps.to_vec(), gen_dists.to_vec());

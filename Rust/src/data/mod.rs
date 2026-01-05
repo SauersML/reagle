@@ -19,7 +19,9 @@ pub mod storage;
 pub use genetic_map::GeneticMap;
 pub use haplotype::{HapIdx, SampleIdx, Samples};
 pub use marker::{Allele, Marker, MarkerIdx, Markers};
-pub use storage::{DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, SparseColumn};
+pub use storage::{
+    DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, MutableGenotypes, SparseColumn,
+};
 
 /// Chromosome identifier (0-based index into chromosome name table)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

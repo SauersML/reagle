@@ -2,27 +2,23 @@
 //!
 //! Orchestrates the phasing workflow:
 //! 1. Load target VCF
-//! 2. Process in sliding windows
+//! 2. Build PBWT for haplotype matching
 //! 3. Run PBWT-accelerated Li-Stephens HMM
-//! 4. Write phased output
+//! 4. Update phase and iterate
+//! 5. Write phased output
 //!
-//! Replaces `phase/PhaseLS.java` and related classes.
+//! This is the core of Beagle's phasing algorithm.
 
-use std::path::Path;
-use std::sync::Arc;
 
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::data::genetic_map::{GeneticMap, GeneticMaps};
-use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
+use crate::data::genetic_map::GeneticMaps;
+use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
-use crate::data::storage::GenotypeMatrix;
-use crate::data::ChromIdx;
+use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes};
 use crate::error::Result;
 use crate::io::vcf::{VcfReader, VcfWriter};
-use crate::io::window::{Window, WindowBuilder};
-use crate::model::hmm::{LiStephensHmm, PhasingHmm};
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIbs};
 use crate::utils::Workspace;
@@ -42,17 +38,25 @@ impl PhasingPipeline {
 
     /// Run the phasing pipeline
     pub fn run(&mut self) -> Result<()> {
+        eprintln!("Loading VCF...");
+        
         // Load target VCF
         let (mut reader, file_reader) = VcfReader::open(&self.config.gt)?;
         let samples = reader.samples_arc();
-        let mut target_gt = reader.read_all(file_reader)?;
+        let target_gt = reader.read_all(file_reader)?;
 
         if target_gt.n_markers() == 0 {
+            eprintln!("No markers found in input VCF");
             return Ok(());
         }
 
-        // Initialize parameters based on sample size
+        let n_markers = target_gt.n_markers();
+        let n_samples = target_gt.n_samples();
         let n_haps = target_gt.n_haplotypes();
+
+        eprintln!("Loaded {} markers, {} samples ({} haplotypes)", n_markers, n_samples, n_haps);
+
+        // Initialize parameters based on sample size
         self.params = ModelParams::for_phasing(n_haps);
         self.params.set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
 
@@ -69,64 +73,10 @@ impl PhasingPipeline {
             GeneticMaps::new()
         };
 
-        // Run phasing iterations
-        let n_burnin = self.config.burnin;
-        let n_iterations = self.config.iterations;
-
-        for it in 0..(n_burnin + n_iterations) {
-            let is_burnin = it < n_burnin;
-            self.run_iteration(&mut target_gt, &gen_maps, it, is_burnin)?;
-        }
-
-        // Write output
-        let output_path = self.config.out.with_extension("vcf.gz");
-        let mut writer = VcfWriter::create(&output_path, samples)?;
-        writer.write_header(target_gt.markers())?;
-        writer.write_phased(&target_gt, 0, target_gt.n_markers())?;
-        writer.flush()?;
-
-        Ok(())
-    }
-
-    /// Run a single phasing iteration
-    fn run_iteration(
-        &mut self,
-        target_gt: &mut GenotypeMatrix,
-        gen_maps: &GeneticMaps,
-        iteration: usize,
-        is_burnin: bool,
-    ) -> Result<()> {
-        let n_samples = target_gt.n_samples();
-        let n_markers = target_gt.n_markers();
-        let n_haps = target_gt.n_haplotypes();
-
-        // Build PBWT for state selection
-        let mut pbwt = PbwtIbs::new(n_haps);
-        let mut updater = PbwtDivUpdater::new(n_haps);
-
-        // Update PBWT with current phasing
-        for m in 0..n_markers {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let alleles: Vec<u8> = (0..n_haps)
-                .map(|h| target_gt.allele(marker_idx, HapIdx::new(h as u32)))
-                .collect();
-            let n_alleles = target_gt.marker(marker_idx).n_alleles();
-
-            // Use temporary buffers to satisfy borrow checker
-            let mut temp_prefix = pbwt.fwd_prefix().to_vec();
-            let mut temp_div = pbwt.fwd_divergence().to_vec();
-            
-            updater.update(
-                &alleles,
-                n_alleles,
-                m,
-                &mut temp_prefix,
-                &mut temp_div,
-            );
-            
-            pbwt.fwd_prefix_mut().copy_from_slice(&temp_prefix);
-            pbwt.fwd_divergence_mut().copy_from_slice(&temp_div);
-        }
+        // Create mutable genotype storage for phasing
+        let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
+            target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
 
         // Compute genetic distances
         let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
@@ -138,25 +88,63 @@ impl PhasingPipeline {
             })
             .collect();
 
-        // Phase each sample in parallel
+        // Run phasing iterations
+        let n_burnin = self.config.burnin;
+        let n_iterations = self.config.iterations;
+        let total_iterations = n_burnin + n_iterations;
+
+        for it in 0..total_iterations {
+            let is_burnin = it < n_burnin;
+            let iter_type = if is_burnin { "burnin" } else { "main" };
+            eprintln!("Iteration {}/{} ({})", it + 1, total_iterations, iter_type);
+            
+            self.run_iteration(&target_gt, &mut geno, &gen_dists, it)?;
+        }
+
+        // Build final GenotypeMatrix from mutable genotypes
+        let final_gt = self.build_final_matrix(&target_gt, &geno);
+
+        // Write output
+        let output_path = self.config.out.with_extension("vcf.gz");
+        eprintln!("Writing output to {:?}", output_path);
+        
+        let mut writer = VcfWriter::create(&output_path, samples)?;
+        writer.write_header(final_gt.markers())?;
+        writer.write_phased(&final_gt, 0, final_gt.n_markers())?;
+        writer.flush()?;
+
+        eprintln!("Phasing complete!");
+        Ok(())
+    }
+
+    /// Run a single phasing iteration
+    fn run_iteration(
+        &self,
+        target_gt: &GenotypeMatrix,
+        geno: &mut MutableGenotypes,
+        gen_dists: &[f64],
+        iteration: usize,
+    ) -> Result<()> {
+        let n_samples = target_gt.n_samples();
+        let n_markers = target_gt.n_markers();
+        let n_haps = target_gt.n_haplotypes();
         let n_states = self.params.n_states;
         let seed = self.config.seed as u64 + iteration as u64;
 
-        // Collect updates from parallel phasing
-        let updates: Vec<(SampleIdx, Vec<u8>, Vec<u8>)> = (0..n_samples)
+        // Build PBWT for state selection using current phasing
+        let pbwt = self.build_pbwt(geno, n_markers, n_haps);
+
+        // Phase each sample in parallel
+        let updates: Vec<(SampleIdx, Vec<usize>)> = (0..n_samples)
             .into_par_iter()
-            .map(|s| {
+            .filter_map(|s| {
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
                 let hap2 = sample_idx.hap2();
 
-                // Get current alleles
-                let alleles1: Vec<u8> = (0..n_markers)
-                    .map(|m| target_gt.allele(MarkerIdx::new(m as u32), hap1))
-                    .collect();
-                let alleles2: Vec<u8> = (0..n_markers)
-                    .map(|m| target_gt.allele(MarkerIdx::new(m as u32), hap2))
-                    .collect();
+                // Get current alleles for this sample
+                let alleles1 = geno.haplotype(hap1);
+                let alleles2 = geno.haplotype(hap2);
 
                 // Find heterozygous markers
                 let het_markers: Vec<usize> = (0..n_markers)
@@ -164,145 +152,280 @@ impl PhasingPipeline {
                     .collect();
 
                 if het_markers.is_empty() {
-                    return (sample_idx, alleles1, alleles2);
+                    return None; // Nothing to phase
                 }
 
-                // Select reference haplotypes using PBWT
-                let ref_haps = pbwt.select_states(hap1, n_states, true);
+                // Select reference haplotypes using PBWT (excluding this sample's haps)
+                let ref_haps = self.select_ref_haps(&pbwt, hap1, n_states, n_haps);
 
                 // Create workspace for this thread
                 let mut workspace = Workspace::new(n_states, n_markers, n_haps);
                 workspace.set_seed(seed + s as u64);
 
+                // Build reference panel view for HMM
+                let ref_alleles: Vec<Vec<u8>> = ref_haps
+                    .iter()
+                    .map(|&h| geno.haplotype(h))
+                    .collect();
+
                 // Run phasing HMM
-                let phasing_hmm = PhasingHmm::new(target_gt, &self.params);
-                let (new_alleles1, new_alleles2) = phasing_hmm.phase_sample(
+                let switch_markers = self.phase_sample(
                     &alleles1,
                     &alleles2,
                     &het_markers,
-                    &ref_haps,
-                    &gen_dists,
+                    &ref_alleles,
+                    gen_dists,
                     &mut workspace,
                 );
 
-                (sample_idx, new_alleles1, new_alleles2)
+                if switch_markers.is_empty() {
+                    None
+                } else {
+                    Some((sample_idx, switch_markers))
+                }
             })
             .collect();
 
-        // Apply updates (sequential to avoid borrow issues)
-        for (sample_idx, new_alleles1, new_alleles2) in updates {
+        // Apply phase switches
+        let mut n_switches = 0;
+        for (sample_idx, switch_markers) in updates {
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
+            
+            for &m in &switch_markers {
+                geno.swap(m, hap1, hap2);
+            }
+            n_switches += switch_markers.len();
+        }
 
-            for m in 0..n_markers {
-                let marker_idx = MarkerIdx::new(m as u32);
-                // Update genotype matrix with new phasing
-                // Note: This requires mutable access to the matrix
-                // In a real implementation, we'd update the underlying storage
+        eprintln!("  Applied {} phase switches", n_switches);
+        Ok(())
+    }
+
+    /// Build PBWT from current genotypes
+    fn build_pbwt(&self, geno: &MutableGenotypes, n_markers: usize, n_haps: usize) -> PbwtIbs {
+        let mut pbwt = PbwtIbs::new(n_haps);
+        let mut updater = PbwtDivUpdater::new(n_haps);
+
+        for m in 0..n_markers {
+            let alleles = geno.marker_alleles(m);
+            
+            // Determine number of alleles (usually 2 for biallelic)
+            let n_alleles = alleles.iter().copied().max().unwrap_or(0) as usize + 1;
+
+            let mut temp_prefix = pbwt.fwd_prefix().to_vec();
+            let mut temp_div = pbwt.fwd_divergence().to_vec();
+
+            updater.update(alleles, n_alleles.max(2), m, &mut temp_prefix, &mut temp_div);
+
+            pbwt.fwd_prefix_mut().copy_from_slice(&temp_prefix);
+            pbwt.fwd_divergence_mut().copy_from_slice(&temp_div);
+        }
+
+        pbwt
+    }
+
+    /// Select reference haplotypes using PBWT
+    fn select_ref_haps(
+        &self,
+        pbwt: &PbwtIbs,
+        target_hap: HapIdx,
+        n_states: usize,
+        n_haps: usize,
+    ) -> Vec<HapIdx> {
+        // Get the sample this haplotype belongs to
+        let _target_sample = target_hap.0 / 2;
+        let other_hap = if target_hap.0 % 2 == 0 {
+            HapIdx::new(target_hap.0 + 1)
+        } else {
+            HapIdx::new(target_hap.0 - 1)
+        };
+
+        // Use PBWT to find nearby haplotypes
+        let mut selected = pbwt.select_states(target_hap, n_states + 2, true);
+        
+        // Remove the other haplotype from the same sample
+        selected.retain(|&h| h != other_hap);
+        
+        // Limit to n_states
+        selected.truncate(n_states);
+
+        // If we don't have enough, add random haplotypes
+        if selected.len() < n_states {
+            for h in 0..n_haps as u32 {
+                let hap = HapIdx::new(h);
+                if hap != target_hap && hap != other_hap && !selected.contains(&hap) {
+                    selected.push(hap);
+                    if selected.len() >= n_states {
+                        break;
+                    }
+                }
             }
         }
 
-        Ok(())
-    }
-}
-
-/// Phase a single window
-pub fn phase_window(
-    window: &Window,
-    params: &ModelParams,
-    seed: u64,
-) -> Result<Vec<(SampleIdx, Vec<u8>, Vec<u8>)>> {
-    let target_gt = &window.target_gt;
-    let n_samples = target_gt.n_samples();
-    let n_markers = target_gt.n_markers();
-    let n_haps = target_gt.n_haplotypes();
-    let n_states = params.n_states;
-
-    // Build PBWT
-    let mut pbwt = PbwtIbs::new(n_haps);
-    let mut updater = PbwtDivUpdater::new(n_haps);
-
-    for m in 0..n_markers {
-        let marker_idx = MarkerIdx::new(m as u32);
-        let alleles: Vec<u8> = (0..n_haps)
-            .map(|h| target_gt.allele(marker_idx, HapIdx::new(h as u32)))
-            .collect();
-        let n_alleles = target_gt.marker(marker_idx).n_alleles();
-        // Use temporary buffers to satisfy borrow checker
-        let mut temp_prefix = pbwt.fwd_prefix().to_vec();
-        let mut temp_div = pbwt.fwd_divergence().to_vec();
-        
-        updater.update(
-            &alleles,
-            n_alleles,
-            m,
-            &mut temp_prefix,
-            &mut temp_div,
-        );
-        
-        pbwt.fwd_prefix_mut().copy_from_slice(&temp_prefix);
-        pbwt.fwd_divergence_mut().copy_from_slice(&temp_div);
+        selected
     }
 
-    // Compute genetic distances
-    let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
-        .map(|m| window.gen_dist(m, m + 1))
-        .collect();
+    /// Phase a single sample using HMM
+    fn phase_sample(
+        &self,
+        alleles1: &[u8],
+        alleles2: &[u8],
+        het_markers: &[usize],
+        ref_alleles: &[Vec<u8>],
+        gen_dists: &[f64],
+        workspace: &mut Workspace,
+    ) -> Vec<usize> {
+        let _n_markers = alleles1.len();
+        let n_states = ref_alleles.len();
 
-    // Phase each sample
-    let results: Vec<_> = (0..n_samples)
-        .into_par_iter()
-        .map(|s| {
-            let sample_idx = SampleIdx::new(s as u32);
-            let hap1 = sample_idx.hap1();
-            let hap2 = sample_idx.hap2();
+        if n_states == 0 || het_markers.is_empty() {
+            return Vec::new();
+        }
 
-            let alleles1: Vec<u8> = (0..n_markers)
-                .map(|m| target_gt.allele(MarkerIdx::new(m as u32), hap1))
-                .collect();
-            let alleles2: Vec<u8> = (0..n_markers)
-                .map(|m| target_gt.allele(MarkerIdx::new(m as u32), hap2))
-                .collect();
+        // Compute forward probabilities for haplotype 1
+        let fwd1 = self.forward_pass(alleles1, ref_alleles, gen_dists, workspace);
+        
+        // Compute forward probabilities for haplotype 2
+        let fwd2 = self.forward_pass(alleles2, ref_alleles, gen_dists, workspace);
 
-            let het_markers: Vec<usize> = (0..n_markers)
-                .filter(|&m| alleles1[m] != alleles2[m])
-                .collect();
+        // Decide phase switches based on likelihood comparison
+        let mut switch_markers = Vec::new();
+        
+        // Simple phase decision: at each het site, check if swapping improves likelihood
+        for &m in het_markers {
+            // Current assignment likelihood (sum over states)
+            let _curr_ll = fwd1[m].iter().sum::<f32>().ln() + fwd2[m].iter().sum::<f32>().ln();
+            
+            // For swap, we'd need to recompute with swapped alleles
+            // Simplified: use emission probability comparison
+            let a1 = alleles1[m];
+            let a2 = alleles2[m];
+            
+            let mut curr_match = 0.0f32;
+            let mut swap_match = 0.0f32;
+            
+            for (s, ref_hap) in ref_alleles.iter().enumerate() {
+                let ref_a = ref_hap[m];
+                let weight = fwd1[m][s] + fwd2[m][s];
+                
+                if a1 == ref_a {
+                    curr_match += weight;
+                }
+                if a2 == ref_a {
+                    swap_match += weight;
+                }
+            }
+            
+            // Random component for exploration (especially in burnin)
+            let rand_val = workspace.next_f32();
+            let threshold = 0.5 + 0.3 * (swap_match - curr_match) / (swap_match + curr_match + 1e-10);
+            
+            if rand_val > threshold && swap_match > curr_match {
+                switch_markers.push(m);
+            }
+        }
 
-            if het_markers.is_empty() {
-                return (sample_idx, alleles1, alleles2);
+        switch_markers
+    }
+
+    /// Forward pass of HMM
+    fn forward_pass(
+        &self,
+        target_alleles: &[u8],
+        ref_alleles: &[Vec<u8>],
+        gen_dists: &[f64],
+        _workspace: &mut Workspace,
+    ) -> Vec<Vec<f32>> {
+        let n_markers = target_alleles.len();
+        let n_states = ref_alleles.len();
+        
+        let mut fwd = vec![vec![0.0f32; n_states]; n_markers];
+        
+        // Initialize
+        let init_prob = 1.0 / n_states as f32;
+        for s in 0..n_states {
+            let emit = self.emission_prob(target_alleles[0], ref_alleles[s][0]);
+            fwd[0][s] = init_prob * emit;
+        }
+        
+        // Normalize
+        let sum: f32 = fwd[0].iter().sum();
+        if sum > 0.0 {
+            for p in &mut fwd[0] {
+                *p /= sum;
+            }
+        }
+
+        // Forward recursion
+        for m in 1..n_markers {
+            let gen_dist = gen_dists.get(m - 1).copied().unwrap_or(0.01);
+            let p_switch = self.params.switch_prob(gen_dist);
+            let p_stay = 1.0 - p_switch;
+            let p_switch_to = p_switch / n_states as f32;
+
+            let fwd_sum: f32 = fwd[m - 1].iter().sum();
+
+            for s in 0..n_states {
+                let emit = self.emission_prob(target_alleles[m], ref_alleles[s][m]);
+                let trans = p_stay * fwd[m - 1][s] + p_switch_to * fwd_sum;
+                fwd[m][s] = trans * emit;
             }
 
-            let ref_haps = pbwt.select_states(hap1, n_states, true);
-            let mut workspace = Workspace::new(n_states, n_markers, n_haps);
-            workspace.set_seed(seed + s as u64);
+            // Normalize
+            let sum: f32 = fwd[m].iter().sum();
+            if sum > 0.0 {
+                for p in &mut fwd[m] {
+                    *p /= sum;
+                }
+            }
+        }
 
-            let phasing_hmm = PhasingHmm::new(target_gt, params);
-            let (new_alleles1, new_alleles2) = phasing_hmm.phase_sample(
-                &alleles1,
-                &alleles2,
-                &het_markers,
-                &ref_haps,
-                &gen_dists,
-                &mut workspace,
-            );
+        fwd
+    }
 
-            (sample_idx, new_alleles1, new_alleles2)
-        })
-        .collect();
+    /// Emission probability
+    #[inline]
+    fn emission_prob(&self, target: u8, reference: u8) -> f32 {
+        if target == reference {
+            self.params.emit_match()
+        } else {
+            self.params.emit_mismatch()
+        }
+    }
 
-    Ok(results)
+    /// Build final GenotypeMatrix from mutable genotypes
+    fn build_final_matrix(
+        &self,
+        original: &GenotypeMatrix,
+        geno: &MutableGenotypes,
+    ) -> GenotypeMatrix {
+        let markers = original.markers().clone();
+        let samples = original.samples_arc();
+        let n_markers = geno.n_markers();
+
+        let columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|m| {
+                let alleles = geno.marker_alleles(m);
+                GenotypeColumn::from_alleles(alleles, 2)
+            })
+            .collect();
+
+        GenotypeMatrix::new(markers, columns, samples, true)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_pipeline_creation() {
         let config = Config {
-            gt: std::path::PathBuf::from("test.vcf"),
+            gt: PathBuf::from("test.vcf"),
             r#ref: None,
-            out: std::path::PathBuf::from("out"),
+            out: PathBuf::from("out"),
             map: None,
             chrom: None,
             excludesamples: None,
@@ -331,5 +454,48 @@ mod tests {
 
         let pipeline = PhasingPipeline::new(config);
         assert_eq!(pipeline.params.n_states, 280);
+    }
+
+    #[test]
+    fn test_emission_prob() {
+        let config = Config {
+            gt: PathBuf::from("test.vcf"),
+            r#ref: None,
+            out: PathBuf::from("out"),
+            map: None,
+            chrom: None,
+            excludesamples: None,
+            excludemarkers: None,
+            burnin: 3,
+            iterations: 12,
+            phase_states: 280,
+            rare: 0.002,
+            impute: true,
+            imp_states: 1600,
+            imp_segment: 6.0,
+            imp_step: 0.1,
+            imp_nsteps: 7,
+            cluster: 0.005,
+            ap: false,
+            gp: false,
+            ne: 100000.0,
+            err: None,
+            em: true,
+            window: 40.0,
+            window_markers: 4000000,
+            overlap: 2.0,
+            seed: 12345,
+            nthreads: None,
+        };
+
+        let pipeline = PhasingPipeline::new(config);
+        
+        // Match should have high probability
+        let match_prob = pipeline.emission_prob(0, 0);
+        assert!(match_prob > 0.99);
+        
+        // Mismatch should have low probability
+        let mismatch_prob = pipeline.emission_prob(0, 1);
+        assert!(mismatch_prob < 0.01);
     }
 }

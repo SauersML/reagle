@@ -3,13 +3,9 @@
 //! Handles chunking of genomic data into overlapping windows for processing.
 //! Replaces `vcf/SlidingWindow.java`, `vcf/TargSlidingWindow.java`, etc.
 
-use std::sync::Arc;
-
 use crate::data::genetic_map::GeneticMap;
-use crate::data::haplotype::Samples;
-use crate::data::marker::{MarkerIdx, Markers};
+use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
-use crate::data::ChromIdx;
 
 /// A processing window containing a subset of markers
 #[derive(Clone, Debug)]
@@ -322,8 +318,11 @@ impl<'a> Iterator for SlidingWindowIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::marker::{Allele, Marker};
+    use crate::data::haplotype::Samples;
+    use crate::data::marker::{Allele, Marker, Markers};
     use crate::data::storage::GenotypeColumn;
+    use crate::data::ChromIdx;
+    use std::sync::Arc;
 
     fn make_test_matrix(n_markers: usize) -> GenotypeMatrix {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));

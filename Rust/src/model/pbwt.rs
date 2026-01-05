@@ -200,7 +200,7 @@ impl PbwtDivUpdater {
     /// for at least `min_length` markers.
     pub fn find_matches(
         &self,
-        query_allele: u8,
+        _query_allele: u8,
         prefix: &[u32],
         divergence: &[u32],
         marker: usize,

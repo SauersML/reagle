@@ -136,7 +136,7 @@ impl DictionaryColumn {
     /// Count ALT alleles at a marker offset
     pub fn alt_count(&self, marker_offset: usize) -> usize {
         let mut count = 0;
-        for (hap_idx, &pattern_idx) in self.hap_to_pattern.iter().enumerate() {
+        for (hap_idx, &_pattern_idx) in self.hap_to_pattern.iter().enumerate() {
             if self.get(marker_offset, HapIdx::new(hap_idx as u32)) > 0 {
                 count += 1;
             }

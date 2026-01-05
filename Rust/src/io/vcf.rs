@@ -9,12 +9,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use noodles::bgzf;
-use noodles::vcf::{self, Header};
+use noodles::vcf::Header;
 
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
-use crate::data::ChromIdx;
 use crate::error::{ReagleError, Result};
 
 /// VCF file reader
@@ -23,8 +22,6 @@ pub struct VcfReader {
     header: Header,
     /// Sample information
     samples: Arc<Samples>,
-    /// Chromosome name to index mapping
-    chrom_names: Vec<Arc<str>>,
 }
 
 impl VcfReader {
@@ -82,7 +79,6 @@ impl VcfReader {
             Self {
                 header,
                 samples,
-                chrom_names: Vec::new(),
             },
             reader,
         ))
@@ -107,7 +103,7 @@ impl VcfReader {
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
         let mut markers = Markers::new();
         let mut columns = Vec::new();
-        let n_haps = self.samples.n_haps();
+        let _n_haps = self.samples.n_haps();
         let mut is_phased = true;
 
         let mut line = String::new();
@@ -138,7 +134,7 @@ impl VcfReader {
             columns.push(column);
         }
 
-        let mut matrix = GenotypeMatrix::new(markers, columns, Arc::clone(&self.samples), is_phased);
+        let matrix = GenotypeMatrix::new(markers, columns, Arc::clone(&self.samples), is_phased);
         Ok(matrix)
     }
 
@@ -182,7 +178,7 @@ impl VcfReader {
             .map(|a| Allele::from_str(a))
             .collect();
 
-        let n_alleles = 1 + alt_alleles.len();
+        let _n_alleles = 1 + alt_alleles.len();
 
         // Parse FORMAT to find GT position
         let format = fields[8];

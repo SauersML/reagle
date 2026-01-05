@@ -177,7 +177,7 @@ impl Marker {
         if n <= 1 {
             0
         } else {
-            (usize::BITS - (n - 1).leading_zeros())
+            usize::BITS - (n - 1).leading_zeros()
         }
     }
 }

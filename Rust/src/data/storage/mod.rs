@@ -6,11 +6,13 @@
 pub mod dense;
 pub mod dictionary;
 pub mod matrix;
+pub mod mutable;
 pub mod sparse;
 
 pub use dense::DenseColumn;
 pub use dictionary::DictionaryColumn;
 pub use matrix::GenotypeMatrix;
+pub use mutable::MutableGenotypes;
 pub use sparse::SparseColumn;
 
 use crate::data::HapIdx;

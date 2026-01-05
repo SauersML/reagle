@@ -8,23 +8,18 @@
 //!
 //! Replaces `imp/ImpLS.java` and related classes.
 
-use std::path::Path;
-use std::sync::Arc;
 
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::data::genetic_map::{GeneticMap, GeneticMaps};
-use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
+use crate::data::genetic_map::GeneticMaps;
+use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
-use crate::data::ChromIdx;
 use crate::error::Result;
 use crate::io::vcf::{VcfReader, VcfWriter};
-use crate::io::window::{Window, WindowBuilder};
 use crate::model::hmm::LiStephensHmm;
 use crate::model::parameters::ModelParams;
-use crate::utils::workspace::ImpWorkspace;
 
 /// Imputation pipeline
 pub struct ImputationPipeline {
@@ -204,8 +199,11 @@ pub fn impute_haplotype(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
     use crate::data::storage::GenotypeColumn;
+    use crate::data::ChromIdx;
+    use std::sync::Arc;
 
     fn make_test_ref_panel() -> GenotypeMatrix {
         let samples = Arc::new(Samples::from_ids(vec![
