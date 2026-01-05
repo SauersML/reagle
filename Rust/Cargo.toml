@@ -7,34 +7,31 @@ repository = "https://github.com/SauersML/reagle"
 
 [dependencies]
 # CLI parsing
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.5.23", features = ["derive"] }
 
 # Parallelism
-rayon = "1.10"
-thread_local = "1.1"
+rayon = "1.10.0"
+thread_local = "1.1.8"
 
 # Bit manipulation for dense genotype storage
-bitvec = "1.0"
+bitvec = "1.0.1"
 
 # Error handling
-thiserror = "1.0"
-anyhow = "1.0"
+thiserror = "2.0.9"
+anyhow = "1.0.95"
 
 # Logging
-log = "0.4"
-env_logger = "0.11"
+log = "0.4.22"
+env_logger = "0.11.6"
 
 # VCF parsing (genomics)
-noodles = { version = "0.84", features = ["vcf", "bgzf", "csi", "tabix"] }
+noodles = { version = "0.91.0", features = ["vcf", "bgzf", "csi", "tabix"] }
 
 # Random number generation (for sampling)
-rand = "0.8"
-
-# Optional: SIMD acceleration
-# packed_simd = "0.3"  # Enable when optimizing hot loops
+rand = "0.9.0"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.5.1"
 
 [[bench]]
 name = "pbwt"
