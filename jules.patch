@@ -1,19 +1,90 @@
 diff --git a/Rust/src/data/storage/view.rs b/Rust/src/data/storage/view.rs
-index 7deda45..63921e9 100644
+index 63921e9..6cd3e6e 100644
 --- a/Rust/src/data/storage/view.rs
 +++ b/Rust/src/data/storage/view.rs
-@@ -38,6 +38,14 @@ impl<'a> GenotypeView<'a> {
-         }
+@@ -23,6 +23,7 @@ pub enum GenotypeView<'a> {
+ 
+ impl<'a> GenotypeView<'a> {
+     /// Get the number of markers
++    #[inline]
+     pub fn n_markers(&self) -> usize {
+         match self {
+             GenotypeView::Matrix(m) => m.n_markers(),
+@@ -31,6 +32,7 @@ impl<'a> GenotypeView<'a> {
      }
  
-+    /// Get the number of samples
-+    pub fn n_samples(&self) -> usize {
-+        match self {
-+            GenotypeView::Matrix(m) => m.n_samples(),
-+            GenotypeView::Mutable { geno, .. } => geno.n_samples(),
-+        }
-+    }
-+
+     /// Get the number of haplotypes
++    #[inline]
+     pub fn n_haplotypes(&self) -> usize {
+         match self {
+             GenotypeView::Matrix(m) => m.n_haplotypes(),
+@@ -39,6 +41,7 @@ impl<'a> GenotypeView<'a> {
+     }
+ 
+     /// Get the number of samples
++    #[inline]
+     pub fn n_samples(&self) -> usize {
+         match self {
+             GenotypeView::Matrix(m) => m.n_samples(),
+@@ -47,6 +50,7 @@ impl<'a> GenotypeView<'a> {
+     }
+ 
      /// Get an allele at a specific marker and haplotype index
++    #[inline]
      pub fn allele(&self, marker: MarkerIdx, hap: HapIdx) -> u8 {
          match self {
+             GenotypeView::Matrix(m) => m.allele(marker, hap),
+@@ -55,6 +59,7 @@ impl<'a> GenotypeView<'a> {
+     }
+ 
+     /// Get marker metadata by index
++    #[inline]
+     pub fn marker(&self, marker: MarkerIdx) -> &Marker {
+         match self {
+             GenotypeView::Matrix(m) => m.marker(marker),
+@@ -63,6 +68,7 @@ impl<'a> GenotypeView<'a> {
+     }
+ 
+     /// Get the markers collection
++    #[inline]
+     pub fn markers(&self) -> &Markers {
+         match self {
+             GenotypeView::Matrix(m) => m.markers(),
+@@ -78,6 +84,13 @@ impl<'a> From<&'a GenotypeMatrix> for GenotypeView<'a> {
+     }
+ }
+ 
++/// Conversion from `(&'a MutableGenotypes, &'a Markers)` to `GenotypeView`
++impl<'a> From<(&'a MutableGenotypes, &'a Markers)> for GenotypeView<'a> {
++    fn from((geno, markers): (&'a MutableGenotypes, &'a Markers)) -> Self {
++        GenotypeView::Mutable { geno, markers }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -123,6 +136,7 @@ mod tests {
+ 
+         assert_eq!(view.n_markers(), 1);
+         assert_eq!(view.n_haplotypes(), 4);
++        assert_eq!(view.n_samples(), 2);
+         assert_eq!(view.allele(MarkerIdx::new(0), HapIdx::new(1)), 1);
+         assert_eq!(view.marker(MarkerIdx::new(0)).pos, 100);
+     }
+@@ -130,13 +144,11 @@ mod tests {
+     #[test]
+     fn test_view_from_mutable() {
+         let (geno, markers) = make_test_mutable();
+-        let view = GenotypeView::Mutable {
+-            geno: &geno,
+-            markers: &markers,
+-        };
++        let view = GenotypeView::from((&geno, &markers));
+ 
+         assert_eq!(view.n_markers(), 1);
+         assert_eq!(view.n_haplotypes(), 2);
++        assert_eq!(view.n_samples(), 1);
+         assert_eq!(view.allele(MarkerIdx::new(0), HapIdx::new(1)), 1);
+         assert_eq!(view.marker(MarkerIdx::new(0)).pos, 200);
+     }

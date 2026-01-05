@@ -1,98 +1,4 @@
 [1m[92m   Compiling[0m reagle v0.1.0 (/home/runner/work/reagle/reagle/Rust)
-[1m[33mwarning[0m[1m: unused imports: `CodedPbwt`, `CodedStep`, `RefPanelCoded`, and `compute_step_starts`[0m
-  [1m[94m--> [0msrc/data/storage/mod.rs:14:23
-   [1m[94m|[0m
-[1m[94m14[0m [1m[94m|[0m pub use coded_steps::{CodedStep, RefPanelCoded, CodedPbwt, compute_step_starts};
-   [1m[94m|[0m                       [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^[0m
-   [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-[1m[33mwarning[0m[1m: unused import: `genetic_map::GeneticMap`[0m
-  [1m[94m--> [0msrc/data/mod.rs:19:9
-   [1m[94m|[0m
-[1m[94m19[0m [1m[94m|[0m pub use genetic_map::GeneticMap;
-   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused import: `Samples`[0m
-  [1m[94m--> [0msrc/data/mod.rs:20:40
-   [1m[94m|[0m
-[1m[94m20[0m [1m[94m|[0m pub use haplotype::{HapIdx, SampleIdx, Samples};
-   [1m[94m|[0m                                        [1m[33m^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `Allele`, `Marker`, and `Markers`[0m
-  [1m[94m--> [0msrc/data/mod.rs:21:18
-   [1m[94m|[0m
-[1m[94m21[0m [1m[94m|[0m pub use marker::{Allele, Marker, MarkerIdx, Markers};
-   [1m[94m|[0m                  [1m[33m^^^^^^[0m  [1m[33m^^^^^^[0m             [1m[33m^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `DenseColumn`, `DictionaryColumn`, `GenotypeColumn`, `GenotypeMatrix`, `GenotypeView`, `MutableGenotypes`, and `SparseColumn`[0m
-  [1m[94m--> [0msrc/data/mod.rs:23:5
-   [1m[94m|[0m
-[1m[94m23[0m [1m[94m|[0m     DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes,
-   [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m
-[1m[94m24[0m [1m[94m|[0m     SparseColumn,
-   [1m[94m|[0m     [1m[33m^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `StreamWindow`, `StreamingConfig`, and `StreamingVcfReader`[0m
-  [1m[94m--> [0msrc/io/mod.rs:10:21
-   [1m[94m|[0m
-[1m[94m10[0m [1m[94m|[0m pub use streaming::{StreamingVcfReader, StreamingConfig, StreamWindow};
-   [1m[94m|[0m                     [1m[33m^^^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `ImputationQuality`, `MarkerImputationStats`, `VcfReader`, and `VcfWriter`[0m
-  [1m[94m--> [0msrc/io/mod.rs:11:15
-   [1m[94m|[0m
-[1m[94m11[0m [1m[94m|[0m pub use vcf::{VcfReader, VcfWriter, ImputationQuality, MarkerImputationStats};
-   [1m[94m|[0m               [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `SlidingWindowIterator`, `WindowBuilder`, and `Window`[0m
-  [1m[94m--> [0msrc/io/mod.rs:12:18
-   [1m[94m|[0m
-[1m[94m12[0m [1m[94m|[0m pub use window::{Window, WindowBuilder, SlidingWindowIterator};
-   [1m[94m|[0m                  [1m[33m^^^^^^[0m  [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `HmmResult` and `LiStephensHmm`[0m
-  [1m[94m--> [0msrc/model/mod.rs:16:15
-   [1m[94m|[0m
-[1m[94m16[0m [1m[94m|[0m pub use hmm::{LiStephensHmm, HmmResult};
-   [1m[94m|[0m               [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `Ibs2Segment` and `Ibs2`[0m
-  [1m[94m--> [0msrc/model/mod.rs:17:16
-   [1m[94m|[0m
-[1m[94m17[0m [1m[94m|[0m pub use ibs2::{Ibs2, Ibs2Segment};
-   [1m[94m|[0m                [1m[33m^^^^[0m  [1m[33m^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `CodedStepsConfig`, `CodedSteps`, and `ImpStates`[0m
-  [1m[94m--> [0msrc/model/mod.rs:18:22
-   [1m[94m|[0m
-[1m[94m18[0m [1m[94m|[0m pub use imp_states::{ImpStates, CodedSteps, CodedStepsConfig};
-   [1m[94m|[0m                      [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused import: `parameters::ModelParams`[0m
-  [1m[94m--> [0msrc/model/mod.rs:19:9
-   [1m[94m|[0m
-[1m[94m19[0m [1m[94m|[0m pub use parameters::ModelParams;
-   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `PbwtDivUpdater` and `PbwtUpdater`[0m
-  [1m[94m--> [0msrc/model/mod.rs:20:16
-   [1m[94m|[0m
-[1m[94m20[0m [1m[94m|[0m pub use pbwt::{PbwtUpdater, PbwtDivUpdater};
-   [1m[94m|[0m                [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused import: `workspace::Workspace`[0m
- [1m[94m--> [0msrc/utils/mod.rs:7:9
-  [1m[94m|[0m
-[1m[94m7[0m [1m[94m|[0m pub use workspace::Workspace;
-  [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `ImputationQuality`, `MarkerImputationStats`, and `VcfWriter`[0m
-  [1m[94m--> [0msrc/io/mod.rs:11:26
-   [1m[94m|[0m
-[1m[94m11[0m [1m[94m|[0m pub use vcf::{VcfReader, VcfWriter, ImputationQuality, MarkerImputationStats};
-   [1m[94m|[0m                          [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
-
 [1m[33mwarning[0m[1m: associated items `err_rate` and `li_stephens_p_mismatch` are never used[0m
    [1m[94m--> [0msrc/config.rs:200:12
     [1m[94m|[0m
@@ -403,38 +309,38 @@
     [1m[94m|[0m            [1m[33m^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: variant `Dictionary` is never constructed[0m
-  [1m[94m--> [0msrc/data/storage/mod.rs:37:5
+  [1m[94m--> [0msrc/data/storage/mod.rs:35:5
    [1m[94m|[0m
-[1m[94m26[0m [1m[94m|[0m pub enum GenotypeColumn {
+[1m[94m24[0m [1m[94m|[0m pub enum GenotypeColumn {
    [1m[94m|[0m          [1m[94m--------------[0m [1m[94mvariant in this enum[0m
 [1m[94m...[0m
-[1m[94m37[0m [1m[94m|[0m     Dictionary(DictionaryColumn),
+[1m[94m35[0m [1m[94m|[0m     Dictionary(DictionaryColumn),
    [1m[94m|[0m     [1m[33m^^^^^^^^^^[0m
    [1m[94m|[0m
    [1m[94m= [0m[1mnote[0m: `GenotypeColumn` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
 
 [1m[33mwarning[0m[1m: methods `n_haplotypes`, `alt_count`, `maf`, `size_bytes`, `is_biallelic`, and `iter` are never used[0m
-   [1m[94m--> [0msrc/data/storage/mod.rs:52:12
+   [1m[94m--> [0msrc/data/storage/mod.rs:50:12
     [1m[94m|[0m
-[1m[94m 40[0m [1m[94m|[0m impl GenotypeColumn {
+[1m[94m 38[0m [1m[94m|[0m impl GenotypeColumn {
     [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m 52[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+[1m[94m 50[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m 61[0m [1m[94m|[0m     pub fn alt_count(&self) -> usize {
+[1m[94m 59[0m [1m[94m|[0m     pub fn alt_count(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m 70[0m [1m[94m|[0m     pub fn maf(&self) -> f64 {
+[1m[94m 68[0m [1m[94m|[0m     pub fn maf(&self) -> f64 {
     [1m[94m|[0m            [1m[33m^^^[0m
 [1m[94m...[0m
-[1m[94m 81[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+[1m[94m 79[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m126[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+[1m[94m124[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m135[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
+[1m[94m133[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
     [1m[94m|[0m            [1m[33m^^^^[0m
 
 [1m[33mwarning[0m[1m: struct `CodedStep` is never constructed[0m
@@ -640,14 +546,11 @@
 [1m[94m168[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: fields `is_phased` and `is_reversed` are never read[0m
-  [1m[94m--> [0msrc/data/storage/matrix.rs:26:5
+[1m[33mwarning[0m[1m: field `is_reversed` is never read[0m
+  [1m[94m--> [0msrc/data/storage/matrix.rs:29:5
    [1m[94m|[0m
 [1m[94m15[0m [1m[94m|[0m pub struct GenotypeMatrix {
-   [1m[94m|[0m            [1m[94m--------------[0m [1m[94mfields in this struct[0m
-[1m[94m...[0m
-[1m[94m26[0m [1m[94m|[0m     is_phased: bool,
-   [1m[94m|[0m     [1m[33m^^^^^^^^^[0m
+   [1m[94m|[0m            [1m[94m--------------[0m [1m[94mfield in this struct[0m
 [1m[94m...[0m
 [1m[94m29[0m [1m[94m|[0m     is_reversed: bool,
    [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m
@@ -662,9 +565,6 @@
 [1m[94m...[0m
 [1m[94m 51[0m [1m[94m|[0m     pub fn empty(samples: Arc<Samples>) -> Self {
     [1m[94m|[0m            [1m[33m^^^^^[0m
-[1m[94m...[0m
-[1m[94m 77[0m [1m[94m|[0m     pub fn is_phased(&self) -> bool {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 [1m[94m...[0m
 [1m[94m 82[0m [1m[94m|[0m     pub fn is_reversed(&self) -> bool {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
@@ -747,17 +647,6 @@
 [1m[94m257[0m [1m[94m|[0m     pub fn to_owned(&self) -> GenotypeMatrix {
     [1m[94m|[0m            [1m[33m^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: field `n_haps` is never read[0m
-  [1m[94m--> [0msrc/data/storage/mutable.rs:17:5
-   [1m[94m|[0m
-[1m[94m13[0m [1m[94m|[0m pub struct MutableGenotypes {
-   [1m[94m|[0m            [1m[94m----------------[0m [1m[94mfield in this struct[0m
-[1m[94m...[0m
-[1m[94m17[0m [1m[94m|[0m     n_haps: usize,
-   [1m[94m|[0m     [1m[33m^^^^^^[0m
-   [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `MutableGenotypes` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
-
 [1m[33mwarning[0m[1m: multiple associated items are never used[0m
    [1m[94m--> [0msrc/data/storage/mutable.rs:22:12
     [1m[94m|[0m
@@ -766,9 +655,6 @@
 [1m[94m 21[0m [1m[94m|[0m     /// Create from existing allele data
 [1m[94m 22[0m [1m[94m|[0m     pub fn new(n_markers: usize, n_haps: usize) -> Self {
     [1m[94m|[0m            [1m[33m^^^[0m
-[1m[94m...[0m
-[1m[94m 48[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
 [1m[94m...[0m
 [1m[94m 54[0m [1m[94m|[0m     pub fn n_samples(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
@@ -868,7 +754,7 @@
 [1m[94m14[0m [1m[94m|[0m pub enum GenotypeView<'a> {
    [1m[94m|[0m          [1m[33m^^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: methods `n_markers`, `n_haplotypes`, `allele`, `marker`, and `markers` are never used[0m
+[1m[33mwarning[0m[1m: methods `n_markers`, `n_haplotypes`, `n_samples`, `allele`, `marker`, and `markers` are never used[0m
   [1m[94m--> [0msrc/data/storage/view.rs:26:12
    [1m[94m|[0m
 [1m[94m24[0m [1m[94m|[0m impl<'a> GenotypeView<'a> {
@@ -880,13 +766,16 @@
 [1m[94m34[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m42[0m [1m[94m|[0m     pub fn allele(&self, marker: MarkerIdx, hap: HapIdx) -> u8 {
+[1m[94m42[0m [1m[94m|[0m     pub fn n_samples(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m50[0m [1m[94m|[0m     pub fn allele(&self, marker: MarkerIdx, hap: HapIdx) -> u8 {
    [1m[94m|[0m            [1m[33m^^^^^^[0m
 [1m[94m...[0m
-[1m[94m50[0m [1m[94m|[0m     pub fn marker(&self, marker: MarkerIdx) -> &Marker {
+[1m[94m58[0m [1m[94m|[0m     pub fn marker(&self, marker: MarkerIdx) -> &Marker {
    [1m[94m|[0m            [1m[33m^^^^^^[0m
 [1m[94m...[0m
-[1m[94m58[0m [1m[94m|[0m     pub fn markers(&self) -> &Markers {
+[1m[94m66[0m [1m[94m|[0m     pub fn markers(&self) -> &Markers {
    [1m[94m|[0m            [1m[33m^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: variants `InvalidData` and `Algorithm` are never constructed[0m
@@ -1172,73 +1061,73 @@
 [1m[94m 81[0m [1m[94m|[0m     pub fn bwd_update(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m106[0m [1m[94m|[0m     pub fn fwd_update_alleles(
+[1m[94m108[0m [1m[94m|[0m     pub fn fwd_update_alleles(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m131[0m [1m[94m|[0m     pub fn bwd_update_alleles(
+[1m[94m142[0m [1m[94m|[0m     pub fn bwd_update_alleles(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: struct `LiStephensHmm` is never constructed[0m
-   [1m[94m--> [0msrc/model/hmm.rs:160:12
+   [1m[94m--> [0msrc/model/hmm.rs:178:12
     [1m[94m|[0m
-[1m[94m160[0m [1m[94m|[0m pub struct LiStephensHmm<'a> {
+[1m[94m178[0m [1m[94m|[0m pub struct LiStephensHmm<'a> {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: multiple associated items are never used[0m
-   [1m[94m--> [0msrc/model/hmm.rs:179:12
+   [1m[94m--> [0msrc/model/hmm.rs:197:12
     [1m[94m|[0m
-[1m[94m171[0m [1m[94m|[0m impl<'a> LiStephensHmm<'a> {
+[1m[94m189[0m [1m[94m|[0m impl<'a> LiStephensHmm<'a> {
     [1m[94m|[0m [1m[94m--------------------------[0m [1m[94massociated items in this implementation[0m
 [1m[94m...[0m
-[1m[94m179[0m [1m[94m|[0m     pub fn new(
+[1m[94m197[0m [1m[94m|[0m     pub fn new(
     [1m[94m|[0m            [1m[33m^^^[0m
 [1m[94m...[0m
-[1m[94m194[0m [1m[94m|[0m     pub fn from_gen_dists(
+[1m[94m212[0m [1m[94m|[0m     pub fn from_gen_dists(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m208[0m [1m[94m|[0m     fn gen_dists_to_p_recomb(gen_dists: &[f64], recomb_intensity: f32) -> Vec<f32> {
+[1m[94m226[0m [1m[94m|[0m     fn gen_dists_to_p_recomb(gen_dists: &[f64], recomb_intensity: f32) -> Vec<f32> {
     [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m222[0m [1m[94m|[0m     pub fn n_states(&self) -> usize {
+[1m[94m240[0m [1m[94m|[0m     pub fn n_states(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m227[0m [1m[94m|[0m     pub fn n_markers(&self) -> usize {
+[1m[94m245[0m [1m[94m|[0m     pub fn n_markers(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m233[0m [1m[94m|[0m     pub fn state_allele(&self, marker: MarkerIdx, state: usize) -> u8 {
+[1m[94m251[0m [1m[94m|[0m     pub fn state_allele(&self, marker: MarkerIdx, state: usize) -> u8 {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m238[0m [1m[94m|[0m     pub fn state_alleles(&self, marker: MarkerIdx) -> Vec<u8> {
+[1m[94m256[0m [1m[94m|[0m     pub fn state_alleles(&self, marker: MarkerIdx) -> Vec<u8> {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m257[0m [1m[94m|[0m     pub fn forward_backward(
+[1m[94m275[0m [1m[94m|[0m     pub fn forward_backward(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m355[0m [1m[94m|[0m     fn forward_pass(
+[1m[94m373[0m [1m[94m|[0m     fn forward_pass(
     [1m[94m|[0m        [1m[33m^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m397[0m [1m[94m|[0m     fn sample_path(&self, state_probs: &[Vec<f32>], n_markers: usize, n_states: usize) -> Vec<usize> {
+[1m[94m415[0m [1m[94m|[0m     fn sample_path(&self, state_probs: &[Vec<f32>], n_markers: usize, n_states: usize) -> Vec<usize> {
     [1m[94m|[0m        [1m[33m^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m417[0m [1m[94m|[0m     pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
+[1m[94m435[0m [1m[94m|[0m     pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: struct `PhasingHmm` is never constructed[0m
-   [1m[94m--> [0msrc/model/hmm.rs:434:12
+   [1m[94m--> [0msrc/model/hmm.rs:452:12
     [1m[94m|[0m
-[1m[94m434[0m [1m[94m|[0m pub struct PhasingHmm<'a> {
+[1m[94m452[0m [1m[94m|[0m pub struct PhasingHmm<'a> {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: associated items `new` and `phase_sample` are never used[0m
-   [1m[94m--> [0msrc/model/hmm.rs:443:12
+   [1m[94m--> [0msrc/model/hmm.rs:461:12
     [1m[94m|[0m
-[1m[94m441[0m [1m[94m|[0m impl<'a> PhasingHmm<'a> {
+[1m[94m459[0m [1m[94m|[0m impl<'a> PhasingHmm<'a> {
     [1m[94m|[0m [1m[94m-----------------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m442[0m [1m[94m|[0m     /// Create a new phasing HMM
-[1m[94m443[0m [1m[94m|[0m     pub fn new(ref_gt: &'a GenotypeMatrix, params: &'a ModelParams) -> Self {
+[1m[94m460[0m [1m[94m|[0m     /// Create a new phasing HMM
+[1m[94m461[0m [1m[94m|[0m     pub fn new(ref_gt: &'a GenotypeMatrix, params: &'a ModelParams) -> Self {
     [1m[94m|[0m            [1m[33m^^^[0m
 [1m[94m...[0m
-[1m[94m460[0m [1m[94m|[0m     pub fn phase_sample(
+[1m[94m478[0m [1m[94m|[0m     pub fn phase_sample(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: constant `MIN_IBS2_CM` is never used[0m
@@ -1415,231 +1304,80 @@
 [1m[94m240[0m [1m[94m|[0m     pub fn set_n_haps(&mut self, n_haps: usize) {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: methods `merge` and `sum_switch_probs` are never used[0m
-   [1m[94m--> [0msrc/model/parameters.rs:297:12
+[1m[33mwarning[0m[1m: method `sum_switch_probs` is never used[0m
+   [1m[94m--> [0msrc/model/parameters.rs:307:12
     [1m[94m|[0m
 [1m[94m276[0m [1m[94m|[0m impl ParamEstimates {
-    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethods in this implementation[0m
-[1m[94m...[0m
-[1m[94m297[0m [1m[94m|[0m     pub fn merge(&mut self, other: &ParamEstimates) {
-    [1m[94m|[0m            [1m[33m^^^^^[0m
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
 [1m[94m...[0m
 [1m[94m307[0m [1m[94m|[0m     pub fn sum_switch_probs(&self) -> f64 {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: struct `PbwtUpdater` is never constructed[0m
-  [1m[94m--> [0msrc/model/pbwt.rs:25:12
+  [1m[94m--> [0msrc/model/pbwt.rs:24:12
    [1m[94m|[0m
-[1m[94m25[0m [1m[94m|[0m pub struct PbwtUpdater {
+[1m[94m24[0m [1m[94m|[0m pub struct PbwtUpdater {
    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: associated items `new`, `n_haps`, `update`, `update_with`, and `ensure_capacity` are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:37:12
+   [1m[94m--> [0msrc/model/pbwt.rs:36:12
     [1m[94m|[0m
-[1m[94m 32[0m [1m[94m|[0m impl PbwtUpdater {
+[1m[94m 31[0m [1m[94m|[0m impl PbwtUpdater {
     [1m[94m|[0m [1m[94m----------------[0m [1m[94massociated items in this implementation[0m
 [1m[94m...[0m
-[1m[94m 37[0m [1m[94m|[0m     pub fn new(n_haps: usize) -> Self {
+[1m[94m 36[0m [1m[94m|[0m     pub fn new(n_haps: usize) -> Self {
     [1m[94m|[0m            [1m[33m^^^[0m
 [1m[94m...[0m
-[1m[94m 46[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+[1m[94m 45[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^[0m
 [1m[94m...[0m
-[1m[94m 56[0m [1m[94m|[0m     pub fn update(&mut self, alleles: &[u8], n_alleles: usize, prefix: &mut [u32]) {
+[1m[94m 55[0m [1m[94m|[0m     pub fn update(&mut self, alleles: &[u8], n_alleles: usize, prefix: &mut [u32]) {
     [1m[94m|[0m            [1m[33m^^^^^^[0m
 [1m[94m...[0m
-[1m[94m 87[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
+[1m[94m 86[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m116[0m [1m[94m|[0m     fn ensure_capacity(&mut self, n_alleles: usize) {
+[1m[94m115[0m [1m[94m|[0m     fn ensure_capacity(&mut self, n_alleles: usize) {
     [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: methods `n_haps` and `bwd_update` are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:156:12
+[1m[33mwarning[0m[1m: associated function `find_ibs_neighbors` is never used[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:256:12
     [1m[94m|[0m
-[1m[94m143[0m [1m[94m|[0m impl PbwtDivUpdater {
-    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m142[0m [1m[94m|[0m impl PbwtDivUpdater {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94massociated function in this implementation[0m
 [1m[94m...[0m
-[1m[94m156[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
-[1m[94m...[0m
-[1m[94m228[0m [1m[94m|[0m     pub fn bwd_update(
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m256[0m [1m[94m|[0m     pub fn find_ibs_neighbors(
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: struct `SimpleDivUpdater` is never constructed[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:387:12
+[1m[33mwarning[0m[1m: struct `PbwtIbs` is never constructed[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:331:12
     [1m[94m|[0m
-[1m[94m387[0m [1m[94m|[0m pub struct SimpleDivUpdater {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+[1m[94m331[0m [1m[94m|[0m pub struct PbwtIbs {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: associated items `new` and `update` are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:393:12
+[1m[33mwarning[0m[1m: associated items `new`, `fwd_prefix`, `fwd_divergence`, `fwd_prefix_mut`, `fwd_divergence_mut`, and `select_states` are never used[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:339:12
     [1m[94m|[0m
-[1m[94m392[0m [1m[94m|[0m impl SimpleDivUpdater {
-    [1m[94m|[0m [1m[94m---------------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m393[0m [1m[94m|[0m     pub fn new(n_haps: usize) -> Self {
+[1m[94m337[0m [1m[94m|[0m impl PbwtIbs {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m338[0m [1m[94m|[0m     /// Create a new PBWT IBS finder
+[1m[94m339[0m [1m[94m|[0m     pub fn new(n_haps: usize) -> Self {
     [1m[94m|[0m            [1m[33m^^^[0m
 [1m[94m...[0m
-[1m[94m401[0m [1m[94m|[0m     pub fn update(
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
-
-[1m[33mwarning[0m[1m: fields `n_haps`, `fwd_updater`, and `bwd_updater` are never read[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:451:5
-    [1m[94m|[0m
-[1m[94m441[0m [1m[94m|[0m pub struct PbwtIbs {
-    [1m[94m|[0m            [1m[94m-------[0m [1m[94mfields in this struct[0m
-[1m[94m...[0m
-[1m[94m451[0m [1m[94m|[0m     n_haps: usize,
-    [1m[94m|[0m     [1m[33m^^^^^^[0m
-[1m[94m...[0m
-[1m[94m454[0m [1m[94m|[0m     fwd_updater: PbwtDivUpdater,
-    [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m457[0m [1m[94m|[0m     bwd_updater: PbwtDivUpdater,
-    [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m
-    [1m[94m|[0m
-    [1m[94m= [0m[1mnote[0m: `PbwtIbs` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
-
-[1m[33mwarning[0m[1m: multiple methods are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:475:12
-    [1m[94m|[0m
-[1m[94m460[0m [1m[94m|[0m impl PbwtIbs {
-    [1m[94m|[0m [1m[94m------------[0m [1m[94mmethods in this implementation[0m
-[1m[94m...[0m
-[1m[94m475[0m [1m[94m|[0m     pub fn reset(&mut self) {
-    [1m[94m|[0m            [1m[33m^^^^^[0m
-[1m[94m...[0m
-[1m[94m488[0m [1m[94m|[0m     pub fn fwd_update(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
+[1m[94m349[0m [1m[94m|[0m     pub fn fwd_prefix(&self) -> &[u32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m499[0m [1m[94m|[0m     pub fn bwd_update(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m530[0m [1m[94m|[0m     pub fn find_position(&self, hap: HapIdx, use_backward: bool) -> Option<usize> {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m627[0m [1m[94m|[0m     pub fn select_ibs_hap(
+[1m[94m354[0m [1m[94m|[0m     pub fn fwd_divergence(&self) -> &[i32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m647[0m [1m[94m|[0m     pub fn select_states_for_external_target(
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m359[0m [1m[94m|[0m     pub fn fwd_prefix_mut(&mut self) -> &mut [u32] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m696[0m [1m[94m|[0m     pub fn find_allele_region(
+[1m[94m364[0m [1m[94m|[0m     pub fn fwd_divergence_mut(&mut self) -> &mut [i32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: struct `BidirectionalPhaseResult` is never constructed[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:734:12
-    [1m[94m|[0m
-[1m[94m734[0m [1m[94m|[0m pub struct BidirectionalPhaseResult {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: associated items `new`, `add`, `n_hets`, and `n_confident` are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:745:12
-    [1m[94m|[0m
-[1m[94m743[0m [1m[94m|[0m impl BidirectionalPhaseResult {
-    [1m[94m|[0m [1m[94m-----------------------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m744[0m [1m[94m|[0m     /// Create a new result with the given capacity
-[1m[94m745[0m [1m[94m|[0m     pub fn new(capacity: usize) -> Self {
-    [1m[94m|[0m            [1m[33m^^^[0m
 [1m[94m...[0m
-[1m[94m754[0m [1m[94m|[0m     pub fn add(&mut self, marker: usize, decision: bool, confident: bool) {
-    [1m[94m|[0m            [1m[33m^^^[0m
-[1m[94m...[0m
-[1m[94m761[0m [1m[94m|[0m     pub fn n_hets(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
-[1m[94m...[0m
-[1m[94m766[0m [1m[94m|[0m     pub fn n_confident(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: function `run_bidirectional_pbwt_phasing` is never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:787:8
-    [1m[94m|[0m
-[1m[94m787[0m [1m[94m|[0m pub fn run_bidirectional_pbwt_phasing(
-    [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: function `build_pbwt_matches` is never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:860:4
-    [1m[94m|[0m
-[1m[94m860[0m [1m[94m|[0m fn build_pbwt_matches(
-    [1m[94m|[0m    [1m[33m^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: struct `WindowResult` is never constructed[0m
-  [1m[94m--> [0msrc/pipelines/imputation.rs:36:12
-   [1m[94m|[0m
-[1m[94m36[0m [1m[94m|[0m pub struct WindowResult {
-   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: associated function `new` is never used[0m
-  [1m[94m--> [0msrc/pipelines/imputation.rs:47:12
-   [1m[94m|[0m
-[1m[94m45[0m [1m[94m|[0m impl WindowResult {
-   [1m[94m|[0m [1m[94m-----------------[0m [1m[94massociated function in this implementation[0m
-[1m[94m46[0m [1m[94m|[0m     /// Create new window result
-[1m[94m47[0m [1m[94m|[0m     pub fn new(n_markers: usize, n_samples: usize, indices: WindowIndices) -> Self {
-   [1m[94m|[0m            [1m[33m^^^[0m
-
-[1m[33mwarning[0m[1m: function `splice_window_results` is never used[0m
-  [1m[94m--> [0msrc/pipelines/imputation.rs:68:8
-   [1m[94m|[0m
-[1m[94m68[0m [1m[94m|[0m pub fn splice_window_results(
-   [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: function `impute_haplotype_internal` is never used[0m
-   [1m[94m--> [0msrc/pipelines/imputation.rs:648:4
-    [1m[94m|[0m
-[1m[94m648[0m [1m[94m|[0m fn impute_haplotype_internal(
-    [1m[94m|[0m    [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: function `impute_haplotype` is never used[0m
-   [1m[94m--> [0msrc/pipelines/imputation.rs:696:8
-    [1m[94m|[0m
-[1m[94m696[0m [1m[94m|[0m pub fn impute_haplotype(
-    [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: struct `ImpLSBaum` is never constructed[0m
-   [1m[94m--> [0msrc/pipelines/imputation.rs:716:12
-    [1m[94m|[0m
-[1m[94m716[0m [1m[94m|[0m pub struct ImpLSBaum<'a> {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: associated items `new` and `impute` are never used[0m
-   [1m[94m--> [0msrc/pipelines/imputation.rs:725:12
-    [1m[94m|[0m
-[1m[94m723[0m [1m[94m|[0m impl<'a> ImpLSBaum<'a> {
-    [1m[94m|[0m [1m[94m----------------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m724[0m [1m[94m|[0m     /// Create a new imputation engine
-[1m[94m725[0m [1m[94m|[0m     pub fn new(
-    [1m[94m|[0m            [1m[33m^^^[0m
-[1m[94m...[0m
-[1m[94m742[0m [1m[94m|[0m     pub fn impute(&mut self, target_alleles: &[u8]) -> Vec<f32> {
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
-
-[1m[33mwarning[0m[1m: struct `StageMarkers` is never constructed[0m
-  [1m[94m--> [0msrc/pipelines/phasing.rs:34:12
-   [1m[94m|[0m
-[1m[94m34[0m [1m[94m|[0m pub struct StageMarkers {
-   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: associated items `classify`, `is_stage1`, `n_stage1`, `stage1_marker`, and `is_allele_low_freq` are never used[0m
-   [1m[94m--> [0msrc/pipelines/phasing.rs:56:12
-    [1m[94m|[0m
-[1m[94m 49[0m [1m[94m|[0m impl StageMarkers {
-    [1m[94m|[0m [1m[94m-----------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m...[0m
-[1m[94m 56[0m [1m[94m|[0m     pub fn classify(
-    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m160[0m [1m[94m|[0m     pub fn is_stage1(&self, marker: usize) -> bool {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m165[0m [1m[94m|[0m     pub fn n_stage1(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m170[0m [1m[94m|[0m     pub fn stage1_marker(&self, stage1_idx: usize) -> usize {
+[1m[94m393[0m [1m[94m|[0m     pub fn select_states(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m175[0m [1m[94m|[0m     pub fn is_allele_low_freq(&self, marker: usize, allele: u8) -> bool {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: struct `Workspace` is never constructed[0m
   [1m[94m--> [0msrc/utils/workspace.rs:16:12
@@ -1707,7 +1445,7 @@
 [1m[94m228[0m [1m[94m|[0m     pub fn clear(&mut self) {
     [1m[94m|[0m            [1m[33m^^^^^[0m
 
-[1m[33mwarning[0m: `reagle` (bin "reagle") generated 127 warnings (run `cargo fix --bin "reagle" -p reagle` to apply 14 suggestions)
+[1m[33mwarning[0m: `reagle` (bin "reagle") generated 97 warnings
 [1m[33mwarning[0m[1m: method `err_rate` is never used[0m
    [1m[94m--> [0msrc/config.rs:200:12
     [1m[94m|[0m
@@ -1858,18 +1596,18 @@
     [1m[94m|[0m            [1m[33m^^^^[0m
 
 [1m[33mwarning[0m[1m: methods `size_bytes`, `is_biallelic`, and `iter` are never used[0m
-   [1m[94m--> [0msrc/data/storage/mod.rs:81:12
+   [1m[94m--> [0msrc/data/storage/mod.rs:79:12
     [1m[94m|[0m
-[1m[94m 40[0m [1m[94m|[0m impl GenotypeColumn {
+[1m[94m 38[0m [1m[94m|[0m impl GenotypeColumn {
     [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m 81[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+[1m[94m 79[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m126[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+[1m[94m124[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m135[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
+[1m[94m133[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
     [1m[94m|[0m            [1m[33m^^^^[0m
 
 [1m[33mwarning[0m[1m: field `first_allele` is never read[0m
@@ -1976,9 +1714,6 @@
 [1m[94m 51[0m [1m[94m|[0m     pub fn empty(samples: Arc<Samples>) -> Self {
     [1m[94m|[0m            [1m[33m^^^^^[0m
 [1m[94m...[0m
-[1m[94m 77[0m [1m[94m|[0m     pub fn is_phased(&self) -> bool {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
-[1m[94m...[0m
 [1m[94m 82[0m [1m[94m|[0m     pub fn is_reversed(&self) -> bool {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 [1m[94m...[0m
@@ -2083,13 +1818,16 @@
 [1m[94m163[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: method `markers` is never used[0m
-  [1m[94m--> [0msrc/data/storage/view.rs:58:12
+[1m[33mwarning[0m[1m: methods `n_samples` and `markers` are never used[0m
+  [1m[94m--> [0msrc/data/storage/view.rs:42:12
    [1m[94m|[0m
 [1m[94m24[0m [1m[94m|[0m impl<'a> GenotypeView<'a> {
-   [1m[94m|[0m [1m[94m-------------------------[0m [1m[94mmethod in this implementation[0m
+   [1m[94m|[0m [1m[94m-------------------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m58[0m [1m[94m|[0m     pub fn markers(&self) -> &Markers {
+[1m[94m42[0m [1m[94m|[0m     pub fn n_samples(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m66[0m [1m[94m|[0m     pub fn markers(&self) -> &Markers {
    [1m[94m|[0m            [1m[33m^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: fields `buffer_cm` and `max_markers` are never read[0m
@@ -2192,24 +1930,24 @@
     [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: associated functions `fwd_update_alleles` and `bwd_update_alleles` are never used[0m
-   [1m[94m--> [0msrc/model/hmm.rs:106:12
+   [1m[94m--> [0msrc/model/hmm.rs:108:12
     [1m[94m|[0m
 [1m[94m 34[0m [1m[94m|[0m impl HmmUpdater {
     [1m[94m|[0m [1m[94m---------------[0m [1m[94massociated functions in this implementation[0m
 [1m[94m...[0m
-[1m[94m106[0m [1m[94m|[0m     pub fn fwd_update_alleles(
+[1m[94m108[0m [1m[94m|[0m     pub fn fwd_update_alleles(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m131[0m [1m[94m|[0m     pub fn bwd_update_alleles(
+[1m[94m142[0m [1m[94m|[0m     pub fn bwd_update_alleles(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: associated function `from_gen_dists` is never used[0m
-   [1m[94m--> [0msrc/model/hmm.rs:194:12
+   [1m[94m--> [0msrc/model/hmm.rs:212:12
     [1m[94m|[0m
-[1m[94m171[0m [1m[94m|[0m impl<'a> LiStephensHmm<'a> {
+[1m[94m189[0m [1m[94m|[0m impl<'a> LiStephensHmm<'a> {
     [1m[94m|[0m [1m[94m--------------------------[0m [1m[94massociated function in this implementation[0m
 [1m[94m...[0m
-[1m[94m194[0m [1m[94m|[0m     pub fn from_gen_dists(
+[1m[94m212[0m [1m[94m|[0m     pub fn from_gen_dists(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: field `other_sample` is never read[0m
@@ -2315,66 +2053,34 @@
 [1m[94m240[0m [1m[94m|[0m     pub fn set_n_haps(&mut self, n_haps: usize) {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: method `sum_switch_probs` is never used[0m
-   [1m[94m--> [0msrc/model/parameters.rs:307:12
-    [1m[94m|[0m
-[1m[94m276[0m [1m[94m|[0m impl ParamEstimates {
-    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
-[1m[94m...[0m
-[1m[94m307[0m [1m[94m|[0m     pub fn sum_switch_probs(&self) -> f64 {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
-
 [1m[33mwarning[0m[1m: methods `n_haps` and `update_with` are never used[0m
-  [1m[94m--> [0msrc/model/pbwt.rs:46:12
+  [1m[94m--> [0msrc/model/pbwt.rs:45:12
    [1m[94m|[0m
-[1m[94m32[0m [1m[94m|[0m impl PbwtUpdater {
+[1m[94m31[0m [1m[94m|[0m impl PbwtUpdater {
    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m46[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+[1m[94m45[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
    [1m[94m|[0m            [1m[33m^^^^^^[0m
 [1m[94m...[0m
-[1m[94m87[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
+[1m[94m86[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: method `n_haps` is never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:156:12
+[1m[33mwarning[0m[1m: methods `fwd_prefix`, `fwd_divergence`, `fwd_prefix_mut`, and `fwd_divergence_mut` are never used[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:349:12
     [1m[94m|[0m
-[1m[94m143[0m [1m[94m|[0m impl PbwtDivUpdater {
-    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
-[1m[94m...[0m
-[1m[94m156[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
-
-[1m[33mwarning[0m[1m: field `bwd_updater` is never read[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:457:5
-    [1m[94m|[0m
-[1m[94m441[0m [1m[94m|[0m pub struct PbwtIbs {
-    [1m[94m|[0m            [1m[94m-------[0m [1m[94mfield in this struct[0m
-[1m[94m...[0m
-[1m[94m457[0m [1m[94m|[0m     bwd_updater: PbwtDivUpdater,
-    [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m
-    [1m[94m|[0m
-    [1m[94m= [0m[1mnote[0m: `PbwtIbs` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
-
-[1m[33mwarning[0m[1m: methods `bwd_update`, `find_position`, `select_ibs_hap`, `select_states_for_external_target`, and `find_allele_region` are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:499:12
-    [1m[94m|[0m
-[1m[94m460[0m [1m[94m|[0m impl PbwtIbs {
+[1m[94m337[0m [1m[94m|[0m impl PbwtIbs {
     [1m[94m|[0m [1m[94m------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m499[0m [1m[94m|[0m     pub fn bwd_update(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
+[1m[94m349[0m [1m[94m|[0m     pub fn fwd_prefix(&self) -> &[u32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m530[0m [1m[94m|[0m     pub fn find_position(&self, hap: HapIdx, use_backward: bool) -> Option<usize> {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m627[0m [1m[94m|[0m     pub fn select_ibs_hap(
+[1m[94m354[0m [1m[94m|[0m     pub fn fwd_divergence(&self) -> &[i32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m647[0m [1m[94m|[0m     pub fn select_states_for_external_target(
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m359[0m [1m[94m|[0m     pub fn fwd_prefix_mut(&mut self) -> &mut [u32] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m696[0m [1m[94m|[0m     pub fn find_allele_region(
+[1m[94m364[0m [1m[94m|[0m     pub fn fwd_divergence_mut(&mut self) -> &mut [i32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: fields `ref_haps` and `switch_probs` are never read[0m
@@ -2409,99 +2115,23 @@
 [1m[94m131[0m [1m[94m|[0m     pub fn init_bwd_ones(&mut self, n_states: usize) {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 99 warnings (57 duplicates) (run `cargo fix --bin "reagle" -p reagle --tests` to apply 1 suggestion)
-[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 3.01s
+[1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 74 warnings (36 duplicates)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 2.79s
 [1m[92m   Compiling[0m aho-corasick v1.1.4
 [1m[92m   Compiling[0m encoding_rs v0.8.35
 [1m[92m   Compiling[0m grep-matcher v0.1.8
 [1m[92m   Compiling[0m memmap2 v0.9.9
 [1m[92m   Compiling[0m serde_json v1.0.148
-[1m[92m   Compiling[0m encoding_rs_io v0.1.7
 [1m[92m   Compiling[0m regex-automata v0.4.13
+[1m[92m   Compiling[0m encoding_rs_io v0.1.7
 [1m[92m   Compiling[0m bstr v1.12.1
-[1m[92m   Compiling[0m globset v0.4.18
 [1m[92m   Compiling[0m grep-searcher v0.1.16
+[1m[92m   Compiling[0m globset v0.4.18
 [1m[92m   Compiling[0m grep-regex v0.1.14
-[1m[92m   Compiling[0m grep-cli v0.1.12
 [1m[92m   Compiling[0m grep-printer v0.2.2
+[1m[92m   Compiling[0m grep-cli v0.1.12
 [1m[92m   Compiling[0m grep v0.3.2
 [1m[92m   Compiling[0m reagle v0.1.0 (/home/runner/work/reagle/reagle/Rust)
-[1m[33mwarning[0m[1m: unused imports: `CodedPbwt`, `CodedStep`, `RefPanelCoded`, and `compute_step_starts`[0m
-  [1m[94m--> [0msrc/data/storage/mod.rs:14:23
-   [1m[94m|[0m
-[1m[94m14[0m [1m[94m|[0m pub use coded_steps::{CodedStep, RefPanelCoded, CodedPbwt, compute_step_starts};
-   [1m[94m|[0m                       [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^[0m
-   [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-[1m[33mwarning[0m[1m: unused import: `genetic_map::GeneticMap`[0m
-  [1m[94m--> [0msrc/data/mod.rs:19:9
-   [1m[94m|[0m
-[1m[94m19[0m [1m[94m|[0m pub use genetic_map::GeneticMap;
-   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused import: `Samples`[0m
-  [1m[94m--> [0msrc/data/mod.rs:20:40
-   [1m[94m|[0m
-[1m[94m20[0m [1m[94m|[0m pub use haplotype::{HapIdx, SampleIdx, Samples};
-   [1m[94m|[0m                                        [1m[33m^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `Allele`, `Marker`, and `Markers`[0m
-  [1m[94m--> [0msrc/data/mod.rs:21:18
-   [1m[94m|[0m
-[1m[94m21[0m [1m[94m|[0m pub use marker::{Allele, Marker, MarkerIdx, Markers};
-   [1m[94m|[0m                  [1m[33m^^^^^^[0m  [1m[33m^^^^^^[0m             [1m[33m^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `DenseColumn`, `DictionaryColumn`, `GenotypeColumn`, `GenotypeMatrix`, `GenotypeView`, `MutableGenotypes`, and `SparseColumn`[0m
-  [1m[94m--> [0msrc/data/mod.rs:23:5
-   [1m[94m|[0m
-[1m[94m23[0m [1m[94m|[0m     DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes,
-   [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m
-[1m[94m24[0m [1m[94m|[0m     SparseColumn,
-   [1m[94m|[0m     [1m[33m^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `StreamWindow`, `StreamingConfig`, and `StreamingVcfReader`[0m
-  [1m[94m--> [0msrc/io/mod.rs:10:21
-   [1m[94m|[0m
-[1m[94m10[0m [1m[94m|[0m pub use streaming::{StreamingVcfReader, StreamingConfig, StreamWindow};
-   [1m[94m|[0m                     [1m[33m^^^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `ImputationQuality`, `MarkerImputationStats`, and `VcfWriter`[0m
-  [1m[94m--> [0msrc/io/mod.rs:11:26
-   [1m[94m|[0m
-[1m[94m11[0m [1m[94m|[0m pub use vcf::{VcfReader, VcfWriter, ImputationQuality, MarkerImputationStats};
-   [1m[94m|[0m                          [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `SlidingWindowIterator`, `WindowBuilder`, and `Window`[0m
-  [1m[94m--> [0msrc/io/mod.rs:12:18
-   [1m[94m|[0m
-[1m[94m12[0m [1m[94m|[0m pub use window::{Window, WindowBuilder, SlidingWindowIterator};
-   [1m[94m|[0m                  [1m[33m^^^^^^[0m  [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `HmmResult` and `LiStephensHmm`[0m
-  [1m[94m--> [0msrc/model/mod.rs:16:15
-   [1m[94m|[0m
-[1m[94m16[0m [1m[94m|[0m pub use hmm::{LiStephensHmm, HmmResult};
-   [1m[94m|[0m               [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `Ibs2Segment` and `Ibs2`[0m
-  [1m[94m--> [0msrc/model/mod.rs:17:16
-   [1m[94m|[0m
-[1m[94m17[0m [1m[94m|[0m pub use ibs2::{Ibs2, Ibs2Segment};
-   [1m[94m|[0m                [1m[33m^^^^[0m  [1m[33m^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `CodedStepsConfig`, `CodedSteps`, and `ImpStates`[0m
-  [1m[94m--> [0msrc/model/mod.rs:18:22
-   [1m[94m|[0m
-[1m[94m18[0m [1m[94m|[0m pub use imp_states::{ImpStates, CodedSteps, CodedStepsConfig};
-   [1m[94m|[0m                      [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: unused imports: `PbwtDivUpdater` and `PbwtUpdater`[0m
-  [1m[94m--> [0msrc/model/mod.rs:20:16
-   [1m[94m|[0m
-[1m[94m20[0m [1m[94m|[0m pub use pbwt::{PbwtUpdater, PbwtDivUpdater};
-   [1m[94m|[0m                [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m
-
 [1m[33mwarning[0m[1m: method `err_rate` is never used[0m
    [1m[94m--> [0msrc/config.rs:200:12
     [1m[94m|[0m
@@ -2726,29 +2356,29 @@
     [1m[94m|[0m            [1m[33m^^^^[0m
 
 [1m[33mwarning[0m[1m: variant `Dictionary` is never constructed[0m
-  [1m[94m--> [0msrc/data/storage/mod.rs:37:5
+  [1m[94m--> [0msrc/data/storage/mod.rs:35:5
    [1m[94m|[0m
-[1m[94m26[0m [1m[94m|[0m pub enum GenotypeColumn {
+[1m[94m24[0m [1m[94m|[0m pub enum GenotypeColumn {
    [1m[94m|[0m          [1m[94m--------------[0m [1m[94mvariant in this enum[0m
 [1m[94m...[0m
-[1m[94m37[0m [1m[94m|[0m     Dictionary(DictionaryColumn),
+[1m[94m35[0m [1m[94m|[0m     Dictionary(DictionaryColumn),
    [1m[94m|[0m     [1m[33m^^^^^^^^^^[0m
    [1m[94m|[0m
    [1m[94m= [0m[1mnote[0m: `GenotypeColumn` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
 
 [1m[33mwarning[0m[1m: methods `size_bytes`, `is_biallelic`, and `iter` are never used[0m
-   [1m[94m--> [0msrc/data/storage/mod.rs:81:12
+   [1m[94m--> [0msrc/data/storage/mod.rs:79:12
     [1m[94m|[0m
-[1m[94m 40[0m [1m[94m|[0m impl GenotypeColumn {
+[1m[94m 38[0m [1m[94m|[0m impl GenotypeColumn {
     [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m 81[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+[1m[94m 79[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m126[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+[1m[94m124[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m135[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
+[1m[94m133[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
     [1m[94m|[0m            [1m[33m^^^^[0m
 
 [1m[33mwarning[0m[1m: field `first_allele` is never read[0m
@@ -2854,9 +2484,6 @@
 [1m[94m...[0m
 [1m[94m 51[0m [1m[94m|[0m     pub fn empty(samples: Arc<Samples>) -> Self {
     [1m[94m|[0m            [1m[33m^^^^^[0m
-[1m[94m...[0m
-[1m[94m 77[0m [1m[94m|[0m     pub fn is_phased(&self) -> bool {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 [1m[94m...[0m
 [1m[94m 82[0m [1m[94m|[0m     pub fn is_reversed(&self) -> bool {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
@@ -2995,13 +2622,16 @@
 [1m[94m163[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: method `markers` is never used[0m
-  [1m[94m--> [0msrc/data/storage/view.rs:58:12
+[1m[33mwarning[0m[1m: methods `n_samples` and `markers` are never used[0m
+  [1m[94m--> [0msrc/data/storage/view.rs:42:12
    [1m[94m|[0m
 [1m[94m24[0m [1m[94m|[0m impl<'a> GenotypeView<'a> {
-   [1m[94m|[0m [1m[94m-------------------------[0m [1m[94mmethod in this implementation[0m
+   [1m[94m|[0m [1m[94m-------------------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m58[0m [1m[94m|[0m     pub fn markers(&self) -> &Markers {
+[1m[94m42[0m [1m[94m|[0m     pub fn n_samples(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m66[0m [1m[94m|[0m     pub fn markers(&self) -> &Markers {
    [1m[94m|[0m            [1m[33m^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: variants `InvalidData` and `Algorithm` are never constructed[0m
@@ -3249,42 +2879,42 @@
     [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: associated functions `fwd_update_alleles` and `bwd_update_alleles` are never used[0m
-   [1m[94m--> [0msrc/model/hmm.rs:106:12
+   [1m[94m--> [0msrc/model/hmm.rs:108:12
     [1m[94m|[0m
 [1m[94m 34[0m [1m[94m|[0m impl HmmUpdater {
     [1m[94m|[0m [1m[94m---------------[0m [1m[94massociated functions in this implementation[0m
 [1m[94m...[0m
-[1m[94m106[0m [1m[94m|[0m     pub fn fwd_update_alleles(
+[1m[94m108[0m [1m[94m|[0m     pub fn fwd_update_alleles(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m131[0m [1m[94m|[0m     pub fn bwd_update_alleles(
+[1m[94m142[0m [1m[94m|[0m     pub fn bwd_update_alleles(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: associated function `from_gen_dists` is never used[0m
-   [1m[94m--> [0msrc/model/hmm.rs:194:12
+   [1m[94m--> [0msrc/model/hmm.rs:212:12
     [1m[94m|[0m
-[1m[94m171[0m [1m[94m|[0m impl<'a> LiStephensHmm<'a> {
+[1m[94m189[0m [1m[94m|[0m impl<'a> LiStephensHmm<'a> {
     [1m[94m|[0m [1m[94m--------------------------[0m [1m[94massociated function in this implementation[0m
 [1m[94m...[0m
-[1m[94m194[0m [1m[94m|[0m     pub fn from_gen_dists(
+[1m[94m212[0m [1m[94m|[0m     pub fn from_gen_dists(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: struct `PhasingHmm` is never constructed[0m
-   [1m[94m--> [0msrc/model/hmm.rs:434:12
+   [1m[94m--> [0msrc/model/hmm.rs:452:12
     [1m[94m|[0m
-[1m[94m434[0m [1m[94m|[0m pub struct PhasingHmm<'a> {
+[1m[94m452[0m [1m[94m|[0m pub struct PhasingHmm<'a> {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: associated items `new` and `phase_sample` are never used[0m
-   [1m[94m--> [0msrc/model/hmm.rs:443:12
+   [1m[94m--> [0msrc/model/hmm.rs:461:12
     [1m[94m|[0m
-[1m[94m441[0m [1m[94m|[0m impl<'a> PhasingHmm<'a> {
+[1m[94m459[0m [1m[94m|[0m impl<'a> PhasingHmm<'a> {
     [1m[94m|[0m [1m[94m-----------------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m442[0m [1m[94m|[0m     /// Create a new phasing HMM
-[1m[94m443[0m [1m[94m|[0m     pub fn new(ref_gt: &'a GenotypeMatrix, params: &'a ModelParams) -> Self {
+[1m[94m460[0m [1m[94m|[0m     /// Create a new phasing HMM
+[1m[94m461[0m [1m[94m|[0m     pub fn new(ref_gt: &'a GenotypeMatrix, params: &'a ModelParams) -> Self {
     [1m[94m|[0m            [1m[33m^^^[0m
 [1m[94m...[0m
-[1m[94m460[0m [1m[94m|[0m     pub fn phase_sample(
+[1m[94m478[0m [1m[94m|[0m     pub fn phase_sample(
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: constant `MIN_IBS2_CM` is never used[0m
@@ -3450,157 +3080,33 @@
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: methods `n_haps` and `update_with` are never used[0m
-  [1m[94m--> [0msrc/model/pbwt.rs:46:12
+  [1m[94m--> [0msrc/model/pbwt.rs:45:12
    [1m[94m|[0m
-[1m[94m32[0m [1m[94m|[0m impl PbwtUpdater {
+[1m[94m31[0m [1m[94m|[0m impl PbwtUpdater {
    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m46[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+[1m[94m45[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
    [1m[94m|[0m            [1m[33m^^^^^^[0m
 [1m[94m...[0m
-[1m[94m87[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
+[1m[94m86[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 
-[1m[33mwarning[0m[1m: method `n_haps` is never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:156:12
+[1m[33mwarning[0m[1m: methods `fwd_prefix`, `fwd_divergence`, `fwd_prefix_mut`, and `fwd_divergence_mut` are never used[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:349:12
     [1m[94m|[0m
-[1m[94m143[0m [1m[94m|[0m impl PbwtDivUpdater {
-    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
-[1m[94m...[0m
-[1m[94m156[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
-
-[1m[33mwarning[0m[1m: struct `SimpleDivUpdater` is never constructed[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:387:12
-    [1m[94m|[0m
-[1m[94m387[0m [1m[94m|[0m pub struct SimpleDivUpdater {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: associated items `new` and `update` are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:393:12
-    [1m[94m|[0m
-[1m[94m392[0m [1m[94m|[0m impl SimpleDivUpdater {
-    [1m[94m|[0m [1m[94m---------------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m393[0m [1m[94m|[0m     pub fn new(n_haps: usize) -> Self {
-    [1m[94m|[0m            [1m[33m^^^[0m
-[1m[94m...[0m
-[1m[94m401[0m [1m[94m|[0m     pub fn update(
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
-
-[1m[33mwarning[0m[1m: field `bwd_updater` is never read[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:457:5
-    [1m[94m|[0m
-[1m[94m441[0m [1m[94m|[0m pub struct PbwtIbs {
-    [1m[94m|[0m            [1m[94m-------[0m [1m[94mfield in this struct[0m
-[1m[94m...[0m
-[1m[94m457[0m [1m[94m|[0m     bwd_updater: PbwtDivUpdater,
-    [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m
-    [1m[94m|[0m
-    [1m[94m= [0m[1mnote[0m: `PbwtIbs` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
-
-[1m[33mwarning[0m[1m: methods `bwd_update`, `find_position`, `select_ibs_hap`, `select_states_for_external_target`, and `find_allele_region` are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:499:12
-    [1m[94m|[0m
-[1m[94m460[0m [1m[94m|[0m impl PbwtIbs {
+[1m[94m337[0m [1m[94m|[0m impl PbwtIbs {
     [1m[94m|[0m [1m[94m------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m499[0m [1m[94m|[0m     pub fn bwd_update(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
+[1m[94m349[0m [1m[94m|[0m     pub fn fwd_prefix(&self) -> &[u32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m530[0m [1m[94m|[0m     pub fn find_position(&self, hap: HapIdx, use_backward: bool) -> Option<usize> {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m627[0m [1m[94m|[0m     pub fn select_ibs_hap(
+[1m[94m354[0m [1m[94m|[0m     pub fn fwd_divergence(&self) -> &[i32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m647[0m [1m[94m|[0m     pub fn select_states_for_external_target(
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m359[0m [1m[94m|[0m     pub fn fwd_prefix_mut(&mut self) -> &mut [u32] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m696[0m [1m[94m|[0m     pub fn find_allele_region(
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: struct `BidirectionalPhaseResult` is never constructed[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:734:12
-    [1m[94m|[0m
-[1m[94m734[0m [1m[94m|[0m pub struct BidirectionalPhaseResult {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: associated items `new`, `add`, `n_hets`, and `n_confident` are never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:745:12
-    [1m[94m|[0m
-[1m[94m743[0m [1m[94m|[0m impl BidirectionalPhaseResult {
-    [1m[94m|[0m [1m[94m-----------------------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m744[0m [1m[94m|[0m     /// Create a new result with the given capacity
-[1m[94m745[0m [1m[94m|[0m     pub fn new(capacity: usize) -> Self {
-    [1m[94m|[0m            [1m[33m^^^[0m
-[1m[94m...[0m
-[1m[94m754[0m [1m[94m|[0m     pub fn add(&mut self, marker: usize, decision: bool, confident: bool) {
-    [1m[94m|[0m            [1m[33m^^^[0m
-[1m[94m...[0m
-[1m[94m761[0m [1m[94m|[0m     pub fn n_hets(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^[0m
-[1m[94m...[0m
-[1m[94m766[0m [1m[94m|[0m     pub fn n_confident(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: function `run_bidirectional_pbwt_phasing` is never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:787:8
-    [1m[94m|[0m
-[1m[94m787[0m [1m[94m|[0m pub fn run_bidirectional_pbwt_phasing(
-    [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: function `build_pbwt_matches` is never used[0m
-   [1m[94m--> [0msrc/model/pbwt.rs:860:4
-    [1m[94m|[0m
-[1m[94m860[0m [1m[94m|[0m fn build_pbwt_matches(
-    [1m[94m|[0m    [1m[33m^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: struct `WindowResult` is never constructed[0m
-  [1m[94m--> [0msrc/pipelines/imputation.rs:36:12
-   [1m[94m|[0m
-[1m[94m36[0m [1m[94m|[0m pub struct WindowResult {
-   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: associated function `new` is never used[0m
-  [1m[94m--> [0msrc/pipelines/imputation.rs:47:12
-   [1m[94m|[0m
-[1m[94m45[0m [1m[94m|[0m impl WindowResult {
-   [1m[94m|[0m [1m[94m-----------------[0m [1m[94massociated function in this implementation[0m
-[1m[94m46[0m [1m[94m|[0m     /// Create new window result
-[1m[94m47[0m [1m[94m|[0m     pub fn new(n_markers: usize, n_samples: usize, indices: WindowIndices) -> Self {
-   [1m[94m|[0m            [1m[33m^^^[0m
-
-[1m[33mwarning[0m[1m: function `splice_window_results` is never used[0m
-  [1m[94m--> [0msrc/pipelines/imputation.rs:68:8
-   [1m[94m|[0m
-[1m[94m68[0m [1m[94m|[0m pub fn splice_window_results(
-   [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: struct `StageMarkers` is never constructed[0m
-  [1m[94m--> [0msrc/pipelines/phasing.rs:34:12
-   [1m[94m|[0m
-[1m[94m34[0m [1m[94m|[0m pub struct StageMarkers {
-   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
-
-[1m[33mwarning[0m[1m: associated items `classify`, `is_stage1`, `n_stage1`, `stage1_marker`, and `is_allele_low_freq` are never used[0m
-   [1m[94m--> [0msrc/pipelines/phasing.rs:56:12
-    [1m[94m|[0m
-[1m[94m 49[0m [1m[94m|[0m impl StageMarkers {
-    [1m[94m|[0m [1m[94m-----------------[0m [1m[94massociated items in this implementation[0m
-[1m[94m...[0m
-[1m[94m 56[0m [1m[94m|[0m     pub fn classify(
-    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m160[0m [1m[94m|[0m     pub fn is_stage1(&self, marker: usize) -> bool {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m165[0m [1m[94m|[0m     pub fn n_stage1(&self) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m170[0m [1m[94m|[0m     pub fn stage1_marker(&self, stage1_idx: usize) -> usize {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m175[0m [1m[94m|[0m     pub fn is_allele_low_freq(&self, marker: usize, allele: u8) -> bool {
+[1m[94m364[0m [1m[94m|[0m     pub fn fwd_divergence_mut(&mut self) -> &mut [i32] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: fields `ref_haps` and `switch_probs` are never read[0m
@@ -3656,52 +3162,52 @@
 [1m[94m228[0m [1m[94m|[0m     pub fn clear(&mut self) {
     [1m[94m|[0m            [1m[33m^^^^^[0m
 
-[1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 99 warnings (run `cargo fix --bin "reagle" -p reagle --tests` to apply 12 suggestions)
-[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 8.75s
+[1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 74 warnings
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 8.58s
 [1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/reagle-16500524a0f8136e)
 
-running 77 tests
+running 74 tests
 test config::tests::test_li_stephens_mismatch ... ok
 test data::genetic_map::tests::test_empty_map ... ok
 test data::genetic_map::tests::test_gen_dist ... ok
+test data::genetic_map::tests::test_extrapolation ... ok
 test data::genetic_map::tests::test_interpolation ... ok
 test data::genetic_map::tests::test_marker_map_from_positions ... ok
-test data::genetic_map::tests::test_extrapolation ... ok
 test data::genetic_map::tests::test_marker_map_p_recomb ... ok
-test data::haplotype::tests::test_hap_sample_index ... ok
 test data::genetic_map::tests::test_marker_map_restrict ... ok
-test data::haplotype::tests::test_sample_hap_indices ... ok
+test data::haplotype::tests::test_hap_sample_index ... ok
 test data::genetic_map::tests::test_position_map ... ok
-test data::haplotype::tests::test_samples_lookup ... ok
+test data::haplotype::tests::test_sample_hap_indices ... ok
 test data::haplotype::tests::test_samples_n_haps ... ok
+test data::haplotype::tests::test_samples_lookup ... ok
 test data::marker::tests::test_allele_from_char ... ok
 test data::marker::tests::test_bits_per_allele ... ok
 test data::marker::tests::test_marker_is_snv ... ok
-test data::storage::coded_steps::tests::test_coded_step ... ok
 test data::storage::coded_steps::tests::test_compute_step_starts ... ok
-test data::storage::coded_steps::tests::test_ref_panel_coded ... ok
-test data::storage::dense::tests::test_multiallelic ... ok
-test data::storage::dense::tests::test_biallelic ... ok
+test data::storage::coded_steps::tests::test_coded_step ... ok
 test data::storage::coded_steps::tests::test_coded_pbwt ... ok
-test data::storage::dictionary::tests::test_dictionary_compression ... ok
+test data::storage::coded_steps::tests::test_ref_panel_coded ... ok
+test data::storage::dense::tests::test_biallelic ... ok
+test data::storage::dense::tests::test_multiallelic ... ok
 test data::storage::dense::tests::test_set ... ok
 test data::storage::matrix::tests::test_genotype ... ok
+test data::storage::dictionary::tests::test_dictionary_compression ... ok
 test data::storage::matrix::tests::test_matrix_access ... ok
 test data::storage::matrix::tests::test_matrix_restrict ... ok
-test data::storage::mutable::tests::test_mutable_genotypes ... ok
 test data::storage::mutable::tests::test_haplotype ... ok
+test data::storage::mutable::tests::test_mutable_genotypes ... ok
 test data::storage::mutable::tests::test_swap ... ok
-test data::storage::sparse::tests::test_sparse_column ... ok
 test data::storage::sparse::tests::test_sparse_inverted ... ok
+test data::storage::sparse::tests::test_sparse_column ... ok
 test data::storage::sparse::tests::test_sparse_multiallelic ... ok
 test data::storage::tests::test_maf_calculation ... ok
-test data::storage::view::tests::test_view_from_matrix ... ok
-test data::storage::tests::test_storage_selection ... ok
 test data::storage::view::tests::test_view_from_mutable ... ok
+test data::storage::tests::test_storage_selection ... ok
+test data::storage::view::tests::test_view_from_matrix ... ok
+test io::streaming::tests::test_parse_gt ... ok
+test io::streaming::tests::test_streaming_config_default ... ok
 test io::vcf::tests::test_allele_frequency ... ok
 test io::vcf::tests::test_dr2_perfect_imputation ... ok
-test io::streaming::tests::test_streaming_config_default ... ok
-test io::streaming::tests::test_parse_gt ... ok
 test io::vcf::tests::test_dr2_uncertain_imputation ... ok
 test io::vcf::tests::test_dr2_variable_imputation ... ok
 test io::vcf::tests::test_imputation_quality_collection ... ok
@@ -3710,17 +3216,17 @@ test io::vcf::tests::test_parse_genotype ... ok
 test io::vcf::tests::test_parse_genotype_multiallelic ... ok
 test io::window::tests::test_single_window ... ok
 test model::hmm::tests::test_dosage_computation ... ok
-test model::hmm::tests::test_hmm_forward_backward ... ok
-test model::hmm::tests::test_hmm_updater_bwd ... ok
-test model::hmm::tests::test_hmm_updater_fwd ... ok
 test io::window::tests::test_window_builder ... ok
 test model::hmm::tests::test_gen_dist_to_p_recomb ... ok
+test model::hmm::tests::test_hmm_updater_bwd ... ok
 test model::ibs2::tests::test_ibs2_segment ... ok
-test model::ibs2::tests::test_phase_consistent ... ok
+test model::hmm::tests::test_hmm_forward_backward ... ok
+test model::hmm::tests::test_hmm_updater_fwd ... ok
 test model::imp_states::tests::test_coded_steps ... ok
 test model::imp_states::tests::test_composite_hap ... ok
-test model::parameters::tests::test_emit_probs ... ok
+test model::ibs2::tests::test_phase_consistent ... ok
 test model::imp_states::tests::test_imp_ibs ... ok
+test model::parameters::tests::test_emit_probs ... ok
 test model::parameters::tests::test_li_stephens_p_mismatch ... ok
 test model::parameters::tests::test_lr_threshold_for_iteration ... ok
 test model::parameters::tests::test_ne_from_recomb_intensity ... ok
@@ -3730,100 +3236,94 @@ test model::parameters::tests::test_recomb_intensity_formula ... ok
 test model::pbwt::tests::test_find_ibs_neighbors ... ok
 test model::pbwt::tests::test_pbwt_div_fwd_update ... ok
 test model::pbwt::tests::test_pbwt_ibs_select ... ok
-test model::pbwt::tests::test_pbwt_div_bwd_update ... ok
 test model::pbwt::tests::test_pbwt_update ... ok
-test pipelines::imputation::tests::test_imp_ls_baum ... ok
 test pipelines::phasing::tests::test_pipeline_creation ... ok
 test utils::workspace::tests::test_workspace_creation ... ok
-test pipelines::imputation::tests::test_impute_haplotype ... ok
 test utils::workspace::tests::test_workspace_resize ... ok
 test utils::workspace::tests::test_random_sampling ... ok
 
-test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 74 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
 [1m[92m     Running[0m unittests src/main.rs (target/debug/deps/reagle-1426dc9efcf1b97d)
 
-running 78 tests
+running 75 tests
 test config::tests::test_li_stephens_mismatch ... ok
 test data::genetic_map::tests::test_empty_map ... ok
 test data::genetic_map::tests::test_extrapolation ... ok
 test data::genetic_map::tests::test_gen_dist ... ok
 test data::genetic_map::tests::test_interpolation ... ok
 test data::genetic_map::tests::test_marker_map_from_positions ... ok
-test data::genetic_map::tests::test_marker_map_restrict ... ok
 test data::genetic_map::tests::test_marker_map_p_recomb ... ok
+test data::genetic_map::tests::test_marker_map_restrict ... ok
 test data::genetic_map::tests::test_position_map ... ok
-test data::haplotype::tests::test_samples_lookup ... ok
 test data::haplotype::tests::test_hap_sample_index ... ok
 test data::haplotype::tests::test_sample_hap_indices ... ok
 test data::haplotype::tests::test_samples_n_haps ... ok
+test data::haplotype::tests::test_samples_lookup ... ok
 test data::marker::tests::test_allele_from_char ... ok
 test data::marker::tests::test_bits_per_allele ... ok
 test data::marker::tests::test_marker_is_snv ... ok
-test data::storage::coded_steps::tests::test_coded_step ... ok
 test data::storage::coded_steps::tests::test_coded_pbwt ... ok
-test data::storage::dense::tests::test_biallelic ... ok
+test data::storage::coded_steps::tests::test_coded_step ... ok
 test data::storage::coded_steps::tests::test_compute_step_starts ... ok
-test data::storage::dense::tests::test_set ... ok
 test data::storage::coded_steps::tests::test_ref_panel_coded ... ok
-test data::storage::dictionary::tests::test_dictionary_compression ... ok
-test data::storage::matrix::tests::test_genotype ... ok
-test data::storage::matrix::tests::test_matrix_access ... ok
+test data::storage::dense::tests::test_set ... ok
+test data::storage::dense::tests::test_biallelic ... ok
 test data::storage::dense::tests::test_multiallelic ... ok
-test data::storage::mutable::tests::test_haplotype ... ok
+test data::storage::matrix::tests::test_genotype ... ok
+test data::storage::dictionary::tests::test_dictionary_compression ... ok
+test data::storage::matrix::tests::test_matrix_access ... ok
 test data::storage::matrix::tests::test_matrix_restrict ... ok
-test data::storage::mutable::tests::test_swap ... ok
+test data::storage::mutable::tests::test_haplotype ... ok
 test data::storage::mutable::tests::test_mutable_genotypes ... ok
-test data::storage::sparse::tests::test_sparse_inverted ... ok
+test data::storage::mutable::tests::test_swap ... ok
 test data::storage::sparse::tests::test_sparse_column ... ok
-test data::storage::tests::test_maf_calculation ... ok
+test data::storage::sparse::tests::test_sparse_inverted ... ok
 test data::storage::sparse::tests::test_sparse_multiallelic ... ok
-test data::storage::view::tests::test_view_from_matrix ... ok
+test data::storage::tests::test_maf_calculation ... ok
 test data::storage::tests::test_storage_selection ... ok
-test data::storage::view::tests::test_view_from_mutable ... ok
+test data::storage::view::tests::test_view_from_matrix ... ok
 test io::streaming::tests::test_parse_gt ... ok
+test data::storage::view::tests::test_view_from_mutable ... ok
 test io::streaming::tests::test_streaming_config_default ... ok
 test io::vcf::tests::test_allele_frequency ... ok
 test io::vcf::tests::test_dr2_perfect_imputation ... ok
 test io::vcf::tests::test_dr2_uncertain_imputation ... ok
-test io::vcf::tests::test_dr2_variable_imputation ... ok
 test io::vcf::tests::test_imputation_quality_collection ... ok
-test io::vcf::tests::test_parse_genotype_multiallelic ... ok
-test io::vcf::tests::test_parse_genotype ... ok
-test io::window::tests::test_single_window ... ok
-test io::window::tests::test_window_builder ... ok
 test io::vcf::tests::test_marker_imputation_stats_new ... ok
+test io::vcf::tests::test_parse_genotype ... ok
+test io::vcf::tests::test_parse_genotype_multiallelic ... ok
+test io::window::tests::test_single_window ... ok
 test model::hmm::tests::test_dosage_computation ... ok
 test model::hmm::tests::test_gen_dist_to_p_recomb ... ok
-test model::hmm::tests::test_hmm_updater_fwd ... ok
-test model::ibs2::tests::test_ibs2_segment ... ok
 test model::hmm::tests::test_hmm_forward_backward ... ok
 test model::hmm::tests::test_hmm_updater_bwd ... ok
+test model::hmm::tests::test_hmm_updater_fwd ... ok
+test io::window::tests::test_window_builder ... ok
+test model::ibs2::tests::test_ibs2_segment ... ok
 test model::ibs2::tests::test_phase_consistent ... ok
-test model::imp_states::tests::test_coded_steps ... ok
+test io::vcf::tests::test_dr2_variable_imputation ... ok
 test model::imp_states::tests::test_composite_hap ... ok
-test model::parameters::tests::test_emit_probs ... ok
+test model::imp_states::tests::test_coded_steps ... ok
 test model::imp_states::tests::test_imp_ibs ... ok
 test model::parameters::tests::test_li_stephens_p_mismatch ... ok
+test model::parameters::tests::test_emit_probs ... ok
 test model::parameters::tests::test_lr_threshold_for_iteration ... ok
 test model::parameters::tests::test_ne_from_recomb_intensity ... ok
 test model::parameters::tests::test_p_recomb ... ok
 test model::parameters::tests::test_param_estimates_merge ... ok
 test model::parameters::tests::test_recomb_intensity_formula ... ok
 test model::pbwt::tests::test_find_ibs_neighbors ... ok
-test model::pbwt::tests::test_pbwt_div_bwd_update ... ok
 test model::pbwt::tests::test_pbwt_div_fwd_update ... ok
 test model::pbwt::tests::test_pbwt_ibs_select ... ok
 test model::pbwt::tests::test_pbwt_update ... ok
 test pipelines::phasing::tests::test_pipeline_creation ... ok
-test pipelines::imputation::tests::test_imp_ls_baum ... ok
-test pipelines::imputation::tests::test_impute_haplotype ... ok
 test tests::test_module_imports ... ok
 test utils::workspace::tests::test_workspace_creation ... ok
 test utils::workspace::tests::test_workspace_resize ... ok
 test utils::workspace::tests::test_random_sampling ... ok
 
-test result: ok. 78 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
 [1m[92m   Doc-tests[0m reagle
 
