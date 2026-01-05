@@ -15,7 +15,6 @@
 //! Durbin, Richard (2014) Efficient haplotype matching and storage using the
 //! positional Burrows-Wheeler transform (PBWT).
 
-use crate::data::HapIdx;
 
 /// PBWT prefix array updater (without divergence tracking)
 ///

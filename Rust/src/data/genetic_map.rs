@@ -269,10 +269,6 @@ impl PositionMap {
         }
     }
 
-    /// Create with custom scale factor
-    pub fn with_scale(scale_factor: f64) -> Self {
-        Self { scale_factor }
-    }
 
     /// Get genetic position from physical position
     pub fn gen_pos(&self, phys_pos: u32) -> f64 {
