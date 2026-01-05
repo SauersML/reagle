@@ -5,12 +5,13 @@
 //! 2. Align markers between target and reference
 //! 3. Run Li-Stephens HMM for each target haplotype with dynamic PBWT state selection
 //! 4. Interpolate state probabilities for ungenotyped markers
-//! 5. Compute dosages and write output
+//! 5. Compute dosages and write output with quality metrics (DR2, AF)
 //!
 //! This matches Java `imp/ImpLS.java`, `imp/ImpLSBaum.java`, and related classes.
 
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
@@ -18,7 +19,7 @@ use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
 use crate::error::Result;
-use crate::io::vcf::{VcfReader, VcfWriter};
+use crate::io::vcf::{VcfReader, VcfWriter, ImputationQuality, MarkerImputationStats};
 use crate::model::hmm::LiStephensHmm;
 use crate::model::imp_states::{CodedStepsConfig, ImpStates};
 use crate::model::parameters::ModelParams;
@@ -411,16 +412,32 @@ impl ImputationPipeline {
             })
             .collect();
 
-        eprintln!("Computing dosages with interpolation...");
+        eprintln!("Computing dosages with interpolation and quality metrics...");
+
+        // Initialize quality stats for all reference markers
+        let n_alleles_per_marker: Vec<usize> = (0..n_ref_markers)
+            .map(|m| {
+                let marker = ref_gt.marker(MarkerIdx::new(m as u32));
+                1 + marker.alt_alleles.len()
+            })
+            .collect();
+        let quality = Mutex::new(ImputationQuality::new(n_ref_markers, &n_alleles_per_marker));
+
+        // Mark imputed markers (those not in target)
+        for m in 0..n_ref_markers {
+            let is_imputed = !alignment.is_genotyped(m);
+            quality.lock().unwrap().set_imputed(m, is_imputed);
+        }
 
         // Compute dosages at all reference markers (including ungenotyped)
+        // Also accumulate quality statistics
         let sample_dosages: Vec<Vec<f32>> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
                 let hap1_probs = &state_probs[s * 2];
                 let hap2_probs = &state_probs[s * 2 + 1];
 
-                (0..n_ref_markers)
+                let dosages: Vec<f32> = (0..n_ref_markers)
                     .map(|m| {
                         let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                             ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
@@ -428,21 +445,46 @@ impl ImputationPipeline {
 
                         let d1 = hap1_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
                         let d2 = hap2_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
+
+                        // For biallelic sites, convert dosage to allele probabilities for DR2
+                        // d1 = P(ALT) for hap1, d2 = P(ALT) for hap2
+                        let n_alleles = n_alleles_per_marker[m];
+                        if n_alleles == 2 {
+                            let probs1 = vec![1.0 - d1, d1];
+                            let probs2 = vec![1.0 - d2, d2];
+                            if let Ok(mut q) = quality.lock() {
+                                if let Some(stats) = q.get_mut(m) {
+                                    stats.add_sample(&probs1, &probs2);
+                                }
+                            }
+                        }
+
                         d1 + d2
                     })
-                    .collect()
+                    .collect();
+
+                dosages
             })
             .collect();
 
-        // Flatten dosages for output
-        let flat_dosages: Vec<f32> = sample_dosages.into_iter().flatten().collect();
+        // Flatten dosages for output (marker-major order for the writer)
+        // Reorder from [sample][marker] to [marker][sample]
+        let mut flat_dosages: Vec<f32> = Vec::with_capacity(n_ref_markers * n_target_samples);
+        for m in 0..n_ref_markers {
+            for s in 0..n_target_samples {
+                flat_dosages.push(sample_dosages[s][m]);
+            }
+        }
 
-        // Write output
+        // Get quality stats
+        let quality = quality.into_inner().unwrap();
+
+        // Write output with quality metrics
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples)?;
-        writer.write_header(ref_gt.markers())?;
-        writer.write_imputed(&ref_gt, &flat_dosages, 0, n_ref_markers)?;
+        writer.write_header_imputed(ref_gt.markers())?;
+        writer.write_imputed_with_quality(&ref_gt, &flat_dosages, &quality, 0, n_ref_markers)?;
         writer.flush()?;
 
         eprintln!("Imputation complete!");
@@ -582,17 +624,16 @@ fn impute_haplotype_internal(
 /// * `params` - Model parameters
 /// * `ref_haps` - Selected reference haplotypes to use as HMM states
 /// * `gen_dists` - Genetic distances between consecutive markers (in cM)
-/// * `_seed` - Random seed (unused, kept for API compatibility)
-///
 /// # Returns
 /// Vector of dosages at each marker
+#[allow(unused_variables)]
 pub fn impute_haplotype(
     target_alleles: &[u8],
     ref_gt: &GenotypeMatrix,
     params: &ModelParams,
     ref_haps: &[HapIdx],
     gen_dists: &[f64],
-    _seed: u64,
+    seed: u64,
 ) -> Vec<f32> {
     // Convert genetic distances to recombination probabilities
     let p_recomb: Vec<f32> = std::iter::once(0.0f32)

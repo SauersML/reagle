@@ -16,6 +16,143 @@ use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::error::{ReagleError, Result};
 
+/// Imputation quality statistics for a single marker
+///
+/// Used to calculate DR2 (dosage R-squared) following the Beagle formula.
+/// This matches Java ImputedRecBuilder's approach.
+#[derive(Clone, Debug, Default)]
+pub struct MarkerImputationStats {
+    /// Sum of allele probabilities (dosages) for each ALT allele
+    pub sum_al_probs: Vec<f32>,
+    /// Sum of squared allele probabilities for each ALT allele
+    pub sum_al_probs2: Vec<f32>,
+    /// Number of haplotypes processed
+    pub n_haps: usize,
+    /// Whether this marker was imputed (not in target genotypes)
+    pub is_imputed: bool,
+}
+
+impl MarkerImputationStats {
+    /// Create new stats for a marker with the given number of alleles
+    pub fn new(n_alleles: usize) -> Self {
+        Self {
+            sum_al_probs: vec![0.0; n_alleles],
+            sum_al_probs2: vec![0.0; n_alleles],
+            n_haps: 0,
+            is_imputed: false,
+        }
+    }
+
+    /// Add dosage contribution from a diploid sample
+    ///
+    /// # Arguments
+    /// * `probs1` - Allele probabilities for haplotype 1 (length = n_alleles)
+    /// * `probs2` - Allele probabilities for haplotype 2 (length = n_alleles)
+    pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
+        self.n_haps += 2;
+        for a in 1..self.sum_al_probs.len() {
+            let dose = probs1.get(a).copied().unwrap_or(0.0)
+                + probs2.get(a).copied().unwrap_or(0.0);
+            let dose2 = probs1.get(a).copied().unwrap_or(0.0).powi(2)
+                + probs2.get(a).copied().unwrap_or(0.0).powi(2);
+            self.sum_al_probs[a] += dose;
+            self.sum_al_probs2[a] += dose2;
+        }
+    }
+
+    /// Add dosage contribution from a haploid sample
+    pub fn add_haploid(&mut self, probs: &[f32]) {
+        self.n_haps += 1;
+        for a in 1..self.sum_al_probs.len() {
+            let dose = probs.get(a).copied().unwrap_or(0.0);
+            self.sum_al_probs[a] += dose;
+            self.sum_al_probs2[a] += dose.powi(2);
+        }
+    }
+
+    /// Calculate DR2 (dosage R-squared) for the specified ALT allele
+    ///
+    /// DR2 estimates the squared correlation between estimated and true dosages.
+    /// Formula follows Java ImputedRecBuilder.r2():
+    /// ```text
+    /// meanTerm = sum^2 / n_haps
+    /// num = sum2 - meanTerm
+    /// den = sum - meanTerm
+    /// r2 = num / den (clamped to [0, 1])
+    /// ```
+    pub fn dr2(&self, allele: usize) -> f32 {
+        if allele == 0 || allele >= self.sum_al_probs.len() || self.n_haps == 0 {
+            return 0.0;
+        }
+
+        let sum = self.sum_al_probs[allele];
+        if sum == 0.0 {
+            return 0.0;
+        }
+
+        let sum2 = self.sum_al_probs2[allele];
+        let mean_term = sum * sum / self.n_haps as f32;
+        let num = sum2 - mean_term;
+        let den = sum - mean_term;
+
+        if num <= 0.0 || den <= 0.0 {
+            0.0
+        } else {
+            (num / den).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Calculate allele frequency for the specified ALT allele
+    pub fn allele_freq(&self, allele: usize) -> f32 {
+        if allele == 0 || allele >= self.sum_al_probs.len() || self.n_haps == 0 {
+            return 0.0;
+        }
+        self.sum_al_probs[allele] / self.n_haps as f32
+    }
+}
+
+/// Collection of imputation statistics for all markers
+#[derive(Clone, Debug, Default)]
+pub struct ImputationQuality {
+    /// Per-marker statistics
+    pub marker_stats: Vec<MarkerImputationStats>,
+}
+
+impl ImputationQuality {
+    /// Create new quality tracker for the given number of markers
+    pub fn new(n_markers: usize, n_alleles_per_marker: &[usize]) -> Self {
+        let marker_stats = n_alleles_per_marker
+            .iter()
+            .map(|&n| MarkerImputationStats::new(n))
+            .collect();
+        Self { marker_stats }
+    }
+
+    /// Create with uniform number of alleles (biallelic)
+    pub fn new_biallelic(n_markers: usize) -> Self {
+        Self {
+            marker_stats: vec![MarkerImputationStats::new(2); n_markers],
+        }
+    }
+
+    /// Get mutable stats for a marker
+    pub fn get_mut(&mut self, marker: usize) -> Option<&mut MarkerImputationStats> {
+        self.marker_stats.get_mut(marker)
+    }
+
+    /// Get stats for a marker
+    pub fn get(&self, marker: usize) -> Option<&MarkerImputationStats> {
+        self.marker_stats.get(marker)
+    }
+
+    /// Mark a marker as imputed
+    pub fn set_imputed(&mut self, marker: usize, imputed: bool) {
+        if let Some(stats) = self.marker_stats.get_mut(marker) {
+            stats.is_imputed = imputed;
+        }
+    }
+}
+
 /// VCF file reader
 pub struct VcfReader {
     /// The VCF header
@@ -103,7 +240,6 @@ impl VcfReader {
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
         let mut markers = Markers::new();
         let mut columns = Vec::new();
-        let _n_haps = self.samples.n_haps();
         let mut is_phased = true;
 
         let mut line = String::new();
@@ -177,8 +313,6 @@ impl VcfReader {
             .split(',')
             .map(|a| Allele::from_str(a))
             .collect();
-
-        let _n_alleles = 1 + alt_alleles.len();
 
         // Parse FORMAT to find GT position
         let format = fields[8];
@@ -306,8 +440,17 @@ impl VcfWriter {
         Ok(Self { writer, samples })
     }
 
-    /// Write VCF header
+    /// Write VCF header for phased output
     pub fn write_header(&mut self, markers: &Markers) -> Result<()> {
+        self.write_header_impl(markers, false)
+    }
+
+    /// Write VCF header for imputed output (includes DR2, AF, IMP fields)
+    pub fn write_header_imputed(&mut self, markers: &Markers) -> Result<()> {
+        self.write_header_impl(markers, true)
+    }
+
+    fn write_header_impl(&mut self, markers: &Markers, imputed: bool) -> Result<()> {
         // Write file format
         writeln!(self.writer, "##fileformat=VCFv4.2")?;
 
@@ -316,8 +459,18 @@ impl VcfWriter {
             writeln!(self.writer, "##contig=<ID={}>", chrom)?;
         }
 
+        // Write INFO lines for imputation
+        if imputed {
+            writeln!(self.writer, "##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Dosage R-squared: estimated squared correlation between estimated REF dose and true REF dose\">")?;
+            writeln!(self.writer, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
+            writeln!(self.writer, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">")?;
+        }
+
         // Write FORMAT lines
         writeln!(self.writer, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+        if imputed {
+            writeln!(self.writer, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Estimated ALT allele dosage\">")?;
+        }
 
         // Write header line
         write!(self.writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
@@ -361,7 +514,7 @@ impl VcfWriter {
         Ok(())
     }
 
-    /// Write imputed genotypes with dosages
+    /// Write imputed genotypes with dosages (legacy method without quality metrics)
     pub fn write_imputed(
         &mut self,
         matrix: &GenotypeMatrix,
@@ -407,6 +560,99 @@ impl VcfWriter {
         Ok(())
     }
 
+    /// Write imputed genotypes with dosages and quality metrics (DR2, AF)
+    ///
+    /// This follows the Java ImputedRecBuilder output format.
+    ///
+    /// # Arguments
+    /// * `matrix` - Genotype matrix with imputed alleles
+    /// * `dosages` - Flattened dosage array [marker][sample]
+    /// * `quality` - Per-marker imputation quality statistics
+    /// * `start` - Start marker index (inclusive)
+    /// * `end` - End marker index (exclusive)
+    pub fn write_imputed_with_quality(
+        &mut self,
+        matrix: &GenotypeMatrix,
+        dosages: &[f32],
+        quality: &ImputationQuality,
+        start: usize,
+        end: usize,
+    ) -> Result<()> {
+        let n_samples = self.samples.len();
+
+        for (local_m, m) in (start..end).enumerate() {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let marker = matrix.marker(marker_idx);
+            let column = matrix.column(marker_idx);
+            let n_alleles = 1 + marker.alt_alleles.len();
+
+            // Get quality stats for this marker
+            let stats = quality.get(m);
+
+            // Build INFO field
+            let info_field = if let Some(stats) = stats {
+                let mut info_parts = Vec::new();
+
+                // DR2 for each ALT allele
+                if n_alleles > 1 {
+                    let dr2_values: Vec<String> = (1..n_alleles)
+                        .map(|a| format!("{:.2}", stats.dr2(a)))
+                        .collect();
+                    info_parts.push(format!("DR2={}", dr2_values.join(",")));
+
+                    // AF for each ALT allele
+                    let af_values: Vec<String> = (1..n_alleles)
+                        .map(|a| format!("{:.4}", stats.allele_freq(a)))
+                        .collect();
+                    info_parts.push(format!("AF={}", af_values.join(",")));
+                }
+
+                // IMP flag if this marker was imputed
+                if stats.is_imputed {
+                    info_parts.push("IMP".to_string());
+                }
+
+                if info_parts.is_empty() {
+                    ".".to_string()
+                } else {
+                    info_parts.join(";")
+                }
+            } else {
+                ".".to_string()
+            };
+
+            // Write fixed fields with INFO
+            write!(
+                self.writer,
+                "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\tGT:DS",
+                matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
+                marker.pos,
+                marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
+                marker.ref_allele,
+                marker.alt_alleles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","),
+                info_field
+            )?;
+
+            // Write genotypes with dosages
+            for s in 0..n_samples {
+                let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
+                let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
+                let a1 = column.get(hap1);
+                let a2 = column.get(hap2);
+                let ds_idx = local_m * n_samples + s;
+                let ds = if ds_idx < dosages.len() {
+                    dosages[ds_idx]
+                } else {
+                    (a1 + a2) as f32
+                };
+                write!(self.writer, "\t{}|{}:{:.2}", a1, a2, ds)?;
+            }
+            writeln!(self.writer)?;
+        }
+
+        Ok(())
+    }
+
     /// Flush the writer
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
@@ -437,5 +683,87 @@ mod tests {
     fn test_parse_genotype_multiallelic() {
         assert_eq!(parse_genotype("0|2").unwrap(), (0, 2, true));
         assert_eq!(parse_genotype("1|2").unwrap(), (1, 2, true));
+    }
+
+    #[test]
+    fn test_marker_imputation_stats_new() {
+        let stats = MarkerImputationStats::new(3);
+        assert_eq!(stats.sum_al_probs.len(), 3);
+        assert_eq!(stats.sum_al_probs2.len(), 3);
+        assert_eq!(stats.n_haps, 0);
+        assert!(!stats.is_imputed);
+    }
+
+    #[test]
+    fn test_dr2_perfect_imputation() {
+        // Perfect imputation: all samples have probability 1.0 for alt allele
+        let mut stats = MarkerImputationStats::new(2);
+
+        // Add 10 samples, all with alt allele
+        for _ in 0..10 {
+            stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
+        }
+
+        // DR2 should be close to 1.0 for perfect certainty
+        let dr2 = stats.dr2(1);
+        assert!(dr2 >= 0.99, "DR2 should be ~1.0, got {}", dr2);
+    }
+
+    #[test]
+    fn test_dr2_uncertain_imputation() {
+        // Uncertain imputation: all samples have 50% probability
+        let mut stats = MarkerImputationStats::new(2);
+
+        // Add 10 samples, all uncertain
+        for _ in 0..10 {
+            stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]);
+        }
+
+        // DR2 should be low for uncertain calls
+        let dr2 = stats.dr2(1);
+        assert!(dr2 < 0.5, "DR2 should be low for uncertain calls, got {}", dr2);
+    }
+
+    #[test]
+    fn test_dr2_variable_imputation() {
+        // Mixed certainty
+        let mut stats = MarkerImputationStats::new(2);
+
+        // Some certain, some uncertain
+        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]); // Certain alt/alt
+        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]); // Certain ref/ref
+        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]); // Uncertain
+
+        let dr2 = stats.dr2(1);
+        assert!(dr2 > 0.0 && dr2 < 1.0, "DR2 should be between 0 and 1, got {}", dr2);
+    }
+
+    #[test]
+    fn test_allele_frequency() {
+        let mut stats = MarkerImputationStats::new(2);
+
+        // 3 samples with dosages 2, 1, 0 (total 3 out of 6 alleles)
+        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]); // Dosage = 2
+        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]); // Dosage = 1
+        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]); // Dosage = 0
+
+        let af = stats.allele_freq(1);
+        assert!((af - 0.5).abs() < 0.01, "AF should be 0.5, got {}", af);
+    }
+
+    #[test]
+    fn test_imputation_quality_collection() {
+        let mut quality = ImputationQuality::new_biallelic(5);
+
+        assert_eq!(quality.marker_stats.len(), 5);
+
+        // Test mutability
+        if let Some(stats) = quality.get_mut(2) {
+            stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
+            stats.is_imputed = true;
+        }
+
+        assert!(quality.get(2).unwrap().is_imputed);
+        assert_eq!(quality.get(2).unwrap().n_haps, 2);
     }
 }

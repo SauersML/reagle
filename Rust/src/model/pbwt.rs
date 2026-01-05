@@ -397,11 +397,12 @@ impl SimpleDivUpdater {
         }
     }
 
+    #[allow(unused_variables)]
     pub fn update(
         &mut self,
         alleles: &[u8],
         n_alleles: usize,
-        _marker: usize,
+        marker: usize,
         prefix: &mut [u32],
         divergence: &mut [u32],
     ) {
@@ -633,6 +634,198 @@ impl PbwtIbs {
         let matches = self.select_states(target_hap, 1, marker, n_candidates, use_backward, true);
         matches.first().map(|h| h.0 as i32).unwrap_or(-1)
     }
+}
+
+/// Bidirectional PBWT phasing result for a single sample
+///
+/// This represents the phase consensus from forward and backward PBWT sweeps.
+/// Sites where both directions agree are "confident", others need HMM resolution.
+#[derive(Clone, Debug)]
+pub struct BidirectionalPhaseResult {
+    /// Phase assignments for each heterozygous marker (true = swap alleles)
+    pub phase_decisions: Vec<bool>,
+    /// Confidence for each decision (true = forward and backward agreed)
+    pub confident: Vec<bool>,
+    /// Marker indices that are heterozygous
+    pub het_markers: Vec<usize>,
+}
+
+impl BidirectionalPhaseResult {
+    /// Create a new result with the given capacity
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            phase_decisions: Vec::with_capacity(capacity),
+            confident: Vec::with_capacity(capacity),
+            het_markers: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Add a phase decision
+    pub fn add(&mut self, marker: usize, decision: bool, confident: bool) {
+        self.het_markers.push(marker);
+        self.phase_decisions.push(decision);
+        self.confident.push(confident);
+    }
+
+    /// Get number of heterozygous sites
+    pub fn n_hets(&self) -> usize {
+        self.het_markers.len()
+    }
+
+    /// Get number of confident phase calls
+    pub fn n_confident(&self) -> usize {
+        self.confident.iter().filter(|&&c| c).count()
+    }
+}
+
+/// Run bidirectional PBWT phasing to establish initial phase consensus
+///
+/// This implements the PbwtPhaser approach from Java:
+/// 1. Run forward PBWT sweep, recording IBS matches at each marker
+/// 2. Run backward PBWT sweep, recording IBS matches at each marker
+/// 3. At each heterozygous site, check if forward and backward agree on phase
+/// 4. Mark sites as "confident" where they agree
+///
+/// # Arguments
+/// * `alleles` - Genotype matrix [marker][haplotype]
+/// * `n_markers` - Number of markers
+/// * `n_haps` - Number of haplotypes
+/// * `n_alleles_per_marker` - Number of alleles at each marker
+///
+/// # Returns
+/// Phase results for each sample, with confidence flags
+pub fn run_bidirectional_pbwt_phasing(
+    get_allele: impl Fn(usize, usize) -> u8 + Sync,
+    n_markers: usize,
+    n_haps: usize,
+    n_alleles_per_marker: &[usize],
+) -> Vec<BidirectionalPhaseResult> {
+    let n_samples = n_haps / 2;
+    let mut results = Vec::with_capacity(n_samples);
+
+    // Build forward PBWT and record IBS matches
+    let fwd_matches = build_pbwt_matches(&get_allele, n_markers, n_haps, n_alleles_per_marker, false);
+
+    // Build backward PBWT and record IBS matches
+    let bwd_matches = build_pbwt_matches(&get_allele, n_markers, n_haps, n_alleles_per_marker, true);
+
+    // Compare forward and backward for each sample
+    for s in 0..n_samples {
+        let hap1 = s * 2;
+        let hap2 = hap1 + 1;
+
+        let mut result = BidirectionalPhaseResult::new(n_markers / 10);
+
+        for m in 0..n_markers {
+            let a1 = get_allele(m, hap1);
+            let a2 = get_allele(m, hap2);
+
+            // Skip homozygous sites
+            if a1 == a2 {
+                continue;
+            }
+
+            // Get IBS match alleles from forward direction
+            let fwd_ibs = fwd_matches.get(m).and_then(|mm| mm.get(&hap1)).copied();
+            let bwd_ibs = bwd_matches.get(m).and_then(|mm| mm.get(&hap1)).copied();
+
+            // Determine phase from each direction
+            // If IBS match allele == a1, keep phase; if == a2, swap
+            let fwd_swap = fwd_ibs.map(|ibs_allele| ibs_allele == a2);
+            let bwd_swap = bwd_ibs.map(|ibs_allele| ibs_allele == a2);
+
+            match (fwd_swap, bwd_swap) {
+                (Some(fwd), Some(bwd)) if fwd == bwd => {
+                    // Both directions agree
+                    result.add(m, fwd, true);
+                }
+                (Some(fwd), Some(_)) => {
+                    // Directions disagree - use forward but mark as uncertain
+                    result.add(m, fwd, false);
+                }
+                (Some(fwd), None) => {
+                    // Only forward available
+                    result.add(m, fwd, false);
+                }
+                (None, Some(bwd)) => {
+                    // Only backward available
+                    result.add(m, bwd, false);
+                }
+                (None, None) => {
+                    // No information - random phase
+                    result.add(m, false, false);
+                }
+            }
+        }
+
+        results.push(result);
+    }
+
+    results
+}
+
+/// Build PBWT and record IBS matches at each marker
+///
+/// Returns a map: marker -> (haplotype -> IBS match allele)
+fn build_pbwt_matches(
+    get_allele: impl Fn(usize, usize) -> u8,
+    n_markers: usize,
+    n_haps: usize,
+    n_alleles_per_marker: &[usize],
+    backward: bool,
+) -> Vec<std::collections::HashMap<usize, u8>> {
+    use std::collections::HashMap;
+
+    let mut matches: Vec<HashMap<usize, u8>> = vec![HashMap::new(); n_markers];
+
+    let mut prefix: Vec<u32> = (0..n_haps as u32).collect();
+    let mut divergence: Vec<i32> = vec![0; n_haps + 1];
+    let mut updater = PbwtDivUpdater::new(n_haps);
+
+    // Create marker ordering
+    let marker_order: Vec<usize> = if backward {
+        (0..n_markers).rev().collect()
+    } else {
+        (0..n_markers).collect()
+    };
+
+    // Collect alleles buffer
+    let mut alleles = vec![0u8; n_haps];
+
+    for &m in &marker_order {
+        // Fill alleles
+        for h in 0..n_haps {
+            alleles[h] = get_allele(m, h);
+        }
+
+        let n_alleles = n_alleles_per_marker.get(m).copied().unwrap_or(2).max(2);
+
+        // Record IBS matches before update (at current position)
+        for (pos, &hap) in prefix.iter().enumerate() {
+            let hap_idx = hap as usize;
+
+            // Find nearest neighbor (prefer same allele, then adjacent in prefix order)
+            let neighbor = if pos > 0 {
+                prefix[pos - 1] as usize
+            } else if pos + 1 < n_haps {
+                prefix[pos + 1] as usize
+            } else {
+                continue;
+            };
+
+            // Record the IBS match allele (what allele the neighbor has)
+            matches[m].insert(hap_idx, alleles[neighbor]);
+        }
+
+        // Update PBWT
+        if backward {
+            updater.bwd_update(&alleles, n_alleles, m, &mut prefix, &mut divergence);
+        } else {
+            updater.fwd_update(&alleles, n_alleles, m, &mut prefix, &mut divergence);
+        }
+    }
+
+    matches
 }
 
 #[cfg(test)]
