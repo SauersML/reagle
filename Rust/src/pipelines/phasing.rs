@@ -61,7 +61,13 @@ impl PhasingPipeline {
         let n_samples = target_gt.n_samples();
         let n_haps = target_gt.n_haplotypes();
 
-        eprintln!("Loaded {} markers, {} samples ({} haplotypes)", n_markers, n_samples, n_haps);
+        eprintln!(
+            "Loaded {} markers, {} samples ({} haplotypes), {:.2} MB",
+            n_markers,
+            n_samples,
+            n_haps,
+            target_gt.size_bytes() as f64 / 1024.0 / 1024.0
+        );
 
         // Initialize parameters based on sample size
         self.params = ModelParams::for_phasing(n_haps);
@@ -433,8 +439,35 @@ impl PhasingPipeline {
                     // Resize workspace for actual number of states
                     workspace.resize(actual_n_states, n_markers, n_haps);
 
+                    // Collect forced alleles from IBS2 segments
+                    // Markers in these segments are excluded from HMM, so we must explicitly copy the phase
+                    // from the IBS2 partner to enforce consistency.
+                    let mut forced_alleles = Vec::new();
+                    if !ibs2_segs.is_empty() {
+                        for seg in ibs2_segs {
+                            let other = seg.other_sample;
+                            // Ensure other sample index is valid
+                            if other.as_usize() < n_samples {
+                                let other_h1 = &geno_snapshot[other.hap1().as_usize()];
+                                let other_h2 = &geno_snapshot[other.hap2().as_usize()];
+                                
+                                for m in seg.start..=seg.incl_end {
+                                    // Only force phase if we are heterozygous at this marker
+                                    if m < n_markers && alleles1[m] != alleles2[m] {
+                                        // If other sample is also het (should be for IBS2)
+                                        if other_h1[m] != other_h2[m] {
+                                            // Copy other's alleles to ensure phase consistency
+                                            // We explicitly set hap1 and hap2 to match other's phase
+                                            forced_alleles.push((m, other_h1[m], other_h2[m]));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Run phase decision using dynamic state HMM with workspace
-                    let (switch_markers, imputed, local_em) = phase_sample_with_hmm(
+                    let (switch_markers, mut imputed, local_em) = phase_sample_with_hmm(
                         alleles1,
                         alleles2,
                         &het_markers,
@@ -447,6 +480,9 @@ impl PhasingPipeline {
                         collect_em,
                         workspace,
                     );
+
+                    // Apply forced IBS2 phase alleles
+                    imputed.extend(forced_alleles);
 
                     // Collect EM estimates
                     if let (Some(global_em), Some(local)) = (&em_estimates, local_em) {
