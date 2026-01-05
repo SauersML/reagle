@@ -14,6 +14,7 @@
 
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
@@ -185,13 +186,19 @@ impl StageMarkers {
 pub struct PhasingPipeline {
     config: Config,
     params: ModelParams,
+    /// Cache of previously selected reference haplotypes per sample (for stickiness)
+    prev_ref_haps: Vec<Vec<HapIdx>>,
 }
 
 impl PhasingPipeline {
     /// Create a new phasing pipeline
     pub fn new(config: Config) -> Self {
         let params = ModelParams::new();
-        Self { config, params }
+        Self { 
+            config, 
+            params,
+            prev_ref_haps: Vec::new(),
+        }
     }
 
     /// Run the phasing pipeline
@@ -285,6 +292,56 @@ impl PhasingPipeline {
         Ok(())
     }
 
+    /// Phase a GenotypeMatrix in-memory and return the phased result
+    /// 
+    /// This is used by the imputation pipeline to auto-phase unphased inputs.
+    pub fn phase_in_memory(&mut self, target_gt: &GenotypeMatrix, gen_maps: &GeneticMaps) -> Result<GenotypeMatrix> {
+        let n_markers = target_gt.n_markers();
+        let n_haps = target_gt.n_haplotypes();
+
+        if n_markers == 0 {
+            return Ok(target_gt.clone());
+        }
+
+        // Initialize parameters
+        self.params = ModelParams::for_phasing(n_haps);
+        self.params.set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
+
+        // Create mutable genotype storage for phasing
+        let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
+            target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
+
+        // Compute recombination probabilities
+        let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
+        let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
+            .map(|m| {
+                let pos1 = target_gt.marker(MarkerIdx::new(m as u32)).pos;
+                let pos2 = target_gt.marker(MarkerIdx::new((m + 1) as u32)).pos;
+                gen_maps.gen_dist(chrom, pos1, pos2)
+            })
+            .collect();
+
+        let p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+            .collect();
+
+        // Run phasing iterations (reduced for imputation pre-processing)
+        let n_burnin = self.config.burnin.min(3);
+        let n_iterations = self.config.iterations.min(6);
+        let total_iterations = n_burnin + n_iterations;
+
+        for it in 0..total_iterations {
+            let is_burnin = it < n_burnin;
+            self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+            let collect_em = self.config.em && is_burnin;
+            self.run_iteration_with_hmm(target_gt, &mut geno, &p_recomb, collect_em)?;
+        }
+
+        // Build and return phased GenotypeMatrix
+        Ok(self.build_final_matrix(target_gt, &geno))
+    }
+
     fn run_iteration_with_hmm(
         &mut self,
         target_gt: &GenotypeMatrix,
@@ -308,6 +365,14 @@ impl PhasingPipeline {
             None
         };
 
+        // Initialize prev_ref_haps if empty
+        if self.prev_ref_haps.len() != n_samples {
+            self.prev_ref_haps = vec![Vec::new(); n_samples];
+        }
+
+        // Collect new selections for stickiness in next iteration
+        let new_ref_haps: Mutex<Vec<(usize, Vec<HapIdx>)>> = Mutex::new(Vec::new());
+
         // Phase each sample in parallel
         let updates: Vec<(SampleIdx, Vec<usize>)> = (0..n_samples)
             .into_par_iter()
@@ -329,11 +394,22 @@ impl PhasingPipeline {
                     return None; // Nothing to phase
                 }
 
-                // Select reference haplotypes using PBWT (excluding this sample's haps)
-                let ref_haps = self.select_ref_haps(&pbwt, hap1, n_states, n_haps);
+                // Get previous selection for stickiness
+                let prev_selected = if self.prev_ref_haps[s].is_empty() {
+                    None
+                } else {
+                    Some(self.prev_ref_haps[s].as_slice())
+                };
 
-                // Build a temporary GenotypeMatrix for HMM reference
-                // For efficiency, we'll use the raw allele access pattern
+                // Select reference haplotypes using PBWT with stickiness
+                let ref_haps = self.select_ref_haps(&pbwt, hap1, n_states, n_haps, prev_selected);
+
+                // Store new selection for next iteration
+                if let Ok(mut guard) = new_ref_haps.lock() {
+                    guard.push((s, ref_haps.clone()));
+                }
+
+                // Build reference alleles for HMM
                 let ref_alleles: Vec<Vec<u8>> = ref_haps
                     .iter()
                     .map(|&h| geno.haplotype(h))
@@ -363,6 +439,13 @@ impl PhasingPipeline {
                 }
             })
             .collect();
+
+        // Update prev_ref_haps with new selections for next iteration
+        if let Ok(guard) = new_ref_haps.into_inner() {
+            for (s, haps) in guard {
+                self.prev_ref_haps[s] = haps;
+            }
+        }
 
         // Apply phase switches
         for (sample_idx, switch_markers) in updates {
@@ -422,13 +505,17 @@ impl PhasingPipeline {
         pbwt
     }
 
-    /// Select reference haplotypes using PBWT
+    /// Select reference haplotypes using PBWT with stickiness heuristic
+    /// 
+    /// The stickiness heuristic (from Java bestFwdStage2Index) prefers haplotypes
+    /// that were selected in the previous iteration, which stabilizes HMM paths.
     fn select_ref_haps(
         &self,
         pbwt: &PbwtIbs,
         target_hap: HapIdx,
         n_states: usize,
         n_haps: usize,
+        prev_selected: Option<&[HapIdx]>,
     ) -> Vec<HapIdx> {
         // Exclude the other haplotype from the same sample
         let other_hap = if target_hap.0 % 2 == 0 {
@@ -438,26 +525,50 @@ impl PhasingPipeline {
         };
 
         // Use PBWT to find nearby haplotypes
-        // Args: target_hap, n_states, marker, n_candidates, use_backward, exclude_self
-        let marker = 0; // Use beginning of sequence for state selection
+        let marker = 0;
         let n_candidates = n_states * 2;
-        let mut selected = pbwt.select_states(target_hap, n_states + 2, marker, n_candidates, false, true);
+        let mut candidates = pbwt.select_states(target_hap, n_states + 2, marker, n_candidates, false, true);
         
         // Remove the other haplotype from the same sample
-        selected.retain(|&h| h != other_hap);
+        candidates.retain(|&h| h != other_hap);
+
+        // Apply stickiness: prefer haplotypes from previous selection
+        let mut selected = Vec::with_capacity(n_states);
         
-        // Limit to n_states
-        selected.truncate(n_states);
+        if let Some(prev) = prev_selected {
+            // First, add candidates that were also in previous selection (sticky)
+            for &h in candidates.iter() {
+                if prev.contains(&h) && selected.len() < n_states {
+                    selected.push(h);
+                }
+            }
+            // Then add new candidates
+            for &h in candidates.iter() {
+                if !selected.contains(&h) && selected.len() < n_states {
+                    selected.push(h);
+                }
+            }
+        } else {
+            // No previous selection - use candidates directly
+            selected = candidates;
+            selected.truncate(n_states);
+        }
 
         // If we don't have enough, add random haplotypes
         if selected.len() < n_states {
-            for h in 0..n_haps as u32 {
-                let hap = HapIdx::new(h);
-                if hap != target_hap && hap != other_hap && !selected.contains(&hap) {
-                    selected.push(hap);
-                    if selected.len() >= n_states {
-                        break;
-                    }
+            use rand::seq::SliceRandom;
+            use rand::thread_rng;
+            
+            let mut remaining: Vec<HapIdx> = (0..n_haps as u32)
+                .map(HapIdx::new)
+                .filter(|&h| h != target_hap && h != other_hap && !selected.contains(&h))
+                .collect();
+            remaining.shuffle(&mut thread_rng());
+            
+            for h in remaining {
+                selected.push(h);
+                if selected.len() >= n_states {
+                    break;
                 }
             }
         }
@@ -511,9 +622,12 @@ fn phase_sample_with_hmm(
     let p_match = params.emit_match();
     let p_mismatch = params.emit_mismatch();
 
-    // Emission function
+    // Emission function - handles missing data (255) as uninformative
     let emit = |target: u8, reference: u8| -> f32 {
-        if target == reference {
+        // Missing data (255) should be treated as uninformative, not as mismatch
+        if target == 255 || reference == 255 {
+            1.0  // Uninformative - probability is uniform across states
+        } else if target == reference {
             p_match
         } else {
             p_mismatch
@@ -581,13 +695,8 @@ fn phase_sample_with_hmm(
         fwd1_sum = new_fwd1_sum.max(1e-30);
         fwd2_sum = new_fwd2_sum.max(1e-30);
 
-        // Collect EM statistics
-        if let Some(ref mut em) = em_estimates {
-            if m > 0 {
-                let p_rec_used = p_recomb.get(m).copied().unwrap_or(0.0) as f64;
-                em.add_switch(p_rec_used, (fwd1_sum - fwd1[m].iter().sum::<f32>()) as f64);
-            }
-        }
+        // Note: EM statistics for switches require backward probabilities
+        // which we collect in the backward pass below.
     }
 
     // Backward pass: compute posterior probabilities at het sites
@@ -646,23 +755,50 @@ fn phase_sample_with_hmm(
         let bwd_m = &bwd_at_het[idx];
 
         // Compute P(phase=0|1) vs P(phase=1|0)
-        // P(0|1) = sum_s1,s2 fwd1[m][s1] * emit(a1,ref[s1]) * bwd[s1] * fwd2[m][s2] * emit(a2,ref[s2]) * bwd[s2]
-        // P(1|0) = sum_s1,s2 fwd1[m][s1] * emit(a2,ref[s1]) * bwd[s1] * fwd2[m][s2] * emit(a1,ref[s2]) * bwd[s2]
+        // 
+        // Forward values fwd1[m][s] already include emission at marker m.
+        // Backward values bwd[s] represent P(O_{m+1..T} | S_m=s), stored BEFORE emission at m.
+        //
+        // For phase decision at m, we want:
+        //   P(phase | O) ∝ Σ_s P(O_1..m, S_m=s) × P(O_m | S_m=s, phase) × P(O_{m+1..T} | S_m=s)
+        //
+        // Since fwd1[m][s] = P(O_1..m, S_m=s) with emit(a1, ref[s]) baked in,
+        // and we want to compare phases, we divide out the original emission
+        // and multiply by phase-specific emission:
+        //   p_01 contribution = fwd1[m][s] × bwd[s]  (a1 on hap1 - matches fwd1)
+        //   p_10 contribution = fwd1[m][s] × (emit_a2/emit_a1) × bwd[s]  (a2 on hap1)
+        //
+        // Equivalently, use fwd1[m-1] + transition + phase-specific emission × bwd.
+        // Since fwd1[m] already encodes emit1, the ratio approach is simpler.
 
         let mut p_01 = 0.0f32; // Current phase (a1 on hap1, a2 on hap2)
         let mut p_10 = 0.0f32; // Swapped phase (a2 on hap1, a1 on hap2)
+        let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
 
         for s in 0..n_states {
             let ref_a = ref_alleles[s][m];
             let emit_a1 = emit(a1, ref_a);
             let emit_a2 = emit(a2, ref_a);
-
-            // Contribution from state s to hap1
-            let fwd1_s = fwd1[m][s];
             let bwd_s = bwd_m[s];
 
-            p_01 += fwd1_s * emit_a1 * bwd_s;
-            p_10 += fwd1_s * emit_a2 * bwd_s;
+            if m == 0 {
+                // At first marker, no transition from previous
+                let init = 1.0 / n_states as f32;
+                p_01 += init * emit_a1 * bwd_s;
+                p_10 += init * emit_a2 * bwd_s;
+            } else {
+                // Use forward from m-1, apply transition and phase-specific emission
+                let fwd_prev = fwd1[m - 1][s];
+                let shift = p_rec / n_states as f32;
+                let scale = 1.0 - p_rec;
+                
+                // Transition probability to stay in same state (dominant term)
+                let trans_stay = scale * fwd_prev + shift * fwd1_sum;
+                
+                // Combine: fwd(m-1) × trans × emit × bwd
+                p_01 += trans_stay * emit_a1 * bwd_s;
+                p_10 += trans_stay * emit_a2 * bwd_s;
+            }
         }
 
         // Normalize
@@ -683,16 +819,58 @@ fn phase_sample_with_hmm(
         };
 
         // Apply phase switch if swapped phase is better and LR exceeds threshold
-        if p_10 > p_01 && lr > lr_threshold {
+        // For ties (p_01 ≈ p_10), use marker index parity for deterministic tie-breaking
+        let should_swap = if (p_10 - p_01).abs() < 1e-6 {
+            m % 2 == 1  // Tie-break based on marker index parity
+        } else {
+            p_10 > p_01
+        };
+        
+        if should_swap && lr > lr_threshold {
             switch_markers.push(m);
         }
 
-        // Collect emission EM statistics
+        // Collect EM statistics
         if let Some(ref mut em) = em_estimates {
-            // Expected matches/mismatches
+            // Expected matches/mismatches based on phase decision
             let best_p = p_01.max(p_10);
             let worst_p = p_01.min(p_10);
             em.add_emission(best_p as f64, worst_p as f64);
+            
+            // Expected switches using Baum-Welch recurrence
+            // ξ_t(i,j) = α_{t-1}(i) × a_{ij} × b_j(o_t) × β_t(j) / P(O)
+            // Expected switches = Σ_{i≠j} ξ_t(i,j)
+            if m > 0 {
+                let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
+                let p_no_rec = 1.0 - p_rec;
+                let shift = p_rec / n_states as f32;
+                
+                // Calculate total posterior mass (for normalization)
+                let mut total_mass = 0.0f64;
+                let mut no_switch_mass = 0.0f64;
+                
+                for s in 0..n_states {
+                    let ref_a = ref_alleles[s][m];
+                    let emit_s = emit(alleles1[m], ref_a).max(emit(alleles2[m], ref_a));
+                    let bwd_s = bwd_at_het.get(idx).and_then(|v| v.get(s)).copied().unwrap_or(1.0 / n_states as f32);
+                    
+                    // No-switch: stay in state s
+                    let no_switch_s = fwd1[m - 1][s] as f64 * p_no_rec as f64 * emit_s as f64 * bwd_s as f64;
+                    no_switch_mass += no_switch_s;
+                    
+                    // All transitions into state s (for total mass)
+                    // Switch: from any other state into s (approximated by shift term)
+                    let switch_into_s = fwd1_sum as f64 * shift as f64 * emit_s as f64 * bwd_s as f64;
+                    total_mass += no_switch_s + switch_into_s;
+                }
+                
+                // Expected switch probability = 1 - P(no switch)
+                if total_mass > 0.0 {
+                    let p_no_switch = no_switch_mass / total_mass;
+                    let expected_switches = 1.0 - p_no_switch;
+                    em.add_switch(p_rec as f64, expected_switches);
+                }
+            }
         }
     }
 

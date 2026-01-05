@@ -543,8 +543,18 @@ impl ImpStates {
     }
 
     fn fill_with_random_haps(&mut self) {
+        use rand::seq::SliceRandom;
+        use rand::thread_rng;
+        
         let n_states = self.max_states.min(self.ibs.n_ref_haps);
-        for h in 0..n_states as u32 {
+        let mut rng = thread_rng();
+        
+        // Create list of all haplotype indices and shuffle
+        let mut hap_indices: Vec<u32> = (0..self.ibs.n_ref_haps as u32).collect();
+        hap_indices.shuffle(&mut rng);
+        
+        // Take first n_states from shuffled list
+        for &h in hap_indices.iter().take(n_states) {
             let comp_hap_idx = self.comp_haps.len();
             self.comp_haps.push(CompositeHap::new(h, self.n_markers));
             self.queue.push(CompHapEntry {

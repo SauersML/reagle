@@ -356,6 +356,31 @@ impl ImputationPipeline {
             return Ok(());
         }
 
+        // Auto-phase target if unphased (imputation requires phased haplotypes)
+        let target_gt = if !target_gt.is_phased() {
+            eprintln!("Target VCF is unphased. Running phasing before imputation...");
+            
+            // Create phasing pipeline with current config
+            let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
+            
+            // Load genetic map if provided
+            let gen_maps = if let Some(ref map_path) = self.config.map {
+                let chrom_names: Vec<&str> = target_gt
+                    .markers()
+                    .chrom_names()
+                    .iter()
+                    .map(|s| s.as_ref())
+                    .collect();
+                GeneticMaps::from_plink_file(map_path, &chrom_names)?
+            } else {
+                GeneticMaps::new()
+            };
+            
+            phasing.phase_in_memory(&target_gt, &gen_maps)?
+        } else {
+            target_gt
+        };
+
         let n_ref_haps = ref_gt.n_haplotypes();
         let n_ref_markers = ref_gt.n_markers();
         let n_target_markers = target_gt.n_markers();
