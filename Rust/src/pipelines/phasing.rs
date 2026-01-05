@@ -27,13 +27,18 @@ use crate::utils::Workspace;
 pub struct PhasingPipeline {
     config: Config,
     params: ModelParams,
+    pbwt: Option<PbwtIbs>,
 }
 
 impl PhasingPipeline {
     /// Create a new phasing pipeline
     pub fn new(config: Config) -> Self {
         let params = ModelParams::new();
-        Self { config, params }
+        Self {
+            config,
+            params,
+            pbwt: None,
+        }
     }
 
     /// Run the phasing pipeline
@@ -88,6 +93,9 @@ impl PhasingPipeline {
             })
             .collect();
 
+        // Initialize PBWT
+        self.pbwt = Some(PbwtIbs::new(n_haps));
+
         // Run phasing iterations
         let n_burnin = self.config.burnin;
         let n_iterations = self.config.iterations;
@@ -97,7 +105,7 @@ impl PhasingPipeline {
             let is_burnin = it < n_burnin;
             let iter_type = if is_burnin { "burnin" } else { "main" };
             eprintln!("Iteration {}/{} ({})", it + 1, total_iterations, iter_type);
-            
+            self.build_pbwt(&geno, n_markers);
             self.run_iteration(&target_gt, &mut geno, &gen_dists, it)?;
         }
 
@@ -119,7 +127,7 @@ impl PhasingPipeline {
 
     /// Run a single phasing iteration
     fn run_iteration(
-        &self,
+        &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
         gen_dists: &[f64],
@@ -130,9 +138,7 @@ impl PhasingPipeline {
         let n_haps = target_gt.n_haplotypes();
         let n_states = self.params.n_states;
         let seed = self.config.seed as u64 + iteration as u64;
-
-        // Build PBWT for state selection using current phasing
-        let pbwt = self.build_pbwt(geno, n_markers, n_haps);
+        let pbwt = self.pbwt.as_ref().unwrap();
 
         // Phase each sample in parallel
         let updates: Vec<(SampleIdx, Vec<usize>)> = (0..n_samples)
@@ -156,7 +162,7 @@ impl PhasingPipeline {
                 }
 
                 // Select reference haplotypes using PBWT (excluding this sample's haps)
-                let ref_haps = self.select_ref_haps(&pbwt, hap1, n_states, n_haps);
+                let ref_haps = self.select_ref_haps(hap1, n_states, n_haps);
 
                 // Create workspace for this thread
                 let mut workspace = Workspace::new(n_states, n_markers, n_haps);
@@ -203,40 +209,28 @@ impl PhasingPipeline {
     }
 
     /// Build PBWT from current genotypes
-    fn build_pbwt(&self, geno: &MutableGenotypes, n_markers: usize, n_haps: usize) -> PbwtIbs {
-        let mut pbwt = PbwtIbs::new(n_haps);
-        let mut updater = PbwtDivUpdater::new(n_haps);
+    fn build_pbwt(&mut self, geno: &MutableGenotypes, n_markers: usize) {
+        let pbwt = self.pbwt.as_mut().unwrap();
+        pbwt.reset();
 
         for m in 0..n_markers {
             let alleles = geno.marker_alleles(m);
-            
+
             // Determine number of alleles (usually 2 for biallelic)
             let n_alleles = alleles.iter().copied().max().unwrap_or(0) as usize + 1;
 
-            let mut temp_prefix = pbwt.fwd_prefix().to_vec();
-            let mut temp_div: Vec<i32> = pbwt.fwd_divergence().iter().map(|&x| x).collect();
-
-            updater.fwd_update(alleles, n_alleles.max(2), m, &mut temp_prefix, &mut temp_div);
-
-            pbwt.fwd_prefix_mut().copy_from_slice(&temp_prefix);
-            for (i, &d) in temp_div.iter().enumerate() {
-                if i < pbwt.fwd_divergence_mut().len() {
-                    pbwt.fwd_divergence_mut()[i] = d;
-                }
-            }
+            pbwt.fwd_update(alleles, n_alleles.max(2), m);
         }
-
-        pbwt
     }
 
     /// Select reference haplotypes using PBWT
     fn select_ref_haps(
         &self,
-        pbwt: &PbwtIbs,
         target_hap: HapIdx,
         n_states: usize,
         n_haps: usize,
     ) -> Vec<HapIdx> {
+        let pbwt = self.pbwt.as_ref().unwrap();
         // Get the sample this haplotype belongs to
         let _target_sample = target_hap.0 / 2;
         let other_hap = if target_hap.0 % 2 == 0 {
@@ -283,56 +277,45 @@ impl PhasingPipeline {
         gen_dists: &[f64],
         workspace: &mut Workspace,
     ) -> Vec<usize> {
-        let _n_markers = alleles1.len();
+        let n_markers = alleles1.len();
         let n_states = ref_alleles.len();
 
         if n_states == 0 || het_markers.is_empty() {
             return Vec::new();
         }
 
-        // Compute forward probabilities for haplotype 1
+        // Run forward-backward for both possible phases
         let fwd1 = self.forward_pass(alleles1, ref_alleles, gen_dists, workspace);
-        
-        // Compute forward probabilities for haplotype 2
-        let fwd2 = self.forward_pass(alleles2, ref_alleles, gen_dists, workspace);
+        let bwd1 = self.backward_pass(alleles1, ref_alleles, gen_dists, workspace);
 
-        // Decide phase switches based on likelihood comparison
+        let fwd2 = self.forward_pass(alleles2, ref_alleles, gen_dists, workspace);
+        let bwd2 = self.backward_pass(alleles2, ref_alleles, gen_dists, workspace);
+
         let mut switch_markers = Vec::new();
-        
-        // Simple phase decision: at each het site, check if swapping improves likelihood
+        let mut is_swapped = false;
+
         for &m in het_markers {
-            // Current assignment likelihood (sum over states)
-            let _curr_ll = fwd1[m].iter().sum::<f32>().ln() + fwd2[m].iter().sum::<f32>().ln();
-            
-            // For swap, we'd need to recompute with swapped alleles
-            // Simplified: use emission probability comparison
-            let a1 = alleles1[m];
-            let a2 = alleles2[m];
-            
-            let mut curr_match = 0.0f32;
-            let mut swap_match = 0.0f32;
-            
-            for (s, ref_hap) in ref_alleles.iter().enumerate() {
-                let ref_a = ref_hap[m];
-                let weight = fwd1[m][s] + fwd2[m][s];
-                
-                if a1 == ref_a {
-                    curr_match += weight;
-                }
-                if a2 == ref_a {
-                    swap_match += weight;
-                }
+            let mut p11 = 0.0;
+            let mut p12 = 0.0;
+            let mut p21 = 0.0;
+            let mut p22 = 0.0;
+
+            for s in 0..n_states {
+                p11 += fwd1[m][s] * bwd1[m][s];
+                p12 += fwd1[m][s] * bwd2[m][s];
+                p21 += fwd2[m][s] * bwd1[m][s];
+                p22 += fwd2[m][s] * bwd2[m][s];
             }
-            
-            // Random component for exploration (especially in burnin)
-            let rand_val = workspace.next_f32();
-            let threshold = 0.5 + 0.3 * (swap_match - curr_match) / (swap_match + curr_match + 1e-10);
-            
-            if rand_val > threshold && swap_match > curr_match {
+
+            let prob_no_swap = p11 * p22;
+            let prob_swap = p12 * p21;
+            let should_swap = prob_swap > prob_no_swap;
+
+            if should_swap != is_swapped {
                 switch_markers.push(m);
+                is_swapped = !is_swapped;
             }
         }
-
         switch_markers
     }
 
@@ -389,6 +372,57 @@ impl PhasingPipeline {
         }
 
         fwd
+    }
+
+    /// Backward pass of HMM
+    fn backward_pass(
+        &self,
+        target_alleles: &[u8],
+        ref_alleles: &[Vec<u8>],
+        gen_dists: &[f64],
+        _workspace: &mut Workspace,
+    ) -> Vec<Vec<f32>> {
+        let n_markers = target_alleles.len();
+        let n_states = ref_alleles.len();
+
+        let mut bwd = vec![vec![0.0f32; n_states]; n_markers];
+
+        // Initialize
+        let init_prob = 1.0 / n_states as f32;
+        for s in 0..n_states {
+            bwd[n_markers - 1][s] = init_prob;
+        }
+
+        // Backward recursion
+        for m in (0..n_markers - 1).rev() {
+            let gen_dist = gen_dists.get(m).copied().unwrap_or(0.01);
+            let p_switch = self.params.switch_prob(gen_dist);
+            let p_stay = 1.0 - p_switch;
+            let p_switch_to = p_switch / n_states as f32;
+
+            let mut weighted_bwd_sum = 0.0;
+            for s in 0..n_states {
+                let emit = self.emission_prob(target_alleles[m + 1], ref_alleles[s][m + 1]);
+                weighted_bwd_sum += emit * bwd[m + 1][s];
+            }
+
+            for s in 0..n_states {
+                let emit = self.emission_prob(target_alleles[m + 1], ref_alleles[s][m + 1]);
+                let term1 = (p_stay - p_switch_to) * emit * bwd[m + 1][s];
+                let term2 = p_switch_to * weighted_bwd_sum;
+                bwd[m][s] = term1 + term2;
+            }
+
+            // Normalize
+            let sum: f32 = bwd[m].iter().sum();
+            if sum > 0.0 {
+                for p in &mut bwd[m] {
+                    *p /= sum;
+                }
+            }
+        }
+
+        bwd
     }
 
     /// Emission probability
