@@ -203,7 +203,7 @@ impl VcfReader {
                 .unwrap_or("./.");
 
             // Parse genotype (handle both phased | and unphased /)
-            let (a1, a2, phased) = parse_genotype(gt_field)?;
+            let (a1, a2, phased) = parse_genotype(gt_field, line_num)?;
             
             if !phased {
                 is_phased = false;
@@ -220,7 +220,7 @@ impl VcfReader {
 }
 
 /// Parse a genotype field (e.g., "0|1", "0/1", ".")
-fn parse_genotype(gt: &str) -> Result<(u8, u8, bool)> {
+fn parse_genotype(gt: &str, line_num: usize) -> Result<(u8, u8, bool)> {
     if gt == "." || gt == "./." || gt == ".|." {
         return Ok((255, 255, true)); // Missing
     }
@@ -234,7 +234,9 @@ fn parse_genotype(gt: &str) -> Result<(u8, u8, bool)> {
         let a1 = if parts[0] == "." {
             255
         } else {
-            parts[0].parse().unwrap_or(255)
+            parts[0]
+                .parse()
+                .map_err(|_| ReagleError::parse(line_num, "Invalid allele value"))?
         };
         return Ok((a1, a1, phased));
     }
@@ -242,13 +244,17 @@ fn parse_genotype(gt: &str) -> Result<(u8, u8, bool)> {
     let a1 = if parts[0] == "." {
         255
     } else {
-        parts[0].parse().unwrap_or(255)
+        parts[0]
+            .parse()
+            .map_err(|_| ReagleError::parse(line_num, "Invalid allele value"))?
     };
 
     let a2 = if parts[1] == "." {
         255
     } else {
-        parts[1].parse().unwrap_or(255)
+        parts[1]
+            .parse()
+            .map_err(|_| ReagleError::parse(line_num, "Invalid allele value"))?
     };
 
     Ok((a1, a2, phased))
@@ -399,16 +405,16 @@ mod tests {
 
     #[test]
     fn test_parse_genotype() {
-        assert_eq!(parse_genotype("0|1").unwrap(), (0, 1, true));
-        assert_eq!(parse_genotype("1|0").unwrap(), (1, 0, true));
-        assert_eq!(parse_genotype("0/1").unwrap(), (0, 1, false));
-        assert_eq!(parse_genotype("./.").unwrap(), (255, 255, true));
-        assert_eq!(parse_genotype(".|.").unwrap(), (255, 255, true));
+        assert_eq!(parse_genotype("0|1", 0).unwrap(), (0, 1, true));
+        assert_eq!(parse_genotype("1|0", 0).unwrap(), (1, 0, true));
+        assert_eq!(parse_genotype("0/1", 0).unwrap(), (0, 1, false));
+        assert_eq!(parse_genotype("./.", 0).unwrap(), (255, 255, true));
+        assert_eq!(parse_genotype(".|.", 0).unwrap(), (255, 255, true));
     }
 
     #[test]
     fn test_parse_genotype_multiallelic() {
-        assert_eq!(parse_genotype("0|2").unwrap(), (0, 2, true));
-        assert_eq!(parse_genotype("1|2").unwrap(), (1, 2, true));
+        assert_eq!(parse_genotype("0|2", 0).unwrap(), (0, 2, true));
+        assert_eq!(parse_genotype("1|2", 0).unwrap(), (1, 2, true));
     }
 }
