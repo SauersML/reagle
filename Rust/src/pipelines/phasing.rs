@@ -482,10 +482,8 @@ impl PhasingPipeline {
                         n_markers
                     };
 
-                    // Swap all markers in this segment
-                    for m in start..end {
-                        geno.swap(m, hap1, hap2);
-                    }
+                    // Swap all markers in this segment using contiguous swap
+                    geno.swap_contiguous(start, end, hap1, hap2);
 
                     i += 2; // Skip to next swapped segment
                 }

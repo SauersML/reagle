@@ -93,6 +93,13 @@ impl MarkerAlignment {
 
                         if mapping.strand_flipped {
                             n_strand_flipped += 1;
+                            // Warn about strand-ambiguous markers (A/T or C/G) where flip detection is unreliable
+                            if crate::data::marker::is_strand_ambiguous(target_marker) {
+                                eprintln!(
+                                    "  Warning: Strand-ambiguous marker at pos {} (A/T or C/G SNV) was strand-flipped",
+                                    target_marker.pos
+                                );
+                            }
                         }
                         if mapping.alleles_swapped {
                             n_allele_swapped += 1;
@@ -450,8 +457,9 @@ impl ImputationPipeline {
             self.config.imp_step as f64,
         );
         eprintln!(
-            "  {} steps, avg compression ratio: {:.1}x",
+            "  {} steps, {} total patterns, avg compression ratio: {:.1}x",
             ref_panel_coded.n_steps(),
+            ref_panel_coded.total_patterns(),
             ref_panel_coded.avg_compression_ratio()
         );
 

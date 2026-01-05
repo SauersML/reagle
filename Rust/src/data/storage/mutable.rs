@@ -102,6 +102,19 @@ impl MutableGenotypes {
         }
     }
 
+    /// Swap alleles between two haplotypes for a contiguous range of markers
+    /// 
+    /// More efficient than swap_range for contiguous segments since it
+    /// avoids the overhead of iterating a slice of indices.
+    #[inline]
+    pub fn swap_contiguous(&mut self, start: usize, end: usize, hap1: HapIdx, hap2: HapIdx) {
+        let h1 = hap1.as_usize();
+        let h2 = hap2.as_usize();
+        for m in start..end {
+            self.alleles[m].swap(h1, h2);
+        }
+    }
+
     /// Copy alleles from another MutableGenotypes
     pub fn copy_from(&mut self, other: &MutableGenotypes) {
         debug_assert_eq!(self.n_markers(), other.n_markers());
