@@ -1,0 +1,46 @@
+[package]
+name = "reagle"
+version = "0.1.0"
+edition = "2024"
+description = "High-performance genotype phasing and imputation"
+repository = "https://github.com/SauersML/reagle"
+
+[dependencies]
+# CLI parsing
+clap = { version = "4", features = ["derive"] }
+
+# Parallelism
+rayon = "1.10"
+thread_local = "1.1"
+
+# Bit manipulation for dense genotype storage
+bitvec = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# VCF parsing (genomics)
+noodles = { version = "0.84", features = ["vcf", "bgzf", "csi", "tabix"] }
+
+# Random number generation (for sampling)
+rand = "0.8"
+
+# Optional: SIMD acceleration
+# packed_simd = "0.3"  # Enable when optimizing hot loops
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "pbwt"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
