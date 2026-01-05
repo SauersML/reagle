@@ -1,12 +1,10 @@
 # Reagle: High-Performance Genotype Phasing and Imputation
 
-[![Rust CI](https://github.com/SauersML/reagle/actions/workflows/rust.yml/badge.svg)](https://github.com/SauersML/reagle/actions/workflows/rust.yml)
-
-Reagle is a high-performance, memory-efficient reimplementation of the [BEAGLE](https://faculty.washington.edu/browning/beagle/beagle.html) software for genotype phasing and imputation, written in Rust. It is designed to be a drop-in replacement for the original, offering significant performance improvements by leveraging modern hardware and parallel processing.
+Reagle is a reimplementation of the [BEAGLE](https://faculty.washington.edu/browning/beagle/beagle.html) software for genotype phasing and imputation, written in Rust.
 
 ## About the Project
 
-This project is a port of the BEAGLE software from Java to Rust. The original Java implementation can be found in the `Java/` directory for reference. The goal of this project is to provide a faster, more memory-efficient tool for genotype phasing and imputation, while maintaining compatibility with the original BEAGLE software.
+The original Java implementation can be found in the `Java/` directory for reference.
 
 ## Usage
 
