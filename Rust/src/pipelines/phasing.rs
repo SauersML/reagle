@@ -295,7 +295,7 @@ impl PhasingPipeline {
         // Simple phase decision: at each het site, check if swapping improves likelihood
         for &m in het_markers {
             // Current assignment likelihood (sum over states)
-            let _curr_ll = fwd1[m].iter().sum::<f32>().ln() + fwd2[m].iter().sum::<f32>().ln();
+            let _curr_ll = self.log_sum_exp(&fwd1[m]) + self.log_sum_exp(&fwd2[m]);
             
             // For swap, we'd need to recompute with swapped alleles
             // Simplified: use emission probability comparison
@@ -307,7 +307,7 @@ impl PhasingPipeline {
             
             for (s, ref_hap) in ref_alleles.iter().enumerate() {
                 let ref_a = ref_hap[m];
-                let weight = fwd1[m][s] + fwd2[m][s];
+                let weight = fwd1[m][s].exp() + fwd2[m][s].exp();
                 
                 if a1 == ref_a {
                     curr_match += weight;
@@ -339,22 +339,14 @@ impl PhasingPipeline {
     ) -> Vec<Vec<f32>> {
         let n_markers = target_alleles.len();
         let n_states = ref_alleles.len();
-        
+
         let mut fwd = vec![vec![0.0f32; n_states]; n_markers];
-        
+
         // Initialize
-        let init_prob = 1.0 / n_states as f32;
+        let init_log_prob = -(n_states as f32).ln();
         for s in 0..n_states {
             let emit = self.emission_prob(target_alleles[0], ref_alleles[s][0]);
-            fwd[0][s] = init_prob * emit;
-        }
-        
-        // Normalize
-        let sum: f32 = fwd[0].iter().sum();
-        if sum > 0.0 {
-            for p in &mut fwd[0] {
-                *p /= sum;
-            }
+            fwd[0][s] = init_log_prob + emit.ln();
         }
 
         // Forward recursion
@@ -364,24 +356,28 @@ impl PhasingPipeline {
             let p_stay = 1.0 - p_switch;
             let p_switch_to = p_switch / n_states as f32;
 
-            let fwd_sum: f32 = fwd[m - 1].iter().sum();
+            let log_fwd_sum = self.log_sum_exp(&fwd[m - 1]);
 
             for s in 0..n_states {
                 let emit = self.emission_prob(target_alleles[m], ref_alleles[s][m]);
-                let trans = p_stay * fwd[m - 1][s] + p_switch_to * fwd_sum;
-                fwd[m][s] = trans * emit;
-            }
-
-            // Normalize
-            let sum: f32 = fwd[m].iter().sum();
-            if sum > 0.0 {
-                for p in &mut fwd[m] {
-                    *p /= sum;
-                }
+                let term1 = p_stay.ln() + fwd[m - 1][s];
+                let term2 = p_switch_to.ln() + log_fwd_sum;
+                let trans = self.log_sum_exp(&[term1, term2]);
+                fwd[m][s] = trans + emit.ln();
             }
         }
 
         fwd
+    }
+
+    /// Calculates log(sum(exp(a))) for a slice of log-probabilities.
+    fn log_sum_exp(&self, a: &[f32]) -> f32 {
+        let max_val = a.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if max_val.is_infinite() {
+            return max_val;
+        }
+        let sum = a.iter().map(|&x| (x - max_val).exp()).sum::<f32>();
+        max_val + sum.ln()
     }
 
     /// Emission probability
