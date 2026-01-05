@@ -283,6 +283,12 @@ impl<'a> Iterator for SlidingWindowIterator<'a> {
         let overlap_start = if is_last { end } else { self.find_overlap_start(end) };
         let next_splice = if is_last { end } else { overlap_start };
 
+        // Calculate n_ref_markers from reference panel
+        let n_ref_markers = self
+            .reference
+            .map(|r| r.restrict(start, end).n_markers())
+            .unwrap_or(0);
+
         let indices = WindowIndices {
             start,
             end,
@@ -290,16 +296,17 @@ impl<'a> Iterator for SlidingWindowIterator<'a> {
             next_splice,
             overlap_start,
             n_targ_markers: end - start,
-            n_ref_markers: 0, // TODO: handle reference
+            n_ref_markers,
         };
 
         // Extract window data
         let target_gt = self.target.restrict(start, end);
         let ref_gt = self.reference.map(|r| r.restrict(start, end));
 
-        // Create genetic map for window
-        let chrom = self.target.marker(MarkerIdx::new(start as u32)).chrom;
-        let gen_map = GeneticMap::empty(chrom); // TODO: slice from full map
+        // Create genetic map for window by slicing from full map
+        let start_marker = self.target.marker(MarkerIdx::new(start as u32));
+        let end_marker = self.target.marker(MarkerIdx::new((end - 1) as u32));
+        let gen_map = self.gen_map.slice(start_marker.pos, end_marker.pos);
 
         let window = Window::new(target_gt, ref_gt, gen_map, indices, self.window_num);
 
