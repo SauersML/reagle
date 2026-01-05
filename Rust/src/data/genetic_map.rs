@@ -64,7 +64,7 @@ impl GeneticMap {
     /// Converts genome coordinates to genetic units by multiplying by scale_factor.
     /// Default scale_factor = 1e-6 (1 cM per Mb)
     pub fn position_map(chrom: ChromIdx, scale_factor: f64) -> PositionMap {
-        PositionMap { chrom, scale_factor }
+        PositionMap { _chrom: chrom, scale_factor }
     }
 
     /// Load from PLINK format map file
@@ -260,7 +260,7 @@ impl GeneticMap {
 /// This matches Java `vcf/PositionMap.java`
 #[derive(Clone, Debug)]
 pub struct PositionMap {
-    chrom: ChromIdx,
+    _chrom: ChromIdx,
     scale_factor: f64,
 }
 
@@ -268,14 +268,14 @@ impl PositionMap {
     /// Create a new position map with default scale factor (1 cM per Mb)
     pub fn new(chrom: ChromIdx) -> Self {
         Self {
-            chrom,
+            _chrom: chrom,
             scale_factor: DEFAULT_SCALE_FACTOR,
         }
     }
 
     /// Create with custom scale factor
     pub fn with_scale(chrom: ChromIdx, scale_factor: f64) -> Self {
-        Self { chrom, scale_factor }
+        Self { _chrom: chrom, scale_factor }
     }
 
     /// Get genetic position from physical position

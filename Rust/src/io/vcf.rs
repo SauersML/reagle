@@ -732,17 +732,22 @@ mod tests {
 
     #[test]
     fn test_dr2_perfect_imputation() {
-        // Perfect imputation: all samples have probability 1.0 for alt allele
+        // Perfect imputation with variation: mix of 0 and 1 dosages, all certain
         let mut stats = MarkerImputationStats::new(2);
 
-        // Add 10 samples, all with alt allele
-        for _ in 0..10 {
+        // Add samples with different certain values to create variance
+        // 5 samples with ref/ref (dosage 0 for alt)
+        for _ in 0..5 {
+            stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]);
+        }
+        // 5 samples with alt/alt (dosage 1 for alt)
+        for _ in 0..5 {
             stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
         }
 
-        // DR2 should be close to 1.0 for perfect certainty
+        // DR2 should be high when there's variance and certainty
         let dr2 = stats.dr2(1);
-        assert!(dr2 >= 0.99, "DR2 should be ~1.0, got {}", dr2);
+        assert!(dr2 >= 0.99, "DR2 should be ~1.0 with certain variable dosages, got {}", dr2);
     }
 
     #[test]

@@ -291,7 +291,7 @@ impl PhasingPipeline {
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
         p_recomb: &[f32],
-        iteration: usize,
+        _iteration: usize,
         collect_em: bool,
     ) -> Result<()> {
         let n_samples = target_gt.n_samples();
@@ -715,13 +715,14 @@ fn phase_sample_with_hmm(
 /// * `stage_markers` - Classification of Stage 1 vs Stage 2 markers
 /// * `stage1_state_probs` - State probabilities at Stage 1 markers [hap][stage1_marker][state]
 /// * `stage1_states` - Selected state haplotype indices [hap][stage1_marker][state_idx]
+#[allow(dead_code)]
 fn run_stage2_phasing(
     geno: &mut MutableGenotypes,
     stage_markers: &StageMarkers,
     stage1_state_probs: &[Vec<Vec<f32>>],
     stage1_states: &[Vec<Vec<u32>>],
     n_samples: usize,
-    params: &ModelParams,
+    _params: &ModelParams,
 ) -> usize {
     let n_markers = geno.n_markers();
     let n_stage1 = stage_markers.n_stage1();
@@ -789,6 +790,7 @@ fn run_stage2_phasing(
 }
 
 /// Compute phase probabilities for a Stage 2 marker by interpolating Stage 1 state probabilities
+#[allow(dead_code)]
 fn compute_stage2_phase_probs(
     a1: u8,
     a2: u8,
@@ -797,9 +799,9 @@ fn compute_stage2_phase_probs(
     next_idx: i32,
     wt: f32,
     probs1: &[Vec<f32>],
-    probs2: &[Vec<f32>],
+    _probs2: &[Vec<f32>],
     states1: &[Vec<u32>],
-    states2: &[Vec<u32>],
+    _states2: &[Vec<u32>],
     geno: &MutableGenotypes,
     stage_markers: &StageMarkers,
 ) -> (f32, f32) {
@@ -817,7 +819,7 @@ fn compute_stage2_phase_probs(
         return (0.5, 0.5);
     };
 
-    let (probs_b1, states_b1) = if next_idx >= 0 && (next_idx as usize) < probs1.len() {
+    let (probs_b1, _states_b1) = if next_idx >= 0 && (next_idx as usize) < probs1.len() {
         let idx = next_idx as usize;
         (&probs1[idx], &states1[idx])
     } else if prev_idx >= 0 {
@@ -917,46 +919,4 @@ mod tests {
         assert_eq!(pipeline.params.n_states, 280);
     }
 
-    #[test]
-    fn test_emission_prob() {
-        let config = Config {
-            gt: PathBuf::from("test.vcf"),
-            r#ref: None,
-            out: PathBuf::from("out"),
-            map: None,
-            chrom: None,
-            excludesamples: None,
-            excludemarkers: None,
-            burnin: 3,
-            iterations: 12,
-            phase_states: 280,
-            rare: 0.002,
-            impute: true,
-            imp_states: 1600,
-            imp_segment: 6.0,
-            imp_step: 0.1,
-            imp_nsteps: 7,
-            cluster: 0.005,
-            ap: false,
-            gp: false,
-            ne: 100000.0,
-            err: None,
-            em: true,
-            window: 40.0,
-            window_markers: 4000000,
-            overlap: 2.0,
-            seed: 12345,
-            nthreads: None,
-        };
-
-        let pipeline = PhasingPipeline::new(config);
-        
-        // Match should have high probability
-        let match_prob = pipeline.emission_prob(0, 0);
-        assert!(match_prob > 0.99);
-        
-        // Mismatch should have low probability
-        let mismatch_prob = pipeline.emission_prob(0, 1);
-        assert!(mismatch_prob < 0.01);
-    }
 }

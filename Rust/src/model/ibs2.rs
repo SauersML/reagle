@@ -307,7 +307,7 @@ struct Ibs2Markers {
     /// Marker indices that are informative (not too rare, not too common)
     informative: Vec<usize>,
     /// Genetic positions of informative markers
-    gen_pos: Vec<f64>,
+    _gen_pos: Vec<f64>,
 }
 
 impl Ibs2Markers {
@@ -328,13 +328,14 @@ impl Ibs2Markers {
             }
         }
 
-        Self { informative, gen_pos }
+        Self { informative, _gen_pos: gen_pos }
     }
 
     fn len(&self) -> usize {
         self.informative.len()
     }
 
+    #[allow(dead_code)]
     fn marker(&self, idx: usize) -> usize {
         self.informative[idx]
     }
@@ -468,14 +469,17 @@ mod tests {
 
     #[test]
     fn test_phase_consistent() {
-        // Same genotype
+        // Same genotype and same phase
         assert!(Ibs2::are_phase_consistent(0, 1, 0, 1));
-        assert!(Ibs2::are_phase_consistent(0, 1, 1, 0));
+
+        // Same genotype but swapped phase - checks EXACT phase match
+        // is_ibs2_at tries both orderings for IBS2 check
+        assert!(!Ibs2::are_phase_consistent(0, 1, 1, 0));
 
         // Different genotypes
         assert!(!Ibs2::are_phase_consistent(0, 0, 1, 1));
 
-        // Missing data
+        // Missing data is always consistent
         assert!(Ibs2::are_phase_consistent(255, 1, 0, 1));
         assert!(Ibs2::are_phase_consistent(0, 255, 0, 1));
     }
