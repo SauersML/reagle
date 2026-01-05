@@ -400,23 +400,24 @@ impl PhasingPipeline {
         let mut pbwt = PbwtIbs::new(n_haps);
         let mut updater = PbwtDivUpdater::new(n_haps);
 
+        // Pre-allocate buffers to avoid allocations in the loop
+        let mut temp_prefix = pbwt.fwd_prefix().to_vec();
+        let mut temp_div = pbwt.fwd_divergence().to_vec();
+
         for m in 0..n_markers {
             let alleles = geno.marker_alleles(m);
-            
+
             // Determine number of alleles (usually 2 for biallelic)
             let n_alleles = alleles.iter().copied().max().unwrap_or(0) as usize + 1;
 
-            let mut temp_prefix = pbwt.fwd_prefix().to_vec();
-            let mut temp_div: Vec<i32> = pbwt.fwd_divergence().iter().map(|&x| x).collect();
+            // Copy current PBWT state to temp buffers
+            temp_prefix.copy_from_slice(pbwt.fwd_prefix());
+            temp_div.copy_from_slice(pbwt.fwd_divergence());
 
             updater.fwd_update(alleles, n_alleles.max(2), m, &mut temp_prefix, &mut temp_div);
 
             pbwt.fwd_prefix_mut().copy_from_slice(&temp_prefix);
-            for (i, &d) in temp_div.iter().enumerate() {
-                if i < pbwt.fwd_divergence_mut().len() {
-                    pbwt.fwd_divergence_mut()[i] = d;
-                }
-            }
+            pbwt.fwd_divergence_mut().copy_from_slice(&temp_div);
         }
 
         pbwt
