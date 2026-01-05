@@ -1,40 +1,88 @@
 //! # Centralized Error Handling
 //!
-//! ## Role
 //! Unified error types for the entire crate using `thiserror`.
-//!
-//! ## Spec
-//! Define `enum ReagleError` with variants:
-//!
-//! - `Io(#[from] std::io::Error)`
-//!   File missing, permission denied, read/write failures.
-//!
-//! - `Vcf(String)`
-//!   Malformed VCF records, missing fields, parse errors.
-//!   (Wrap noodles errors as String for simpler error chains)
-//!
-//! - `InvalidData { msg: String }`
-//!   Inconsistent data: sample count mismatch between files,
-//!   marker position out of order, invalid allele codes.
-//!
-//! - `Algorithm { msg: String }`
-//!   Math errors: non-finite probabilities, matrix dimension mismatch,
-//!   convergence failures.
-//!
-//! - `Config { msg: String }`
-//!   Invalid CLI arguments caught after clap parsing.
-//!
-//! ## Type Alias
-//! ```rust,ignore
-//! pub type Result<T> = std::result::Result<T, ReagleError>;
-//! ```
-//!
-//! ## Usage
-//! ```rust,ignore
-//! use crate::error::{ReagleError, Result};
-//!
-//! fn load_vcf(path: &Path) -> Result<GenotypeMatrix> {
-//!     let file = File::open(path)?; // auto-converts io::Error
-//!     // ...
-//! }
-//! ```
+
+use std::path::PathBuf;
+use thiserror::Error;
+
+/// Main error type for Reagle operations
+#[derive(Error, Debug)]
+pub enum ReagleError {
+    /// I/O errors (file missing, permission denied, read/write failures)
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// VCF parsing errors (malformed records, missing fields)
+    #[error("VCF error: {message}")]
+    Vcf { message: String },
+
+    /// Invalid data errors (sample count mismatch, marker position out of order)
+    #[error("Invalid data: {message}")]
+    InvalidData { message: String },
+
+    /// Algorithm errors (non-finite probabilities, convergence failures)
+    #[error("Algorithm error: {message}")]
+    Algorithm { message: String },
+
+    /// Configuration errors (invalid CLI arguments)
+    #[error("Configuration error: {message}")]
+    Config { message: String },
+
+    /// File not found errors
+    #[error("File not found: {path}")]
+    FileNotFound { path: PathBuf },
+
+    /// Parse errors
+    #[error("Parse error at line {line}: {message}")]
+    Parse { line: usize, message: String },
+}
+
+/// Type alias for Results using ReagleError
+pub type Result<T> = std::result::Result<T, ReagleError>;
+
+impl ReagleError {
+    /// Create a VCF error with a message
+    pub fn vcf(message: impl Into<String>) -> Self {
+        Self::Vcf {
+            message: message.into(),
+        }
+    }
+
+    /// Create an invalid data error
+    pub fn invalid_data(message: impl Into<String>) -> Self {
+        Self::InvalidData {
+            message: message.into(),
+        }
+    }
+
+    /// Create an algorithm error
+    pub fn algorithm(message: impl Into<String>) -> Self {
+        Self::Algorithm {
+            message: message.into(),
+        }
+    }
+
+    /// Create a configuration error
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::Config {
+            message: message.into(),
+        }
+    }
+
+    /// Create a parse error
+    pub fn parse(line: usize, message: impl Into<String>) -> Self {
+        Self::Parse {
+            line,
+            message: message.into(),
+        }
+    }
+}
+
+// Convert noodles VCF errors to ReagleError
+impl From<noodles::vcf::header::ParseError> for ReagleError {
+    fn from(err: noodles::vcf::header::ParseError) -> Self {
+        Self::Vcf {
+            message: err.to_string(),
+        }
+    }
+}

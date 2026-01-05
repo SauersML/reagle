@@ -1,61 +1,215 @@
 //! # Sparse Storage for Rare Variants
 //!
-//! ## Role
 //! Efficient storage for rare variants (MAF < 1%) by storing only carrier indices.
 //! Replaces `vcf/LowMafGTRec.java`.
-//!
-//! ## Spec
-//!
-//! ### SparseColumn Struct
-//! ```rust,ignore
-//! pub struct SparseColumn {
-//!     /// Sorted indices of haplotypes carrying the ALT allele.
-//!     /// For multi-allelic: Vec<(HapIdx, u8)> storing (haplotype, allele).
-//!     carriers: Vec<HapIdx>,
-//!
-//!     /// Total number of haplotypes (needed to know who has REF).
-//!     n_haplotypes: u32,
-//! }
-//! ```
-//!
-//! ### Methods
-//! ```rust,ignore
-//! impl SparseColumn {
-//!     /// Create from carrier indices.
-//!     pub fn from_carriers(carriers: Vec<HapIdx>, n_haplotypes: u32) -> Self;
-//!
-//!     /// Get allele for haplotype (binary search).
-//!     #[inline]
-//!     pub fn get(&self, hap: HapIdx) -> u8 {
-//!         match self.carriers.binary_search(&hap) {
-//!             Ok(_) => 1,  // Found: has ALT
-//!             Err(_) => 0, // Not found: has REF
-//!         }
-//!     }
-//!
-//!     /// Iterate carrier indices.
-//!     pub fn carriers(&self) -> &[HapIdx];
-//!
-//!     /// Number of carriers (ALT allele count).
-//!     pub fn n_carriers(&self) -> usize;
-//!
-//!     /// Minor allele frequency.
-//!     pub fn maf(&self) -> f64;
-//! }
-//! ```
-//!
-//! ### When to Use
-//! - MAF < 0.01: Sparse is more memory-efficient
-//! - For a marker with 10,000 haplotypes and MAF=0.001:
-//!   - Dense: 10,000 bits = 1,250 bytes
-//!   - Sparse: 10 carriers * 4 bytes = 40 bytes
-//!   - Savings: 31x
-//!
-//! ### Multi-allelic Extension
-//! ```rust,ignore
-//! pub struct SparseMultiAllelic {
-//!     /// (haplotype_index, allele) pairs, sorted by haplotype.
-//!     entries: Vec<(HapIdx, u8)>,
-//!     n_haplotypes: u32,
-//! }
-//! ```
+
+use crate::data::HapIdx;
+
+/// Sparse storage for rare variants
+#[derive(Clone, Debug)]
+pub struct SparseColumn {
+    /// Sorted indices of carrier haplotypes
+    carriers: Vec<HapIdx>,
+
+    /// Total number of haplotypes
+    n_haplotypes: u32,
+
+    /// If true, carriers are REF (0) and non-carriers are ALT (1)
+    /// If false, carriers are ALT (1) and non-carriers are REF (0)
+    inverted: bool,
+}
+
+impl SparseColumn {
+    /// Create from carrier indices
+    pub fn from_carriers(mut carriers: Vec<HapIdx>, n_haplotypes: u32, inverted: bool) -> Self {
+        carriers.sort_unstable();
+        Self {
+            carriers,
+            n_haplotypes,
+            inverted,
+        }
+    }
+
+    /// Create from allele slice (for biallelic markers)
+    pub fn from_alleles(alleles: &[u8]) -> Self {
+        let n_haplotypes = alleles.len() as u32;
+        let alt_count = alleles.iter().filter(|&&a| a > 0).count();
+
+        // Store whichever is smaller
+        let inverted = alt_count > alleles.len() / 2;
+
+        let carriers: Vec<HapIdx> = if inverted {
+            alleles
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| **a == 0)
+                .map(|(i, _)| HapIdx::new(i as u32))
+                .collect()
+        } else {
+            alleles
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| **a > 0)
+                .map(|(i, _)| HapIdx::new(i as u32))
+                .collect()
+        };
+
+        Self::from_carriers(carriers, n_haplotypes, inverted)
+    }
+
+    /// Get allele for haplotype (binary search)
+    #[inline]
+    pub fn get(&self, hap: HapIdx) -> u8 {
+        let is_carrier = self.carriers.binary_search(&hap).is_ok();
+        if self.inverted {
+            if is_carrier { 0 } else { 1 }
+        } else {
+            if is_carrier { 1 } else { 0 }
+        }
+    }
+
+    /// Check if haplotype is a carrier
+    #[inline]
+    pub fn is_carrier(&self, hap: HapIdx) -> bool {
+        self.carriers.binary_search(&hap).is_ok()
+    }
+
+    /// Get carrier indices
+    pub fn carriers(&self) -> &[HapIdx] {
+        &self.carriers
+    }
+
+    /// Number of carriers
+    pub fn n_carriers(&self) -> usize {
+        if self.inverted {
+            self.n_haplotypes as usize - self.carriers.len()
+        } else {
+            self.carriers.len()
+        }
+    }
+
+    /// Number of haplotypes
+    pub fn n_haplotypes(&self) -> usize {
+        self.n_haplotypes as usize
+    }
+
+    /// Minor allele frequency
+    pub fn maf(&self) -> f64 {
+        let n = self.n_haplotypes as f64;
+        if n == 0.0 {
+            return 0.0;
+        }
+        let alt = self.n_carriers() as f64;
+        (alt / n).min(1.0 - alt / n)
+    }
+
+    /// Memory usage in bytes
+    pub fn size_bytes(&self) -> usize {
+        self.carriers.len() * std::mem::size_of::<HapIdx>()
+            + std::mem::size_of::<Self>()
+    }
+
+    /// Iterate all alleles
+    pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..self.n_haplotypes).map(move |i| self.get(HapIdx::new(i)))
+    }
+
+    /// Is this an inverted representation?
+    pub fn is_inverted(&self) -> bool {
+        self.inverted
+    }
+}
+
+/// Sparse storage for multi-allelic rare variants
+#[derive(Clone, Debug)]
+pub struct SparseMultiAllelic {
+    /// (haplotype_index, allele) pairs, sorted by haplotype
+    entries: Vec<(HapIdx, u8)>,
+
+    /// Total number of haplotypes
+    n_haplotypes: u32,
+}
+
+impl SparseMultiAllelic {
+    /// Create from entries
+    pub fn from_entries(mut entries: Vec<(HapIdx, u8)>, n_haplotypes: u32) -> Self {
+        entries.sort_unstable_by_key(|(h, _)| *h);
+        Self {
+            entries,
+            n_haplotypes,
+        }
+    }
+
+    /// Get allele for haplotype
+    #[inline]
+    pub fn get(&self, hap: HapIdx) -> u8 {
+        match self.entries.binary_search_by_key(&hap, |(h, _)| *h) {
+            Ok(idx) => self.entries[idx].1,
+            Err(_) => 0, // REF
+        }
+    }
+
+    /// Number of haplotypes
+    pub fn n_haplotypes(&self) -> usize {
+        self.n_haplotypes as usize
+    }
+
+    /// Number of non-REF entries
+    pub fn n_entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Memory usage in bytes
+    pub fn size_bytes(&self) -> usize {
+        self.entries.len() * std::mem::size_of::<(HapIdx, u8)>()
+            + std::mem::size_of::<Self>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sparse_column() {
+        let carriers = vec![HapIdx::new(2), HapIdx::new(5), HapIdx::new(7)];
+        let col = SparseColumn::from_carriers(carriers, 10, false);
+
+        assert_eq!(col.get(HapIdx::new(0)), 0);
+        assert_eq!(col.get(HapIdx::new(2)), 1);
+        assert_eq!(col.get(HapIdx::new(5)), 1);
+        assert_eq!(col.get(HapIdx::new(7)), 1);
+        assert_eq!(col.get(HapIdx::new(9)), 0);
+
+        assert_eq!(col.n_carriers(), 3);
+    }
+
+    #[test]
+    fn test_sparse_inverted() {
+        // Most are ALT, few are REF
+        let alleles = vec![1, 1, 0, 1, 1, 1, 0, 1, 1, 1];
+        let col = SparseColumn::from_alleles(&alleles);
+
+        assert!(col.is_inverted());
+        assert_eq!(col.carriers().len(), 2); // Stored REF carriers
+
+        for (i, &expected) in alleles.iter().enumerate() {
+            assert_eq!(col.get(HapIdx::new(i as u32)), expected);
+        }
+    }
+
+    #[test]
+    fn test_sparse_multiallelic() {
+        let entries = vec![
+            (HapIdx::new(1), 1),
+            (HapIdx::new(3), 2),
+            (HapIdx::new(5), 1),
+        ];
+        let col = SparseMultiAllelic::from_entries(entries, 10);
+
+        assert_eq!(col.get(HapIdx::new(0)), 0);
+        assert_eq!(col.get(HapIdx::new(1)), 1);
+        assert_eq!(col.get(HapIdx::new(3)), 2);
+        assert_eq!(col.get(HapIdx::new(5)), 1);
+    }
+}

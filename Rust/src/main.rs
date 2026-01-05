@@ -1,19 +1,88 @@
-//! # Application Entry Point
+//! # Reagle: High-Performance Genotype Phasing and Imputation
 //!
-//! ## Role
-//! The CLI entry point for Reagle.
+//! A Rust reimplementation of Beagle, optimized for modern hardware.
 //!
-//! ## Spec
-//! - Initialize the logger (`env_logger` or `tracing`).
-//! - Use `clap` to parse CLI arguments into the `Config` struct.
-//! - Determine mode (Phasing vs. Imputation) based on input flags.
-//! - Initialize the global thread pool (`rayon::ThreadPoolBuilder`).
-//! - Call the appropriate pipeline orchestrator:
-//!   - `pipelines::phasing::run()` for phasing mode
-//!   - `pipelines::imputation::run()` for imputation mode
-//! - Handle top-level errors and exit gracefully with appropriate codes.
+//! ## Usage
+//! ```bash
+//! # Phasing only
+//! reagle --gt input.vcf.gz --out phased
 //!
-//! ## Dependencies
-//! - `config::Config` for CLI parsing
-//! - `error::ReagleError` for error handling
-//! - `pipelines::*` for execution
+//! # Imputation with reference panel
+//! reagle --gt input.vcf.gz --ref reference.vcf.gz --out imputed
+//! ```
+
+use std::time::Instant;
+
+mod config;
+mod data;
+mod error;
+mod io;
+mod model;
+mod pipelines;
+mod utils;
+
+use config::Config;
+use error::Result;
+use pipelines::{ImputationPipeline, PhasingPipeline};
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let start = Instant::now();
+
+    // Parse and validate configuration
+    let config = Config::parse_and_validate()?;
+
+    // Configure thread pool
+    let n_threads = config.nthreads();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build_global()
+        .ok();
+
+    eprintln!("Reagle v0.1.0");
+    eprintln!("Threads: {}", n_threads);
+
+    // Run appropriate pipeline
+    if config.is_imputation_mode() {
+        eprintln!("Mode: Imputation");
+        eprintln!("Target: {:?}", config.gt);
+        eprintln!("Reference: {:?}", config.r#ref.as_ref().unwrap());
+        
+        let mut pipeline = ImputationPipeline::new(config);
+        pipeline.run()?;
+    } else {
+        eprintln!("Mode: Phasing");
+        eprintln!("Input: {:?}", config.gt);
+        
+        let mut pipeline = PhasingPipeline::new(config);
+        pipeline.run()?;
+    }
+
+    let elapsed = start.elapsed();
+    eprintln!("Completed in {:.2}s", elapsed.as_secs_f64());
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_module_imports() {
+        // Verify all modules are accessible
+        let _ = config::Config::parse_and_validate;
+        let _ = error::ReagleError::vcf("test");
+        let _ = data::MarkerIdx::new;
+        let _ = io::VcfReader::open;
+        let _ = model::ModelParams::new;
+        let _ = pipelines::PhasingPipeline::new;
+        let _ = utils::Workspace::new;
+    }
+}
