@@ -4,9 +4,9 @@
 //! Uses the forward-backward algorithm with scaling for numerical stability.
 //!
 //! ## Key Concepts
-//! - **States**: Reference haplotypes that the target could copy from
-//! - **Transitions**: Probability of switching to a different reference haplotype
-//! - **Emissions**: Probability of observing target allele given reference allele
+//! - `States`: Reference haplotypes that the target could copy from
+//! - `Transitions`: Probability of switching to a different reference haplotype
+//! - `Emissions`: Probability of observing target allele given reference allele
 //!
 //! ## Reference
 //! Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33

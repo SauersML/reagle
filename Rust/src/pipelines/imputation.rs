@@ -118,7 +118,7 @@ pub struct MarkerAlignment {
     /// Number of reference markers
     n_ref_markers: usize,
     /// Number of target markers (genotyped)
-    n_target_markers: usize,
+    _n_target_markers: usize,
 }
 
 impl MarkerAlignment {
@@ -150,7 +150,7 @@ impl MarkerAlignment {
             ref_to_target,
             target_to_ref,
             n_ref_markers,
-            n_target_markers,
+            _n_target_markers: n_target_markers,
         }
     }
 
@@ -216,7 +216,7 @@ pub struct StateProbs {
     /// State probabilities at marker+1 (for interpolation)
     probs_p1: Vec<Vec<f32>>,
     /// Target haplotype index
-    targ_hap: usize,
+    _targ_hap: usize,
 }
 
 impl StateProbs {
@@ -260,7 +260,7 @@ impl StateProbs {
             hap_indices: filtered_haps,
             probs: filtered_probs,
             probs_p1: filtered_probs_p1,
-            targ_hap,
+            _targ_hap: targ_hap,
         }
     }
 
@@ -315,7 +315,7 @@ impl StateProbs {
     fn interpolated_dosage_between<F>(
         &self,
         left_marker: usize,
-        right_marker: usize,
+        _right_marker: usize,
         weight: f32,
         ref_marker: usize,
         get_ref_allele: &F,
@@ -572,7 +572,7 @@ impl ImputationPipeline {
 /// Run forward-backward HMM on IBS-selected states
 fn run_hmm_forward_backward(
     target_alleles: &[u8],
-    hap_indices: &[Vec<u32>],
+    _hap_indices: &[Vec<u32>],
     allele_match: &[Vec<bool>],
     p_recomb: &[f32],
     p_mismatch: f32,

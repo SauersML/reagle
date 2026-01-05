@@ -22,10 +22,8 @@ use crate::data::marker::MarkerIdx;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes};
 use crate::error::Result;
 use crate::io::vcf::{VcfReader, VcfWriter};
-use crate::model::hmm::PhasingHmm;
 use crate::model::parameters::{AtomicParamEstimates, ModelParams, ParamEstimates};
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIbs};
-use crate::utils::Workspace;
 
 /// Stage marker classification for two-stage phasing
 ///
@@ -62,7 +60,7 @@ impl StageMarkers {
         min_stage1_spacing: usize,
     ) -> Self {
         let n_markers = geno.n_markers();
-        let n_haps = geno.n_haplotypes();
+        let n_haps = geno.n_haps();
 
         // Compute allele frequencies and classify markers
         let mut stage1_indices = Vec::new();
@@ -269,11 +267,6 @@ impl PhasingPipeline {
             // Run phasing iteration with EM estimation (if enabled and during burnin)
             let collect_em = self.config.em && is_burnin;
             self.run_iteration_with_hmm(&target_gt, &mut geno, &p_recomb, it, collect_em)?;
-
-            // Update parameters from EM estimates during burnin
-            if collect_em && it < n_burnin - 1 {
-                // Parameter updates happen inside run_iteration_with_hmm
-            }
         }
 
         // Build final GenotypeMatrix from mutable genotypes
@@ -360,7 +353,7 @@ impl PhasingPipeline {
                 );
 
                 // Collect EM estimates
-                if let (Some(ref global_em), Some(local)) = (&em_estimates, local_em) {
+                if let (Some(global_em), Some(local)) = (&em_estimates, local_em) {
                     global_em.add_estimation_data(&local);
                 }
 

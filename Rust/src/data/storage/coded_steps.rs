@@ -140,7 +140,7 @@ impl CodedStep {
         self.hap_to_pattern
             .iter()
             .enumerate()
-            .filter(|(_, &p)| p == pattern)
+            .filter(|(_, p)| **p == pattern)
             .map(|(h, _)| HapIdx::new(h as u32))
             .collect()
     }

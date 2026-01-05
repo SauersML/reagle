@@ -33,6 +33,10 @@ rand = "0.9.0"
 [dev-dependencies]
 criterion = "0.5.1"
 
+[build-dependencies]
+grep = "0.3"
+walkdir = "2.5"
+
 [profile.release]
 lto = true
 codegen-units = 1

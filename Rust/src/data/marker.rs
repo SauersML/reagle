@@ -83,6 +83,20 @@ impl Allele {
         matches!(self, Self::Missing)
     }
 
+    /// Get the length of this allele in bases
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Base(_) => 1,
+            Self::Seq(s) => s.len(),
+            Self::Missing => 0,
+        }
+    }
+
+    /// Check if allele is empty (missing)
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Get complement (for strand flipping)
     pub fn complement(&self) -> Self {
         match self {
@@ -114,8 +128,11 @@ impl std::fmt::Display for Allele {
 pub struct Marker {
     /// Chromosome index
     pub chrom: ChromIdx,
-    /// 1-based genomic position
+    /// 1-based genomic position (start)
     pub pos: u32,
+    /// 1-based end position (from INFO/END tag for SVs, or pos + len(ref) - 1 for SNVs/indels)
+    /// This is used for gVCF blocks and structural variants.
+    pub end: u32,
     /// Variant ID (rsID or similar), None if missing
     pub id: Option<Arc<str>>,
     /// Reference allele
@@ -136,6 +153,7 @@ impl Marker {
         Self {
             chrom,
             pos,
+            end: pos,
             id,
             ref_allele,
             alt_alleles,
@@ -174,6 +192,230 @@ impl Marker {
         } else {
             usize::BITS - (n - 1).leading_zeros()
         }
+    }
+
+    /// Create a new marker with explicit end position (for SVs and gVCF blocks)
+    pub fn with_end(
+        chrom: ChromIdx,
+        pos: u32,
+        end: u32,
+        id: Option<Arc<str>>,
+        ref_allele: Allele,
+        alt_alleles: Vec<Allele>,
+    ) -> Self {
+        Self {
+            chrom,
+            pos,
+            end,
+            id,
+            ref_allele,
+            alt_alleles,
+        }
+    }
+
+    /// Get the span of this marker (end - pos + 1)
+    pub fn span(&self) -> u32 {
+        self.end.saturating_sub(self.pos) + 1
+    }
+
+    /// Check if this marker overlaps with a position range
+    pub fn overlaps(&self, start: u32, end: u32) -> bool {
+        self.pos <= end && self.end >= start
+    }
+
+    /// Check if this marker has a non-trivial END value (spans multiple positions)
+    pub fn has_end_value(&self) -> bool {
+        self.end > self.pos
+    }
+}
+
+/// Allele mapping from target to reference panel
+///
+/// This handles Ref/Alt swaps and strand flips following Java Marker.targToRefAllele().
+#[derive(Clone, Debug)]
+pub struct AlleleMapping {
+    /// For each target allele index, the corresponding reference allele index (-1 if no match)
+    pub targ_to_ref: Vec<i8>,
+    /// Whether strand was flipped
+    pub strand_flipped: bool,
+    /// Whether Ref/Alt were swapped
+    pub alleles_swapped: bool,
+}
+
+impl AlleleMapping {
+    /// Create an identity mapping (no transformation needed)
+    pub fn identity(n_alleles: usize) -> Self {
+        Self {
+            targ_to_ref: (0..n_alleles as i8).collect(),
+            strand_flipped: false,
+            alleles_swapped: false,
+        }
+    }
+
+    /// Create a mapping indicating no match is possible
+    pub fn no_match(n_alleles: usize) -> Self {
+        Self {
+            targ_to_ref: vec![-1; n_alleles],
+            strand_flipped: false,
+            alleles_swapped: false,
+        }
+    }
+
+    /// Map a target allele to reference allele
+    /// Returns None if the allele cannot be mapped
+    pub fn map_allele(&self, targ_allele: u8) -> Option<u8> {
+        self.targ_to_ref
+            .get(targ_allele as usize)
+            .and_then(|&r| if r >= 0 { Some(r as u8) } else { None })
+    }
+
+    /// Check if all target alleles can be mapped
+    pub fn is_valid(&self) -> bool {
+        self.targ_to_ref.iter().all(|&r| r >= 0)
+    }
+}
+
+/// Compute allele mapping from target marker to reference marker
+///
+/// This implements the Java Marker.targToRefAllele() logic:
+/// 1. Check if alleles match directly
+/// 2. If not, check if Ref/Alt are swapped
+/// 3. If not, check if strand is flipped (A<->T, C<->G)
+/// 4. If not, check if both swapped and flipped
+///
+/// # Arguments
+/// * `targ` - Target marker
+/// * `ref_marker` - Reference marker
+///
+/// # Returns
+/// AlleleMapping if markers can be aligned, or None if incompatible
+pub fn compute_allele_mapping(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping> {
+    // Must be at same position
+    if targ.chrom != ref_marker.chrom || targ.pos != ref_marker.pos {
+        return None;
+    }
+
+    // Only handle SNVs for now (strand flip only makes sense for SNVs)
+    if !targ.is_snv() || !ref_marker.is_snv() {
+        // For non-SNVs, try direct match only
+        return try_direct_match(targ, ref_marker);
+    }
+
+    // Try direct match
+    if let Some(mapping) = try_direct_match(targ, ref_marker) {
+        return Some(mapping);
+    }
+
+    // Try strand flip
+    if let Some(mapping) = try_strand_flip(targ, ref_marker) {
+        return Some(mapping);
+    }
+
+    // No valid mapping found
+    None
+}
+
+/// Try to match alleles directly without any transformation
+fn try_direct_match(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping> {
+    let n_targ_alleles = targ.n_alleles();
+    let mut targ_to_ref = vec![-1i8; n_targ_alleles];
+    let mut all_matched = true;
+
+    // Build reference allele lookup
+    let ref_alleles: Vec<&Allele> = std::iter::once(&ref_marker.ref_allele)
+        .chain(ref_marker.alt_alleles.iter())
+        .collect();
+
+    // Try to match each target allele
+    for (t_idx, t_allele) in std::iter::once(&targ.ref_allele)
+        .chain(targ.alt_alleles.iter())
+        .enumerate()
+    {
+        let mut found = false;
+        for (r_idx, &r_allele) in ref_alleles.iter().enumerate() {
+            if t_allele == r_allele {
+                targ_to_ref[t_idx] = r_idx as i8;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            all_matched = false;
+        }
+    }
+
+    // Check if Ref alleles match (identity) or are swapped
+    let alleles_swapped = targ_to_ref.get(0) == Some(&1);
+
+    if all_matched {
+        Some(AlleleMapping {
+            targ_to_ref,
+            strand_flipped: false,
+            alleles_swapped,
+        })
+    } else {
+        None
+    }
+}
+
+/// Try to match alleles with strand flip (A<->T, C<->G)
+fn try_strand_flip(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping> {
+    let n_targ_alleles = targ.n_alleles();
+    let mut targ_to_ref = vec![-1i8; n_targ_alleles];
+    let mut all_matched = true;
+
+    // Build reference allele lookup
+    let ref_alleles: Vec<&Allele> = std::iter::once(&ref_marker.ref_allele)
+        .chain(ref_marker.alt_alleles.iter())
+        .collect();
+
+    // Try to match each target allele (with complement)
+    for (t_idx, t_allele) in std::iter::once(&targ.ref_allele)
+        .chain(targ.alt_alleles.iter())
+        .enumerate()
+    {
+        let flipped = t_allele.complement();
+        let mut found = false;
+        for (r_idx, &r_allele) in ref_alleles.iter().enumerate() {
+            if &flipped == r_allele {
+                targ_to_ref[t_idx] = r_idx as i8;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            all_matched = false;
+        }
+    }
+
+    let alleles_swapped = targ_to_ref.get(0) == Some(&1);
+
+    if all_matched {
+        Some(AlleleMapping {
+            targ_to_ref,
+            strand_flipped: true,
+            alleles_swapped,
+        })
+    } else {
+        None
+    }
+}
+
+/// Check if a marker can potentially have ambiguous strand (A/T or C/G SNV)
+pub fn is_strand_ambiguous(marker: &Marker) -> bool {
+    if !marker.is_snv() || !marker.is_biallelic() {
+        return false;
+    }
+
+    let ref_allele = &marker.ref_allele;
+    let alt_allele = marker.alt_alleles.first();
+
+    match (ref_allele, alt_allele) {
+        (Allele::Base(0), Some(Allele::Base(3))) => true, // A/T
+        (Allele::Base(3), Some(Allele::Base(0))) => true, // T/A
+        (Allele::Base(1), Some(Allele::Base(2))) => true, // C/G
+        (Allele::Base(2), Some(Allele::Base(1))) => true, // G/C
+        _ => false,
     }
 }
 

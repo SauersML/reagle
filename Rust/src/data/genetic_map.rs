@@ -40,8 +40,8 @@ pub struct GeneticMap {
 impl GeneticMap {
     /// Create a new genetic map
     pub fn new(chrom: ChromIdx, positions: Vec<u32>, gen_positions: Vec<f64>) -> Self {
-        debug_assert_eq!(positions.len(), gen_positions.len());
-        debug_assert!(positions.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(positions.len(), gen_positions.len());
+        assert!(positions.windows(2).all(|w| w[0] <= w[1]));
         Self {
             chrom,
             positions,

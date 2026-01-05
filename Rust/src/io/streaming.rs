@@ -10,15 +10,16 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
 
 use noodles::bgzf;
 
-use crate::data::genetic_map::{GeneticMap, GeneticMaps};
+use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::Samples;
-use crate::data::marker::{Allele, ChromIdx, Marker, MarkerIdx, Markers};
+use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
+use crate::data::ChromIdx;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::error::{ReagleError, Result};
 use crate::io::vcf::VcfWriter;
@@ -249,7 +250,6 @@ impl StreamingVcfReader {
 
         for i in 0..window_end {
             let bm = &self.buffer[i];
-            markers.add_chrom_idx(bm.marker.chrom);
             markers.push(bm.marker.clone());
             columns.push(GenotypeColumn::from_alleles(&bm.alleles, 2));
         }
@@ -321,13 +321,13 @@ impl StreamingVcfReader {
                 return Ok(None);
             }
 
-            let line = self.line_buf.trim();
+            let line = self.line_buf.trim().to_string();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
 
             // Parse the VCF line
-            return self.parse_vcf_line(line).map(Some);
+            return self.parse_vcf_line(&line).map(Some);
         }
     }
 

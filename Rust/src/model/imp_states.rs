@@ -11,7 +11,7 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
 
-use crate::data::HapIdx;
+
 use crate::model::pbwt::PbwtDivUpdater;
 
 /// A segment of a composite haplotype
@@ -483,7 +483,7 @@ impl ImpStates {
         self.ibs.reset();
     }
 
-    fn update_with_ibs_hap(&mut self, hap: u32, step: i32, step_start: usize) {
+    fn update_with_ibs_hap(&mut self, hap: u32, step: i32, _step_start: usize) {
         const NIL: i32 = i32::MIN;
 
         if self.hap_to_last_ibs.get(&hap).copied().unwrap_or(NIL) == NIL {
