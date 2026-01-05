@@ -168,13 +168,21 @@ impl PhasingPipeline {
                     .map(|&h| geno.haplotype(h))
                     .collect();
 
-                // Run phasing HMM
+                // Run forward-backward HMM
+                let fwd1 = self.forward_pass(&alleles1, &ref_alleles, gen_dists, &mut workspace);
+                let bwd1 = self.backward_pass(&alleles1, &ref_alleles, gen_dists, &mut workspace);
+                let fwd2 = self.forward_pass(&alleles2, &ref_alleles, gen_dists, &mut workspace);
+                let bwd2 = self.backward_pass(&alleles2, &ref_alleles, gen_dists, &mut workspace);
+
                 let switch_markers = self.phase_sample(
                     &alleles1,
                     &alleles2,
                     &het_markers,
                     &ref_alleles,
-                    gen_dists,
+                    fwd1.as_slice(),
+                    bwd1.as_slice(),
+                    fwd2.as_slice(),
+                    bwd2.as_slice(),
                     &mut workspace,
                 );
 
@@ -273,7 +281,10 @@ impl PhasingPipeline {
         alleles2: &[u8],
         het_markers: &[usize],
         ref_alleles: &[Vec<u8>],
-        gen_dists: &[f64],
+        fwd1: &[Vec<f32>],
+        bwd1: &[Vec<f32>],
+        fwd2: &[Vec<f32>],
+        bwd2: &[Vec<f32>],
         workspace: &mut Workspace,
     ) -> Vec<usize> {
         let _n_markers = alleles1.len();
@@ -283,46 +294,26 @@ impl PhasingPipeline {
             return Vec::new();
         }
 
-        // Compute forward probabilities for haplotype 1
-        let fwd1 = self.forward_pass(alleles1, ref_alleles, gen_dists, workspace);
-        
-        // Compute forward probabilities for haplotype 2
-        let fwd2 = self.forward_pass(alleles2, ref_alleles, gen_dists, workspace);
-
-        // Decide phase switches based on likelihood comparison
+        // Decide phase switches based on posterior probabilities
         let mut switch_markers = Vec::new();
-        
-        // Simple phase decision: at each het site, check if swapping improves likelihood
+        let mut current_phase_swapped = false;
+
         for &m in het_markers {
-            // Current assignment likelihood (sum over states)
-            let _curr_ll = fwd1[m].iter().sum::<f32>().ln() + fwd2[m].iter().sum::<f32>().ln();
-            
-            // For swap, we'd need to recompute with swapped alleles
-            // Simplified: use emission probability comparison
-            let a1 = alleles1[m];
-            let a2 = alleles2[m];
-            
-            let mut curr_match = 0.0f32;
-            let mut swap_match = 0.0f32;
-            
-            for (s, ref_hap) in ref_alleles.iter().enumerate() {
-                let ref_a = ref_hap[m];
-                let weight = fwd1[m][s] + fwd2[m][s];
-                
-                if a1 == ref_a {
-                    curr_match += weight;
-                }
-                if a2 == ref_a {
-                    swap_match += weight;
-                }
-            }
-            
-            // Random component for exploration (especially in burnin)
-            let rand_val = workspace.next_f32();
-            let threshold = 0.5 + 0.3 * (swap_match - curr_match) / (swap_match + curr_match + 1e-10);
-            
-            if rand_val > threshold && swap_match > curr_match {
+            // Calculate probability of current phasing (hap1->fwd1, hap2->fwd2)
+            let p_no_switch1: f32 = (0..n_states).map(|s| fwd1[m][s] * bwd1[m][s]).sum();
+            let p_no_switch2: f32 = (0..n_states).map(|s| fwd2[m][s] * bwd2[m][s]).sum();
+            let p_no_switch = p_no_switch1 * p_no_switch2;
+
+            // Calculate probability of swapped phasing (hap1->fwd2, hap2->fwd1)
+            let p_switch1: f32 = (0..n_states).map(|s| fwd1[m][s] * bwd2[m][s]).sum();
+            let p_switch2: f32 = (0..n_states).map(|s| fwd2[m][s] * bwd1[m][s]).sum();
+            let p_switch = p_switch1 * p_switch2;
+
+            // Compare probabilities to decide on a switch
+            let swap = p_switch > p_no_switch;
+            if swap != current_phase_swapped {
                 switch_markers.push(m);
+                current_phase_swapped = !current_phase_swapped;
             }
         }
 
@@ -382,6 +373,67 @@ impl PhasingPipeline {
         }
 
         fwd
+    }
+
+    /// Backward pass of HMM
+    fn backward_pass(
+        &self,
+        target_alleles: &[u8],
+        ref_alleles: &[Vec<u8>],
+        gen_dists: &[f64],
+        _workspace: &mut Workspace,
+    ) -> Vec<Vec<f32>> {
+        let n_markers = target_alleles.len();
+        let n_states = ref_alleles.len();
+
+        if n_states == 0 || n_markers == 0 {
+            return vec![];
+        }
+
+        let mut bwd = vec![vec![0.0f32; n_states]; n_markers];
+
+        // Initialize: At the last position, prob is 1.0 for all states.
+        // We normalize at each step, so starting with 1.0 is fine.
+        for s in 0..n_states {
+            bwd[n_markers - 1][s] = 1.0;
+        }
+
+        // Backward recursion from m = n_markers - 2 down to 0
+        for m in (0..n_markers - 1).rev() {
+            let gen_dist = gen_dists.get(m).copied().unwrap_or(0.01);
+            let p_switch = self.params.switch_prob(gen_dist);
+            let p_stay = 1.0 - p_switch;
+            let p_switch_to = p_switch / n_states as f32;
+
+            // Pre-calculate emission probabilities for the next marker (m+1)
+            let mut emit_probs_next = vec![0.0f32; n_states];
+            for s in 0..n_states {
+                emit_probs_next[s] =
+                    self.emission_prob(target_alleles[m + 1], ref_alleles[s][m + 1]);
+            }
+
+            // Calculate the weighted sum of backward probabilities from the next step
+            let bwd_sum_term: f32 = (0..n_states)
+                .map(|s_next| bwd[m + 1][s_next] * emit_probs_next[s_next])
+                .sum();
+
+            // Calculate backward probabilities for current marker m
+            for s in 0..n_states {
+                let term1 = p_stay * bwd[m + 1][s] * emit_probs_next[s];
+                let term2 = p_switch_to * bwd_sum_term;
+                bwd[m][s] = term1 + term2;
+            }
+
+            // Normalize to prevent underflow
+            let sum: f32 = bwd[m].iter().sum();
+            if sum > 0.0 {
+                for p in &mut bwd[m] {
+                    *p /= sum;
+                }
+            }
+        }
+
+        bwd
     }
 
     /// Emission probability
