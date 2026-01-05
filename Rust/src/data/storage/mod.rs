@@ -16,7 +16,6 @@ pub use dictionary::DictionaryColumn;
 pub use matrix::GenotypeMatrix;
 pub use mutable::MutableGenotypes;
 pub use sparse::SparseColumn;
-pub use view::GenotypeView;
 
 use crate::data::HapIdx;
 
