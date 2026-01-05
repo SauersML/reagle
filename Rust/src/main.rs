@@ -79,10 +79,10 @@ mod tests {
         // Verify all modules are accessible
         let _ = config::Config::parse_and_validate;
         let _ = error::ReagleError::vcf("test");
-        let _ = data::MarkerIdx::new;
-        let _ = io::VcfReader::open;
-        let _ = model::ModelParams::new;
+        let _ = data::marker::MarkerIdx::new;
+        let _ = io::vcf::VcfReader::open;
+        let _ = model::parameters::ModelParams::new;
         let _ = pipelines::PhasingPipeline::new;
-        let _ = utils::Workspace::new;
+
     }
 }

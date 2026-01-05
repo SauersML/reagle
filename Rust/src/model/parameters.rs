@@ -342,74 +342,32 @@ impl ParamEstimates {
     }
 }
 
-/// Thread-safe wrapper for ParamEstimates using atomics
+/// Thread-safe wrapper for ParamEstimates using Mutex
+/// 
+/// Uses interior mutability for correct float accumulation across threads.
 #[derive(Debug)]
 pub struct AtomicParamEstimates {
-    sum_switch_probs: std::sync::atomic::AtomicU64,
-    sum_expected_switches: std::sync::atomic::AtomicU64,
-    sum_match_probs: std::sync::atomic::AtomicU64,
-    sum_mismatch_probs: std::sync::atomic::AtomicU64,
-    n_switch_obs: std::sync::atomic::AtomicUsize,
-    n_emit_obs: std::sync::atomic::AtomicUsize,
+    inner: std::sync::Mutex<ParamEstimates>,
 }
 
 impl AtomicParamEstimates {
     /// Create new empty estimates
     pub fn new() -> Self {
-        use std::sync::atomic::AtomicU64;
-        use std::sync::atomic::AtomicUsize;
-
         Self {
-            sum_switch_probs: AtomicU64::new(0),
-            sum_expected_switches: AtomicU64::new(0),
-            sum_match_probs: AtomicU64::new(0),
-            sum_mismatch_probs: AtomicU64::new(0),
-            n_switch_obs: AtomicUsize::new(0),
-            n_emit_obs: AtomicUsize::new(0),
+            inner: std::sync::Mutex::new(ParamEstimates::new()),
         }
     }
 
     /// Add estimation data from a local ParamEstimates
     pub fn add_estimation_data(&self, estimates: &ParamEstimates) {
-        use std::sync::atomic::Ordering;
-
-        // Convert f64 to bits for atomic addition
-        self.sum_switch_probs.fetch_add(
-            estimates.sum_switch_probs.to_bits(),
-            Ordering::Relaxed,
-        );
-        self.sum_expected_switches.fetch_add(
-            estimates.sum_expected_switches.to_bits(),
-            Ordering::Relaxed,
-        );
-        self.sum_match_probs.fetch_add(
-            estimates.sum_match_probs.to_bits(),
-            Ordering::Relaxed,
-        );
-        self.sum_mismatch_probs.fetch_add(
-            estimates.sum_mismatch_probs.to_bits(),
-            Ordering::Relaxed,
-        );
-        self.n_switch_obs
-            .fetch_add(estimates.n_switch_obs, Ordering::Relaxed);
-        self.n_emit_obs
-            .fetch_add(estimates.n_emit_obs, Ordering::Relaxed);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.merge(estimates);
+        }
     }
 
     /// Convert to regular ParamEstimates
     pub fn to_estimates(&self) -> ParamEstimates {
-        use std::sync::atomic::Ordering;
-
-        ParamEstimates {
-            sum_switch_probs: f64::from_bits(self.sum_switch_probs.load(Ordering::Relaxed)),
-            sum_expected_switches: f64::from_bits(
-                self.sum_expected_switches.load(Ordering::Relaxed),
-            ),
-            sum_match_probs: f64::from_bits(self.sum_match_probs.load(Ordering::Relaxed)),
-            sum_mismatch_probs: f64::from_bits(self.sum_mismatch_probs.load(Ordering::Relaxed)),
-            n_switch_obs: self.n_switch_obs.load(Ordering::Relaxed),
-            n_emit_obs: self.n_emit_obs.load(Ordering::Relaxed),
-        }
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 

@@ -102,6 +102,8 @@ impl HmmUpdater {
     }
 
     /// Forward update with allele comparison (convenience wrapper)
+    /// 
+    /// Missing data (allele 255) is treated as uninformative (no emission penalty).
     #[inline]
     pub fn fwd_update_alleles(
         fwd: &mut [f32],
@@ -118,7 +120,14 @@ impl HmmUpdater {
 
         let mut new_sum = 0.0f32;
         for k in 0..n_states {
-            let mismatch = if ref_alleles[k] == target_allele { 0 } else { 1 };
+            // Missing data (255) - no penalty, use match emission
+            let mismatch = if target_allele == 255 || ref_alleles[k] == 255 {
+                0
+            } else if ref_alleles[k] == target_allele {
+                0
+            } else {
+                1
+            };
             let emit = emit_probs[mismatch];
             fwd[k] = emit * (scale * fwd[k] + shift);
             new_sum += fwd[k];
@@ -127,6 +136,8 @@ impl HmmUpdater {
     }
 
     /// Backward update with allele comparison (convenience wrapper)
+    /// 
+    /// Missing data (allele 255) is treated as uninformative (no emission penalty).
     #[inline]
     pub fn bwd_update_alleles(
         bwd: &mut [f32],
@@ -141,7 +152,14 @@ impl HmmUpdater {
         // First: multiply by emission and compute sum
         let mut sum = 0.0f32;
         for k in 0..n_states {
-            let mismatch = if ref_alleles[k] == target_allele { 0 } else { 1 };
+            // Missing data (255) - no penalty, use match emission
+            let mismatch = if target_allele == 255 || ref_alleles[k] == 255 {
+                0
+            } else if ref_alleles[k] == target_allele {
+                0
+            } else {
+                1
+            };
             bwd[k] *= emit_probs[mismatch];
             sum += bwd[k];
         }

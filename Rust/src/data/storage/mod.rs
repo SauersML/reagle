@@ -11,13 +11,11 @@ pub mod mutable;
 pub mod sparse;
 pub mod view;
 
-pub use coded_steps::{CodedStep, RefPanelCoded, CodedPbwt, compute_step_starts};
 pub use dense::DenseColumn;
 pub use dictionary::DictionaryColumn;
 pub use matrix::GenotypeMatrix;
 pub use mutable::MutableGenotypes;
 pub use sparse::SparseColumn;
-pub use view::GenotypeView;
 
 use crate::data::HapIdx;
 
