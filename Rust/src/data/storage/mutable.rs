@@ -49,6 +49,12 @@ impl MutableGenotypes {
         self.n_haps
     }
 
+    /// Number of samples (assuming diploid)
+    #[inline]
+    pub fn n_samples(&self) -> usize {
+        self.n_haps / 2
+    }
+
     /// Get allele at (marker, haplotype)
     #[inline]
     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
@@ -118,6 +124,10 @@ mod tests {
     #[test]
     fn test_mutable_genotypes() {
         let mut geno = MutableGenotypes::new(3, 4);
+
+        assert_eq!(geno.n_markers(), 3);
+        assert_eq!(geno.n_haps(), 4);
+        assert_eq!(geno.n_samples(), 2);
         
         // Set some values
         geno.set(0, HapIdx::new(0), 1);

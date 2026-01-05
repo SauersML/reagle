@@ -1,37 +1,28 @@
-diff --git a/Rust/src/pipelines/phasing.rs b/Rust/src/pipelines/phasing.rs
-index 61dfe6f..01cba94 100644
---- a/Rust/src/pipelines/phasing.rs
-+++ b/Rust/src/pipelines/phasing.rs
-@@ -400,23 +400,24 @@ impl PhasingPipeline {
-         let mut pbwt = PbwtIbs::new(n_haps);
-         let mut updater = PbwtDivUpdater::new(n_haps);
+diff --git a/Rust/src/data/storage/mutable.rs b/Rust/src/data/storage/mutable.rs
+index b0ee41b..31a472f 100644
+--- a/Rust/src/data/storage/mutable.rs
++++ b/Rust/src/data/storage/mutable.rs
+@@ -49,6 +49,12 @@ impl MutableGenotypes {
+         self.n_haps
+     }
  
-+        // Pre-allocate buffers to avoid allocations in the loop
-+        let mut temp_prefix = pbwt.fwd_prefix().to_vec();
-+        let mut temp_div = pbwt.fwd_divergence().to_vec();
++    /// Number of samples (assuming diploid)
++    #[inline]
++    pub fn n_samples(&self) -> usize {
++        self.n_haps / 2
++    }
 +
-         for m in 0..n_markers {
-             let alleles = geno.marker_alleles(m);
--            
+     /// Get allele at (marker, haplotype)
+     #[inline]
+     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
+@@ -118,6 +124,10 @@ mod tests {
+     #[test]
+     fn test_mutable_genotypes() {
+         let mut geno = MutableGenotypes::new(3, 4);
 +
-             // Determine number of alleles (usually 2 for biallelic)
-             let n_alleles = alleles.iter().copied().max().unwrap_or(0) as usize + 1;
- 
--            let mut temp_prefix = pbwt.fwd_prefix().to_vec();
--            let mut temp_div: Vec<i32> = pbwt.fwd_divergence().iter().map(|&x| x).collect();
-+            // Copy current PBWT state to temp buffers
-+            temp_prefix.copy_from_slice(pbwt.fwd_prefix());
-+            temp_div.copy_from_slice(pbwt.fwd_divergence());
- 
-             updater.fwd_update(alleles, n_alleles.max(2), m, &mut temp_prefix, &mut temp_div);
- 
-             pbwt.fwd_prefix_mut().copy_from_slice(&temp_prefix);
--            for (i, &d) in temp_div.iter().enumerate() {
--                if i < pbwt.fwd_divergence_mut().len() {
--                    pbwt.fwd_divergence_mut()[i] = d;
--                }
--            }
-+            pbwt.fwd_divergence_mut().copy_from_slice(&temp_div);
-         }
- 
-         pbwt
++        assert_eq!(geno.n_markers(), 3);
++        assert_eq!(geno.n_haps(), 4);
++        assert_eq!(geno.n_samples(), 2);
+         
+         // Set some values
+         geno.set(0, HapIdx::new(0), 1);
