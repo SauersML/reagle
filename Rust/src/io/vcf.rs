@@ -260,13 +260,15 @@ impl VcfReader {
 
             // Parse VCF record
             let (marker, alleles, record_phased) = self.parse_record(line, &mut markers, line_num)?;
-            
+
             if !record_phased {
                 is_phased = false;
             }
 
+            // Calculate actual number of alleles: 1 REF + N ALT
+            let n_alleles = 1 + marker.alt_alleles.len();
             markers.push(marker);
-            let column = GenotypeColumn::from_alleles(&alleles, 2); // Assume biallelic for now
+            let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
             columns.push(column);
         }
 
@@ -314,6 +316,10 @@ impl VcfReader {
             .map(|a| Allele::from_str(a))
             .collect();
 
+        // Parse INFO field for END tag (field[7])
+        // This is important for structural variants and gVCF blocks
+        let end_pos = parse_info_end(fields[7], pos, &ref_allele);
+
         // Parse FORMAT to find GT position
         let format = fields[8];
         let gt_idx = format
@@ -347,10 +353,40 @@ impl VcfReader {
             alleles.push(a2);
         }
 
-        let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles);
+        let marker = Marker::with_end(chrom_idx, pos, end_pos, id, ref_allele, alt_alleles);
 
         Ok((marker, alleles, is_phased))
     }
+}
+
+/// Parse END tag from INFO field
+///
+/// Looks for "END=<number>" in the INFO field for structural variants and gVCF blocks.
+/// If not found, returns pos + ref_length - 1 (standard VCF behavior).
+///
+/// # Arguments
+/// * `info` - The INFO field string
+/// * `pos` - The POS field value
+/// * `ref_allele` - The reference allele (to compute default end)
+fn parse_info_end(info: &str, pos: u32, ref_allele: &Allele) -> u32 {
+    // Default end: pos + ref_length - 1
+    let default_end = pos + ref_allele.len().saturating_sub(1) as u32;
+
+    // Check for empty INFO
+    if info.is_empty() || info == "." {
+        return default_end;
+    }
+
+    // Look for END= tag
+    for field in info.split(';') {
+        if field.starts_with("END=") {
+            if let Ok(end) = field[4..].parse::<u32>() {
+                return end;
+            }
+        }
+    }
+
+    default_end
 }
 
 /// Parse a genotype field (e.g., "0|1", "0/1", ".")

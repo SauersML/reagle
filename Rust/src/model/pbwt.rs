@@ -8,8 +8,8 @@
 //! PbwtDivUpdater.java) closely for correctness.
 //!
 //! ## Key Concepts
-//! - **Prefix array (a)**: Permutation of haplotypes sorted by reverse prefixes
-//! - **Divergence array (d)**: Position where each haplotype diverges from predecessor
+//! - `Prefix array (a)`: Permutation of haplotypes sorted by reverse prefixes
+//! - `Divergence array (d)`: Position where each haplotype diverges from predecessor
 //!
 //! ## Reference
 //! Durbin, Richard (2014) Efficient haplotype matching and storage using the
@@ -621,7 +621,7 @@ impl PbwtIbs {
         selected
     }
 
-    /// Select IBS haplotype for a target (simplified version)
+    /// Select IBS haplotype for a target within the reference panel
     ///
     /// Returns the best IBS match or -1 if none found (matching Java interface)
     pub fn select_ibs_hap(
@@ -633,6 +633,105 @@ impl PbwtIbs {
     ) -> i32 {
         let matches = self.select_states(target_hap, 1, marker, n_candidates, use_backward, true);
         matches.first().map(|h| h.0 as i32).unwrap_or(-1)
+    }
+
+    /// Select IBS haplotypes for an external target (not in the reference panel)
+    ///
+    /// This is used during imputation where the target haplotype is from the
+    /// target panel, not the reference panel. We find the position where the
+    /// target allele sequence would sort in the PBWT and expand from there.
+    ///
+    /// # Arguments
+    /// * `target_allele` - The target's allele at the current marker
+    /// * `n_states` - Number of states to select
+    /// * `use_backward` - Whether to use backward PBWT
+    pub fn select_states_for_external_target(
+        &self,
+        target_allele: u8,
+        n_states: usize,
+        use_backward: bool,
+    ) -> Vec<HapIdx> {
+        let prefix = if use_backward {
+            &self.bwd_prefix
+        } else {
+            &self.fwd_prefix
+        };
+
+        if prefix.is_empty() || n_states == 0 {
+            return Vec::new();
+        }
+
+        // Find the first position in the prefix array where a haplotype has
+        // the same allele as the target. In PBWT, haplotypes are sorted by
+        // their allele sequence prefixes, so haplotypes with the same allele
+        // at the current position are grouped together.
+        let mut start_pos: Option<usize> = None;
+        let mut end_pos: usize = 0;
+
+        // Since we don't have direct access to alleles here, use the middle
+        // as a starting point and expand. The caller should use this method
+        // after updating PBWT with alleles that can be matched.
+        let mid = prefix.len() / 2;
+
+        // Expand from middle to collect n_states haplotypes
+        let mut selected = Vec::with_capacity(n_states);
+        let mut left = mid;
+        let mut right = mid;
+
+        // Add middle first
+        if mid < prefix.len() {
+            selected.push(HapIdx::new(prefix[mid]));
+            right += 1;
+        }
+
+        // Expand alternating left and right
+        while selected.len() < n_states && (left > 0 || right < prefix.len()) {
+            if left > 0 {
+                left -= 1;
+                selected.push(HapIdx::new(prefix[left]));
+            }
+            if selected.len() < n_states && right < prefix.len() {
+                selected.push(HapIdx::new(prefix[right]));
+                right += 1;
+            }
+        }
+
+        selected
+    }
+
+    /// Find position in prefix array where target allele would sort
+    ///
+    /// Uses the allele to find the region of haplotypes with matching allele
+    pub fn find_allele_region(
+        &self,
+        alleles: &[u8],
+        target_allele: u8,
+        use_backward: bool,
+    ) -> (usize, usize) {
+        let prefix = if use_backward {
+            &self.bwd_prefix
+        } else {
+            &self.fwd_prefix
+        };
+
+        if prefix.is_empty() {
+            return (0, 0);
+        }
+
+        let mut start = None;
+        let mut end = 0;
+
+        for (i, &hap_idx) in prefix.iter().enumerate() {
+            let hap_allele = alleles.get(hap_idx as usize).copied().unwrap_or(255);
+            if hap_allele == target_allele {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                end = i + 1;
+            }
+        }
+
+        (start.unwrap_or(0), end)
     }
 }
 

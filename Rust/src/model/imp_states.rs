@@ -238,31 +238,63 @@ impl ImpIbs {
         );
     }
 
-    /// Find IBS haplotypes for a target allele sequence at current PBWT position
+    /// Find IBS haplotypes for a target allele at current PBWT position
+    ///
+    /// This is the key method for imputation: we find reference haplotypes that
+    /// are IBS with the target by locating where the target's allele pattern
+    /// would sort in the PBWT prefix array.
+    ///
+    /// # Arguments
+    /// * `target_allele` - The target's allele at the last marker of this step
+    /// * `ref_alleles` - Reference panel alleles at the last marker (indexed by hap)
+    /// * `step` - Current step number (for divergence checking)
     ///
     /// Returns haplotype indices that are IBS with the target
-    pub fn find_ibs_haps(&self, target_seq_idx: usize, step: usize) -> Vec<u32> {
-        // Find position of target in prefix array (or closest match)
-        let target_pos = self.find_target_position(target_seq_idx);
+    pub fn find_ibs_haps_for_allele(
+        &self,
+        target_allele: u8,
+        ref_alleles: &[u8],
+        step: usize,
+    ) -> Vec<u32> {
+        let n = self.fwd_prefix.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Find the region in the prefix array where haplotypes have the same
+        // allele as the target. In PBWT, haplotypes are sorted by their prefix
+        // sequences, so haplotypes with the same allele at the current position
+        // tend to be grouped together.
+        let (region_start, region_end) = self.find_allele_region(target_allele, ref_alleles);
+
+        // Start from the middle of the matching region
+        let target_pos = if region_end > region_start {
+            (region_start + region_end) / 2
+        } else {
+            n / 2
+        };
 
         // Expand from target position to find IBS neighbors
         let mut result = Vec::with_capacity(self.n_ibs_haps);
-        let n = self.fwd_prefix.len();
-
-        let mut left = target_pos;
-        let mut right = target_pos + 1;
         let step_i32 = step as i32;
 
+        let mut left = target_pos;
+        let mut right = if target_pos < n { target_pos + 1 } else { n };
+
+        // First, add haplotypes with matching allele and valid IBS
         while result.len() < self.n_ibs_haps && (left > 0 || right < n) {
             // Check left neighbor
             if left > 0 {
                 left -= 1;
                 let hap = self.fwd_prefix[left];
                 if hap < self.n_ref_haps as u32 {
-                    // Check if IBS (divergence <= current step)
-                    let div = self.fwd_divergence.get(left + 1).copied().unwrap_or(0);
-                    if div <= step_i32 {
-                        result.push(hap);
+                    let hap_allele = ref_alleles.get(hap as usize).copied().unwrap_or(255);
+                    // Prefer haplotypes with matching allele
+                    if hap_allele == target_allele {
+                        let div = self.fwd_divergence.get(left + 1).copied().unwrap_or(0);
+                        if div <= step_i32 {
+                            result.push(hap);
+                        }
                     }
                 }
             }
@@ -271,19 +303,23 @@ impl ImpIbs {
             if right < n && result.len() < self.n_ibs_haps {
                 let hap = self.fwd_prefix[right];
                 if hap < self.n_ref_haps as u32 {
-                    let div = self.fwd_divergence.get(right).copied().unwrap_or(0);
-                    if div <= step_i32 {
-                        result.push(hap);
+                    let hap_allele = ref_alleles.get(hap as usize).copied().unwrap_or(255);
+                    if hap_allele == target_allele {
+                        let div = self.fwd_divergence.get(right).copied().unwrap_or(0);
+                        if div <= step_i32 {
+                            result.push(hap);
+                        }
                     }
                 }
                 right += 1;
             }
         }
 
-        // If we still don't have enough, just add nearby haplotypes
+        // If we still don't have enough, add nearby haplotypes regardless of allele
         if result.len() < self.n_ibs_haps {
-            let mut left = target_pos;
-            let mut right = target_pos + 1;
+            left = target_pos;
+            right = if target_pos < n { target_pos + 1 } else { n };
+
             while result.len() < self.n_ibs_haps && (left > 0 || right < n) {
                 if left > 0 {
                     left -= 1;
@@ -305,10 +341,29 @@ impl ImpIbs {
         result
     }
 
-    fn find_target_position(&self, target_seq_idx: usize) -> usize {
-        // For imputation, target is not in prefix array
-        // Return middle position as starting point
-        self.fwd_prefix.len() / 2
+    /// Find the region in prefix array where haplotypes have the target allele
+    fn find_allele_region(&self, target_allele: u8, ref_alleles: &[u8]) -> (usize, usize) {
+        let mut start = None;
+        let mut end = 0;
+
+        for (i, &hap_idx) in self.fwd_prefix.iter().enumerate() {
+            let hap_allele = ref_alleles.get(hap_idx as usize).copied().unwrap_or(255);
+            if hap_allele == target_allele {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                end = i + 1;
+            }
+        }
+
+        (start.unwrap_or(0), end)
+    }
+
+    /// Legacy method for backwards compatibility
+    pub fn find_ibs_haps(&self, target_allele: u8, step: usize) -> Vec<u32> {
+        // Create a dummy ref_alleles array based on prefix order
+        let ref_alleles: Vec<u8> = (0..self.n_ref_haps).map(|_| 0).collect();
+        self.find_ibs_haps_for_allele(target_allele, &ref_alleles, step)
     }
 }
 
@@ -392,9 +447,16 @@ impl ImpStates {
                 self.ibs.update(&alleles, n_alleles.max(2), m);
             }
 
-            // Find IBS haplotypes for target
-            let target_seq = 0; // Placeholder - would need proper sequence matching
-            let ibs_haps = self.ibs.find_ibs_haps(target_seq, step);
+            // Find IBS haplotypes for target using target's allele at last marker of step
+            let last_marker = step_end.saturating_sub(1);
+            let target_allele = target_alleles.get(last_marker).copied().unwrap_or(255);
+
+            // Get reference alleles at the last marker for allele-aware IBS finding
+            let ref_alleles: Vec<u8> = (0..self.ibs.n_ref_haps as u32)
+                .map(|h| get_ref_allele(last_marker, h))
+                .collect();
+
+            let ibs_haps = self.ibs.find_ibs_haps_for_allele(target_allele, &ref_alleles, step);
 
             // Update composite haplotypes with IBS matches
             for hap in ibs_haps {

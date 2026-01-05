@@ -3,9 +3,11 @@
 //! Orchestrates the imputation workflow:
 //! 1. Load target and reference VCFs
 //! 2. Align markers between target and reference
-//! 3. Run Li-Stephens HMM for each target haplotype with dynamic PBWT state selection
-//! 4. Interpolate state probabilities for ungenotyped markers
-//! 5. Compute dosages and write output with quality metrics (DR2, AF)
+//! 3. Process data in overlapping sliding windows (for memory efficiency)
+//! 4. Run Li-Stephens HMM for each target haplotype with dynamic PBWT state selection
+//! 5. Interpolate state probabilities for ungenotyped markers
+//! 6. Splice window results at overlap midpoints
+//! 7. Compute dosages and write output with quality metrics (DR2, AF)
 //!
 //! This matches Java `imp/ImpLS.java`, `imp/ImpLSBaum.java`, and related classes.
 
@@ -19,11 +21,86 @@ use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
 use crate::error::Result;
-use crate::io::vcf::{VcfReader, VcfWriter, ImputationQuality, MarkerImputationStats};
+use crate::io::vcf::{VcfReader, VcfWriter, ImputationQuality};
+use crate::io::window::WindowIndices;
 use crate::model::hmm::LiStephensHmm;
 use crate::model::imp_states::{CodedStepsConfig, ImpStates};
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtIbs;
+
+/// Results from processing a single window
+///
+/// Contains dosages and quality metrics that need to be spliced together
+/// from overlapping windows.
+#[derive(Clone)]
+pub struct WindowResult {
+    /// Dosages for each sample at each marker in this window [marker][sample]
+    pub dosages: Vec<Vec<f32>>,
+    /// Quality statistics for each marker
+    pub quality: ImputationQuality,
+    /// Window indices (splice points)
+    pub indices: WindowIndices,
+}
+
+impl WindowResult {
+    /// Create new window result
+    pub fn new(n_markers: usize, n_samples: usize, indices: WindowIndices) -> Self {
+        let n_alleles_per_marker = vec![2usize; n_markers]; // Assume biallelic
+        Self {
+            dosages: vec![vec![0.0; n_samples]; n_markers],
+            quality: ImputationQuality::new(n_markers, &n_alleles_per_marker),
+            indices,
+        }
+    }
+}
+
+/// Splice window results together using overlap midpoints
+///
+/// This implements Java MarkerIndices splice point logic:
+/// - Each window computes results for its full range
+/// - Output is taken from prev_splice to next_splice
+/// - Splice points are at the middle of overlap regions
+///
+/// # Arguments
+/// * `results` - Vector of window results in order
+/// * `total_markers` - Total number of markers in output
+/// * `n_samples` - Number of samples
+pub fn splice_window_results(
+    results: &[WindowResult],
+    total_markers: usize,
+    n_samples: usize,
+) -> (Vec<Vec<f32>>, ImputationQuality) {
+    let n_alleles_per_marker = vec![2usize; total_markers];
+    let mut final_dosages = vec![vec![0.0f32; n_samples]; total_markers];
+    let mut final_quality = ImputationQuality::new(total_markers, &n_alleles_per_marker);
+
+    for result in results {
+        let indices = &result.indices;
+
+        // Only copy from prev_splice to next_splice (the "owned" region)
+        let local_splice_start = indices.prev_splice.saturating_sub(indices.start);
+        let local_splice_end = indices.next_splice.saturating_sub(indices.start).min(result.dosages.len());
+
+        for local_m in local_splice_start..local_splice_end {
+            let global_m = indices.start + local_m;
+            if global_m < total_markers {
+                // Copy dosages
+                if local_m < result.dosages.len() {
+                    final_dosages[global_m] = result.dosages[local_m].clone();
+                }
+
+                // Copy quality stats
+                if let Some(src_stats) = result.quality.get(local_m) {
+                    if let Some(dst_stats) = final_quality.get_mut(global_m) {
+                        *dst_stats = src_stats.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    (final_dosages, final_quality)
+}
 
 /// Imputation pipeline
 pub struct ImputationPipeline {
@@ -681,19 +758,51 @@ impl<'a> ImpLSBaum<'a> {
             return vec![0.0; n_markers];
         }
 
-        // Build PBWT on reference panel (could be done once and cached)
+        // Build PBWT on reference panel incrementally and select IBS states
         self.pbwt.reset();
+
+        // Create a synthetic "target haplotype" position tracker
+        // We'll select states based on IBS matches to the target at each marker
+        let n_ref_haps = self.ref_gt.n_haplotypes();
+
+        // Track cumulative IBS match scores for each reference haplotype
+        let mut ibs_scores: Vec<u32> = vec![0; n_ref_haps];
+
+        // Build PBWT and accumulate IBS scores
         for m in 0..n_markers {
-            let alleles: Vec<u8> = (0..self.ref_gt.n_haplotypes())
+            let target_allele = target_alleles.get(m).copied().unwrap_or(255);
+
+            let alleles: Vec<u8> = (0..n_ref_haps)
                 .map(|h| self.ref_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32)))
                 .collect();
+
+            // Increment IBS score for haplotypes matching target allele
+            if target_allele != 255 {
+                for (h, &allele) in alleles.iter().enumerate() {
+                    if allele == target_allele {
+                        ibs_scores[h] += 1;
+                    }
+                }
+            }
+
             self.pbwt.fwd_update(&alleles, 2, m);
         }
 
-        // For now, use simple state selection (first n_states haplotypes)
-        // A full implementation would select states per-cluster
-        let ref_haps: Vec<HapIdx> = (0..n_states.min(self.ref_gt.n_haplotypes()))
-            .map(|i| HapIdx::new(i as u32))
+        // Select top n_states haplotypes by IBS score
+        let mut scored_haps: Vec<(u32, usize)> = ibs_scores
+            .iter()
+            .enumerate()
+            .map(|(h, &score)| (score, h))
+            .collect();
+
+        // Sort by score descending
+        scored_haps.sort_by(|a, b| b.0.cmp(&a.0));
+
+        // Take top n_states
+        let ref_haps: Vec<HapIdx> = scored_haps
+            .iter()
+            .take(n_states.min(n_ref_haps))
+            .map(|&(_, h)| HapIdx::new(h as u32))
             .collect();
 
         impute_haplotype_internal(
