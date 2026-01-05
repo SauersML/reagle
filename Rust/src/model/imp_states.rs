@@ -194,7 +194,10 @@ impl CodedSteps {
     }
 }
 
-/// IBS haplotype finder using PBWT
+/// IBS haplotype finder using PBWT (forward and backward)
+///
+/// Java Beagle uses BOTH forward and backward PBWT to select states,
+/// ensuring we find haplotypes that match well in the past AND future.
 pub struct ImpIbs {
     /// PBWT updater
     pbwt_updater: PbwtDivUpdater,
@@ -202,8 +205,12 @@ pub struct ImpIbs {
     fwd_prefix: Vec<u32>,
     /// Forward divergence array
     fwd_divergence: Vec<i32>,
+    /// Backward prefix array
+    bwd_prefix: Vec<u32>,
+    /// Backward divergence array
+    bwd_divergence: Vec<i32>,
     /// Number of reference haplotypes
-    n_ref_haps: usize,
+    pub n_ref_haps: usize,
     /// Number of IBS haplotypes to return per step
     n_ibs_haps: usize,
 }
@@ -215,20 +222,42 @@ impl ImpIbs {
             pbwt_updater: PbwtDivUpdater::new(n_ref_haps),
             fwd_prefix: (0..n_ref_haps as u32).collect(),
             fwd_divergence: vec![0; n_ref_haps + 1],
+            bwd_prefix: (0..n_ref_haps as u32).collect(),
+            bwd_divergence: vec![0; n_ref_haps + 1],
             n_ref_haps,
             n_ibs_haps,
         }
     }
 
-    /// Reset PBWT state
+    /// Reset PBWT state (both forward and backward)
     pub fn reset(&mut self) {
+        for (i, p) in self.fwd_prefix.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        self.fwd_divergence.fill(0);
+        for (i, p) in self.bwd_prefix.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        self.bwd_divergence.fill(0);
+    }
+
+    /// Reset only forward PBWT
+    pub fn reset_fwd(&mut self) {
         for (i, p) in self.fwd_prefix.iter_mut().enumerate() {
             *p = i as u32;
         }
         self.fwd_divergence.fill(0);
     }
 
-    /// Update PBWT with alleles at a marker
+    /// Reset only backward PBWT
+    pub fn reset_bwd(&mut self) {
+        for (i, p) in self.bwd_prefix.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        self.bwd_divergence.fill(0);
+    }
+
+    /// Update forward PBWT with alleles at a marker
     pub fn update(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
         self.pbwt_updater.fwd_update(
             alleles,
@@ -236,6 +265,17 @@ impl ImpIbs {
             marker,
             &mut self.fwd_prefix,
             &mut self.fwd_divergence[..self.n_ref_haps],
+        );
+    }
+
+    /// Update backward PBWT with alleles at a marker
+    pub fn update_bwd(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
+        self.pbwt_updater.fwd_update(
+            alleles,
+            n_alleles,
+            marker,
+            &mut self.bwd_prefix,
+            &mut self.bwd_divergence[..self.n_ref_haps],
         );
     }
 
@@ -365,6 +405,110 @@ impl ImpIbs {
         // Create a dummy ref_alleles array based on prefix order
         let ref_alleles: Vec<u8> = (0..self.n_ref_haps).map(|_| 0).collect();
         self.find_ibs_haps_for_allele(target_allele, &ref_alleles, step)
+    }
+
+    /// Find IBS haplotypes using BACKWARD PBWT
+    ///
+    /// This finds haplotypes that match well in the FUTURE direction.
+    /// Java Beagle calls both fwdIbsHap() and bwdIbsHap() at each step.
+    pub fn find_bwd_ibs_haps_for_allele(
+        &self,
+        target_allele: u8,
+        ref_alleles: &[u8],
+        step: usize,
+    ) -> Vec<u32> {
+        let n = self.bwd_prefix.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Find region in backward prefix array with target allele
+        let (region_start, region_end) = self.find_bwd_allele_region(target_allele, ref_alleles);
+
+        let target_pos = if region_end > region_start {
+            (region_start + region_end) / 2
+        } else {
+            n / 2
+        };
+
+        let step_i32 = step as i32;
+        let mut result = Vec::with_capacity(self.n_ibs_haps);
+        let mut left = target_pos;
+        let mut right = if target_pos < n { target_pos + 1 } else { n };
+
+        // First pass: prefer haplotypes with matching allele and recent divergence
+        while result.len() < self.n_ibs_haps && (left > 0 || right < n) {
+            if left > 0 {
+                left -= 1;
+                let hap = self.bwd_prefix[left];
+                if hap < self.n_ref_haps as u32 {
+                    let hap_allele = ref_alleles.get(hap as usize).copied().unwrap_or(255);
+                    if hap_allele == target_allele {
+                        let div = self.bwd_divergence.get(left).copied().unwrap_or(0);
+                        if div <= step_i32 {
+                            result.push(hap);
+                        }
+                    }
+                }
+            }
+
+            if right < n && result.len() < self.n_ibs_haps {
+                let hap = self.bwd_prefix[right];
+                if hap < self.n_ref_haps as u32 {
+                    let hap_allele = ref_alleles.get(hap as usize).copied().unwrap_or(255);
+                    if hap_allele == target_allele {
+                        let div = self.bwd_divergence.get(right).copied().unwrap_or(0);
+                        if div <= step_i32 {
+                            result.push(hap);
+                        }
+                    }
+                }
+                right += 1;
+            }
+        }
+
+        // Fallback: add nearby haplotypes regardless of allele
+        if result.len() < self.n_ibs_haps {
+            left = target_pos;
+            right = if target_pos < n { target_pos + 1 } else { n };
+
+            while result.len() < self.n_ibs_haps && (left > 0 || right < n) {
+                if left > 0 {
+                    left -= 1;
+                    let hap = self.bwd_prefix[left];
+                    if hap < self.n_ref_haps as u32 && !result.contains(&hap) {
+                        result.push(hap);
+                    }
+                }
+                if right < n && result.len() < self.n_ibs_haps {
+                    let hap = self.bwd_prefix[right];
+                    if hap < self.n_ref_haps as u32 && !result.contains(&hap) {
+                        result.push(hap);
+                    }
+                    right += 1;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Find region in backward prefix array where haplotypes have target allele
+    fn find_bwd_allele_region(&self, target_allele: u8, ref_alleles: &[u8]) -> (usize, usize) {
+        let mut start = None;
+        let mut end = 0;
+
+        for (i, &hap_idx) in self.bwd_prefix.iter().enumerate() {
+            let hap_allele = ref_alleles.get(hap_idx as usize).copied().unwrap_or(255);
+            if hap_allele == target_allele {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                end = i + 1;
+            }
+        }
+
+        (start.unwrap_or(0), end)
     }
 }
 
@@ -663,6 +807,9 @@ impl ImpStatesLegacy {
     }
 
     /// Select IBS-based HMM states for a target haplotype (legacy version)
+    ///
+    /// Uses BOTH forward and backward PBWT passes to find IBS matches,
+    /// matching Java Beagle's LowFreqPhaseStates behavior.
     pub fn ibs_states<F>(
         &mut self,
         get_ref_allele: F,
@@ -675,18 +822,38 @@ impl ImpStatesLegacy {
     {
         self.initialize();
 
-        // Process each step
-        for step in 0..self.coded_steps.n_steps() {
+        let n_steps = self.coded_steps.n_steps();
+
+        // First, build backward PBWT by scanning markers in REVERSE order
+        // This allows us to find haplotypes that match well going forward from each position
+        self.ibs.reset_bwd();
+        for step in (0..n_steps).rev() {
             let step_start = self.coded_steps.step_start(step);
             let step_end = self.coded_steps.step_end(step);
 
-            // Update PBWT for markers in this step (naive approach)
+            // Update backward PBWT for markers in reverse
+            for m in (step_start..step_end).rev() {
+                let mut alleles: Vec<u8> = Vec::with_capacity(self.ibs.n_ref_haps);
+                for h in 0..self.ibs.n_ref_haps as u32 {
+                    alleles.push(get_ref_allele(m, h));
+                }
+                let n_alleles = alleles.iter().copied().max().unwrap_or(0) as usize + 1;
+                self.ibs.update_bwd(&alleles, n_alleles.max(2), m);
+            }
+        }
+
+        // Now process forward, collecting IBS haps from BOTH directions
+        self.ibs.reset_fwd();
+        for step in 0..n_steps {
+            let step_start = self.coded_steps.step_start(step);
+            let step_end = self.coded_steps.step_end(step);
+
+            // Update forward PBWT for markers in this step
             for m in step_start..step_end {
                 let mut alleles: Vec<u8> = Vec::with_capacity(self.ibs.n_ref_haps);
                 for h in 0..self.ibs.n_ref_haps as u32 {
                     alleles.push(get_ref_allele(m, h));
                 }
-                // Determine number of alleles
                 let n_alleles = alleles.iter().copied().max().unwrap_or(0) as usize + 1;
                 self.ibs.update(&alleles, n_alleles.max(2), m);
             }
@@ -700,10 +867,18 @@ impl ImpStatesLegacy {
                 .map(|h| get_ref_allele(last_marker, h))
                 .collect();
 
-            let ibs_haps = self.ibs.find_ibs_haps_for_allele(target_allele, &ref_alleles, step);
+            // Get IBS haps from FORWARD PBWT (matches from past)
+            let fwd_ibs_haps = self.ibs.find_ibs_haps_for_allele(target_allele, &ref_alleles, step);
 
-            // Update composite haplotypes with IBS matches
-            for hap in ibs_haps {
+            // Get IBS haps from BACKWARD PBWT (matches from future)
+            // Java Beagle: addIbsHap(ibsHaps.fwdIbsHap(...)); addIbsHap(ibsHaps.bwdIbsHap(...));
+            let bwd_ibs_haps = self.ibs.find_bwd_ibs_haps_for_allele(target_allele, &ref_alleles, step);
+
+            // Update composite haplotypes with IBS matches from BOTH directions
+            for hap in fwd_ibs_haps {
+                self.update_with_ibs_hap(hap, step as i32);
+            }
+            for hap in bwd_ibs_haps {
                 self.update_with_ibs_hap(hap, step as i32);
             }
         }

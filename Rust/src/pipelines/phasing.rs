@@ -116,9 +116,9 @@ impl PhasingPipeline {
 
         // Build IBS2 segments for phase consistency (uses PositionMap fallback if no --map)
         eprintln!("Building IBS2 segments...");
-        let _ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
-        eprintln!("Found {} samples with IBS2 segments",
-            (0..n_samples).filter(|&s| _ibs2.n_segments(crate::data::haplotype::SampleIdx::new(s as u32)) > 0).count());
+        let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
+        let n_with_ibs2 = (0..n_samples).filter(|&s| ibs2.n_segments(crate::data::haplotype::SampleIdx::new(s as u32)) > 0).count();
+        eprintln!("Found {} samples with IBS2 segments, {} total", n_with_ibs2, ibs2.n_samples());
 
         // Run phasing iterations
         let n_burnin = self.config.burnin;
@@ -610,26 +610,31 @@ fn phase_sample_with_hmm(
         // which we collect in the backward pass below.
     }
 
-    // Backward pass: compute posterior probabilities at het sites
-    let mut bwd = vec![1.0 / n_states as f32; n_states];
-    let mut bwd_sum = 1.0f32;
+    // Backward passes: compute SEPARATE backward probabilities for each haplotype
+    // Java Beagle (PhaseBaum2.java) maintains bwdHet1 and bwdHet2 separately
+    let mut bwd1 = vec![1.0 / n_states as f32; n_states];
+    let mut bwd2 = vec![1.0 / n_states as f32; n_states];
+    let mut bwd1_sum = 1.0f32;
+    let mut bwd2_sum = 1.0f32;
 
     // Store backward values at het sites for phase decision
-    let mut bwd_at_het: Vec<Vec<f32>> = Vec::with_capacity(het_markers.len());
+    let mut bwd1_at_het: Vec<Vec<f32>> = Vec::with_capacity(het_markers.len());
+    let mut bwd2_at_het: Vec<Vec<f32>> = Vec::with_capacity(het_markers.len());
     let mut het_idx = het_markers.len();
 
     for m in (0..n_markers).rev() {
         // Store backward values at het sites
         while het_idx > 0 && het_markers[het_idx - 1] == m {
             het_idx -= 1;
-            bwd_at_het.push(bwd.clone());
+            bwd1_at_het.push(bwd1.clone());
+            bwd2_at_het.push(bwd2.clone());
         }
 
         if m == 0 {
             break;
         }
 
-        // Apply emission for current marker
+        // Apply emission for current marker SEPARATELY for each haplotype
         let a1 = alleles1[m];
         let a2 = alleles2[m];
 
@@ -637,90 +642,77 @@ fn phase_sample_with_hmm(
             let ref_a = get_ref_allele(m, s);
             let emit1 = emit(a1, ref_a);
             let emit2 = emit(a2, ref_a);
-            bwd[s] *= emit1.max(emit2);
+            // Each backward pass uses its own allele's emission (separate buffers)
+            bwd1[s] *= emit1;
+            bwd2[s] *= emit2;
         }
 
-        // Apply transition
+        // Apply transition for bwd1
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
-        let scale = (1.0 - p_rec) / bwd_sum;
+        let scale1 = (1.0 - p_rec) / bwd1_sum;
 
-        bwd_sum = 0.0;
+        bwd1_sum = 0.0;
         for s in 0..n_states {
-            bwd[s] = scale * bwd[s] + shift;
-            bwd_sum += bwd[s];
+            bwd1[s] = scale1 * bwd1[s] + shift;
+            bwd1_sum += bwd1[s];
         }
-        bwd_sum = bwd_sum.max(1e-30);
+        bwd1_sum = bwd1_sum.max(1e-30);
+
+        // Apply transition for bwd2
+        let scale2 = (1.0 - p_rec) / bwd2_sum;
+        bwd2_sum = 0.0;
+        for s in 0..n_states {
+            bwd2[s] = scale2 * bwd2[s] + shift;
+            bwd2_sum += bwd2[s];
+        }
+        bwd2_sum = bwd2_sum.max(1e-30);
     }
 
     // Reverse so bwd_at_het[i] corresponds to het_markers[i]
-    bwd_at_het.reverse();
+    bwd1_at_het.reverse();
+    bwd2_at_het.reverse();
 
-    // Make phase decisions
+    // Make phase decisions using BOTH backward passes
+    // Java Beagle computes: prob_no_swap = p11 * p22, prob_swap = p12 * p21
+    // where p_ij = Σ_s fwd_i[m][s] * bwd_j[m][s]
     let mut switch_markers = Vec::new();
     let lr_threshold = params.lr_threshold;
 
     for (idx, &m) in het_markers.iter().enumerate() {
-        let a1 = alleles1[m];
-        let a2 = alleles2[m];
-        let bwd_m = &bwd_at_het[idx];
+        let bwd1_m = &bwd1_at_het[idx];
+        let bwd2_m = &bwd2_at_het[idx];
 
-        // Compute P(phase=0|1) vs P(phase=1|0)
-        // 
-        // Forward values fwd1[m][s] already include emission at marker m.
-        // Backward values bwd[s] represent P(O_{m+1..T} | S_m=s), stored BEFORE emission at m.
-        //
-        // For phase decision at m, we want:
-        //   P(phase | O) ∝ Σ_s P(O_1..m, S_m=s) × P(O_m | S_m=s, phase) × P(O_{m+1..T} | S_m=s)
-        //
-        // Since fwd1[m][s] = P(O_1..m, S_m=s) with emit(a1, ref[s]) baked in,
-        // and we want to compare phases, we divide out the original emission
-        // and multiply by phase-specific emission:
-        //   p_01 contribution = fwd1[m][s] × bwd[s]  (a1 on hap1 - matches fwd1)
-        //   p_10 contribution = fwd1[m][s] × (emit_a2/emit_a1) × bwd[s]  (a2 on hap1)
-        //
-        // Equivalently, use fwd1[m-1] + transition + phase-specific emission × bwd.
-        // Since fwd1[m] already encodes emit1, the ratio approach is simpler.
-
-        let mut p_01 = 0.0f32; // Current phase (a1 on hap1, a2 on hap2)
-        let mut p_10 = 0.0f32; // Swapped phase (a2 on hap1, a1 on hap2)
-        let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
+        // Compute posterior probabilities using BOTH forward and backward passes
+        // p11 = Σ_s fwd1[m][s] * bwd1[m][s]  (hap1 continues with allele1)
+        // p12 = Σ_s fwd1[m][s] * bwd2[m][s]  (hap1 switches to allele2)
+        // p21 = Σ_s fwd2[m][s] * bwd1[m][s]  (hap2 switches to allele1)
+        // p22 = Σ_s fwd2[m][s] * bwd2[m][s]  (hap2 continues with allele2)
+        let mut p11 = 0.0f32;
+        let mut p12 = 0.0f32;
+        let mut p21 = 0.0f32;
+        let mut p22 = 0.0f32;
 
         for s in 0..n_states {
-            let ref_a = get_ref_allele(m, s);
-            let emit_a1 = emit(a1, ref_a);
-            let emit_a2 = emit(a2, ref_a);
-            let bwd_s = bwd_m[s];
-
-            if m == 0 {
-                // At first marker, no transition from previous
-                let init = 1.0 / n_states as f32;
-                p_01 += init * emit_a1 * bwd_s;
-                p_10 += init * emit_a2 * bwd_s;
-            } else {
-                // Use forward from m-1, apply transition and phase-specific emission
-                let fwd_prev = fwd1[m - 1][s];
-                let shift = p_rec / n_states as f32;
-                let scale = 1.0 - p_rec;
-                
-                // Transition probability to stay in same state (dominant term)
-                let trans_stay = scale * fwd_prev + shift * fwd1_sum;
-                
-                // Combine: fwd(m-1) × trans × emit × bwd
-                p_01 += trans_stay * emit_a1 * bwd_s;
-                p_10 += trans_stay * emit_a2 * bwd_s;
-            }
+            p11 += fwd1[m][s] * bwd1_m[s];
+            p12 += fwd1[m][s] * bwd2_m[s];
+            p21 += fwd2[m][s] * bwd1_m[s];
+            p22 += fwd2[m][s] * bwd2_m[s];
         }
+
+        // Phase likelihoods:
+        // Current phase (a1 on hap1, a2 on hap2): prob_no_swap = p11 * p22
+        // Swapped phase (a2 on hap1, a1 on hap2): prob_swap = p12 * p21
+        let prob_no_swap = p11 * p22;
+        let prob_swap = p12 * p21;
 
         // Normalize
-        let total = p_01 + p_10;
-        if total > 0.0 {
-            p_01 /= total;
-            p_10 /= total;
+        let total = prob_no_swap + prob_swap;
+        let (p_01, p_10) = if total > 0.0 {
+            (prob_no_swap / total, prob_swap / total)
         } else {
-            p_01 = 0.5;
-            p_10 = 0.5;
-        }
+            (0.5, 0.5)
+        };
 
         // Likelihood ratio test
         let lr = if p_01 > p_10 {
@@ -730,14 +722,13 @@ fn phase_sample_with_hmm(
         };
 
         // Apply phase switch if swapped phase is better and LR exceeds threshold
-        // For ties (p_01 ≈ p_10), use random tie-breaking for statistical neutrality
         let should_swap = if (p_10 - p_01).abs() < 1e-6 {
             use rand::Rng;
             rand::rng().random_bool(0.5)
         } else {
             p_10 > p_01
         };
-        
+
         if should_swap && lr > lr_threshold {
             switch_markers.push(m);
         }
@@ -748,34 +739,32 @@ fn phase_sample_with_hmm(
             let best_p = p_01.max(p_10);
             let worst_p = p_01.min(p_10);
             em.add_emission(best_p as f64, worst_p as f64);
-            
+
             // Expected switches using Baum-Welch recurrence
-            // ξ_t(i,j) = α_{t-1}(i) × a_{ij} × b_j(o_t) × β_t(j) / P(O)
-            // Expected switches = Σ_{i≠j} ξ_t(i,j)
             if m > 0 {
                 let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
                 let p_no_rec = 1.0 - p_rec;
                 let shift = p_rec / n_states as f32;
-                
+
                 // Calculate total posterior mass (for normalization)
                 let mut total_mass = 0.0f64;
                 let mut no_switch_mass = 0.0f64;
-                
+
                 for s in 0..n_states {
                     let ref_a = get_ref_allele(m, s);
                     let emit_s = emit(alleles1[m], ref_a).max(emit(alleles2[m], ref_a));
-                    let bwd_s = bwd_at_het.get(idx).and_then(|v| v.get(s)).copied().unwrap_or(1.0 / n_states as f32);
-                    
+                    // Use bwd1 for EM (could also average bwd1 and bwd2)
+                    let bwd_s = bwd1_at_het.get(idx).and_then(|v| v.get(s)).copied().unwrap_or(1.0 / n_states as f32);
+
                     // No-switch: stay in state s
                     let no_switch_s = fwd1[m - 1][s] as f64 * p_no_rec as f64 * emit_s as f64 * bwd_s as f64;
                     no_switch_mass += no_switch_s;
-                    
+
                     // All transitions into state s (for total mass)
-                    // Switch: from any other state into s (approximated by shift term)
                     let switch_into_s = fwd1_sum as f64 * shift as f64 * emit_s as f64 * bwd_s as f64;
                     total_mass += no_switch_s + switch_into_s;
                 }
-                
+
                 // Expected switch probability = 1 - P(no switch)
                 if total_mass > 0.0 {
                     let p_no_switch = no_switch_mass / total_mass;
