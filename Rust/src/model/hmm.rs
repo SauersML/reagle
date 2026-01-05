@@ -11,8 +11,7 @@
 //! ## Reference
 //! Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
 
-use crate::data::storage::GenotypeMatrix;
-use crate::data::{HapIdx, MarkerIdx};
+use crate::data::{GenotypeMatrix, GenotypeView, HapIdx, MarkerIdx};
 use crate::model::parameters::ModelParams;
 use crate::utils::Workspace;
 
@@ -30,7 +29,7 @@ pub struct HmmResult {
 /// Li-Stephens HMM for a single target haplotype
 pub struct LiStephensHmm<'a> {
     /// Reference panel genotypes
-    ref_gt: &'a GenotypeMatrix,
+    ref_gt: GenotypeView<'a>,
     /// Model parameters
     params: &'a ModelParams,
     /// Selected reference haplotype indices (the HMM states)
@@ -42,13 +41,13 @@ pub struct LiStephensHmm<'a> {
 impl<'a> LiStephensHmm<'a> {
     /// Create a new HMM for the given reference panel
     pub fn new(
-        ref_gt: &'a GenotypeMatrix,
+        ref_gt: impl Into<GenotypeView<'a>>,
         params: &'a ModelParams,
         ref_haps: Vec<HapIdx>,
         gen_dists: Vec<f64>,
     ) -> Self {
         Self {
-            ref_gt,
+            ref_gt: ref_gt.into(),
             params,
             ref_haps,
             gen_dists,
@@ -288,15 +287,18 @@ impl<'a> LiStephensHmm<'a> {
 /// Phasing HMM that considers both haplotypes of a diploid sample
 pub struct PhasingHmm<'a> {
     /// Reference genotypes (other samples' haplotypes)
-    ref_gt: &'a GenotypeMatrix,
+    ref_gt: GenotypeView<'a>,
     /// Model parameters
     params: &'a ModelParams,
 }
 
 impl<'a> PhasingHmm<'a> {
     /// Create a new phasing HMM
-    pub fn new(ref_gt: &'a GenotypeMatrix, params: &'a ModelParams) -> Self {
-        Self { ref_gt, params }
+    pub fn new(ref_gt: impl Into<GenotypeView<'a>>, params: &'a ModelParams) -> Self {
+        Self {
+            ref_gt: ref_gt.into(),
+            params,
+        }
     }
 
     /// Phase a single sample

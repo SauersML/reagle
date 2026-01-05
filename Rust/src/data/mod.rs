@@ -20,7 +20,8 @@ pub use genetic_map::GeneticMap;
 pub use haplotype::{HapIdx, SampleIdx, Samples};
 pub use marker::{Allele, Marker, MarkerIdx, Markers};
 pub use storage::{
-    DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, MutableGenotypes, SparseColumn,
+    DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes,
+    SparseColumn,
 };
 
 /// Chromosome identifier (0-based index into chromosome name table)

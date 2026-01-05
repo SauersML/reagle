@@ -16,9 +16,10 @@ use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes};
+use crate::data::storage::{GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes};
 use crate::error::Result;
 use crate::io::vcf::{VcfReader, VcfWriter};
+use crate::model::hmm::LiStephensHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIbs};
 use crate::utils::Workspace;
@@ -163,17 +164,18 @@ impl PhasingPipeline {
                 workspace.set_seed(seed + s as u64);
 
                 // Build reference panel view for HMM
-                let ref_alleles: Vec<Vec<u8>> = ref_haps
-                    .iter()
-                    .map(|&h| geno.haplotype(h))
-                    .collect();
+                let ref_view = GenotypeView::Mutable {
+                    geno,
+                    markers: target_gt.markers(),
+                };
 
                 // Run phasing HMM
                 let switch_markers = self.phase_sample(
                     &alleles1,
                     &alleles2,
                     &het_markers,
-                    &ref_alleles,
+                    ref_view,
+                    &ref_haps,
                     gen_dists,
                     &mut workspace,
                 );
@@ -272,126 +274,50 @@ impl PhasingPipeline {
         alleles1: &[u8],
         alleles2: &[u8],
         het_markers: &[usize],
-        ref_alleles: &[Vec<u8>],
+        ref_view: GenotypeView,
+        ref_haps: &[HapIdx],
         gen_dists: &[f64],
         workspace: &mut Workspace,
     ) -> Vec<usize> {
-        let _n_markers = alleles1.len();
-        let n_states = ref_alleles.len();
+        let n_states = ref_haps.len();
 
         if n_states == 0 || het_markers.is_empty() {
             return Vec::new();
         }
 
-        // Compute forward probabilities for haplotype 1
-        let fwd1 = self.forward_pass(alleles1, ref_alleles, gen_dists, workspace);
-        
-        // Compute forward probabilities for haplotype 2
-        let fwd2 = self.forward_pass(alleles2, ref_alleles, gen_dists, workspace);
+        // Create HMM
+        let hmm = LiStephensHmm::new(ref_view, &self.params, ref_haps.to_vec(), gen_dists.to_vec());
 
-        // Decide phase switches based on likelihood comparison
+        // Run forward-backward for both haplotypes
+        let result1 = hmm.forward_backward(alleles1, workspace);
+        let result2 = hmm.forward_backward(alleles2, workspace);
+
+        // Decide phase switches based on sampled paths
         let mut switch_markers = Vec::new();
-        
-        // Simple phase decision: at each het site, check if swapping improves likelihood
         for &m in het_markers {
-            // Current assignment likelihood (sum over states)
-            let _curr_ll = fwd1[m].iter().sum::<f32>().ln() + fwd2[m].iter().sum::<f32>().ln();
-            
-            // For swap, we'd need to recompute with swapped alleles
-            // Simplified: use emission probability comparison
+            let state1 = result1.sampled_path[m];
+            let state2 = result2.sampled_path[m];
+
+            let ref_allele1 = hmm.state_allele(MarkerIdx::new(m as u32), state1);
+            let ref_allele2 = hmm.state_allele(MarkerIdx::new(m as u32), state2);
+
             let a1 = alleles1[m];
             let a2 = alleles2[m];
-            
-            let mut curr_match = 0.0f32;
-            let mut swap_match = 0.0f32;
-            
-            for (s, ref_hap) in ref_alleles.iter().enumerate() {
-                let ref_a = ref_hap[m];
-                let weight = fwd1[m][s] + fwd2[m][s];
-                
-                if a1 == ref_a {
-                    curr_match += weight;
+
+            // Check if swapping improves the match to the reference paths
+            let current_match = (a1 == ref_allele1) as u32 + (a2 == ref_allele2) as u32;
+            let swapped_match = (a1 == ref_allele2) as u32 + (a2 == ref_allele1) as u32;
+
+            if swapped_match > current_match {
+                // Stochastic element: only swap with a certain probability
+                // This helps exploration, especially during burn-in.
+                if workspace.next_f32() > 0.5 {
+                    switch_markers.push(m);
                 }
-                if a2 == ref_a {
-                    swap_match += weight;
-                }
-            }
-            
-            // Random component for exploration (especially in burnin)
-            let rand_val = workspace.next_f32();
-            let threshold = 0.5 + 0.3 * (swap_match - curr_match) / (swap_match + curr_match + 1e-10);
-            
-            if rand_val > threshold && swap_match > curr_match {
-                switch_markers.push(m);
             }
         }
 
         switch_markers
-    }
-
-    /// Forward pass of HMM
-    fn forward_pass(
-        &self,
-        target_alleles: &[u8],
-        ref_alleles: &[Vec<u8>],
-        gen_dists: &[f64],
-        _workspace: &mut Workspace,
-    ) -> Vec<Vec<f32>> {
-        let n_markers = target_alleles.len();
-        let n_states = ref_alleles.len();
-        
-        let mut fwd = vec![vec![0.0f32; n_states]; n_markers];
-        
-        // Initialize
-        let init_prob = 1.0 / n_states as f32;
-        for s in 0..n_states {
-            let emit = self.emission_prob(target_alleles[0], ref_alleles[s][0]);
-            fwd[0][s] = init_prob * emit;
-        }
-        
-        // Normalize
-        let sum: f32 = fwd[0].iter().sum();
-        if sum > 0.0 {
-            for p in &mut fwd[0] {
-                *p /= sum;
-            }
-        }
-
-        // Forward recursion
-        for m in 1..n_markers {
-            let gen_dist = gen_dists.get(m - 1).copied().unwrap_or(0.01);
-            let p_switch = self.params.switch_prob(gen_dist);
-            let p_stay = 1.0 - p_switch;
-            let p_switch_to = p_switch / n_states as f32;
-
-            let fwd_sum: f32 = fwd[m - 1].iter().sum();
-
-            for s in 0..n_states {
-                let emit = self.emission_prob(target_alleles[m], ref_alleles[s][m]);
-                let trans = p_stay * fwd[m - 1][s] + p_switch_to * fwd_sum;
-                fwd[m][s] = trans * emit;
-            }
-
-            // Normalize
-            let sum: f32 = fwd[m].iter().sum();
-            if sum > 0.0 {
-                for p in &mut fwd[m] {
-                    *p /= sum;
-                }
-            }
-        }
-
-        fwd
-    }
-
-    /// Emission probability
-    #[inline]
-    fn emission_prob(&self, target: u8, reference: u8) -> f32 {
-        if target == reference {
-            self.params.emit_match()
-        } else {
-            self.params.emit_mismatch()
-        }
     }
 
     /// Build final GenotypeMatrix from mutable genotypes
@@ -456,46 +382,4 @@ mod tests {
         assert_eq!(pipeline.params.n_states, 280);
     }
 
-    #[test]
-    fn test_emission_prob() {
-        let config = Config {
-            gt: PathBuf::from("test.vcf"),
-            r#ref: None,
-            out: PathBuf::from("out"),
-            map: None,
-            chrom: None,
-            excludesamples: None,
-            excludemarkers: None,
-            burnin: 3,
-            iterations: 12,
-            phase_states: 280,
-            rare: 0.002,
-            impute: true,
-            imp_states: 1600,
-            imp_segment: 6.0,
-            imp_step: 0.1,
-            imp_nsteps: 7,
-            cluster: 0.005,
-            ap: false,
-            gp: false,
-            ne: 100000.0,
-            err: None,
-            em: true,
-            window: 40.0,
-            window_markers: 4000000,
-            overlap: 2.0,
-            seed: 12345,
-            nthreads: None,
-        };
-
-        let pipeline = PhasingPipeline::new(config);
-        
-        // Match should have high probability
-        let match_prob = pipeline.emission_prob(0, 0);
-        assert!(match_prob > 0.99);
-        
-        // Mismatch should have low probability
-        let mismatch_prob = pipeline.emission_prob(0, 1);
-        assert!(mismatch_prob < 0.01);
-    }
 }
