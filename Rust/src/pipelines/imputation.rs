@@ -47,11 +47,19 @@ pub struct MarkerAlignment {
     target_to_ref: Vec<usize>,
     /// Number of reference markers
     n_ref_markers: usize,
+    /// Allele mapping for each aligned marker (indexed by target marker)
+    /// Maps target allele indices to reference allele indices
+    allele_mappings: Vec<Option<crate::data::marker::AlleleMapping>>,
 }
 
 impl MarkerAlignment {
-    /// Create alignment by matching markers by position
+    /// Create alignment by matching markers by position with allele mapping
+    ///
+    /// This handles strand flips (A/T vs T/A) and allele swaps automatically
+    /// using `compute_allele_mapping`.
     pub fn new(target_gt: &GenotypeMatrix, ref_gt: &GenotypeMatrix) -> Self {
+        use crate::data::marker::compute_allele_mapping;
+
         let n_ref_markers = ref_gt.n_markers();
         let n_target_markers = target_gt.n_markers();
 
@@ -65,19 +73,50 @@ impl MarkerAlignment {
         // Map reference markers to target markers
         let mut ref_to_target = vec![-1i32; n_ref_markers];
         let mut target_to_ref = vec![0usize; n_target_markers];
+        let mut allele_mappings: Vec<Option<crate::data::marker::AlleleMapping>> =
+            vec![None; n_target_markers];
+
+        let mut n_strand_flipped = 0usize;
+        let mut n_allele_swapped = 0usize;
 
         for m in 0..n_ref_markers {
-            let marker = ref_gt.marker(MarkerIdx::new(m as u32));
-            if let Some(&target_idx) = target_pos_map.get(&(marker.chrom.0, marker.pos)) {
-                ref_to_target[m] = target_idx as i32;
-                target_to_ref[target_idx] = m;
+            let ref_marker = ref_gt.marker(MarkerIdx::new(m as u32));
+            if let Some(&target_idx) = target_pos_map.get(&(ref_marker.chrom.0, ref_marker.pos)) {
+                let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
+
+                // Compute allele mapping (handles strand flips)
+                if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
+                    // Check if the mapping is valid (at least REF allele maps)
+                    if mapping.is_valid() {
+                        ref_to_target[m] = target_idx as i32;
+                        target_to_ref[target_idx] = m;
+
+                        if mapping.strand_flipped {
+                            n_strand_flipped += 1;
+                        }
+                        if mapping.alleles_swapped {
+                            n_allele_swapped += 1;
+                        }
+
+                        allele_mappings[target_idx] = Some(mapping);
+                    }
+                    // If mapping is invalid, marker won't be aligned
+                }
             }
+        }
+
+        if n_strand_flipped > 0 || n_allele_swapped > 0 {
+            eprintln!(
+                "  Allele alignment: {} strand-flipped, {} allele-swapped markers",
+                n_strand_flipped, n_allele_swapped
+            );
         }
 
         Self {
             ref_to_target,
             target_to_ref,
             n_ref_markers,
+            allele_mappings,
         }
     }
 
@@ -99,6 +138,24 @@ impl MarkerAlignment {
     /// Get reference marker index for a target marker
     pub fn ref_marker(&self, target_marker: usize) -> usize {
         self.target_to_ref[target_marker]
+    }
+
+    /// Map a target allele to reference allele space
+    ///
+    /// Returns the reference allele index for a given target allele,
+    /// handling strand flips and swaps automatically.
+    /// Returns 255 (missing) if no valid mapping exists.
+    pub fn map_allele(&self, target_marker: usize, target_allele: u8) -> u8 {
+        if target_allele == 255 {
+            return 255; // Missing stays missing
+        }
+
+        if let Some(Some(mapping)) = self.allele_mappings.get(target_marker) {
+            mapping.map_allele(target_allele).unwrap_or(255)
+        } else {
+            // No mapping means identity (direct match assumed)
+            target_allele
+        }
     }
 
     /// Find flanking genotyped markers for a reference marker
@@ -411,9 +468,13 @@ impl ImputationPipeline {
                 |workspace, h| {
                     let hap_idx = HapIdx::new(h as u32);
 
-                    // Get target alleles at genotyped markers
+                    // Get target alleles at genotyped markers, mapped to reference allele space
+                    // This handles strand flips (A/T vs T/A) and allele swaps automatically
                     let target_alleles: Vec<u8> = (0..n_target_markers)
-                        .map(|m| target_gt.allele(MarkerIdx::new(m as u32), hap_idx))
+                        .map(|m| {
+                            let raw_allele = target_gt.allele(MarkerIdx::new(m as u32), hap_idx);
+                            alignment.map_allele(m, raw_allele)
+                        })
                         .collect();
 
                     // Create ImpStates for dynamic state selection with RefPanelCoded

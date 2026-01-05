@@ -18,9 +18,7 @@ use crate::error::{ReagleError, Result};
 /// Default scale factor: 1 cM per Mb (1e-6 cM per bp)
 pub const DEFAULT_SCALE_FACTOR: f64 = 1e-6;
 
-/// Minimum genetic distance between consecutive markers (prevents zero distances)
-/// This is approximately 0.01 * mean human single base genetic distance
-pub const MIN_GEN_DIST: f64 = 1e-8;
+
 
 /// A genetic map for interpolating physical positions to genetic distances (cM)
 ///
@@ -415,6 +413,9 @@ impl MarkerMap {
     ///
     /// From Java `MarkerMap.meanSingleBaseGenDist`
     fn mean_single_base_gen_dist(markers: &Markers, gen_map: &GeneticMap) -> f64 {
+        // Minimum genetic distance (~0.01 * mean human single base genetic distance)
+        const MIN_GEN_DIST: f64 = 1e-8;
+
         let n = markers.len();
         if n < 2 {
             return MIN_GEN_DIST;

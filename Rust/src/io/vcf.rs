@@ -550,52 +550,6 @@ impl VcfWriter {
         Ok(())
     }
 
-    /// Write imputed genotypes with dosages (legacy method without quality metrics)
-    pub fn write_imputed(
-        &mut self,
-        matrix: &GenotypeMatrix,
-        dosages: &[f32],
-        start: usize,
-        end: usize,
-    ) -> Result<()> {
-        let n_samples = self.samples.len();
-
-        for (local_m, m) in (start..end).enumerate() {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let marker = matrix.marker(marker_idx);
-            let column = matrix.column(marker_idx);
-
-            // Write fixed fields
-            write!(
-                self.writer,
-                "{}\t{}\t{}\t{}\t{}\t.\tPASS\t.\tGT:DS",
-                matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
-                marker.pos,
-                marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
-                marker.ref_allele,
-                marker.alt_alleles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")
-            )?;
-
-            // Write genotypes with dosages
-            for s in 0..n_samples {
-                let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
-                let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
-                let a1 = column.get(hap1);
-                let a2 = column.get(hap2);
-                let ds_idx = local_m * n_samples + s;
-                let ds = if ds_idx < dosages.len() {
-                    dosages[ds_idx]
-                } else {
-                    (a1 + a2) as f32
-                };
-                write!(self.writer, "\t{}|{}:{:.3}", a1, a2, ds)?;
-            }
-            writeln!(self.writer)?;
-        }
-
-        Ok(())
-    }
-
     /// Write imputed genotypes with dosages and quality metrics (DR2, AF)
     ///
     /// This follows the Java ImputedRecBuilder output format.

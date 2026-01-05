@@ -61,7 +61,7 @@ fn run() -> Result<()> {
         eprintln!("Input: {:?}", config.gt);
         
         let mut pipeline = PhasingPipeline::new(config);
-        pipeline.run()?;
+        pipeline.run_auto()?;
     }
 
     let elapsed = start.elapsed();
