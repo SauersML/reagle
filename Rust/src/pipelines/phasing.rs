@@ -24,7 +24,7 @@ use crate::error::Result;
 use crate::io::streaming::{StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
-use crate::model::imp_states::{CodedStepsConfig, ImpStatesLegacy};
+use crate::model::imp_states::{CodedStepsConfig, ImpStatesMutable};
 use crate::model::parameters::{AtomicParamEstimates, ModelParams, ParamEstimates};
 use crate::utils::workspace::Workspace;
 
@@ -402,8 +402,8 @@ impl PhasingPipeline {
                         return None;
                     }
 
-                    // Create ImpStatesLegacy for dynamic state selection (phasing uses naive PBWT)
-                    let mut imp_states = ImpStatesLegacy::new(n_haps, n_states, gen_positions, &steps_config);
+                    // Create ImpStatesMutable for dynamic state selection (phasing uses raw PBWT)
+                    let mut imp_states = ImpStatesMutable::new(n_haps, n_states, gen_positions, &steps_config);
 
                     // Use hap1's alleles as the target for IBS matching
                     let target_alleles: Vec<u8> = alleles1.clone();

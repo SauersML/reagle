@@ -512,8 +512,12 @@ impl ImpIbs {
     }
 }
 
-/// Legacy HMM state selector for phasing (uses ImpIbs directly)
-pub struct ImpStatesLegacy {
+/// HMM state selector for phasing (uses ImpIbs on mutable/raw genotypes)
+///
+/// This version operates on raw allele data and is designed for the phasing
+/// pipeline where genotypes are modified during each iteration. For compressed
+/// reference panels, use `ImpStates` instead.
+pub struct ImpStatesMutable {
     /// Maximum number of HMM states
     max_states: usize,
     /// IBS haplotype finder
@@ -836,7 +840,7 @@ impl<'a> ImpStates<'a> {
     }
 }
 
-impl ImpStatesLegacy {
+impl ImpStatesMutable {
     /// Create a new state selector (legacy version for phasing)
     pub fn new(
         n_ref_haps: usize,
