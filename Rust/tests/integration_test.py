@@ -185,7 +185,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     Calculate detailed imputation accuracy metrics.
 
     Metrics:
-    - Genotype concordance (exact match rate)
+    - Unphased genotype concordance (exact match ignoring phase: 0|1 == 1|0)
     - Allelic R² (correlation between true and imputed dosages)
     - Non-reference concordance
     - Per-MAF-bin metrics
@@ -196,8 +196,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
 
     print(f"\nCalculating metrics: {imputed_vcf} vs {truth_vcf}")
 
-    # Load truth genotypes
-    truth_gts = {}  # (chrom, pos) -> {sample: dosage}
+    # Load truth genotypes - store both genotype tuple and dosage
+    truth_gts = {}  # (chrom, pos) -> {sample: (gt_tuple, dosage)}
     result = run(f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {truth_vcf}", capture=True)
     samples_result = run(f"bcftools query -l {truth_vcf}", capture=True)
     truth_samples = samples_result.stdout.strip().split('\n')
@@ -216,9 +216,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             if i < len(truth_samples):
                 gt = parse_genotype(gt_str.split(':')[0])  # Handle GT:other fields
                 if gt is not None:
-                    truth_gts[key][truth_samples[i]] = calculate_dosage(gt)
+                    truth_gts[key][truth_samples[i]] = (gt, calculate_dosage(gt))
 
-    # Load imputed genotypes
+    # Load imputed genotypes - store both genotype tuple and dosage
     imputed_gts = {}
     result = run(f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}", capture=True)
     samples_result = run(f"bcftools query -l {imputed_vcf}", capture=True)
@@ -238,18 +238,17 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             if i < len(imputed_samples):
                 gt = parse_genotype(gt_str.split(':')[0])
                 if gt is not None:
-                    imputed_gts[key][imputed_samples[i]] = calculate_dosage(gt)
+                    imputed_gts[key][imputed_samples[i]] = (gt, calculate_dosage(gt))
 
     # Calculate metrics
-    concordant = 0
-    discordant = 0
+    unphased_concordant = 0  # Genotype match ignoring phase (0|1 == 1|0)
     total_compared = 0
 
     truth_dosages = []
     imputed_dosages = []
 
     # MAF bins for stratified analysis
-    maf_bins = defaultdict(lambda: {"concordant": 0, "total": 0, "truth": [], "imputed": []})
+    maf_bins = defaultdict(lambda: {"unphased_concordant": 0, "total": 0, "truth": [], "imputed": []})
 
     common_sites = set(truth_gts.keys()) & set(imputed_gts.keys())
     print(f"Common sites: {len(common_sites)}")
@@ -259,7 +258,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         imputed_site = imputed_gts.get(site, {})
 
         # Calculate MAF from truth
-        dosages = [d for d in truth_site.values() if d is not None]
+        dosages = [v[1] for v in truth_site.values() if v[1] is not None]
         if dosages:
             af = sum(dosages) / (2 * len(dosages))
             maf = min(af, 1 - af)
@@ -278,8 +277,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
 
         for sample in truth_site:
             if sample in imputed_site:
-                t_dos = truth_site[sample]
-                i_dos = imputed_site[sample]
+                t_gt, t_dos = truth_site[sample]
+                i_gt, i_dos = imputed_site[sample]
 
                 if t_dos is not None and i_dos is not None:
                     total_compared += 1
@@ -290,17 +289,18 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     maf_bins[maf_bin]["imputed"].append(i_dos)
                     maf_bins[maf_bin]["total"] += 1
 
-                    if t_dos == i_dos:
-                        concordant += 1
-                        maf_bins[maf_bin]["concordant"] += 1
-                    else:
-                        discordant += 1
+                    # Unphased concordance: sort alleles so 0|1 == 1|0
+                    t_sorted = tuple(sorted(t_gt))
+                    i_sorted = tuple(sorted(i_gt))
+                    if t_sorted == i_sorted:
+                        unphased_concordant += 1
+                        maf_bins[maf_bin]["unphased_concordant"] += 1
 
     # Calculate overall metrics
     metrics = {}
 
     if total_compared > 0:
-        metrics["concordance"] = concordant / total_compared
+        metrics["unphased_concordance"] = unphased_concordant / total_compared
         metrics["total_genotypes"] = total_compared
         metrics["sites_compared"] = len(common_sites)
 
@@ -326,7 +326,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         for maf_bin, data in sorted(maf_bins.items()):
             if data["total"] > 0:
                 bin_metrics = {
-                    "concordance": data["concordant"] / data["total"],
+                    "unphased_concordance": data["unphased_concordant"] / data["total"],
                     "n_genotypes": data["total"]
                 }
                 # R² per bin
@@ -350,14 +350,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     if metrics:
         print(f"Sites compared: {metrics.get('sites_compared', 'N/A')}")
         print(f"Genotypes compared: {metrics.get('total_genotypes', 'N/A')}")
-        print(f"Overall concordance: {metrics.get('concordance', 0):.4f}")
+        print(f"Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")
         print(f"Overall R²: {metrics.get('r_squared', 'N/A'):.4f}" if metrics.get('r_squared') else "Overall R²: N/A")
 
         if "by_maf" in metrics:
             print("\nBy MAF bin:")
             for maf_bin, bin_metrics in metrics["by_maf"].items():
                 r2_str = f"{bin_metrics.get('r_squared', 0):.4f}" if bin_metrics.get('r_squared') else "N/A"
-                print(f"  {maf_bin}: concordance={bin_metrics['concordance']:.4f}, "
+                print(f"  {maf_bin}: conc={bin_metrics['unphased_concordance']:.4f}, "
                       f"R²={r2_str}, n={bin_metrics['n_genotypes']}")
 
     # Save metrics to file
@@ -368,13 +368,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         if metrics:
             f.write(f"Sites compared: {metrics.get('sites_compared', 'N/A')}\n")
             f.write(f"Genotypes compared: {metrics.get('total_genotypes', 'N/A')}\n")
-            f.write(f"Overall concordance: {metrics.get('concordance', 0):.4f}\n")
+            f.write(f"Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}\n")
             if metrics.get('r_squared'):
                 f.write(f"Overall R²: {metrics['r_squared']:.4f}\n")
             f.write("\nBy MAF bin:\n")
             for maf_bin, bin_metrics in metrics.get("by_maf", {}).items():
-                f.write(f"  {maf_bin}: conc={bin_metrics['concordance']:.4f}, "
-                       f"n={bin_metrics['n_genotypes']}\n")
+                r2_str = f"{bin_metrics.get('r_squared', 0):.4f}" if bin_metrics.get('r_squared') else "N/A"
+                f.write(f"  {maf_bin}: conc={bin_metrics['unphased_concordance']:.4f}, "
+                       f"R²={r2_str}, n={bin_metrics['n_genotypes']}\n")
 
     return metrics
 
@@ -539,7 +540,7 @@ def main():
     for name, metrics in all_metrics.items():
         if metrics:
             print(f"{name.upper()}:")
-            print(f"  Concordance: {metrics.get('concordance', 0):.4f}")
+            print(f"  Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")
             r2 = metrics.get('r_squared')
             print(f"  R²: {r2:.4f}" if r2 else "  R²: N/A")
         else:
