@@ -283,52 +283,41 @@ impl PhasingPipeline {
         gen_dists: &[f64],
         workspace: &mut Workspace,
     ) -> Vec<usize> {
-        let _n_markers = alleles1.len();
         let n_states = ref_alleles.len();
 
         if n_states == 0 || het_markers.is_empty() {
             return Vec::new();
         }
 
-        // Compute forward probabilities for haplotype 1
+        // Run forward and backward passes for both haplotypes
         let fwd1 = self.forward_pass(alleles1, ref_alleles, gen_dists, workspace);
-        
-        // Compute forward probabilities for haplotype 2
         let fwd2 = self.forward_pass(alleles2, ref_alleles, gen_dists, workspace);
+        let bwd1 = self.backward_pass(alleles1, ref_alleles, gen_dists, workspace);
+        let bwd2 = self.backward_pass(alleles2, ref_alleles, gen_dists, workspace);
 
-        // Decide phase switches based on likelihood comparison
         let mut switch_markers = Vec::new();
-        
-        // Simple phase decision: at each het site, check if swapping improves likelihood
+
+        // Iterate through heterozygous markers and decide phase
         for &m in het_markers {
-            // Current assignment likelihood (sum over states)
-            let _curr_ll = fwd1[m].iter().sum::<f32>().ln() + fwd2[m].iter().sum::<f32>().ln();
-            
-            // For swap, we'd need to recompute with swapped alleles
-            // Simplified: use emission probability comparison
-            let a1 = alleles1[m];
-            let a2 = alleles2[m];
-            
-            let mut curr_match = 0.0f32;
-            let mut swap_match = 0.0f32;
-            
-            for (s, ref_hap) in ref_alleles.iter().enumerate() {
-                let ref_a = ref_hap[m];
-                let weight = fwd1[m][s] + fwd2[m][s];
-                
-                if a1 == ref_a {
-                    curr_match += weight;
-                }
-                if a2 == ref_a {
-                    swap_match += weight;
-                }
+            // Calculate dot products of forward and backward probabilities
+            let mut p11 = 0.0f32;
+            let mut p12 = 0.0f32;
+            let mut p21 = 0.0f32;
+            let mut p22 = 0.0f32;
+
+            for s in 0..n_states {
+                p11 += fwd1[m][s] * bwd1[m][s];
+                p12 += fwd1[m][s] * bwd2[m][s];
+                p21 += fwd2[m][s] * bwd1[m][s];
+                p22 += fwd2[m][s] * bwd2[m][s];
             }
-            
-            // Random component for exploration (especially in burnin)
-            let rand_val = workspace.next_f32();
-            let threshold = 0.5 + 0.3 * (swap_match - curr_match) / (swap_match + curr_match + 1e-10);
-            
-            if rand_val > threshold && swap_match > curr_match {
+
+            // Likelihood of current vs swapped phase
+            // These are posteriors, but the ratio is the same as the likelihood ratio
+            let p_no_switch = p11 * p22;
+            let p_switch = p12 * p21;
+
+            if p_switch > p_no_switch {
                 switch_markers.push(m);
             }
         }
@@ -389,6 +378,58 @@ impl PhasingPipeline {
         }
 
         fwd
+    }
+
+    /// Backward pass of HMM
+    fn backward_pass(
+        &self,
+        target_alleles: &[u8],
+        ref_alleles: &[Vec<u8>],
+        gen_dists: &[f64],
+        _workspace: &mut Workspace,
+    ) -> Vec<Vec<f32>> {
+        let n_markers = target_alleles.len();
+        let n_states = ref_alleles.len();
+
+        let mut bwd = vec![vec![0.0f32; n_states]; n_markers];
+
+        // Initialize
+        let init_prob = 1.0 / n_states as f32;
+        for s in 0..n_states {
+            bwd[n_markers - 1][s] = init_prob;
+        }
+
+        // Backward recursion
+        for m in (0..n_markers - 1).rev() {
+            let gen_dist = gen_dists.get(m).copied().unwrap_or(0.01);
+            let p_switch = self.params.switch_prob(gen_dist);
+            let p_stay = 1.0 - p_switch;
+            let p_switch_to = p_switch / n_states as f32;
+
+            let mut weighted_bwd = vec![0.0f32; n_states];
+            let mut weighted_bwd_sum = 0.0;
+            for s_prime in 0..n_states {
+                let emit = self.emission_prob(target_alleles[m + 1], ref_alleles[s_prime][m + 1]);
+                let val = emit * bwd[m + 1][s_prime];
+                weighted_bwd[s_prime] = val;
+                weighted_bwd_sum += val;
+            }
+
+            for s in 0..n_states {
+                let trans = (p_stay - p_switch_to) * weighted_bwd[s] + p_switch_to * weighted_bwd_sum;
+                bwd[m][s] = trans;
+            }
+
+            // Normalize
+            let sum: f32 = bwd[m].iter().sum();
+            if sum > 0.0 {
+                for p in &mut bwd[m] {
+                    *p /= sum;
+                }
+            }
+        }
+
+        bwd
     }
 
     /// Emission probability
