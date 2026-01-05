@@ -1,0 +1,25 @@
+diff --git a/Rust/src/srcs/stats.rs b/Rust/src/srcs/stats.rs
+new file mode 100644
+index 0000000..b6a8cb9
+--- /dev/null
++++ b/Rust/src/srcs/stats.rs
+@@ -0,0 +1,19 @@
++//! # Run Statistics
++//!
++//! A module for tracking and reporting run statistics, similar to `main/RunStats.java`.
++
++use std::time::Instant;
++
++/// A struct for tracking and reporting run statistics.
++pub struct RunStats {
++    start: Instant,
++}
++
++impl RunStats {
++    /// Creates a new `RunStats` instance.
++    pub fn new() -> Self {
++        Self {
++            start: Instant::now(),
++        }
++    }
++}

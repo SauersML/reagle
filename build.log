@@ -1,0 +1,2116 @@
+[1m[92m    Checking[0m reagle v0.1.0 (/home/runner/work/reagle/reagle/Rust)
+[1m[33mwarning[0m[1m: unused variable: `m`[0m
+   [1m[94m--> [0msrc/data/storage/mutable.rs:134:57
+    [1m[94m|[0m
+[1m[94m134[0m [1m[94m|[0m         let mut geno = MutableGenotypes::from_fn(3, 4, |m, h| {
+    [1m[94m|[0m                                                         [1m[33m^[0m [1m[33mhelp: if this is intentional, prefix it with an underscore: `_m`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: unused import: `genetic_map::GeneticMap`[0m
+  [1m[94m--> [0msrc/data/mod.rs:19:9
+   [1m[94m|[0m
+[1m[94m19[0m [1m[94m|[0m pub use genetic_map::GeneticMap;
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: unused import: `Samples`[0m
+  [1m[94m--> [0msrc/data/mod.rs:20:40
+   [1m[94m|[0m
+[1m[94m20[0m [1m[94m|[0m pub use haplotype::{HapIdx, SampleIdx, Samples};
+   [1m[94m|[0m                                        [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `Allele`, `Marker`, and `Markers`[0m
+  [1m[94m--> [0msrc/data/mod.rs:21:18
+   [1m[94m|[0m
+[1m[94m21[0m [1m[94m|[0m pub use marker::{Allele, Marker, MarkerIdx, Markers};
+   [1m[94m|[0m                  [1m[33m^^^^^^[0m  [1m[33m^^^^^^[0m             [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `DenseColumn`, `DictionaryColumn`, `GenotypeColumn`, `GenotypeMatrix`, `MutableGenotypes`, and `SparseColumn`[0m
+  [1m[94m--> [0msrc/data/mod.rs:23:5
+   [1m[94m|[0m
+[1m[94m23[0m [1m[94m|[0m     DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, MutableGenotypes, SparseColumn,
+   [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `VcfReader` and `VcfWriter`[0m
+ [1m[94m--> [0msrc/io/mod.rs:9:15
+  [1m[94m|[0m
+[1m[94m9[0m [1m[94m|[0m pub use vcf::{VcfReader, VcfWriter};
+  [1m[94m|[0m               [1m[33m^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `SlidingWindowIterator`, `WindowBuilder`, and `Window`[0m
+  [1m[94m--> [0msrc/io/mod.rs:10:18
+   [1m[94m|[0m
+[1m[94m10[0m [1m[94m|[0m pub use window::{Window, WindowBuilder, SlidingWindowIterator};
+   [1m[94m|[0m                  [1m[33m^^^^^^[0m  [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `HmmResult` and `LiStephensHmm`[0m
+  [1m[94m--> [0msrc/model/mod.rs:14:15
+   [1m[94m|[0m
+[1m[94m14[0m [1m[94m|[0m pub use hmm::{LiStephensHmm, HmmResult};
+   [1m[94m|[0m               [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused import: `parameters::ModelParams`[0m
+  [1m[94m--> [0msrc/model/mod.rs:15:9
+   [1m[94m|[0m
+[1m[94m15[0m [1m[94m|[0m pub use parameters::ModelParams;
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `PbwtDivUpdater` and `PbwtUpdater`[0m
+  [1m[94m--> [0msrc/model/mod.rs:16:16
+   [1m[94m|[0m
+[1m[94m16[0m [1m[94m|[0m pub use pbwt::{PbwtUpdater, PbwtDivUpdater};
+   [1m[94m|[0m                [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused import: `VcfWriter`[0m
+ [1m[94m--> [0msrc/io/mod.rs:9:26
+  [1m[94m|[0m
+[1m[94m9[0m [1m[94m|[0m pub use vcf::{VcfReader, VcfWriter};
+  [1m[94m|[0m                          [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m: `reagle` (lib test) generated 1 warning (run `cargo fix --lib -p reagle --tests` to apply 1 suggestion)
+[1m[33mwarning[0m[1m: associated items `err_rate` and `li_stephens_p_mismatch` are never used[0m
+   [1m[94m--> [0msrc/config.rs:200:12
+    [1m[94m|[0m
+[1m[94m131[0m [1m[94m|[0m impl Config {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94massociated items in this implementation[0m
+[1m[94m...[0m
+[1m[94m200[0m [1m[94m|[0m     pub fn err_rate(&self, n_haps: usize) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m209[0m [1m[94m|[0m     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: associated items `new`, `empty`, `len`, `is_empty`, and `chrom` are never used[0m
+   [1m[94m--> [0msrc/data/genetic_map.rs:28:12
+    [1m[94m|[0m
+[1m[94m 26[0m [1m[94m|[0m impl GeneticMap {
+    [1m[94m|[0m [1m[94m---------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m 27[0m [1m[94m|[0m     /// Create a new genetic map
+[1m[94m 28[0m [1m[94m|[0m     pub fn new(chrom: ChromIdx, positions: Vec<u32>, gen_positions: Vec<f64>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m 39[0m [1m[94m|[0m     pub fn empty(chrom: ChromIdx) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+[1m[94m...[0m
+[1m[94m145[0m [1m[94m|[0m     pub fn len(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m150[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m155[0m [1m[94m|[0m     pub fn chrom(&self) -> ChromIdx {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `insert` and `gen_pos` are never used[0m
+   [1m[94m--> [0msrc/data/genetic_map.rs:194:12
+    [1m[94m|[0m
+[1m[94m171[0m [1m[94m|[0m impl GeneticMaps {
+    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m194[0m [1m[94m|[0m     pub fn insert(&mut self, chrom: ChromIdx, map: GeneticMap) {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m203[0m [1m[94m|[0m     pub fn gen_pos(&self, chrom: ChromIdx, phys_pos: u32) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `id_to_idx` is never read[0m
+   [1m[94m--> [0msrc/data/haplotype.rs:114:5
+    [1m[94m|[0m
+[1m[94m108[0m [1m[94m|[0m pub struct Samples {
+    [1m[94m|[0m            [1m[94m-------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m114[0m [1m[94m|[0m     id_to_idx: HashMap<Arc<str>, SampleIdx>,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `Samples` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/haplotype.rs:119:12
+    [1m[94m|[0m
+[1m[94m117[0m [1m[94m|[0m impl Samples {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m118[0m [1m[94m|[0m     /// Create an empty sample collection
+[1m[94m119[0m [1m[94m|[0m     pub fn new() -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m141[0m [1m[94m|[0m     pub fn from_ids_with_ploidy(ids: Vec<String>, is_diploid: Vec<bool>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m163[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m176[0m [1m[94m|[0m     pub fn id(&self, idx: SampleIdx) -> &str {
+    [1m[94m|[0m            [1m[33m^^[0m
+[1m[94m...[0m
+[1m[94m181[0m [1m[94m|[0m     pub fn index_of(&self, id: &str) -> Option<SampleIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m186[0m [1m[94m|[0m     pub fn is_diploid(&self, idx: SampleIdx) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m191[0m [1m[94m|[0m     pub fn push(&mut self, id: String, diploid: bool) {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m205[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = SampleIdx> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m210[0m [1m[94m|[0m     pub fn hap_iter(&self) -> impl Iterator<Item = HapIdx> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m221[0m [1m[94m|[0m     pub fn combine(first: &Samples, second: &Samples) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `is_snv`, `is_missing`, and `complement` are never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:77:12
+    [1m[94m|[0m
+[1m[94m 52[0m [1m[94m|[0m impl Allele {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 77[0m [1m[94m|[0m     pub fn is_snv(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 82[0m [1m[94m|[0m     pub fn is_missing(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m100[0m [1m[94m|[0m     pub fn complement(&self) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `n_alleles`, `is_biallelic`, `is_snv`, `allele`, and `bits_per_allele` are never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:151:12
+    [1m[94m|[0m
+[1m[94m132[0m [1m[94m|[0m impl Marker {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m151[0m [1m[94m|[0m     pub fn n_alleles(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m156[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m161[0m [1m[94m|[0m     pub fn is_snv(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m166[0m [1m[94m|[0m     pub fn allele(&self, idx: usize) -> Option<&Allele> {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m175[0m [1m[94m|[0m     pub fn bits_per_allele(&self) -> u32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `from_vec`, `is_empty`, `get`, `iter`, and `restrict` are never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:224:12
+    [1m[94m|[0m
+[1m[94m217[0m [1m[94m|[0m impl Markers {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m...[0m
+[1m[94m224[0m [1m[94m|[0m     pub fn from_vec(markers: Vec<Marker>, chrom_names: Vec<Arc<str>>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m237[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m242[0m [1m[94m|[0m     pub fn get(&self, idx: MarkerIdx) -> Option<&Marker> {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m275[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = &Marker> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m280[0m [1m[94m|[0m     pub fn restrict(&self, start: usize, end: usize) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: variant `Dictionary` is never constructed[0m
+  [1m[94m--> [0msrc/data/storage/mod.rs:33:5
+   [1m[94m|[0m
+[1m[94m22[0m [1m[94m|[0m pub enum GenotypeColumn {
+   [1m[94m|[0m          [1m[94m--------------[0m [1m[94mvariant in this enum[0m
+[1m[94m...[0m
+[1m[94m33[0m [1m[94m|[0m     Dictionary(DictionaryColumn),
+   [1m[94m|[0m     [1m[33m^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `GenotypeColumn` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `n_haplotypes`, `alt_count`, `maf`, `size_bytes`, `is_biallelic`, and `iter` are never used[0m
+   [1m[94m--> [0msrc/data/storage/mod.rs:48:12
+    [1m[94m|[0m
+[1m[94m 36[0m [1m[94m|[0m impl GenotypeColumn {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 48[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 57[0m [1m[94m|[0m     pub fn alt_count(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 66[0m [1m[94m|[0m     pub fn maf(&self) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m 77[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m122[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m131[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple methods are never used[0m
+   [1m[94m--> [0msrc/data/storage/dense.rs:90:12
+    [1m[94m|[0m
+[1m[94m 25[0m [1m[94m|[0m impl DenseColumn {
+    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 90[0m [1m[94m|[0m     pub fn set(&mut self, hap: HapIdx, allele: u8) {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m103[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m108[0m [1m[94m|[0m     pub fn bits_per_allele(&self) -> u8 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m113[0m [1m[94m|[0m     pub fn alt_count(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m122[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m127[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m133[0m [1m[94m|[0m     pub fn raw_bits(&self) -> &BitSlice<u64, Lsb0> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m138[0m [1m[94m|[0m     pub fn raw_u64s(&self) -> &[u64] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `n_markers` is never read[0m
+  [1m[94m--> [0msrc/data/storage/dictionary.rs:22:5
+   [1m[94m|[0m
+[1m[94m13[0m [1m[94m|[0m pub struct DictionaryColumn {
+   [1m[94m|[0m            [1m[94m----------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m22[0m [1m[94m|[0m     n_markers: u32,
+   [1m[94m|[0m     [1m[33m^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `DictionaryColumn` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/storage/dictionary.rs:30:12
+    [1m[94m|[0m
+[1m[94m 28[0m [1m[94m|[0m impl DictionaryColumn {
+    [1m[94m|[0m [1m[94m---------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m 29[0m [1m[94m|[0m     /// Create a new dictionary column from patterns and mapping
+[1m[94m 30[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m 45[0m [1m[94m|[0m     pub fn compress(
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m112[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m117[0m [1m[94m|[0m     pub fn n_markers(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m122[0m [1m[94m|[0m     pub fn n_patterns(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m127[0m [1m[94m|[0m     pub fn compression_ratio(&self) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m132[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m137[0m [1m[94m|[0m     pub fn alt_count(&self, marker_offset: usize) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m148[0m [1m[94m|[0m     pub fn iter_marker(&self, marker_offset: usize) -> impl Iterator<Item = u8> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m153[0m [1m[94m|[0m     pub fn pattern_index(&self, hap: HapIdx) -> u16 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m158[0m [1m[94m|[0m     pub fn haplotypes_with_pattern(&self, pattern_idx: u16) -> Vec<HapIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m168[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `is_phased` and `is_reversed` are never read[0m
+  [1m[94m--> [0msrc/data/storage/matrix.rs:26:5
+   [1m[94m|[0m
+[1m[94m15[0m [1m[94m|[0m pub struct GenotypeMatrix {
+   [1m[94m|[0m            [1m[94m--------------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m26[0m [1m[94m|[0m     is_phased: bool,
+   [1m[94m|[0m     [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m29[0m [1m[94m|[0m     is_reversed: bool,
+   [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `GenotypeMatrix` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/storage/matrix.rs:51:12
+    [1m[94m|[0m
+[1m[94m 32[0m [1m[94m|[0m impl GenotypeMatrix {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m...[0m
+[1m[94m 51[0m [1m[94m|[0m     pub fn empty(samples: Arc<Samples>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+[1m[94m...[0m
+[1m[94m 77[0m [1m[94m|[0m     pub fn is_phased(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 82[0m [1m[94m|[0m     pub fn is_reversed(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 97[0m [1m[94m|[0m     pub fn samples(&self) -> &Samples {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m118[0m [1m[94m|[0m     pub fn genotype(&self, marker: MarkerIdx, sample: SampleIdx) -> (u8, u8) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m125[0m [1m[94m|[0m     pub fn restrict(&self, start: usize, end: usize) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m136[0m [1m[94m|[0m     pub fn restrict_markers(&self, indices: &[usize]) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m153[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = (MarkerIdx, &Marker, &GenotypeColumn)> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m161[0m [1m[94m|[0m     pub fn marker_indices(&self) -> impl Iterator<Item = MarkerIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m166[0m [1m[94m|[0m     pub fn haplotype_indices(&self) -> impl Iterator<Item = HapIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m171[0m [1m[94m|[0m     pub fn haplotype(&self, hap: HapIdx) -> Vec<u8> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m176[0m [1m[94m|[0m     pub fn alleles_at_marker(&self, marker: MarkerIdx) -> Vec<u8> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m184[0m [1m[94m|[0m     pub fn set_phased(&mut self, phased: bool) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m189[0m [1m[94m|[0m     pub fn set_reversed(&mut self, reversed: bool) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m194[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m200[0m [1m[94m|[0m     pub fn column_mut(&mut self, idx: MarkerIdx) -> &mut GenotypeColumn {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m205[0m [1m[94m|[0m     pub fn set_column(&mut self, idx: MarkerIdx, column: GenotypeColumn) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m210[0m [1m[94m|[0m     pub fn push(&mut self, marker: Marker, column: GenotypeColumn) {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `GenotypeMatrixView` is never constructed[0m
+   [1m[94m--> [0msrc/data/storage/matrix.rs:217:12
+    [1m[94m|[0m
+[1m[94m217[0m [1m[94m|[0m pub struct GenotypeMatrixView<'a> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/storage/matrix.rs:224:12
+    [1m[94m|[0m
+[1m[94m222[0m [1m[94m|[0m impl<'a> GenotypeMatrixView<'a> {
+    [1m[94m|[0m [1m[94m-------------------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m223[0m [1m[94m|[0m     /// Create a view into a matrix
+[1m[94m224[0m [1m[94m|[0m     pub fn new(matrix: &'a GenotypeMatrix, marker_range: Range<usize>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m229[0m [1m[94m|[0m     pub fn n_markers(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m234[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m239[0m [1m[94m|[0m     pub fn allele(&self, marker_offset: usize, hap: HapIdx) -> u8 {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m245[0m [1m[94m|[0m     pub fn marker(&self, marker_offset: usize) -> &Marker {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m251[0m [1m[94m|[0m     pub fn column(&self, marker_offset: usize) -> &GenotypeColumn {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m257[0m [1m[94m|[0m     pub fn to_owned(&self) -> GenotypeMatrix {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `n_haps` is never read[0m
+  [1m[94m--> [0msrc/data/storage/mutable.rs:17:5
+   [1m[94m|[0m
+[1m[94m13[0m [1m[94m|[0m pub struct MutableGenotypes {
+   [1m[94m|[0m            [1m[94m----------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m17[0m [1m[94m|[0m     n_haps: usize,
+   [1m[94m|[0m     [1m[33m^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `MutableGenotypes` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/storage/mutable.rs:22:12
+    [1m[94m|[0m
+[1m[94m 20[0m [1m[94m|[0m impl MutableGenotypes {
+    [1m[94m|[0m [1m[94m---------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m 21[0m [1m[94m|[0m     /// Create from existing allele data
+[1m[94m 22[0m [1m[94m|[0m     pub fn new(n_markers: usize, n_haps: usize) -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m 48[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 54[0m [1m[94m|[0m     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m 60[0m [1m[94m|[0m     pub fn set(&mut self, marker: usize, hap: HapIdx, allele: u8) {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m 72[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 91[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m100[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m109[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `n_haplotypes` is never read[0m
+  [1m[94m--> [0msrc/data/storage/sparse.rs:15:5
+   [1m[94m|[0m
+[1m[94m10[0m [1m[94m|[0m pub struct SparseColumn {
+   [1m[94m|[0m            [1m[94m------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m15[0m [1m[94m|[0m     n_haplotypes: u32,
+   [1m[94m|[0m     [1m[33m^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `SparseColumn` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:34:12
+    [1m[94m|[0m
+[1m[94m 22[0m [1m[94m|[0m impl SparseColumn {
+    [1m[94m|[0m [1m[94m-----------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m...[0m
+[1m[94m 34[0m [1m[94m|[0m     pub fn from_alleles(alleles: &[u8]) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 73[0m [1m[94m|[0m     pub fn is_carrier(&self, hap: HapIdx) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 78[0m [1m[94m|[0m     pub fn carriers(&self) -> &[HapIdx] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 83[0m [1m[94m|[0m     pub fn n_carriers(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 92[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 97[0m [1m[94m|[0m     pub fn maf(&self) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m107[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m113[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m118[0m [1m[94m|[0m     pub fn is_inverted(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `SparseMultiAllelic` is never constructed[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:125:12
+    [1m[94m|[0m
+[1m[94m125[0m [1m[94m|[0m pub struct SparseMultiAllelic {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `from_entries`, `get`, `n_haplotypes`, `n_entries`, and `size_bytes` are never used[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:135:12
+    [1m[94m|[0m
+[1m[94m133[0m [1m[94m|[0m impl SparseMultiAllelic {
+    [1m[94m|[0m [1m[94m-----------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m134[0m [1m[94m|[0m     /// Create from entries
+[1m[94m135[0m [1m[94m|[0m     pub fn from_entries(mut entries: Vec<(HapIdx, u8)>, n_haplotypes: u32) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m145[0m [1m[94m|[0m     pub fn get(&self, hap: HapIdx) -> u8 {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m153[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m158[0m [1m[94m|[0m     pub fn n_entries(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m163[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: variants `InvalidData` and `Algorithm` are never constructed[0m
+  [1m[94m--> [0msrc/error.rs:21:5
+   [1m[94m|[0m
+[1m[94m10[0m [1m[94m|[0m pub enum ReagleError {
+   [1m[94m|[0m          [1m[94m-----------[0m [1m[94mvariants in this enum[0m
+[1m[94m...[0m
+[1m[94m21[0m [1m[94m|[0m     InvalidData { message: String },
+   [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m25[0m [1m[94m|[0m     Algorithm { message: String },
+   [1m[94m|[0m     [1m[33m^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `ReagleError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: associated functions `invalid_data` and `algorithm` are never used[0m
+  [1m[94m--> [0msrc/error.rs:52:12
+   [1m[94m|[0m
+[1m[94m43[0m [1m[94m|[0m impl ReagleError {
+   [1m[94m|[0m [1m[94m----------------[0m [1m[94massociated functions in this implementation[0m
+[1m[94m...[0m
+[1m[94m52[0m [1m[94m|[0m     pub fn invalid_data(message: impl Into<String>) -> Self {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m59[0m [1m[94m|[0m     pub fn algorithm(message: impl Into<String>) -> Self {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `header` is never read[0m
+  [1m[94m--> [0msrc/io/vcf.rs:22:5
+   [1m[94m|[0m
+[1m[94m20[0m [1m[94m|[0m pub struct VcfReader {
+   [1m[94m|[0m            [1m[94m---------[0m [1m[94mfield in this struct[0m
+[1m[94m21[0m [1m[94m|[0m     /// The VCF header
+[1m[94m22[0m [1m[94m|[0m     header: Header,
+   [1m[94m|[0m     [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `samples` and `header` are never used[0m
+  [1m[94m--> [0msrc/io/vcf.rs:88:12
+   [1m[94m|[0m
+[1m[94m27[0m [1m[94m|[0m impl VcfReader {
+   [1m[94m|[0m [1m[94m--------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m88[0m [1m[94m|[0m     pub fn samples(&self) -> &Samples {
+   [1m[94m|[0m            [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m98[0m [1m[94m|[0m     pub fn header(&self) -> &Header {
+   [1m[94m|[0m            [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `Window` is never constructed[0m
+  [1m[94m--> [0msrc/io/window.rs:12:12
+   [1m[94m|[0m
+[1m[94m12[0m [1m[94m|[0m pub struct Window {
+   [1m[94m|[0m            [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `WindowIndices` is never constructed[0m
+  [1m[94m--> [0msrc/io/window.rs:31:12
+   [1m[94m|[0m
+[1m[94m31[0m [1m[94m|[0m pub struct WindowIndices {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `n_markers` and `n_output_markers` are never used[0m
+  [1m[94m--> [0msrc/io/window.rs:50:12
+   [1m[94m|[0m
+[1m[94m48[0m [1m[94m|[0m impl WindowIndices {
+   [1m[94m|[0m [1m[94m------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m49[0m [1m[94m|[0m     /// Number of markers in the window
+[1m[94m50[0m [1m[94m|[0m     pub fn n_markers(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m55[0m [1m[94m|[0m     pub fn n_output_markers(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new`, `n_markers`, `n_samples`, `n_haplotypes`, `has_ref`, and `gen_dist` are never used[0m
+  [1m[94m--> [0msrc/io/window.rs:62:12
+   [1m[94m|[0m
+[1m[94m60[0m [1m[94m|[0m impl Window {
+   [1m[94m|[0m [1m[94m-----------[0m [1m[94massociated items in this implementation[0m
+[1m[94m61[0m [1m[94m|[0m     /// Create a new window
+[1m[94m62[0m [1m[94m|[0m     pub fn new(
+   [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m79[0m [1m[94m|[0m     pub fn n_markers(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m84[0m [1m[94m|[0m     pub fn n_samples(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m89[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m94[0m [1m[94m|[0m     pub fn has_ref(&self) -> bool {
+   [1m[94m|[0m            [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m99[0m [1m[94m|[0m     pub fn gen_dist(&self, m1: usize, m2: usize) -> f64 {
+   [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `WindowBuilder` is never constructed[0m
+   [1m[94m--> [0msrc/io/window.rs:107:12
+    [1m[94m|[0m
+[1m[94m107[0m [1m[94m|[0m pub struct WindowBuilder {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new`, `window_cm`, `overlap_cm`, `max_markers`, `buffer_cm`, and `build` are never used[0m
+   [1m[94m--> [0msrc/io/window.rs:120:12
+    [1m[94m|[0m
+[1m[94m118[0m [1m[94m|[0m impl WindowBuilder {
+    [1m[94m|[0m [1m[94m------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m119[0m [1m[94m|[0m     /// Create a new window builder with default settings
+[1m[94m120[0m [1m[94m|[0m     pub fn new() -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m130[0m [1m[94m|[0m     pub fn window_cm(mut self, cm: f32) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m136[0m [1m[94m|[0m     pub fn overlap_cm(mut self, cm: f32) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m142[0m [1m[94m|[0m     pub fn max_markers(mut self, n: usize) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m148[0m [1m[94m|[0m     pub fn buffer_cm(mut self, cm: f32) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m154[0m [1m[94m|[0m     pub fn build<'a>(
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `SlidingWindowIterator` is never constructed[0m
+   [1m[94m--> [0msrc/io/window.rs:178:12
+    [1m[94m|[0m
+[1m[94m178[0m [1m[94m|[0m pub struct SlidingWindowIterator<'a> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new`, `find_window_end`, and `find_overlap_start` are never used[0m
+   [1m[94m--> [0msrc/io/window.rs:192:12
+    [1m[94m|[0m
+[1m[94m190[0m [1m[94m|[0m impl<'a> SlidingWindowIterator<'a> {
+    [1m[94m|[0m [1m[94m----------------------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m191[0m [1m[94m|[0m     /// Create a new sliding window iterator
+[1m[94m192[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m214[0m [1m[94m|[0m     fn find_window_end(&self, start: usize) -> usize {
+    [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m239[0m [1m[94m|[0m     fn find_overlap_start(&self, end: usize) -> usize {
+    [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `sampled_path` and `log_likelihood` are never read[0m
+  [1m[94m--> [0msrc/model/hmm.rs:25:9
+   [1m[94m|[0m
+[1m[94m21[0m [1m[94m|[0m pub struct HmmResult {
+   [1m[94m|[0m            [1m[94m---------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m25[0m [1m[94m|[0m     pub sampled_path: Vec<usize>,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^[0m
+[1m[94m26[0m [1m[94m|[0m     /// Log-likelihood of the data
+[1m[94m27[0m [1m[94m|[0m     pub log_likelihood: f64,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `HmmResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: struct `PhasingHmm` is never constructed[0m
+   [1m[94m--> [0msrc/model/hmm.rs:289:12
+    [1m[94m|[0m
+[1m[94m289[0m [1m[94m|[0m pub struct PhasingHmm<'a> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new` and `phase_sample` are never used[0m
+   [1m[94m--> [0msrc/model/hmm.rs:298:12
+    [1m[94m|[0m
+[1m[94m296[0m [1m[94m|[0m impl<'a> PhasingHmm<'a> {
+    [1m[94m|[0m [1m[94m-----------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m297[0m [1m[94m|[0m     /// Create a new phasing HMM
+[1m[94m298[0m [1m[94m|[0m     pub fn new(ref_gt: &'a GenotypeMatrix, params: &'a ModelParams) -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m314[0m [1m[94m|[0m     pub fn phase_sample(
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `min_match_length` is never read[0m
+  [1m[94m--> [0msrc/model/parameters.rs:22:9
+   [1m[94m|[0m
+[1m[94m 8[0m [1m[94m|[0m pub struct ModelParams {
+   [1m[94m|[0m            [1m[94m-----------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m22[0m [1m[94m|[0m     pub min_match_length: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `ModelParams` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `no_switch_prob`, `update_p_mismatch`, `update_recomb_intensity`, and `set_ne` are never used[0m
+   [1m[94m--> [0msrc/model/parameters.rs:87:12
+    [1m[94m|[0m
+[1m[94m 25[0m [1m[94m|[0m impl ModelParams {
+    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 87[0m [1m[94m|[0m     pub fn no_switch_prob(&self, gen_dist: f64) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m102[0m [1m[94m|[0m     pub fn update_p_mismatch(&mut self, new_p: f32) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m109[0m [1m[94m|[0m     pub fn update_recomb_intensity(&mut self, new_intensity: f32) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m116[0m [1m[94m|[0m     pub fn set_ne(&mut self, ne: f32) {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `ParamEstimates` is never constructed[0m
+   [1m[94m--> [0msrc/model/parameters.rs:134:12
+    [1m[94m|[0m
+[1m[94m134[0m [1m[94m|[0m pub struct ParamEstimates {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/model/parameters.rs:149:12
+    [1m[94m|[0m
+[1m[94m147[0m [1m[94m|[0m impl ParamEstimates {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m148[0m [1m[94m|[0m     /// Create new empty estimates
+[1m[94m149[0m [1m[94m|[0m     pub fn new() -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m154[0m [1m[94m|[0m     pub fn add_switch(&mut self, switch_prob: f64, expected_switches: f64) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m161[0m [1m[94m|[0m     pub fn add_emission(&mut self, match_prob: f64, mismatch_prob: f64) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m167[0m [1m[94m|[0m     pub fn merge(&mut self, other: &ParamEstimates) {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+[1m[94m...[0m
+[1m[94m176[0m [1m[94m|[0m     pub fn recomb_intensity(&self) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m184[0m [1m[94m|[0m     pub fn p_mismatch(&self) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m193[0m [1m[94m|[0m     pub fn n_obs(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `PbwtUpdater` is never constructed[0m
+  [1m[94m--> [0msrc/model/pbwt.rs:24:12
+   [1m[94m|[0m
+[1m[94m24[0m [1m[94m|[0m pub struct PbwtUpdater {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new`, `n_haps`, `update`, and `update_with` are never used[0m
+  [1m[94m--> [0msrc/model/pbwt.rs:33:12
+   [1m[94m|[0m
+[1m[94m31[0m [1m[94m|[0m impl PbwtUpdater {
+   [1m[94m|[0m [1m[94m----------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m32[0m [1m[94m|[0m     /// Create a new PBWT updater
+[1m[94m33[0m [1m[94m|[0m     pub fn new(n_haps: usize) -> Self {
+   [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m41[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m51[0m [1m[94m|[0m     pub fn update(&mut self, alleles: &[u8], n_alleles: usize, prefix: &mut [u32]) {
+   [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m84[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: method `find_matches` is never used[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:201:12
+    [1m[94m|[0m
+[1m[94m128[0m [1m[94m|[0m impl PbwtDivUpdater {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m201[0m [1m[94m|[0m     pub fn find_matches(
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `bwd_prefix` and `bwd_divergence` are never read[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:243:5
+    [1m[94m|[0m
+[1m[94m237[0m [1m[94m|[0m pub struct PbwtIbs {
+    [1m[94m|[0m            [1m[94m-------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m243[0m [1m[94m|[0m     bwd_prefix: Vec<u32>,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^[0m
+[1m[94m244[0m [1m[94m|[0m     bwd_divergence: Vec<u32>,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `PbwtIbs` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: method `reset` is never used[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:263:12
+    [1m[94m|[0m
+[1m[94m250[0m [1m[94m|[0m impl PbwtIbs {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m263[0m [1m[94m|[0m     pub fn reset(&mut self) {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: function `impute_haplotype` is never used[0m
+   [1m[94m--> [0msrc/pipelines/imputation.rs:168:8
+    [1m[94m|[0m
+[1m[94m168[0m [1m[94m|[0m pub fn impute_haplotype(
+    [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `ref_haps` and `switch_probs` are never read[0m
+  [1m[94m--> [0msrc/utils/workspace.rs:36:9
+   [1m[94m|[0m
+[1m[94m16[0m [1m[94m|[0m pub struct Workspace {
+   [1m[94m|[0m            [1m[94m---------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m36[0m [1m[94m|[0m     pub ref_haps: Vec<HapIdx>,
+   [1m[94m|[0m         [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m42[0m [1m[94m|[0m     pub switch_probs: Vec<f32>,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `Workspace` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `clear`, `reset_pbwt`, `init_fwd_uniform`, and `init_bwd_ones` are never used[0m
+   [1m[94m--> [0msrc/utils/workspace.rs:98:12
+    [1m[94m|[0m
+[1m[94m 51[0m [1m[94m|[0m impl Workspace {
+    [1m[94m|[0m [1m[94m--------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 98[0m [1m[94m|[0m     pub fn clear(&mut self) {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+[1m[94m...[0m
+[1m[94m111[0m [1m[94m|[0m     pub fn reset_pbwt(&mut self, n_haps: usize) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m123[0m [1m[94m|[0m     pub fn init_fwd_uniform(&mut self, n_states: usize) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m131[0m [1m[94m|[0m     pub fn init_bwd_ones(&mut self, n_states: usize) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `ImpWorkspace` is never constructed[0m
+   [1m[94m--> [0msrc/utils/workspace.rs:184:12
+    [1m[94m|[0m
+[1m[94m184[0m [1m[94m|[0m pub struct ImpWorkspace {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new`, `resize`, and `clear` are never used[0m
+   [1m[94m--> [0msrc/utils/workspace.rs:206:12
+    [1m[94m|[0m
+[1m[94m204[0m [1m[94m|[0m impl ImpWorkspace {
+    [1m[94m|[0m [1m[94m-----------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m205[0m [1m[94m|[0m     /// Create a new imputation workspace
+[1m[94m206[0m [1m[94m|[0m     pub fn new(n_states: usize, n_markers: usize) -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m218[0m [1m[94m|[0m     pub fn resize(&mut self, n_states: usize, n_markers: usize) {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m228[0m [1m[94m|[0m     pub fn clear(&mut self) {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m: `reagle` (bin "reagle") generated 61 warnings (run `cargo fix --bin "reagle" -p reagle` to apply 9 suggestions)
+[1m[33mwarning[0m[1m: method `err_rate` is never used[0m
+   [1m[94m--> [0msrc/config.rs:200:12
+    [1m[94m|[0m
+[1m[94m131[0m [1m[94m|[0m impl Config {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m200[0m [1m[94m|[0m     pub fn err_rate(&self, n_haps: usize) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: methods `len`, `is_empty`, and `chrom` are never used[0m
+   [1m[94m--> [0msrc/data/genetic_map.rs:145:12
+    [1m[94m|[0m
+[1m[94m 26[0m [1m[94m|[0m impl GeneticMap {
+    [1m[94m|[0m [1m[94m---------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m145[0m [1m[94m|[0m     pub fn len(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m150[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m155[0m [1m[94m|[0m     pub fn chrom(&self) -> ChromIdx {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/haplotype.rs:119:12
+    [1m[94m|[0m
+[1m[94m117[0m [1m[94m|[0m impl Samples {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m118[0m [1m[94m|[0m     /// Create an empty sample collection
+[1m[94m119[0m [1m[94m|[0m     pub fn new() -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m141[0m [1m[94m|[0m     pub fn from_ids_with_ploidy(ids: Vec<String>, is_diploid: Vec<bool>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m163[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m176[0m [1m[94m|[0m     pub fn id(&self, idx: SampleIdx) -> &str {
+    [1m[94m|[0m            [1m[33m^^[0m
+[1m[94m...[0m
+[1m[94m186[0m [1m[94m|[0m     pub fn is_diploid(&self, idx: SampleIdx) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m191[0m [1m[94m|[0m     pub fn push(&mut self, id: String, diploid: bool) {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m205[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = SampleIdx> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m210[0m [1m[94m|[0m     pub fn hap_iter(&self) -> impl Iterator<Item = HapIdx> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m221[0m [1m[94m|[0m     pub fn combine(first: &Samples, second: &Samples) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `is_missing` and `complement` are never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:82:12
+    [1m[94m|[0m
+[1m[94m 52[0m [1m[94m|[0m impl Allele {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 82[0m [1m[94m|[0m     pub fn is_missing(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m100[0m [1m[94m|[0m     pub fn complement(&self) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: method `allele` is never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:166:12
+    [1m[94m|[0m
+[1m[94m132[0m [1m[94m|[0m impl Marker {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m166[0m [1m[94m|[0m     pub fn allele(&self, idx: usize) -> Option<&Allele> {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `from_vec`, `is_empty`, `get`, and `iter` are never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:224:12
+    [1m[94m|[0m
+[1m[94m217[0m [1m[94m|[0m impl Markers {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m...[0m
+[1m[94m224[0m [1m[94m|[0m     pub fn from_vec(markers: Vec<Marker>, chrom_names: Vec<Arc<str>>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m237[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m242[0m [1m[94m|[0m     pub fn get(&self, idx: MarkerIdx) -> Option<&Marker> {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m275[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = &Marker> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `size_bytes`, `is_biallelic`, and `iter` are never used[0m
+   [1m[94m--> [0msrc/data/storage/mod.rs:77:12
+    [1m[94m|[0m
+[1m[94m 36[0m [1m[94m|[0m impl GenotypeColumn {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 77[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m122[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m131[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `size_bytes`, `raw_bits`, and `raw_u64s` are never used[0m
+   [1m[94m--> [0msrc/data/storage/dense.rs:127:12
+    [1m[94m|[0m
+[1m[94m 25[0m [1m[94m|[0m impl DenseColumn {
+    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m127[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m133[0m [1m[94m|[0m     pub fn raw_bits(&self) -> &BitSlice<u64, Lsb0> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m138[0m [1m[94m|[0m     pub fn raw_u64s(&self) -> &[u64] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new`, `compression_ratio`, `is_biallelic`, `iter_marker`, `haplotypes_with_pattern`, and `size_bytes` are never used[0m
+   [1m[94m--> [0msrc/data/storage/dictionary.rs:30:12
+    [1m[94m|[0m
+[1m[94m 28[0m [1m[94m|[0m impl DictionaryColumn {
+    [1m[94m|[0m [1m[94m---------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m 29[0m [1m[94m|[0m     /// Create a new dictionary column from patterns and mapping
+[1m[94m 30[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m127[0m [1m[94m|[0m     pub fn compression_ratio(&self) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m132[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m148[0m [1m[94m|[0m     pub fn iter_marker(&self, marker_offset: usize) -> impl Iterator<Item = u8> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m158[0m [1m[94m|[0m     pub fn haplotypes_with_pattern(&self, pattern_idx: u16) -> Vec<HapIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m168[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/storage/matrix.rs:51:12
+    [1m[94m|[0m
+[1m[94m 32[0m [1m[94m|[0m impl GenotypeMatrix {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m...[0m
+[1m[94m 51[0m [1m[94m|[0m     pub fn empty(samples: Arc<Samples>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+[1m[94m...[0m
+[1m[94m 77[0m [1m[94m|[0m     pub fn is_phased(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 82[0m [1m[94m|[0m     pub fn is_reversed(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 97[0m [1m[94m|[0m     pub fn samples(&self) -> &Samples {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m136[0m [1m[94m|[0m     pub fn restrict_markers(&self, indices: &[usize]) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m153[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = (MarkerIdx, &Marker, &GenotypeColumn)> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m161[0m [1m[94m|[0m     pub fn marker_indices(&self) -> impl Iterator<Item = MarkerIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m166[0m [1m[94m|[0m     pub fn haplotype_indices(&self) -> impl Iterator<Item = HapIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m171[0m [1m[94m|[0m     pub fn haplotype(&self, hap: HapIdx) -> Vec<u8> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m176[0m [1m[94m|[0m     pub fn alleles_at_marker(&self, marker: MarkerIdx) -> Vec<u8> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m184[0m [1m[94m|[0m     pub fn set_phased(&mut self, phased: bool) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m189[0m [1m[94m|[0m     pub fn set_reversed(&mut self, reversed: bool) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m194[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m200[0m [1m[94m|[0m     pub fn column_mut(&mut self, idx: MarkerIdx) -> &mut GenotypeColumn {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m205[0m [1m[94m|[0m     pub fn set_column(&mut self, idx: MarkerIdx, column: GenotypeColumn) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m210[0m [1m[94m|[0m     pub fn push(&mut self, marker: Marker, column: GenotypeColumn) {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `n_haps`, `marker_alleles_mut`, `swap_range`, `copy_from`, and `raw_alleles` are never used[0m
+   [1m[94m--> [0msrc/data/storage/mutable.rs:48:12
+    [1m[94m|[0m
+[1m[94m 20[0m [1m[94m|[0m impl MutableGenotypes {
+    [1m[94m|[0m [1m[94m---------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 48[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 72[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 91[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m100[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m109[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `is_carrier`, `maf`, `size_bytes`, and `iter` are never used[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:73:12
+    [1m[94m|[0m
+[1m[94m 22[0m [1m[94m|[0m impl SparseColumn {
+    [1m[94m|[0m [1m[94m-----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 73[0m [1m[94m|[0m     pub fn is_carrier(&self, hap: HapIdx) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 97[0m [1m[94m|[0m     pub fn maf(&self) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m107[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m113[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: field `n_haplotypes` is never read[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:130:5
+    [1m[94m|[0m
+[1m[94m125[0m [1m[94m|[0m pub struct SparseMultiAllelic {
+    [1m[94m|[0m            [1m[94m------------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m130[0m [1m[94m|[0m     n_haplotypes: u32,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `SparseMultiAllelic` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `n_haplotypes`, `n_entries`, and `size_bytes` are never used[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:153:12
+    [1m[94m|[0m
+[1m[94m133[0m [1m[94m|[0m impl SparseMultiAllelic {
+    [1m[94m|[0m [1m[94m-----------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m153[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m158[0m [1m[94m|[0m     pub fn n_entries(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m163[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `ref_gt`, `gen_map`, and `indices` are never read[0m
+  [1m[94m--> [0msrc/io/window.rs:17:9
+   [1m[94m|[0m
+[1m[94m12[0m [1m[94m|[0m pub struct Window {
+   [1m[94m|[0m            [1m[94m------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m17[0m [1m[94m|[0m     pub ref_gt: Option<GenotypeMatrix>,
+   [1m[94m|[0m         [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m20[0m [1m[94m|[0m     pub gen_map: GeneticMap,
+   [1m[94m|[0m         [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m23[0m [1m[94m|[0m     pub indices: WindowIndices,
+   [1m[94m|[0m         [1m[33m^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `Window` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: multiple fields are never read[0m
+  [1m[94m--> [0msrc/io/window.rs:33:9
+   [1m[94m|[0m
+[1m[94m31[0m [1m[94m|[0m pub struct WindowIndices {
+   [1m[94m|[0m            [1m[94m-------------[0m [1m[94mfields in this struct[0m
+[1m[94m32[0m [1m[94m|[0m     /// Start marker index (inclusive) in the full dataset
+[1m[94m33[0m [1m[94m|[0m     pub start: usize,
+   [1m[94m|[0m         [1m[33m^^^^^[0m
+[1m[94m34[0m [1m[94m|[0m     /// End marker index (exclusive) in the full dataset
+[1m[94m35[0m [1m[94m|[0m     pub end: usize,
+   [1m[94m|[0m         [1m[33m^^^[0m
+[1m[94m36[0m [1m[94m|[0m     /// Previous splice point (where output starts)
+[1m[94m37[0m [1m[94m|[0m     pub prev_splice: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^[0m
+[1m[94m38[0m [1m[94m|[0m     /// Next splice point (where output ends)
+[1m[94m39[0m [1m[94m|[0m     pub next_splice: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^[0m
+[1m[94m40[0m [1m[94m|[0m     /// Overlap start (where next window's data begins)
+[1m[94m41[0m [1m[94m|[0m     pub overlap_start: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
+[1m[94m42[0m [1m[94m|[0m     /// Number of target markers
+[1m[94m43[0m [1m[94m|[0m     pub n_targ_markers: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^[0m
+[1m[94m44[0m [1m[94m|[0m     /// Number of reference markers (if imputing)
+[1m[94m45[0m [1m[94m|[0m     pub n_ref_markers: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `WindowIndices` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `n_samples`, `n_haplotypes`, `has_ref`, and `gen_dist` are never used[0m
+  [1m[94m--> [0msrc/io/window.rs:84:12
+   [1m[94m|[0m
+[1m[94m60[0m [1m[94m|[0m impl Window {
+   [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m84[0m [1m[94m|[0m     pub fn n_samples(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m89[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m94[0m [1m[94m|[0m     pub fn has_ref(&self) -> bool {
+   [1m[94m|[0m            [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m99[0m [1m[94m|[0m     pub fn gen_dist(&self, m1: usize, m2: usize) -> f64 {
+   [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `buffer_cm` is never read[0m
+   [1m[94m--> [0msrc/io/window.rs:115:5
+    [1m[94m|[0m
+[1m[94m107[0m [1m[94m|[0m pub struct WindowBuilder {
+    [1m[94m|[0m            [1m[94m-------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m115[0m [1m[94m|[0m     buffer_cm: f32,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `max_markers` and `buffer_cm` are never used[0m
+   [1m[94m--> [0msrc/io/window.rs:142:12
+    [1m[94m|[0m
+[1m[94m118[0m [1m[94m|[0m impl WindowBuilder {
+    [1m[94m|[0m [1m[94m------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m142[0m [1m[94m|[0m     pub fn max_markers(mut self, n: usize) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m148[0m [1m[94m|[0m     pub fn buffer_cm(mut self, cm: f32) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `n_haps` and `update_with` are never used[0m
+  [1m[94m--> [0msrc/model/pbwt.rs:41:12
+   [1m[94m|[0m
+[1m[94m31[0m [1m[94m|[0m impl PbwtUpdater {
+   [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m41[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m84[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 52 warnings (31 duplicates) (run `cargo fix --bin "reagle" -p reagle --tests` to apply 1 suggestion)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 0.86s
+[1m[92m   Compiling[0m reagle v0.1.0 (/home/runner/work/reagle/reagle/Rust)
+[1m[33mwarning[0m[1m: unused variable: `m`[0m
+   [1m[94m--> [0msrc/data/storage/mutable.rs:134:57
+    [1m[94m|[0m
+[1m[94m134[0m [1m[94m|[0m         let mut geno = MutableGenotypes::from_fn(3, 4, |m, h| {
+    [1m[94m|[0m                                                         [1m[33m^[0m [1m[33mhelp: if this is intentional, prefix it with an underscore: `_m`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m: `reagle` (lib test) generated 1 warning (run `cargo fix --lib -p reagle --tests` to apply 1 suggestion)
+[1m[33mwarning[0m[1m: unused import: `genetic_map::GeneticMap`[0m
+  [1m[94m--> [0msrc/data/mod.rs:19:9
+   [1m[94m|[0m
+[1m[94m19[0m [1m[94m|[0m pub use genetic_map::GeneticMap;
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: unused import: `Samples`[0m
+  [1m[94m--> [0msrc/data/mod.rs:20:40
+   [1m[94m|[0m
+[1m[94m20[0m [1m[94m|[0m pub use haplotype::{HapIdx, SampleIdx, Samples};
+   [1m[94m|[0m                                        [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `Allele`, `Marker`, and `Markers`[0m
+  [1m[94m--> [0msrc/data/mod.rs:21:18
+   [1m[94m|[0m
+[1m[94m21[0m [1m[94m|[0m pub use marker::{Allele, Marker, MarkerIdx, Markers};
+   [1m[94m|[0m                  [1m[33m^^^^^^[0m  [1m[33m^^^^^^[0m             [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `DenseColumn`, `DictionaryColumn`, `GenotypeColumn`, `GenotypeMatrix`, `MutableGenotypes`, and `SparseColumn`[0m
+  [1m[94m--> [0msrc/data/mod.rs:23:5
+   [1m[94m|[0m
+[1m[94m23[0m [1m[94m|[0m     DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, MutableGenotypes, SparseColumn,
+   [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused import: `VcfWriter`[0m
+ [1m[94m--> [0msrc/io/mod.rs:9:26
+  [1m[94m|[0m
+[1m[94m9[0m [1m[94m|[0m pub use vcf::{VcfReader, VcfWriter};
+  [1m[94m|[0m                          [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `SlidingWindowIterator`, `WindowBuilder`, and `Window`[0m
+  [1m[94m--> [0msrc/io/mod.rs:10:18
+   [1m[94m|[0m
+[1m[94m10[0m [1m[94m|[0m pub use window::{Window, WindowBuilder, SlidingWindowIterator};
+   [1m[94m|[0m                  [1m[33m^^^^^^[0m  [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `HmmResult` and `LiStephensHmm`[0m
+  [1m[94m--> [0msrc/model/mod.rs:14:15
+   [1m[94m|[0m
+[1m[94m14[0m [1m[94m|[0m pub use hmm::{LiStephensHmm, HmmResult};
+   [1m[94m|[0m               [1m[33m^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: unused imports: `PbwtDivUpdater` and `PbwtUpdater`[0m
+  [1m[94m--> [0msrc/model/mod.rs:16:16
+   [1m[94m|[0m
+[1m[94m16[0m [1m[94m|[0m pub use pbwt::{PbwtUpdater, PbwtDivUpdater};
+   [1m[94m|[0m                [1m[33m^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: method `err_rate` is never used[0m
+   [1m[94m--> [0msrc/config.rs:200:12
+    [1m[94m|[0m
+[1m[94m131[0m [1m[94m|[0m impl Config {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m200[0m [1m[94m|[0m     pub fn err_rate(&self, n_haps: usize) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: methods `len`, `is_empty`, and `chrom` are never used[0m
+   [1m[94m--> [0msrc/data/genetic_map.rs:145:12
+    [1m[94m|[0m
+[1m[94m 26[0m [1m[94m|[0m impl GeneticMap {
+    [1m[94m|[0m [1m[94m---------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m145[0m [1m[94m|[0m     pub fn len(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m150[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m155[0m [1m[94m|[0m     pub fn chrom(&self) -> ChromIdx {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `insert` and `gen_pos` are never used[0m
+   [1m[94m--> [0msrc/data/genetic_map.rs:194:12
+    [1m[94m|[0m
+[1m[94m171[0m [1m[94m|[0m impl GeneticMaps {
+    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m194[0m [1m[94m|[0m     pub fn insert(&mut self, chrom: ChromIdx, map: GeneticMap) {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m203[0m [1m[94m|[0m     pub fn gen_pos(&self, chrom: ChromIdx, phys_pos: u32) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/haplotype.rs:119:12
+    [1m[94m|[0m
+[1m[94m117[0m [1m[94m|[0m impl Samples {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m118[0m [1m[94m|[0m     /// Create an empty sample collection
+[1m[94m119[0m [1m[94m|[0m     pub fn new() -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m141[0m [1m[94m|[0m     pub fn from_ids_with_ploidy(ids: Vec<String>, is_diploid: Vec<bool>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m163[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m176[0m [1m[94m|[0m     pub fn id(&self, idx: SampleIdx) -> &str {
+    [1m[94m|[0m            [1m[33m^^[0m
+[1m[94m...[0m
+[1m[94m186[0m [1m[94m|[0m     pub fn is_diploid(&self, idx: SampleIdx) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m191[0m [1m[94m|[0m     pub fn push(&mut self, id: String, diploid: bool) {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m205[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = SampleIdx> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m210[0m [1m[94m|[0m     pub fn hap_iter(&self) -> impl Iterator<Item = HapIdx> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m221[0m [1m[94m|[0m     pub fn combine(first: &Samples, second: &Samples) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `is_missing` and `complement` are never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:82:12
+    [1m[94m|[0m
+[1m[94m 52[0m [1m[94m|[0m impl Allele {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 82[0m [1m[94m|[0m     pub fn is_missing(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m100[0m [1m[94m|[0m     pub fn complement(&self) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: method `allele` is never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:166:12
+    [1m[94m|[0m
+[1m[94m132[0m [1m[94m|[0m impl Marker {
+    [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m166[0m [1m[94m|[0m     pub fn allele(&self, idx: usize) -> Option<&Allele> {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `from_vec`, `is_empty`, `get`, and `iter` are never used[0m
+   [1m[94m--> [0msrc/data/marker.rs:224:12
+    [1m[94m|[0m
+[1m[94m217[0m [1m[94m|[0m impl Markers {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m...[0m
+[1m[94m224[0m [1m[94m|[0m     pub fn from_vec(markers: Vec<Marker>, chrom_names: Vec<Arc<str>>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m237[0m [1m[94m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m242[0m [1m[94m|[0m     pub fn get(&self, idx: MarkerIdx) -> Option<&Marker> {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m275[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = &Marker> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: variant `Dictionary` is never constructed[0m
+  [1m[94m--> [0msrc/data/storage/mod.rs:33:5
+   [1m[94m|[0m
+[1m[94m22[0m [1m[94m|[0m pub enum GenotypeColumn {
+   [1m[94m|[0m          [1m[94m--------------[0m [1m[94mvariant in this enum[0m
+[1m[94m...[0m
+[1m[94m33[0m [1m[94m|[0m     Dictionary(DictionaryColumn),
+   [1m[94m|[0m     [1m[33m^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `GenotypeColumn` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `size_bytes`, `is_biallelic`, and `iter` are never used[0m
+   [1m[94m--> [0msrc/data/storage/mod.rs:77:12
+    [1m[94m|[0m
+[1m[94m 36[0m [1m[94m|[0m impl GenotypeColumn {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 77[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m122[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m131[0m [1m[94m|[0m     pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `size_bytes`, `raw_bits`, and `raw_u64s` are never used[0m
+   [1m[94m--> [0msrc/data/storage/dense.rs:127:12
+    [1m[94m|[0m
+[1m[94m 25[0m [1m[94m|[0m impl DenseColumn {
+    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m127[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m133[0m [1m[94m|[0m     pub fn raw_bits(&self) -> &BitSlice<u64, Lsb0> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m138[0m [1m[94m|[0m     pub fn raw_u64s(&self) -> &[u64] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new`, `compression_ratio`, `is_biallelic`, `iter_marker`, `haplotypes_with_pattern`, and `size_bytes` are never used[0m
+   [1m[94m--> [0msrc/data/storage/dictionary.rs:30:12
+    [1m[94m|[0m
+[1m[94m 28[0m [1m[94m|[0m impl DictionaryColumn {
+    [1m[94m|[0m [1m[94m---------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m 29[0m [1m[94m|[0m     /// Create a new dictionary column from patterns and mapping
+[1m[94m 30[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m127[0m [1m[94m|[0m     pub fn compression_ratio(&self) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m132[0m [1m[94m|[0m     pub fn is_biallelic(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m148[0m [1m[94m|[0m     pub fn iter_marker(&self, marker_offset: usize) -> impl Iterator<Item = u8> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m158[0m [1m[94m|[0m     pub fn haplotypes_with_pattern(&self, pattern_idx: u16) -> Vec<HapIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m168[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/storage/matrix.rs:51:12
+    [1m[94m|[0m
+[1m[94m 32[0m [1m[94m|[0m impl GenotypeMatrix {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m...[0m
+[1m[94m 51[0m [1m[94m|[0m     pub fn empty(samples: Arc<Samples>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+[1m[94m...[0m
+[1m[94m 77[0m [1m[94m|[0m     pub fn is_phased(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 82[0m [1m[94m|[0m     pub fn is_reversed(&self) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 97[0m [1m[94m|[0m     pub fn samples(&self) -> &Samples {
+    [1m[94m|[0m            [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m136[0m [1m[94m|[0m     pub fn restrict_markers(&self, indices: &[usize]) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m153[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = (MarkerIdx, &Marker, &GenotypeColumn)> {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+[1m[94m...[0m
+[1m[94m161[0m [1m[94m|[0m     pub fn marker_indices(&self) -> impl Iterator<Item = MarkerIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m166[0m [1m[94m|[0m     pub fn haplotype_indices(&self) -> impl Iterator<Item = HapIdx> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m171[0m [1m[94m|[0m     pub fn haplotype(&self, hap: HapIdx) -> Vec<u8> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m176[0m [1m[94m|[0m     pub fn alleles_at_marker(&self, marker: MarkerIdx) -> Vec<u8> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m184[0m [1m[94m|[0m     pub fn set_phased(&mut self, phased: bool) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m189[0m [1m[94m|[0m     pub fn set_reversed(&mut self, reversed: bool) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m194[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m200[0m [1m[94m|[0m     pub fn column_mut(&mut self, idx: MarkerIdx) -> &mut GenotypeColumn {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m205[0m [1m[94m|[0m     pub fn set_column(&mut self, idx: MarkerIdx, column: GenotypeColumn) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m210[0m [1m[94m|[0m     pub fn push(&mut self, marker: Marker, column: GenotypeColumn) {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `GenotypeMatrixView` is never constructed[0m
+   [1m[94m--> [0msrc/data/storage/matrix.rs:217:12
+    [1m[94m|[0m
+[1m[94m217[0m [1m[94m|[0m pub struct GenotypeMatrixView<'a> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/data/storage/matrix.rs:224:12
+    [1m[94m|[0m
+[1m[94m222[0m [1m[94m|[0m impl<'a> GenotypeMatrixView<'a> {
+    [1m[94m|[0m [1m[94m-------------------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m223[0m [1m[94m|[0m     /// Create a view into a matrix
+[1m[94m224[0m [1m[94m|[0m     pub fn new(matrix: &'a GenotypeMatrix, marker_range: Range<usize>) -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m229[0m [1m[94m|[0m     pub fn n_markers(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m234[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m239[0m [1m[94m|[0m     pub fn allele(&self, marker_offset: usize, hap: HapIdx) -> u8 {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m245[0m [1m[94m|[0m     pub fn marker(&self, marker_offset: usize) -> &Marker {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m251[0m [1m[94m|[0m     pub fn column(&self, marker_offset: usize) -> &GenotypeColumn {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m257[0m [1m[94m|[0m     pub fn to_owned(&self) -> GenotypeMatrix {
+    [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `n_haps` is never read[0m
+  [1m[94m--> [0msrc/data/storage/mutable.rs:17:5
+   [1m[94m|[0m
+[1m[94m13[0m [1m[94m|[0m pub struct MutableGenotypes {
+   [1m[94m|[0m            [1m[94m----------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m17[0m [1m[94m|[0m     n_haps: usize,
+   [1m[94m|[0m     [1m[33m^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `MutableGenotypes` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `n_haps`, `marker_alleles_mut`, `swap_range`, `copy_from`, and `raw_alleles` are never used[0m
+   [1m[94m--> [0msrc/data/storage/mutable.rs:48:12
+    [1m[94m|[0m
+[1m[94m 20[0m [1m[94m|[0m impl MutableGenotypes {
+    [1m[94m|[0m [1m[94m---------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 48[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 72[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 91[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m100[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m109[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `is_carrier`, `maf`, `size_bytes`, and `iter` are never used[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:73:12
+    [1m[94m|[0m
+[1m[94m 22[0m [1m[94m|[0m impl SparseColumn {
+    [1m[94m|[0m [1m[94m-----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 73[0m [1m[94m|[0m     pub fn is_carrier(&self, hap: HapIdx) -> bool {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 97[0m [1m[94m|[0m     pub fn maf(&self) -> f64 {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m107[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m113[0m [1m[94m|[0m     pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+    [1m[94m|[0m            [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: field `n_haplotypes` is never read[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:130:5
+    [1m[94m|[0m
+[1m[94m125[0m [1m[94m|[0m pub struct SparseMultiAllelic {
+    [1m[94m|[0m            [1m[94m------------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m130[0m [1m[94m|[0m     n_haplotypes: u32,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `SparseMultiAllelic` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `n_haplotypes`, `n_entries`, and `size_bytes` are never used[0m
+   [1m[94m--> [0msrc/data/storage/sparse.rs:153:12
+    [1m[94m|[0m
+[1m[94m133[0m [1m[94m|[0m impl SparseMultiAllelic {
+    [1m[94m|[0m [1m[94m-----------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m153[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m158[0m [1m[94m|[0m     pub fn n_entries(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m163[0m [1m[94m|[0m     pub fn size_bytes(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: variants `InvalidData` and `Algorithm` are never constructed[0m
+  [1m[94m--> [0msrc/error.rs:21:5
+   [1m[94m|[0m
+[1m[94m10[0m [1m[94m|[0m pub enum ReagleError {
+   [1m[94m|[0m          [1m[94m-----------[0m [1m[94mvariants in this enum[0m
+[1m[94m...[0m
+[1m[94m21[0m [1m[94m|[0m     InvalidData { message: String },
+   [1m[94m|[0m     [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m25[0m [1m[94m|[0m     Algorithm { message: String },
+   [1m[94m|[0m     [1m[33m^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `ReagleError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: associated functions `invalid_data` and `algorithm` are never used[0m
+  [1m[94m--> [0msrc/error.rs:52:12
+   [1m[94m|[0m
+[1m[94m43[0m [1m[94m|[0m impl ReagleError {
+   [1m[94m|[0m [1m[94m----------------[0m [1m[94massociated functions in this implementation[0m
+[1m[94m...[0m
+[1m[94m52[0m [1m[94m|[0m     pub fn invalid_data(message: impl Into<String>) -> Self {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m59[0m [1m[94m|[0m     pub fn algorithm(message: impl Into<String>) -> Self {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `header` is never read[0m
+  [1m[94m--> [0msrc/io/vcf.rs:22:5
+   [1m[94m|[0m
+[1m[94m20[0m [1m[94m|[0m pub struct VcfReader {
+   [1m[94m|[0m            [1m[94m---------[0m [1m[94mfield in this struct[0m
+[1m[94m21[0m [1m[94m|[0m     /// The VCF header
+[1m[94m22[0m [1m[94m|[0m     header: Header,
+   [1m[94m|[0m     [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `samples` and `header` are never used[0m
+  [1m[94m--> [0msrc/io/vcf.rs:88:12
+   [1m[94m|[0m
+[1m[94m27[0m [1m[94m|[0m impl VcfReader {
+   [1m[94m|[0m [1m[94m--------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m88[0m [1m[94m|[0m     pub fn samples(&self) -> &Samples {
+   [1m[94m|[0m            [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m98[0m [1m[94m|[0m     pub fn header(&self) -> &Header {
+   [1m[94m|[0m            [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `ref_gt`, `gen_map`, and `indices` are never read[0m
+  [1m[94m--> [0msrc/io/window.rs:17:9
+   [1m[94m|[0m
+[1m[94m12[0m [1m[94m|[0m pub struct Window {
+   [1m[94m|[0m            [1m[94m------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m17[0m [1m[94m|[0m     pub ref_gt: Option<GenotypeMatrix>,
+   [1m[94m|[0m         [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m20[0m [1m[94m|[0m     pub gen_map: GeneticMap,
+   [1m[94m|[0m         [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m23[0m [1m[94m|[0m     pub indices: WindowIndices,
+   [1m[94m|[0m         [1m[33m^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `Window` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: multiple fields are never read[0m
+  [1m[94m--> [0msrc/io/window.rs:33:9
+   [1m[94m|[0m
+[1m[94m31[0m [1m[94m|[0m pub struct WindowIndices {
+   [1m[94m|[0m            [1m[94m-------------[0m [1m[94mfields in this struct[0m
+[1m[94m32[0m [1m[94m|[0m     /// Start marker index (inclusive) in the full dataset
+[1m[94m33[0m [1m[94m|[0m     pub start: usize,
+   [1m[94m|[0m         [1m[33m^^^^^[0m
+[1m[94m34[0m [1m[94m|[0m     /// End marker index (exclusive) in the full dataset
+[1m[94m35[0m [1m[94m|[0m     pub end: usize,
+   [1m[94m|[0m         [1m[33m^^^[0m
+[1m[94m36[0m [1m[94m|[0m     /// Previous splice point (where output starts)
+[1m[94m37[0m [1m[94m|[0m     pub prev_splice: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^[0m
+[1m[94m38[0m [1m[94m|[0m     /// Next splice point (where output ends)
+[1m[94m39[0m [1m[94m|[0m     pub next_splice: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^[0m
+[1m[94m40[0m [1m[94m|[0m     /// Overlap start (where next window's data begins)
+[1m[94m41[0m [1m[94m|[0m     pub overlap_start: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
+[1m[94m42[0m [1m[94m|[0m     /// Number of target markers
+[1m[94m43[0m [1m[94m|[0m     pub n_targ_markers: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^[0m
+[1m[94m44[0m [1m[94m|[0m     /// Number of reference markers (if imputing)
+[1m[94m45[0m [1m[94m|[0m     pub n_ref_markers: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `WindowIndices` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `n_markers` and `n_output_markers` are never used[0m
+  [1m[94m--> [0msrc/io/window.rs:50:12
+   [1m[94m|[0m
+[1m[94m48[0m [1m[94m|[0m impl WindowIndices {
+   [1m[94m|[0m [1m[94m------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m49[0m [1m[94m|[0m     /// Number of markers in the window
+[1m[94m50[0m [1m[94m|[0m     pub fn n_markers(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m55[0m [1m[94m|[0m     pub fn n_output_markers(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `n_samples`, `n_haplotypes`, `has_ref`, and `gen_dist` are never used[0m
+  [1m[94m--> [0msrc/io/window.rs:84:12
+   [1m[94m|[0m
+[1m[94m60[0m [1m[94m|[0m impl Window {
+   [1m[94m|[0m [1m[94m-----------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m84[0m [1m[94m|[0m     pub fn n_samples(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m89[0m [1m[94m|[0m     pub fn n_haplotypes(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m94[0m [1m[94m|[0m     pub fn has_ref(&self) -> bool {
+   [1m[94m|[0m            [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m99[0m [1m[94m|[0m     pub fn gen_dist(&self, m1: usize, m2: usize) -> f64 {
+   [1m[94m|[0m            [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `buffer_cm` is never read[0m
+   [1m[94m--> [0msrc/io/window.rs:115:5
+    [1m[94m|[0m
+[1m[94m107[0m [1m[94m|[0m pub struct WindowBuilder {
+    [1m[94m|[0m            [1m[94m-------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m115[0m [1m[94m|[0m     buffer_cm: f32,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `max_markers` and `buffer_cm` are never used[0m
+   [1m[94m--> [0msrc/io/window.rs:142:12
+    [1m[94m|[0m
+[1m[94m118[0m [1m[94m|[0m impl WindowBuilder {
+    [1m[94m|[0m [1m[94m------------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m142[0m [1m[94m|[0m     pub fn max_markers(mut self, n: usize) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m148[0m [1m[94m|[0m     pub fn buffer_cm(mut self, cm: f32) -> Self {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `PhasingHmm` is never constructed[0m
+   [1m[94m--> [0msrc/model/hmm.rs:289:12
+    [1m[94m|[0m
+[1m[94m289[0m [1m[94m|[0m pub struct PhasingHmm<'a> {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new` and `phase_sample` are never used[0m
+   [1m[94m--> [0msrc/model/hmm.rs:298:12
+    [1m[94m|[0m
+[1m[94m296[0m [1m[94m|[0m impl<'a> PhasingHmm<'a> {
+    [1m[94m|[0m [1m[94m-----------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m297[0m [1m[94m|[0m     /// Create a new phasing HMM
+[1m[94m298[0m [1m[94m|[0m     pub fn new(ref_gt: &'a GenotypeMatrix, params: &'a ModelParams) -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m314[0m [1m[94m|[0m     pub fn phase_sample(
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `min_match_length` is never read[0m
+  [1m[94m--> [0msrc/model/parameters.rs:22:9
+   [1m[94m|[0m
+[1m[94m 8[0m [1m[94m|[0m pub struct ModelParams {
+   [1m[94m|[0m            [1m[94m-----------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m22[0m [1m[94m|[0m     pub min_match_length: usize,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `ModelParams` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `no_switch_prob`, `update_p_mismatch`, `update_recomb_intensity`, and `set_ne` are never used[0m
+   [1m[94m--> [0msrc/model/parameters.rs:87:12
+    [1m[94m|[0m
+[1m[94m 25[0m [1m[94m|[0m impl ModelParams {
+    [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 87[0m [1m[94m|[0m     pub fn no_switch_prob(&self, gen_dist: f64) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m102[0m [1m[94m|[0m     pub fn update_p_mismatch(&mut self, new_p: f32) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m109[0m [1m[94m|[0m     pub fn update_recomb_intensity(&mut self, new_intensity: f32) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m116[0m [1m[94m|[0m     pub fn set_ne(&mut self, ne: f32) {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `ParamEstimates` is never constructed[0m
+   [1m[94m--> [0msrc/model/parameters.rs:134:12
+    [1m[94m|[0m
+[1m[94m134[0m [1m[94m|[0m pub struct ParamEstimates {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: multiple associated items are never used[0m
+   [1m[94m--> [0msrc/model/parameters.rs:149:12
+    [1m[94m|[0m
+[1m[94m147[0m [1m[94m|[0m impl ParamEstimates {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m148[0m [1m[94m|[0m     /// Create new empty estimates
+[1m[94m149[0m [1m[94m|[0m     pub fn new() -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m154[0m [1m[94m|[0m     pub fn add_switch(&mut self, switch_prob: f64, expected_switches: f64) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m161[0m [1m[94m|[0m     pub fn add_emission(&mut self, match_prob: f64, mismatch_prob: f64) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m167[0m [1m[94m|[0m     pub fn merge(&mut self, other: &ParamEstimates) {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+[1m[94m...[0m
+[1m[94m176[0m [1m[94m|[0m     pub fn recomb_intensity(&self) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m184[0m [1m[94m|[0m     pub fn p_mismatch(&self) -> f32 {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m193[0m [1m[94m|[0m     pub fn n_obs(&self) -> usize {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: methods `n_haps` and `update_with` are never used[0m
+  [1m[94m--> [0msrc/model/pbwt.rs:41:12
+   [1m[94m|[0m
+[1m[94m31[0m [1m[94m|[0m impl PbwtUpdater {
+   [1m[94m|[0m [1m[94m----------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m41[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
+   [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m84[0m [1m[94m|[0m     pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: method `find_matches` is never used[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:201:12
+    [1m[94m|[0m
+[1m[94m128[0m [1m[94m|[0m impl PbwtDivUpdater {
+    [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m201[0m [1m[94m|[0m     pub fn find_matches(
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `bwd_prefix` and `bwd_divergence` are never read[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:243:5
+    [1m[94m|[0m
+[1m[94m237[0m [1m[94m|[0m pub struct PbwtIbs {
+    [1m[94m|[0m            [1m[94m-------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m243[0m [1m[94m|[0m     bwd_prefix: Vec<u32>,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^[0m
+[1m[94m244[0m [1m[94m|[0m     bwd_divergence: Vec<u32>,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `PbwtIbs` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: method `reset` is never used[0m
+   [1m[94m--> [0msrc/model/pbwt.rs:263:12
+    [1m[94m|[0m
+[1m[94m250[0m [1m[94m|[0m impl PbwtIbs {
+    [1m[94m|[0m [1m[94m------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m263[0m [1m[94m|[0m     pub fn reset(&mut self) {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `ref_haps` and `switch_probs` are never read[0m
+  [1m[94m--> [0msrc/utils/workspace.rs:36:9
+   [1m[94m|[0m
+[1m[94m16[0m [1m[94m|[0m pub struct Workspace {
+   [1m[94m|[0m            [1m[94m---------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m36[0m [1m[94m|[0m     pub ref_haps: Vec<HapIdx>,
+   [1m[94m|[0m         [1m[33m^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m42[0m [1m[94m|[0m     pub switch_probs: Vec<f32>,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `Workspace` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[33mwarning[0m[1m: methods `clear`, `reset_pbwt`, `init_fwd_uniform`, and `init_bwd_ones` are never used[0m
+   [1m[94m--> [0msrc/utils/workspace.rs:98:12
+    [1m[94m|[0m
+[1m[94m 51[0m [1m[94m|[0m impl Workspace {
+    [1m[94m|[0m [1m[94m--------------[0m [1m[94mmethods in this implementation[0m
+[1m[94m...[0m
+[1m[94m 98[0m [1m[94m|[0m     pub fn clear(&mut self) {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+[1m[94m...[0m
+[1m[94m111[0m [1m[94m|[0m     pub fn reset_pbwt(&mut self, n_haps: usize) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m123[0m [1m[94m|[0m     pub fn init_fwd_uniform(&mut self, n_states: usize) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m131[0m [1m[94m|[0m     pub fn init_bwd_ones(&mut self, n_states: usize) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `ImpWorkspace` is never constructed[0m
+   [1m[94m--> [0msrc/utils/workspace.rs:184:12
+    [1m[94m|[0m
+[1m[94m184[0m [1m[94m|[0m pub struct ImpWorkspace {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: associated items `new`, `resize`, and `clear` are never used[0m
+   [1m[94m--> [0msrc/utils/workspace.rs:206:12
+    [1m[94m|[0m
+[1m[94m204[0m [1m[94m|[0m impl ImpWorkspace {
+    [1m[94m|[0m [1m[94m-----------------[0m [1m[94massociated items in this implementation[0m
+[1m[94m205[0m [1m[94m|[0m     /// Create a new imputation workspace
+[1m[94m206[0m [1m[94m|[0m     pub fn new(n_states: usize, n_markers: usize) -> Self {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m218[0m [1m[94m|[0m     pub fn resize(&mut self, n_states: usize, n_markers: usize) {
+    [1m[94m|[0m            [1m[33m^^^^^^[0m
+[1m[94m...[0m
+[1m[94m228[0m [1m[94m|[0m     pub fn clear(&mut self) {
+    [1m[94m|[0m            [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 52 warnings (1 duplicate) (run `cargo fix --bin "reagle" -p reagle --tests` to apply 8 suggestions)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 2.17s
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/reagle-f1da98890af36106)
+
+running 45 tests
+test data::genetic_map::tests::test_empty_map ... ok
+test data::genetic_map::tests::test_extrapolation ... ok
+test config::tests::test_li_stephens_mismatch ... ok
+test data::genetic_map::tests::test_gen_dist ... ok
+test data::genetic_map::tests::test_interpolation ... ok
+test data::haplotype::tests::test_hap_sample_index ... ok
+test data::haplotype::tests::test_sample_hap_indices ... ok
+test data::haplotype::tests::test_samples_lookup ... ok
+test data::haplotype::tests::test_samples_n_haps ... ok
+test data::marker::tests::test_allele_from_char ... ok
+test data::marker::tests::test_bits_per_allele ... ok
+test data::marker::tests::test_marker_is_snv ... ok
+test data::storage::dense::tests::test_biallelic ... ok
+test data::storage::dense::tests::test_multiallelic ... ok
+test data::storage::dictionary::tests::test_dictionary_compression ... ok
+test data::storage::dense::tests::test_set ... ok
+test data::storage::matrix::tests::test_genotype ... ok
+test data::storage::matrix::tests::test_matrix_access ... ok
+test data::storage::mutable::tests::test_mutable_genotypes ... ok
+test data::storage::mutable::tests::test_swap ... ok
+test data::storage::matrix::tests::test_matrix_restrict ... ok
+test data::storage::mutable::tests::test_haplotype ... ok
+test data::storage::sparse::tests::test_sparse_column ... ok
+test data::storage::tests::test_maf_calculation ... ok
+test data::storage::sparse::tests::test_sparse_multiallelic ... ok
+test data::storage::sparse::tests::test_sparse_inverted ... ok
+test io::vcf::tests::test_parse_genotype ... ok
+test io::vcf::tests::test_parse_genotype_multiallelic ... ok
+test data::storage::tests::test_storage_selection ... ok
+test io::window::tests::test_single_window ... ok
+test model::hmm::tests::test_emission_prob ... ok
+test model::hmm::tests::test_hmm_forward_backward ... ok
+test model::parameters::tests::test_emit_probs ... ok
+test model::parameters::tests::test_switch_prob ... ok
+test io::window::tests::test_window_builder ... ok
+test model::pbwt::tests::test_pbwt_div_update ... ok
+test model::parameters::tests::test_li_stephens_p_mismatch ... ok
+test pipelines::phasing::tests::test_emission_prob ... ok
+test model::pbwt::tests::test_pbwt_ibs_select ... ok
+test model::pbwt::tests::test_pbwt_update ... ok
+test pipelines::imputation::tests::test_impute_haplotype ... ok
+test pipelines::phasing::tests::test_pipeline_creation ... ok
+test utils::workspace::tests::test_workspace_creation ... ok
+test utils::workspace::tests::test_workspace_resize ... ok
+test utils::workspace::tests::test_random_sampling ... ok
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/reagle-e47cecb6b621026c)
+
+running 46 tests
+test config::tests::test_li_stephens_mismatch ... ok
+test data::genetic_map::tests::test_empty_map ... ok
+test data::genetic_map::tests::test_extrapolation ... ok
+test data::genetic_map::tests::test_gen_dist ... ok
+test data::genetic_map::tests::test_interpolation ... ok
+test data::haplotype::tests::test_hap_sample_index ... ok
+test data::haplotype::tests::test_samples_n_haps ... ok
+test data::haplotype::tests::test_sample_hap_indices ... ok
+test data::haplotype::tests::test_samples_lookup ... ok
+test data::marker::tests::test_allele_from_char ... ok
+test data::marker::tests::test_bits_per_allele ... ok
+test data::marker::tests::test_marker_is_snv ... ok
+test data::storage::dense::tests::test_biallelic ... ok
+test data::storage::dense::tests::test_set ... ok
+test data::storage::dictionary::tests::test_dictionary_compression ... ok
+test data::storage::dense::tests::test_multiallelic ... ok
+test data::storage::matrix::tests::test_genotype ... ok
+test data::storage::matrix::tests::test_matrix_access ... ok
+test data::storage::matrix::tests::test_matrix_restrict ... ok
+test data::storage::mutable::tests::test_haplotype ... ok
+test data::storage::mutable::tests::test_mutable_genotypes ... ok
+test data::storage::mutable::tests::test_swap ... ok
+test data::storage::sparse::tests::test_sparse_column ... ok
+test data::storage::sparse::tests::test_sparse_inverted ... ok
+test data::storage::sparse::tests::test_sparse_multiallelic ... ok
+test data::storage::tests::test_maf_calculation ... ok
+test io::vcf::tests::test_parse_genotype ... ok
+test io::vcf::tests::test_parse_genotype_multiallelic ... ok
+test io::window::tests::test_single_window ... ok
+test data::storage::tests::test_storage_selection ... ok
+test io::window::tests::test_window_builder ... ok
+test model::hmm::tests::test_emission_prob ... ok
+test model::parameters::tests::test_emit_probs ... ok
+test model::hmm::tests::test_hmm_forward_backward ... ok
+test model::parameters::tests::test_li_stephens_p_mismatch ... ok
+test model::parameters::tests::test_switch_prob ... ok
+test model::pbwt::tests::test_pbwt_div_update ... ok
+test model::pbwt::tests::test_pbwt_ibs_select ... ok
+test model::pbwt::tests::test_pbwt_update ... ok
+test pipelines::phasing::tests::test_pipeline_creation ... ok
+test tests::test_module_imports ... ok
+test pipelines::imputation::tests::test_impute_haplotype ... ok
+test pipelines::phasing::tests::test_emission_prob ... ok
+test utils::workspace::tests::test_workspace_creation ... ok
+test utils::workspace::tests::test_workspace_resize ... ok
+test utils::workspace::tests::test_random_sampling ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m   Doc-tests[0m reagle
+
+running 1 test
+test src/model/pbwt.rs - model::pbwt (line 12) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.11s; merged doctests compilation took 0.11s
