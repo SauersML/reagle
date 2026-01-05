@@ -3,12 +3,14 @@
 //! Orchestrates the imputation workflow:
 //! 1. Load target and reference VCFs
 //! 2. Align markers between target and reference
-//! 3. Run Li-Stephens HMM for each target haplotype
-//! 4. Compute dosages and write output
+//! 3. Run Li-Stephens HMM for each target haplotype with dynamic PBWT state selection
+//! 4. Interpolate state probabilities for ungenotyped markers
+//! 5. Compute dosages and write output
 //!
 //! This matches Java `imp/ImpLS.java`, `imp/ImpLSBaum.java`, and related classes.
 
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
@@ -18,6 +20,7 @@ use crate::data::storage::GenotypeMatrix;
 use crate::error::Result;
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::hmm::LiStephensHmm;
+use crate::model::imp_states::{CodedStepsConfig, ImpStates};
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtIbs;
 
@@ -25,6 +28,237 @@ use crate::model::pbwt::PbwtIbs;
 pub struct ImputationPipeline {
     config: Config,
     params: ModelParams,
+}
+
+/// Marker alignment between target and reference panels
+#[derive(Clone, Debug)]
+pub struct MarkerAlignment {
+    /// For each reference marker, the index of the corresponding target marker (-1 if not in target)
+    ref_to_target: Vec<i32>,
+    /// For each target marker, the index of the corresponding reference marker
+    target_to_ref: Vec<usize>,
+    /// Number of reference markers
+    n_ref_markers: usize,
+    /// Number of target markers (genotyped)
+    n_target_markers: usize,
+}
+
+impl MarkerAlignment {
+    /// Create alignment by matching markers by position
+    pub fn new(target_gt: &GenotypeMatrix, ref_gt: &GenotypeMatrix) -> Self {
+        let n_ref_markers = ref_gt.n_markers();
+        let n_target_markers = target_gt.n_markers();
+
+        // Build position -> target index map
+        let mut target_pos_map: HashMap<(u16, u32), usize> = HashMap::new();
+        for m in 0..n_target_markers {
+            let marker = target_gt.marker(MarkerIdx::new(m as u32));
+            target_pos_map.insert((marker.chrom.0, marker.pos), m);
+        }
+
+        // Map reference markers to target markers
+        let mut ref_to_target = vec![-1i32; n_ref_markers];
+        let mut target_to_ref = vec![0usize; n_target_markers];
+
+        for m in 0..n_ref_markers {
+            let marker = ref_gt.marker(MarkerIdx::new(m as u32));
+            if let Some(&target_idx) = target_pos_map.get(&(marker.chrom.0, marker.pos)) {
+                ref_to_target[m] = target_idx as i32;
+                target_to_ref[target_idx] = m;
+            }
+        }
+
+        Self {
+            ref_to_target,
+            target_to_ref,
+            n_ref_markers,
+            n_target_markers,
+        }
+    }
+
+    /// Check if a reference marker is genotyped in target
+    pub fn is_genotyped(&self, ref_marker: usize) -> bool {
+        self.ref_to_target.get(ref_marker).copied().unwrap_or(-1) >= 0
+    }
+
+    /// Get target marker index for a reference marker (returns None if not genotyped)
+    pub fn target_marker(&self, ref_marker: usize) -> Option<usize> {
+        let idx = self.ref_to_target.get(ref_marker).copied().unwrap_or(-1);
+        if idx >= 0 {
+            Some(idx as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Get reference marker index for a target marker
+    pub fn ref_marker(&self, target_marker: usize) -> usize {
+        self.target_to_ref[target_marker]
+    }
+
+    /// Find flanking genotyped markers for a reference marker
+    /// Returns (left_ref_marker, right_ref_marker, interpolation_weight)
+    pub fn flanking_markers(&self, ref_marker: usize) -> (usize, usize, f32) {
+        // Find left genotyped marker
+        let mut left = ref_marker;
+        while left > 0 && !self.is_genotyped(left) {
+            left -= 1;
+        }
+        if !self.is_genotyped(left) {
+            left = 0;
+        }
+
+        // Find right genotyped marker
+        let mut right = ref_marker;
+        while right < self.n_ref_markers - 1 && !self.is_genotyped(right) {
+            right += 1;
+        }
+        if !self.is_genotyped(right) {
+            right = self.n_ref_markers - 1;
+        }
+
+        // Calculate interpolation weight
+        let weight = if left == right {
+            0.5
+        } else {
+            (ref_marker - left) as f32 / (right - left) as f32
+        };
+
+        (left, right, weight)
+    }
+}
+
+/// State probabilities with interpolation support
+#[derive(Clone, Debug)]
+pub struct StateProbs {
+    /// Reference haplotype indices at each genotyped marker
+    hap_indices: Vec<Vec<u32>>,
+    /// State probabilities at each genotyped marker
+    probs: Vec<Vec<f32>>,
+    /// State probabilities at marker+1 (for interpolation)
+    probs_p1: Vec<Vec<f32>>,
+    /// Target haplotype index
+    targ_hap: usize,
+}
+
+impl StateProbs {
+    /// Create state probabilities from HMM output
+    pub fn new(
+        targ_hap: usize,
+        n_markers: usize,
+        n_states: usize,
+        hap_indices: Vec<Vec<u32>>,
+        state_probs: Vec<Vec<f32>>,
+    ) -> Self {
+        let threshold = 0.005f32.min(0.9999 / n_states as f32);
+
+        let mut filtered_haps = Vec::with_capacity(n_markers);
+        let mut filtered_probs = Vec::with_capacity(n_markers);
+        let mut filtered_probs_p1 = Vec::with_capacity(n_markers);
+
+        for m in 0..n_markers {
+            let m_p1 = (m + 1).min(n_markers - 1);
+            let mut haps = Vec::new();
+            let mut probs = Vec::new();
+            let mut probs_p1 = Vec::new();
+
+            for j in 0..n_states.min(hap_indices.get(m).map(|v| v.len()).unwrap_or(0)) {
+                let prob_m = state_probs.get(m).and_then(|v| v.get(j)).copied().unwrap_or(0.0);
+                let prob_m_p1 = state_probs.get(m_p1).and_then(|v| v.get(j)).copied().unwrap_or(0.0);
+
+                if prob_m > threshold || prob_m_p1 > threshold {
+                    haps.push(hap_indices[m][j]);
+                    probs.push(prob_m);
+                    probs_p1.push(prob_m_p1);
+                }
+            }
+
+            filtered_haps.push(haps);
+            filtered_probs.push(probs);
+            filtered_probs_p1.push(probs_p1);
+        }
+
+        Self {
+            hap_indices: filtered_haps,
+            probs: filtered_probs,
+            probs_p1: filtered_probs_p1,
+            targ_hap,
+        }
+    }
+
+    /// Get interpolated dosage at a reference marker
+    pub fn interpolated_dosage<F>(
+        &self,
+        ref_marker: usize,
+        alignment: &MarkerAlignment,
+        get_ref_allele: F,
+    ) -> f32
+    where
+        F: Fn(usize, u32) -> u8,
+    {
+        if let Some(target_marker) = alignment.target_marker(ref_marker) {
+            // Genotyped marker - use direct state probs
+            self.dosage_at_genotyped(target_marker, ref_marker, &get_ref_allele)
+        } else {
+            // Ungenotyped marker - interpolate
+            let (left_ref, right_ref, weight) = alignment.flanking_markers(ref_marker);
+            let left_target = alignment.target_marker(left_ref);
+            let right_target = alignment.target_marker(right_ref);
+
+            match (left_target, right_target) {
+                (Some(lt), Some(rt)) => {
+                    // Interpolate between two genotyped markers
+                    self.interpolated_dosage_between(lt, rt, weight, ref_marker, &get_ref_allele)
+                }
+                (Some(t), None) | (None, Some(t)) => {
+                    // Only one flanking marker - use its probs
+                    self.dosage_at_genotyped(t, ref_marker, &get_ref_allele)
+                }
+                (None, None) => 0.0,
+            }
+        }
+    }
+
+    fn dosage_at_genotyped<F>(&self, target_marker: usize, ref_marker: usize, get_ref_allele: &F) -> f32
+    where
+        F: Fn(usize, u32) -> u8,
+    {
+        let haps = &self.hap_indices[target_marker];
+        let probs = &self.probs[target_marker];
+
+        let mut dosage = 0.0f32;
+        for (j, &hap) in haps.iter().enumerate() {
+            let allele = get_ref_allele(ref_marker, hap);
+            dosage += probs[j] * allele as f32;
+        }
+        dosage
+    }
+
+    fn interpolated_dosage_between<F>(
+        &self,
+        left_marker: usize,
+        right_marker: usize,
+        weight: f32,
+        ref_marker: usize,
+        get_ref_allele: &F,
+    ) -> f32
+    where
+        F: Fn(usize, u32) -> u8,
+    {
+        // Use probs from left marker and probs_p1 from left marker
+        // Linear interpolation: (1-w) * prob_left + w * prob_right
+        let left_haps = &self.hap_indices[left_marker];
+        let left_probs = &self.probs[left_marker];
+        let left_probs_p1 = &self.probs_p1[left_marker];
+
+        let mut dosage = 0.0f32;
+        for (j, &hap) in left_haps.iter().enumerate() {
+            let allele = get_ref_allele(ref_marker, hap);
+            let interp_prob = (1.0 - weight) * left_probs[j] + weight * left_probs_p1[j];
+            dosage += interp_prob * allele as f32;
+        }
+        dosage
+    }
 }
 
 impl ImputationPipeline {
@@ -36,12 +270,12 @@ impl ImputationPipeline {
 
     /// Run the imputation pipeline
     pub fn run(&mut self) -> Result<()> {
-        // Load target VCF
+        eprintln!("Loading target VCF...");
         let (mut target_reader, target_file) = VcfReader::open(&self.config.gt)?;
         let target_samples = target_reader.samples_arc();
         let target_gt = target_reader.read_all(target_file)?;
 
-        // Load reference VCF
+        eprintln!("Loading reference VCF...");
         let ref_path = self.config.r#ref.as_ref().ok_or_else(|| {
             crate::error::ReagleError::config("Reference panel required for imputation")
         })?;
@@ -52,8 +286,27 @@ impl ImputationPipeline {
             return Ok(());
         }
 
-        // Initialize parameters
         let n_ref_haps = ref_gt.n_haplotypes();
+        let n_ref_markers = ref_gt.n_markers();
+        let n_target_markers = target_gt.n_markers();
+        let n_target_samples = target_gt.n_samples();
+        let n_target_haps = target_gt.n_haplotypes();
+
+        eprintln!(
+            "Target: {} markers, {} samples; Reference: {} markers, {} haplotypes",
+            n_target_markers, n_target_samples, n_ref_markers, n_ref_haps
+        );
+
+        // Create marker alignment
+        eprintln!("Aligning markers...");
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let n_genotyped = alignment.ref_to_target.iter().filter(|&&x| x >= 0).count();
+        eprintln!(
+            "  {} of {} reference markers are genotyped in target",
+            n_genotyped, n_ref_markers
+        );
+
+        // Initialize parameters
         self.params = ModelParams::for_imputation(n_ref_haps);
         self.params.set_n_states(self.config.imp_states.min(n_ref_haps));
 
@@ -70,66 +323,111 @@ impl ImputationPipeline {
             GeneticMaps::new()
         };
 
-        // Create marker map for recombination probabilities
-        let n_ref_markers = ref_gt.n_markers();
         let chrom = ref_gt.marker(MarkerIdx::new(0)).chrom;
 
-        // Compute genetic distances
-        let gen_dists: Vec<f64> = (0..n_ref_markers.saturating_sub(1))
+        // Compute genetic positions at genotyped markers (for ImpStates)
+        let gen_positions: Vec<f64> = (0..n_target_markers)
             .map(|m| {
-                let pos1 = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
-                let pos2 = ref_gt.marker(MarkerIdx::new((m + 1) as u32)).pos;
-                gen_maps.gen_dist(chrom, pos1, pos2)
+                let ref_m = alignment.ref_marker(m);
+                let pos = ref_gt.marker(MarkerIdx::new(ref_m as u32)).pos;
+                gen_maps.gen_pos(chrom, pos)
             })
             .collect();
 
-        // Convert to pRecomb using model parameters
+        // Compute recombination probabilities at genotyped markers
         let p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+            .chain((1..n_target_markers).map(|m| {
+                let prev_ref = alignment.ref_marker(m - 1);
+                let curr_ref = alignment.ref_marker(m);
+                let pos1 = ref_gt.marker(MarkerIdx::new(prev_ref as u32)).pos;
+                let pos2 = ref_gt.marker(MarkerIdx::new(curr_ref as u32)).pos;
+                let gen_dist = gen_maps.gen_dist(chrom, pos1, pos2);
+                self.params.p_recomb(gen_dist)
+            }))
             .collect();
 
-        // Run imputation for each target haplotype
-        let n_target_samples = target_gt.n_samples();
-        let n_target_haps = target_gt.n_haplotypes();
-        let n_states = self.params.n_states;
-        let _seed = self.config.seed as u64; // Reserved for future use
+        // CodedSteps configuration
+        let steps_config = CodedStepsConfig {
+            step_cm: self.config.imp_step,
+            n_ibs_haps: self.config.imp_nsteps,
+        };
 
-        // Collect dosages for all samples
-        let dosages: Vec<Vec<f32>> = (0..n_target_haps)
+        eprintln!("Running imputation with dynamic state selection...");
+        let n_states = self.params.n_states;
+
+        // Run imputation for each target haplotype
+        let state_probs: Vec<StateProbs> = (0..n_target_haps)
             .into_par_iter()
             .map(|h| {
                 let hap_idx = HapIdx::new(h as u32);
 
                 // Get target alleles at genotyped markers
-                let target_alleles: Vec<u8> = (0..target_gt.n_markers())
+                let target_alleles: Vec<u8> = (0..n_target_markers)
                     .map(|m| target_gt.allele(MarkerIdx::new(m as u32), hap_idx))
                     .collect();
 
-                // Select reference haplotypes
-                let ref_haps: Vec<HapIdx> = (0..n_states.min(n_ref_haps))
-                    .map(|i| HapIdx::new(i as u32))
-                    .collect();
+                // Create ImpStates for dynamic state selection
+                let mut imp_states = ImpStates::new(
+                    n_ref_haps,
+                    n_states,
+                    &gen_positions,
+                    &steps_config,
+                );
 
-                // Run imputation
-                impute_haplotype_internal(
+                // Get reference allele closure
+                let get_ref_allele = |m: usize, hap: u32| -> u8 {
+                    let ref_m = alignment.ref_marker(m);
+                    ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
+                };
+
+                // Get IBS-based states
+                let mut hap_indices: Vec<Vec<u32>> = Vec::new();
+                let mut allele_match: Vec<Vec<bool>> = Vec::new();
+                let actual_n_states = imp_states.ibs_states(
+                    get_ref_allele,
                     &target_alleles,
-                    &ref_gt,
-                    &self.params,
-                    &ref_haps,
+                    &mut hap_indices,
+                    &mut allele_match,
+                );
+
+                // Run forward-backward HMM
+                let hmm_state_probs = run_hmm_forward_backward(
+                    &target_alleles,
+                    &hap_indices,
+                    &allele_match,
                     &p_recomb,
+                    self.params.p_mismatch,
+                    actual_n_states,
+                );
+
+                // Create StateProbs for interpolation
+                StateProbs::new(
+                    h,
+                    n_target_markers,
+                    actual_n_states,
+                    hap_indices,
+                    hmm_state_probs,
                 )
             })
             .collect();
 
-        // Combine dosages for diploid samples
+        eprintln!("Computing dosages with interpolation...");
+
+        // Compute dosages at all reference markers (including ungenotyped)
         let sample_dosages: Vec<Vec<f32>> = (0..n_target_samples)
+            .into_par_iter()
             .map(|s| {
-                let hap1 = s * 2;
-                let hap2 = s * 2 + 1;
+                let hap1_probs = &state_probs[s * 2];
+                let hap2_probs = &state_probs[s * 2 + 1];
+
                 (0..n_ref_markers)
                     .map(|m| {
-                        let d1 = dosages.get(hap1).and_then(|d| d.get(m)).copied().unwrap_or(0.0);
-                        let d2 = dosages.get(hap2).and_then(|d| d.get(m)).copied().unwrap_or(0.0);
+                        let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
+                            ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
+                        };
+
+                        let d1 = hap1_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
+                        let d2 = hap2_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
                         d1 + d2
                     })
                     .collect()
@@ -141,13 +439,101 @@ impl ImputationPipeline {
 
         // Write output
         let output_path = self.config.out.with_extension("vcf.gz");
+        eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples)?;
         writer.write_header(ref_gt.markers())?;
         writer.write_imputed(&ref_gt, &flat_dosages, 0, n_ref_markers)?;
         writer.flush()?;
 
+        eprintln!("Imputation complete!");
         Ok(())
     }
+}
+
+/// Run forward-backward HMM on IBS-selected states
+fn run_hmm_forward_backward(
+    target_alleles: &[u8],
+    hap_indices: &[Vec<u32>],
+    allele_match: &[Vec<bool>],
+    p_recomb: &[f32],
+    p_mismatch: f32,
+    n_states: usize,
+) -> Vec<Vec<f32>> {
+    let n_markers = target_alleles.len();
+    if n_markers == 0 || n_states == 0 {
+        return Vec::new();
+    }
+
+    let p_match = 1.0 - p_mismatch;
+    let emit_probs = [p_match, p_mismatch];
+
+    // Forward pass
+    let mut fwd: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_markers];
+    let mut fwd_sum = 1.0f32;
+
+    for m in 0..n_markers {
+        let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
+        let shift = p_rec / n_states as f32;
+        let scale = (1.0 - p_rec) / fwd_sum;
+
+        let mut new_sum = 0.0f32;
+        let matches = &allele_match[m];
+
+        for k in 0..n_states.min(matches.len()) {
+            let emit = if matches[k] { emit_probs[0] } else { emit_probs[1] };
+            fwd[m][k] = if m == 0 {
+                emit / n_states as f32
+            } else {
+                emit * (scale * fwd[m - 1][k] + shift)
+            };
+            new_sum += fwd[m][k];
+        }
+        fwd_sum = new_sum;
+    }
+
+    // Backward pass and compute posteriors
+    let mut bwd = vec![1.0 / n_states as f32; n_states];
+    let mut bwd_sum = 1.0f32;
+
+    for m in (0..n_markers).rev() {
+        // Apply transition for backward (except at last marker)
+        if m < n_markers - 1 {
+            let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
+            let shift = p_rec / n_states as f32;
+            let scale = (1.0 - p_rec) / bwd_sum;
+
+            for k in 0..n_states {
+                bwd[k] = scale * bwd[k] + shift;
+            }
+        }
+
+        // Compute posterior: fwd * bwd
+        let mut state_sum = 0.0f32;
+        for k in 0..n_states {
+            fwd[m][k] *= bwd[k];
+            state_sum += fwd[m][k];
+        }
+
+        // Normalize
+        if state_sum > 0.0 {
+            for k in 0..n_states {
+                fwd[m][k] /= state_sum;
+            }
+        }
+
+        // Apply emission for next backward iteration
+        if m > 0 {
+            let matches = &allele_match[m];
+            bwd_sum = 0.0;
+            for k in 0..n_states.min(matches.len()) {
+                let emit = if matches[k] { emit_probs[0] } else { emit_probs[1] };
+                bwd[k] *= emit;
+                bwd_sum += bwd[k];
+            }
+        }
+    }
+
+    fwd
 }
 
 /// Internal implementation of imputation for a single haplotype
