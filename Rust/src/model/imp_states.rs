@@ -597,7 +597,7 @@ impl ImpStates {
                     hap_indices[m][j] = hap;
 
                     let ref_allele = get_ref_allele(m, hap);
-                    allele_match[m][j] = ref_allele == target_allele;
+                    allele_match[m][j] = target_allele == 255 || ref_allele == target_allele;
                 }
             }
         }

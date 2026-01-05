@@ -12,9 +12,3 @@ pub mod ibs2;
 pub mod imp_states;
 pub mod parameters;
 pub mod pbwt;
-
-pub use hmm::{LiStephensHmm, HmmResult};
-pub use ibs2::{Ibs2, Ibs2Segment};
-pub use imp_states::{ImpStates, CodedSteps, CodedStepsConfig};
-pub use parameters::ModelParams;
-pub use pbwt::{PbwtUpdater, PbwtDivUpdater};

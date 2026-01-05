@@ -16,13 +16,8 @@ pub mod marker;
 pub mod storage;
 
 // Re-export commonly used types
-pub use genetic_map::GeneticMap;
-pub use haplotype::{HapIdx, SampleIdx, Samples};
-pub use marker::{Allele, Marker, MarkerIdx, Markers};
-pub use storage::{
-    DenseColumn, DictionaryColumn, GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes,
-    SparseColumn,
-};
+pub use haplotype::{HapIdx, SampleIdx};
+pub use marker::MarkerIdx;
 
 /// Chromosome identifier (0-based index into chromosome name table)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -22,9 +22,13 @@ pub mod utils;
 
 // Re-export commonly used types
 pub use config::Config;
-pub use data::{GenotypeMatrix, HapIdx, Marker, MarkerIdx, Markers, SampleIdx, Samples};
+pub use data::haplotype::{HapIdx, SampleIdx, Samples};
+pub use data::marker::{Marker, MarkerIdx, Markers};
+pub use data::storage::GenotypeMatrix;
 pub use error::{ReagleError, Result};
-pub use io::{VcfReader, VcfWriter};
-pub use model::{LiStephensHmm, ModelParams, PbwtUpdater};
+pub use io::vcf::{VcfReader, VcfWriter};
+pub use model::hmm::LiStephensHmm;
+pub use model::parameters::ModelParams;
+pub use model::pbwt::PbwtUpdater;
 pub use pipelines::{ImputationPipeline, PhasingPipeline};
-pub use utils::Workspace;
+pub use utils::workspace::Workspace;
