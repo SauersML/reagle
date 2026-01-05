@@ -642,12 +642,10 @@ impl PbwtIbs {
     /// target allele sequence would sort in the PBWT and expand from there.
     ///
     /// # Arguments
-    /// * `target_allele` - The target's allele at the current marker
     /// * `n_states` - Number of states to select
     /// * `use_backward` - Whether to use backward PBWT
     pub fn select_states_for_external_target(
         &self,
-        _target_allele: u8,
         n_states: usize,
         use_backward: bool,
     ) -> Vec<HapIdx> {
@@ -660,13 +658,6 @@ impl PbwtIbs {
         if prefix.is_empty() || n_states == 0 {
             return Vec::new();
         }
-
-        // Find the first position in the prefix array where a haplotype has
-        // the same allele as the target. In PBWT, haplotypes are sorted by
-        // their allele sequence prefixes, so haplotypes with the same allele
-        // at the current position are grouped together.
-        let _start_pos: Option<usize> = None;
-        let _end_pos: usize = 0;
 
         // Since we don't have direct access to alleles here, use the middle
         // as a starting point and expand. The caller should use this method

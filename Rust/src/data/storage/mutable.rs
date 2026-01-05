@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_swap() {
-        let mut geno = MutableGenotypes::from_fn(3, 4, |_m, h| {
+        let mut geno = MutableGenotypes::from_fn(3, 4, |_, h| {
             if h == 0 { 1 } else { 0 }
         });
         

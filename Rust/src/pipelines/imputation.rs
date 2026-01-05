@@ -48,7 +48,7 @@ impl WindowResult {
         let n_alleles_per_marker = vec![2usize; n_markers]; // Assume biallelic
         Self {
             dosages: vec![vec![0.0; n_samples]; n_markers],
-            quality: ImputationQuality::new(n_markers, &n_alleles_per_marker),
+            quality: ImputationQuality::new(&n_alleles_per_marker),
             indices,
         }
     }
@@ -72,7 +72,7 @@ pub fn splice_window_results(
 ) -> (Vec<Vec<f32>>, ImputationQuality) {
     let n_alleles_per_marker = vec![2usize; total_markers];
     let mut final_dosages = vec![vec![0.0f32; n_samples]; total_markers];
-    let mut final_quality = ImputationQuality::new(total_markers, &n_alleles_per_marker);
+    let mut final_quality = ImputationQuality::new(&n_alleles_per_marker);
 
     for result in results {
         let indices = &result.indices;
@@ -117,8 +117,6 @@ pub struct MarkerAlignment {
     target_to_ref: Vec<usize>,
     /// Number of reference markers
     n_ref_markers: usize,
-    /// Number of target markers (genotyped)
-    _n_target_markers: usize,
 }
 
 impl MarkerAlignment {
@@ -150,7 +148,6 @@ impl MarkerAlignment {
             ref_to_target,
             target_to_ref,
             n_ref_markers,
-            _n_target_markers: n_target_markers,
         }
     }
 
@@ -215,14 +212,11 @@ pub struct StateProbs {
     probs: Vec<Vec<f32>>,
     /// State probabilities at marker+1 (for interpolation)
     probs_p1: Vec<Vec<f32>>,
-    /// Target haplotype index
-    _targ_hap: usize,
 }
 
 impl StateProbs {
     /// Create state probabilities from HMM output
     pub fn new(
-        targ_hap: usize,
         n_markers: usize,
         n_states: usize,
         hap_indices: Vec<Vec<u32>>,
@@ -260,7 +254,6 @@ impl StateProbs {
             hap_indices: filtered_haps,
             probs: filtered_probs,
             probs_p1: filtered_probs_p1,
-            _targ_hap: targ_hap,
         }
     }
 
@@ -284,9 +277,9 @@ impl StateProbs {
             let right_target = alignment.target_marker(right_ref);
 
             match (left_target, right_target) {
-                (Some(lt), Some(rt)) => {
+                (Some(lt), Some(_)) => {
                     // Interpolate between two genotyped markers
-                    self.interpolated_dosage_between(lt, rt, weight, ref_marker, &get_ref_allele)
+                    self.interpolated_dosage_between(lt, weight, ref_marker, &get_ref_allele)
                 }
                 (Some(t), None) | (None, Some(t)) => {
                     // Only one flanking marker - use its probs
@@ -315,7 +308,6 @@ impl StateProbs {
     fn interpolated_dosage_between<F>(
         &self,
         left_marker: usize,
-        _right_marker: usize,
         weight: f32,
         ref_marker: usize,
         get_ref_allele: &F,
@@ -471,7 +463,6 @@ impl ImputationPipeline {
                 // Run forward-backward HMM
                 let hmm_state_probs = run_hmm_forward_backward(
                     &target_alleles,
-                    &hap_indices,
                     &allele_match,
                     &p_recomb,
                     self.params.p_mismatch,
@@ -480,7 +471,6 @@ impl ImputationPipeline {
 
                 // Create StateProbs for interpolation
                 StateProbs::new(
-                    h,
                     n_target_markers,
                     actual_n_states,
                     hap_indices,
@@ -498,7 +488,7 @@ impl ImputationPipeline {
                 1 + marker.alt_alleles.len()
             })
             .collect();
-        let quality = Mutex::new(ImputationQuality::new(n_ref_markers, &n_alleles_per_marker));
+        let quality = Mutex::new(ImputationQuality::new(&n_alleles_per_marker));
 
         // Mark imputed markers (those not in target)
         for m in 0..n_ref_markers {
@@ -572,7 +562,6 @@ impl ImputationPipeline {
 /// Run forward-backward HMM on IBS-selected states
 fn run_hmm_forward_backward(
     target_alleles: &[u8],
-    _hap_indices: &[Vec<u32>],
     allele_match: &[Vec<bool>],
     p_recomb: &[f32],
     p_mismatch: f32,

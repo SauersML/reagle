@@ -120,7 +120,7 @@ pub struct ImputationQuality {
 
 impl ImputationQuality {
     /// Create new quality tracker for the given number of markers
-    pub fn new(_n_markers: usize, n_alleles_per_marker: &[usize]) -> Self {
+    pub fn new(n_alleles_per_marker: &[usize]) -> Self {
         let marker_stats = n_alleles_per_marker
             .iter()
             .map(|&n| MarkerImputationStats::new(n))

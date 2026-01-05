@@ -460,7 +460,7 @@ impl ImpStates {
 
             // Update composite haplotypes with IBS matches
             for hap in ibs_haps {
-                self.update_with_ibs_hap(hap, step as i32, step_start);
+                self.update_with_ibs_hap(hap, step as i32);
             }
         }
 
@@ -483,7 +483,7 @@ impl ImpStates {
         self.ibs.reset();
     }
 
-    fn update_with_ibs_hap(&mut self, hap: u32, step: i32, _step_start: usize) {
+    fn update_with_ibs_hap(&mut self, hap: u32, step: i32) {
         const NIL: i32 = i32::MIN;
 
         if self.hap_to_last_ibs.get(&hap).copied().unwrap_or(NIL) == NIL {

@@ -72,7 +72,7 @@ impl Ibs2 {
         let n_samples = gt.n_samples();
 
         // First pass: find initial IBS2 sets using informative markers
-        let ibs2_markers = Ibs2Markers::new(gt, gen_map, maf);
+        let ibs2_markers = Ibs2Markers::new(gt, maf);
         let ibs2_sets = Ibs2Sets::new(gt, &ibs2_markers);
 
         // Build segments for each sample
@@ -306,38 +306,28 @@ impl Ibs2 {
 struct Ibs2Markers {
     /// Marker indices that are informative (not too rare, not too common)
     informative: Vec<usize>,
-    /// Genetic positions of informative markers
-    _gen_pos: Vec<f64>,
 }
 
 impl Ibs2Markers {
     /// Minimum MAF for informative markers
     const MIN_MAF: f32 = 0.05;
 
-    fn new(gt: &GenotypeMatrix, gen_map: &GeneticMap, maf: &[f32]) -> Self {
+    fn new(gt: &GenotypeMatrix, maf: &[f32]) -> Self {
         let n_markers = gt.n_markers();
         let mut informative = Vec::new();
-        let mut gen_pos = Vec::new();
 
         for m in 0..n_markers {
             let marker_maf = maf.get(m).copied().unwrap_or(0.0);
             if marker_maf >= Self::MIN_MAF && marker_maf <= 1.0 - Self::MIN_MAF {
-                let pos = gt.marker(MarkerIdx::new(m as u32)).pos;
                 informative.push(m);
-                gen_pos.push(gen_map.gen_pos(pos));
             }
         }
 
-        Self { informative, _gen_pos: gen_pos }
+        Self { informative }
     }
 
     fn len(&self) -> usize {
         self.informative.len()
-    }
-
-    #[allow(dead_code)]
-    fn marker(&self, idx: usize) -> usize {
-        self.informative[idx]
     }
 }
 

@@ -266,7 +266,7 @@ impl PhasingPipeline {
 
             // Run phasing iteration with EM estimation (if enabled and during burnin)
             let collect_em = self.config.em && is_burnin;
-            self.run_iteration_with_hmm(&target_gt, &mut geno, &p_recomb, it, collect_em)?;
+            self.run_iteration_with_hmm(&target_gt, &mut geno, &p_recomb, collect_em)?;
         }
 
         // Build final GenotypeMatrix from mutable genotypes
@@ -285,13 +285,11 @@ impl PhasingPipeline {
         Ok(())
     }
 
-    /// Run a single phasing iteration using proper PhasingHmm
     fn run_iteration_with_hmm(
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
         p_recomb: &[f32],
-        _iteration: usize,
         collect_em: bool,
     ) -> Result<()> {
         let n_samples = target_gt.n_samples();
@@ -699,183 +697,6 @@ fn phase_sample_with_hmm(
     }
 
     (switch_markers, em_estimates)
-}
-
-/// Stage 2 phasing: Phase rare/low-frequency variants using Stage 1 scaffold
-///
-/// This implements Java Stage2Baum.java logic:
-/// 1. Run HMM forward-backward on Stage 1 markers to get state probabilities
-/// 2. For each Stage 2 (rare) marker:
-///    - Interpolate state probabilities from surrounding Stage 1 markers
-///    - Use these to estimate allele probabilities
-///    - Phase heterozygotes based on which phase has higher probability
-///
-/// # Arguments
-/// * `geno` - Mutable genotype storage
-/// * `stage_markers` - Classification of Stage 1 vs Stage 2 markers
-/// * `stage1_state_probs` - State probabilities at Stage 1 markers [hap][stage1_marker][state]
-/// * `stage1_states` - Selected state haplotype indices [hap][stage1_marker][state_idx]
-#[allow(dead_code)]
-fn run_stage2_phasing(
-    geno: &mut MutableGenotypes,
-    stage_markers: &StageMarkers,
-    stage1_state_probs: &[Vec<Vec<f32>>],
-    stage1_states: &[Vec<Vec<u32>>],
-    n_samples: usize,
-    _params: &ModelParams,
-) -> usize {
-    let n_markers = geno.n_markers();
-    let n_stage1 = stage_markers.n_stage1();
-    let mut total_switches = 0usize;
-
-    if n_stage1 == 0 {
-        return 0;
-    }
-
-    // Process each sample
-    for s in 0..n_samples {
-        let sample_idx = SampleIdx::new(s as u32);
-        let hap1 = sample_idx.hap1();
-        let hap2 = sample_idx.hap2();
-
-        let h1_idx = hap1.0 as usize;
-        let h2_idx = hap2.0 as usize;
-
-        // Get state probs for this sample's haplotypes
-        let probs1 = &stage1_state_probs[h1_idx];
-        let probs2 = &stage1_state_probs[h2_idx];
-        let states1 = &stage1_states[h1_idx];
-        let states2 = &stage1_states[h2_idx];
-
-        // Phase each Stage 2 marker
-        for m in 0..n_markers {
-            // Skip Stage 1 markers (already phased)
-            if stage_markers.is_stage1(m) {
-                continue;
-            }
-
-            let a1 = geno.get(m, hap1);
-            let a2 = geno.get(m, hap2);
-
-            // Skip homozygous sites
-            if a1 == a2 {
-                continue;
-            }
-
-            // Get interpolation parameters
-            let prev_idx = stage_markers.prev_stage1[m];
-            let next_idx = stage_markers.next_stage1[m];
-            let wt = stage_markers.prev_stage1_wt[m];
-
-            // Compute allele probabilities for each phase configuration
-            // P(a1 on hap1) vs P(a2 on hap1)
-            let (p_01, p_10) = compute_stage2_phase_probs(
-                a1, a2, m,
-                prev_idx, next_idx, wt,
-                probs1, probs2,
-                states1, states2,
-                geno,
-                stage_markers,
-            );
-
-            // Apply phase switch if swapped is better
-            if p_10 > p_01 {
-                geno.swap(m, hap1, hap2);
-                total_switches += 1;
-            }
-        }
-    }
-
-    total_switches
-}
-
-/// Compute phase probabilities for a Stage 2 marker by interpolating Stage 1 state probabilities
-#[allow(dead_code)]
-fn compute_stage2_phase_probs(
-    a1: u8,
-    a2: u8,
-    marker: usize,
-    prev_idx: i32,
-    next_idx: i32,
-    wt: f32,
-    probs1: &[Vec<f32>],
-    _probs2: &[Vec<f32>],
-    states1: &[Vec<u32>],
-    _states2: &[Vec<u32>],
-    geno: &MutableGenotypes,
-    stage_markers: &StageMarkers,
-) -> (f32, f32) {
-    let mut p_01 = 0.0f32; // P(a1 on hap1, a2 on hap2)
-    let mut p_10 = 0.0f32; // P(a2 on hap1, a1 on hap2)
-
-    // Get state probabilities from surrounding Stage 1 markers
-    let (probs_a1, states_a1) = if prev_idx >= 0 {
-        let idx = prev_idx as usize;
-        (&probs1[idx], &states1[idx])
-    } else if next_idx >= 0 && (next_idx as usize) < probs1.len() {
-        let idx = next_idx as usize;
-        (&probs1[idx], &states1[idx])
-    } else {
-        return (0.5, 0.5);
-    };
-
-    let (probs_b1, _states_b1) = if next_idx >= 0 && (next_idx as usize) < probs1.len() {
-        let idx = next_idx as usize;
-        (&probs1[idx], &states1[idx])
-    } else if prev_idx >= 0 {
-        let idx = prev_idx as usize;
-        (&probs1[idx], &states1[idx])
-    } else {
-        return (0.5, 0.5);
-    };
-
-    let n_states = probs_a1.len().min(states_a1.len());
-    if n_states == 0 {
-        return (0.5, 0.5);
-    }
-
-    // Compute allele probability contributions from each state
-    for j in 0..n_states {
-        let state_hap = states_a1[j] as usize;
-        let prob = wt * probs_a1[j] + (1.0 - wt) * probs_b1.get(j).copied().unwrap_or(0.0);
-
-        // Get allele from state haplotype at this marker
-        let state_allele = geno.get(marker, HapIdx::new(state_hap as u32));
-
-        // Check if state allele matches one of the target alleles
-        // and use rare allele matching heuristic from Java Stage2Baum
-        let rare1 = stage_markers.is_allele_low_freq(marker, a1);
-        let rare2 = stage_markers.is_allele_low_freq(marker, a2);
-
-        if state_allele == a1 {
-            if rare1 && !rare2 {
-                // Rare allele on state -> likely on target hap
-                p_01 += prob * 0.6;
-                p_10 += prob * 0.4;
-            } else {
-                p_01 += prob;
-            }
-        } else if state_allele == a2 {
-            if rare2 && !rare1 {
-                p_10 += prob * 0.6;
-                p_01 += prob * 0.4;
-            } else {
-                p_10 += prob;
-            }
-        } else {
-            // State has neither allele - split evenly
-            p_01 += prob * 0.5;
-            p_10 += prob * 0.5;
-        }
-    }
-
-    // Normalize
-    let total = p_01 + p_10;
-    if total > 0.0 {
-        (p_01 / total, p_10 / total)
-    } else {
-        (0.5, 0.5)
-    }
 }
 
 #[cfg(test)]

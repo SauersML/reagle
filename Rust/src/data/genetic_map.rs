@@ -63,8 +63,8 @@ impl GeneticMap {
     /// This matches Java `vcf/PositionMap.java`
     /// Converts genome coordinates to genetic units by multiplying by scale_factor.
     /// Default scale_factor = 1e-6 (1 cM per Mb)
-    pub fn position_map(chrom: ChromIdx, scale_factor: f64) -> PositionMap {
-        PositionMap { _chrom: chrom, scale_factor }
+    pub fn position_map(scale_factor: f64) -> PositionMap {
+        PositionMap { scale_factor }
     }
 
     /// Load from PLINK format map file
@@ -260,22 +260,20 @@ impl GeneticMap {
 /// This matches Java `vcf/PositionMap.java`
 #[derive(Clone, Debug)]
 pub struct PositionMap {
-    _chrom: ChromIdx,
     scale_factor: f64,
 }
 
 impl PositionMap {
     /// Create a new position map with default scale factor (1 cM per Mb)
-    pub fn new(chrom: ChromIdx) -> Self {
+    pub fn new() -> Self {
         Self {
-            _chrom: chrom,
             scale_factor: DEFAULT_SCALE_FACTOR,
         }
     }
 
     /// Create with custom scale factor
-    pub fn with_scale(chrom: ChromIdx, scale_factor: f64) -> Self {
-        Self { _chrom: chrom, scale_factor }
+    pub fn with_scale(scale_factor: f64) -> Self {
+        Self { scale_factor }
     }
 
     /// Get genetic position from physical position
@@ -396,7 +394,7 @@ impl MarkerMap {
             };
         }
 
-        let pos_map = PositionMap::new(ChromIdx::new(0));
+        let pos_map = PositionMap::new();
         let mut gen_pos = Vec::with_capacity(n);
         let mut gen_dist = Vec::with_capacity(n);
 
@@ -708,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_position_map() {
-        let pm = PositionMap::new(ChromIdx::new(0));
+        let pm = PositionMap::new();
 
         assert!((pm.gen_pos(1_000_000) - 1.0).abs() < 0.001);
         assert!((pm.gen_pos(2_000_000) - 2.0).abs() < 0.001);
