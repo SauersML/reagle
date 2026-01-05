@@ -259,8 +259,9 @@ impl Default for ModelParams {
 /// Matches Java `phase/ParamEstimates.java`.
 #[derive(Clone, Debug, Default)]
 pub struct ParamEstimates {
-    /// Sum of switch probabilities (for recombIntensity estimation)
-    sum_switch_probs: f64,
+    /// Sum of genetic distances (for recombIntensity estimation)
+    /// Note: Java Beagle uses genDist, NOT switch probabilities
+    sum_gen_dist: f64,
     /// Sum of expected switches
     sum_expected_switches: f64,
     /// Sum of match probabilities
@@ -280,8 +281,12 @@ impl ParamEstimates {
     }
 
     /// Add switch observation
-    pub fn add_switch(&mut self, switch_prob: f64, expected_switches: f64) {
-        self.sum_switch_probs += switch_prob;
+    ///
+    /// # Arguments
+    /// * `gen_dist` - Genetic distance in cM (NOT recombination probability)
+    /// * `expected_switches` - Expected number of switches from Baum-Welch
+    pub fn add_switch(&mut self, gen_dist: f64, expected_switches: f64) {
+        self.sum_gen_dist += gen_dist;
         self.sum_expected_switches += expected_switches;
         self.n_switch_obs += 1;
     }
@@ -295,7 +300,7 @@ impl ParamEstimates {
 
     /// Merge with another estimate (thread-safe reduction)
     pub fn merge(&mut self, other: &ParamEstimates) {
-        self.sum_switch_probs += other.sum_switch_probs;
+        self.sum_gen_dist += other.sum_gen_dist;
         self.sum_expected_switches += other.sum_expected_switches;
         self.sum_match_probs += other.sum_match_probs;
         self.sum_mismatch_probs += other.sum_mismatch_probs;
@@ -303,20 +308,21 @@ impl ParamEstimates {
         self.n_emit_obs += other.n_emit_obs;
     }
 
-    /// Sum of switch probabilities (for checking convergence)
-    pub fn sum_switch_probs(&self) -> f64 {
-        self.sum_switch_probs
+    /// Sum of genetic distances (for checking convergence)
+    pub fn sum_gen_dist(&self) -> f64 {
+        self.sum_gen_dist
     }
 
     /// Estimate recombination intensity
     ///
     /// From Java `ParamEstimates.recombIntensity()`:
-    /// Returns ratio of expected switches to switch probabilities
+    /// Returns ratio of expected switches to total genetic distance
+    /// λ = Σ(expected_switches) / Σ(genetic_distances)
     pub fn recomb_intensity(&self) -> f32 {
-        if self.sum_switch_probs <= 0.0 {
+        if self.sum_gen_dist <= 0.0 {
             return 1.0;
         }
-        (self.sum_expected_switches / self.sum_switch_probs) as f32
+        (self.sum_expected_switches / self.sum_gen_dist) as f32
     }
 
     /// Estimate mismatch probability
@@ -455,17 +461,17 @@ mod tests {
     #[test]
     fn test_param_estimates_merge() {
         let mut e1 = ParamEstimates::new();
-        e1.add_switch(0.5, 2.0);
+        e1.add_switch(0.5, 2.0);  // 0.5 cM genetic distance
         e1.add_emission(0.9, 0.1);
 
         let mut e2 = ParamEstimates::new();
-        e2.add_switch(0.3, 1.5);
+        e2.add_switch(0.3, 1.5);  // 0.3 cM genetic distance
         e2.add_emission(0.8, 0.2);
 
         e1.merge(&e2);
 
-        assert!((e1.sum_switch_probs - 0.8).abs() < 0.0001);
-        assert_eq!(e1.n_switch_obs, 2);
+        assert!((e1.sum_gen_dist() - 0.8).abs() < 0.0001);
+        assert_eq!(e1.n_switch_obs(), 2);
     }
 
     #[test]

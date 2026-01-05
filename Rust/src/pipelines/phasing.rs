@@ -135,7 +135,7 @@ impl PhasingPipeline {
 
             // Run phasing iteration with EM estimation (if enabled and during burnin)
             let collect_em = self.config.em && is_burnin;
-            self.run_iteration_with_hmm(&mut geno, &p_recomb, &gen_positions, collect_em)?;
+            self.run_iteration_with_hmm(&mut geno, &p_recomb, &gen_dists, &gen_positions, &ibs2, collect_em)?;
         }
 
         // Build final GenotypeMatrix from mutable genotypes
@@ -294,6 +294,14 @@ impl PhasingPipeline {
             pos
         };
 
+        // Compute MAF for each marker (used by IBS2)
+        let maf: Vec<f32> = (0..n_markers)
+            .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+            .collect();
+
+        // Build IBS2 segments for phase consistency
+        let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
+
         // Run phasing iterations (reduced for imputation pre-processing)
         let n_burnin = self.config.burnin.min(3);
         let n_iterations = self.config.iterations.min(6);
@@ -303,7 +311,7 @@ impl PhasingPipeline {
             let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
             let collect_em = self.config.em && is_burnin;
-            self.run_iteration_with_hmm(&mut geno, &p_recomb, &gen_positions, collect_em)?;
+            self.run_iteration_with_hmm(&mut geno, &p_recomb, &gen_dists, &gen_positions, &ibs2, collect_em)?;
         }
 
         // Build and return phased GenotypeMatrix
@@ -318,7 +326,9 @@ impl PhasingPipeline {
         &mut self,
         geno: &mut MutableGenotypes,
         p_recomb: &[f32],
+        gen_dists: &[f64],
         gen_positions: &[f64],
+        ibs2: &Ibs2,
         collect_em: bool,
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
@@ -343,7 +353,7 @@ impl PhasingPipeline {
             .collect();
 
         // Phase each sample in parallel using dynamic ImpStates with thread-local workspaces
-        let updates: Vec<(SampleIdx, Vec<usize>)> = (0..n_samples)
+        let updates: Vec<(SampleIdx, Vec<usize>, Vec<(usize, u8, u8)>)> = (0..n_samples)
             .into_par_iter()
             .map_init(
                 || Workspace::new(n_states, n_markers, n_haps),
@@ -356,13 +366,40 @@ impl PhasingPipeline {
                     let alleles1 = &geno_snapshot[hap1.0 as usize];
                     let alleles2 = &geno_snapshot[hap2.0 as usize];
 
-                    // Find heterozygous markers
-                    let het_markers: Vec<usize> = (0..n_markers)
+                    // Find all heterozygous markers
+                    let all_het_markers: Vec<usize> = (0..n_markers)
                         .filter(|&m| alleles1[m] != alleles2[m])
                         .collect();
 
-                    if het_markers.is_empty() {
+                    if all_het_markers.is_empty() {
                         return None; // Nothing to phase
+                    }
+
+                    // Get IBS2 segments for this sample
+                    // Markers inside IBS2 segments have their phase "locked" by shared haplotypes
+                    let ibs2_segs = ibs2.segments(sample_idx);
+
+                    // Filter out het markers that fall within IBS2 segments
+                    let het_markers: Vec<usize> = if ibs2_segs.is_empty() {
+                        all_het_markers
+                    } else {
+                        all_het_markers
+                            .into_iter()
+                            .filter(|&m| {
+                                // Keep marker only if it's NOT in any IBS2 segment
+                                !ibs2_segs.iter().any(|seg| seg.contains(m))
+                            })
+                            .collect()
+                    };
+
+                    // Find markers with missing data (for imputation)
+                    let missing_markers: Vec<usize> = (0..n_markers)
+                        .filter(|&m| alleles1[m] == 255 || alleles2[m] == 255)
+                        .collect();
+
+                    // If no hets to phase and no missing to impute, skip this sample
+                    if het_markers.is_empty() && missing_markers.is_empty() {
+                        return None;
                     }
 
                     // Create ImpStatesLegacy for dynamic state selection (phasing uses naive PBWT)
@@ -397,13 +434,15 @@ impl PhasingPipeline {
                     workspace.resize(actual_n_states, n_markers, n_haps);
 
                     // Run phase decision using dynamic state HMM with workspace
-                    let (switch_markers, local_em) = phase_sample_with_hmm(
+                    let (switch_markers, imputed, local_em) = phase_sample_with_hmm(
                         alleles1,
                         alleles2,
                         &het_markers,
+                        &missing_markers,
                         &hap_indices,
                         &geno_snapshot,
                         p_recomb,
+                        gen_dists,
                         &self.params,
                         collect_em,
                         workspace,
@@ -414,24 +453,31 @@ impl PhasingPipeline {
                         global_em.add_estimation_data(&local);
                     }
 
-                    if switch_markers.is_empty() {
+                    if switch_markers.is_empty() && imputed.is_empty() {
                         None
                     } else {
                         total_switches.fetch_add(switch_markers.len(), Ordering::Relaxed);
-                        Some((sample_idx, switch_markers))
+                        Some((sample_idx, switch_markers, imputed))
                     }
                 },
             )
             .flatten()
             .collect();
 
-        // Apply phase switches
-        for (sample_idx, switch_markers) in updates {
+        // Apply phase switches and imputed genotypes
+        for (sample_idx, switch_markers, imputed) in updates {
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
 
+            // Apply phase switches
             for &m in &switch_markers {
                 geno.swap(m, hap1, hap2);
+            }
+
+            // Apply imputed genotypes
+            for (m, a1, a2) in imputed {
+                geno.set(m, hap1, a1);
+                geno.set(m, hap2, a2);
             }
         }
 
@@ -483,29 +529,36 @@ impl PhasingPipeline {
 /// 1. Run forward pass for combined, hap1, and hap2
 /// 2. Run backward pass storing values at het sites
 /// 3. Make phase decisions by computing P(0|1) vs P(1|0) posteriors
+/// 4. Impute missing genotypes based on HMM posteriors
 ///
 /// Uses dynamic state selection where hap_indices[m][s] gives the reference
 /// haplotype index for state s at marker m.
+///
+/// Returns: (switch_markers, imputed_genotypes, em_estimates)
+/// - switch_markers: markers where phase should be swapped
+/// - imputed_genotypes: (marker, allele1, allele2) for missing genotypes
 fn phase_sample_with_hmm(
     alleles1: &[u8],
     alleles2: &[u8],
     het_markers: &[usize],
+    missing_markers: &[usize],
     hap_indices: &[Vec<u32>],
     geno_snapshot: &[Vec<u8>],
     p_recomb: &[f32],
+    gen_dists: &[f64],
     params: &ModelParams,
     collect_em: bool,
     workspace: &mut Workspace,
-) -> (Vec<usize>, Option<ParamEstimates>) {
+) -> (Vec<usize>, Vec<(usize, u8, u8)>, Option<ParamEstimates>) {
     let n_markers = alleles1.len();
 
-    if hap_indices.is_empty() || het_markers.is_empty() || n_markers == 0 {
-        return (Vec::new(), None);
+    if hap_indices.is_empty() || n_markers == 0 {
+        return (Vec::new(), Vec::new(), None);
     }
 
     let n_states = hap_indices.first().map(|v| v.len()).unwrap_or(0);
     if n_states == 0 {
-        return (Vec::new(), None);
+        return (Vec::new(), Vec::new(), None);
     }
 
     // Helper to get reference allele at marker m for state s (dynamic lookup)
@@ -622,12 +675,23 @@ fn phase_sample_with_hmm(
     let mut bwd2_at_het: Vec<Vec<f32>> = Vec::with_capacity(het_markers.len());
     let mut het_idx = het_markers.len();
 
+    // Store backward values at missing sites for imputation
+    let mut bwd_at_missing: Vec<Vec<f32>> = Vec::with_capacity(missing_markers.len());
+    let mut miss_idx = missing_markers.len();
+
     for m in (0..n_markers).rev() {
         // Store backward values at het sites
         while het_idx > 0 && het_markers[het_idx - 1] == m {
             het_idx -= 1;
             bwd1_at_het.push(bwd1.clone());
             bwd2_at_het.push(bwd2.clone());
+        }
+
+        // Store backward values at missing sites (use combined bwd for simplicity)
+        // For missing data, we use uniform emission so bwd1 ≈ bwd2
+        while miss_idx > 0 && missing_markers[miss_idx - 1] == m {
+            miss_idx -= 1;
+            bwd_at_missing.push(bwd1.clone());
         }
 
         if m == 0 {
@@ -672,6 +736,8 @@ fn phase_sample_with_hmm(
     // Reverse so bwd_at_het[i] corresponds to het_markers[i]
     bwd1_at_het.reverse();
     bwd2_at_het.reverse();
+    // Reverse so bwd_at_missing[i] corresponds to missing_markers[i]
+    bwd_at_missing.reverse();
 
     // Make phase decisions using BOTH backward passes
     // Java Beagle computes: prob_no_swap = p11 * p22, prob_swap = p12 * p21
@@ -746,6 +812,9 @@ fn phase_sample_with_hmm(
                 let p_no_rec = 1.0 - p_rec;
                 let shift = p_rec / n_states as f32;
 
+                // Get genetic distance for this interval (gen_dists[m-1] is distance from marker m-1 to m)
+                let g_dist = gen_dists.get(m.saturating_sub(1)).copied().unwrap_or(0.0);
+
                 // Calculate total posterior mass (for normalization)
                 let mut total_mass = 0.0f64;
                 let mut no_switch_mass = 0.0f64;
@@ -766,16 +835,74 @@ fn phase_sample_with_hmm(
                 }
 
                 // Expected switch probability = 1 - P(no switch)
+                // Note: Java Beagle passes genetic distance (cM), NOT p_rec
                 if total_mass > 0.0 {
                     let p_no_switch = no_switch_mass / total_mass;
                     let expected_switches = 1.0 - p_no_switch;
-                    em.add_switch(p_rec as f64, expected_switches);
+                    em.add_switch(g_dist, expected_switches);
                 }
             }
         }
     }
 
-    (switch_markers, em_estimates)
+    // Impute missing genotypes based on HMM posteriors
+    // For each missing marker, compute posterior probability P(allele) ∝ Σ_s fwd[m][s] * bwd[m][s]
+    // Java Beagle (PhaseBaum2.java imputeAlleles) does: alFreq[al] += fwd[s] * bwd[s]
+    let mut imputed: Vec<(usize, u8, u8)> = Vec::new();
+
+    for (idx, &m) in missing_markers.iter().enumerate() {
+        if m >= n_markers {
+            continue;
+        }
+
+        // Get backward values at this missing marker
+        let bwd_m = match bwd_at_missing.get(idx) {
+            Some(b) => b,
+            None => continue,
+        };
+
+        // Calculate posterior probability for each possible allele
+        // Using fwd_combined (which treats missing as uninformative) and backward values
+        let mut allele_probs = [0.0f32; 2];
+
+        for s in 0..n_states {
+            let ref_a = get_ref_allele(m, s);
+            if ref_a < 2 {
+                // Posterior ∝ fwd * bwd at this position
+                // Use fwd_combined since missing markers have uniform emission
+                let posterior = fwd_combined[m][s] * bwd_m[s];
+                allele_probs[ref_a as usize] += posterior;
+            }
+        }
+
+        // Normalize and determine most likely allele
+        let total = allele_probs[0] + allele_probs[1];
+        if total > 0.0 {
+            let p0 = allele_probs[0] / total;
+            let p1 = allele_probs[1] / total;
+            let best_allele = if p0 >= p1 { 0u8 } else { 1u8 };
+
+            // Determine imputed values based on which alleles are missing
+            let a1 = alleles1[m];
+            let a2 = alleles2[m];
+
+            let (imputed_a1, imputed_a2) = if a1 == 255 && a2 == 255 {
+                // Both missing: impute as homozygous for most likely allele
+                // Note: Could be improved to impute diploid independently
+                (best_allele, best_allele)
+            } else if a1 == 255 {
+                // Only hap1 missing
+                (best_allele, a2)
+            } else {
+                // Only hap2 missing
+                (a1, best_allele)
+            };
+
+            imputed.push((m, imputed_a1, imputed_a2));
+        }
+    }
+
+    (switch_markers, imputed, em_estimates)
 }
 
 #[cfg(test)]
