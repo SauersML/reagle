@@ -469,9 +469,26 @@ impl PhasingPipeline {
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
 
-            // Apply phase switches
-            for &m in &switch_markers {
-                geno.swap(m, hap1, hap2);
+            // Apply phase switches - swap SEGMENTS, not just switch points
+            // switch_markers contains boundaries where phase changes
+            // Segments [switch[0], switch[1]), [switch[2], switch[3]), etc. need swapping
+            if !switch_markers.is_empty() {
+                let mut i = 0;
+                while i < switch_markers.len() {
+                    let start = switch_markers[i];
+                    let end = if i + 1 < switch_markers.len() {
+                        switch_markers[i + 1]
+                    } else {
+                        n_markers
+                    };
+
+                    // Swap all markers in this segment
+                    for m in start..end {
+                        geno.swap(m, hap1, hap2);
+                    }
+
+                    i += 2; // Skip to next swapped segment
+                }
             }
 
             // Apply imputed genotypes
