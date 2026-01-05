@@ -31,19 +31,21 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
+            Rust/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache test data
         uses: actions/cache@v4
         with:
-          path: tests/data/
+          path: Rust/tests/data/
           key: test-data-hgdp1kg-chr22-v1
 
       - name: Build Reagle
+        working-directory: Rust
         run: cargo build --release
 
       - name: Run Integration Test
+        working-directory: Rust
         run: python3 tests/integration_test.py
 
       - name: Upload metrics
@@ -51,5 +53,5 @@ jobs:
         if: always()
         with:
           name: imputation-metrics
-          path: tests/data/*_metrics.txt
+          path: Rust/tests/data/*_metrics.txt
           retention-days: 30
