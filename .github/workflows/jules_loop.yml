@@ -21,11 +21,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-action@stable
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
