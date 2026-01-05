@@ -283,6 +283,11 @@ impl<'a> Iterator for SlidingWindowIterator<'a> {
         let overlap_start = if is_last { end } else { self.find_overlap_start(end) };
         let next_splice = if is_last { end } else { overlap_start };
 
+        let n_ref_markers = self
+            .reference
+            .map(|r| r.restrict(start, end).n_markers())
+            .unwrap_or(0);
+
         let indices = WindowIndices {
             start,
             end,
@@ -290,7 +295,7 @@ impl<'a> Iterator for SlidingWindowIterator<'a> {
             next_splice,
             overlap_start,
             n_targ_markers: end - start,
-            n_ref_markers: 0, // TODO: handle reference
+            n_ref_markers,
         };
 
         // Extract window data
@@ -372,5 +377,22 @@ mod tests {
 
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].n_markers(), 10);
+    }
+
+    #[test]
+    fn test_window_with_reference_markers_count() {
+        let target = make_test_matrix(100);
+        let reference = make_test_matrix(100);
+        let gen_map = GeneticMap::empty(ChromIdx::new(0));
+
+        let windows: Vec<_> = WindowBuilder::new()
+            .window_cm(10.0)
+            .overlap_cm(1.0)
+            .build(&target, Some(&reference), &gen_map)
+            .collect();
+
+        assert!(!windows.is_empty());
+        assert!(windows[0].indices.n_ref_markers > 0, "n_ref_markers should be > 0 when reference is provided");
+        assert_eq!(windows[0].indices.n_ref_markers, windows[0].indices.n_targ_markers, "n_ref_markers should match n_targ_markers for aligned data");
     }
 }
