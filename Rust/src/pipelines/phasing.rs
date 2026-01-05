@@ -214,12 +214,16 @@ impl PhasingPipeline {
             let n_alleles = alleles.iter().copied().max().unwrap_or(0) as usize + 1;
 
             let mut temp_prefix = pbwt.fwd_prefix().to_vec();
-            let mut temp_div = pbwt.fwd_divergence().to_vec();
+            let mut temp_div: Vec<i32> = pbwt.fwd_divergence().iter().map(|&x| x).collect();
 
-            updater.update(alleles, n_alleles.max(2), m, &mut temp_prefix, &mut temp_div);
+            updater.fwd_update(alleles, n_alleles.max(2), m, &mut temp_prefix, &mut temp_div);
 
             pbwt.fwd_prefix_mut().copy_from_slice(&temp_prefix);
-            pbwt.fwd_divergence_mut().copy_from_slice(&temp_div);
+            for (i, &d) in temp_div.iter().enumerate() {
+                if i < pbwt.fwd_divergence_mut().len() {
+                    pbwt.fwd_divergence_mut()[i] = d;
+                }
+            }
         }
 
         pbwt
@@ -242,7 +246,10 @@ impl PhasingPipeline {
         };
 
         // Use PBWT to find nearby haplotypes
-        let mut selected = pbwt.select_states(target_hap, n_states + 2, true);
+        // Args: target_hap, n_states, marker, n_candidates, use_backward, exclude_self
+        let marker = 0; // Use beginning of sequence for state selection
+        let n_candidates = n_states * 2;
+        let mut selected = pbwt.select_states(target_hap, n_states + 2, marker, n_candidates, false, true);
         
         // Remove the other haplotype from the same sample
         selected.retain(|&h| h != other_hap);

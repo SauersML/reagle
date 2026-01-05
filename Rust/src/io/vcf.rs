@@ -220,38 +220,65 @@ impl VcfReader {
 }
 
 /// Parse a genotype field (e.g., "0|1", "0/1", ".")
+///
+/// This follows the Java VcfRecGTParser behavior:
+/// - If one allele is missing, treat both as missing
+/// - Returns (allele1, allele2, is_phased)
+/// - Missing alleles are represented as 255
 fn parse_genotype(gt: &str) -> Result<(u8, u8, bool)> {
+    // Handle completely missing genotypes
     if gt == "." || gt == "./." || gt == ".|." {
-        return Ok((255, 255, true)); // Missing
+        return Ok((255, 255, true)); // Missing, treated as phased
     }
 
+    // Determine if phased (| separator) or unphased (/ separator)
     let phased = gt.contains('|');
     let sep = if phased { '|' } else { '/' };
 
+    // Split genotype into alleles
     let parts: Vec<&str> = gt.split(sep).collect();
-    if parts.len() != 2 {
-        // Haploid
-        let a1 = if parts[0] == "." {
-            255
-        } else {
-            parts[0].parse().unwrap_or(255)
-        };
-        return Ok((a1, a1, phased));
+
+    // Handle haploid genotypes
+    if parts.len() == 1 {
+        let a1 = parse_allele(parts[0]);
+        return Ok((a1, a1, true)); // Haploid is always "phased"
     }
 
-    let a1 = if parts[0] == "." {
-        255
-    } else {
-        parts[0].parse().unwrap_or(255)
-    };
+    // Parse diploid genotypes
+    if parts.len() != 2 {
+        // Malformed, treat as missing
+        return Ok((255, 255, false));
+    }
 
-    let a2 = if parts[1] == "." {
-        255
-    } else {
-        parts[1].parse().unwrap_or(255)
-    };
+    let a1 = parse_allele(parts[0]);
+    let a2 = parse_allele(parts[1]);
+
+    // Java behavior: if one allele is missing, treat both as missing
+    if a1 == 255 || a2 == 255 {
+        return Ok((255, 255, false));
+    }
 
     Ok((a1, a2, phased))
+}
+
+/// Parse a single allele string to a u8
+/// Returns 255 for missing (.)
+#[inline]
+fn parse_allele(s: &str) -> u8 {
+    if s == "." || s.is_empty() {
+        return 255;
+    }
+
+    // Fast path for single digit alleles (most common case)
+    if s.len() == 1 {
+        let c = s.as_bytes()[0];
+        if c >= b'0' && c <= b'9' {
+            return c - b'0';
+        }
+    }
+
+    // Multi-digit alleles
+    s.parse().unwrap_or(255)
 }
 
 /// VCF file writer

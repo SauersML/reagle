@@ -83,19 +83,6 @@ impl Allele {
         matches!(self, Self::Missing)
     }
 
-    /// Convert to string representation
-    pub fn to_string(&self) -> String {
-        match self {
-            Self::Base(0) => "A".to_string(),
-            Self::Base(1) => "C".to_string(),
-            Self::Base(2) => "G".to_string(),
-            Self::Base(3) => "T".to_string(),
-            Self::Base(_) => "N".to_string(),
-            Self::Seq(s) => s.to_string(),
-            Self::Missing => ".".to_string(),
-        }
-    }
-
     /// Get complement (for strand flipping)
     pub fn complement(&self) -> Self {
         match self {
@@ -110,7 +97,15 @@ impl Allele {
 
 impl std::fmt::Display for Allele {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        match self {
+            Self::Base(0) => write!(f, "A"),
+            Self::Base(1) => write!(f, "C"),
+            Self::Base(2) => write!(f, "G"),
+            Self::Base(3) => write!(f, "T"),
+            Self::Base(_) => write!(f, "N"),
+            Self::Seq(s) => write!(f, "{}", s),
+            Self::Missing => write!(f, "."),
+        }
     }
 }
 

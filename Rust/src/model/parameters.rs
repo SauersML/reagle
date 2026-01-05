@@ -1,62 +1,134 @@
 //! # Model Parameters
 //!
 //! Hyperparameters for the Li-Stephens HMM model.
-//! Replaces `phase/PhaseData.java` parameter handling.
+//! This matches the Java Beagle implementation in `phase/PhaseData.java`
+//! and `main/Par.java`.
 
 /// Model parameters for Li-Stephens HMM
+///
+/// Parameters are tuned based on the Java Beagle defaults and formulas.
 #[derive(Clone, Debug)]
 pub struct ModelParams {
     /// Effective population size (Ne)
-    pub ne: f32,
+    /// Default: 1_000_000 (Beagle default)
+    pub ne: u64,
 
     /// Per-site allele mismatch probability
     pub p_mismatch: f32,
 
-    /// Recombination intensity multiplier
+    /// Recombination intensity (controls state transition rate)
+    /// Formula from Java: recombIntensity = 0.04 * ne / nHaps
     pub recomb_intensity: f32,
 
     /// Number of HMM states (reference haplotypes to consider)
+    /// Default for phasing: 280
+    /// Default for imputation: 1600
     pub n_states: usize,
 
-    /// Minimum match length for PBWT state selection (in markers)
-    pub min_match_length: usize,
+    /// Number of total haplotypes in panel
+    pub n_haps: usize,
+
+    /// Number of burnin iterations
+    pub burnin: usize,
+
+    /// Number of phasing iterations (after burnin)
+    pub iterations: usize,
+
+    /// Likelihood ratio threshold for marking heterozygotes as phased
+    pub lr_threshold: f32,
+
+    /// Initial likelihood ratio threshold
+    pub initial_lr: f32,
+
+    /// Whether to use EM parameter estimation
+    pub use_em: bool,
 }
 
 impl ModelParams {
+    /// Default Ne value from Beagle
+    pub const DEFAULT_NE: u64 = 1_000_000;
+
+    /// Default phase states
+    pub const DEFAULT_PHASE_STATES: usize = 280;
+
+    /// Default imputation states
+    pub const DEFAULT_IMP_STATES: usize = 1600;
+
+    /// Default burnin iterations
+    pub const DEFAULT_BURNIN: usize = 3;
+
+    /// Default phasing iterations
+    pub const DEFAULT_ITERATIONS: usize = 12;
+
+    /// Default initial LR threshold
+    pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
-            ne: 100_000.0,
+            ne: Self::DEFAULT_NE,
             p_mismatch: 0.0001,
             recomb_intensity: 1.0,
-            n_states: 280,
-            min_match_length: 10,
+            n_states: Self::DEFAULT_PHASE_STATES,
+            n_haps: 0,
+            burnin: Self::DEFAULT_BURNIN,
+            iterations: Self::DEFAULT_ITERATIONS,
+            lr_threshold: f32::INFINITY,
+            initial_lr: Self::DEFAULT_INITIAL_LR,
+            use_em: true,
         }
     }
 
     /// Create parameters for phasing
+    ///
+    /// # Arguments
+    /// * `n_haps` - Total number of haplotypes (target + reference)
     pub fn for_phasing(n_haps: usize) -> Self {
+        let ne = Self::DEFAULT_NE;
+        // Formula from Java PhaseData constructor
+        let recomb_intensity = 0.04 * ne as f32 / n_haps as f32;
+
         Self {
-            ne: 100_000.0,
+            ne,
             p_mismatch: Self::li_stephens_p_mismatch(n_haps),
-            recomb_intensity: 1.0,
-            n_states: 280.min(n_haps.saturating_sub(2)),
-            min_match_length: 10,
+            recomb_intensity,
+            n_states: Self::DEFAULT_PHASE_STATES.min(n_haps.saturating_sub(2)),
+            n_haps,
+            burnin: Self::DEFAULT_BURNIN,
+            iterations: Self::DEFAULT_ITERATIONS,
+            lr_threshold: f32::INFINITY, // Set per iteration
+            initial_lr: Self::DEFAULT_INITIAL_LR,
+            use_em: true,
         }
     }
 
     /// Create parameters for imputation
+    ///
+    /// # Arguments
+    /// * `n_ref_haps` - Number of reference haplotypes
     pub fn for_imputation(n_ref_haps: usize) -> Self {
         Self {
-            ne: 100_000.0,
+            ne: Self::DEFAULT_NE,
             p_mismatch: Self::li_stephens_p_mismatch(n_ref_haps),
             recomb_intensity: 1.0,
-            n_states: 1600.min(n_ref_haps),
-            min_match_length: 10,
+            n_states: Self::DEFAULT_IMP_STATES.min(n_ref_haps),
+            n_haps: n_ref_haps,
+            burnin: 0,
+            iterations: 1,
+            lr_threshold: 1.0,
+            initial_lr: Self::DEFAULT_INITIAL_LR,
+            use_em: false,
         }
     }
 
     /// Li-Stephens approximation for allele mismatch probability
+    ///
+    /// From Java `Par.liStephensPMismatch`:
+    /// ```java
+    /// double theta = 1.0 / (Math.log(nHaps) + 0.5);
+    /// return (float) (theta / (2*(theta + nHaps)));
+    /// ```
+    ///
     /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
         if n_haps <= 1 {
@@ -67,25 +139,48 @@ impl ModelParams {
         (theta / (2.0 * (theta + n))) as f32
     }
 
-    /// Calculate switch probability between markers
+    /// Calculate LR threshold for a given iteration
     ///
-    /// # Arguments
-    /// * `gen_dist` - Genetic distance in cM
+    /// From Java `PhaseData.lrThreshold`:
+    /// - During burnin: infinity (don't mark anything as phased)
+    /// - Final iteration: 1.0 (mark everything)
+    /// - Otherwise: exponential decay from initial_lr to 4.0
+    pub fn lr_threshold_for_iteration(&self, it: usize) -> f32 {
+        if it < self.burnin {
+            f32::INFINITY
+        } else if it == self.burnin + self.iterations - 1 {
+            1.0
+        } else {
+            let n_its_m1 = (self.iterations - 1) as f64;
+            let last_val = 4.0;
+            let exp = (n_its_m1 - (it - self.burnin) as f64) / n_its_m1;
+            let base = self.initial_lr as f64 / last_val;
+            (last_val * base.powf(exp)) as f32
+        }
+    }
+
+    /// Calculate recombination probability from genetic distance
     ///
-    /// # Returns
-    /// Probability of switching to a different haplotype
-    pub fn switch_prob(&self, gen_dist: f64) -> f32 {
-        // Li-Stephens recombination probability
-        // P(switch) = 1 - exp(-4 * Ne * r / n_states)
-        // where r is recombination rate (cM/100)
-        let r = gen_dist / 100.0; // Convert cM to Morgan
-        let rate = 4.0 * self.ne as f64 * r * self.recomb_intensity as f64 / self.n_states as f64;
-        (1.0 - (-rate).exp()) as f32
+    /// From Java `MarkerMap.pRecomb`:
+    /// ```java
+    /// double c = -recombIntensity;
+    /// pRecomb[m] = -Math.expm1(c * genDist.get(m))
+    /// ```
+    ///
+    /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
+    pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
+        let c = -(self.recomb_intensity as f64);
+        (-f64::exp_m1(c * gen_dist_cm)) as f32
+    }
+
+    /// Calculate switch probability between markers using recombIntensity
+    pub fn switch_prob(&self, gen_dist_cm: f64) -> f32 {
+        self.p_recomb(gen_dist_cm)
     }
 
     /// Calculate no-switch probability
-    pub fn no_switch_prob(&self, gen_dist: f64) -> f32 {
-        1.0 - self.switch_prob(gen_dist)
+    pub fn no_switch_prob(&self, gen_dist_cm: f64) -> f32 {
+        1.0 - self.switch_prob(gen_dist_cm)
     }
 
     /// Calculate emission probability for matching allele
@@ -99,27 +194,56 @@ impl ModelParams {
     }
 
     /// Update mismatch probability (for EM estimation)
+    ///
+    /// From Java `PhaseData.updatePMismatch`:
+    /// Only update if new value is valid and greater than current
     pub fn update_p_mismatch(&mut self, new_p: f32) {
-        if new_p.is_finite() && new_p > 0.0 && new_p < 0.5 {
+        if new_p.is_finite() && new_p > self.p_mismatch && new_p < 0.5 {
             self.p_mismatch = new_p;
         }
     }
 
     /// Update recombination intensity (for EM estimation)
+    ///
+    /// From Java `PhaseData.updateRecombIntensity`:
+    /// Only update if new value is valid and positive
     pub fn update_recomb_intensity(&mut self, new_intensity: f32) {
         if new_intensity.is_finite() && new_intensity > 0.0 {
             self.recomb_intensity = new_intensity;
         }
     }
 
-    /// Set effective population size
-    pub fn set_ne(&mut self, ne: f32) {
+    /// Calculate Ne from recombIntensity
+    ///
+    /// From Java `PhaseData.ne`:
+    /// ```java
+    /// return (long) Math.ceil(25 * recombIntensity * nHaps);
+    /// ```
+    pub fn ne_from_recomb_intensity(&self) -> u64 {
+        (25.0 * self.recomb_intensity as f64 * self.n_haps as f64).ceil() as u64
+    }
+
+    /// Set effective population size and update recombIntensity
+    pub fn set_ne(&mut self, ne: u64) {
         self.ne = ne;
+        if self.n_haps > 0 {
+            self.recomb_intensity = 0.04 * ne as f32 / self.n_haps as f32;
+        }
     }
 
     /// Set number of states
     pub fn set_n_states(&mut self, n_states: usize) {
         self.n_states = n_states;
+    }
+
+    /// Set number of haplotypes
+    pub fn set_n_haps(&mut self, n_haps: usize) {
+        self.n_haps = n_haps;
+        // Recalculate dependent parameters
+        self.p_mismatch = Self::li_stephens_p_mismatch(n_haps);
+        if self.ne > 0 {
+            self.recomb_intensity = 0.04 * self.ne as f32 / n_haps as f32;
+        }
     }
 }
 
@@ -130,9 +254,12 @@ impl Default for ModelParams {
 }
 
 /// Parameter estimates from EM iteration
+///
+/// Thread-safe accumulator for EM parameter estimation.
+/// Matches Java `phase/ParamEstimates.java`.
 #[derive(Clone, Debug, Default)]
 pub struct ParamEstimates {
-    /// Sum of switch probabilities
+    /// Sum of switch probabilities (for recombIntensity estimation)
     sum_switch_probs: f64,
     /// Sum of expected switches
     sum_expected_switches: f64,
@@ -140,8 +267,10 @@ pub struct ParamEstimates {
     sum_match_probs: f64,
     /// Sum of mismatch probabilities
     sum_mismatch_probs: f64,
-    /// Number of observations
-    n_obs: usize,
+    /// Total observations for switch estimation
+    n_switch_obs: usize,
+    /// Total observations for emission estimation
+    n_emit_obs: usize,
 }
 
 impl ParamEstimates {
@@ -154,25 +283,35 @@ impl ParamEstimates {
     pub fn add_switch(&mut self, switch_prob: f64, expected_switches: f64) {
         self.sum_switch_probs += switch_prob;
         self.sum_expected_switches += expected_switches;
-        self.n_obs += 1;
+        self.n_switch_obs += 1;
     }
 
     /// Add emission observation
     pub fn add_emission(&mut self, match_prob: f64, mismatch_prob: f64) {
         self.sum_match_probs += match_prob;
         self.sum_mismatch_probs += mismatch_prob;
+        self.n_emit_obs += 1;
     }
 
-    /// Merge with another estimate
+    /// Merge with another estimate (thread-safe reduction)
     pub fn merge(&mut self, other: &ParamEstimates) {
         self.sum_switch_probs += other.sum_switch_probs;
         self.sum_expected_switches += other.sum_expected_switches;
         self.sum_match_probs += other.sum_match_probs;
         self.sum_mismatch_probs += other.sum_mismatch_probs;
-        self.n_obs += other.n_obs;
+        self.n_switch_obs += other.n_switch_obs;
+        self.n_emit_obs += other.n_emit_obs;
+    }
+
+    /// Sum of switch probabilities (for checking convergence)
+    pub fn sum_switch_probs(&self) -> f64 {
+        self.sum_switch_probs
     }
 
     /// Estimate recombination intensity
+    ///
+    /// From Java `ParamEstimates.recombIntensity()`:
+    /// Returns ratio of expected switches to switch probabilities
     pub fn recomb_intensity(&self) -> f32 {
         if self.sum_switch_probs <= 0.0 {
             return 1.0;
@@ -181,6 +320,9 @@ impl ParamEstimates {
     }
 
     /// Estimate mismatch probability
+    ///
+    /// From Java `ParamEstimates.pMismatch()`:
+    /// Returns proportion of mismatches
     pub fn p_mismatch(&self) -> f32 {
         let total = self.sum_match_probs + self.sum_mismatch_probs;
         if total <= 0.0 {
@@ -189,9 +331,91 @@ impl ParamEstimates {
         (self.sum_mismatch_probs / total) as f32
     }
 
-    /// Number of observations
-    pub fn n_obs(&self) -> usize {
-        self.n_obs
+    /// Number of switch observations
+    pub fn n_switch_obs(&self) -> usize {
+        self.n_switch_obs
+    }
+
+    /// Number of emission observations
+    pub fn n_emit_obs(&self) -> usize {
+        self.n_emit_obs
+    }
+}
+
+/// Thread-safe wrapper for ParamEstimates using atomics
+#[derive(Debug)]
+pub struct AtomicParamEstimates {
+    sum_switch_probs: std::sync::atomic::AtomicU64,
+    sum_expected_switches: std::sync::atomic::AtomicU64,
+    sum_match_probs: std::sync::atomic::AtomicU64,
+    sum_mismatch_probs: std::sync::atomic::AtomicU64,
+    n_switch_obs: std::sync::atomic::AtomicUsize,
+    n_emit_obs: std::sync::atomic::AtomicUsize,
+}
+
+impl AtomicParamEstimates {
+    /// Create new empty estimates
+    pub fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::AtomicUsize;
+
+        Self {
+            sum_switch_probs: AtomicU64::new(0),
+            sum_expected_switches: AtomicU64::new(0),
+            sum_match_probs: AtomicU64::new(0),
+            sum_mismatch_probs: AtomicU64::new(0),
+            n_switch_obs: AtomicUsize::new(0),
+            n_emit_obs: AtomicUsize::new(0),
+        }
+    }
+
+    /// Add estimation data from a local ParamEstimates
+    pub fn add_estimation_data(&self, estimates: &ParamEstimates) {
+        use std::sync::atomic::Ordering;
+
+        // Convert f64 to bits for atomic addition
+        self.sum_switch_probs.fetch_add(
+            estimates.sum_switch_probs.to_bits(),
+            Ordering::Relaxed,
+        );
+        self.sum_expected_switches.fetch_add(
+            estimates.sum_expected_switches.to_bits(),
+            Ordering::Relaxed,
+        );
+        self.sum_match_probs.fetch_add(
+            estimates.sum_match_probs.to_bits(),
+            Ordering::Relaxed,
+        );
+        self.sum_mismatch_probs.fetch_add(
+            estimates.sum_mismatch_probs.to_bits(),
+            Ordering::Relaxed,
+        );
+        self.n_switch_obs
+            .fetch_add(estimates.n_switch_obs, Ordering::Relaxed);
+        self.n_emit_obs
+            .fetch_add(estimates.n_emit_obs, Ordering::Relaxed);
+    }
+
+    /// Convert to regular ParamEstimates
+    pub fn to_estimates(&self) -> ParamEstimates {
+        use std::sync::atomic::Ordering;
+
+        ParamEstimates {
+            sum_switch_probs: f64::from_bits(self.sum_switch_probs.load(Ordering::Relaxed)),
+            sum_expected_switches: f64::from_bits(
+                self.sum_expected_switches.load(Ordering::Relaxed),
+            ),
+            sum_match_probs: f64::from_bits(self.sum_match_probs.load(Ordering::Relaxed)),
+            sum_mismatch_probs: f64::from_bits(self.sum_mismatch_probs.load(Ordering::Relaxed)),
+            n_switch_obs: self.n_switch_obs.load(Ordering::Relaxed),
+            n_emit_obs: self.n_emit_obs.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for AtomicParamEstimates {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -207,23 +431,56 @@ mod tests {
         // More haplotypes -> lower mismatch probability
         let p2 = ModelParams::li_stephens_p_mismatch(10000);
         assert!(p2 < p);
+
+        // Edge case
+        let p0 = ModelParams::li_stephens_p_mismatch(0);
+        assert_eq!(p0, 0.0001);
     }
 
     #[test]
-    fn test_switch_prob() {
-        let params = ModelParams::new();
+    fn test_recomb_intensity_formula() {
+        let params = ModelParams::for_phasing(1000);
 
-        // No distance -> no switch
-        let p0 = params.switch_prob(0.0);
-        assert!(p0 < 0.001);
+        // Should be 0.04 * 1_000_000 / 1000 = 40.0
+        let expected = 0.04 * 1_000_000.0 / 1000.0;
+        assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
+    }
 
-        // Small distance -> small switch prob
-        let p1 = params.switch_prob(0.01);
+    #[test]
+    fn test_p_recomb() {
+        let params = ModelParams::for_phasing(1000);
+
+        // No distance -> no recomb
+        let p0 = params.p_recomb(0.0);
+        assert!(p0.abs() < 0.0001);
+
+        // Small distance -> small prob
+        let p1 = params.p_recomb(0.001);
         assert!(p1 > 0.0 && p1 < 0.5);
 
-        // Large distance -> high switch prob
-        let p2 = params.switch_prob(1.0);
+        // Larger distance -> higher prob
+        let p2 = params.p_recomb(0.01);
         assert!(p2 > p1);
+    }
+
+    #[test]
+    fn test_lr_threshold_for_iteration() {
+        let params = ModelParams::for_phasing(1000);
+
+        // Burnin: infinity
+        for it in 0..params.burnin {
+            assert!(params.lr_threshold_for_iteration(it).is_infinite());
+        }
+
+        // Final iteration: 1.0
+        let final_it = params.burnin + params.iterations - 1;
+        assert!((params.lr_threshold_for_iteration(final_it) - 1.0).abs() < 0.0001);
+
+        // Middle iterations: between initial_lr and 4.0
+        let mid_it = params.burnin + params.iterations / 2;
+        let mid_lr = params.lr_threshold_for_iteration(mid_it);
+        assert!(mid_lr > 4.0);
+        assert!(mid_lr < params.initial_lr);
     }
 
     #[test]
@@ -235,5 +492,32 @@ mod tests {
         assert!(match_p > 0.99);
         assert!(mismatch_p < 0.01);
         assert!((match_p + mismatch_p - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_param_estimates_merge() {
+        let mut e1 = ParamEstimates::new();
+        e1.add_switch(0.5, 2.0);
+        e1.add_emission(0.9, 0.1);
+
+        let mut e2 = ParamEstimates::new();
+        e2.add_switch(0.3, 1.5);
+        e2.add_emission(0.8, 0.2);
+
+        e1.merge(&e2);
+
+        assert!((e1.sum_switch_probs - 0.8).abs() < 0.0001);
+        assert_eq!(e1.n_switch_obs, 2);
+    }
+
+    #[test]
+    fn test_ne_from_recomb_intensity() {
+        let mut params = ModelParams::new();
+        params.n_haps = 1000;
+        params.recomb_intensity = 40.0;
+
+        let ne = params.ne_from_recomb_intensity();
+        // Should be ceil(25 * 40 * 1000) = 1_000_000
+        assert_eq!(ne, 1_000_000);
     }
 }
