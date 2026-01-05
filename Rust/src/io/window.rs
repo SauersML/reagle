@@ -298,8 +298,10 @@ impl<'a> Iterator for SlidingWindowIterator<'a> {
         let ref_gt = self.reference.map(|r| r.restrict(start, end));
 
         // Create genetic map for window
-        let chrom = self.target.marker(MarkerIdx::new(start as u32)).chrom;
-        let gen_map = GeneticMap::empty(chrom); // TODO: slice from full map
+        let start_marker = self.target.marker(MarkerIdx::new(start as u32));
+        let end_marker = self.target.marker(MarkerIdx::new((end - 1) as u32));
+
+        let gen_map = self.gen_map.slice(start_marker.pos, end_marker.pos);
 
         let window = Window::new(target_gt, ref_gt, gen_map, indices, self.window_num);
 

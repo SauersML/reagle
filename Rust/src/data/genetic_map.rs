@@ -187,6 +187,55 @@ impl GeneticMap {
         (self.gen_pos(pos2) - self.gen_pos(pos1)).abs()
     }
 
+    /// Slice the genetic map to cover a physical position range
+    ///
+    /// The slice includes all map points within `[min_bp, max_bp]`, plus
+    /// immediately surrounding points to ensure correct interpolation/extrapolation.
+    pub fn slice(&self, min_bp: u32, max_bp: u32) -> Self {
+        if self.positions.is_empty() {
+            return self.clone();
+        }
+
+        // Find start index (inclusive)
+        // binary_search: Ok(i) -> i, Err(i) -> i-1 (if i>0)
+        let start_idx = match self.positions.binary_search(&min_bp) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+
+        // Find end index (inclusive)
+        // binary_search: Ok(j) -> j, Err(j) -> j (clamped)
+        let mut end_idx = match self.positions.binary_search(&max_bp) {
+            Ok(j) => j,
+            Err(j) => j.min(self.positions.len() - 1),
+        };
+
+        // Ensure we preserve extrapolation slopes at the edges
+        let mut final_start = start_idx;
+        let mut final_end = end_idx;
+
+        // If slice starts at 0, include index 1 to preserve initial slope
+        if final_start == 0 && self.positions.len() > 1 {
+            final_end = final_end.max(1);
+        }
+
+        // If slice ends at last, include second-to-last to preserve final slope
+        if final_end == self.positions.len() - 1 && self.positions.len() > 1 {
+            final_start = final_start.min(self.positions.len() - 2);
+        }
+
+        // Ensure start <= end (handling empty range or overlap)
+        if final_start > final_end {
+            final_end = final_start;
+        }
+
+        Self {
+            chrom: self.chrom,
+            positions: self.positions[final_start..=final_end].to_vec(),
+            gen_positions: self.gen_positions[final_start..=final_end].to_vec(),
+        }
+    }
+
     /// Number of map entries
     pub fn len(&self) -> usize {
         self.positions.len()
@@ -666,5 +715,63 @@ mod tests {
         assert!((pm.gen_pos(1_000_000) - 1.0).abs() < 0.001);
         assert!((pm.gen_pos(2_000_000) - 2.0).abs() < 0.001);
         assert!((pm.gen_dist(1_000_000, 2_000_000) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_slice() {
+        let map = GeneticMap::new(
+            ChromIdx::new(0),
+            vec![100, 200, 300, 400, 500],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        );
+
+        // 1. Slice containing points exactly
+        let s1 = map.slice(200, 400);
+        assert_eq!(s1.positions, vec![200, 300, 400]);
+
+        // 2. Slice between points
+        let s2 = map.slice(250, 350);
+        // Should include 200 (start-1) and 400 (end+1/clamped)
+        // 250 -> Err(2) -> start=1 (200)
+        // 350 -> Err(3) -> end=3 (400)
+        assert_eq!(s2.positions, vec![200, 300, 400]);
+
+        // 3. Slice at start
+        let s3 = map.slice(50, 150);
+        // 50 -> Err(0) -> start=0
+        // 150 -> Err(1) -> end=1
+        // start=0 -> ensures end>=1.
+        assert_eq!(s3.positions, vec![100, 200]);
+
+        // 4. Slice at end
+        let s4 = map.slice(450, 550);
+        // 450 -> Err(4) -> start=3 (400)
+        // 550 -> Err(5) -> end=4 (500)
+        // end=4 -> ensures start<=3.
+        assert_eq!(s4.positions, vec![400, 500]);
+
+        // 5. Slice completely before
+        let s5 = map.slice(10, 20);
+        // start=0, end=0 -> force end=1
+        assert_eq!(s5.positions, vec![100, 200]);
+
+        // 6. Slice completely after
+        let s6 = map.slice(600, 700);
+        // start=4, end=4 -> force start=3
+        assert_eq!(s6.positions, vec![400, 500]);
+
+        // 7. Small slice in middle
+        let s7 = map.slice(210, 220);
+        // 210 -> Err(2) -> start=1 (200)
+        // 220 -> Err(2) -> end=2 (300)
+        assert_eq!(s7.positions, vec![200, 300]);
+
+        // Verify interpolation/extrapolation works same as original
+        // Before first
+        assert!((s5.gen_pos(50) - map.gen_pos(50)).abs() < 1e-10);
+        // After last
+        assert!((s6.gen_pos(600) - map.gen_pos(600)).abs() < 1e-10);
+        // Middle
+        assert!((s7.gen_pos(215) - map.gen_pos(215)).abs() < 1e-10);
     }
 }
