@@ -1,28 +1,19 @@
-diff --git a/Rust/src/data/storage/mutable.rs b/Rust/src/data/storage/mutable.rs
-index b0ee41b..31a472f 100644
---- a/Rust/src/data/storage/mutable.rs
-+++ b/Rust/src/data/storage/mutable.rs
-@@ -49,6 +49,12 @@ impl MutableGenotypes {
-         self.n_haps
+diff --git a/Rust/src/data/storage/view.rs b/Rust/src/data/storage/view.rs
+index 7deda45..63921e9 100644
+--- a/Rust/src/data/storage/view.rs
++++ b/Rust/src/data/storage/view.rs
+@@ -38,6 +38,14 @@ impl<'a> GenotypeView<'a> {
+         }
      }
  
-+    /// Number of samples (assuming diploid)
-+    #[inline]
++    /// Get the number of samples
 +    pub fn n_samples(&self) -> usize {
-+        self.n_haps / 2
++        match self {
++            GenotypeView::Matrix(m) => m.n_samples(),
++            GenotypeView::Mutable { geno, .. } => geno.n_samples(),
++        }
 +    }
 +
-     /// Get allele at (marker, haplotype)
-     #[inline]
-     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
-@@ -118,6 +124,10 @@ mod tests {
-     #[test]
-     fn test_mutable_genotypes() {
-         let mut geno = MutableGenotypes::new(3, 4);
-+
-+        assert_eq!(geno.n_markers(), 3);
-+        assert_eq!(geno.n_haps(), 4);
-+        assert_eq!(geno.n_samples(), 2);
-         
-         // Set some values
-         geno.set(0, HapIdx::new(0), 1);
+     /// Get an allele at a specific marker and haplotype index
+     pub fn allele(&self, marker: MarkerIdx, hap: HapIdx) -> u8 {
+         match self {

@@ -38,6 +38,14 @@ impl<'a> GenotypeView<'a> {
         }
     }
 
+    /// Get the number of samples
+    pub fn n_samples(&self) -> usize {
+        match self {
+            GenotypeView::Matrix(m) => m.n_samples(),
+            GenotypeView::Mutable { geno, .. } => geno.n_samples(),
+        }
+    }
+
     /// Get an allele at a specific marker and haplotype index
     pub fn allele(&self, marker: MarkerIdx, hap: HapIdx) -> u8 {
         match self {

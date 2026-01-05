@@ -770,22 +770,25 @@
 [1m[94m 48[0m [1m[94m|[0m     pub fn n_haps(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^[0m
 [1m[94m...[0m
-[1m[94m 54[0m [1m[94m|[0m     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
-    [1m[94m|[0m            [1m[33m^^^[0m
-[1m[94m...[0m
-[1m[94m 60[0m [1m[94m|[0m     pub fn set(&mut self, marker: usize, hap: HapIdx, allele: u8) {
-    [1m[94m|[0m            [1m[33m^^^[0m
-[1m[94m...[0m
-[1m[94m 72[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m 91[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
-    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
-[1m[94m...[0m
-[1m[94m100[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
+[1m[94m 54[0m [1m[94m|[0m     pub fn n_samples(&self) -> usize {
     [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m109[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
+[1m[94m 60[0m [1m[94m|[0m     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m 66[0m [1m[94m|[0m     pub fn set(&mut self, marker: usize, hap: HapIdx, allele: u8) {
+    [1m[94m|[0m            [1m[33m^^^[0m
+[1m[94m...[0m
+[1m[94m 78[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m 97[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m106[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
+    [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m115[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: field `n_haplotypes` is never read[0m
@@ -2019,21 +2022,21 @@
     [1m[94m|[0m            [1m[33m^^^^[0m
 
 [1m[33mwarning[0m[1m: methods `marker_alleles_mut`, `swap_range`, `copy_from`, and `raw_alleles` are never used[0m
-   [1m[94m--> [0msrc/data/storage/mutable.rs:72:12
+   [1m[94m--> [0msrc/data/storage/mutable.rs:78:12
     [1m[94m|[0m
 [1m[94m 20[0m [1m[94m|[0m impl MutableGenotypes {
     [1m[94m|[0m [1m[94m---------------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m 72[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
+[1m[94m 78[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m 91[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
+[1m[94m 97[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m100[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
+[1m[94m106[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
     [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m109[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
+[1m[94m115[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: methods `is_carrier`, `maf`, `size_bytes`, and `iter` are never used[0m
@@ -2407,20 +2410,20 @@
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 99 warnings (57 duplicates) (run `cargo fix --bin "reagle" -p reagle --tests` to apply 1 suggestion)
-[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 2.83s
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 3.01s
 [1m[92m   Compiling[0m aho-corasick v1.1.4
 [1m[92m   Compiling[0m encoding_rs v0.8.35
 [1m[92m   Compiling[0m grep-matcher v0.1.8
 [1m[92m   Compiling[0m memmap2 v0.9.9
 [1m[92m   Compiling[0m serde_json v1.0.148
-[1m[92m   Compiling[0m regex-automata v0.4.13
 [1m[92m   Compiling[0m encoding_rs_io v0.1.7
+[1m[92m   Compiling[0m regex-automata v0.4.13
 [1m[92m   Compiling[0m bstr v1.12.1
-[1m[92m   Compiling[0m grep-searcher v0.1.16
 [1m[92m   Compiling[0m globset v0.4.18
+[1m[92m   Compiling[0m grep-searcher v0.1.16
 [1m[92m   Compiling[0m grep-regex v0.1.14
-[1m[92m   Compiling[0m grep-printer v0.2.2
 [1m[92m   Compiling[0m grep-cli v0.1.12
+[1m[92m   Compiling[0m grep-printer v0.2.2
 [1m[92m   Compiling[0m grep v0.3.2
 [1m[92m   Compiling[0m reagle v0.1.0 (/home/runner/work/reagle/reagle/Rust)
 [1m[33mwarning[0m[1m: unused imports: `CodedPbwt`, `CodedStep`, `RefPanelCoded`, and `compute_step_starts`[0m
@@ -2931,21 +2934,21 @@
     [1m[94m|[0m            [1m[33m^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: methods `marker_alleles_mut`, `swap_range`, `copy_from`, and `raw_alleles` are never used[0m
-   [1m[94m--> [0msrc/data/storage/mutable.rs:72:12
+   [1m[94m--> [0msrc/data/storage/mutable.rs:78:12
     [1m[94m|[0m
 [1m[94m 20[0m [1m[94m|[0m impl MutableGenotypes {
     [1m[94m|[0m [1m[94m---------------------[0m [1m[94mmethods in this implementation[0m
 [1m[94m...[0m
-[1m[94m 72[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
+[1m[94m 78[0m [1m[94m|[0m     pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m 91[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
+[1m[94m 97[0m [1m[94m|[0m     pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m100[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
+[1m[94m106[0m [1m[94m|[0m     pub fn copy_from(&mut self, other: &MutableGenotypes) {
     [1m[94m|[0m            [1m[33m^^^^^^^^^[0m
 [1m[94m...[0m
-[1m[94m109[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
+[1m[94m115[0m [1m[94m|[0m     pub fn raw_alleles(&self) -> &[Vec<u8>] {
     [1m[94m|[0m            [1m[33m^^^^^^^^^^^[0m
 
 [1m[33mwarning[0m[1m: methods `is_carrier`, `maf`, `size_bytes`, and `iter` are never used[0m
@@ -3654,85 +3657,85 @@
     [1m[94m|[0m            [1m[33m^^^^^[0m
 
 [1m[33mwarning[0m: `reagle` (bin "reagle" test) generated 99 warnings (run `cargo fix --bin "reagle" -p reagle --tests` to apply 12 suggestions)
-[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 8.49s
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 8.75s
 [1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/reagle-16500524a0f8136e)
 
 running 77 tests
-test data::genetic_map::tests::test_empty_map ... ok
-test data::genetic_map::tests::test_extrapolation ... ok
 test config::tests::test_li_stephens_mismatch ... ok
+test data::genetic_map::tests::test_empty_map ... ok
 test data::genetic_map::tests::test_gen_dist ... ok
-test data::genetic_map::tests::test_marker_map_from_positions ... ok
 test data::genetic_map::tests::test_interpolation ... ok
-test data::genetic_map::tests::test_marker_map_restrict ... ok
-test data::genetic_map::tests::test_position_map ... ok
+test data::genetic_map::tests::test_marker_map_from_positions ... ok
+test data::genetic_map::tests::test_extrapolation ... ok
 test data::genetic_map::tests::test_marker_map_p_recomb ... ok
+test data::haplotype::tests::test_hap_sample_index ... ok
+test data::genetic_map::tests::test_marker_map_restrict ... ok
 test data::haplotype::tests::test_sample_hap_indices ... ok
-test data::marker::tests::test_allele_from_char ... ok
+test data::genetic_map::tests::test_position_map ... ok
 test data::haplotype::tests::test_samples_lookup ... ok
 test data::haplotype::tests::test_samples_n_haps ... ok
-test data::haplotype::tests::test_hap_sample_index ... ok
+test data::marker::tests::test_allele_from_char ... ok
 test data::marker::tests::test_bits_per_allele ... ok
 test data::marker::tests::test_marker_is_snv ... ok
 test data::storage::coded_steps::tests::test_coded_step ... ok
-test data::storage::coded_steps::tests::test_coded_pbwt ... ok
 test data::storage::coded_steps::tests::test_compute_step_starts ... ok
-test data::storage::dense::tests::test_set ... ok
 test data::storage::coded_steps::tests::test_ref_panel_coded ... ok
-test data::storage::dense::tests::test_biallelic ... ok
 test data::storage::dense::tests::test_multiallelic ... ok
+test data::storage::dense::tests::test_biallelic ... ok
+test data::storage::coded_steps::tests::test_coded_pbwt ... ok
 test data::storage::dictionary::tests::test_dictionary_compression ... ok
+test data::storage::dense::tests::test_set ... ok
 test data::storage::matrix::tests::test_genotype ... ok
 test data::storage::matrix::tests::test_matrix_access ... ok
-test data::storage::mutable::tests::test_haplotype ... ok
 test data::storage::matrix::tests::test_matrix_restrict ... ok
 test data::storage::mutable::tests::test_mutable_genotypes ... ok
+test data::storage::mutable::tests::test_haplotype ... ok
 test data::storage::mutable::tests::test_swap ... ok
 test data::storage::sparse::tests::test_sparse_column ... ok
 test data::storage::sparse::tests::test_sparse_inverted ... ok
 test data::storage::sparse::tests::test_sparse_multiallelic ... ok
 test data::storage::tests::test_maf_calculation ... ok
 test data::storage::view::tests::test_view_from_matrix ... ok
-test data::storage::view::tests::test_view_from_mutable ... ok
 test data::storage::tests::test_storage_selection ... ok
-test io::streaming::tests::test_parse_gt ... ok
-test io::streaming::tests::test_streaming_config_default ... ok
-test io::vcf::tests::test_dr2_variable_imputation ... ok
+test data::storage::view::tests::test_view_from_mutable ... ok
 test io::vcf::tests::test_allele_frequency ... ok
 test io::vcf::tests::test_dr2_perfect_imputation ... ok
+test io::streaming::tests::test_streaming_config_default ... ok
+test io::streaming::tests::test_parse_gt ... ok
 test io::vcf::tests::test_dr2_uncertain_imputation ... ok
-test io::vcf::tests::test_marker_imputation_stats_new ... ok
+test io::vcf::tests::test_dr2_variable_imputation ... ok
 test io::vcf::tests::test_imputation_quality_collection ... ok
+test io::vcf::tests::test_marker_imputation_stats_new ... ok
 test io::vcf::tests::test_parse_genotype ... ok
 test io::vcf::tests::test_parse_genotype_multiallelic ... ok
 test io::window::tests::test_single_window ... ok
+test model::hmm::tests::test_dosage_computation ... ok
 test model::hmm::tests::test_hmm_forward_backward ... ok
 test model::hmm::tests::test_hmm_updater_bwd ... ok
 test model::hmm::tests::test_hmm_updater_fwd ... ok
 test io::window::tests::test_window_builder ... ok
-test model::ibs2::tests::test_ibs2_segment ... ok
-test model::hmm::tests::test_dosage_computation ... ok
 test model::hmm::tests::test_gen_dist_to_p_recomb ... ok
-test model::imp_states::tests::test_coded_steps ... ok
+test model::ibs2::tests::test_ibs2_segment ... ok
 test model::ibs2::tests::test_phase_consistent ... ok
+test model::imp_states::tests::test_coded_steps ... ok
 test model::imp_states::tests::test_composite_hap ... ok
-test model::parameters::tests::test_li_stephens_p_mismatch ... ok
-test model::imp_states::tests::test_imp_ibs ... ok
 test model::parameters::tests::test_emit_probs ... ok
+test model::imp_states::tests::test_imp_ibs ... ok
+test model::parameters::tests::test_li_stephens_p_mismatch ... ok
 test model::parameters::tests::test_lr_threshold_for_iteration ... ok
 test model::parameters::tests::test_ne_from_recomb_intensity ... ok
 test model::parameters::tests::test_p_recomb ... ok
 test model::parameters::tests::test_param_estimates_merge ... ok
 test model::parameters::tests::test_recomb_intensity_formula ... ok
 test model::pbwt::tests::test_find_ibs_neighbors ... ok
+test model::pbwt::tests::test_pbwt_div_fwd_update ... ok
 test model::pbwt::tests::test_pbwt_ibs_select ... ok
 test model::pbwt::tests::test_pbwt_div_bwd_update ... ok
-test model::pbwt::tests::test_pbwt_div_fwd_update ... ok
 test model::pbwt::tests::test_pbwt_update ... ok
-test pipelines::imputation::tests::test_impute_haplotype ... ok
 test pipelines::imputation::tests::test_imp_ls_baum ... ok
 test pipelines::phasing::tests::test_pipeline_creation ... ok
 test utils::workspace::tests::test_workspace_creation ... ok
+test pipelines::imputation::tests::test_impute_haplotype ... ok
 test utils::workspace::tests::test_workspace_resize ... ok
 test utils::workspace::tests::test_random_sampling ... ok
 
@@ -3743,80 +3746,80 @@ test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 running 78 tests
 test config::tests::test_li_stephens_mismatch ... ok
 test data::genetic_map::tests::test_empty_map ... ok
-test data::genetic_map::tests::test_gen_dist ... ok
 test data::genetic_map::tests::test_extrapolation ... ok
+test data::genetic_map::tests::test_gen_dist ... ok
 test data::genetic_map::tests::test_interpolation ... ok
 test data::genetic_map::tests::test_marker_map_from_positions ... ok
 test data::genetic_map::tests::test_marker_map_restrict ... ok
-test data::genetic_map::tests::test_position_map ... ok
 test data::genetic_map::tests::test_marker_map_p_recomb ... ok
+test data::genetic_map::tests::test_position_map ... ok
+test data::haplotype::tests::test_samples_lookup ... ok
 test data::haplotype::tests::test_hap_sample_index ... ok
 test data::haplotype::tests::test_sample_hap_indices ... ok
 test data::haplotype::tests::test_samples_n_haps ... ok
-test data::haplotype::tests::test_samples_lookup ... ok
 test data::marker::tests::test_allele_from_char ... ok
 test data::marker::tests::test_bits_per_allele ... ok
 test data::marker::tests::test_marker_is_snv ... ok
 test data::storage::coded_steps::tests::test_coded_step ... ok
 test data::storage::coded_steps::tests::test_coded_pbwt ... ok
-test data::storage::coded_steps::tests::test_compute_step_starts ... ok
 test data::storage::dense::tests::test_biallelic ... ok
-test data::storage::coded_steps::tests::test_ref_panel_coded ... ok
-test data::storage::dense::tests::test_multiallelic ... ok
+test data::storage::coded_steps::tests::test_compute_step_starts ... ok
 test data::storage::dense::tests::test_set ... ok
-test data::storage::matrix::tests::test_matrix_restrict ... ok
+test data::storage::coded_steps::tests::test_ref_panel_coded ... ok
 test data::storage::dictionary::tests::test_dictionary_compression ... ok
 test data::storage::matrix::tests::test_genotype ... ok
 test data::storage::matrix::tests::test_matrix_access ... ok
+test data::storage::dense::tests::test_multiallelic ... ok
 test data::storage::mutable::tests::test_haplotype ... ok
-test data::storage::mutable::tests::test_mutable_genotypes ... ok
+test data::storage::matrix::tests::test_matrix_restrict ... ok
 test data::storage::mutable::tests::test_swap ... ok
-test data::storage::sparse::tests::test_sparse_column ... ok
+test data::storage::mutable::tests::test_mutable_genotypes ... ok
 test data::storage::sparse::tests::test_sparse_inverted ... ok
-test data::storage::sparse::tests::test_sparse_multiallelic ... ok
+test data::storage::sparse::tests::test_sparse_column ... ok
 test data::storage::tests::test_maf_calculation ... ok
-test data::storage::view::tests::test_view_from_mutable ... ok
+test data::storage::sparse::tests::test_sparse_multiallelic ... ok
 test data::storage::view::tests::test_view_from_matrix ... ok
-test io::streaming::tests::test_parse_gt ... ok
 test data::storage::tests::test_storage_selection ... ok
+test data::storage::view::tests::test_view_from_mutable ... ok
+test io::streaming::tests::test_parse_gt ... ok
 test io::streaming::tests::test_streaming_config_default ... ok
 test io::vcf::tests::test_allele_frequency ... ok
 test io::vcf::tests::test_dr2_perfect_imputation ... ok
-test io::vcf::tests::test_dr2_variable_imputation ... ok
 test io::vcf::tests::test_dr2_uncertain_imputation ... ok
+test io::vcf::tests::test_dr2_variable_imputation ... ok
 test io::vcf::tests::test_imputation_quality_collection ... ok
-test io::vcf::tests::test_marker_imputation_stats_new ... ok
-test io::vcf::tests::test_parse_genotype ... ok
 test io::vcf::tests::test_parse_genotype_multiallelic ... ok
+test io::vcf::tests::test_parse_genotype ... ok
 test io::window::tests::test_single_window ... ok
+test io::window::tests::test_window_builder ... ok
+test io::vcf::tests::test_marker_imputation_stats_new ... ok
 test model::hmm::tests::test_dosage_computation ... ok
 test model::hmm::tests::test_gen_dist_to_p_recomb ... ok
+test model::hmm::tests::test_hmm_updater_fwd ... ok
+test model::ibs2::tests::test_ibs2_segment ... ok
 test model::hmm::tests::test_hmm_forward_backward ... ok
 test model::hmm::tests::test_hmm_updater_bwd ... ok
-test model::hmm::tests::test_hmm_updater_fwd ... ok
-test io::window::tests::test_window_builder ... ok
 test model::ibs2::tests::test_phase_consistent ... ok
 test model::imp_states::tests::test_coded_steps ... ok
-test model::ibs2::tests::test_ibs2_segment ... ok
 test model::imp_states::tests::test_composite_hap ... ok
+test model::parameters::tests::test_emit_probs ... ok
+test model::imp_states::tests::test_imp_ibs ... ok
 test model::parameters::tests::test_li_stephens_p_mismatch ... ok
 test model::parameters::tests::test_lr_threshold_for_iteration ... ok
-test model::imp_states::tests::test_imp_ibs ... ok
-test model::parameters::tests::test_emit_probs ... ok
 test model::parameters::tests::test_ne_from_recomb_intensity ... ok
 test model::parameters::tests::test_p_recomb ... ok
-test model::parameters::tests::test_recomb_intensity_formula ... ok
 test model::parameters::tests::test_param_estimates_merge ... ok
+test model::parameters::tests::test_recomb_intensity_formula ... ok
 test model::pbwt::tests::test_find_ibs_neighbors ... ok
 test model::pbwt::tests::test_pbwt_div_bwd_update ... ok
 test model::pbwt::tests::test_pbwt_div_fwd_update ... ok
 test model::pbwt::tests::test_pbwt_ibs_select ... ok
 test model::pbwt::tests::test_pbwt_update ... ok
+test pipelines::phasing::tests::test_pipeline_creation ... ok
 test pipelines::imputation::tests::test_imp_ls_baum ... ok
 test pipelines::imputation::tests::test_impute_haplotype ... ok
-test pipelines::phasing::tests::test_pipeline_creation ... ok
-test utils::workspace::tests::test_workspace_creation ... ok
 test tests::test_module_imports ... ok
+test utils::workspace::tests::test_workspace_creation ... ok
 test utils::workspace::tests::test_workspace_resize ... ok
 test utils::workspace::tests::test_random_sampling ... ok
 
