@@ -13,7 +13,7 @@
 //!
 //! This implementation follows the Beagle Java code (HmmUpdater.java) closely.
 
-use crate::data::storage::GenotypeMatrix;
+use crate::data::storage::view::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
 use crate::model::parameters::ModelParams;
 
@@ -176,8 +176,8 @@ impl HmmUpdater {
 
 /// Li-Stephens HMM for a single target haplotype
 pub struct LiStephensHmm<'a> {
-    /// Reference panel genotypes
-    ref_gt: &'a GenotypeMatrix,
+    /// Reference panel genotypes (can be GenotypeMatrix or MutableGenotypes via GenotypeView)
+    ref_gt: GenotypeView<'a>,
     /// Model parameters
     params: &'a ModelParams,
     /// Selected reference haplotype indices (the HMM states)
@@ -190,18 +190,18 @@ impl<'a> LiStephensHmm<'a> {
     /// Create a new HMM for the given reference panel
     ///
     /// # Arguments
-    /// * `ref_gt` - Reference genotype matrix
+    /// * `ref_gt` - Reference genotype view (can be Matrix or Mutable)
     /// * `params` - Model parameters
     /// * `ref_haps` - Selected reference haplotypes to use as HMM states
     /// * `p_recomb` - Recombination probabilities for each marker (first element is 0)
     pub fn new(
-        ref_gt: &'a GenotypeMatrix,
+        ref_gt: impl Into<GenotypeView<'a>>,
         params: &'a ModelParams,
         ref_haps: Vec<HapIdx>,
         p_recomb: Vec<f32>,
     ) -> Self {
         Self {
-            ref_gt,
+            ref_gt: ref_gt.into(),
             params,
             ref_haps,
             p_recomb,
@@ -210,7 +210,7 @@ impl<'a> LiStephensHmm<'a> {
 
     /// Create HMM from genetic distances (converts to pRecomb internally)
     pub fn from_gen_dists(
-        ref_gt: &'a GenotypeMatrix,
+        ref_gt: impl Into<GenotypeView<'a>>,
         params: &'a ModelParams,
         ref_haps: Vec<HapIdx>,
         gen_dists: &[f64],
@@ -447,7 +447,7 @@ mod tests {
     use super::*;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
-    use crate::data::storage::GenotypeColumn;
+    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
     use crate::data::ChromIdx;
     use std::sync::Arc;
 
