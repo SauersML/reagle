@@ -5,18 +5,9 @@
 //!
 //! ## Type State Pattern
 //!
-//! The matrix uses a generic `State` parameter to track phasing status at compile time:
-//!
-//! ```ignore
-//! // Unphased data from VCF reader
-//! let unphased: GenotypeMatrix<Unphased> = vcf_reader.read()?;
-//!
-//! // Phasing transforms to phased type
-//! let phased: GenotypeMatrix<Phased> = phasing_pipeline.run(unphased)?;
-//!
-//! // Imputation requires phased - enforced at compile time!
-//! imputation_pipeline.run(&phased)?;
-//! ```
+//! The matrix uses a generic `State` parameter to track phasing status at compile time.
+//! `GenotypeMatrix<Unphased>` represents unphased data, while `GenotypeMatrix<Phased>`
+//! represents phased data. This enables compile-time enforcement of pipeline correctness.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -221,6 +212,13 @@ impl GenotypeMatrix<Phased> {
             is_reversed: self.is_reversed,
             phantom: PhantomData,
         }
+    }
+
+    /// Get a reference as unphased (zero-cost, same memory layout)
+    pub fn as_unphased_ref(&self) -> &GenotypeMatrix<Unphased> {
+        // SAFETY: GenotypeMatrix<Phased> and GenotypeMatrix<Unphased> have identical
+        // memory layouts (PhantomData is zero-sized), differing only in the type parameter
+        unsafe { &*(self as *const GenotypeMatrix<Phased> as *const GenotypeMatrix<Unphased>) }
     }
 }
 

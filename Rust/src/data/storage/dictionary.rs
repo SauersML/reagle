@@ -36,7 +36,8 @@ impl DictionaryColumn {
         bits_per_allele: u8,
     ) -> Self {
         // Build pattern for each haplotype
-        let bits_per_marker = bits_per_allele as usize;
+        // We use (bits_per_allele + 1) bits per marker. The last bit is the missing flag.
+        let bits_per_marker = bits_per_allele as usize + 1;
         let pattern_bits = n_markers * bits_per_marker;
 
         let mut pattern_map: HashMap<BitVec<u64, Lsb0>, u16> = HashMap::new();
@@ -50,9 +51,14 @@ impl DictionaryColumn {
             for m in 0..n_markers {
                 let allele = columns[m](hap);
                 let start = m * bits_per_marker;
-                for b in 0..bits_per_marker {
-                    if (allele >> b) & 1 == 1 {
-                        pattern.set(start + b, true);
+                if allele == 255 {
+                    // Set the missing bit (the last bit of this marker's segment)
+                    pattern.set(start + bits_per_marker - 1, true);
+                } else {
+                    for b in 0..bits_per_allele as usize {
+                        if (allele >> b) & 1 == 1 {
+                            pattern.set(start + b, true);
+                        }
                     }
                 }
             }
@@ -83,11 +89,16 @@ impl DictionaryColumn {
         let pattern_idx = self.hap_to_pattern[hap.as_usize()] as usize;
         let pattern = &self.patterns[pattern_idx];
 
-        let bits_per_marker = self.bits_per_allele as usize;
+        let bits_per_marker = self.bits_per_allele as usize + 1;
         let start = marker_offset * bits_per_marker;
 
+        // Check the missing bit
+        if pattern[start + bits_per_marker - 1] {
+            return 255;
+        }
+
         let mut allele = 0u8;
-        for b in 0..bits_per_marker {
+        for b in 0..self.bits_per_allele as usize {
             if pattern[start + b] {
                 allele |= 1 << b;
             }
@@ -119,7 +130,8 @@ impl DictionaryColumn {
     pub fn alt_count(&self, marker_offset: usize) -> usize {
         let mut count = 0;
         for hap_idx in 0..self.hap_to_pattern.len() {
-            if self.get(marker_offset, HapIdx::new(hap_idx as u32)) > 0 {
+            let a = self.get(marker_offset, HapIdx::new(hap_idx as u32));
+            if a > 0 && a != 255 {
                 count += 1;
             }
         }
@@ -158,16 +170,6 @@ impl DictionaryColumn {
 /// This wrapper enables `AlleleAccess` trait implementation for dictionary columns
 /// by binding a specific marker offset. It's a zero-cost abstraction - just two
 /// pointers and an integer.
-///
-/// # Example
-///
-/// ```ignore
-/// let dict: Arc<DictionaryColumn> = ...;
-/// let view = DictionaryColumnView::new(&dict, marker_offset);
-///
-/// // Now view implements AlleleAccess
-/// let allele = view.get(HapIdx::new(0));
-/// ```
 #[derive(Clone, Debug)]
 pub struct DictionaryColumnView<'a> {
     /// Reference to the dictionary column

@@ -132,6 +132,8 @@ pub struct Marker {
     pub chrom: ChromIdx,
     /// 1-based genomic position (start)
     pub pos: u32,
+    /// End position for gVCF blocks/SVs (None = pos, same as start)
+    pub end: Option<u32>,
     /// Variant ID (rsID or similar), None if missing
     pub id: Option<Arc<str>>,
     /// Reference allele
@@ -152,6 +154,7 @@ impl Marker {
         Self {
             chrom,
             pos,
+            end: None,
             id,
             ref_allele,
             alt_alleles,
@@ -184,10 +187,18 @@ impl Marker {
     }
 
     /// Create a new marker with explicit end position (for SVs and gVCF blocks)
-    /// Note: end parameter is ignored as struct no longer stores it
+    ///
+    /// # Arguments
+    /// * `chrom` - Chromosome index
+    /// * `pos` - Start position (1-based)
+    /// * `end` - End position from INFO/END field (None if not present)
+    /// * `id` - Variant ID
+    /// * `ref_allele` - Reference allele
+    /// * `alt_alleles` - Alternate alleles
     pub fn with_end(
         chrom: ChromIdx,
         pos: u32,
+        end: Option<u32>,
         id: Option<Arc<str>>,
         ref_allele: Allele,
         alt_alleles: Vec<Allele>,
@@ -195,10 +206,27 @@ impl Marker {
         Self {
             chrom,
             pos,
+            end,
             id,
             ref_allele,
             alt_alleles,
         }
+    }
+
+    /// Get the end position of this marker
+    ///
+    /// Returns the END field value if present, otherwise returns pos
+    /// (point marker).
+    pub fn end_pos(&self) -> u32 {
+        self.end.unwrap_or(self.pos)
+    }
+
+    /// Check if a position falls within this marker's range
+    ///
+    /// For gVCF blocks, this checks if pos <= target_pos <= end.
+    /// For regular markers, returns true only if target_pos == pos.
+    pub fn contains_position(&self, target_pos: u32) -> bool {
+        target_pos >= self.pos && target_pos <= self.end_pos()
     }
 }
 

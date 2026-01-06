@@ -8,11 +8,11 @@
 //! - Speed up phasing in regions of high relatedness
 //! - Prune HMM search space
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
-use crate::data::haplotype::SampleIdx;
+use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
 
@@ -61,12 +61,6 @@ pub struct Ibs2 {
 
 impl Ibs2 {
     /// Build IBS2 segments from genotype data
-    ///
-    /// # Arguments
-    /// * `gt` - Genotype matrix (target samples)
-    /// * `gen_maps` - Genetic maps for distance calculations (uses PositionMap fallback if no map loaded)
-    /// * `chrom` - Chromosome index for genetic distance lookups
-    /// * `maf` - Minor allele frequencies for each marker
     pub fn new(gt: &GenotypeMatrix, gen_maps: &GeneticMaps, chrom: ChromIdx, maf: &[f32]) -> Self {
         let n_markers = gt.n_markers();
         let n_samples = gt.n_samples();
@@ -76,8 +70,8 @@ impl Ibs2 {
             .map(|m| gt.marker(MarkerIdx::new(m as u32)).pos)
             .collect();
 
-        // First pass: find initial IBS2 sets using informative markers
-        let ibs2_markers = Ibs2Markers::new(gt, maf);
+        // First pass: find initial IBS2 sets using recursive partitioning
+        let ibs2_markers = Ibs2Markers::new(gt, gen_maps, chrom, maf);
         let ibs2_sets = Ibs2Sets::new(gt, &ibs2_markers);
 
         // Build segments for each sample
@@ -165,7 +159,6 @@ impl Ibs2 {
         chrom: ChromIdx,
         marker_positions: &[u32],
     ) -> f64 {
-        // Use physical positions from markers, not marker indices
         let pos1 = marker_positions.get(prev.incl_end).copied().unwrap_or(0);
         let pos2 = marker_positions.get(next.start).copied().unwrap_or(0);
         gen_maps.gen_dist(chrom, pos1, pos2)
@@ -209,7 +202,6 @@ impl Ibs2 {
         segments
             .into_iter()
             .filter(|seg| {
-                // Use physical positions from markers, not marker indices
                 let start_pos = marker_positions.get(seg.start).copied().unwrap_or(0);
                 let end_pos = marker_positions.get(seg.incl_end).copied().unwrap_or(0);
                 let len_cm = gen_maps.gen_dist(chrom, start_pos, end_pos);
@@ -234,12 +226,10 @@ impl Ibs2 {
         (a1 == 255 || b1 == 255 || a1 == b1) && (a2 == 255 || b2 == 255 || a2 == b2)
     }
 
-    /// Number of target samples
     pub fn n_samples(&self) -> usize {
         self.sample_segs.len()
     }
 
-    /// Number of IBS2 segments for a sample
     pub fn n_segments(&self, sample: SampleIdx) -> usize {
         self.sample_segs
             .get(sample.0 as usize)
@@ -247,7 +237,6 @@ impl Ibs2 {
             .unwrap_or(0)
     }
 
-    /// Get all IBS2 segments for a sample
     pub fn segments(&self, sample: SampleIdx) -> &[Ibs2Segment] {
         self.sample_segs
             .get(sample.0 as usize)
@@ -256,143 +245,244 @@ impl Ibs2 {
     }
 }
 
-/// Identifies informative markers for IBS2 detection
+/// Identifies informative markers and partitions them into steps for IBS2 detection
 struct Ibs2Markers {
-    /// Marker indices that are informative (not too rare, not too common)
-    informative: Vec<usize>,
+    use_marker: Vec<bool>,
+    step_starts: Vec<usize>,
 }
 
 impl Ibs2Markers {
-    /// Minimum MAF for informative markers
-    const MIN_MAF: f32 = 0.05;
+    const MAX_MISS_FREQ: f32 = 0.1;
+    const MIN_MINOR_FREQ: f32 = 0.1;
+    const MIN_MARKER_CNT: usize = 50;
+    const MIN_INTERMARKER_CM: f64 = 0.02;
 
-    fn new(gt: &GenotypeMatrix, maf: &[f32]) -> Self {
+    fn new(gt: &GenotypeMatrix, gen_maps: &GeneticMaps, chrom: ChromIdx, maf: &[f32]) -> Self {
         let n_markers = gt.n_markers();
-        let mut informative = Vec::new();
+        let mut use_marker = vec![false; n_markers];
 
         for m in 0..n_markers {
             let marker_maf = maf.get(m).copied().unwrap_or(0.0);
-            if marker_maf >= Self::MIN_MAF && marker_maf <= 1.0 - Self::MIN_MAF {
-                informative.push(m);
+            if marker_maf >= Self::MIN_MINOR_FREQ && marker_maf <= 1.0 - Self::MIN_MINOR_FREQ {
+                let mut miss_cnt = 0;
+                let m_idx = MarkerIdx::new(m as u32);
+                for h in 0..gt.n_haplotypes() {
+                    if gt.allele(m_idx, HapIdx::new(h as u32)) == 255 {
+                        miss_cnt += 1;
+                    }
+                }
+                if (miss_cnt as f32 / gt.n_haplotypes() as f32) <= Self::MAX_MISS_FREQ {
+                    use_marker[m] = true;
+                }
             }
         }
 
-        Self { informative }
+        let mut step_starts = Vec::new();
+        let mut last_start = 0;
+        
+        while last_start < n_markers {
+            step_starts.push(last_start);
+            
+            let mut next_start = last_start + 1;
+            let mut mkr_cnt = 0;
+            let mut min_cm_pos = gen_maps.gen_pos(chrom, gt.marker(MarkerIdx::new(last_start as u32)).pos) + Self::MIN_INTERMARKER_CM;
+            
+            while next_start < n_markers && mkr_cnt < Self::MIN_MARKER_CNT {
+                if use_marker[next_start] {
+                    let cur_cm_pos = gen_maps.gen_pos(chrom, gt.marker(MarkerIdx::new(next_start as u32)).pos);
+                    if cur_cm_pos < min_cm_pos {
+                        use_marker[next_start] = false;
+                    } else {
+                        mkr_cnt += 1;
+                        min_cm_pos = cur_cm_pos + Self::MIN_INTERMARKER_CM;
+                    }
+                }
+                next_start += 1;
+            }
+            last_start = next_start;
+        }
+
+        Self { use_marker, step_starts }
     }
 
-    fn len(&self) -> usize {
-        self.informative.len()
+    fn markers_in_step(&self, step_idx: usize, n_markers: usize) -> Vec<usize> {
+        let start = self.step_starts[step_idx];
+        let end = if step_idx + 1 < self.step_starts.len() {
+            self.step_starts[step_idx + 1]
+        } else {
+            n_markers
+        };
+        
+        (start..end).filter(|&m| self.use_marker[m]).collect()
     }
 }
 
-/// Builds initial IBS2 sets for efficient lookup
+/// Stores clusters of samples that are IBS2 within each step
 struct Ibs2Sets {
-    /// For each informative marker, sets of sample pairs that are IBS2
-    /// ibs2_at_marker[info_marker_idx] = HashMap<(min_sample, max_sample), ()>
-    ibs2_at_marker: Vec<HashMap<(u32, u32), ()>>,
+    ibs2_sets: Vec<Vec<Option<Arc<Vec<u32>>>>>,
+    step_starts: Vec<usize>,
+    n_markers: usize,
 }
 
 impl Ibs2Sets {
+    const MAX_MISS_STEP_FREQ: f32 = 0.1;
+
     fn new(gt: &GenotypeMatrix, ibs2_markers: &Ibs2Markers) -> Self {
         let n_samples = gt.n_samples();
-        let n_info = ibs2_markers.len();
+        let n_steps = ibs2_markers.step_starts.len();
+        let mut ibs2_sets = Vec::with_capacity(n_steps);
 
-        let mut ibs2_at_marker: Vec<HashMap<(u32, u32), ()>> = vec![HashMap::new(); n_info];
-
-        // For each informative marker, find IBS2 pairs
-        for (info_idx, &marker) in ibs2_markers.informative.iter().enumerate() {
-            let m_idx = MarkerIdx::new(marker as u32);
-
-            // Group samples by genotype pattern
-            let mut patterns: HashMap<(u8, u8), Vec<u32>> = HashMap::new();
-
-            for s in 0..n_samples {
-                let sample = SampleIdx::new(s as u32);
-                let a1 = gt.allele(m_idx, sample.hap1());
-                let a2 = gt.allele(m_idx, sample.hap2());
-
-                // Skip missing
-                if a1 == 255 || a2 == 255 {
-                    continue;
-                }
-
-                // Normalize: smaller allele first
-                let key = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
-                patterns.entry(key).or_default().push(s as u32);
+        for step in 0..n_steps {
+            let step_markers = ibs2_markers.markers_in_step(step, gt.n_markers());
+            if step_markers.is_empty() {
+                ibs2_sets.push(vec![None; n_samples]);
+                continue;
             }
 
-            // Samples with same genotype pattern are potentially IBS2
-            for samples in patterns.values() {
-                if samples.len() < 2 {
-                    continue;
+            let mut init_samples = Vec::new();
+            let max_miss = (Self::MAX_MISS_STEP_FREQ * step_markers.len() as f32).floor() as usize;
+            for s in 0..n_samples {
+                let mut miss_cnt = 0;
+                for &m in &step_markers {
+                    let m_idx = MarkerIdx::new(m as u32);
+                    let sample = SampleIdx::new(s as u32);
+                    if gt.allele(m_idx, sample.hap1()) == 255 || gt.allele(m_idx, sample.hap2()) == 255 {
+                        miss_cnt += 1;
+                    }
                 }
+                if miss_cnt <= max_miss {
+                    init_samples.push(s as u32);
+                }
+            }
 
-                for i in 0..samples.len() {
-                    for j in (i + 1)..samples.len() {
-                        let s1 = samples[i].min(samples[j]);
-                        let s2 = samples[i].max(samples[j]);
-                        ibs2_at_marker[info_idx].insert((s1, s2), ());
+            let mut partition = vec![SampClust {
+                samples: init_samples,
+                is_homozygous: true,
+            }];
+
+            for &m in &step_markers {
+                let mut next_partition = Vec::new();
+                for parent in partition {
+                    next_partition.extend(Self::partition_cluster(gt, parent, m));
+                }
+                partition = next_partition;
+                if partition.is_empty() { break; }
+            }
+
+            let mut step_results = vec![None; n_samples];
+            for clust in partition {
+                if !clust.is_homozygous && clust.samples.len() > 1 {
+                    let arc_samples = Arc::new(clust.samples);
+                    for &s in arc_samples.iter() {
+                        let s_idx = s as usize;
+                        if step_results[s_idx].is_none() {
+                            step_results[s_idx] = Some(Arc::clone(&arc_samples));
+                        } else {
+                            // Clone the inner Vec from the existing Arc
+                            let mut merged: Vec<u32> = (**step_results[s_idx].as_ref().unwrap()).clone();
+                            merged.extend(arc_samples.iter().copied());
+                            merged.sort_unstable();
+                            merged.dedup();
+                            step_results[s_idx] = Some(Arc::new(merged));
+                        }
+                    }
+                }
+            }
+            ibs2_sets.push(step_results);
+        }
+
+        Self {
+            ibs2_sets,
+            step_starts: ibs2_markers.step_starts.clone(),
+            n_markers: gt.n_markers(),
+        }
+    }
+
+    fn partition_cluster(gt: &GenotypeMatrix, parent: SampClust, m: usize) -> Vec<SampClust> {
+        let m_idx = MarkerIdx::new(m as u32);
+        let n_alleles = 1 + gt.marker(m_idx).alt_alleles.len();
+        let n_gt = (n_alleles * (n_alleles + 1)) / 2;
+        
+        let mut gt_to_list: Vec<Option<Vec<u32>>> = vec![None; n_gt];
+        let mut missing = Vec::new();
+        
+        let mut next_is_hom = vec![false; n_gt];
+        if parent.is_homozygous {
+            for a in 0..n_alleles {
+                let gt_idx = (a * (a + 1)) / 2 + a;
+                if gt_idx < n_gt {
+                    next_is_hom[gt_idx] = true;
+                }
+            }
+        }
+
+        for &s in &parent.samples {
+            let sample = SampleIdx::new(s);
+            let a1 = gt.allele(m_idx, sample.hap1());
+            let a2 = gt.allele(m_idx, sample.hap2());
+
+            if a1 == 255 || a2 == 255 {
+                missing.push(s);
+                for list in gt_to_list.iter_mut().flatten() {
+                    list.push(s);
+                }
+            } else {
+                let gt_idx = if a1 <= a2 {
+                    (a2 as usize * (a2 as usize + 1)) / 2 + a1 as usize
+                } else {
+                    (a1 as usize * (a1 as usize + 1)) / 2 + a2 as usize
+                };
+                
+                if gt_idx < n_gt {
+                    let list = gt_to_list[gt_idx].get_or_insert_with(|| missing.clone());
+                    list.push(s);
+                }
+            }
+        }
+
+        gt_to_list.into_iter().enumerate()
+            .filter_map(|(i, opt_list)| {
+                let list = opt_list?;
+                if list.len() > 1 {
+                    Some(SampClust {
+                        samples: list,
+                        is_homozygous: next_is_hom[i],
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn segments_for_sample(&self, sample: SampleIdx) -> Vec<Ibs2Segment> {
+        let s_idx = sample.0 as usize;
+        let mut segments = Vec::new();
+
+        for (step, step_results) in self.ibs2_sets.iter().enumerate() {
+            if let Some(cluster) = &step_results[s_idx] {
+                let start = self.step_starts[step];
+                let end = if step + 1 < self.step_starts.len() {
+                    self.step_starts[step + 1] - 1
+                } else {
+                    self.n_markers - 1
+                };
+
+                for &other in cluster.iter() {
+                    if other != sample.0 {
+                        segments.push(Ibs2Segment::new(SampleIdx::new(other), start, end));
                     }
                 }
             }
         }
 
-        Self { ibs2_at_marker }
-    }
-
-    /// Get initial IBS2 segments for a sample
-    fn segments_for_sample(&self, sample: SampleIdx) -> Vec<Ibs2Segment> {
-        let s = sample.0;
-        let mut segments = Vec::new();
-        let mut current_segments: HashMap<u32, usize> = HashMap::new(); // other -> start_info_idx
-
-        for (info_idx, pairs) in self.ibs2_at_marker.iter().enumerate() {
-            // Find pairs involving this sample
-            let mut current_partners: Vec<u32> = Vec::new();
-
-            for &(s1, s2) in pairs.keys() {
-                if s1 == s {
-                    current_partners.push(s2);
-                } else if s2 == s {
-                    current_partners.push(s1);
-                }
-            }
-
-            // End segments for samples no longer IBS2
-            let ended: Vec<u32> = current_segments
-                .keys()
-                .filter(|&&other| !current_partners.contains(&other))
-                .copied()
-                .collect();
-
-            for other in ended {
-                if let Some(start) = current_segments.remove(&other) {
-                    segments.push(Ibs2Segment::new(
-                        SampleIdx::new(other),
-                        start,
-                        info_idx.saturating_sub(1),
-                    ));
-                }
-            }
-
-            // Start new segments
-            for other in current_partners {
-                current_segments.entry(other).or_insert(info_idx);
-            }
-        }
-
-        // Close remaining segments
-        let n_info = self.ibs2_at_marker.len();
-        for (other, start) in current_segments {
-            segments.push(Ibs2Segment::new(
-                SampleIdx::new(other),
-                start,
-                n_info.saturating_sub(1),
-            ));
-        }
-
         segments
     }
+}
+
+struct SampClust {
+    samples: Vec<u32>,
+    is_homozygous: bool,
 }
 
 #[cfg(test)]

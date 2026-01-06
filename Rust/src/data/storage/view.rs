@@ -6,7 +6,7 @@
 
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::{Marker, MarkerIdx, Markers};
-use crate::data::storage::{GenotypeMatrix, MutableGenotypes};
+use crate::data::storage::{GenotypeMatrix, MutableGenotypes, phase_state};
 
 /// A read-only view of genotype data - allows HMM to work with either
 /// GenotypeMatrix or MutableGenotypes without caring about concrete type
@@ -101,10 +101,17 @@ impl<'a> GenotypeView<'a> {
     }
 }
 
-/// Conversion from `&GenotypeMatrix` to `GenotypeView`
+/// Conversion from `&GenotypeMatrix` (Unphased) to `GenotypeView`
 impl<'a> From<&'a GenotypeMatrix> for GenotypeView<'a> {
     fn from(matrix: &'a GenotypeMatrix) -> Self {
         GenotypeView::Matrix(matrix)
+    }
+}
+
+/// Conversion from `&GenotypeMatrix<Phased>` to `GenotypeView`
+impl<'a> From<&'a GenotypeMatrix<phase_state::Phased>> for GenotypeView<'a> {
+    fn from(matrix: &'a GenotypeMatrix<phase_state::Phased>) -> Self {
+        GenotypeView::Matrix(matrix.as_unphased_ref())
     }
 }
 

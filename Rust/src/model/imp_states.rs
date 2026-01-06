@@ -917,6 +917,8 @@ pub struct ImpStatesMutable {
     queue: BinaryHeap<CompHapEntry>,
     /// Number of markers
     n_markers: usize,
+    /// Random seed for reproducibility (combined from global seed + sample index)
+    seed: u64,
 }
 
 /// Dynamic HMM state selector for imputation (optimized with CodedPbwt)
@@ -939,15 +941,25 @@ pub struct ImpStates<'a> {
     n_markers: usize,
     /// Number of IBS haplotypes to find per step
     n_ibs_haps: usize,
+    /// Random seed for reproducibility (combined from global seed + sample index)
+    seed: u64,
 }
 
 impl<'a> ImpStates<'a> {
     /// Create a new state selector
+    ///
+    /// # Arguments
+    /// * `ref_panel` - Reference panel with coded steps
+    /// * `max_states` - Maximum number of HMM states
+    /// * `gen_positions` - Genetic positions for markers
+    /// * `config` - Coded steps configuration
+    /// * `seed` - Random seed for reproducibility (should be combined from global seed + sample index)
     pub fn new(
         ref_panel: &'a RefPanelCoded,
         max_states: usize,
         gen_positions: &[f64],
         config: &CodedStepsConfig,
+        seed: u64,
     ) -> Self {
         let coded_steps = CodedSteps::new(gen_positions, config);
         let n_markers = gen_positions.len();
@@ -961,6 +973,7 @@ impl<'a> ImpStates<'a> {
             queue: BinaryHeap::with_capacity(max_states),
             n_markers,
             n_ibs_haps: config.n_ibs_haps,
+            seed,
         }
     }
 
@@ -1184,12 +1197,15 @@ impl<'a> ImpStates<'a> {
     }
 
     fn fill_with_random_haps(&mut self) {
-        use rand::rng;
+        use rand::SeedableRng;
         use rand::seq::SliceRandom;
+        use rand::rngs::StdRng;
 
         let n_ref_haps = self.ref_panel.n_haps();
         let n_states = self.max_states.min(n_ref_haps);
-        let mut rng = rng();
+
+        // Use deterministic RNG seeded from stored seed for reproducibility
+        let mut rng = StdRng::seed_from_u64(self.seed);
 
         // Create list of all haplotype indices and shuffle
         let mut hap_indices: Vec<u32> = (0..n_ref_haps as u32).collect();
@@ -1245,11 +1261,19 @@ impl<'a> ImpStates<'a> {
 
 impl ImpStatesMutable {
     /// Create a new state selector (legacy version for phasing)
+    ///
+    /// # Arguments
+    /// * `n_ref_haps` - Number of reference haplotypes
+    /// * `max_states` - Maximum number of HMM states
+    /// * `gen_positions` - Genetic positions for markers
+    /// * `config` - Coded steps configuration
+    /// * `seed` - Random seed for reproducibility (should be combined from global seed + sample index)
     pub fn new(
         n_ref_haps: usize,
         max_states: usize,
         gen_positions: &[f64],
         config: &CodedStepsConfig,
+        seed: u64,
     ) -> Self {
         let coded_steps = CodedSteps::new(gen_positions, config);
         let n_markers = gen_positions.len();
@@ -1262,6 +1286,7 @@ impl ImpStatesMutable {
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
             n_markers,
+            seed,
         }
     }
 
@@ -1434,11 +1459,14 @@ impl ImpStatesMutable {
     }
 
     fn fill_with_random_haps(&mut self) {
-        use rand::rng;
+        use rand::SeedableRng;
         use rand::seq::SliceRandom;
+        use rand::rngs::StdRng;
 
         let n_states = self.max_states.min(self.ibs.n_ref_haps);
-        let mut rng = rng();
+
+        // Use deterministic RNG seeded from stored seed for reproducibility
+        let mut rng = StdRng::seed_from_u64(self.seed);
 
         // Create list of all haplotype indices and shuffle
         let mut hap_indices: Vec<u32> = (0..self.ibs.n_ref_haps as u32).collect();

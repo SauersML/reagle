@@ -140,6 +140,10 @@ impl ImputationQuality {
 pub struct VcfReader {
     /// Sample information
     samples: Arc<Samples>,
+    /// Sample indices to include (None = include all)
+    include_sample_indices: Option<Vec<usize>>,
+    /// Marker IDs to exclude (None = exclude none)
+    exclude_marker_ids: Option<std::collections::HashSet<String>>,
 }
 
 impl VcfReader {
@@ -197,7 +201,52 @@ impl VcfReader {
 
         let samples = Arc::new(Samples::from_ids(sample_names));
 
-        Ok((Self { samples }, reader))
+        Ok((Self {
+            samples,
+            include_sample_indices: None,
+            exclude_marker_ids: None,
+        }, reader))
+    }
+
+    /// Set sample exclusion filter
+    ///
+    /// # Arguments
+    /// * `exclude_ids` - Set of sample IDs to exclude from processing
+    pub fn set_exclude_samples(&mut self, exclude_ids: &std::collections::HashSet<String>) {
+        if exclude_ids.is_empty() {
+            self.include_sample_indices = None;
+            return;
+        }
+
+        // Build list of sample indices to INCLUDE (those NOT in exclude list)
+        let include_indices: Vec<usize> = self.samples
+            .ids()
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !exclude_ids.contains(id.as_ref()))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Update samples Arc to only include non-excluded samples
+        let filtered_ids: Vec<String> = include_indices
+            .iter()
+            .map(|&i| self.samples.ids()[i].to_string())
+            .collect();
+
+        self.samples = Arc::new(Samples::from_ids(filtered_ids));
+        self.include_sample_indices = Some(include_indices);
+    }
+
+    /// Set marker exclusion filter
+    ///
+    /// # Arguments
+    /// * `exclude_ids` - Set of marker IDs to exclude from processing
+    pub fn set_exclude_markers(&mut self, exclude_ids: std::collections::HashSet<String>) {
+        if exclude_ids.is_empty() {
+            self.exclude_marker_ids = None;
+        } else {
+            self.exclude_marker_ids = Some(exclude_ids);
+        }
     }
 
     /// Get samples Arc
@@ -233,8 +282,32 @@ impl VcfReader {
             }
 
             // Parse VCF record
-            let (marker, alleles, _) =
+            let (marker, mut alleles, _) =
                 self.parse_record(line, &mut markers, line_num)?;
+
+            // Check marker exclusion filter
+            if let Some(ref exclude_ids) = self.exclude_marker_ids {
+                if let Some(ref id) = marker.id {
+                    if exclude_ids.contains(id.as_ref()) {
+                        continue; // Skip this marker
+                    }
+                }
+            }
+
+            // Apply sample filtering if set
+            if let Some(ref include_indices) = self.include_sample_indices {
+                // Filter alleles to only include non-excluded samples
+                let mut filtered_alleles = Vec::with_capacity(include_indices.len() * 2);
+                for &sample_idx in include_indices {
+                    let hap1_idx = sample_idx * 2;
+                    let hap2_idx = sample_idx * 2 + 1;
+                    if hap1_idx < alleles.len() && hap2_idx < alleles.len() {
+                        filtered_alleles.push(alleles[hap1_idx]);
+                        filtered_alleles.push(alleles[hap2_idx]);
+                    }
+                }
+                alleles = filtered_alleles;
+            }
 
             // Calculate actual number of alleles: 1 REF + N ALT
             let n_alleles = 1 + marker.alt_alleles.len();
@@ -371,7 +444,23 @@ impl VcfReader {
 
         // Parse INFO field for END tag (field[7])
         // This is important for structural variants and gVCF blocks
-        // (Calculated but no longer needed by Marker::with_end)
+        let info_field = fields[7];
+        let end_pos: Option<u32> = if info_field != "." {
+            // Parse INFO field looking for END=value
+            info_field
+                .split(';')
+                .filter_map(|kv| {
+                    let parts: Vec<&str> = kv.splitn(2, '=').collect();
+                    if parts.len() == 2 && parts[0] == "END" {
+                        parts[1].parse().ok()
+                    } else {
+                        None
+                    }
+                })
+                .next()
+        } else {
+            None
+        };
 
         // Parse FORMAT to find GT position
         let format = fields[8];
@@ -403,7 +492,7 @@ impl VcfReader {
             alleles.push(a2);
         }
 
-        let marker = Marker::with_end(chrom_idx, pos, id, ref_allele, alt_alleles);
+        let marker = Marker::with_end(chrom_idx, pos, end_pos, id, ref_allele, alt_alleles);
 
         Ok((marker, alleles, is_phased))
     }
@@ -451,8 +540,13 @@ fn parse_genotype(gt: &str) -> Result<(u8, u8, bool)> {
     Ok((a1, a2, phased))
 }
 
+/// Maximum supported allele index (u8 limitation)
+/// Alleles beyond this will be treated as missing with a warning
+pub const MAX_ALLELE_INDEX: u16 = 254;
+
 /// Parse a single allele string to a u8
 /// Returns 255 for missing (.)
+/// Returns 255 with a log warning if allele index exceeds 254 (u8 limitation)
 #[inline]
 fn parse_allele(s: &str) -> u8 {
     if s == "." || s.is_empty() {
@@ -467,8 +561,19 @@ fn parse_allele(s: &str) -> u8 {
         }
     }
 
-    // Multi-digit alleles
-    s.parse().unwrap_or(255)
+    // Multi-digit alleles - check for overflow
+    match s.parse::<u16>() {
+        Ok(val) if val <= MAX_ALLELE_INDEX => val as u8,
+        Ok(val) => {
+            log::warn!(
+                "Allele index {} exceeds maximum supported value {}; treating as missing",
+                val,
+                MAX_ALLELE_INDEX
+            );
+            255
+        }
+        Err(_) => 255,
+    }
 }
 
 /// VCF file writer
@@ -507,6 +612,23 @@ impl VcfWriter {
     }
 
     fn write_header_impl(&mut self, markers: &Markers, imputed: bool) -> Result<()> {
+        self.write_header_extended(markers, imputed, false, false)
+    }
+
+    /// Write VCF header with optional GP/AP fields
+    ///
+    /// # Arguments
+    /// * `markers` - Marker metadata
+    /// * `imputed` - Include imputation INFO fields (DR2, AF, IMP)
+    /// * `include_gp` - Include GP (genotype probabilities) FORMAT field
+    /// * `include_ap` - Include AP (allele probabilities) FORMAT field
+    pub fn write_header_extended(
+        &mut self,
+        markers: &Markers,
+        imputed: bool,
+        include_gp: bool,
+        include_ap: bool,
+    ) -> Result<()> {
         // Write file format
         writeln!(self.writer, "##fileformat=VCFv4.2")?;
 
@@ -540,6 +662,22 @@ impl VcfWriter {
             writeln!(
                 self.writer,
                 "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Estimated ALT allele dosage\">"
+            )?;
+        }
+        if include_gp {
+            writeln!(
+                self.writer,
+                "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Estimated Posterior Probabilities for Genotypes 0/0, 0/1 and 1/1\">"
+            )?;
+        }
+        if include_ap {
+            writeln!(
+                self.writer,
+                "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"Estimated ALT Allele Probability for Haplotype 1\">"
+            )?;
+            writeln!(
+                self.writer,
+                "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"Estimated ALT Allele Probability for Haplotype 2\">"
             )?;
         }
 
@@ -696,6 +834,152 @@ impl VcfWriter {
         Ok(())
     }
 
+    /// Write imputed genotypes with GP (genotype probabilities) and/or AP (allele probabilities)
+    ///
+    /// # Arguments
+    /// * `matrix` - Genotype matrix with imputed alleles
+    /// * `dosages` - Flattened dosage array [marker][sample]
+    /// * `allele_probs` - Per-haplotype allele probabilities (optional, for AP output)
+    ///                    Layout: [marker][sample*2 + hap_offset] -> probability of ALT
+    /// * `quality` - Per-marker imputation quality statistics
+    /// * `start` - Start marker index (inclusive)
+    /// * `end` - End marker index (exclusive)
+    /// * `include_gp` - Include GP field (genotype probabilities P(0/0), P(0/1), P(1/1))
+    /// * `include_ap` - Include AP1/AP2 fields (per-haplotype allele probabilities)
+    pub fn write_imputed_with_probs(
+        &mut self,
+        matrix: &GenotypeMatrix,
+        dosages: &[f32],
+        allele_probs: Option<&[f32]>,
+        quality: &ImputationQuality,
+        start: usize,
+        end: usize,
+        include_gp: bool,
+        include_ap: bool,
+    ) -> Result<()> {
+        let n_samples = self.samples.len();
+
+        // Build FORMAT string based on which fields are requested
+        let format_str = {
+            let mut parts = vec!["GT", "DS"];
+            if include_gp {
+                parts.push("GP");
+            }
+            if include_ap {
+                parts.push("AP1");
+                parts.push("AP2");
+            }
+            parts.join(":")
+        };
+
+        for (local_m, m) in (start..end).enumerate() {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let marker = matrix.marker(marker_idx);
+            let column = matrix.column(marker_idx);
+            let n_alleles = 1 + marker.alt_alleles.len();
+
+            // Get quality stats for this marker
+            let stats = quality.get(m);
+
+            // Build INFO field
+            let info_field = if let Some(stats) = stats {
+                let mut info_parts = Vec::new();
+
+                if n_alleles > 1 {
+                    let dr2_values: Vec<String> = (1..n_alleles)
+                        .map(|a| format!("{:.2}", stats.dr2(a)))
+                        .collect();
+                    info_parts.push(format!("DR2={}", dr2_values.join(",")));
+
+                    let af_values: Vec<String> = (1..n_alleles)
+                        .map(|a| format!("{:.4}", stats.allele_freq(a)))
+                        .collect();
+                    info_parts.push(format!("AF={}", af_values.join(",")));
+                }
+
+                if stats.is_imputed {
+                    info_parts.push("IMP".to_string());
+                }
+
+                if info_parts.is_empty() {
+                    ".".to_string()
+                } else {
+                    info_parts.join(";")
+                }
+            } else {
+                ".".to_string()
+            };
+
+            // Write fixed fields with INFO
+            write!(
+                self.writer,
+                "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
+                matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
+                marker.pos,
+                marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
+                marker.ref_allele,
+                marker
+                    .alt_alleles
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                info_field,
+                format_str
+            )?;
+
+            // Write genotypes with probabilities
+            for s in 0..n_samples {
+                let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
+                let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
+                let a1 = column.get(hap1);
+                let a2 = column.get(hap2);
+
+                // Dosage
+                let ds_idx = local_m * n_samples + s;
+                let ds = if ds_idx < dosages.len() {
+                    dosages[ds_idx]
+                } else {
+                    (a1 + a2) as f32
+                };
+
+                // Allele probabilities (probability of ALT for each haplotype)
+                let (ap1, ap2) = if let Some(probs) = allele_probs {
+                    let hap1_idx = local_m * n_samples * 2 + s * 2;
+                    let hap2_idx = hap1_idx + 1;
+                    let p1 = probs.get(hap1_idx).copied().unwrap_or(a1 as f32);
+                    let p2 = probs.get(hap2_idx).copied().unwrap_or(a2 as f32);
+                    (p1, p2)
+                } else {
+                    // If no probabilities provided, use deterministic values from genotypes
+                    (a1 as f32, a2 as f32)
+                };
+
+                // Start building sample field
+                write!(self.writer, "\t{}|{}:{:.2}", a1, a2, ds)?;
+
+                // GP: Genotype probabilities P(0/0), P(0/1), P(1/1)
+                // Calculated from allele probabilities assuming independence
+                if include_gp {
+                    let p_ref1 = 1.0 - ap1;
+                    let p_ref2 = 1.0 - ap2;
+                    let gp00 = p_ref1 * p_ref2;           // P(both REF)
+                    let gp01 = p_ref1 * ap2 + ap1 * p_ref2; // P(het)
+                    let gp11 = ap1 * ap2;                  // P(both ALT)
+                    write!(self.writer, ":{:.2},{:.2},{:.2}", gp00, gp01, gp11)?;
+                }
+
+                // AP1, AP2: Per-haplotype allele probabilities
+                if include_ap {
+                    write!(self.writer, ":{:.2}:{:.2}", ap1, ap2)?;
+                }
+            }
+            writeln!(self.writer)?;
+        }
+
+        Ok(())
+    }
+
     /// Flush the writer
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
@@ -813,7 +1097,8 @@ mod tests {
 
     #[test]
     fn test_imputation_quality_collection() {
-        let mut quality = ImputationQuality::new_biallelic(5);
+        // Create quality tracker for 5 biallelic markers (2 alleles each)
+        let mut quality = ImputationQuality::new(&[2, 2, 2, 2, 2]);
 
         assert_eq!(quality.marker_stats.len(), 5);
 

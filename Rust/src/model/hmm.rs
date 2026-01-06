@@ -258,6 +258,20 @@ impl<'a> LiStephensHmm<'a> {
             .collect()
     }
 
+    /// Compute expected allele dosage at a marker given state probabilities
+    ///
+    /// Returns the expected ALT allele count (0.0 to 1.0 for a single haplotype)
+    pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
+        let mut dosage = 0.0f32;
+        for (k, &prob) in state_probs.iter().enumerate() {
+            let allele = self.state_allele(marker, k);
+            if allele != 255 {
+                dosage += prob * allele as f32;
+            }
+        }
+        dosage
+    }
+
     /// Run forward-backward algorithm and return raw Forward and Backward tables
     ///
     /// This separates the forward and backward passes to allow cross-haplotype
@@ -537,14 +551,112 @@ impl<'a> LiStephensHmm<'a> {
         path
     }
 
-    /// Compute dosage at a marker given state probabilities
-    pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
-        let mut dosage = 0.0f32;
-        for (s, &prob) in state_probs.iter().enumerate() {
-            let allele = self.state_allele(marker, s);
-            dosage += prob * allele as f32;
+    /// Collect statistics for EM parameter estimation
+    ///
+    /// # Arguments
+    /// * `target_alleles` - Alleles of the target haplotype
+    /// * `gen_dists` - Genetic distances between markers (in cM)
+    /// * `estimates` - Estimates structure to accumulate results
+    pub fn collect_stats(
+        &self,
+        target_alleles: &[u8],
+        gen_dists: &[f64],
+        estimates: &mut crate::model::parameters::ParamEstimates,
+    ) {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states();
+        if n_markers < 2 || n_states <= 1 {
+            return;
         }
-        dosage
+
+        let p_err = self.params.p_mismatch;
+        let p_no_err = 1.0 - p_err;
+        let emit_probs = [p_no_err, p_err];
+
+        // 1. Backward pass: compute all backward values
+        let mut saved_bwd = vec![0.0f32; n_markers * n_states];
+        let mut bwd = vec![1.0f32; n_states];
+        
+        // Initialize last row
+        let last_row_start = (n_markers - 1) * n_states;
+        saved_bwd[last_row_start..last_row_start + n_states].fill(1.0);
+
+        for m in (0..n_markers - 1).rev() {
+            let m_next = m + 1;
+            let marker_next_idx = MarkerIdx::new(m_next as u32);
+            let targ_al_next = target_alleles[m_next];
+            let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
+            
+            let ref_alleles = self.state_alleles(marker_next_idx);
+            let mismatches: Vec<u8> = ref_alleles
+                .iter()
+                .map(|&r| if r == targ_al_next { 0 } else { 1 })
+                .collect();
+
+            HmmUpdater::bwd_update(&mut bwd, p_recomb, &emit_probs, &mismatches, n_states);
+            let row_start = m * n_states;
+            saved_bwd[row_start..row_start + n_states].copy_from_slice(&bwd);
+        }
+
+        // 2. Forward pass and accumulate stats
+        let h_factor = n_states as f32 / (n_states - 1) as f32;
+        let mut fwd = vec![1.0f32 / n_states as f32; n_states];
+        let mut last_fwd_sum = 1.0f32;
+
+        for m in 0..n_markers {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let targ_al = target_alleles[m];
+            let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0);
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) / last_fwd_sum;
+            let no_switch_scale = ((1.0 - p_switch) + shift) / last_fwd_sum;
+
+            let mut joint_state_sum = 0.0f32;
+            let mut state_sum = 0.0f32;
+            let mut mismatch_sum = 0.0f32;
+            let mut next_fwd_sum = 0.0f32;
+
+            let bwd_m = &saved_bwd[m * n_states .. (m + 1) * n_states];
+            let ref_alleles = self.state_alleles(marker_idx);
+
+            for k in 0..n_states {
+                let is_mismatch = ref_alleles[k] != targ_al;
+                let em = if is_mismatch { p_err } else { p_no_err };
+                
+                // P(State_m = k, State_{m-1} = k, Data_m)
+                joint_state_sum += bwd_m[k] * em * no_switch_scale * fwd[k];
+                
+                // Update fwd for next marker
+                fwd[k] = em * (scale * fwd[k] + shift);
+                next_fwd_sum += fwd[k];
+                
+                // Posterior P(State_m = k | Data) * P(Data)
+                let state_prob = fwd[k] * bwd_m[k];
+                state_sum += state_prob;
+                if is_mismatch {
+                    mismatch_sum += state_prob;
+                }
+            }
+
+            // Accumulate mismatch stats
+            if state_sum > 0.0 {
+                estimates.add_emission(
+                    (1.0 - mismatch_sum / state_sum) as f64,
+                    (mismatch_sum / state_sum) as f64
+                );
+            }
+
+            // Accumulate switch stats
+            if m > 0 && state_sum > 0.0 {
+                let switch_prob = h_factor * (1.0 - joint_state_sum / state_sum);
+                if switch_prob > 0.0 {
+                    let gen_dist = gen_dists.get(m).copied().unwrap_or(0.0);
+                    estimates.add_switch(gen_dist, switch_prob as f64);
+                }
+            }
+
+            last_fwd_sum = next_fwd_sum;
+        }
     }
 }
 

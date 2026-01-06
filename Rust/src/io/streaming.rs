@@ -69,7 +69,7 @@ pub struct StreamWindow {
 /// Buffered marker data for streaming
 struct BufferedMarker {
     marker: Marker,
-    alleles: Vec<u8>,
+    column: GenotypeColumn,
     gen_pos: f64,
 }
 
@@ -241,7 +241,7 @@ impl StreamingVcfReader {
         for i in 0..window_end {
             let bm = &self.buffer[i];
             markers.push(bm.marker.clone());
-            columns.push(GenotypeColumn::from_alleles(&bm.alleles, 2));
+            columns.push(bm.column.clone());
         }
 
         let genotypes = GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples));
@@ -372,14 +372,16 @@ impl StreamingVcfReader {
             alleles.push(a2);
         }
 
-        let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles);
+        let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles.clone());
+        let n_alleles = 1 + alt_alleles.len();
+        let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
 
         // Calculate genetic position
         let gen_pos = self.gen_maps.gen_pos(chrom_idx, pos);
 
         Ok(BufferedMarker {
             marker,
-            alleles,
+            column,
             gen_pos,
         })
     }

@@ -41,14 +41,6 @@ use std::sync::Arc;
 /// By making PBWT and HMM algorithms generic over `T: AlleleAccess`, the compiler
 /// generates specialized machine code for each storage type (Dense, Sparse, Dictionary),
 /// eliminating the `match` dispatch overhead inside tight loops.
-///
-/// # Example
-///
-/// ```ignore
-/// fn process_column<A: AlleleAccess>(col: &A, haps: &[HapIdx]) -> Vec<u8> {
-///     haps.iter().map(|&h| col.get(h)).collect()
-/// }
-/// ```
 pub trait AlleleAccess {
     /// Get allele for a specific haplotype (0 = REF, 1+ = ALT)
     fn get(&self, hap: HapIdx) -> u8;
@@ -161,12 +153,25 @@ impl GenotypeColumn {
             return Self::Dense(DenseColumn::new(0, 1));
         }
 
-        // Count ALT carriers for MAF calculation
-        let alt_count = alleles.iter().filter(|&&a| a > 0).count();
-        let maf = (alt_count as f64 / n_haps as f64).min(1.0 - alt_count as f64 / n_haps as f64);
+        // Count ALT carriers for MAF calculation (ignore missing = 255)
+        let alt_count = alleles.iter().filter(|&&a| a > 0 && a != 255).count();
+        let present_count = alleles.iter().filter(|&&a| a != 255).count();
+        
+        let maf = if present_count > 0 {
+            let freq = alt_count as f64 / present_count as f64;
+            freq.min(1.0 - freq)
+        } else {
+            0.0
+        };
 
         // Use sparse storage for rare variants (MAF < 1%)
-        if maf < 0.01 && n_alleles == 2 {
+        // Note: SparseColumn currently doesn't support missing data explicitly,
+        // so we only use it if there are no missing alleles or if we are okay
+        // with missing being treated as REF/ALT in sparse storage (usually rare variants don't have many missing).
+        // For correctness, if there's missing data, we might want to stick to Dense for now.
+        let has_missing = alleles.iter().any(|&a| a == 255);
+
+        if maf < 0.01 && n_alleles == 2 && !has_missing {
             // Determine if we should store ALT or REF carriers (whichever is fewer)
             if alt_count <= n_haps / 2 {
                 let carriers: Vec<HapIdx> = alleles
@@ -201,19 +206,6 @@ impl GenotypeColumn {
     ///
     /// This enables monomorphization: the compiler generates specialized code
     /// for each storage type, eliminating the match dispatch from inner loops.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Instead of calling col.get(hap) in a loop (enum dispatch each time),
-    /// // use visit_with to get monomorphized code:
-    /// col.visit_with(|accessor| {
-    ///     for hap in haps {
-    ///         // This get() call is monomorphized - no enum dispatch
-    ///         let allele = accessor.get(hap);
-    ///     }
-    /// });
-    /// ```
     #[inline]
     pub fn visit_with<F, R>(&self, f: F) -> R
     where

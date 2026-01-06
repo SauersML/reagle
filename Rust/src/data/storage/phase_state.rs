@@ -5,18 +5,12 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! // VCF reader produces unphased data
-//! let unphased: GenotypeMatrix<Unphased> = vcf_reader.read()?;
+//! ```
+//! use reagle::data::storage::phase_state::{Phased, Unphased, PhaseState};
 //!
-//! // Phasing pipeline transforms Unphased -> Phased
-//! let phased: GenotypeMatrix<Phased> = phasing_pipeline.run(unphased)?;
-//!
-//! // Imputation requires phased input - this is enforced at compile time!
-//! imputation_pipeline.run(&phased)?;
-//!
-//! // This would NOT compile:
-//! // imputation_pipeline.run(&unphased);  // Error: expected Phased, found Unphased
+//! // Check phase state properties
+//! assert!(!Unphased::IS_PHASED);
+//! assert!(Phased::IS_PHASED);
 //! ```
 
 use std::fmt::Debug;

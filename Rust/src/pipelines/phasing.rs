@@ -12,8 +12,6 @@
 //!
 //! This implements Beagle's two-stage phasing algorithm for handling rare variants.
 
-use std::collections::HashMap;
-// Unused Arc removed
 use bitvec::prelude::*;
 use rayon::prelude::*;
 
@@ -28,6 +26,7 @@ use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
 use crate::model::hmm::LiStephensHmm;
 use crate::model::parameters::ModelParams;
+use crate::model::phase_ibs::GlobalPhaseIbs;
 
 /// Phasing pipeline
 pub struct PhasingPipeline {
@@ -46,8 +45,21 @@ impl PhasingPipeline {
     pub fn run(&mut self) -> Result<()> {
         eprintln!("Loading VCF...");
 
-        // Load target VCF
+        // Load exclusion lists
+        let exclude_samples = self.config.load_exclude_samples()?;
+        let exclude_markers = self.config.load_exclude_markers()?;
+
+        if !exclude_samples.is_empty() {
+            eprintln!("Excluding {} samples", exclude_samples.len());
+        }
+        if !exclude_markers.is_empty() {
+            eprintln!("Excluding {} markers", exclude_markers.len());
+        }
+
+        // Load target VCF with filtering
         let (mut reader, file_reader) = VcfReader::open(&self.config.gt)?;
+        reader.set_exclude_samples(&exclude_samples);
+        reader.set_exclude_markers(exclude_markers);
         let samples = reader.samples_arc();
         let target_gt = reader.read_all(file_reader)?;
 
@@ -158,10 +170,6 @@ impl PhasingPipeline {
             Vec::new()
         };
 
-        let stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-            .collect();
-
         // Build IBS2 segments for phase consistency (uses PositionMap fallback if no --map)
         eprintln!("Building IBS2 segments...");
         let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
@@ -179,6 +187,11 @@ impl PhasingPipeline {
         let n_iterations = self.config.iterations;
         let total_iterations = n_burnin + n_iterations;
 
+        // Recombination probabilities - mutable so EM can update them
+        let mut stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+            .collect();
+
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             let iter_type = if is_burnin { "burnin" } else { "main" };
@@ -188,24 +201,65 @@ impl PhasingPipeline {
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
 
             // Run phasing iteration with EM estimation (if enabled and during burnin)
-            // Use Forward-Backward (LiStephensHmm) for phasing decision
+            let atomic_estimates = if is_burnin && self.config.em {
+                Some(crate::model::parameters::AtomicParamEstimates::new())
+            } else {
+                None
+            };
+
             self.run_phase_baum_iteration_stage1(
                 &target_gt,
                 &mut geno,
                 &missing_mask,
                 &stage1_p_recomb,
+                &stage1_gen_dists,
                 &hi_freq_to_orig,
                 &ibs2,
+                atomic_estimates.as_ref(),
             )?;
+
+            // Update parameters from EM estimates and recompute recombination probabilities
+            if let Some(ref atomic) = atomic_estimates {
+                let est = atomic.to_estimates();
+                let mut params_updated = false;
+                
+                if est.n_emit_obs() > 0 {
+                    self.params.update_p_mismatch(est.p_mismatch());
+                    params_updated = true;
+                }
+                if est.n_switch_obs() > 0 {
+                    self.params.update_recomb_intensity(est.recomb_intensity());
+                    params_updated = true;
+                }
+                
+                // Recompute recombination probabilities with updated intensity
+                if params_updated {
+                    stage1_p_recomb = std::iter::once(0.0f32)
+                        .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                        .collect();
+                }
+                
+                eprintln!(
+                    "  EM update: p_mismatch={:.6}, recomb_intensity={:.4}",
+                    self.params.p_mismatch, self.params.recomb_intensity
+                );
+            }
         }
 
         // STAGE 2: Interpolate rare marker phases from flanking high-frequency markers
+        // Uses genetic-distance-weighted interpolation for improved accuracy
         if !rare_markers.is_empty() {
             eprintln!(
                 "Stage 2: Phasing {} rare markers by interpolation...",
                 rare_markers.len()
             );
-            self.phase_rare_markers(&mut geno, &rare_markers, &hi_freq_markers);
+            // Pass genetic positions for recombination-based weighting
+            let gen_pos_ref = if !gen_positions.is_empty() {
+                Some(gen_positions.as_slice())
+            } else {
+                None
+            };
+            self.phase_rare_markers(&mut geno, &rare_markers, &hi_freq_markers, gen_pos_ref);
         }
 
         // Build final GenotypeMatrix from mutable genotypes
@@ -370,10 +424,6 @@ impl PhasingPipeline {
             })
             .collect();
 
-        let p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-            .collect();
-
         let maf: Vec<f32> = (0..n_markers)
             .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
             .collect();
@@ -384,82 +434,124 @@ impl PhasingPipeline {
         let n_iterations = self.config.iterations.min(6);
         let total_iterations = n_burnin + n_iterations;
 
+        // Recombination probabilities - mutable so EM can update them
+        let mut p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+            .collect();
+
         for it in 0..total_iterations {
+            let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
             
+            let atomic_estimates = if is_burnin && self.config.em {
+                Some(crate::model::parameters::AtomicParamEstimates::new())
+            } else {
+                None
+            };
+
             self.run_phase_baum_iteration(
                 &target_gt,
                 &mut geno,
                 &missing_mask,
                 &p_recomb,
+                &gen_dists,
                 &ibs2,
+                atomic_estimates.as_ref(),
             )?;
+
+            // Update parameters from EM estimates and recompute recombination probabilities
+            if let Some(ref atomic) = atomic_estimates {
+                let est = atomic.to_estimates();
+                let mut params_updated = false;
+                
+                if est.n_emit_obs() > 0 {
+                    self.params.update_p_mismatch(est.p_mismatch());
+                    params_updated = true;
+                }
+                if est.n_switch_obs() > 0 {
+                    self.params.update_recomb_intensity(est.recomb_intensity());
+                    params_updated = true;
+                }
+                
+                // Recompute recombination probabilities with updated intensity
+                if params_updated {
+                    p_recomb = std::iter::once(0.0f32)
+                        .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                        .collect();
+                }
+            }
         }
 
         Ok(self.build_final_matrix(target_gt, &geno))
     }
 
-    /// Select optimal HMM states (reference haplotypes) for a sample using IBS2 sharing
-    fn select_states(
+    /// Select optimal HMM states using PBWT-based dynamic state selection
+    ///
+    /// This method uses GlobalPhaseIbs to find IBS neighbors at a specific marker,
+    /// incorporating divergence information for accurate long-match detection.
+    /// This is closer to Beagle's dynamic state selection approach.
+    ///
+    /// # Arguments
+    /// * `hap_idx` - The haplotype to find neighbors for
+    /// * `marker_idx` - Current marker index for localized IBS matching
+    /// * `phase_ibs` - Global PBWT state tracker
+    /// * `ibs2` - IBS2 segments for guaranteed long-range matches
+    /// * `n_states_wanted` - Number of reference haplotypes to select
+    /// * `n_total_haps` - Total haplotypes available
+    fn select_states_pbwt(
         &self,
-        sample: SampleIdx,
+        hap_idx: HapIdx,
+        marker_idx: usize,
+        phase_ibs: &GlobalPhaseIbs,
         ibs2: &Ibs2,
         n_states_wanted: usize,
         n_total_haps: usize,
     ) -> Vec<HapIdx> {
-        let segments = ibs2.segments(sample);
-        if segments.is_empty() {
-            // Fallback: simply use random haplotypes if no IBS2 sharing found
-            // For now, return first K haplotypes excluding self
-            // Real implementation would pick random, but deterministic for now
-            let s_idx = sample.0 as usize;
-            let start = (s_idx * 2 + 2) % n_total_haps;
-            let mut states = Vec::with_capacity(n_states_wanted);
-            for i in 0..n_states_wanted {
-                states.push(HapIdx::new(((start + i) % n_total_haps) as u32));
-            }
-            return states;
-        }
+        // Use PBWT neighbor finding with divergence-aware selection
+        let neighbors = phase_ibs.find_neighbors(
+            hap_idx.0,
+            marker_idx,
+            ibs2,
+            n_states_wanted,
+        );
 
-        // Score other samples by total shared length
-        let mut scores: HashMap<u32, usize> = HashMap::new();
-        for seg in segments {
-            let other = seg.other_sample.0;
-            let len = seg.len();
-            *scores.entry(other).or_default() += len;
-        }
+        let mut states: Vec<HapIdx> = neighbors.into_iter().map(HapIdx::new).collect();
 
-        // Sort by score
-        let mut top_samples: Vec<(u32, usize)> = scores.into_iter().collect();
-        top_samples.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-
-        // Select top K/2 samples (K haplotypes)
-        let n_samples_wanted = (n_states_wanted + 1) / 2;
-        let mut states = Vec::with_capacity(n_states_wanted);
-
-        for (s, _) in top_samples.iter().take(n_samples_wanted) {
-            states.push(HapIdx::new(s * 2));
-            states.push(HapIdx::new(s * 2 + 1));
-        }
-
-        // Fill remaining if not enough
+        // Fill remaining if PBWT didn't find enough neighbors
         if states.len() < n_states_wanted {
+            let sample = SampleIdx::new(hap_idx.0 / 2);
             let mut i = 0;
-            while states.len() < n_states_wanted {
-                let h = HapIdx::new(i);
+            while states.len() < n_states_wanted && i < n_total_haps {
+                let h = HapIdx::new(i as u32);
                 if h != sample.hap1() && h != sample.hap2() && !states.contains(&h) {
                     states.push(h);
                 }
                 i += 1;
-                if i as usize >= n_total_haps {
-                    break;
-                }
             }
         }
-        
-        // Trim if too many (due to taking both haps)
+
         states.truncate(n_states_wanted);
         states
+    }
+
+    /// Build and maintain PBWT state for dynamic state selection
+    ///
+    /// Creates a GlobalPhaseIbs and updates it with allele data, returning it
+    /// for use in select_states_pbwt.
+    fn build_phase_pbwt(&self, geno: &MutableGenotypes, n_markers: usize, n_haps: usize) -> GlobalPhaseIbs {
+        let mut phase_ibs = GlobalPhaseIbs::new(n_haps);
+
+        // Advance PBWT through all markers to build the divergence array
+        for m in 0..n_markers {
+            // Collect alleles for this marker
+            let mut alleles = Vec::with_capacity(n_haps);
+            for h in 0..n_haps {
+                alleles.push(geno.get(m, HapIdx::new(h as u32)));
+            }
+            phase_ibs.advance(&alleles, m);
+        }
+
+        phase_ibs
     }
 
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
@@ -473,7 +565,9 @@ impl PhasingPipeline {
         geno: &mut MutableGenotypes,
         missing_mask: &[BitBox<u8, Lsb0>],
         p_recomb: &[f32],
+        gen_dists: &[f64], // Pass genetic distances for EM
         ibs2: &Ibs2,
+        atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
@@ -481,22 +575,24 @@ impl PhasingPipeline {
         let markers = target_gt.markers();
 
         // Clone current genotypes to use as a frozen reference panel
-        // MutableGenotypes doesn't implement Clone easily for safety? 
-        // It does verify implementation.
         let ref_geno = geno.clone();
         let ref_view = GenotypeView::from((&ref_geno, markers));
 
+        // Build PBWT for dynamic state selection (using current phased genotypes)
+        let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
+
         // Prepare swap masks (one BitVec per sample)
         let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
-        
+
         // Process samples in parallel
         swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
             let sample_idx = SampleIdx::new(s as u32);
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
 
-            // 1. Select States
-            let states = self.select_states(sample_idx, ibs2, self.params.n_states, n_haps);
+            // Use midpoint marker for PBWT-based state selection
+            let mid_marker = n_markers / 2;
+            let states = self.select_states_pbwt(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps);
             
             // 2. Extract current alleles for H1 and H2
             let seq1 = ref_geno.haplotype(hap1);
@@ -504,6 +600,18 @@ impl PhasingPipeline {
 
             // 3. Run HMM Forward-Backward for H1
             let hmm1 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
+            
+            // Collect EM statistics if requested
+            if let Some(atomic) = atomic_estimates {
+                let mut local_est = crate::model::parameters::ParamEstimates::new();
+                hmm1.collect_stats(&seq1, gen_dists, &mut local_est);
+                
+                let hmm2 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
+                hmm2.collect_stats(&seq2, gen_dists, &mut local_est);
+                
+                atomic.add_estimation_data(&local_est);
+            }
+
             let mut fwd1 = Vec::new();
             let mut bwd1 = Vec::new();
             hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
@@ -514,47 +622,99 @@ impl PhasingPipeline {
             let mut bwd2 = Vec::new();
             hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
 
-            // 5. Decide Phase at each marker
-            // L_keep = (F1 * B1) * (F2 * B2)
-            // L_swap = (F1 * B2) * (F2 * B1) (Cross-over of tails)
+            // 5. Decide Phase using BLOCK-BASED phasing
+            // Instead of per-marker decisions, identify contiguous heterozygous blocks
+            // and compute block-level likelihoods to preserve linkage structure
             let n_states = states.len();
+            
+            // Identify heterozygous blocks
+            let mut het_blocks: Vec<(usize, usize)> = Vec::new(); // (start, end) inclusive
+            let mut block_start: Option<usize> = None;
+            
             for m in 0..n_markers {
-                // Skip if homozygous or missing (phase doesn't matter or can't be determined)
-                // Actually missing data is imputed by HMM, but we only swap hets here
                 let a1 = seq1[m];
                 let a2 = seq2[m];
                 let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
-
-                if is_missing || a1 == a2 {
-                    continue;
-                }
-
-                let row_start = m * n_states;
-                let row_end = row_start + n_states;
+                let is_het = !is_missing && a1 != a2;
                 
-                let f1 = &fwd1[row_start..row_end];
-                let b1 = &bwd1[row_start..row_end];
-                let f2 = &fwd2[row_start..row_end];
-                let b2 = &bwd2[row_start..row_end];
-
-                // Compute sums
-                let mut s11 = 0.0;
-                let mut s22 = 0.0;
-                let mut s12 = 0.0;
-                let mut s21 = 0.0;
-
-                for k in 0..n_states {
-                    s11 += f1[k] * b1[k];
-                    s22 += f2[k] * b2[k];
-                    s12 += f1[k] * b2[k];
-                    s21 += f2[k] * b1[k];
+                if is_het {
+                    if block_start.is_none() {
+                        block_start = Some(m);
+                    }
+                } else if let Some(start) = block_start {
+                    het_blocks.push((start, m - 1));
+                    block_start = None;
                 }
+            }
+            if let Some(start) = block_start {
+                het_blocks.push((start, n_markers - 1));
+            }
+            
+            // Compute block-level likelihoods and decide phase for each block
+            let mut current_swap = false;
+            let lr_threshold = self.params.lr_threshold as f64;
+            
+            for (block_start_m, block_end_m) in het_blocks {
+                // Compute log-likelihood ratio for the entire block
+                // L_keep = Π_{m in block} (Σ_k fwd1[m,k] * bwd1[m,k]) * (Σ_k fwd2[m,k] * bwd2[m,k])
+                // L_swap = Π_{m in block} (Σ_k fwd1[m,k] * bwd2[m,k]) * (Σ_k fwd2[m,k] * bwd1[m,k])
+                // Use log-domain for numerical stability
+                let mut log_l_keep = 0.0f64;
+                let mut log_l_swap = 0.0f64;
+                
+                for m in block_start_m..=block_end_m {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
+                    
+                    if is_missing || a1 == a2 {
+                        continue; // Skip non-het markers in block
+                    }
+                    
+                    let row_start = m * n_states;
+                    let row_end = row_start + n_states;
+                    
+                    let f1 = &fwd1[row_start..row_end];
+                    let b1 = &bwd1[row_start..row_end];
+                    let f2 = &fwd2[row_start..row_end];
+                    let b2 = &bwd2[row_start..row_end];
 
-                let l_keep = s11 * s22;
-                let l_swap = s12 * s21;
+                    let mut s11 = 0.0f64;
+                    let mut s22 = 0.0f64;
+                    let mut s12 = 0.0f64;
+                    let mut s21 = 0.0f64;
 
-                if l_swap > l_keep {
-                    mask.set(m, true);
+                    for k in 0..n_states {
+                        s11 += f1[k] as f64 * b1[k] as f64;
+                        s22 += f2[k] as f64 * b2[k] as f64;
+                        s12 += f1[k] as f64 * b2[k] as f64;
+                        s21 += f2[k] as f64 * b1[k] as f64;
+                    }
+
+                    // Avoid log(0) by adding small epsilon
+                    let eps = 1e-300f64;
+                    log_l_keep += (s11 * s22 + eps).ln();
+                    log_l_swap += (s12 * s21 + eps).ln();
+                }
+                
+                // Compare block-level likelihoods considering current phase state
+                let (log_l_stay, log_l_flip) = if current_swap {
+                    (log_l_swap, log_l_keep)
+                } else {
+                    (log_l_keep, log_l_swap)
+                };
+                
+                // Flip if log(L_flip) >= log(L_stay) + log(threshold)
+                let log_threshold = lr_threshold.ln();
+                if log_l_flip >= log_l_stay + log_threshold {
+                    current_swap = !current_swap;
+                }
+                
+                // Apply phase to entire block
+                if current_swap {
+                    for m in block_start_m..=block_end_m {
+                        mask.set(m, true);
+                    }
                 }
             }
         });
@@ -586,11 +746,14 @@ impl PhasingPipeline {
         geno: &mut MutableGenotypes,
         missing_mask: &[BitBox<u8, Lsb0>],
         stage1_p_recomb: &[f32],
+        stage1_gen_dists: &[f64],
         hi_freq_to_orig: &[usize],
         ibs2: &Ibs2,
+        atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_haps = geno.n_haps();
+        let n_markers = geno.n_markers();
         let markers = target_gt.markers();
 
         // 1. Create Subset View for Stage 1 markers
@@ -601,6 +764,9 @@ impl PhasingPipeline {
             subset: hi_freq_to_orig,
         };
 
+        // 2. Build PBWT for dynamic state selection (using current phased genotypes)
+        let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
+
         let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, hi_freq_to_orig.len()); n_samples];
 
         swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
@@ -608,14 +774,29 @@ impl PhasingPipeline {
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
 
-            // Select States (using global IBS2 which assumes full markers, but reasonable approx)
-            let states = self.select_states(sample_idx, ibs2, self.params.n_states, n_haps);
+            // Use midpoint marker for PBWT-based state selection
+            // This gives a representative set of IBS neighbors for the window
+            let mid_marker = hi_freq_to_orig.len() / 2;
+            let mid_orig = hi_freq_to_orig.get(mid_marker).copied().unwrap_or(0);
+            let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps);
             
             // Extract Alleles for SUBSET of markers
             let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| ref_geno.get(m, hap1)).collect();
             let seq2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| ref_geno.get(m, hap2)).collect();
 
             let hmm1 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
+            
+            // Collect EM statistics if requested
+            if let Some(atomic) = atomic_estimates {
+                let mut local_est = crate::model::parameters::ParamEstimates::new();
+                hmm1.collect_stats(&seq1, stage1_gen_dists, &mut local_est);
+                
+                let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
+                hmm2.collect_stats(&seq2, stage1_gen_dists, &mut local_est);
+                
+                atomic.add_estimation_data(&local_est);
+            }
+
             let mut fwd1 = Vec::new();
             let mut bwd1 = Vec::new();
             hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
@@ -625,39 +806,92 @@ impl PhasingPipeline {
             let mut bwd2 = Vec::new();
             hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
 
+            // BLOCK-BASED phasing for Stage 1
             let n_states = states.len();
-            for i in 0..hi_freq_to_orig.len() {
+            let n_hi_freq = hi_freq_to_orig.len();
+            
+            // Identify heterozygous blocks in hi-freq marker space
+            let mut het_blocks: Vec<(usize, usize)> = Vec::new(); // (start, end) inclusive in hi-freq index
+            let mut block_start: Option<usize> = None;
+            
+            for i in 0..n_hi_freq {
                 let m = hi_freq_to_orig[i];
                 let a1 = seq1[i];
                 let a2 = seq2[i];
                 let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
-
-                if is_missing || a1 == a2 {
-                    continue;
-                }
-
-                let row_start = i * n_states;
-                let row_end = row_start + n_states;
+                let is_het = !is_missing && a1 != a2;
                 
-                let f1 = &fwd1[row_start..row_end];
-                let b1 = &bwd1[row_start..row_end];
-                let f2 = &fwd2[row_start..row_end];
-                let b2 = &bwd2[row_start..row_end];
-
-                let mut s11 = 0.0;
-                let mut s22 = 0.0;
-                let mut s12 = 0.0;
-                let mut s21 = 0.0;
-
-                for k in 0..n_states {
-                    s11 += f1[k] * b1[k];
-                    s22 += f2[k] * b2[k];
-                    s12 += f1[k] * b2[k];
-                    s21 += f2[k] * b1[k];
+                if is_het {
+                    if block_start.is_none() {
+                        block_start = Some(i);
+                    }
+                } else if let Some(start) = block_start {
+                    het_blocks.push((start, i - 1));
+                    block_start = None;
                 }
+            }
+            if let Some(start) = block_start {
+                het_blocks.push((start, n_hi_freq - 1));
+            }
+            
+            // Compute block-level likelihoods and decide phase for each block
+            let mut current_swap = false;
+            let lr_threshold = self.params.lr_threshold as f64;
+            
+            for (block_start_i, block_end_i) in het_blocks {
+                let mut log_l_keep = 0.0f64;
+                let mut log_l_swap = 0.0f64;
+                
+                for i in block_start_i..=block_end_i {
+                    let m = hi_freq_to_orig[i];
+                    let a1 = seq1[i];
+                    let a2 = seq2[i];
+                    let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
+                    
+                    if is_missing || a1 == a2 {
+                        continue;
+                    }
+                    
+                    let row_start = i * n_states;
+                    let row_end = row_start + n_states;
+                    
+                    let f1 = &fwd1[row_start..row_end];
+                    let b1 = &bwd1[row_start..row_end];
+                    let f2 = &fwd2[row_start..row_end];
+                    let b2 = &bwd2[row_start..row_end];
 
-                if s12 * s21 > s11 * s22 {
-                    mask.set(i, true);
+                    let mut s11 = 0.0f64;
+                    let mut s22 = 0.0f64;
+                    let mut s12 = 0.0f64;
+                    let mut s21 = 0.0f64;
+
+                    for k in 0..n_states {
+                        s11 += f1[k] as f64 * b1[k] as f64;
+                        s22 += f2[k] as f64 * b2[k] as f64;
+                        s12 += f1[k] as f64 * b2[k] as f64;
+                        s21 += f2[k] as f64 * b1[k] as f64;
+                    }
+
+                    let eps = 1e-300f64;
+                    log_l_keep += (s11 * s22 + eps).ln();
+                    log_l_swap += (s12 * s21 + eps).ln();
+                }
+                
+                let (log_l_stay, log_l_flip) = if current_swap {
+                    (log_l_swap, log_l_keep)
+                } else {
+                    (log_l_keep, log_l_swap)
+                };
+                
+                let log_threshold = lr_threshold.ln();
+                if log_l_flip >= log_l_stay + log_threshold {
+                    current_swap = !current_swap;
+                }
+                
+                if current_swap {
+                    for i in block_start_i..=block_end_i {
+                        mask.set(i, true);
+                    }
                 }
             }
         });
@@ -704,17 +938,36 @@ impl PhasingPipeline {
     }
 
     /// Stage 2: Phase rare markers by interpolation from flanking high-frequency markers
+    /// Phase rare markers using interpolation from flanking high-frequency markers.
+    ///
+    /// This improved method uses genetic-distance-weighted interpolation following
+    /// the approach in Java Beagle's Stage2Baum.java. The key idea is:
+    ///
+    /// 1. For each rare heterozygous marker, find flanking high-frequency het markers
+    /// 2. Weight the phase evidence from each flanking marker by genetic distance
+    /// 3. Use recombination probability to compute the likelihood of each phase
+    /// 4. Choose the phase with higher likelihood
+    ///
+    /// The probability of no recombination between markers i and j is approximately:
+    /// P(no_recomb) = exp(-recomb_intensity * genetic_distance)
+    ///
+    /// When genetic map is not available, falls back to physical-distance heuristic
+    /// with assumed 1 cM/Mb rate.
     fn phase_rare_markers(
         &self,
         geno: &mut MutableGenotypes,
         rare_markers: &[usize],
         hi_freq_markers: &[usize],
+        gen_positions: Option<&[f64]>,
     ) {
         let n_samples = geno.n_haps() / 2;
 
         if rare_markers.is_empty() || hi_freq_markers.is_empty() {
             return;
         }
+
+        // Precompute recombination intensity
+        let recomb_intensity = self.params.recomb_intensity as f64;
 
         for s in 0..n_samples {
             let sample_idx = SampleIdx::new(s as u32);
@@ -724,6 +977,7 @@ impl PhasingPipeline {
             let alleles1 = geno.haplotype(hap1);
             let alleles2 = geno.haplotype(hap2);
 
+            // Find rare heterozygotes for this sample
             let rare_het: Vec<usize> = rare_markers
                 .iter()
                 .copied()
@@ -734,6 +988,7 @@ impl PhasingPipeline {
                 continue;
             }
 
+            // Find high-frequency heterozygotes for this sample
             let hf_het: Vec<usize> = hi_freq_markers
                 .iter()
                 .copied()
@@ -748,29 +1003,80 @@ impl PhasingPipeline {
                 let left_hf = hf_het.iter().copied().filter(|&m| m < rare_m).max();
                 let right_hf = hf_het.iter().copied().filter(|&m| m > rare_m).min();
 
-                let should_swap = match (left_hf, right_hf) {
+                // Calculate phase probabilities using genetic distance weighting
+                let (p_keep, p_swap) = match (left_hf, right_hf) {
                     (Some(left), Some(right)) => {
-                        let left_hap1_has_0 = alleles1[left] == 0;
-                        let right_hap1_has_0 = alleles1[right] == 0;
-                        if left_hap1_has_0 != right_hap1_has_0 {
-                            let dist_left = rare_m - left;
-                            let dist_right = right - rare_m;
-                            if dist_left <= dist_right {
-                                !left_hap1_has_0
-                            } else {
-                                !right_hap1_has_0
-                            }
+                        // Both flanking markers available - interpolate using
+                        // probability of no recombination from each side
+                        let left_hap1_allele = alleles1[left];
+                        let right_hap1_allele = alleles1[right];
+
+                        // Genetic distances (or fallback to physical distance as proxy)
+                        let (gen_dist_left, gen_dist_right) = if let Some(gen_pos) = gen_positions {
+                            let d_left = (gen_pos[rare_m] - gen_pos[left]).abs();
+                            let d_right = (gen_pos[right] - gen_pos[rare_m]).abs();
+                            (d_left, d_right)
                         } else {
-                            !left_hap1_has_0
+                            // Fallback: assume 1 cM per marker as rough proxy
+                            ((rare_m - left) as f64 * 0.001, (right - rare_m) as f64 * 0.001)
+                        };
+
+                        // Probability of no recombination from each flanking marker
+                        // P(no_recomb) = exp(-intensity * distance)
+                        let p_no_recomb_left = (-recomb_intensity * gen_dist_left).exp();
+                        let p_no_recomb_right = (-recomb_intensity * gen_dist_right).exp();
+
+                        // Phase contribution from left marker
+                        // If hap1 has REF at left (allele=0), phase_from_left suggests hap1 should
+                        // continue with same pattern. If hap1 has ALT (allele=1), suggests swap.
+                        let left_suggests_keep = left_hap1_allele == 0;
+                        let right_suggests_keep = right_hap1_allele == 0;
+
+                        // Weight the suggestions by recombination probability
+                        // Higher p_no_recomb means more confidence from that flanking marker
+                        let weight_left = p_no_recomb_left;
+                        let weight_right = p_no_recomb_right;
+                        let total_weight = weight_left + weight_right;
+
+                        if total_weight < 1e-10 {
+                            // Both flanking markers too far - no strong evidence
+                            (0.5, 0.5)
+                        } else {
+                            // Normalized weighted vote
+                            let p_keep = (if left_suggests_keep { weight_left } else { 0.0 }
+                                + if right_suggests_keep { weight_right } else { 0.0 })
+                                / total_weight;
+                            let p_swap = 1.0 - p_keep;
+                            (p_keep, p_swap)
                         }
                     }
-                    (Some(left), None) => alleles1[left] != 0,
-                    (None, Some(right)) => alleles1[right] != 0,
+                    (Some(left), None) => {
+                        // Only left flanking marker
+                        let left_suggests_keep = alleles1[left] == 0;
+                        if left_suggests_keep {
+                            (0.9, 0.1) // High confidence to keep
+                        } else {
+                            (0.1, 0.9) // High confidence to swap
+                        }
+                    }
+                    (None, Some(right)) => {
+                        // Only right flanking marker
+                        let right_suggests_keep = alleles1[right] == 0;
+                        if right_suggests_keep {
+                            (0.9, 0.1)
+                        } else {
+                            (0.1, 0.9)
+                        }
+                    }
                     (None, None) => continue,
                 };
 
+                // Decide based on probability comparison
                 let rare_hap1_has_0 = alleles1[rare_m] == 0;
-                
+                let should_swap = p_swap > p_keep;
+
+                // Apply swap if needed
+                // If should_swap XOR rare_hap1_has_0, we need to actually swap
                 if should_swap == rare_hap1_has_0 {
                     let a1 = alleles1[rare_m];
                     let a2 = alleles2[rare_m];
@@ -866,7 +1172,7 @@ mod tests {
             })
             .collect();
             
-        let gt = GenotypeMatrix::new_phased(
+        let gt = GenotypeMatrix::new_unphased(
             markers, 
             columns, 
             samples

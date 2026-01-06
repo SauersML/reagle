@@ -491,8 +491,10 @@ impl ImputationPipeline {
                         .collect();
 
                     // Create ImpStates for dynamic state selection with RefPanelCoded
+                    // Combine config seed with haplotype index for reproducibility
+                    let seed = (self.config.seed as u64).wrapping_add(h as u64);
                     let mut imp_states =
-                        ImpStates::new(&ref_panel_coded, n_states, &gen_positions, &steps_config);
+                        ImpStates::new(&ref_panel_coded, n_states, &gen_positions, &steps_config, seed);
 
                     // Get reference allele closure
                     let get_ref_allele = |m: usize, hap: u32| -> u8 {

@@ -140,6 +140,54 @@ impl Config {
         Ok(config)
     }
 
+    /// Load sample IDs to exclude from the exclusion file
+    ///
+    /// Returns an empty set if no exclusion file is specified.
+    pub fn load_exclude_samples(&self) -> Result<std::collections::HashSet<String>> {
+        use std::io::{BufRead, BufReader};
+        use std::fs::File;
+
+        let mut exclude_set = std::collections::HashSet::new();
+
+        if let Some(ref path) = self.excludesamples {
+            let file = File::open(path)?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                let id = line.trim();
+                if !id.is_empty() && !id.starts_with('#') {
+                    exclude_set.insert(id.to_string());
+                }
+            }
+        }
+
+        Ok(exclude_set)
+    }
+
+    /// Load marker IDs to exclude from the exclusion file
+    ///
+    /// Returns an empty set if no exclusion file is specified.
+    pub fn load_exclude_markers(&self) -> Result<std::collections::HashSet<String>> {
+        use std::io::{BufRead, BufReader};
+        use std::fs::File;
+
+        let mut exclude_set = std::collections::HashSet::new();
+
+        if let Some(ref path) = self.excludemarkers {
+            let file = File::open(path)?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                let id = line.trim();
+                if !id.is_empty() && !id.starts_with('#') {
+                    exclude_set.insert(id.to_string());
+                }
+            }
+        }
+
+        Ok(exclude_set)
+    }
+
     /// Validate configuration parameters
     pub fn validate(&self) -> Result<()> {
         // Check input file exists

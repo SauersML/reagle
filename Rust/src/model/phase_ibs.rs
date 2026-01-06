@@ -81,6 +81,10 @@ impl GlobalPhaseIbs {
     }
 
     /// Find best neighbors writing into a reusable buffer
+    ///
+    /// Uses PBWT divergence array to select neighbors with actual IBS matches.
+    /// Only selects neighbors whose divergence value indicates a match extending
+    /// to or past the current marker position (i.e., divergence <= marker_idx).
     pub fn find_neighbors_buf(
         &self,
         hap_idx: u32,
@@ -91,15 +95,12 @@ impl GlobalPhaseIbs {
     ) {
         neighbors.clear();
         let sample = SampleIdx::new(hap_idx / 2);
+        let marker_i32 = marker_idx as i32;
 
         // 1. Add guaranteed IBS2 matches
         // IBS2 segments indicate shared long-range haplotype blocks (potentially unphased)
         // We include both haplotypes of the IBS2 partner as candidates
         let segments = ibs2.segments(sample);
-        // Optimize: use binary search or helper if segments are sorted?
-        // Segments are sorted by start position.
-        // We need segments containing marker_idx.
-        // Simple iteration is fast enough if segment count is low.
         for seg in segments {
             if seg.contains(marker_idx) {
                 let other_s = seg.other_sample;
@@ -111,39 +112,70 @@ impl GlobalPhaseIbs {
                 }
             }
         }
-        
-        // 2. Add PBWT neighbors
+
+        // 2. Add PBWT neighbors using divergence array for IBS validation
         // Get sorted position of the target haplotype
         let sorted_pos = self.opa[hap_idx as usize] as usize;
-        
+
+        // In forward PBWT, divergence[i] indicates where the match between
+        // prefix[i] and prefix[i-1] begins. A haplotype at position i is IBS
+        // with the target (at sorted_pos) if the divergence values between them
+        // are all <= marker_idx (meaning the match extends at least to marker_idx).
+
         // Check "up" (decreasing sorted_pos)
+        // Track the maximum divergence seen as we expand upward
         let mut u = sorted_pos;
         let mut count = 0;
+        let mut max_div_u = i32::MIN;
+
         while count < n_candidates && u > 0 {
-            u -= 1; // Move to u-1
+            // Divergence at position u tells us where prefix[u] diverges from prefix[u-1]
+            let div = self.div.get(u).copied().unwrap_or(i32::MAX);
+            max_div_u = max_div_u.max(div);
+
+            // Only accept neighbors whose match extends to current marker
+            // (divergence <= marker_idx means match started at or before marker_idx)
+            if max_div_u > marker_i32 {
+                // No more valid IBS matches in this direction
+                break;
+            }
+
+            u -= 1;
             let neighbor_hap = self.ppa[u];
-            // Filter: don't match self, don't match other hap of same sample?
-            
+
             if neighbor_hap == hap_idx { continue; }
-            
+
             let other_sample_idx = neighbor_hap / 2;
             if sample.0 == other_sample_idx {
-                continue; 
+                continue;
             }
-            
+
             neighbors.push(neighbor_hap);
             count += 1;
         }
-        
+
         // Check "down" (increasing sorted_pos)
+        // Track the maximum divergence seen as we expand downward
         let mut v = sorted_pos + 1;
         count = 0;
+        let mut max_div_v = i32::MIN;
+
         while count < n_candidates && v < self.n_haps {
+            // Divergence at position v tells us where prefix[v] diverges from prefix[v-1]
+            let div = self.div.get(v).copied().unwrap_or(i32::MAX);
+            max_div_v = max_div_v.max(div);
+
+            // Only accept neighbors whose match extends to current marker
+            if max_div_v > marker_i32 {
+                // No more valid IBS matches in this direction
+                break;
+            }
+
             let neighbor_hap = self.ppa[v];
-            
-            if neighbor_hap == hap_idx { 
+
+            if neighbor_hap == hap_idx {
                 v += 1;
-                continue; 
+                continue;
             }
 
             let other_sample_idx = neighbor_hap / 2;
@@ -151,10 +183,41 @@ impl GlobalPhaseIbs {
                 v += 1;
                 continue;
             }
-            
+
             neighbors.push(neighbor_hap);
             v += 1;
             count += 1;
+        }
+
+        // If we didn't find enough neighbors with IBS matches, fall back to
+        // nearest neighbors in PBWT order (without strict divergence check)
+        // This ensures we always return some candidates
+        if neighbors.len() < n_candidates {
+            u = sorted_pos;
+            v = sorted_pos + 1;
+            let target_count = n_candidates.min(self.n_haps.saturating_sub(1));
+
+            while neighbors.len() < target_count && (u > 0 || v < self.n_haps) {
+                // Expand in direction with smaller divergence first (greedy)
+                let div_u = if u > 0 { self.div.get(u).copied().unwrap_or(i32::MAX) } else { i32::MAX };
+                let div_v = if v < self.n_haps { self.div.get(v).copied().unwrap_or(i32::MAX) } else { i32::MAX };
+
+                if div_u <= div_v && u > 0 {
+                    u -= 1;
+                    let neighbor_hap = self.ppa[u];
+                    if neighbor_hap != hap_idx && neighbor_hap / 2 != sample.0 && !neighbors.contains(&neighbor_hap) {
+                        neighbors.push(neighbor_hap);
+                    }
+                } else if v < self.n_haps {
+                    let neighbor_hap = self.ppa[v];
+                    if neighbor_hap != hap_idx && neighbor_hap / 2 != sample.0 && !neighbors.contains(&neighbor_hap) {
+                        neighbors.push(neighbor_hap);
+                    }
+                    v += 1;
+                } else {
+                    break;
+                }
+            }
         }
     }
 }

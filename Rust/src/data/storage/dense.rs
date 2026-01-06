@@ -16,6 +16,9 @@ pub struct DenseColumn {
     /// For multi-allelic: ceil(log2(n_alleles)) bits per haplotype
     bits: BitVec<u64, Lsb0>,
 
+    /// Bit vector tracking missing data (1 = missing, 0 = present)
+    missing: BitVec<u64, Lsb0>,
+
     /// Bits per allele (1 for biallelic, 2 for 3-4 alleles, etc.)
     bits_per_allele: u8,
 
@@ -30,6 +33,7 @@ impl DenseColumn {
         let total_bits = n_haplotypes * bits_per_allele as usize;
         Self {
             bits: bitvec![u64, Lsb0; 0; total_bits],
+            missing: bitvec![u64, Lsb0; 0; n_haplotypes],
             bits_per_allele,
             n_haplotypes: n_haplotypes as u32,
         }
@@ -43,8 +47,13 @@ impl DenseColumn {
 
         let total_bits = n_haplotypes * bits_per_allele as usize;
         let mut bits = bitvec![u64, Lsb0; 0; total_bits];
+        let mut missing = bitvec![u64, Lsb0; 0; n_haplotypes];
 
         for (i, &allele) in alleles.iter().enumerate() {
+            if allele == 255 {
+                missing.set(i, true);
+                continue;
+            }
             let start = i * bits_per_allele as usize;
             for b in 0..bits_per_allele as usize {
                 if (allele >> b) & 1 == 1 {
@@ -55,6 +64,7 @@ impl DenseColumn {
 
         Self {
             bits,
+            missing,
             bits_per_allele,
             n_haplotypes: n_haplotypes as u32,
         }
@@ -65,7 +75,7 @@ impl DenseColumn {
         if n_alleles <= 1 {
             1
         } else {
-            (usize::BITS - (n_alleles - 1).leading_zeros()) as u8
+            (usize::BITS - (n_alleles.max(1) - 1).leading_zeros()) as u8
         }
     }
 
@@ -75,6 +85,10 @@ impl DenseColumn {
         let idx = hap.as_usize();
         if idx >= self.n_haplotypes as usize {
             return 0;
+        }
+
+        if self.missing[idx] {
+            return 255;
         }
 
         let start = idx * self.bits_per_allele as usize;
@@ -94,6 +108,16 @@ impl DenseColumn {
             return;
         }
 
+        if allele == 255 {
+            self.missing.set(idx, true);
+            let start = idx * self.bits_per_allele as usize;
+            for b in 0..self.bits_per_allele as usize {
+                self.bits.set(start + b, false);
+            }
+            return;
+        }
+
+        self.missing.set(idx, false);
         let start = idx * self.bits_per_allele as usize;
         for b in 0..self.bits_per_allele as usize {
             self.bits.set(start + b, (allele >> b) & 1 == 1);
@@ -113,9 +137,12 @@ impl DenseColumn {
     /// Count of ALT alleles (for biallelic)
     pub fn alt_count(&self) -> usize {
         if self.bits_per_allele == 1 {
-            self.bits.count_ones()
+            // bits.count_ones() includes bits that might have been set for missing data 
+            // if we didn't clear them. But our set/from_alleles clears them.
+            // Still, it's safer and clearer to use the iter or bit-parallel logic that respects 'missing'.
+            self.iter().filter(|&a| a > 0 && a != 255).count()
         } else {
-            self.iter().filter(|&a| a > 0).count()
+            self.iter().filter(|&a| a > 0 && a != 255).count()
         }
     }
 
@@ -126,14 +153,19 @@ impl DenseColumn {
 
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
-        self.bits.as_raw_slice().len() * std::mem::size_of::<u64>() + std::mem::size_of::<Self>()
+        self.bits.as_raw_slice().len() * std::mem::size_of::<u64>() 
+            + self.missing.as_raw_slice().len() * std::mem::size_of::<u64>()
+            + std::mem::size_of::<Self>()
     }
 
-    /// Access the underlying raw u64 storage slice
-    ///
-    /// This allows for bit-parallel operations (SIMD/SWAR) on blocks of 64 haplotypes.
+    /// Access the underlying raw u64 storage slice for alleles
     pub fn as_raw_slice(&self) -> &[u64] {
         self.bits.as_raw_slice()
+    }
+
+    /// Access the underlying raw u64 storage slice for missing data mask
+    pub fn missing_raw_slice(&self) -> &[u64] {
+        self.missing.as_raw_slice()
     }
 }
 
