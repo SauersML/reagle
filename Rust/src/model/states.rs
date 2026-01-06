@@ -201,16 +201,6 @@ impl MosaicCursor {
         &self.active_haps
     }
 
-    /// Phase A: Advance to marker, updating any states that need to switch.
-    #[inline]
-    pub fn advance_to_marker(&mut self, marker: usize, th: &ThreadedHaps) {
-        for state in 0..self.active_haps.len() {
-            if marker >= self.next_switch[state] {
-                self.advance_state(state, marker, th);
-            }
-        }
-    }
-
     fn advance_state(&mut self, state: usize, marker: usize, th: &ThreadedHaps) {
         let mut cur = self.cursor_indices[state] as usize;
 
@@ -355,14 +345,15 @@ mod tests {
         th.push_new(20);
 
         let mut cursor = MosaicCursor::from_threaded(&th);
+        let mut history = Vec::new();
 
         assert_eq!(cursor.active_haps()[0], 10);
         assert_eq!(cursor.active_haps()[1], 20);
 
-        cursor.advance_to_marker(25, &th);
+        cursor.advance_with_history(25, &th, &mut history);
         assert_eq!(cursor.active_haps()[0], 10);
 
-        cursor.advance_to_marker(60, &th);
+        cursor.advance_with_history(60, &th, &mut history);
         assert_eq!(cursor.active_haps()[0], 15);
         assert_eq!(cursor.active_haps()[1], 20);
 

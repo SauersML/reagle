@@ -109,12 +109,6 @@ impl CodedStep {
         self.hap_to_pattern[hap.0 as usize]
     }
 
-    /// Get allele at a marker for a haplotype
-    pub fn hap_allele(&self, hap: HapIdx, marker_offset: usize) -> u8 {
-        let pattern = self.hap_to_pattern[hap.0 as usize] as usize;
-        self.patterns[pattern][marker_offset]
-    }
-
     /// Compression ratio (n_haps / n_patterns)
     pub fn compression_ratio(&self) -> f32 {
         if self.n_patterns == 0 {
@@ -164,31 +158,6 @@ impl CodedStep {
 
         best_pattern
     }
-
-    /// Append a haplotype to this step.
-    ///
-    /// Checks if the allele sequence matches an existing pattern.
-    /// If yes, reuses the pattern index. If no, adds a new pattern.
-    /// Returns the pattern index assigned to the haplotype.
-    pub fn append_haplotype(&mut self, alleles: &[u8]) -> u16 {
-        // Look for existing pattern match
-        if let Some(idx) = self
-            .patterns
-            .iter()
-            .position(|p| p.as_slice() == alleles)
-        {
-            let pattern_idx = idx as u16;
-            self.hap_to_pattern.push(pattern_idx);
-            pattern_idx
-        } else {
-            // Add new pattern
-            let pattern_idx = self.patterns.len() as u16;
-            self.patterns.push(alleles.to_vec());
-            self.n_patterns = self.patterns.len();
-            self.hap_to_pattern.push(pattern_idx);
-            pattern_idx
-        }
-    }
 }
 
 /// Collection of coded steps for a chromosome
@@ -198,15 +167,12 @@ pub struct RefPanelCoded {
     steps: Vec<CodedStep>,
     /// Number of markers
     n_markers: usize,
-    /// Number of haplotypes
-    n_haps: usize,
 }
 
 impl RefPanelCoded {
     /// Create coded reference panel from genotype matrix
     pub fn new<S: PhaseState>(gt: &GenotypeMatrix<S>, step_starts: &[usize]) -> Self {
         let n_markers = gt.n_markers();
-        let n_haps = gt.n_haplotypes();
 
         let mut steps = Vec::with_capacity(step_starts.len());
 
@@ -218,7 +184,6 @@ impl RefPanelCoded {
         Self {
             steps,
             n_markers,
-            n_haps,
         }
     }
 
@@ -238,24 +203,6 @@ impl RefPanelCoded {
         &self.steps[idx]
     }
 
-    /// Get step index for a marker
-    pub fn step_for_marker(&self, marker: usize) -> usize {
-        for (i, step) in self.steps.iter().enumerate() {
-            if marker >= step.start && marker < step.end {
-                return i;
-            }
-        }
-        self.steps.len().saturating_sub(1)
-    }
-
-    /// Get allele for a haplotype at a marker
-    pub fn allele(&self, marker: usize, hap: HapIdx) -> u8 {
-        let step_idx = self.step_for_marker(marker);
-        let step = &self.steps[step_idx];
-        let offset = marker - step.start;
-        step.hap_allele(hap, offset)
-    }
-
     /// Total number of patterns across all steps
     pub fn total_patterns(&self) -> usize {
         self.steps.iter().map(|s| s.n_patterns()).sum()
@@ -273,78 +220,6 @@ impl RefPanelCoded {
     /// Number of markers
     pub fn n_markers(&self) -> usize {
         self.n_markers
-    }
-
-    /// Number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        self.n_haps
-    }
-
-    /// Get mutable reference to a step
-    pub fn step_mut(&mut self, idx: usize) -> &mut CodedStep {
-        &mut self.steps[idx]
-    }
-
-    /// Append target haplotypes to the coded reference panel.
-    ///
-    /// For each step, extracts the relevant markers from the target genotype matrix
-    /// (using the alignment to map target markers to reference markers and handle 
-    /// strand flips), then appends each target haplotype to the step.
-    ///
-    /// # Arguments
-    /// * `target_gt` - Target genotype matrix (with target markers)
-    /// * `ref_to_target` - For each reference marker, the corresponding target marker index (-1 if not in target)
-    /// * `map_allele` - Function to map target allele to reference allele space
-    ///
-    /// After this call, the panel contains `n_ref_haps + n_target_haps` haplotypes.
-    pub fn append_target_haplotypes<S: PhaseState, F>(
-        &mut self,
-        target_gt: &GenotypeMatrix<S>,
-        ref_to_target: &[i32],
-        map_allele: F,
-    ) where
-        F: Fn(usize, u8) -> u8,
-    {
-        let n_target_haps = target_gt.n_haplotypes();
-        if n_target_haps == 0 {
-            return;
-        }
-
-        // Process each step
-        for step in &mut self.steps {
-            let n_markers_in_step = step.end - step.start;
-            let mut allele_buffer = vec![0u8; n_markers_in_step];
-
-            // For each target haplotype
-            for h in 0..n_target_haps {
-                let hap_idx = HapIdx::new(h as u32);
-
-                // Extract alleles for this step's marker range
-                for (offset, ref_m) in (step.start..step.end).enumerate() {
-                    let target_m_idx = ref_to_target.get(ref_m).copied().unwrap_or(-1);
-                    
-                    let allele = if target_m_idx >= 0 {
-                        let target_m = target_m_idx as usize;
-                        let raw_allele = target_gt.allele(
-                            crate::data::marker::MarkerIdx::new(target_m as u32),
-                            hap_idx,
-                        );
-                        map_allele(target_m, raw_allele)
-                    } else {
-                        // Reference marker not in target - use missing value
-                        255
-                    };
-                    
-                    allele_buffer[offset] = allele;
-                }
-
-                // Append the haplotype to this step
-                step.append_haplotype(&allele_buffer);
-            }
-        }
-
-        // Update total haplotype count
-        self.n_haps += n_target_haps;
     }
 }
 
@@ -369,107 +244,6 @@ pub fn compute_step_starts(gen_positions: &[f64], step_cm: f64) -> Vec<usize> {
     }
 
     step_starts
-}
-
-/// PBWT operations on coded steps
-///
-/// Allows efficient PBWT updates using pattern indices instead of raw alleles
-pub struct CodedPbwt {
-    /// Prefix array (sorted by pattern)
-    prefix: Vec<u32>,
-    /// Divergence array
-    divergence: Vec<i32>,
-    /// Current coded step
-    current_step: usize,
-}
-
-impl CodedPbwt {
-    /// Create new PBWT for coded reference panel
-    pub fn new(n_haps: usize) -> Self {
-        Self {
-            prefix: (0..n_haps as u32).collect(),
-            divergence: vec![0; n_haps + 1],
-            current_step: 0,
-        }
-    }
-
-    /// Update PBWT with a coded step
-    pub fn update(&mut self, step: &CodedStep) {
-        let n_haps = self.prefix.len();
-        let n_patterns = step.n_patterns();
-
-        // Bucket sort by pattern
-        let mut buckets: Vec<Vec<(u32, i32)>> = vec![Vec::new(); n_patterns.max(1)];
-
-        for i in 0..n_haps {
-            let hap = self.prefix[i];
-            let div = self.divergence[i];
-            let pattern = step.pattern(HapIdx::new(hap)) as usize;
-            if pattern < buckets.len() {
-                buckets[pattern].push((hap, div));
-            }
-        }
-
-        // Rebuild arrays
-        let mut idx = 0;
-        let step_start = self.current_step as i32;
-
-        for bucket in &buckets {
-            let bucket_start = idx;
-            for &(hap, div) in bucket {
-                self.prefix[idx] = hap;
-                // Divergence is max of previous div and bucket start
-                self.divergence[idx] = if idx == bucket_start {
-                    step_start.max(div)
-                } else {
-                    div
-                };
-                idx += 1;
-            }
-        }
-
-        self.current_step += 1;
-    }
-
-    /// Find IBS haplotypes for a target pattern at current step
-    pub fn find_ibs(&self, target_pattern: u16, step: &CodedStep, n_matches: usize) -> Vec<HapIdx> {
-        // Find position of a haplotype with target pattern
-        let mut target_pos = None;
-        for (i, &hap) in self.prefix.iter().enumerate() {
-            if step.pattern(HapIdx::new(hap)) == target_pattern {
-                target_pos = Some(i);
-                break;
-            }
-        }
-
-        let target_pos = match target_pos {
-            Some(p) => p,
-            None => self.prefix.len() / 2,
-        };
-
-        // Expand from target position
-        let mut result = Vec::with_capacity(n_matches);
-        let mut left = target_pos;
-        let mut right = target_pos + 1;
-
-        while result.len() < n_matches && (left > 0 || right < self.prefix.len()) {
-            if left > 0 {
-                left -= 1;
-                result.push(HapIdx::new(self.prefix[left]));
-            }
-            if right < self.prefix.len() && result.len() < n_matches {
-                result.push(HapIdx::new(self.prefix[right]));
-                right += 1;
-            }
-        }
-
-        result
-    }
-
-    /// Current step index
-    pub fn current_step(&self) -> usize {
-        self.current_step
-    }
 }
 
 /// PBWT operations on coded steps using external buffers
@@ -574,45 +348,6 @@ impl<'a> CodedPbwtView<'a> {
         // Step 4: Copy results back to main arrays
         self.prefix[..n_haps].copy_from_slice(&prefix_scratch[..n_haps]);
         self.divergence[..n_haps].copy_from_slice(&div_scratch[..n_haps]);
-    }
-
-    /// Update PBWT with a coded step (legacy bucket sort version)
-    ///
-    /// Kept for compatibility. Use `update_counting_sort` for better performance.
-    pub fn update(&mut self, step: &CodedStep) {
-        let n_haps = self.prefix.len();
-        let n_patterns = step.n_patterns();
-
-        // Allocate buckets based on pattern count
-        let mut buckets: Vec<Vec<(u32, i32)>> = vec![Vec::new(); n_patterns.max(1)];
-
-        // Bucket sort by pattern
-        for i in 0..n_haps {
-            let hap = self.prefix[i];
-            let div = self.divergence[i];
-            let pattern = step.pattern(HapIdx::new(hap)) as usize;
-            if pattern < buckets.len() {
-                buckets[pattern].push((hap, div));
-            }
-        }
-
-        // Rebuild arrays
-        let mut idx = 0;
-        let step_start = 0i32;
-
-        for bucket in &buckets {
-            let bucket_start = idx;
-            for &(hap, div) in bucket {
-                self.prefix[idx] = hap;
-                // Divergence is max of previous div and bucket start
-                self.divergence[idx] = if idx == bucket_start {
-                    step_start.max(div)
-                } else {
-                    div
-                };
-                idx += 1;
-            }
-        }
     }
 
     /// Backward update PBWT with a coded step
@@ -773,12 +508,6 @@ mod tests {
 
         assert_eq!(coded.n_steps(), 2);
         assert_eq!(coded.n_markers(), 6);
-        assert_eq!(coded.n_haps(), 6);
-
-        // Check allele access
-        assert_eq!(coded.allele(0, HapIdx::new(0)), 0);
-        assert_eq!(coded.allele(0, HapIdx::new(1)), 1);
-        assert_eq!(coded.allele(3, HapIdx::new(2)), 1);
     }
 
     #[test]
@@ -796,20 +525,5 @@ mod tests {
             let diff = curr_pos - prev_pos;
             assert!(diff >= 0.05 && diff <= 0.2, "Step distance: {}", diff);
         }
-    }
-
-    #[test]
-    fn test_coded_pbwt() {
-        let gt = make_test_matrix();
-        let step = CodedStep::new(&gt, 0, 3);
-        let mut pbwt = CodedPbwt::new(6);
-
-        pbwt.update(&step);
-        assert_eq!(pbwt.current_step(), 1);
-
-        // Find IBS haplotypes for pattern 0
-        let p0 = step.pattern(HapIdx::new(0));
-        let ibs = pbwt.find_ibs(p0, &step, 3);
-        assert!(!ibs.is_empty());
     }
 }

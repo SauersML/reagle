@@ -8,9 +8,9 @@
 //! ```
 //! use reagle::data::storage::phase_state::{Phased, Unphased, PhaseState};
 //!
-//! // Check phase state properties
-//! assert!(!Unphased::IS_PHASED);
-//! assert!(Phased::IS_PHASED);
+//! // Phase state types are zero-sized markers
+//! assert_eq!(std::mem::size_of::<Phased>(), 0);
+//! assert_eq!(std::mem::size_of::<Unphased>(), 0);
 //! ```
 
 use std::fmt::Debug;
@@ -19,10 +19,7 @@ use std::fmt::Debug;
 ///
 /// This trait is sealed and cannot be implemented outside this module,
 /// ensuring only `Phased` and `Unphased` can be used as state parameters.
-pub trait PhaseState: Copy + Clone + Default + Debug + private::Sealed {
-    /// Whether data in this state is phased
-    const IS_PHASED: bool;
-}
+pub trait PhaseState: Copy + Clone + Default + Debug + private::Sealed {}
 
 mod private {
     pub trait Sealed {}
@@ -37,9 +34,7 @@ mod private {
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct Phased;
 
-impl PhaseState for Phased {
-    const IS_PHASED: bool = true;
-}
+impl PhaseState for Phased {}
 
 /// Type state marker: Data is unphased (genotype-level only).
 ///
@@ -48,19 +43,11 @@ impl PhaseState for Phased {
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct Unphased;
 
-impl PhaseState for Unphased {
-    const IS_PHASED: bool = false;
-}
+impl PhaseState for Unphased {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_phase_state_constants() {
-        assert!(Phased::IS_PHASED);
-        assert!(!Unphased::IS_PHASED);
-    }
 
     #[test]
     fn test_zero_sized() {

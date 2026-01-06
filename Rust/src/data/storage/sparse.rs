@@ -30,33 +30,6 @@ impl SparseColumn {
         }
     }
 
-    /// Create from allele slice (for biallelic markers)
-    pub fn from_alleles(alleles: &[u8]) -> Self {
-        let n_haplotypes = alleles.len() as u32;
-        let alt_count = alleles.iter().filter(|&&a| a > 0).count();
-
-        // Store whichever is smaller
-        let inverted = alt_count > alleles.len() / 2;
-
-        let carriers: Vec<HapIdx> = if inverted {
-            alleles
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| **a == 0)
-                .map(|(i, _)| HapIdx::new(i as u32))
-                .collect()
-        } else {
-            alleles
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| **a > 0)
-                .map(|(i, _)| HapIdx::new(i as u32))
-                .collect()
-        };
-
-        Self::from_carriers(carriers, n_haplotypes, inverted)
-    }
-
     /// Get allele for haplotype (binary search)
     #[inline]
     pub fn get(&self, hap: HapIdx) -> u8 {
@@ -66,11 +39,6 @@ impl SparseColumn {
         } else {
             if is_carrier { 1 } else { 0 }
         }
-    }
-
-    /// Get carrier indices
-    pub fn carriers(&self) -> &[HapIdx] {
-        &self.carriers
     }
 
     /// Number of carriers
@@ -90,11 +58,6 @@ impl SparseColumn {
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
         self.carriers.len() * std::mem::size_of::<HapIdx>() + std::mem::size_of::<Self>()
-    }
-
-    /// Is this an inverted representation?
-    pub fn is_inverted(&self) -> bool {
-        self.inverted
     }
 }
 
@@ -116,17 +79,4 @@ mod tests {
         assert_eq!(col.n_carriers(), 3);
     }
 
-    #[test]
-    fn test_sparse_inverted() {
-        // Most are ALT, few are REF
-        let alleles = vec![1, 1, 0, 1, 1, 1, 0, 1, 1, 1];
-        let col = SparseColumn::from_alleles(&alleles);
-
-        assert!(col.is_inverted());
-        assert_eq!(col.carriers().len(), 2); // Stored REF carriers
-
-        for (i, &expected) in alleles.iter().enumerate() {
-            assert_eq!(col.get(HapIdx::new(i as u32)), expected);
-        }
-    }
 }

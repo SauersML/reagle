@@ -12,7 +12,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
+use crate::data::haplotype::{HapIdx, Samples};
 use crate::data::marker::{Marker, MarkerIdx, Markers};
 use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
 use crate::data::storage::GenotypeColumn;
@@ -59,11 +59,6 @@ impl<S: PhaseState> GenotypeMatrix<S> {
         self.samples.n_haps()
     }
 
-    /// Check if data is phased (compile-time constant)
-    pub const fn is_phased() -> bool {
-        S::IS_PHASED
-    }
-
     /// Get marker by index
     pub fn marker(&self, idx: MarkerIdx) -> &Marker {
         self.markers.marker(idx)
@@ -72,11 +67,6 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Get all markers
     pub fn markers(&self) -> &Markers {
         &self.markers
-    }
-
-    /// Get samples reference
-    pub fn samples(&self) -> &Samples {
-        &self.samples
     }
 
     /// Get samples Arc
@@ -89,44 +79,16 @@ impl<S: PhaseState> GenotypeMatrix<S> {
         &self.columns[idx.as_usize()]
     }
 
-    /// Get all columns
-    pub fn columns(&self) -> &[GenotypeColumn] {
-        &self.columns
-    }
-
     /// Get allele at (marker, haplotype)
     #[inline]
     pub fn allele(&self, marker: MarkerIdx, hap: HapIdx) -> u8 {
         self.columns[marker.as_usize()].get(hap)
     }
 
-    /// Get both alleles for a sample at a marker (for diploid)
-    pub fn genotype(&self, marker: MarkerIdx, sample: SampleIdx) -> (u8, u8) {
-        let hap1 = sample.hap1();
-        let hap2 = sample.hap2();
-        (self.allele(marker, hap1), self.allele(marker, hap2))
-    }
-
-    /// Restrict to a range of markers (preserves phase state)
-    pub fn restrict(&self, start: usize, end: usize) -> Self {
-        Self {
-            markers: self.markers.restrict(start, end),
-            columns: self.columns[start..end].to_vec(),
-            samples: Arc::clone(&self.samples),
-            is_reversed: self.is_reversed,
-            phantom: PhantomData,
-        }
-    }
-
     /// Total memory usage in bytes (approximate)
     pub fn size_bytes(&self) -> usize {
         let column_bytes: usize = self.columns.iter().map(|c| c.size_bytes()).sum();
         column_bytes + std::mem::size_of::<Self>()
-    }
-
-    /// Whether markers are in reverse order
-    pub fn is_reversed(&self) -> bool {
-        self.is_reversed
     }
 }
 
@@ -164,22 +126,6 @@ impl GenotypeMatrix<Unphased> {
             phantom: PhantomData,
         }
     }
-
-    /// Legacy constructor for backwards compatibility.
-    ///
-    /// Creates an unphased matrix if `is_phased` is false,
-    /// or a phased matrix wrapped in an enum if true.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use new_unphased() or new_phased() for type-safe construction"
-    )]
-    pub fn new(
-        markers: Markers,
-        columns: Vec<GenotypeColumn>,
-        samples: Arc<Samples>,
-    ) -> Self {
-        Self::new_unphased(markers, columns, samples)
-    }
 }
 
 // ============================================================================
@@ -199,17 +145,6 @@ impl GenotypeMatrix<Phased> {
             columns,
             samples,
             is_reversed: false,
-            phantom: PhantomData,
-        }
-    }
-
-    /// Convert to unphased (for algorithms that don't need phase)
-    pub fn into_unphased(self) -> GenotypeMatrix<Unphased> {
-        GenotypeMatrix {
-            markers: self.markers,
-            columns: self.columns,
-            samples: self.samples,
-            is_reversed: self.is_reversed,
             phantom: PhantomData,
         }
     }
@@ -300,37 +235,11 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_restrict() {
-        let matrix = make_test_matrix_phased();
-        let restricted = matrix.restrict(0, 1);
-
-        assert_eq!(restricted.n_markers(), 1);
-        assert_eq!(restricted.n_haplotypes(), 4);
-    }
-
-    #[test]
-    fn test_genotype() {
-        let matrix = make_test_matrix_phased();
-        let (a1, a2) = matrix.genotype(MarkerIdx::new(0), SampleIdx::new(0));
-        assert_eq!(a1, 0);
-        assert_eq!(a2, 1);
-    }
-
-    #[test]
-    fn test_phase_state_compile_time() {
-        // Verify phase state is known at compile time
-        assert!(GenotypeMatrix::<Phased>::is_phased());
-        assert!(!GenotypeMatrix::<Unphased>::is_phased());
-    }
-
-    #[test]
     fn test_phase_transition() {
         let unphased = make_test_matrix_unphased();
-        assert!(!GenotypeMatrix::<Unphased>::is_phased());
 
         // Transform to phased
         let phased = unphased.into_phased();
-        assert!(GenotypeMatrix::<Phased>::is_phased());
         assert_eq!(phased.n_markers(), 2);
     }
 }

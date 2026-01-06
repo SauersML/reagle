@@ -202,12 +202,6 @@ impl PositionMap {
     pub fn gen_pos(&self, phys_pos: u32) -> f64 {
         phys_pos as f64 * self.scale_factor
     }
-
-    /// Get genetic distance between two positions (test-only)
-    #[cfg(test)]
-    pub fn gen_dist(&self, pos1: u32, pos2: u32) -> f64 {
-        ((pos2 as i64 - pos1 as i64).abs() as f64) * self.scale_factor
-    }
 }
 
 /// Pre-computed genetic positions for a set of markers

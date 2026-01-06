@@ -5,7 +5,6 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 use std::path::PathBuf;
 use std::fs::File;
-use std::io::BufReader;
 use ::noodles::bgzf;
 use ::noodles::vcf as noodles_vcf;
 use noodles_vcf::Record;

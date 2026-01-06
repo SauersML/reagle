@@ -134,11 +134,6 @@ impl MarkerAlignment {
         if idx >= 0 { Some(idx as usize) } else { None }
     }
 
-    /// Get reference marker index for a target marker
-    pub fn ref_marker(&self, target_marker: usize) -> usize {
-        self.target_to_ref[target_marker]
-    }
-
     /// Map a target allele to reference allele space
     ///
     /// Returns the reference allele index for a given target allele,
@@ -175,13 +170,6 @@ impl MarkerAlignment {
         }
     }
 
-    /// Get the ref_to_target mapping array
-    ///
-    /// For each reference marker, returns the corresponding target marker index (-1 if not in target)
-    pub fn ref_to_target(&self) -> &[i32] {
-        &self.ref_to_target
-    }
-
     /// Get reference marker index for a target marker (returns None if not aligned)
     pub fn target_to_ref(&self, target_marker: usize) -> Option<usize> {
         // Check allele_mappings to ensure the marker actually aligns.
@@ -196,11 +184,6 @@ impl MarkerAlignment {
     /// Get the number of markers that were successfully aligned
     pub fn n_aligned(&self) -> usize {
         self.ref_to_target.iter().filter(|&&x| x >= 0).count()
-    }
-
-    /// Get the allele mapping for a target marker (for strand flip/swap handling)
-    pub fn allele_mapping(&self, target_marker: usize) -> Option<&crate::data::marker::AlleleMapping> {
-        self.allele_mappings.get(target_marker)?.as_ref()
     }
 }
 /// State probabilities from HMM forward-backward on reference markers.

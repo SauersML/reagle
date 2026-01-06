@@ -136,11 +136,6 @@ impl DictionaryColumn {
         count
     }
 
-    /// Get the pattern index for a haplotype
-    pub fn pattern_index(&self, hap: HapIdx) -> u16 {
-        self.hap_to_pattern[hap.as_usize()]
-    }
-
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
         let pattern_bytes: usize = self
@@ -200,10 +195,5 @@ mod tests {
         assert_eq!(dict.get(1, HapIdx::new(2)), 0);
         assert_eq!(dict.get(2, HapIdx::new(2)), 1);
 
-        // Hap 0 and 1 should share a pattern
-        assert_eq!(
-            dict.pattern_index(HapIdx::new(0)),
-            dict.pattern_index(HapIdx::new(1))
-        );
     }
 }

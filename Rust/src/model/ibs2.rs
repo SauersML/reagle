@@ -46,11 +46,6 @@ impl Ibs2Segment {
     pub fn contains(&self, marker: usize) -> bool {
         marker >= self.start && marker <= self.incl_end
     }
-
-    /// Length of segment in markers
-    pub fn len(&self) -> usize {
-        self.incl_end - self.start + 1
-    }
 }
 
 /// Collection of IBS2 segments for all target samples
@@ -497,7 +492,6 @@ mod tests {
         assert!(seg.contains(20));
         assert!(!seg.contains(9));
         assert!(!seg.contains(21));
-        assert_eq!(seg.len(), 11);
     }
 
     #[test]

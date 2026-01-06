@@ -76,7 +76,6 @@ static SNV_PERMS: [[&str; 4]; 24] = [
 pub struct Bref3Reader {
     reader: BufReader<File>,
     samples: Samples,
-    program: String,
     n_haps: usize,
     markers: Markers,
     chrom_map: std::collections::HashMap<String, ChromIdx>,
@@ -97,7 +96,7 @@ impl Bref3Reader {
             );
         }
 
-        let program = read_utf8_string(&mut reader)?;
+        read_utf8_string(&mut reader)?; // program string (unused)
         let sample_ids = read_string_array(&mut reader)?;
         let n_haps = sample_ids.len() * 2;
         let samples = Samples::from_ids(sample_ids);
@@ -105,26 +104,10 @@ impl Bref3Reader {
         Ok(Self {
             reader,
             samples,
-            program,
             n_haps,
             markers: Markers::new(),
             chrom_map: std::collections::HashMap::new(),
         })
-    }
-
-    /// Get the program string from the BREF3 header
-    pub fn program(&self) -> &str {
-        &self.program
-    }
-
-    /// Get samples
-    pub fn samples(&self) -> &Samples {
-        &self.samples
-    }
-
-    /// Number of haplotypes
-    pub fn n_haplotypes(&self) -> usize {
-        self.n_haps
     }
 
     /// Read all genotypes into a GenotypeMatrix (phased reference data)
@@ -359,60 +342,6 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn make_bref3_header(samples: &[&str]) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        data.extend_from_slice(&BREF3_MAGIC.to_be_bytes());
-
-        let program = "test-program";
-        data.extend_from_slice(&(program.len() as u16).to_be_bytes());
-        data.extend_from_slice(program.as_bytes());
-
-        data.extend_from_slice(&(samples.len() as i32).to_be_bytes());
-        for &sample in samples {
-            data.extend_from_slice(&(sample.len() as u16).to_be_bytes());
-            data.extend_from_slice(sample.as_bytes());
-        }
-
-        data
-    }
-
-    fn append_end_of_data(data: &mut Vec<u8>) {
-        data.extend_from_slice(&END_OF_DATA.to_be_bytes());
-    }
-
-    fn append_block_with_snv(
-        data: &mut Vec<u8>,
-        chrom: &str,
-        pos: u32,
-        allele_code: u8,
-        hap_alleles: &[u8],
-    ) {
-        let n_haps = hap_alleles.len();
-
-        data.extend_from_slice(&1i32.to_be_bytes());
-
-        data.extend_from_slice(&(chrom.len() as u16).to_be_bytes());
-        data.extend_from_slice(chrom.as_bytes());
-
-        let n_seq = hap_alleles.iter().max().map(|&m| m as usize + 1).unwrap_or(1);
-        data.extend_from_slice(&(n_seq as u16).to_be_bytes());
-
-        for (i, &allele) in hap_alleles.iter().enumerate() {
-            data.extend_from_slice(&(allele as u16).to_be_bytes());
-        }
-
-        data.extend_from_slice(&(pos as i32).to_be_bytes());
-        data.push(0);
-        data.push(allele_code);
-
-        data.push(SEQ_CODED);
-
-        for seq in 0..n_seq {
-            data.push(seq as u8);
-        }
-    }
-
     #[test]
     fn test_read_be_i32() {
         let data = [0x7A, 0x89, 0xAB, 0xF4u8];
@@ -496,7 +425,7 @@ mod tests {
             "G".to_string(),
             "T".to_string(),
         ];
-        let (ref_allele, alt_alleles, end) = parse_alleles(&allele_strs, None);
+        let (ref_allele, alt_alleles, ..) = parse_alleles(&allele_strs, None);
 
         assert_eq!(ref_allele, Allele::Base(0));
         assert_eq!(alt_alleles.len(), 3);

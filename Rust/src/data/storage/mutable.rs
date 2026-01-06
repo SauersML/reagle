@@ -25,14 +25,6 @@ pub struct MutableGenotypes {
 }
 
 impl MutableGenotypes {
-    /// Create with all zeros (REF allele, no missing data)
-    pub fn new(n_markers: usize, n_haps: usize) -> Self {
-        Self {
-            alleles: vec![vec![0u8; n_haps]; n_markers],
-            n_haps,
-        }
-    }
-
     /// Create from a function that provides alleles
     ///
     /// Allele values: 0 = REF, 1-254 = ALT alleles, 255 = missing
@@ -57,12 +49,6 @@ impl MutableGenotypes {
     #[inline]
     pub fn n_haps(&self) -> usize {
         self.n_haps
-    }
-
-    /// Number of samples (assuming diploid)
-    #[inline]
-    pub fn n_samples(&self) -> usize {
-        self.n_haps / 2
     }
 
     /// Get allele at (marker, haplotype)
@@ -108,16 +94,6 @@ impl MutableGenotypes {
         let h2 = hap2.as_usize();
         self.alleles[marker].swap(h1, h2);
     }
-
-    /// Swap alleles between two haplotypes for a contiguous range of markers
-    #[inline]
-    pub fn swap_contiguous(&mut self, start: usize, end: usize, hap1: HapIdx, hap2: HapIdx) {
-        let h1 = hap1.as_usize();
-        let h2 = hap2.as_usize();
-        for m in start..end {
-            self.alleles[m].swap(h1, h2);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -126,11 +102,10 @@ mod tests {
 
     #[test]
     fn test_mutable_genotypes() {
-        let mut geno = MutableGenotypes::new(3, 4);
+        let mut geno = MutableGenotypes::from_fn(3, 4, |_, _| 0);
 
         assert_eq!(geno.n_markers(), 3);
         assert_eq!(geno.n_haps(), 4);
-        assert_eq!(geno.n_samples(), 2);
 
         // Set some values
         geno.set(0, HapIdx::new(0), 1);
@@ -209,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_set_missing() {
-        let mut geno = MutableGenotypes::new(3, 2);
+        let mut geno = MutableGenotypes::from_fn(3, 2, |_, _| 0);
 
         // Set some values including missing
         geno.set(0, HapIdx::new(0), 1);

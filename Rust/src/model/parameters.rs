@@ -21,9 +21,6 @@ pub struct ModelParams {
     /// Default for imputation: 1600
     pub n_states: usize,
 
-    /// Number of total haplotypes in panel
-    pub n_haps: usize,
-
     /// Number of burnin iterations
     pub burnin: usize,
 
@@ -59,7 +56,6 @@ impl ModelParams {
             p_mismatch: 0.0001,
             recomb_intensity: 1.0,
             n_states: Self::DEFAULT_PHASE_STATES,
-            n_haps: 0,
             burnin: Self::DEFAULT_BURNIN,
             iterations: Self::DEFAULT_ITERATIONS,
             lr_threshold: f32::INFINITY,
@@ -83,7 +79,6 @@ impl ModelParams {
             p_mismatch,
             recomb_intensity,
             n_states: Self::DEFAULT_PHASE_STATES.min(n_haps.saturating_sub(2)),
-            n_haps,
             burnin: Self::DEFAULT_BURNIN,
             iterations: Self::DEFAULT_ITERATIONS,
             lr_threshold: f32::INFINITY, // Set per iteration
@@ -105,7 +100,6 @@ impl ModelParams {
             p_mismatch,
             recomb_intensity,
             n_states: Self::DEFAULT_IMP_STATES.min(n_ref_haps),
-            n_haps: n_ref_haps,
             burnin: 0,
             iterations: 1,
             lr_threshold: 1.0,
@@ -165,16 +159,6 @@ impl ModelParams {
         (-f64::exp_m1(c * gen_dist_cm)) as f32
     }
 
-    /// Calculate emission probability for matching allele
-    pub fn emit_match(&self) -> f32 {
-        1.0 - self.p_mismatch
-    }
-
-    /// Calculate emission probability for mismatching allele
-    pub fn emit_mismatch(&self) -> f32 {
-        self.p_mismatch
-    }
-
     /// Update mismatch probability (for EM estimation)
     ///
     /// From Java `PhaseData.updatePMismatch`:
@@ -193,16 +177,6 @@ impl ModelParams {
         if new_intensity.is_finite() && new_intensity > 0.0 {
             self.recomb_intensity = new_intensity;
         }
-    }
-
-    /// Calculate Ne from recombIntensity
-    ///
-    /// From Java `PhaseData.ne`:
-    /// ```java
-    /// return (long) Math.ceil(25 * recombIntensity * nHaps);
-    /// ```
-    pub fn ne_from_recomb_intensity(&self) -> u64 {
-        (25.0 * self.recomb_intensity as f64 * self.n_haps as f64).ceil() as u64
     }
 
     /// Set number of states
@@ -270,11 +244,6 @@ impl ParamEstimates {
         self.sum_mismatch_probs += other.sum_mismatch_probs;
         self.n_switch_obs += other.n_switch_obs;
         self.n_emit_obs += other.n_emit_obs;
-    }
-
-    /// Sum of genetic distances (for checking convergence)
-    pub fn sum_gen_dist(&self) -> f64 {
-        self.sum_gen_dist
     }
 
     /// Estimate recombination intensity
@@ -412,17 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_probs() {
-        let params = ModelParams::new();
-        let match_p = params.emit_match();
-        let mismatch_p = params.emit_mismatch();
-
-        assert!(match_p > 0.99);
-        assert!(mismatch_p < 0.01);
-        assert!((match_p + mismatch_p - 1.0).abs() < 0.0001);
-    }
-
-    #[test]
     fn test_param_estimates_merge() {
         let mut e1 = ParamEstimates::new();
         e1.add_switch(0.5, 2.0); // 0.5 cM genetic distance
@@ -434,18 +392,7 @@ mod tests {
 
         e1.merge(&e2);
 
-        assert!((e1.sum_gen_dist() - 0.8).abs() < 0.0001);
+        assert!((e1.sum_gen_dist - 0.8).abs() < 0.0001);
         assert_eq!(e1.n_switch_obs(), 2);
-    }
-
-    #[test]
-    fn test_ne_from_recomb_intensity() {
-        let mut params = ModelParams::new();
-        params.n_haps = 1000;
-        params.recomb_intensity = 40.0;
-
-        let ne = params.ne_from_recomb_intensity();
-        // Should be ceil(25 * 40 * 1000) = 1_000_000
-        assert_eq!(ne, 1_000_000);
     }
 }

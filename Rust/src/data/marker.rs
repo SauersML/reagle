@@ -455,14 +455,6 @@ impl Markers {
         self.markers.push(marker);
     }
 
-    /// Get a slice of markers
-    pub fn restrict(&self, start: usize, end: usize) -> Self {
-        Self {
-            markers: self.markers[start..end].to_vec(),
-            chrom_names: self.chrom_names.clone(),
-        }
-    }
-
     /// Get all chromosome names
     pub fn chrom_names(&self) -> &[Arc<str>] {
         &self.chrom_names

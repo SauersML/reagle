@@ -231,11 +231,6 @@ impl<'a> BeagleHmm<'a> {
         }
     }
 
-    /// Number of HMM states
-    pub fn n_states(&self) -> usize {
-        self.n_states
-    }
-
     /// Number of markers
     pub fn n_markers(&self) -> usize {
         self.ref_gt.n_markers()
@@ -381,24 +376,6 @@ impl<'a> BeagleHmm<'a> {
         }
 
         fwd_sum.ln() as f64
-    }
-
-    /// Compute expected allele dosage at a marker given state probabilities
-    pub fn compute_dosage(
-        &self,
-        marker: MarkerIdx,
-        state_probs: &[f32],
-        marker_haps: &[u32],
-    ) -> f32 {
-        let mut dosage = 0.0f32;
-        for (k, &prob) in state_probs.iter().enumerate() {
-            let hap = marker_haps[k];
-            let allele = self.ref_gt.allele(marker, HapIdx::new(hap));
-            if allele != 255 {
-                dosage += prob * allele as f32;
-            }
-        }
-        dosage
     }
 
     /// Collect statistics for EM parameter estimation
@@ -615,25 +592,5 @@ mod tests {
         assert_eq!(fwd.len(), 5 * 6); // 5 markers * 6 states
         assert_eq!(bwd.len(), 5 * 6);
         assert!(log_likelihood.is_finite());
-    }
-
-    #[test]
-    fn test_beagle_hmm_dosage() {
-        let ref_panel = make_test_ref_panel();
-        let params = ModelParams::for_phasing(6, 10000.0, None);
-        let ref_haps: Vec<HapIdx> = (0..6).map(|i| HapIdx::new(i)).collect();
-        let p_recomb = vec![0.0, 0.01, 0.01, 0.01, 0.01];
-
-        let n_markers = 5;
-        let n_states = ref_haps.len();
-        let hmm = BeagleHmm::new(&ref_panel, &params, n_states, p_recomb);
-
-        // Uniform state probs
-        let state_probs = vec![1.0 / 6.0; 6];
-        let marker_haps: Vec<u32> = ref_haps.iter().map(|h| h.0).collect();
-        let dosage = hmm.compute_dosage(MarkerIdx::new(0), &state_probs, &marker_haps);
-
-        // Marker 0 alleles: [0, 0, 1, 1, 0, 1] -> mean = 0.5
-        assert!((dosage - 0.5).abs() < 0.01);
     }
 }

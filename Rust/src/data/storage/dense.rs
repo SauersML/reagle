@@ -100,37 +100,9 @@ impl DenseColumn {
         allele
     }
 
-    /// Set allele for haplotype
-    pub fn set(&mut self, hap: HapIdx, allele: u8) {
-        let idx = hap.as_usize();
-        if idx >= self.n_haplotypes as usize {
-            return;
-        }
-
-        if allele == 255 {
-            self.missing.set(idx, true);
-            let start = idx * self.bits_per_allele as usize;
-            for b in 0..self.bits_per_allele as usize {
-                self.bits.set(start + b, false);
-            }
-            return;
-        }
-
-        self.missing.set(idx, false);
-        let start = idx * self.bits_per_allele as usize;
-        for b in 0..self.bits_per_allele as usize {
-            self.bits.set(start + b, (allele >> b) & 1 == 1);
-        }
-    }
-
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.n_haplotypes as usize
-    }
-
-    /// Bits per allele
-    pub fn bits_per_allele(&self) -> u8 {
-        self.bits_per_allele
     }
 
     /// Count of ALT alleles (for biallelic)
@@ -169,7 +141,6 @@ mod tests {
         let col = DenseColumn::from_alleles(alleles.iter().copied(), 2);
 
         assert_eq!(col.n_haplotypes(), 8);
-        assert_eq!(col.bits_per_allele(), 1);
 
         for (i, &expected) in alleles.iter().enumerate() {
             assert_eq!(col.get(HapIdx::new(i as u32)), expected);
@@ -184,22 +155,10 @@ mod tests {
         let col = DenseColumn::from_alleles(alleles.iter().copied(), 4);
 
         assert_eq!(col.n_haplotypes(), 8);
-        assert_eq!(col.bits_per_allele(), 2);
 
         for (i, &expected) in alleles.iter().enumerate() {
             assert_eq!(col.get(HapIdx::new(i as u32)), expected);
         }
     }
 
-    #[test]
-    fn test_set() {
-        let mut col = DenseColumn::new(4, 2);
-        col.set(HapIdx::new(0), 1);
-        col.set(HapIdx::new(2), 1);
-
-        assert_eq!(col.get(HapIdx::new(0)), 1);
-        assert_eq!(col.get(HapIdx::new(1)), 0);
-        assert_eq!(col.get(HapIdx::new(2)), 1);
-        assert_eq!(col.get(HapIdx::new(3)), 0);
-    }
 }
