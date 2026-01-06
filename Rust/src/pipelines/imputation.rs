@@ -26,7 +26,7 @@ use crate::io::bref3::Bref3Reader;
 use crate::io::vcf::{ImputationQuality, VcfReader, VcfWriter};
 use crate::utils::workspace::ImpWorkspace;
 
-use crate::model::imp_states::{CodedStepsConfig, ImpStates};
+use crate::model::imp_states::ImpStates;
 use crate::model::parameters::ModelParams;
 use crate::model::recursive_ibs::RecursiveIbs;
 
@@ -436,32 +436,10 @@ impl ImputationPipeline {
 
         let chrom = ref_gt.marker(MarkerIdx::new(0)).chrom;
 
-        // Compute genetic positions at genotyped markers (for ImpStates)
-        let gen_positions: Vec<f64> = (0..n_target_markers)
-            .map(|m| {
-                let ref_m = alignment.ref_marker(m);
-                let pos = ref_gt.marker(MarkerIdx::new(ref_m as u32)).pos;
-                gen_maps.gen_pos(chrom, pos)
-            })
-            .collect();
+        // Note: gen_positions and steps_config removed - ImpStates now uses ref_panel step boundaries directly
 
-        // Compute recombination probabilities at genotyped markers
-        let p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain((1..n_target_markers).map(|m| {
-                let prev_ref = alignment.ref_marker(m - 1);
-                let curr_ref = alignment.ref_marker(m);
-                let pos1 = ref_gt.marker(MarkerIdx::new(prev_ref as u32)).pos;
-                let pos2 = ref_gt.marker(MarkerIdx::new(curr_ref as u32)).pos;
-                let gen_dist = gen_maps.gen_dist(chrom, pos1, pos2);
-                self.params.p_recomb(gen_dist)
-            }))
-            .collect();
-
-        // CodedSteps configuration
-        let steps_config = CodedStepsConfig {
-            step_cm: self.config.imp_step,
-            n_ibs_haps: self.config.imp_nsteps,
-        };
+        // Number of IBS haplotypes to find per step
+        let n_ibs_haps = self.config.imp_nsteps;
 
         // Compute genetic positions at ALL reference markers (for RefPanelCoded)
         let ref_gen_positions: Vec<f64> = (0..n_ref_markers)
@@ -520,22 +498,37 @@ impl ImputationPipeline {
         eprintln!("Running imputation with dynamic state selection...");
         let n_states = self.params.n_states;
 
+        // Compute recombination probabilities at REFERENCE markers (used by HMM)
+        let p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain((1..n_ref_markers).map(|m| {
+                let pos1 = ref_gt.marker(MarkerIdx::new((m - 1) as u32)).pos;
+                let pos2 = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
+                let gen_dist = gen_maps.gen_dist(chrom, pos1, pos2);
+                self.params.p_recomb(gen_dist)
+            }))
+            .collect();
+
         // Run imputation for each target haplotype with per-thread workspaces
         let state_probs: Vec<StateProbs> = (0..n_target_haps)
             .into_par_iter()
             .map_init(
-                // Initialize workspace for each thread
-                || ImpWorkspace::with_ref_size(n_states, n_target_markers, n_ref_haps),
+                // Initialize workspace for each thread (now uses n_ref_markers)
+                || ImpWorkspace::with_ref_size(n_states, n_ref_markers, n_ref_haps),
                 // Process each haplotype with its thread's workspace
                 |workspace, h| {
                     let hap_idx = HapIdx::new(h as u32);
 
-                    // Get target alleles at genotyped markers, mapped to reference allele space
-                    // This handles strand flips (A/T vs T/A) and allele swaps automatically
-                    let target_alleles: Vec<u8> = (0..n_target_markers)
-                        .map(|m| {
-                            let raw_allele = target_gt.allele(MarkerIdx::new(m as u32), hap_idx);
-                            alignment.map_allele(m, raw_allele)
+                    // Build target alleles in REFERENCE marker space
+                    // For each reference marker, look up the corresponding target marker
+                    // Use 255 (missing) for markers not genotyped in target
+                    let target_alleles: Vec<u8> = (0..n_ref_markers)
+                        .map(|ref_m| {
+                            if let Some(target_m) = alignment.target_marker(ref_m) {
+                                let raw_allele = target_gt.allele(MarkerIdx::new(target_m as u32), hap_idx);
+                                alignment.map_allele(target_m, raw_allele)
+                            } else {
+                                255 // Missing - marker not in target
+                            }
                         })
                         .collect();
 
@@ -543,11 +536,10 @@ impl ImputationPipeline {
                     // Combine config seed with haplotype index for reproducibility
                     let seed = (self.config.seed as u64).wrapping_add(h as u64);
                     let mut imp_states =
-                        ImpStates::new(&ref_panel_coded, n_states, &gen_positions, &steps_config, seed);
+                        ImpStates::new(&ref_panel_coded, n_states, n_ibs_haps, seed);
 
-                    // Get reference allele closure
-                    let get_ref_allele = |m: usize, hap: u32| -> u8 {
-                        let ref_m = alignment.ref_marker(m);
+                    // Get reference allele closure (now indices are in reference space directly)
+                    let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                         ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
 
@@ -562,7 +554,7 @@ impl ImputationPipeline {
                         &mut allele_match,
                     );
 
-                    // Run forward-backward HMM using workspace buffers
+                    // Run forward-backward HMM using workspace buffers (now on ref markers)
                     let hmm_state_probs = run_hmm_forward_backward(
                         &target_alleles,
                         &allele_match,
@@ -572,9 +564,9 @@ impl ImputationPipeline {
                         workspace,
                     );
 
-                    // Create StateProbs for interpolation
+                    // Create StateProbs for interpolation (now uses n_ref_markers)
                     StateProbs::new(
-                        n_target_markers,
+                        n_ref_markers,
                         actual_n_states,
                         hap_indices,
                         hmm_state_probs,

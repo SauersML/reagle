@@ -191,7 +191,7 @@ impl HmmUpdater {
 // BeagleHmm: Memory-Efficient Mosaic HMM with A-B-C Loop Pattern
 // ============================================================================
 
-use crate::model::states::{AlleleScratch, MosaicCursor, ThreadedHaps};
+use crate::model::states::{AlleleScratch, MosaicCursor, StateSwitch, ThreadedHaps};
 
 /// High-performance Li-Stephens HMM using mosaic states with A-B-C loop pattern.
 ///
@@ -283,18 +283,16 @@ impl<'a> BeagleHmm<'a> {
         // =====================================================================
         let mut fwd_sum = 1.0f32;
 
-        // Store active haps at each marker for backward pass
-        let mut marker_haps: Vec<Vec<u32>> = Vec::with_capacity(n_markers);
+        // Event stack for efficient backward pass (sparse, O(switches))
+        // For phasing (static states), this remains empty - zero overhead.
+        let mut history: Vec<StateSwitch> = Vec::with_capacity(n_markers);
 
         for m in 0..n_markers {
             let targ_al = target_alleles[m];
             let p_recomb_m = self.p_recomb.get(m).copied().unwrap_or(0.0);
 
-            // Phase A: Advance cursor (state maintenance)
-            cursor.advance_to_marker(m, threaded_haps);
-            
-            // Store snapshot of active haps for backward pass
-            marker_haps.push(cursor.active_haps().to_vec());
+            // Phase A: Advance cursor with history recording
+            cursor.advance_with_history(m, threaded_haps, &mut history);
 
             // Phase B: Materialize alleles into scratch buffer
             scratch.materialize(&cursor, m, |marker, hap| {
@@ -332,7 +330,7 @@ impl<'a> BeagleHmm<'a> {
         }
 
         // =====================================================================
-        // BACKWARD PASS using stored marker haplotypes
+        // BACKWARD PASS using cursor rewind (Event Stack approach)
         // =====================================================================
 
         // Initialize last row
@@ -342,7 +340,8 @@ impl<'a> BeagleHmm<'a> {
             bwd[last_row + k] = init_bwd;
         }
 
-        // Backward sweep using stored haplotypes
+        // Backward sweep using cursor.rewind()
+        // Cursor is currently at last marker; we rewind as we go backwards
         for m in (0..n_markers - 1).rev() {
             let m_next = m + 1;
             let marker_next_idx = MarkerIdx::new(m_next as u32);
@@ -350,9 +349,12 @@ impl<'a> BeagleHmm<'a> {
 
             let p_recomb_next = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
 
-            // Use stored haplotypes for marker m_next
+            // Rewind cursor to m_next (we need alleles at m_next for emission)
+            cursor.rewind(m_next, &mut history);
+
+            // Materialize alleles at m_next using rewound cursor
             for k in 0..n_states {
-                let hap = marker_haps[m_next][k];
+                let hap = cursor.active_haps()[k];
                 scratch.alleles[k] = self.ref_gt.allele(marker_next_idx, HapIdx::new(hap));
                 mismatches[k] = if scratch.alleles[k] == targ_al_next { 0 } else { 1 };
             }
@@ -416,33 +418,38 @@ impl<'a> BeagleHmm<'a> {
         let p_no_err = 1.0 - p_err;
         let emit_probs = [p_no_err, p_err];
 
-        // Create cursor and store haps at each marker
+        // Create cursor and record history during forward traversal
         let mut cursor = MosaicCursor::from_threaded(threaded_haps);
-        let mut marker_haps: Vec<Vec<u32>> = Vec::with_capacity(n_markers);
+        let mut history: Vec<StateSwitch> = Vec::with_capacity(n_markers);
+        
+        // First pass: advance cursor to end while recording history
         for m in 0..n_markers {
-            cursor.advance_to_marker(m, threaded_haps);
-            marker_haps.push(cursor.active_haps().to_vec());
+            cursor.advance_with_history(m, threaded_haps, &mut history);
         }
 
-        // 1. Backward pass: compute all backward values
+        // 1. Backward pass: compute all backward values using cursor rewind
         let mut saved_bwd = vec![0.0f32; n_markers * n_states];
         let mut bwd = vec![1.0f32; n_states];
+        let mut mismatches = vec![0u8; n_states];
         
         let last_row_start = (n_markers - 1) * n_states;
         saved_bwd[last_row_start..last_row_start + n_states].fill(1.0);
 
+        // Cursor is at end; rewind it as we go backwards
         for m in (0..n_markers - 1).rev() {
             let m_next = m + 1;
             let marker_next_idx = MarkerIdx::new(m_next as u32);
             let targ_al_next = target_alleles[m_next];
             let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
             
-            let mismatches: Vec<u8> = marker_haps[m_next].iter()
-                .map(|&h| {
-                    let r = self.ref_gt.allele(marker_next_idx, HapIdx::new(h));
-                    if r == targ_al_next { 0 } else { 1 }
-                })
-                .collect();
+            // Rewind to m_next to get correct haplotypes
+            cursor.rewind(m_next, &mut history);
+            
+            for k in 0..n_states {
+                let h = cursor.active_haps()[k];
+                let r = self.ref_gt.allele(marker_next_idx, HapIdx::new(h));
+                mismatches[k] = if r == targ_al_next { 0 } else { 1 };
+            }
 
             HmmUpdater::bwd_update(&mut bwd, p_recomb, &emit_probs, &mismatches, n_states);
             let row_start = m * n_states;
@@ -450,6 +457,10 @@ impl<'a> BeagleHmm<'a> {
         }
 
         // 2. Forward pass and accumulate stats
+        // Reset cursor and history for forward traversal
+        cursor.reset(threaded_haps);
+        history.clear();
+        
         let h_factor = n_states as f32 / (n_states - 1) as f32;
         let mut fwd = vec![1.0f32 / n_states as f32; n_states];
         let mut last_fwd_sum = 1.0f32;
@@ -462,6 +473,9 @@ impl<'a> BeagleHmm<'a> {
             let scale = (1.0 - p_switch) / last_fwd_sum;
             let no_switch_scale = ((1.0 - p_switch) + shift) / last_fwd_sum;
 
+            // Advance cursor to this marker
+            cursor.advance_with_history(m, threaded_haps, &mut history);
+            
             let mut joint_state_sum = 0.0f32;
             let mut state_sum = 0.0f32;
             let mut mismatch_sum = 0.0f32;
@@ -470,7 +484,7 @@ impl<'a> BeagleHmm<'a> {
             let bwd_m = &saved_bwd[m * n_states .. (m + 1) * n_states];
 
             for k in 0..n_states {
-                let ref_al = self.ref_gt.allele(marker_idx, HapIdx::new(marker_haps[m][k]));
+                let ref_al = self.ref_gt.allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
                 let is_mismatch = ref_al != targ_al;
                 let em = if is_mismatch { p_err } else { p_no_err };
                 

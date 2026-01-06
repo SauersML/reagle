@@ -133,6 +133,27 @@ impl ThreadedHaps {
 }
 
 // ============================================================================
+// StateSwitch: Event Record for Backward Pass Rewinding
+// ============================================================================
+
+/// Record of a state switch for backward pass "rewinding".
+///
+/// During the forward pass, whenever a state crosses a segment boundary,
+/// we record the switch. During the backward pass, we replay these events
+/// in reverse to restore the cursor to its previous state.
+///
+/// This approach is O(switches) memory vs O(markers × states) for snapshots.
+#[derive(Debug, Clone, Copy)]
+pub struct StateSwitch {
+    /// Marker index where switch occurred (inclusive start of new segment)
+    pub marker: u32,
+    /// State index that switched
+    pub state_idx: u32,
+    /// Haplotype index *before* the switch (for restoration)
+    pub old_hap: u32,
+}
+
+// ============================================================================
 // MosaicCursor: SIMD-Friendly State Access for HMM Hot Path
 // ============================================================================
 
@@ -217,6 +238,50 @@ impl MosaicCursor {
             self.cursor_indices[state] = head as u32;
             self.active_haps[state] = th.segments_hap[head];
             self.next_switch[state] = th.segments_end[head] as usize;
+        }
+    }
+
+    /// Phase A with history: Advance to marker, recording state switches.
+    ///
+    /// Same as `advance_to_marker` but pushes `StateSwitch` events onto the
+    /// history stack whenever a state crosses a segment boundary. This enables
+    /// efficient backward pass rewinding without O(M×K) snapshots.
+    #[inline]
+    pub fn advance_with_history(
+        &mut self,
+        marker: usize,
+        th: &ThreadedHaps,
+        history: &mut Vec<StateSwitch>,
+    ) {
+        for state in 0..self.active_haps.len() {
+            if marker >= self.next_switch[state] {
+                // Record the switch BEFORE updating
+                history.push(StateSwitch {
+                    marker: self.next_switch[state] as u32,
+                    state_idx: state as u32,
+                    old_hap: self.active_haps[state],
+                });
+                self.advance_state(state, marker, th);
+            }
+        }
+    }
+
+    /// Rewind cursor to a previous marker by replaying history in reverse.
+    ///
+    /// Pops all events that occurred after `target_marker`, restoring
+    /// `active_haps` to the state it was in at that marker.
+    ///
+    /// Note: This only restores `active_haps`, not internal cursor pointers.
+    /// This is safe because the backward pass only reads `active_haps`.
+    #[inline]
+    pub fn rewind(&mut self, target_marker: usize, history: &mut Vec<StateSwitch>) {
+        while let Some(event) = history.last() {
+            if event.marker as usize > target_marker {
+                let event = history.pop().unwrap();
+                self.active_haps[event.state_idx as usize] = event.old_hap;
+            } else {
+                break;
+            }
         }
     }
 }
@@ -320,5 +385,62 @@ mod tests {
         assert_eq!(scratch.alleles[0], 0);
         assert_eq!(scratch.alleles[1], 1);
         assert_eq!(scratch.alleles[2], 2);
+    }
+
+    #[test]
+    fn test_mosaic_cursor_rewind() {
+        // Create a mosaic setup with 2 states, each having segment boundaries
+        let mut th = ThreadedHaps::new(2, 8, 100);
+        
+        // State 0: hap 10 for [0, 40), hap 15 for [40, 70), hap 20 for [70, 100)
+        th.push_new(10);
+        th.add_segment(0, 15, 40);
+        th.add_segment(0, 20, 70);
+        
+        // State 1: hap 30 for [0, 50), hap 35 for [50, 100)
+        th.push_new(30);
+        th.add_segment(1, 35, 50);
+        
+        let mut cursor = MosaicCursor::from_threaded(&th);
+        let mut history: Vec<StateSwitch> = Vec::new();
+        
+        // Advance through all markers recording history
+        for m in 0..100 {
+            cursor.advance_with_history(m, &th, &mut history);
+        }
+        
+        // Verify cursor is at end state
+        assert_eq!(cursor.active_haps()[0], 20); // State 0 at marker 99
+        assert_eq!(cursor.active_haps()[1], 35); // State 1 at marker 99
+        
+        // History should have recorded 3 switches total:
+        // - State 0 switched at marker 40, 70
+        // - State 1 switched at marker 50
+        assert_eq!(history.len(), 3);
+        
+        // Now test rewinding
+        // Rewind to marker 80 - should stay at hap 20, 35
+        cursor.rewind(80, &mut history);
+        assert_eq!(cursor.active_haps()[0], 20);
+        assert_eq!(cursor.active_haps()[1], 35);
+        assert_eq!(history.len(), 3); // No events popped
+        
+        // Rewind to marker 60 - state 1 stays at 35, state 0 reverts to 15
+        cursor.rewind(60, &mut history);
+        assert_eq!(cursor.active_haps()[0], 15);
+        assert_eq!(cursor.active_haps()[1], 35);
+        assert_eq!(history.len(), 2); // One event popped (state 0's switch at 70)
+        
+        // Rewind to marker 45 - state 1 reverts to 30, state 0 stays at 15
+        cursor.rewind(45, &mut history);
+        assert_eq!(cursor.active_haps()[0], 15);
+        assert_eq!(cursor.active_haps()[1], 30);
+        assert_eq!(history.len(), 1); // Two events popped total
+        
+        // Rewind to marker 30 - state 0 reverts to 10, state 1 stays at 30
+        cursor.rewind(30, &mut history);
+        assert_eq!(cursor.active_haps()[0], 10);
+        assert_eq!(cursor.active_haps()[1], 30);
+        assert_eq!(history.len(), 0); // All events popped
     }
 }

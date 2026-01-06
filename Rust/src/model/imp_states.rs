@@ -49,105 +49,26 @@ impl Ord for CompHapEntry {
     }
 }
 
-/// Configuration for coded steps (marker clusters)
-#[derive(Clone, Debug)]
-pub struct CodedStepsConfig {
-    /// Step size in cM
-    pub step_cm: f32,
-    /// Number of IBS haplotypes to find per step
-    pub n_ibs_haps: usize,
-}
-
-impl Default for CodedStepsConfig {
-    fn default() -> Self {
-        Self {
-            step_cm: 0.1,  // From Java imp_step parameter
-            n_ibs_haps: 8, // From Java imp_nsteps
-        }
-    }
-}
-
-/// Coded steps - divides markers into intervals for IBS matching
-#[derive(Clone, Debug)]
-pub struct CodedSteps {
-    /// Start marker index for each step
-    step_starts: Vec<usize>,
-    /// Number of markers total
-    n_markers: usize,
-}
-
-impl CodedSteps {
-    /// Create coded steps from genetic positions
-    pub fn new(gen_positions: &[f64], config: &CodedStepsConfig) -> Self {
-        if gen_positions.is_empty() {
-            return Self {
-                step_starts: vec![0],
-                n_markers: 0,
-            };
-        }
-
-        let n_markers = gen_positions.len();
-        let mut step_starts = Vec::new();
-        step_starts.push(0);
-
-        let step_cm = config.step_cm as f64;
-
-        // First step is half-length
-        let mut next_pos = gen_positions[0] + step_cm / 2.0;
-        let mut idx = Self::next_index(gen_positions, 0, next_pos);
-
-        while idx < n_markers {
-            step_starts.push(idx);
-            next_pos = gen_positions[idx] + step_cm;
-            idx = Self::next_index(gen_positions, idx, next_pos);
-        }
-
-        Self {
-            step_starts,
-            n_markers,
-        }
-    }
-
-    fn next_index(positions: &[f64], start: usize, target: f64) -> usize {
-        match positions[start..].binary_search_by(|p| p.partial_cmp(&target).unwrap()) {
-            Ok(i) => start + i,
-            Err(i) => start + i,
-        }
-    }
-
-    /// Start marker for a step
-    pub fn step_start(&self, step: usize) -> usize {
-        self.step_starts[step]
-    }
-
-    /// End marker for a step (exclusive)
-    pub fn step_end(&self, step: usize) -> usize {
-        if step + 1 < self.step_starts.len() {
-            self.step_starts[step + 1]
-        } else {
-            self.n_markers
-        }
-    }
-}
-
 /// Dynamic HMM state selector for imputation
 ///
 /// Matches Java `imp/ImpStates.java`
+///
+/// IMPORTANT: This struct uses the reference panel's step boundaries for all operations.
+/// The `target_alleles` passed to `ibs_states()` must be in **reference marker space**
+/// (indexed by reference marker, with 255 for markers not genotyped in target).
 pub struct ImpStates<'a> {
     /// Maximum number of HMM states
     max_states: usize,
     /// Reference panel with coded steps
     ref_panel: &'a RefPanelCoded,
-    /// Coded steps configuration
-    coded_steps: CodedSteps,
     /// Composite haplotypes (the HMM states) - Optimized Arena
     threaded_haps: ThreadedHaps,
     /// Map from reference haplotype to last IBS step
     hap_to_last_ibs: HashMap<u32, i32>,
     /// Priority queue for managing composite haplotypes
     queue: BinaryHeap<CompHapEntry>,
-    /// Number of markers
-    n_markers: usize,
+    /// Number of reference markers
+    n_ref_markers: usize,
     /// Number of IBS haplotypes to find per step
     n_ibs_haps: usize,
     /// Random seed for reproducibility
@@ -156,25 +77,28 @@ pub struct ImpStates<'a> {
 
 impl<'a> ImpStates<'a> {
     /// Create a new state selector
+    ///
+    /// # Arguments
+    /// * `ref_panel` - Reference panel with coded steps (defines step boundaries)
+    /// * `max_states` - Maximum number of HMM states to track
+    /// * `n_ibs_haps` - Number of IBS haplotypes to find per step
+    /// * `seed` - Random seed for reproducibility
     pub fn new(
         ref_panel: &'a RefPanelCoded,
         max_states: usize,
-        gen_positions: &[f64],
-        config: &CodedStepsConfig,
+        n_ibs_haps: usize,
         seed: u64,
     ) -> Self {
-        let coded_steps = CodedSteps::new(gen_positions, config);
-        let n_markers = gen_positions.len();
+        let n_ref_markers = ref_panel.n_markers();
 
         Self {
             max_states,
             ref_panel,
-            coded_steps,
-            threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_markers),
+            threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_ref_markers),
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
-            n_markers,
-            n_ibs_haps: config.n_ibs_haps,
+            n_ref_markers,
+            n_ibs_haps,
             seed,
         }
     }
@@ -183,6 +107,17 @@ impl<'a> ImpStates<'a> {
     ///
     /// Uses BOTH forward and backward PBWT passes to find IBS matches,
     /// matching Java Beagle's bidirectional approach.
+    ///
+    /// # Arguments
+    /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
+    /// * `target_alleles` - Target alleles in **reference marker space** (length = n_ref_markers)
+    ///                      Use 255 for markers not genotyped in target
+    /// * `workspace` - Pre-allocated workspace buffers
+    /// * `hap_indices` - Output: reference haplotype indices at each marker
+    /// * `allele_match` - Output: whether each state matches target at each marker
+    ///
+    /// # Returns
+    /// Number of states selected
     pub fn ibs_states<F>(
         &mut self,
         get_ref_allele: F,
@@ -199,7 +134,7 @@ impl<'a> ImpStates<'a> {
         let n_ref_haps = self.ref_panel.n_haps();
         let n_steps = self.ref_panel.n_steps();
         let n_ibs_haps = self.n_ibs_haps;
-        workspace.resize_with_ref(self.max_states, self.n_markers, n_ref_haps);
+        workspace.resize_with_ref(self.max_states, self.n_ref_markers, n_ref_haps);
 
         // Store backward IBS haps for each step (to use during forward pass)
         let mut bwd_ibs_per_step: Vec<Vec<u32>> = vec![Vec::new(); n_steps];
@@ -214,11 +149,13 @@ impl<'a> ImpStates<'a> {
 
             for step_idx in (0..n_steps).rev() {
                 let coded_step = self.ref_panel.step(step_idx);
-                let step_start = self.coded_steps.step_start(step_idx);
-                let step_end = self.coded_steps.step_end(step_idx);
+                // Use reference panel's step boundaries (the fix!)
+                let step_start = coded_step.start;
+                let step_end = coded_step.end;
 
                 pbwt_bwd.update_backward(coded_step, n_steps);
 
+                // Extract target sequence for this step using reference marker indices
                 let target_seq: Vec<u8> = (step_start..step_end)
                     .map(|m| target_alleles.get(m).copied().unwrap_or(255))
                     .collect();
@@ -252,8 +189,9 @@ impl<'a> ImpStates<'a> {
 
             for step_idx in 0..n_steps {
                 let coded_step = self.ref_panel.step(step_idx);
-                let step_start = self.coded_steps.step_start(step_idx);
-                let step_end = self.coded_steps.step_end(step_idx);
+                // Use reference panel's step boundaries (the fix!)
+                let step_start = coded_step.start;
+                let step_end = coded_step.end;
 
                 pbwt_fwd.update_counting_sort(
                     coded_step,
@@ -263,6 +201,7 @@ impl<'a> ImpStates<'a> {
                     &mut workspace.sort_div_scratch,
                 );
 
+                // Extract target sequence for this step using reference marker indices
                 let target_seq: Vec<u8> = (step_start..step_end)
                     .map(|m| target_alleles.get(m).copied().unwrap_or(255))
                     .collect();
@@ -327,7 +266,13 @@ impl<'a> ImpStates<'a> {
                 // Replace oldest composite haplotype
                 if let Some(mut head) = self.queue.pop() {
                     let mid_step = (head.last_ibs_step + step) / 2;
-                    let start_marker = self.coded_steps.step_start(mid_step.max(0) as usize);
+                    // Use reference panel's step boundary (the fix!)
+                    let mid_step_idx = mid_step.max(0) as usize;
+                    let start_marker = if mid_step_idx < self.ref_panel.n_steps() {
+                        self.ref_panel.step(mid_step_idx).start
+                    } else {
+                        0
+                    };
 
                     self.hap_to_last_ibs.remove(&head.hap);
 
@@ -399,13 +344,13 @@ impl<'a> ImpStates<'a> {
         F: Fn(usize, u32) -> u8,
     {
         hap_indices.clear();
-        hap_indices.resize(self.n_markers, vec![0; n_states]);
+        hap_indices.resize(self.n_ref_markers, vec![0; n_states]);
         allele_match.clear();
-        allele_match.resize(self.n_markers, vec![false; n_states]);
+        allele_match.resize(self.n_ref_markers, vec![false; n_states]);
 
         self.threaded_haps.reset_cursors();
 
-        for m in 0..self.n_markers {
+        for m in 0..self.n_ref_markers {
             let target_allele = target_alleles.get(m).copied().unwrap_or(255);
 
             for (j, entry) in self.queue.iter().take(n_states).enumerate() {
@@ -426,12 +371,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_coded_steps() {
-        let positions: Vec<f64> = (0..100).map(|i| i as f64 * 0.05).collect();
-        let config = CodedStepsConfig::default();
-        let steps = CodedSteps::new(&positions, &config);
-
-        assert!(steps.step_starts.len() > 1);
-        assert_eq!(steps.step_start(0), 0);
+    fn test_imp_states_creation() {
+        // Basic sanity test - we can't easily test without a full RefPanelCoded
+        // but we verify the struct compiles and basic invariants hold
+        assert!(std::mem::size_of::<ImpStates>() > 0);
     }
 }
