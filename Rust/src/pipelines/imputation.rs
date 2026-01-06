@@ -165,52 +165,24 @@ impl MarkerAlignment {
     pub fn ref_to_target(&self) -> &[i32] {
         &self.ref_to_target
     }
-
-    /// Find flanking genotyped markers for a reference marker
-    /// Returns (left_ref_marker, right_ref_marker, interpolation_weight)
-    pub fn flanking_markers(&self, ref_marker: usize) -> (usize, usize, f32) {
-        // Find left genotyped marker
-        let mut left = ref_marker;
-        while left > 0 && !self.is_genotyped(left) {
-            left -= 1;
-        }
-        if !self.is_genotyped(left) {
-            left = 0;
-        }
-
-        // Find right genotyped marker
-        let mut right = ref_marker;
-        while right < self.n_ref_markers - 1 && !self.is_genotyped(right) {
-            right += 1;
-        }
-        if !self.is_genotyped(right) {
-            right = self.n_ref_markers - 1;
-        }
-
-        // Calculate interpolation weight
-        let weight = if left == right {
-            0.5
-        } else {
-            (ref_marker - left) as f32 / (right - left) as f32
-        };
-
-        (left, right, weight)
-    }
 }
-
-/// State probabilities with interpolation support
+/// State probabilities from HMM forward-backward on reference markers.
+///
+/// Since the HMM now runs on all reference markers (not just genotyped target markers),
+/// we have exact posterior probabilities for every marker. No interpolation needed.
 #[derive(Clone, Debug)]
 pub struct StateProbs {
-    /// Reference haplotype indices at each genotyped marker
+    /// Reference haplotype indices at each reference marker
     hap_indices: Vec<Vec<u32>>,
-    /// State probabilities at each genotyped marker
+    /// State probabilities at each reference marker
     probs: Vec<Vec<f32>>,
-    /// State probabilities at marker+1 (for interpolation)
-    probs_p1: Vec<Vec<f32>>,
 }
 
 impl StateProbs {
-    /// Create state probabilities from HMM output
+    /// Create state probabilities from HMM output.
+    ///
+    /// Filters to keep only states with probability above threshold
+    /// to reduce memory and speed up dosage computation.
     pub fn new(
         n_markers: usize,
         n_states: usize,
@@ -221,120 +193,53 @@ impl StateProbs {
 
         let mut filtered_haps = Vec::with_capacity(n_markers);
         let mut filtered_probs = Vec::with_capacity(n_markers);
-        let mut filtered_probs_p1 = Vec::with_capacity(n_markers);
 
         for m in 0..n_markers {
-            let m_p1 = (m + 1).min(n_markers - 1);
             let row_offset = m * n_states;
-            let row_offset_p1 = m_p1 * n_states;
             
             let mut haps = Vec::new();
             let mut probs = Vec::new();
-            let mut probs_p1 = Vec::new();
 
             for j in 0..n_states.min(hap_indices.get(m).map(|v| v.len()).unwrap_or(0)) {
-                let prob_m = state_probs
+                let prob = state_probs
                     .get(row_offset + j)
                     .copied()
                     .unwrap_or(0.0);
-                let prob_m_p1 = state_probs
-                    .get(row_offset_p1 + j)
-                    .copied()
-                    .unwrap_or(0.0);
 
-                if prob_m > threshold || prob_m_p1 > threshold {
+                if prob > threshold {
                     haps.push(hap_indices[m][j]);
-                    probs.push(prob_m);
-                    probs_p1.push(prob_m_p1);
+                    probs.push(prob);
                 }
             }
 
             filtered_haps.push(haps);
             filtered_probs.push(probs);
-            filtered_probs_p1.push(probs_p1);
         }
 
         Self {
             hap_indices: filtered_haps,
             probs: filtered_probs,
-            probs_p1: filtered_probs_p1,
         }
     }
 
-    /// Get interpolated dosage at a reference marker
-    pub fn interpolated_dosage<F>(
-        &self,
-        ref_marker: usize,
-        alignment: &MarkerAlignment,
-        get_ref_allele: F,
-    ) -> f32
+    /// Compute dosage at a reference marker.
+    ///
+    /// Since the HMM runs on all reference markers, this is a direct lookup
+    /// of the posterior probabilities - no interpolation needed.
+    #[inline]
+    pub fn dosage<F>(&self, ref_marker: usize, get_ref_allele: F) -> f32
     where
         F: Fn(usize, u32) -> u8,
     {
-        if let Some(target_marker) = alignment.target_marker(ref_marker) {
-            // Genotyped marker - use direct state probs
-            self.dosage_at_genotyped(target_marker, ref_marker, &get_ref_allele)
-        } else {
-            // Ungenotyped marker - interpolate
-            let (left_ref, right_ref, weight) = alignment.flanking_markers(ref_marker);
-            let left_target = alignment.target_marker(left_ref);
-            let right_target = alignment.target_marker(right_ref);
-
-            match (left_target, right_target) {
-                (Some(lt), Some(_)) => {
-                    // Interpolate between two genotyped markers
-                    self.interpolated_dosage_between(lt, weight, ref_marker, &get_ref_allele)
-                }
-                (Some(t), None) | (None, Some(t)) => {
-                    // Only one flanking marker - use its probs
-                    self.dosage_at_genotyped(t, ref_marker, &get_ref_allele)
-                }
-                (None, None) => 0.0,
-            }
-        }
-    }
-
-    fn dosage_at_genotyped<F>(
-        &self,
-        target_marker: usize,
-        ref_marker: usize,
-        get_ref_allele: &F,
-    ) -> f32
-    where
-        F: Fn(usize, u32) -> u8,
-    {
-        let haps = &self.hap_indices[target_marker];
-        let probs = &self.probs[target_marker];
+        let haps = &self.hap_indices[ref_marker];
+        let probs = &self.probs[ref_marker];
 
         let mut dosage = 0.0f32;
         for (j, &hap) in haps.iter().enumerate() {
             let allele = get_ref_allele(ref_marker, hap);
-            dosage += probs[j] * allele as f32;
-        }
-        dosage
-    }
-
-    fn interpolated_dosage_between<F>(
-        &self,
-        left_marker: usize,
-        weight: f32,
-        ref_marker: usize,
-        get_ref_allele: &F,
-    ) -> f32
-    where
-        F: Fn(usize, u32) -> u8,
-    {
-        // Use probs from left marker and probs_p1 from left marker
-        // Linear interpolation: (1-w) * prob_left + w * prob_right
-        let left_haps = &self.hap_indices[left_marker];
-        let left_probs = &self.probs[left_marker];
-        let left_probs_p1 = &self.probs_p1[left_marker];
-
-        let mut dosage = 0.0f32;
-        for (j, &hap) in left_haps.iter().enumerate() {
-            let allele = get_ref_allele(ref_marker, hap);
-            let interp_prob = (1.0 - weight) * left_probs[j] + weight * left_probs_p1[j];
-            dosage += interp_prob * allele as f32;
+            if allele != 255 {
+                dosage += probs[j] * allele as f32;
+            }
         }
         dosage
     }
@@ -618,8 +523,8 @@ impl ImputationPipeline {
                         ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
 
-                    let d1 = hap1_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
-                    let d2 = hap2_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
+                    let d1 = hap1_probs.dosage(m, &get_ref_allele);
+                    let d2 = hap2_probs.dosage(m, &get_ref_allele);
 
                     // For biallelic sites, record contributions for DR2 calculation
                     let n_alleles = n_alleles_per_marker[m];
