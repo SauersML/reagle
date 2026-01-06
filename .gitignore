@@ -5,3 +5,5 @@ target
 ‎jules.patch‎
 build.log
 **/build
+Rust/.gitignore
+**/Cargo.lock
