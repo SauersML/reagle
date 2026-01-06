@@ -172,11 +172,6 @@ impl StreamingVcfReader {
         })
     }
 
-    /// Get samples
-    pub fn samples(&self) -> &Samples {
-        &self.samples
-    }
-
     /// Get samples Arc
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)

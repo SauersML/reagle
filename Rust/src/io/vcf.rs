@@ -60,16 +60,6 @@ impl MarkerImputationStats {
         }
     }
 
-    /// Add dosage contribution from a haploid sample
-    pub fn add_haploid(&mut self, probs: &[f32]) {
-        self.n_haps += 1;
-        for a in 1..self.sum_al_probs.len() {
-            let dose = probs.get(a).copied().unwrap_or(0.0);
-            self.sum_al_probs[a] += dose;
-            self.sum_al_probs2[a] += dose.powi(2);
-        }
-    }
-
     /// Calculate DR2 (dosage R-squared) for the specified ALT allele
     ///
     /// DR2 estimates the squared correlation between estimated and true dosages.
@@ -102,7 +92,7 @@ impl MarkerImputationStats {
         }
     }
 
-    /// Calculate allele frequency for the specified ALT allele
+    /// Calculate estimated allele frequency for the specified ALT allele
     pub fn allele_freq(&self, allele: usize) -> f32 {
         if allele == 0 || allele >= self.sum_al_probs.len() || self.n_haps == 0 {
             return 0.0;
@@ -155,8 +145,6 @@ impl ImputationQuality {
 
 /// VCF file reader
 pub struct VcfReader {
-    /// The VCF header
-    header: Header,
     /// Sample information
     samples: Arc<Samples>,
 }
@@ -216,22 +204,12 @@ impl VcfReader {
 
         let samples = Arc::new(Samples::from_ids(sample_names));
 
-        Ok((Self { header, samples }, reader))
-    }
-
-    /// Get samples
-    pub fn samples(&self) -> &Samples {
-        &self.samples
+        Ok((Self { samples }, reader))
     }
 
     /// Get samples Arc
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)
-    }
-
-    /// Get header
-    pub fn header(&self) -> &Header {
-        &self.header
     }
 
     /// Read all records into a GenotypeMatrix

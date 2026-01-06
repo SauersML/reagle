@@ -26,21 +26,6 @@ pub struct DictionaryColumn {
 }
 
 impl DictionaryColumn {
-    /// Create a new dictionary column from patterns and mapping
-    pub fn new(
-        patterns: Vec<BitVec<u64, Lsb0>>,
-        hap_to_pattern: Vec<u16>,
-        n_markers: u32,
-        bits_per_allele: u8,
-    ) -> Self {
-        Self {
-            patterns,
-            hap_to_pattern,
-            n_markers,
-            bits_per_allele,
-        }
-    }
-
     /// Compress a set of marker columns into a dictionary block
     pub fn compress(
         columns: &[impl Fn(HapIdx) -> u8],
@@ -128,11 +113,6 @@ impl DictionaryColumn {
         self.n_patterns() as f64 / self.n_haplotypes() as f64
     }
 
-    /// Is this biallelic?
-    pub fn is_biallelic(&self) -> bool {
-        self.bits_per_allele == 1
-    }
-
     /// Count ALT alleles at a marker offset
     pub fn alt_count(&self, marker_offset: usize) -> usize {
         let mut count = 0;
@@ -144,24 +124,9 @@ impl DictionaryColumn {
         count
     }
 
-    /// Iterate alleles at a specific marker
-    pub fn iter_marker(&self, marker_offset: usize) -> impl Iterator<Item = u8> + '_ {
-        (0..self.n_haplotypes()).map(move |h| self.get(marker_offset, HapIdx::new(h as u32)))
-    }
-
     /// Get the pattern index for a haplotype
     pub fn pattern_index(&self, hap: HapIdx) -> u16 {
         self.hap_to_pattern[hap.as_usize()]
-    }
-
-    /// Get haplotypes sharing the same pattern
-    pub fn haplotypes_with_pattern(&self, pattern_idx: u16) -> Vec<HapIdx> {
-        self.hap_to_pattern
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| **p == pattern_idx)
-            .map(|(h, _)| HapIdx::new(h as u32))
-            .collect()
     }
 
     /// Memory usage in bytes

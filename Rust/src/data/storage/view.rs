@@ -66,15 +66,6 @@ impl<'a> GenotypeView<'a> {
             GenotypeView::Mutable { markers, .. } => markers.marker(marker),
         }
     }
-
-    /// Get the markers collection
-    #[inline]
-    pub fn markers(&self) -> &Markers {
-        match self {
-            GenotypeView::Matrix(m) => m.markers(),
-            GenotypeView::Mutable { markers, .. } => markers,
-        }
-    }
 }
 
 /// Conversion from `&GenotypeMatrix` to `GenotypeView`
@@ -87,13 +78,6 @@ impl<'a> From<&'a GenotypeMatrix> for GenotypeView<'a> {
 /// Conversion from `(&'a MutableGenotypes, &'a Markers)` to `GenotypeView`
 impl<'a> From<(&'a MutableGenotypes, &'a Markers)> for GenotypeView<'a> {
     fn from((geno, markers): (&'a MutableGenotypes, &'a Markers)) -> Self {
-        GenotypeView::Mutable { geno, markers }
-    }
-}
-
-impl<'a> GenotypeView<'a> {
-    /// Create a view over mutable genotypes with associated markers
-    pub fn from_mutable(geno: &'a MutableGenotypes, markers: &'a Markers) -> Self {
         GenotypeView::Mutable { geno, markers }
     }
 }

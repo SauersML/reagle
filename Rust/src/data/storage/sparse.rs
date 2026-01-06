@@ -68,12 +68,6 @@ impl SparseColumn {
         }
     }
 
-    /// Check if haplotype is a carrier
-    #[inline]
-    pub fn is_carrier(&self, hap: HapIdx) -> bool {
-        self.carriers.binary_search(&hap).is_ok()
-    }
-
     /// Get carrier indices
     pub fn carriers(&self) -> &[HapIdx] {
         &self.carriers
@@ -93,24 +87,9 @@ impl SparseColumn {
         self.n_haplotypes as usize
     }
 
-    /// Minor allele frequency
-    pub fn maf(&self) -> f64 {
-        let n = self.n_haplotypes as f64;
-        if n == 0.0 {
-            return 0.0;
-        }
-        let alt = self.n_carriers() as f64;
-        (alt / n).min(1.0 - alt / n)
-    }
-
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
         self.carriers.len() * std::mem::size_of::<HapIdx>() + std::mem::size_of::<Self>()
-    }
-
-    /// Iterate all alleles
-    pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
-        (0..self.n_haplotypes).map(move |i| self.get(HapIdx::new(i)))
     }
 
     /// Is this an inverted representation?

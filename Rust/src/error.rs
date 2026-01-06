@@ -16,14 +16,6 @@ pub enum ReagleError {
     #[error("VCF error: {message}")]
     Vcf { message: String },
 
-    /// Invalid data errors (sample count mismatch, marker position out of order)
-    #[error("Invalid data: {message}")]
-    InvalidData { message: String },
-
-    /// Algorithm errors (non-finite probabilities, convergence failures)
-    #[error("Algorithm error: {message}")]
-    Algorithm { message: String },
-
     /// Configuration errors (invalid CLI arguments)
     #[error("Configuration error: {message}")]
     Config { message: String },
@@ -44,20 +36,6 @@ impl ReagleError {
     /// Create a VCF error with a message
     pub fn vcf(message: impl Into<String>) -> Self {
         Self::Vcf {
-            message: message.into(),
-        }
-    }
-
-    /// Create an invalid data error
-    pub fn invalid_data(message: impl Into<String>) -> Self {
-        Self::InvalidData {
-            message: message.into(),
-        }
-    }
-
-    /// Create an algorithm error
-    pub fn algorithm(message: impl Into<String>) -> Self {
-        Self::Algorithm {
             message: message.into(),
         }
     }

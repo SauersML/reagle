@@ -100,78 +100,6 @@ impl HmmUpdater {
             bwd[k] = scale * bwd[k] + shift;
         }
     }
-
-    /// Forward update with allele comparison (convenience wrapper)
-    ///
-    /// Missing data (allele 255) is treated as uninformative (no emission penalty).
-    #[inline]
-    pub fn fwd_update_alleles(
-        fwd: &mut [f32],
-        fwd_sum: f32,
-        p_switch: f32,
-        p_mismatch: f32,
-        target_allele: u8,
-        ref_alleles: &[u8],
-        n_states: usize,
-    ) -> f32 {
-        let emit_probs = [1.0 - p_mismatch, p_mismatch];
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / fwd_sum;
-
-        let mut new_sum = 0.0f32;
-        for k in 0..n_states {
-            // Missing data (255) - no penalty, use match emission
-            let mismatch = if target_allele == 255 || ref_alleles[k] == 255 {
-                0
-            } else if ref_alleles[k] == target_allele {
-                0
-            } else {
-                1
-            };
-            let emit = emit_probs[mismatch];
-            fwd[k] = emit * (scale * fwd[k] + shift);
-            new_sum += fwd[k];
-        }
-        new_sum
-    }
-
-    /// Backward update with allele comparison (convenience wrapper)
-    ///
-    /// Missing data (allele 255) is treated as uninformative (no emission penalty).
-    #[inline]
-    pub fn bwd_update_alleles(
-        bwd: &mut [f32],
-        p_switch: f32,
-        p_mismatch: f32,
-        target_allele: u8,
-        ref_alleles: &[u8],
-        n_states: usize,
-    ) {
-        let emit_probs = [1.0 - p_mismatch, p_mismatch];
-
-        // First: multiply by emission and compute sum
-        let mut sum = 0.0f32;
-        for k in 0..n_states {
-            // Missing data (255) - no penalty, use match emission
-            let mismatch = if target_allele == 255 || ref_alleles[k] == 255 {
-                0
-            } else if ref_alleles[k] == target_allele {
-                0
-            } else {
-                1
-            };
-            bwd[k] *= emit_probs[mismatch];
-            sum += bwd[k];
-        }
-
-        // Then: apply transition
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / sum;
-
-        for k in 0..n_states {
-            bwd[k] = scale * bwd[k] + shift;
-        }
-    }
 }
 
 /// Li-Stephens HMM for a single target haplotype
@@ -206,34 +134,6 @@ impl<'a> LiStephensHmm<'a> {
             ref_haps,
             p_recomb,
         }
-    }
-
-    /// Create HMM from genetic distances (converts to pRecomb internally)
-    pub fn from_gen_dists(
-        ref_gt: impl Into<GenotypeView<'a>>,
-        params: &'a ModelParams,
-        ref_haps: Vec<HapIdx>,
-        gen_dists: &[f64],
-    ) -> Self {
-        let p_recomb = Self::gen_dists_to_p_recomb(gen_dists, params.recomb_intensity);
-        Self::new(ref_gt, params, ref_haps, p_recomb)
-    }
-
-    /// Convert genetic distances to recombination probabilities
-    ///
-    /// Formula: pRecomb = 1 - exp(-recombIntensity * genDist)
-    /// This matches Java MarkerMap.pRecomb
-    fn gen_dists_to_p_recomb(gen_dists: &[f64], recomb_intensity: f32) -> Vec<f32> {
-        let mut p_recomb = Vec::with_capacity(gen_dists.len() + 1);
-        p_recomb.push(0.0); // First marker has no preceding marker
-
-        let c = -(recomb_intensity as f64);
-        for &dist in gen_dists {
-            // -expm1(x) = 1 - exp(x) but more numerically stable
-            let p = -f64::exp_m1(c * dist);
-            p_recomb.push(p as f32);
-        }
-        p_recomb
     }
 
     /// Number of HMM states
@@ -540,18 +440,6 @@ mod tests {
             let sum: f32 = probs.iter().sum();
             assert!((sum - 1.0).abs() < 0.01, "Sum was {}", sum);
         }
-    }
-
-    #[test]
-    fn test_gen_dist_to_p_recomb() {
-        let gen_dists = vec![0.01, 0.02, 0.05]; // cM
-        let p_recomb = LiStephensHmm::gen_dists_to_p_recomb(&gen_dists, 1.0);
-
-        assert_eq!(p_recomb.len(), 4);
-        assert_eq!(p_recomb[0], 0.0); // First marker
-        assert!(p_recomb[1] > 0.0);
-        assert!(p_recomb[2] > p_recomb[1]); // Larger distance = higher recomb prob
-        assert!(p_recomb[3] > p_recomb[2]);
     }
 
     #[test]

@@ -392,8 +392,6 @@ pub struct CodedPbwtView<'a> {
     prefix: &'a mut [u32],
     /// Divergence array (borrowed from workspace)
     divergence: &'a mut [i32],
-    /// Current coded step
-    current_step: usize,
 }
 
 impl<'a> CodedPbwtView<'a> {
@@ -405,11 +403,7 @@ impl<'a> CodedPbwtView<'a> {
         }
         divergence.fill(0);
 
-        Self {
-            prefix,
-            divergence,
-            current_step: 0,
-        }
+        Self { prefix, divergence }
     }
 
     /// Update PBWT with a coded step using counting sort
@@ -428,7 +422,6 @@ impl<'a> CodedPbwtView<'a> {
         let n_patterns = step.n_patterns();
 
         if n_patterns == 0 || n_haps == 0 {
-            self.current_step += 1;
             return;
         }
 
@@ -456,7 +449,7 @@ impl<'a> CodedPbwtView<'a> {
         // Step 3: Distribute haplotypes to their sorted positions
         // We need to track current write position for each pattern
         let mut write_pos: Vec<usize> = offsets[..n_patterns].to_vec();
-        let step_start = self.current_step as i32;
+        let step_start = 0i32;
 
         for i in 0..n_haps {
             let hap = self.prefix[i];
@@ -482,8 +475,6 @@ impl<'a> CodedPbwtView<'a> {
         // Step 4: Copy results back to main arrays
         self.prefix[..n_haps].copy_from_slice(&prefix_scratch[..n_haps]);
         self.divergence[..n_haps].copy_from_slice(&div_scratch[..n_haps]);
-
-        self.current_step += 1;
     }
 
     /// Update PBWT with a coded step (legacy bucket sort version)
@@ -508,7 +499,7 @@ impl<'a> CodedPbwtView<'a> {
 
         // Rebuild arrays
         let mut idx = 0;
-        let step_start = self.current_step as i32;
+        let step_start = 0i32;
 
         for bucket in &buckets {
             let bucket_start = idx;
@@ -523,8 +514,6 @@ impl<'a> CodedPbwtView<'a> {
                 idx += 1;
             }
         }
-
-        self.current_step += 1;
     }
 
     /// Find IBS haplotypes for a target pattern at current step
@@ -560,11 +549,6 @@ impl<'a> CodedPbwtView<'a> {
         }
 
         result
-    }
-
-    /// Current step index
-    pub fn current_step(&self) -> usize {
-        self.current_step
     }
 }
 

@@ -46,17 +46,6 @@ impl GenotypeMatrix {
         }
     }
 
-    /// Create an empty matrix
-    pub fn empty(samples: Arc<Samples>) -> Self {
-        Self {
-            markers: Markers::new(),
-            columns: Vec::new(),
-            samples,
-            is_phased: true,
-            is_reversed: false,
-        }
-    }
-
     /// Number of markers
     pub fn n_markers(&self) -> usize {
         self.markers.len()
@@ -77,11 +66,6 @@ impl GenotypeMatrix {
         self.is_phased
     }
 
-    /// Check if markers are in reverse order
-    pub fn is_reversed(&self) -> bool {
-        self.is_reversed
-    }
-
     /// Get marker by index
     pub fn marker(&self, idx: MarkerIdx) -> &Marker {
         self.markers.marker(idx)
@@ -90,11 +74,6 @@ impl GenotypeMatrix {
     /// Get all markers
     pub fn markers(&self) -> &Markers {
         &self.markers
-    }
-
-    /// Get samples
-    pub fn samples(&self) -> &Samples {
-        &self.samples
     }
 
     /// Get samples Arc
@@ -131,87 +110,10 @@ impl GenotypeMatrix {
         }
     }
 
-    /// Restrict to specific marker indices
-    pub fn restrict_markers(&self, indices: &[usize]) -> Self {
-        let markers = Markers::from_vec(
-            indices
-                .iter()
-                .map(|&i| self.markers.marker(MarkerIdx::new(i as u32)).clone())
-                .collect(),
-            self.markers.chrom_names().to_vec(),
-        );
-        let columns = indices.iter().map(|&i| self.columns[i].clone()).collect();
-
-        Self {
-            markers,
-            columns,
-            samples: Arc::clone(&self.samples),
-            is_phased: self.is_phased,
-            is_reversed: self.is_reversed,
-        }
-    }
-
-    /// Iterate over markers with their columns
-    pub fn iter(&self) -> impl Iterator<Item = (MarkerIdx, &Marker, &GenotypeColumn)> {
-        self.markers
-            .iter()
-            .enumerate()
-            .map(move |(i, m)| (MarkerIdx::new(i as u32), m, &self.columns[i]))
-    }
-
-    /// Iterate over marker indices
-    pub fn marker_indices(&self) -> impl Iterator<Item = MarkerIdx> {
-        (0..self.n_markers()).map(|i| MarkerIdx::new(i as u32))
-    }
-
-    /// Iterate over haplotype indices
-    pub fn haplotype_indices(&self) -> impl Iterator<Item = HapIdx> {
-        (0..self.n_haplotypes()).map(|i| HapIdx::new(i as u32))
-    }
-
-    /// Get alleles for a haplotype across all markers
-    pub fn haplotype(&self, hap: HapIdx) -> Vec<u8> {
-        self.columns.iter().map(|col| col.get(hap)).collect()
-    }
-
-    /// Get alleles for a marker across all haplotypes
-    pub fn alleles_at_marker(&self, marker: MarkerIdx) -> Vec<u8> {
-        let col = &self.columns[marker.as_usize()];
-        (0..self.n_haplotypes())
-            .map(|h| col.get(HapIdx::new(h as u32)))
-            .collect()
-    }
-
-    /// Set the phased flag
-    pub fn set_phased(&mut self, phased: bool) {
-        self.is_phased = phased;
-    }
-
-    /// Set the reversed flag
-    pub fn set_reversed(&mut self, reversed: bool) {
-        self.is_reversed = reversed;
-    }
-
     /// Total memory usage in bytes (approximate)
     pub fn size_bytes(&self) -> usize {
         let column_bytes: usize = self.columns.iter().map(|c| c.size_bytes()).sum();
         column_bytes + std::mem::size_of::<Self>()
-    }
-
-    /// Get column mutably (for phasing updates)
-    pub fn column_mut(&mut self, idx: MarkerIdx) -> &mut GenotypeColumn {
-        &mut self.columns[idx.as_usize()]
-    }
-
-    /// Replace a column
-    pub fn set_column(&mut self, idx: MarkerIdx, column: GenotypeColumn) {
-        self.columns[idx.as_usize()] = column;
-    }
-
-    /// Add a marker and its genotype column
-    pub fn push(&mut self, marker: Marker, column: GenotypeColumn) {
-        self.markers.push(marker);
-        self.columns.push(column);
     }
 }
 

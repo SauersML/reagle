@@ -9,8 +9,6 @@
 //! borrow checker issues), we create a separate Workspace that owns all
 //! temporary buffers and pass `&mut Workspace` to computation functions.
 
-use crate::data::HapIdx;
-
 /// Workspace for phasing HMM computations
 #[derive(Debug)]
 pub struct Workspace {

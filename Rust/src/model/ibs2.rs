@@ -55,8 +55,6 @@ impl Ibs2Segment {
 
 /// Collection of IBS2 segments for all target samples
 pub struct Ibs2 {
-    /// Number of markers
-    n_markers: usize,
     /// IBS2 segments for each sample: sample_segs[sample_idx] = Vec<Ibs2Segment>
     sample_segs: Vec<Vec<Ibs2Segment>>,
 }
@@ -98,7 +96,6 @@ impl Ibs2 {
             .collect();
 
         Self {
-            n_markers,
             sample_segs,
         }
     }
@@ -237,11 +234,6 @@ impl Ibs2 {
         (a1 == 255 || b1 == 255 || a1 == b1) && (a2 == 255 || b2 == 255 || a2 == b2)
     }
 
-    /// Number of markers
-    pub fn n_markers(&self) -> usize {
-        self.n_markers
-    }
-
     /// Number of target samples
     pub fn n_samples(&self) -> usize {
         self.sample_segs.len()
@@ -255,79 +247,12 @@ impl Ibs2 {
             .unwrap_or(0)
     }
 
-    /// Check if two samples are IBS2 at a marker
-    pub fn are_ibs2(&self, sample: SampleIdx, other: SampleIdx, marker: usize) -> bool {
-        if sample == other {
-            return true;
-        }
-
-        let segs = match self.sample_segs.get(sample.0 as usize) {
-            Some(s) => s,
-            None => return false,
-        };
-
-        for seg in segs {
-            if seg.other_sample == other && seg.contains(marker) {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// Check if two samples are IBS2 within an interval
-    pub fn are_ibs2_in_interval(
-        &self,
-        sample: SampleIdx,
-        other: SampleIdx,
-        start: usize,
-        incl_end: usize,
-    ) -> bool {
-        if sample == other {
-            return true;
-        }
-
-        let segs = match self.sample_segs.get(sample.0 as usize) {
-            Some(s) => s,
-            None => return false,
-        };
-
-        for seg in segs {
-            if seg.other_sample == other {
-                // Check for overlap
-                if start <= seg.incl_end && seg.start <= incl_end {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
     /// Get all IBS2 segments for a sample
     pub fn segments(&self, sample: SampleIdx) -> &[Ibs2Segment] {
         self.sample_segs
             .get(sample.0 as usize)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Get samples that are IBS2 with target at a marker
-    pub fn ibs2_samples_at(&self, sample: SampleIdx, marker: usize) -> Vec<SampleIdx> {
-        let mut result = Vec::new();
-
-        let segs = match self.sample_segs.get(sample.0 as usize) {
-            Some(s) => s,
-            None => return result,
-        };
-
-        for seg in segs {
-            if seg.contains(marker) {
-                result.push(seg.other_sample);
-            }
-        }
-
-        result
     }
 }
 

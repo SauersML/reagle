@@ -26,9 +26,8 @@ use crate::io::streaming::{StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
 use crate::model::online_hmm::OnlineHmm;
-use crate::model::parameters::{ModelParams, ParamEstimates};
+use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::GlobalPhaseIbs;
-use crate::utils::workspace::Workspace;
 
 /// Phasing pipeline
 pub struct PhasingPipeline {

@@ -86,12 +86,6 @@ impl MutableGenotypes {
         &self.alleles[marker]
     }
 
-    /// Get mutable alleles at a marker as a BitSlice
-    #[inline]
-    pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut BitSlice<u8, Lsb0> {
-        &mut self.alleles[marker]
-    }
-
     /// Get all alleles for a haplotype
     /// Note: This is now slower than before as it iterates columns
     pub fn haplotype(&self, hap: HapIdx) -> Vec<u8> {
@@ -109,15 +103,6 @@ impl MutableGenotypes {
         row.swap(h1, h2);
     }
 
-    /// Swap alleles between two haplotypes at multiple markers
-    pub fn swap_range(&mut self, markers: &[usize], hap1: HapIdx, hap2: HapIdx) {
-        let h1 = hap1.as_usize();
-        let h2 = hap2.as_usize();
-        for &m in markers {
-            self.alleles[m].swap(h1, h2);
-        }
-    }
-
     /// Swap alleles between two haplotypes for a contiguous range of markers
     #[inline]
     pub fn swap_contiguous(&mut self, start: usize, end: usize, hap1: HapIdx, hap2: HapIdx) {
@@ -126,24 +111,6 @@ impl MutableGenotypes {
         for m in start..end {
             self.alleles[m].swap(h1, h2);
         }
-    }
-
-    /// Copy alleles from another MutableGenotypes
-    pub fn copy_from(&mut self, other: &MutableGenotypes) {
-        debug_assert_eq!(self.n_markers(), other.n_markers());
-        debug_assert_eq!(self.n_haps, other.n_haps);
-        for (dst, src) in self.alleles.iter_mut().zip(other.alleles.iter()) {
-            dst.copy_from_bitslice(src);
-        }
-    }
-
-    /// Get raw alleles (legacy support, expensive)
-    /// Used for reading into GenotypeColumn. 
-    /// WARNING: Allocates new vectors. Avoid using in tight loops.
-    pub fn to_raw_alleles(&self) -> Vec<Vec<u8>> {
-        self.alleles.iter()
-            .map(|row| row.iter().map(|b| if *b { 1 } else { 0 }).collect())
-            .collect()
     }
 }
 

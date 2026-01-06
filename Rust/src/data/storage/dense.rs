@@ -128,13 +128,10 @@ impl DenseColumn {
         self.bits.as_raw_slice().len() * std::mem::size_of::<u64>() + std::mem::size_of::<Self>()
     }
 
-    /// Get raw bits for SIMD operations
-    pub fn raw_bits(&self) -> &BitSlice<u64, Lsb0> {
-        &self.bits
-    }
-
-    /// Get raw u64 slice for fast operations
-    pub fn raw_u64s(&self) -> &[u64] {
+    /// Access the underlying raw u64 storage slice
+    ///
+    /// This allows for bit-parallel operations (SIMD/SWAR) on blocks of 64 haplotypes.
+    pub fn as_raw_slice(&self) -> &[u64] {
         self.bits.as_raw_slice()
     }
 }
