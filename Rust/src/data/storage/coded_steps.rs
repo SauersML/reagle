@@ -168,6 +168,31 @@ impl CodedStep {
 
         best_pattern
     }
+
+    /// Append a haplotype to this step.
+    ///
+    /// Checks if the allele sequence matches an existing pattern.
+    /// If yes, reuses the pattern index. If no, adds a new pattern.
+    /// Returns the pattern index assigned to the haplotype.
+    pub fn append_haplotype(&mut self, alleles: &[u8]) -> u16 {
+        // Look for existing pattern match
+        if let Some(idx) = self
+            .patterns
+            .iter()
+            .position(|p| p.as_slice() == alleles)
+        {
+            let pattern_idx = idx as u16;
+            self.hap_to_pattern.push(pattern_idx);
+            pattern_idx
+        } else {
+            // Add new pattern
+            let pattern_idx = self.patterns.len() as u16;
+            self.patterns.push(alleles.to_vec());
+            self.n_patterns = self.patterns.len();
+            self.hap_to_pattern.push(pattern_idx);
+            pattern_idx
+        }
+    }
 }
 
 /// Collection of coded steps for a chromosome
@@ -257,6 +282,73 @@ impl RefPanelCoded {
     /// Number of haplotypes
     pub fn n_haps(&self) -> usize {
         self.n_haps
+    }
+
+    /// Get mutable reference to a step
+    pub fn step_mut(&mut self, idx: usize) -> &mut CodedStep {
+        &mut self.steps[idx]
+    }
+
+    /// Append target haplotypes to the coded reference panel.
+    ///
+    /// For each step, extracts the relevant markers from the target genotype matrix
+    /// (using the alignment to map target markers to reference markers and handle 
+    /// strand flips), then appends each target haplotype to the step.
+    ///
+    /// # Arguments
+    /// * `target_gt` - Target genotype matrix (with target markers)
+    /// * `ref_to_target` - For each reference marker, the corresponding target marker index (-1 if not in target)
+    /// * `map_allele` - Function to map target allele to reference allele space
+    ///
+    /// After this call, the panel contains `n_ref_haps + n_target_haps` haplotypes.
+    pub fn append_target_haplotypes<F>(
+        &mut self,
+        target_gt: &GenotypeMatrix,
+        ref_to_target: &[i32],
+        map_allele: F,
+    ) where
+        F: Fn(usize, u8) -> u8,
+    {
+        let n_target_haps = target_gt.n_haplotypes();
+        if n_target_haps == 0 {
+            return;
+        }
+
+        // Process each step
+        for step in &mut self.steps {
+            let n_markers_in_step = step.end - step.start;
+            let mut allele_buffer = vec![0u8; n_markers_in_step];
+
+            // For each target haplotype
+            for h in 0..n_target_haps {
+                let hap_idx = HapIdx::new(h as u32);
+
+                // Extract alleles for this step's marker range
+                for (offset, ref_m) in (step.start..step.end).enumerate() {
+                    let target_m_idx = ref_to_target.get(ref_m).copied().unwrap_or(-1);
+                    
+                    let allele = if target_m_idx >= 0 {
+                        let target_m = target_m_idx as usize;
+                        let raw_allele = target_gt.allele(
+                            crate::data::marker::MarkerIdx::new(target_m as u32),
+                            hap_idx,
+                        );
+                        map_allele(target_m, raw_allele)
+                    } else {
+                        // Reference marker not in target - use missing value
+                        255
+                    };
+                    
+                    allele_buffer[offset] = allele;
+                }
+
+                // Append the haplotype to this step
+                step.append_haplotype(&allele_buffer);
+            }
+        }
+
+        // Update total haplotype count
+        self.n_haps += n_target_haps;
     }
 }
 

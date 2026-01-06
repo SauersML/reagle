@@ -158,6 +158,13 @@ impl MarkerAlignment {
         }
     }
 
+    /// Get the ref_to_target mapping array
+    ///
+    /// For each reference marker, returns the corresponding target marker index (-1 if not in target)
+    pub fn ref_to_target(&self) -> &[i32] {
+        &self.ref_to_target
+    }
+
     /// Find flanking genotyped markers for a reference marker
     /// Returns (left_ref_marker, right_ref_marker, interpolation_weight)
     pub fn flanking_markers(&self, ref_marker: usize) -> (usize, usize, f32) {
