@@ -78,7 +78,7 @@ impl CodedStep {
                 .position(|p| p.as_slice() == scratch.as_slice())
                 .map(|i| i as u16)
                 .unwrap_or_else(|| {
-                    // Only allocate when we discover a NEW unique pattern
+                    // Only allocate when we discover a unique pattern
                     let idx = patterns.len() as u16;
                     patterns.push(scratch.clone()); // Only allocation per unique pattern
                     idx

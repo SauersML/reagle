@@ -101,17 +101,6 @@ impl PhasingPipeline {
 
         let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
 
-        // NOTE: These full-marker-set distances are kept for reference but not used in two-stage phasing.
-        // Stage 1 computes distances only between high-frequency markers (see stage1_gen_dists below).
-        let _gen_dists: Vec<f64> = marker_map
-            .gen_distances()
-            .iter()
-            .map(|&d| d as f64)
-            .collect();
-
-        // Full marker set p_recomb (not used in two-stage phasing)
-        let _p_recomb = marker_map.p_recomb(self.params.recomb_intensity);
-
         // Compute MAF for each marker (used by IBS2 and two-stage phasing)
         let maf: Vec<f32> = (0..n_markers)
             .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
