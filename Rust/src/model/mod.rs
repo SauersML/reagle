@@ -16,3 +16,4 @@ pub mod pbwt;
 pub mod phase_ibs;
 pub mod recursive_ibs;
 pub mod states;
+pub mod target_clusters;

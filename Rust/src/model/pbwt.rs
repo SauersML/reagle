@@ -155,14 +155,15 @@ impl PbwtDivUpdater {
 
         self.ensure_capacity(2);
 
-        // For i32, saturating_sub(1) correctly yields -1 for marker 0
-        // (saturates at i32::MIN, not 0). This allows detecting "match extends past start".
-        let init_value = (marker as i32).saturating_sub(1);
+        // For backward PBWT, divergence indicates how far FORWARD (toward higher indices)
+        // the match extends. Larger divergence = longer match.
+        // Initialize to current marker: "match starts here"
+        let init_value = marker as i32;
 
         // Pass 1: Count zeros
         let mut c0 = 0;
         for i in 0..self.n_haps {
-             if unsafe { *alleles.get_unchecked(*prefix.get_unchecked(i) as usize) } == 0 {
+            if unsafe { *alleles.get_unchecked(*prefix.get_unchecked(i) as usize) } == 0 {
                 c0 += 1;
             }
         }
@@ -170,7 +171,8 @@ impl PbwtDivUpdater {
         // Pass 2: Scatter
         let mut idx0 = 0;
         let mut idx1 = c0;
-        
+
+        // For backward PBWT: use max() to propagate (larger = longer match)
         let mut p0 = init_value;
         let mut p1 = init_value;
 
@@ -179,23 +181,23 @@ impl PbwtDivUpdater {
             let div = unsafe { *divergence.get_unchecked(i) };
             let allele = unsafe { *alleles.get_unchecked(hap as usize) };
 
-            // Backward PBWT uses min() for propagation
-            if div < p0 { p0 = div; }
-            if div < p1 { p1 = div; }
+            // Backward PBWT uses max() for propagation (larger divergence = longer match)
+            if div > p0 { p0 = div; }
+            if div > p1 { p1 = div; }
 
             if allele == 0 {
                 unsafe {
                     *self.scratch_a.get_unchecked_mut(idx0) = hap;
                     *self.scratch_d.get_unchecked_mut(idx0) = p0;
                 }
-                p0 = i32::MAX; // Reset for min
+                p0 = init_value; // Reset to current marker for next group
                 idx0 += 1;
             } else {
                 unsafe {
                     *self.scratch_a.get_unchecked_mut(idx1) = hap;
                     *self.scratch_d.get_unchecked_mut(idx1) = p1;
                 }
-                p1 = i32::MAX; // Reset for min
+                p1 = init_value; // Reset to current marker for next group
                 idx1 += 1;
             }
         }
@@ -401,8 +403,10 @@ impl PbwtDivUpdater {
         self.ensure_capacity(n_alleles);
 
         // 1. Initialize p array (propagation) - Backward Direction
-        // For i32, saturating_sub(1) correctly yields -1 for marker 0.
-        let init_value = (marker as i32).saturating_sub(1);
+        // For backward PBWT, divergence indicates how far FORWARD the match extends.
+        // Larger divergence = longer match. Initialize to current marker.
+        let init_value = marker as i32;
+
         // 2. Count frequencies
         self.counts[..n_alleles].fill(0);
         for i in 0..self.n_haps {
@@ -419,7 +423,7 @@ impl PbwtDivUpdater {
             running += self.counts[i];
         }
 
-        // 4. Scatter (maintaining min divergence)
+        // 4. Scatter (maintaining max divergence for backward PBWT)
         self.counts[..n_alleles].fill(0);
         self.p[..n_alleles].fill(init_value);
 
@@ -429,9 +433,9 @@ impl PbwtDivUpdater {
             let allele = alleles[hap as usize] as usize;
             let allele = if allele >= n_alleles { 0 } else { allele };
 
-            // Update p: min(p, div) for backward, for ALL alleles
+            // Update p: max(p, div) for backward (larger = longer match)
             for j in 0..n_alleles {
-                if div < self.p[j] {
+                if div > self.p[j] {
                     self.p[j] = div;
                 }
             }
@@ -443,7 +447,7 @@ impl PbwtDivUpdater {
             self.scratch_a[pos] = hap;
             self.scratch_d[pos] = self.p[allele];
 
-            self.p[allele] = i32::MAX; // Reset with MAX for min-tracking
+            self.p[allele] = init_value; // Reset to current marker for next group
             self.counts[allele] += 1;
         }
 
@@ -467,13 +471,14 @@ impl PbwtDivUpdater {
         self.ensure_capacity(n_alleles);
 
         // 1. Initialize p array (propagation) - Backward Direction
-        // For i32, saturating_sub(1) correctly yields -1 for marker 0.
-        let init_value = (marker as i32).saturating_sub(1);
-        
+        // For backward PBWT, divergence indicates how far FORWARD the match extends.
+        // Larger divergence = longer match. Initialize to current marker.
+        let init_value = marker as i32;
+
         // 2. Count frequencies
         self.counts[0] = 0;
         self.counts[1] = 0;
-        
+
         for i in 0..self.n_haps {
             let hap = prefix[i] as usize;
             let word_idx = hap / 64;
@@ -486,24 +491,24 @@ impl PbwtDivUpdater {
         self.offsets[0] = 0;
         self.offsets[1] = self.counts[0];
 
-        // 4. Scatter (maintaining min divergence)
+        // 4. Scatter (maintaining max divergence for backward PBWT)
         self.counts[0] = 0;
         self.counts[1] = 0;
-        
+
         self.p[0] = init_value;
         self.p[1] = init_value;
 
         for i in 0..self.n_haps {
             let hap = prefix[i] as usize;
             let div = divergence[i];
-            
+
             let word_idx = hap / 64;
             let bit_idx = hap % 64;
             let allele = ((alleles_packed[word_idx] >> bit_idx) & 1) as usize;
 
-            // Update p: min(p, div) for backward, for ALL alleles
-            if div < self.p[0] { self.p[0] = div; }
-            if div < self.p[1] { self.p[1] = div; }
+            // Update p: max(p, div) for backward (larger = longer match)
+            if div > self.p[0] { self.p[0] = div; }
+            if div > self.p[1] { self.p[1] = div; }
 
             let base = self.offsets[allele];
             let offset = self.counts[allele];
@@ -512,7 +517,7 @@ impl PbwtDivUpdater {
             self.scratch_a[pos] = hap as u32;
             self.scratch_d[pos] = self.p[allele];
 
-            self.p[allele] = i32::MAX; // Reset with MAX for min-tracking
+            self.p[allele] = init_value; // Reset to current marker for next group
             self.counts[allele] += 1;
         }
 

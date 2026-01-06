@@ -282,6 +282,208 @@ impl<'a> ImpStates<'a> {
         n_states
     }
 
+    /// Select IBS-based HMM states using TARGET-BASED CLUSTERS.
+    ///
+    /// This is the preferred method for sparse targets (e.g., genotyping arrays).
+    /// Unlike `ibs_states`, this iterates over target-defined clusters where every
+    /// cluster has informative data, matching Java Beagle's approach.
+    ///
+    /// # Arguments
+    /// * `target_alleles` - Target alleles in **target marker space** (dense, no gaps)
+    /// * `targ_cluster_start` - Target marker index for start of each cluster
+    /// * `targ_cluster_end` - Target marker index for end of each cluster (exclusive)
+    /// * `ref_cluster_start` - Reference marker index for start of each cluster
+    /// * `workspace` - Pre-allocated workspace buffers
+    /// * `get_cluster_allele` - Returns (ref_allele, target_allele) for (cluster, ref_hap)
+    /// * `hap_indices` - Output: reference haplotype indices at each cluster
+    /// * `allele_match` - Output: whether each state matches target at each cluster
+    ///
+    /// # Returns
+    /// Number of states selected
+    pub fn ibs_states_clustered<F>(
+        &mut self,
+        target_alleles: &[u8],
+        targ_cluster_start: &[usize],
+        targ_cluster_end: &[usize],
+        ref_cluster_start: &[usize],
+        workspace: &mut ImpWorkspace,
+        get_cluster_allele: F,
+        hap_indices: &mut Vec<Vec<u32>>,
+        allele_match: &mut Vec<Vec<bool>>,
+    ) -> usize
+    where
+        F: Fn(usize, u32) -> (u8, u8), // (ref_allele, target_allele)
+    {
+        self.initialize();
+
+        let n_ref_haps = self.n_ref_haps;
+        let n_steps = self.ref_panel.n_steps();
+        let n_clusters = targ_cluster_start.len();
+        let n_ibs_haps = self.n_ibs_haps;
+        workspace.resize_with_ref(self.max_states, self.n_ref_markers, n_ref_haps);
+
+        // Build mapping from reference step to target cluster (if any)
+        // A reference step maps to a target cluster if the step's markers overlap
+        // with the cluster's reference marker range
+        let step_to_cluster: Vec<Option<usize>> = (0..n_steps)
+            .map(|step_idx| {
+                let coded_step = self.ref_panel.step(step_idx);
+                let step_start = coded_step.start;
+                let step_end = coded_step.end;
+                // Find cluster that overlaps this step
+                for (c, &ref_start) in ref_cluster_start.iter().enumerate() {
+                    let ref_end = if c + 1 < n_clusters {
+                        ref_cluster_start[c + 1]
+                    } else {
+                        self.n_ref_markers
+                    };
+                    // Check if step overlaps cluster's reference range
+                    if step_start < ref_end && step_end > ref_start {
+                        return Some(c);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // Store backward IBS haps for each cluster
+        let mut bwd_ibs_per_cluster: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
+
+        // STEP 1: Backward PBWT pass
+        {
+            let mut pbwt_bwd = CodedPbwtView::new_backward(
+                &mut workspace.pbwt_prefix_bwd[..n_ref_haps],
+                &mut workspace.pbwt_divergence_bwd[..n_ref_haps + 1],
+                n_steps,
+            );
+
+            for step_idx in (0..n_steps).rev() {
+                let coded_step = self.ref_panel.step(step_idx);
+                let step_start = coded_step.start;
+                let step_end = coded_step.end;
+
+                pbwt_bwd.update_backward(coded_step, n_steps);
+
+                // Only do IBS matching if this step maps to a target cluster
+                if let Some(cluster) = step_to_cluster[step_idx] {
+                    let targ_start = targ_cluster_start[cluster];
+                    let targ_end = targ_cluster_end[cluster];
+
+                    // Build target sequence for this step from target alleles
+                    let target_seq: Vec<u8> = (step_start..step_end)
+                        .map(|_| {
+                            // Use majority allele from target markers in this cluster
+                            // For simplicity, use first non-missing allele
+                            (targ_start..targ_end)
+                                .map(|t| target_alleles.get(t).copied().unwrap_or(255))
+                                .find(|&a| a != 255)
+                                .unwrap_or(0)
+                        })
+                        .collect();
+
+                    let bwd_ibs: Vec<u32> =
+                        if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                            pbwt_bwd
+                                .find_ibs(target_pattern, coded_step, n_ibs_haps)
+                                .into_iter()
+                                .map(|h| h.0)
+                                .collect()
+                        } else {
+                            let closest_pattern = coded_step.closest_pattern(&target_seq);
+                            pbwt_bwd
+                                .find_ibs(closest_pattern, coded_step, n_ibs_haps)
+                                .into_iter()
+                                .map(|h| h.0)
+                                .collect()
+                        };
+
+                    bwd_ibs_per_cluster[cluster].extend(bwd_ibs);
+                }
+            }
+        }
+
+        // STEP 2: Forward PBWT pass + composite haplotype building
+        {
+            let mut pbwt_fwd = CodedPbwtView::new(
+                &mut workspace.pbwt_prefix[..n_ref_haps],
+                &mut workspace.pbwt_divergence[..n_ref_haps + 1],
+            );
+
+            for step_idx in 0..n_steps {
+                let coded_step = self.ref_panel.step(step_idx);
+                let step_start = coded_step.start;
+                let step_end = coded_step.end;
+
+                pbwt_fwd.update_counting_sort(
+                    coded_step,
+                    &mut workspace.sort_counts,
+                    &mut workspace.sort_offsets,
+                    &mut workspace.sort_prefix_scratch,
+                    &mut workspace.sort_div_scratch,
+                );
+
+                // Only do IBS matching if this step maps to a target cluster
+                if let Some(cluster) = step_to_cluster[step_idx] {
+                    let targ_start = targ_cluster_start[cluster];
+                    let targ_end = targ_cluster_end[cluster];
+
+                    // Build target sequence for this step
+                    let target_seq: Vec<u8> = (step_start..step_end)
+                        .map(|_| {
+                            (targ_start..targ_end)
+                                .map(|t| target_alleles.get(t).copied().unwrap_or(255))
+                                .find(|&a| a != 255)
+                                .unwrap_or(0)
+                        })
+                        .collect();
+
+                    let fwd_ibs: Vec<u32> =
+                        if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                            pbwt_fwd
+                                .find_ibs(target_pattern, coded_step, n_ibs_haps)
+                                .into_iter()
+                                .map(|h| h.0)
+                                .collect()
+                        } else {
+                            let closest_pattern = coded_step.closest_pattern(&target_seq);
+                            pbwt_fwd
+                                .find_ibs(closest_pattern, coded_step, n_ibs_haps)
+                                .into_iter()
+                                .map(|h| h.0)
+                                .collect()
+                        };
+
+                    // Update composite haplotypes with IBS matches from BOTH directions
+                    // Use cluster index for state recency tracking
+                    for hap in fwd_ibs {
+                        self.update_with_ibs_hap(hap, cluster as i32);
+                    }
+                    for &hap in &bwd_ibs_per_cluster[cluster] {
+                        self.update_with_ibs_hap(hap, cluster as i32);
+                    }
+                }
+            }
+        }
+
+        // If queue is empty, fill with random haplotypes
+        if self.queue.is_empty() {
+            self.fill_with_random_haps();
+        }
+
+        // Build output arrays indexed by cluster
+        let n_states = self.queue.len().min(self.max_states);
+        self.build_output_clustered(
+            get_cluster_allele,
+            n_clusters,
+            ref_cluster_start,
+            n_states,
+            hap_indices,
+            allele_match,
+        );
+
+        n_states
+    }
+
     fn initialize(&mut self) {
         self.hap_to_last_ibs.clear();
         self.threaded_haps.clear();
@@ -396,6 +598,57 @@ impl<'a> ImpStates<'a> {
                 }
             }
         }
+    }
+
+    /// Build output arrays indexed by TARGET CLUSTER instead of reference marker.
+    ///
+    /// This matches Java Beagle's approach where HMM runs on clusters defined by
+    /// target marker positions, ensuring every cluster has informative data.
+    ///
+    /// # Arguments
+    /// * `get_cluster_allele` - Returns (ref_hap_allele, target_allele) for (cluster, ref_hap)
+    /// * `n_clusters` - Number of target clusters
+    /// * `cluster_to_ref_start` - Maps cluster index to reference marker start
+    /// * `n_states` - Number of HMM states
+    /// * `hap_indices` - Output: reference haplotype at each (cluster, state)
+    /// * `allele_match` - Output: whether state matches target at each cluster
+    pub fn build_output_clustered<F>(
+        &mut self,
+        get_cluster_allele: F,
+        n_clusters: usize,
+        cluster_to_ref_start: &[usize],
+        n_states: usize,
+        hap_indices: &mut Vec<Vec<u32>>,
+        allele_match: &mut Vec<Vec<bool>>,
+    ) where
+        F: Fn(usize, u32) -> (u8, u8), // (ref_allele, target_allele)
+    {
+        hap_indices.clear();
+        hap_indices.resize(n_clusters, vec![0; n_states]);
+        allele_match.clear();
+        allele_match.resize(n_clusters, vec![false; n_states]);
+
+        self.threaded_haps.reset_cursors();
+
+        for cluster in 0..n_clusters {
+            // Get the reference marker corresponding to this cluster start
+            let ref_m = cluster_to_ref_start[cluster];
+
+            for (j, entry) in self.queue.iter().take(n_states).enumerate() {
+                if entry.comp_hap_idx < self.threaded_haps.n_states() {
+                    let hap = self.threaded_haps.hap_at_raw(entry.comp_hap_idx, ref_m);
+                    hap_indices[cluster][j] = hap;
+
+                    let (ref_allele, target_allele) = get_cluster_allele(cluster, hap);
+                    allele_match[cluster][j] = target_allele == 255 || ref_allele == target_allele;
+                }
+            }
+        }
+    }
+
+    /// Get the number of states currently in the queue
+    pub fn n_active_states(&self) -> usize {
+        self.queue.len().min(self.max_states)
     }
 }
 
