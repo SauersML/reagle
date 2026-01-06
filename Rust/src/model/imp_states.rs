@@ -75,6 +75,147 @@ impl CompositeHap {
 }
 
 // ============================================================================
+// Threaded Arena Layout (Linked List in Vecs) for O(1) Updates
+// ============================================================================
+
+/// Arena-based storage for composite haplotypes using threaded indices.
+///
+/// This avoids the O(N) shift cost of standard SoA insertion and the
+/// heap fragmentation of `Vec<CompositeHap>`.
+///
+/// # Memory Layout
+/// Segments are stored in a global arena (vectors). Each composite haplotype
+/// is a linked list of segment indices.
+///
+/// - `segments_hap`: Haplotype ID for the segment
+/// - `segments_end`: End marker for the segment
+/// - `segments_next`: Index of the next segment in the arena (or u32::MAX)
+#[derive(Clone, Debug)]
+pub struct ThreadedHaps {
+    // --- Arena Storage ---
+    segments_hap: Vec<u32>,
+    segments_end: Vec<u32>,
+    segments_next: Vec<u32>,
+
+    // --- State Pointers ---
+    // Index of the first segment for each state
+    state_heads: Vec<u32>,
+    // Index of the last segment for each state (for O(1) append)
+    state_tails: Vec<u32>,
+    // Current iteration cursor for each state
+    state_cursors: Vec<u32>,
+
+    // --- Metadata ---
+    n_markers: usize,
+    // List of active state indices (holes are possible if we supported removal, 
+    // but here we only add/replace)
+    // We assume states are 0..n_states
+}
+
+impl ThreadedHaps {
+    const NIL: u32 = u32::MAX;
+
+    /// Create new threaded haps arena
+    pub fn new(initial_capacity_states: usize, initial_capacity_segments: usize, n_markers: usize) -> Self {
+        Self {
+            segments_hap: Vec::with_capacity(initial_capacity_segments),
+            segments_end: Vec::with_capacity(initial_capacity_segments),
+            segments_next: Vec::with_capacity(initial_capacity_segments),
+            state_heads: Vec::with_capacity(initial_capacity_states),
+            state_tails: Vec::with_capacity(initial_capacity_states),
+            state_cursors: Vec::with_capacity(initial_capacity_states),
+            n_markers,
+        }
+    }
+
+    /// Clear all states (keeps capacity)
+    pub fn clear(&mut self) {
+        self.segments_hap.clear();
+        self.segments_end.clear();
+        self.segments_next.clear();
+        self.state_heads.clear();
+        self.state_tails.clear();
+        self.state_cursors.clear();
+    }
+
+    /// Number of active states
+    pub fn n_states(&self) -> usize {
+        self.state_heads.len()
+    }
+
+    /// Initialize a new state starting with given hap
+    /// Returns the state index
+    pub fn push_new(&mut self, start_hap: u32) -> usize {
+        let state_idx = self.state_heads.len();
+        
+        // Create first segment
+        let seg_idx = self.segments_hap.len() as u32;
+        self.segments_hap.push(start_hap);
+        self.segments_end.push(self.n_markers as u32);
+        self.segments_next.push(Self::NIL);
+
+        // Register state
+        self.state_heads.push(seg_idx);
+        self.state_tails.push(seg_idx);
+        self.state_cursors.push(seg_idx);
+
+        state_idx
+    }
+
+    /// Add a segment to an existing state
+    /// 
+    /// # Arguments
+    /// * `state_idx` - Index of the state to extend
+    /// * `hap` - Reference haplotype for the new segment
+    /// * `start_marker` - Start marker of the new segment (truncates previous segment)
+    pub fn add_segment(&mut self, state_idx: usize, hap: u32, start_marker: usize) {
+        let tail_idx = self.state_tails[state_idx] as usize;
+
+        // Truncate previous segment
+        // Note: In standard Beagle logic, we might need to handle cases where 
+        // start_marker <= prev_start (complete overwrite). 
+        // But usually we move forward.
+        self.segments_end[tail_idx] = start_marker as u32;
+
+        // Create new segment
+        let new_seg_idx = self.segments_hap.len() as u32;
+        self.segments_hap.push(hap);
+        self.segments_end.push(self.n_markers as u32);
+        self.segments_next.push(Self::NIL);
+
+        // Link
+        self.segments_next[tail_idx] = new_seg_idx;
+        self.state_tails[state_idx] = new_seg_idx;
+    }
+
+    /// Get haplotype at marker for a state (advances cursor)
+    #[inline]
+    pub fn hap_at(&mut self, state_idx: usize, marker: usize) -> u32 {
+        let mut cur = self.state_cursors[state_idx] as usize;
+
+        // Advance while marker is past this segment's end
+        // (Fast path: most checks just return current)
+        while marker >= self.segments_end[cur] as usize {
+            let next = self.segments_next[cur];
+            if next == Self::NIL {
+                break; 
+            }
+            cur = next as usize;
+        }
+        
+        self.state_cursors[state_idx] = cur as u32;
+        self.segments_hap[cur]
+    }
+
+    /// Reset cursors for all states (for new iteration pass)
+    pub fn reset_cursors(&mut self) {
+        // Reset cursors to heads
+        // Optimized: copy_from_slice is fast
+        self.state_cursors.copy_from_slice(&self.state_heads);
+    }
+}
+
+// ============================================================================
 // Structure of Arrays (SoA) Layout for Cache-Friendly Access
 // ============================================================================
 
@@ -480,13 +621,22 @@ impl ImpIbs {
 
     /// Update forward PBWT with alleles at a marker
     pub fn update(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
-        self.pbwt_updater.fwd_update(
-            alleles,
-            n_alleles,
-            marker,
-            &mut self.fwd_prefix,
-            &mut self.fwd_divergence[..self.n_ref_haps],
-        );
+        if n_alleles <= 2 {
+            self.pbwt_updater.fwd_update_biallelic(
+                alleles,
+                marker,
+                &mut self.fwd_prefix,
+                &mut self.fwd_divergence[..self.n_ref_haps],
+            );
+        } else {
+            self.pbwt_updater.fwd_update(
+                alleles,
+                n_alleles,
+                marker,
+                &mut self.fwd_prefix,
+                &mut self.fwd_divergence[..self.n_ref_haps],
+            );
+        }
     }
 
     /// Update backward PBWT with alleles at a marker
@@ -496,13 +646,22 @@ impl ImpIbs {
     /// - Uses min() for propagation (not max())
     /// - Resets p[allele] with i32::MAX (not i32::MIN)
     pub fn update_bwd(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
-        self.pbwt_updater.bwd_update(
-            alleles,
-            n_alleles,
-            marker,
-            &mut self.bwd_prefix,
-            &mut self.bwd_divergence[..self.n_ref_haps],
-        );
+        if n_alleles <= 2 {
+            self.pbwt_updater.bwd_update_biallelic(
+                alleles,
+                marker,
+                &mut self.bwd_prefix,
+                &mut self.bwd_divergence[..self.n_ref_haps],
+            );
+        } else {
+            self.pbwt_updater.bwd_update(
+                alleles,
+                n_alleles,
+                marker,
+                &mut self.bwd_prefix,
+                &mut self.bwd_divergence[..self.n_ref_haps],
+            );
+        }
     }
 
     /// Find IBS haplotypes for a target allele at current PBWT position
@@ -750,8 +909,8 @@ pub struct ImpStatesMutable {
     ibs: ImpIbs,
     /// Coded steps configuration
     coded_steps: CodedSteps,
-    /// Composite haplotypes (the HMM states)
-    comp_haps: Vec<CompositeHap>,
+    /// Composite haplotypes (the HMM states) - Optimized Arena
+    threaded_haps: ThreadedHaps,
     /// Map from reference haplotype to last IBS step
     hap_to_last_ibs: HashMap<u32, i32>,
     /// Priority queue for managing composite haplotypes
@@ -770,8 +929,8 @@ pub struct ImpStates<'a> {
     ref_panel: &'a RefPanelCoded,
     /// Coded steps configuration
     coded_steps: CodedSteps,
-    /// Composite haplotypes (the HMM states)
-    comp_haps: Vec<CompositeHap>,
+    /// Composite haplotypes (the HMM states) - Optimized Arena
+    threaded_haps: ThreadedHaps,
     /// Map from reference haplotype to last IBS step
     hap_to_last_ibs: HashMap<u32, i32>,
     /// Priority queue for managing composite haplotypes
@@ -797,7 +956,7 @@ impl<'a> ImpStates<'a> {
             max_states,
             ref_panel,
             coded_steps,
-            comp_haps: Vec::with_capacity(max_states),
+            threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_markers),
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
             n_markers,
@@ -958,7 +1117,7 @@ impl<'a> ImpStates<'a> {
 
     fn initialize(&mut self) {
         self.hap_to_last_ibs.clear();
-        self.comp_haps.clear();
+        self.threaded_haps.clear();
         self.queue.clear();
     }
 
@@ -978,11 +1137,11 @@ impl<'a> ImpStates<'a> {
                     self.hap_to_last_ibs.remove(&head.hap);
 
                     // Update composite haplotype with new segment
-                    if head.comp_hap_idx < self.comp_haps.len() {
-                        self.comp_haps[head.comp_hap_idx].add_segment(
+                    if head.comp_hap_idx < self.threaded_haps.n_states() {
+                        self.threaded_haps.add_segment(
+                            head.comp_hap_idx,
                             hap,
                             start_marker,
-                            self.n_markers,
                         );
                     }
 
@@ -993,8 +1152,7 @@ impl<'a> ImpStates<'a> {
                 }
             } else {
                 // Add new composite haplotype
-                let comp_hap_idx = self.comp_haps.len();
-                self.comp_haps.push(CompositeHap::new(hap, self.n_markers));
+                let comp_hap_idx = self.threaded_haps.push_new(hap);
                 self.queue.push(CompHapEntry {
                     comp_hap_idx,
                     hap,
@@ -1039,8 +1197,7 @@ impl<'a> ImpStates<'a> {
 
         // Take first n_states from shuffled list
         for &h in hap_indices.iter().take(n_states) {
-            let comp_hap_idx = self.comp_haps.len();
-            self.comp_haps.push(CompositeHap::new(h, self.n_markers));
+            let comp_hap_idx = self.threaded_haps.push_new(h);
             self.queue.push(CompHapEntry {
                 comp_hap_idx,
                 hap: h,
@@ -1067,17 +1224,15 @@ impl<'a> ImpStates<'a> {
         allele_match.resize(self.n_markers, vec![false; n_states]);
 
         // Reset composite haplotypes for iteration
-        for comp_hap in &mut self.comp_haps {
-            comp_hap.reset();
-        }
+        self.threaded_haps.reset_cursors();
 
         // Build output for each marker
         for m in 0..self.n_markers {
             let target_allele = target_alleles.get(m).copied().unwrap_or(255);
 
             for (j, entry) in self.queue.iter().take(n_states).enumerate() {
-                if entry.comp_hap_idx < self.comp_haps.len() {
-                    let hap = self.comp_haps[entry.comp_hap_idx].hap_at(m);
+                if entry.comp_hap_idx < self.threaded_haps.n_states() {
+                    let hap = self.threaded_haps.hap_at(entry.comp_hap_idx, m);
                     hap_indices[m][j] = hap;
 
                     let ref_allele = get_ref_allele(m, hap);
@@ -1103,7 +1258,7 @@ impl ImpStatesMutable {
             max_states,
             ibs: ImpIbs::new(n_ref_haps, config.n_ibs_haps),
             coded_steps,
-            comp_haps: Vec::with_capacity(max_states),
+            threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_markers),
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
             n_markers,
@@ -1211,7 +1366,7 @@ impl ImpStatesMutable {
 
     fn initialize(&mut self) {
         self.hap_to_last_ibs.clear();
-        self.comp_haps.clear();
+        self.threaded_haps.clear();
         self.queue.clear();
         self.ibs.reset();
     }
@@ -1232,11 +1387,11 @@ impl ImpStatesMutable {
                     self.hap_to_last_ibs.remove(&head.hap);
 
                     // Update composite haplotype with new segment
-                    if head.comp_hap_idx < self.comp_haps.len() {
-                        self.comp_haps[head.comp_hap_idx].add_segment(
+                    if head.comp_hap_idx < self.threaded_haps.n_states() {
+                        self.threaded_haps.add_segment(
+                            head.comp_hap_idx,
                             hap,
                             start_marker,
-                            self.n_markers,
                         );
                     }
 
@@ -1247,8 +1402,7 @@ impl ImpStatesMutable {
                 }
             } else {
                 // Add new composite haplotype
-                let comp_hap_idx = self.comp_haps.len();
-                self.comp_haps.push(CompositeHap::new(hap, self.n_markers));
+                let comp_hap_idx = self.threaded_haps.push_new(hap);
                 self.queue.push(CompHapEntry {
                     comp_hap_idx,
                     hap,
@@ -1292,8 +1446,7 @@ impl ImpStatesMutable {
 
         // Take first n_states from shuffled list
         for &h in hap_indices.iter().take(n_states) {
-            let comp_hap_idx = self.comp_haps.len();
-            self.comp_haps.push(CompositeHap::new(h, self.n_markers));
+            let comp_hap_idx = self.threaded_haps.push_new(h);
             self.queue.push(CompHapEntry {
                 comp_hap_idx,
                 hap: h,
@@ -1320,17 +1473,15 @@ impl ImpStatesMutable {
         allele_match.resize(self.n_markers, vec![false; n_states]);
 
         // Reset composite haplotypes for iteration
-        for comp_hap in &mut self.comp_haps {
-            comp_hap.reset();
-        }
+        self.threaded_haps.reset_cursors();
 
         // Build output for each marker
         for m in 0..self.n_markers {
             let target_allele = target_alleles.get(m).copied().unwrap_or(255);
 
             for (j, entry) in self.queue.iter().take(n_states).enumerate() {
-                if entry.comp_hap_idx < self.comp_haps.len() {
-                    let hap = self.comp_haps[entry.comp_hap_idx].hap_at(m);
+                if entry.comp_hap_idx < self.threaded_haps.n_states() {
+                    let hap = self.threaded_haps.hap_at(entry.comp_hap_idx, m);
                     hap_indices[m][j] = hap;
 
                     let ref_allele = get_ref_allele(m, hap);

@@ -4,10 +4,12 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::data::ChromIdx;
 
 /// Zero-cost newtype for marker indices
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct MarkerIdx(pub u32);
 
 impl MarkerIdx {
@@ -39,7 +41,7 @@ impl From<MarkerIdx> for usize {
 }
 
 /// Allele representation
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Allele {
     /// Single nucleotide (A=0, C=1, G=2, T=3)
     Base(u8),
@@ -124,7 +126,7 @@ impl std::fmt::Display for Allele {
 }
 
 /// A genomic marker (variant site)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Marker {
     /// Chromosome index
     pub chrom: ChromIdx,
@@ -186,7 +188,6 @@ impl Marker {
     pub fn with_end(
         chrom: ChromIdx,
         pos: u32,
-        _end: u32,
         id: Option<Arc<str>>,
         ref_allele: Allele,
         alt_alleles: Vec<Allele>,
@@ -204,7 +205,7 @@ impl Marker {
 /// Allele mapping from target to reference panel
 ///
 /// This handles Ref/Alt swaps and strand flips following Java Marker.targToRefAllele().
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AlleleMapping {
     /// For each target allele index, the corresponding reference allele index (-1 if no match)
     pub targ_to_ref: Vec<i8>,
@@ -415,7 +416,7 @@ impl Ord for Marker {
 }
 
 /// A collection of markers
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Markers {
     /// The markers in order
     markers: Vec<Marker>,

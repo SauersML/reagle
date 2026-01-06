@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
 /// Zero-cost newtype for sample indices
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct SampleIdx(pub u32);
 
 impl SampleIdx {
@@ -48,7 +49,7 @@ impl From<SampleIdx> for usize {
 }
 
 /// Zero-cost newtype for haplotype indices
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct HapIdx(pub u32);
 
 impl HapIdx {
@@ -104,7 +105,7 @@ impl From<HapIdx> for usize {
 }
 
 /// A collection of samples
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Samples {
     /// Sample IDs
     ids: Vec<Arc<str>>,

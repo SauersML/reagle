@@ -45,7 +45,7 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased> {
     is_reversed: bool,
 
     /// Phantom data to hold the State type parameter (zero-sized)
-    _state: PhantomData<State>,
+    phantom: PhantomData<State>,
 }
 
 // ============================================================================
@@ -123,7 +123,7 @@ impl<S: PhaseState> GenotypeMatrix<S> {
             columns: self.columns[start..end].to_vec(),
             samples: Arc::clone(&self.samples),
             is_reversed: self.is_reversed,
-            _state: PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -156,7 +156,7 @@ impl GenotypeMatrix<Unphased> {
             columns,
             samples,
             is_reversed: false,
-            _state: PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -170,7 +170,7 @@ impl GenotypeMatrix<Unphased> {
             columns: self.columns,
             samples: self.samples,
             is_reversed: self.is_reversed,
-            _state: PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -186,7 +186,6 @@ impl GenotypeMatrix<Unphased> {
         markers: Markers,
         columns: Vec<GenotypeColumn>,
         samples: Arc<Samples>,
-        _is_phased: bool,
     ) -> Self {
         Self::new_unphased(markers, columns, samples)
     }
@@ -209,7 +208,7 @@ impl GenotypeMatrix<Phased> {
             columns,
             samples,
             is_reversed: false,
-            _state: PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -220,7 +219,7 @@ impl GenotypeMatrix<Phased> {
             columns: self.columns,
             samples: self.samples,
             is_reversed: self.is_reversed,
-            _state: PhantomData,
+            phantom: PhantomData,
         }
     }
 }

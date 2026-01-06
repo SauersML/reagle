@@ -19,6 +19,17 @@ pub enum GenotypeView<'a> {
         geno: &'a MutableGenotypes,
         markers: &'a Markers,
     },
+    /// View over a subset of markers in a Matrix
+    MatrixSubset {
+        matrix: &'a GenotypeMatrix,
+        subset: &'a [usize],
+    },
+    /// View over a subset of markers in MutableGenotypes
+    MutableSubset {
+        geno: &'a MutableGenotypes,
+        markers: &'a Markers,
+        subset: &'a [usize],
+    },
 }
 
 impl<'a> GenotypeView<'a> {
@@ -28,6 +39,8 @@ impl<'a> GenotypeView<'a> {
         match self {
             GenotypeView::Matrix(m) => m.n_markers(),
             GenotypeView::Mutable { geno, .. } => geno.n_markers(),
+            GenotypeView::MatrixSubset { subset, .. } => subset.len(),
+            GenotypeView::MutableSubset { subset, .. } => subset.len(),
         }
     }
 
@@ -37,6 +50,8 @@ impl<'a> GenotypeView<'a> {
         match self {
             GenotypeView::Matrix(m) => m.n_haplotypes(),
             GenotypeView::Mutable { geno, .. } => geno.n_haps(),
+            GenotypeView::MatrixSubset { matrix, .. } => matrix.n_haplotypes(),
+            GenotypeView::MutableSubset { geno, .. } => geno.n_haps(),
         }
     }
 
@@ -46,6 +61,8 @@ impl<'a> GenotypeView<'a> {
         match self {
             GenotypeView::Matrix(m) => m.n_samples(),
             GenotypeView::Mutable { geno, .. } => geno.n_samples(),
+            GenotypeView::MatrixSubset { matrix, .. } => matrix.n_samples(),
+            GenotypeView::MutableSubset { geno, .. } => geno.n_samples(),
         }
     }
 
@@ -55,6 +72,14 @@ impl<'a> GenotypeView<'a> {
         match self {
             GenotypeView::Matrix(m) => m.allele(marker, hap),
             GenotypeView::Mutable { geno, .. } => geno.get(marker.as_usize(), hap),
+            GenotypeView::MatrixSubset { matrix, subset } => {
+                let real_idx = subset[marker.as_usize()];
+                matrix.allele(MarkerIdx::new(real_idx as u32), hap)
+            }
+            GenotypeView::MutableSubset { geno, subset, .. } => {
+                let real_idx = subset[marker.as_usize()];
+                geno.get(real_idx, hap)
+            }
         }
     }
 
@@ -64,6 +89,14 @@ impl<'a> GenotypeView<'a> {
         match self {
             GenotypeView::Matrix(m) => m.marker(marker),
             GenotypeView::Mutable { markers, .. } => markers.marker(marker),
+            GenotypeView::MatrixSubset { matrix, subset } => {
+                let real_idx = subset[marker.as_usize()];
+                matrix.marker(MarkerIdx::new(real_idx as u32))
+            }
+            GenotypeView::MutableSubset { markers, subset, .. } => {
+                let real_idx = subset[marker.as_usize()];
+                markers.marker(MarkerIdx::new(real_idx as u32))
+            }
         }
     }
 }
@@ -88,10 +121,11 @@ mod tests {
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker};
+    use crate::data::storage::phase_state::Phased;
     use crate::data::storage::GenotypeColumn;
     use std::sync::Arc;
 
-    fn make_test_matrix() -> GenotypeMatrix {
+    fn make_test_matrix() -> GenotypeMatrix<Phased> {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
         let mut markers = Markers::new();
         markers.add_chrom("chr1");
@@ -103,7 +137,7 @@ mod tests {
             vec![Allele::Base(1)],
         ));
         let col = GenotypeColumn::from_alleles(&[0, 1, 0, 1], 2);
-        GenotypeMatrix::new(markers, vec![col], samples, true)
+        GenotypeMatrix::new_phased(markers, vec![col], samples)
     }
 
     fn make_test_mutable() -> (MutableGenotypes, Markers) {

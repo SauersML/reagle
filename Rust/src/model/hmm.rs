@@ -16,6 +16,7 @@
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
 use crate::model::parameters::ModelParams;
+use wide::f32x8;
 
 /// Result of HMM forward-backward computation
 #[derive(Debug, Clone)]
@@ -60,11 +61,56 @@ impl HmmUpdater {
         let shift = p_switch / n_states as f32;
         let scale = (1.0 - p_switch) / fwd_sum;
 
-        let mut new_sum = 0.0f32;
-        for k in 0..n_states {
-            let emit = emit_probs[mismatches[k] as usize];
-            fwd[k] = emit * (scale * fwd[k] + shift);
-            new_sum += fwd[k];
+        let shift_vec = f32x8::splat(shift);
+        let scale_vec = f32x8::splat(scale);
+        let mut sum_vec = f32x8::splat(0.0);
+
+        let p0 = emit_probs[0];
+        let p1 = emit_probs[1];
+        let diff = p1 - p0; // optimization: emit = p0 + mismatch * diff
+
+        let mut k = 0;
+        
+        // Vectorized loop (process 8 items at a time)
+        while k + 8 <= n_states {
+            // Load fwd chunk
+            let mut fwd_arr = [0.0f32; 8];
+            fwd_arr.copy_from_slice(&fwd[k..k+8]);
+            let fwd_chunk = f32x8::from(fwd_arr);
+            
+            // Construct emission vector branchlessly
+            let m_chunk = &mismatches[k..k+8];
+            let emit_arr = [
+                p0 + (m_chunk[0] as f32) * diff,
+                p0 + (m_chunk[1] as f32) * diff,
+                p0 + (m_chunk[2] as f32) * diff,
+                p0 + (m_chunk[3] as f32) * diff,
+                p0 + (m_chunk[4] as f32) * diff,
+                p0 + (m_chunk[5] as f32) * diff,
+                p0 + (m_chunk[6] as f32) * diff,
+                p0 + (m_chunk[7] as f32) * diff,
+            ];
+            let emit_vec = f32x8::from(emit_arr);
+            
+            // Compute
+            // fwd[k] = emit * (scale * fwd[k] + shift)
+            let res = emit_vec * (scale_vec * fwd_chunk + shift_vec);
+            
+            // Store result
+            let res_arr: [f32; 8] = res.into();
+            fwd[k..k+8].copy_from_slice(&res_arr);
+            
+            sum_vec += res;
+            k += 8;
+        }
+
+        let mut new_sum = sum_vec.reduce_add();
+
+        // Scalar tail loop
+        for i in k..n_states {
+            let emit = emit_probs[mismatches[i] as usize];
+            fwd[i] = emit * (scale * fwd[i] + shift);
+            new_sum += fwd[i];
         }
         new_sum
     }
@@ -88,18 +134,68 @@ impl HmmUpdater {
         n_states: usize,
     ) {
         // First: multiply by emission and compute sum
-        let mut sum = 0.0f32;
-        for k in 0..n_states {
-            bwd[k] *= emit_probs[mismatches[k] as usize];
-            sum += bwd[k];
+        let mut sum_vec = f32x8::splat(0.0);
+        let p0 = emit_probs[0];
+        let p1 = emit_probs[1];
+        let diff = p1 - p0;
+        
+        let mut k = 0;
+        while k + 8 <= n_states {
+            let mut bwd_arr = [0.0f32; 8];
+            bwd_arr.copy_from_slice(&bwd[k..k+8]);
+            let bwd_chunk = f32x8::from(bwd_arr);
+            
+            let m_chunk = &mismatches[k..k+8];
+            let emit_arr = [
+                p0 + (m_chunk[0] as f32) * diff,
+                p0 + (m_chunk[1] as f32) * diff,
+                p0 + (m_chunk[2] as f32) * diff,
+                p0 + (m_chunk[3] as f32) * diff,
+                p0 + (m_chunk[4] as f32) * diff,
+                p0 + (m_chunk[5] as f32) * diff,
+                p0 + (m_chunk[6] as f32) * diff,
+                p0 + (m_chunk[7] as f32) * diff,
+            ];
+            let emit_vec = f32x8::from(emit_arr);
+            
+            let res = bwd_chunk * emit_vec;
+            let res_arr: [f32; 8] = res.into();
+            bwd[k..k+8].copy_from_slice(&res_arr);
+            
+            sum_vec += res;
+            k += 8;
+        }
+        
+        let mut sum = sum_vec.reduce_add();
+        
+        // Tail loop 1
+        for i in k..n_states {
+            bwd[i] *= emit_probs[mismatches[i] as usize];
+            sum += bwd[i];
         }
 
         // Then: apply transition
         let shift = p_switch / n_states as f32;
         let scale = (1.0 - p_switch) / sum;
+        
+        let shift_vec = f32x8::splat(shift);
+        let scale_vec = f32x8::splat(scale);
+        
+        k = 0;
+        while k + 8 <= n_states {
+            let mut bwd_arr = [0.0f32; 8];
+            bwd_arr.copy_from_slice(&bwd[k..k+8]);
+            let bwd_chunk = f32x8::from(bwd_arr);
+            
+            let res = scale_vec * bwd_chunk + shift_vec;
+            let res_arr: [f32; 8] = res.into();
+            bwd[k..k+8].copy_from_slice(&res_arr);
+            
+            k += 8;
+        }
 
-        for k in 0..n_states {
-            bwd[k] = scale * bwd[k] + shift;
+        for i in k..n_states {
+            bwd[i] = scale * bwd[i] + shift;
         }
     }
 }
@@ -162,6 +258,98 @@ impl<'a> LiStephensHmm<'a> {
             .collect()
     }
 
+    /// Run forward-backward algorithm and return raw Forward and Backward tables
+    ///
+    /// This separates the forward and backward passes to allow cross-haplotype
+    /// calculations (e.g. Fwd1 * Bwd2) needed for phasing.
+    ///
+    /// # Arguments
+    /// * `target_alleles` - Alleles of the target haplotype
+    /// * `fwd` - Pre-allocated forward buffer [n_markers * n_states]
+    /// * `bwd` - Pre-allocated backward buffer [n_markers * n_states]
+    ///
+    /// # Returns
+    /// Log-likelihood of the data
+    pub fn forward_backward_raw(
+        &self,
+        target_alleles: &[u8],
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> f64 {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states();
+        let total_size = n_markers * n_states;
+
+        if n_markers == 0 || n_states == 0 {
+            return 0.0;
+        }
+
+        // Resize buffers
+        fwd.resize(total_size, 0.0);
+        bwd.resize(total_size, 0.0);
+
+        let p_err = self.params.p_mismatch;
+        let p_no_err = 1.0 - p_err;
+        let emit_probs = [p_no_err, p_err];
+
+        // 1. Forward Pass
+        let fwd_sum = self.forward_pass(target_alleles, fwd, &emit_probs);
+
+        // 2. Backward Pass
+        // Initialize last marker of backward table
+        let last_row = (n_markers - 1) * n_states;
+        let init_bwd = 1.0 / n_states as f32;
+        for k in 0..n_states {
+            bwd[last_row + k] = init_bwd;
+        }
+
+        // Iterate backwards from M-2 to 0
+        // (The last marker M-1 is already initialized)
+        for m in (0..n_markers - 1).rev() {
+            // Setup for step FROM m+1 TO m
+            // But bwd_update computes values at m based on m+1
+            let m_next = m + 1;
+            let marker_next_idx = MarkerIdx::new(m_next as u32);
+            let targ_al_next = target_alleles[m_next];
+            
+            // Recombination from m to m+1
+            let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
+            
+            // Compute mismatches at m+1
+            let ref_alleles = self.state_alleles(marker_next_idx);
+            let mismatches: Vec<u8> = ref_alleles
+                .iter()
+                .map(|&r| if r == targ_al_next { 0 } else { 1 })
+                .collect();
+
+            // Calculate Bwd[m] based on Bwd[m+1]
+            // We need to copy Bwd[m+1] to Bwd[m] then update in place
+            let curr_row = m * n_states;
+            let next_row = m_next * n_states;
+            
+            // Copy next row values to current row to prepare for update
+            for k in 0..n_states {
+                bwd[curr_row + k] = bwd[next_row + k];
+            }
+            
+            // Update in place (this matches HmmUpdater::bwd_update logic)
+            // It multiplies by emission at m+1, then applies transition from m to m+1
+            // Result is Prob(Tail | State at m)
+            
+            // Apply bwd_update on the slice
+            let bwd_slice = &mut bwd[curr_row..curr_row + n_states];
+            
+            // HmmUpdater::bwd_update normalizes using bwd_sum? 
+            // Wait, HmmUpdater::bwd_update calculates its OWN scale based on sum.
+            // But we need to be careful about scaling consistency with Forward?
+            // Usually we just normalize Bwd to sum to 1 to prevent underflow.
+            
+            HmmUpdater::bwd_update(bwd_slice, p_recomb, &emit_probs, &mismatches, n_states);
+        }
+
+        fwd_sum.ln() as f64
+    }
+
     /// Run forward-backward algorithm for a target haplotype
     ///
     /// This implements the Baum-Welch style forward-backward following
@@ -170,7 +358,7 @@ impl<'a> LiStephensHmm<'a> {
     /// # Arguments
     /// * `target_alleles` - Alleles of the target haplotype at each marker
     /// * `fwd` - Pre-allocated forward buffer [n_markers * n_states]
-    /// * `bwd` - Pre-allocated backward buffer [n_states]
+    /// * `bwd` - Pre-allocated backward buffer [n_states] (scratch)
     ///
     /// # Returns
     /// HMM result with posterior probabilities
@@ -366,6 +554,7 @@ mod tests {
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
+    use crate::data::storage::phase_state::Phased;
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
     use std::sync::Arc;
 
@@ -402,7 +591,7 @@ mod tests {
             columns.push(GenotypeColumn::from_alleles(&alleles, 2));
         }
 
-        GenotypeMatrix::new(markers, columns, samples, true)
+        GenotypeMatrix::new_unphased(markers, columns, samples)
     }
 
     #[test]

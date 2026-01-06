@@ -131,6 +131,11 @@ impl DictionaryColumn {
         self.hap_to_pattern[hap.as_usize()]
     }
 
+    /// Get raw patterns (for serialization)
+    pub fn patterns(&self) -> &[BitVec<u64, Lsb0>] {
+        &self.patterns
+    }
+
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
         let pattern_bytes: usize = self

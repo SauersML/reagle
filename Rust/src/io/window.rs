@@ -215,10 +215,11 @@ mod tests {
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
+    use crate::data::storage::phase_state::Phased;
     use crate::data::storage::GenotypeColumn;
     use std::sync::Arc;
 
-    fn make_test_matrix(n_markers: usize) -> GenotypeMatrix {
+    fn make_test_matrix(n_markers: usize) -> GenotypeMatrix<Phased> {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
         let mut markers = Markers::new();
         markers.add_chrom("chr1");
@@ -236,7 +237,7 @@ mod tests {
             columns.push(GenotypeColumn::from_alleles(&[0, 1, 0, 1], 2));
         }
 
-        GenotypeMatrix::new(markers, columns, samples, true)
+        GenotypeMatrix::new_phased(markers, columns, samples)
     }
 
     #[test]

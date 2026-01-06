@@ -73,6 +73,136 @@ impl PbwtDivUpdater {
         }
     }
 
+    /// Forward update optimized for biallelic markers (2 alleles)
+    ///
+    /// Uses dual-stream writing to avoid random memory access patterns in the scatter phase.
+    pub fn fwd_update_biallelic(
+        &mut self,
+        alleles: &[u8],
+        marker: usize,
+        prefix: &mut [u32],
+        divergence: &mut [i32],
+    ) {
+        assert_eq!(alleles.len(), self.n_haps);
+        assert_eq!(prefix.len(), self.n_haps);
+
+        self.ensure_capacity(2);
+        
+        let init_value = (marker + 1) as i32;
+
+        // Pass 1: Count zeros (no random write, linear scan over prefix)
+        // Accessing alleles[prefix[i]] is random read, but we can't avoid that without changing data layout.
+        let mut c0 = 0;
+        for i in 0..self.n_haps {
+            // Unsafe check: we trust prefix contains valid indices
+            if unsafe { *alleles.get_unchecked(*prefix.get_unchecked(i) as usize) } == 0 {
+                c0 += 1;
+            }
+        }
+
+        // Pass 2: Scatter to two sequential streams
+        let mut idx0 = 0;
+        let mut idx1 = c0;
+        
+        let mut p0 = init_value;
+        let mut p1 = init_value;
+
+        // We process in blocks to help auto-vectorization of min/max logic? 
+        // No, the dependency on p0/p1 is serial.
+        // But the write streams are distinct.
+        
+        for i in 0..self.n_haps {
+            let hap = unsafe { *prefix.get_unchecked(i) };
+            let div = unsafe { *divergence.get_unchecked(i) };
+            let allele = unsafe { *alleles.get_unchecked(hap as usize) };
+            
+            // Branchless p update
+            if div > p0 { p0 = div; }
+            if div > p1 { p1 = div; }
+            
+            if allele == 0 {
+                unsafe {
+                    *self.scratch_a.get_unchecked_mut(idx0) = hap;
+                    *self.scratch_d.get_unchecked_mut(idx0) = p0;
+                }
+                p0 = i32::MIN;
+                idx0 += 1;
+            } else {
+                unsafe {
+                    *self.scratch_a.get_unchecked_mut(idx1) = hap;
+                    *self.scratch_d.get_unchecked_mut(idx1) = p1;
+                }
+                p1 = i32::MIN;
+                idx1 += 1;
+            }
+        }
+
+        // Copy back
+        prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
+        divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
+    }
+
+    /// Backward update optimized for biallelic markers
+    pub fn bwd_update_biallelic(
+        &mut self,
+        alleles: &[u8],
+        marker: usize,
+        prefix: &mut [u32],
+        divergence: &mut [i32],
+    ) {
+        assert_eq!(alleles.len(), self.n_haps);
+        assert_eq!(prefix.len(), self.n_haps);
+
+        self.ensure_capacity(2);
+
+        let init_value = (marker as i32).saturating_sub(1);
+
+        // Pass 1: Count zeros
+        let mut c0 = 0;
+        for i in 0..self.n_haps {
+             if unsafe { *alleles.get_unchecked(*prefix.get_unchecked(i) as usize) } == 0 {
+                c0 += 1;
+            }
+        }
+
+        // Pass 2: Scatter
+        let mut idx0 = 0;
+        let mut idx1 = c0;
+        
+        let mut p0 = init_value;
+        let mut p1 = init_value;
+
+        for i in 0..self.n_haps {
+            let hap = unsafe { *prefix.get_unchecked(i) };
+            let div = unsafe { *divergence.get_unchecked(i) };
+            let allele = unsafe { *alleles.get_unchecked(hap as usize) };
+
+            // Backward PBWT uses min() for propagation
+            if div < p0 { p0 = div; }
+            if div < p1 { p1 = div; }
+
+            if allele == 0 {
+                unsafe {
+                    *self.scratch_a.get_unchecked_mut(idx0) = hap;
+                    *self.scratch_d.get_unchecked_mut(idx0) = p0;
+                }
+                p0 = i32::MAX; // Reset for min
+                idx0 += 1;
+            } else {
+                unsafe {
+                    *self.scratch_a.get_unchecked_mut(idx1) = hap;
+                    *self.scratch_d.get_unchecked_mut(idx1) = p1;
+                }
+                p1 = i32::MAX; // Reset for min
+                idx1 += 1;
+            }
+        }
+
+        // Copy back
+        prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
+        divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
+    }
+
     /// Forward update of prefix and divergence arrays
     ///
     /// Uses In-Place Counting Sort to remove allocations.

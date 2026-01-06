@@ -19,8 +19,10 @@ pub mod storage;
 pub use haplotype::{HapIdx, SampleIdx};
 pub use marker::MarkerIdx;
 
+use serde::{Deserialize, Serialize};
+
 /// Chromosome identifier (0-based index into chromosome name table)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChromIdx(pub u16);
 
 impl ChromIdx {

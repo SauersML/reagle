@@ -18,12 +18,14 @@ pub mod mutable;
 pub mod phase_state;
 pub mod sparse;
 pub mod view;
+pub mod binary_dictionary;
 
 pub use dense::DenseColumn;
 pub use dictionary::{DictionaryColumn, DictionaryColumnView};
+pub use binary_dictionary::{BinaryDictionaryColumn, BinaryDictionaryColumnView};
 pub use matrix::GenotypeMatrix;
 pub use mutable::MutableGenotypes;
-pub use phase_state::{PhaseState, Phased, Unphased};
+pub use phase_state::PhaseState;
 pub use sparse::SparseColumn;
 pub use view::GenotypeView;
 
@@ -82,6 +84,10 @@ pub enum GenotypeColumn {
     /// For runs of similar haplotype patterns.
     /// Stores (Shared Dictionary, Marker Offset in Dictionary)
     Dictionary(Arc<DictionaryColumn>, usize),
+
+    /// Zero-copy Binary Dictionary from memory-mapped files.
+    /// Stores (Shared Binary Dictionary, Marker Offset in Dictionary)
+    BinaryDictionary(Arc<BinaryDictionaryColumn>, usize),
 }
 
 impl GenotypeColumn {
@@ -92,6 +98,7 @@ impl GenotypeColumn {
             Self::Dense(col) => col.get(hap),
             Self::Sparse(col) => col.get(hap),
             Self::Dictionary(col, offset) => col.get(*offset, hap),
+            Self::BinaryDictionary(col, offset) => col.get(*offset, hap),
         }
     }
 
@@ -101,6 +108,7 @@ impl GenotypeColumn {
             Self::Dense(col) => col.n_haplotypes(),
             Self::Sparse(col) => col.n_haplotypes(),
             Self::Dictionary(col, _) => col.n_haplotypes(),
+            Self::BinaryDictionary(col, _) => col.n_haplotypes(),
         }
     }
 
@@ -110,6 +118,16 @@ impl GenotypeColumn {
             Self::Dense(col) => col.alt_count(),
             Self::Sparse(col) => col.n_carriers(),
             Self::Dictionary(col, offset) => col.alt_count(*offset),
+            Self::BinaryDictionary(col, offset) => {
+                // Inefficient default implementation for now, but valid
+                let mut count = 0;
+                for h in 0..col.n_haplotypes() {
+                    if col.get(*offset, HapIdx::new(h as u32)) > 0 {
+                        count += 1;
+                    }
+                }
+                count
+            }
         }
     }
 
@@ -131,6 +149,8 @@ impl GenotypeColumn {
             Self::Sparse(col) => col.size_bytes(),
             // Report amortized size per marker to avoid over-counting shared memory
             Self::Dictionary(col, _) => col.size_bytes() / col.n_markers().max(1),
+            // Mmap doesn't consume heap, but we report struct size
+            Self::BinaryDictionary(_, _) => std::mem::size_of::<Arc<BinaryDictionaryColumn>>(),
         }
     }
 
@@ -206,6 +226,10 @@ impl GenotypeColumn {
                 let view = DictionaryColumnView::new(col, *offset);
                 f(&view)
             }
+            Self::BinaryDictionary(col, offset) => {
+                let view = BinaryDictionaryColumnView::new(col, *offset);
+                f(&view)
+            }
         }
     }
 
@@ -215,11 +239,18 @@ impl GenotypeColumn {
     /// fully specialized code for each storage type. Each closure receives a
     /// concrete type, not a trait object.
     #[inline]
-    pub fn visit_typed<F1, F2, F3, R>(&self, dense_fn: F1, sparse_fn: F2, dict_fn: F3) -> R
+    pub fn visit_typed<F1, F2, F3, F4, R>(
+        &self, 
+        dense_fn: F1, 
+        sparse_fn: F2, 
+        dict_fn: F3,
+        bin_dict_fn: F4
+    ) -> R
     where
         F1: FnOnce(&DenseColumn) -> R,
         F2: FnOnce(&SparseColumn) -> R,
         F3: FnOnce(&DictionaryColumnView<'_>) -> R,
+        F4: FnOnce(&BinaryDictionaryColumnView<'_>) -> R,
     {
         match self {
             Self::Dense(col) => dense_fn(col),
@@ -227,6 +258,10 @@ impl GenotypeColumn {
             Self::Dictionary(col, offset) => {
                 let view = DictionaryColumnView::new(col, *offset);
                 dict_fn(&view)
+            }
+            Self::BinaryDictionary(col, offset) => {
+                let view = BinaryDictionaryColumnView::new(col, *offset);
+                bin_dict_fn(&view)
             }
         }
     }
