@@ -2,17 +2,20 @@
 //!
 //! A simple mutable storage for genotypes during phasing iterations.
 //! This allows efficient in-place updates without rebuilding columns.
+//! Now optimized using `bitvec` for 8x memory reduction.
 
 use crate::data::HapIdx;
+use bitvec::prelude::*;
 
 /// Mutable genotype storage for phasing
 ///
-/// Uses a simple Vec<Vec<u8>> layout for easy mutation.
-/// Less memory-efficient than dense/sparse but allows O(1) updates.
+/// Uses `Vec<BitBox>` for memory efficiency (1 bit per allele).
+/// Outer vector is indexed by marker, inner BitBox by haplotype.
 #[derive(Clone, Debug)]
 pub struct MutableGenotypes {
     /// Alleles indexed by [marker][haplotype]
-    alleles: Vec<Vec<u8>>,
+    /// Using Lsb0 order: bit 0 is hap 0, bit 1 is hap 1, etc.
+    alleles: Vec<BitBox<u8, Lsb0>>,
     /// Number of haplotypes
     n_haps: usize,
 }
@@ -20,8 +23,10 @@ pub struct MutableGenotypes {
 impl MutableGenotypes {
     /// Create from existing allele data
     pub fn new(n_markers: usize, n_haps: usize) -> Self {
+        // Initialize with all zeros
+        let empty_row = bitbox![u8, Lsb0; 0; n_haps];
         Self {
-            alleles: vec![vec![0u8; n_haps]; n_markers],
+            alleles: vec![empty_row; n_markers],
             n_haps,
         }
     }
@@ -31,9 +36,17 @@ impl MutableGenotypes {
     where
         F: FnMut(usize, usize) -> u8,
     {
-        let alleles = (0..n_markers)
-            .map(|m| (0..n_haps).map(|h| f(m, h)).collect())
-            .collect();
+        let mut alleles = Vec::with_capacity(n_markers);
+        
+        for m in 0..n_markers {
+            let mut row = BitVec::<u8, Lsb0>::with_capacity(n_haps);
+            for h in 0..n_haps {
+                let val = f(m, h) != 0;
+                row.push(val);
+            }
+            alleles.push(row.into_boxed_bitslice());
+        }
+        
         Self { alleles, n_haps }
     }
 
@@ -58,31 +71,32 @@ impl MutableGenotypes {
     /// Get allele at (marker, haplotype)
     #[inline]
     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
-        self.alleles[marker][hap.as_usize()]
+        self.alleles[marker][hap.as_usize()] as u8
     }
 
     /// Set allele at (marker, haplotype)
     #[inline]
     pub fn set(&mut self, marker: usize, hap: HapIdx, allele: u8) {
-        self.alleles[marker][hap.as_usize()] = allele;
+        self.alleles[marker].set(hap.as_usize(), allele != 0);
     }
 
-    /// Get all alleles at a marker
+    /// Get all alleles at a marker as a BitSlice
     #[inline]
-    pub fn marker_alleles(&self, marker: usize) -> &[u8] {
+    pub fn marker_alleles(&self, marker: usize) -> &BitSlice<u8, Lsb0> {
         &self.alleles[marker]
     }
 
-    /// Get mutable alleles at a marker
+    /// Get mutable alleles at a marker as a BitSlice
     #[inline]
-    pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut [u8] {
+    pub fn marker_alleles_mut(&mut self, marker: usize) -> &mut BitSlice<u8, Lsb0> {
         &mut self.alleles[marker]
     }
 
     /// Get all alleles for a haplotype
+    /// Note: This is now slower than before as it iterates columns
     pub fn haplotype(&self, hap: HapIdx) -> Vec<u8> {
         let h = hap.as_usize();
-        self.alleles.iter().map(|m| m[h]).collect()
+        self.alleles.iter().map(|m| m[h] as u8).collect()
     }
 
     /// Swap alleles between two haplotypes at a marker
@@ -90,7 +104,9 @@ impl MutableGenotypes {
     pub fn swap(&mut self, marker: usize, hap1: HapIdx, hap2: HapIdx) {
         let h1 = hap1.as_usize();
         let h2 = hap2.as_usize();
-        self.alleles[marker].swap(h1, h2);
+        let row = &mut self.alleles[marker];
+        // BitSlice::swap is efficient
+        row.swap(h1, h2);
     }
 
     /// Swap alleles between two haplotypes at multiple markers
@@ -103,9 +119,6 @@ impl MutableGenotypes {
     }
 
     /// Swap alleles between two haplotypes for a contiguous range of markers
-    ///
-    /// More efficient than swap_range for contiguous segments since it
-    /// avoids the overhead of iterating a slice of indices.
     #[inline]
     pub fn swap_contiguous(&mut self, start: usize, end: usize, hap1: HapIdx, hap2: HapIdx) {
         let h1 = hap1.as_usize();
@@ -120,13 +133,17 @@ impl MutableGenotypes {
         debug_assert_eq!(self.n_markers(), other.n_markers());
         debug_assert_eq!(self.n_haps, other.n_haps);
         for (dst, src) in self.alleles.iter_mut().zip(other.alleles.iter()) {
-            dst.copy_from_slice(src);
+            dst.copy_from_bitslice(src);
         }
     }
 
-    /// Get raw alleles (for reading into GenotypeColumn)
-    pub fn raw_alleles(&self) -> &[Vec<u8>] {
-        &self.alleles
+    /// Get raw alleles (legacy support, expensive)
+    /// Used for reading into GenotypeColumn. 
+    /// WARNING: Allocates new vectors. Avoid using in tight loops.
+    pub fn to_raw_alleles(&self) -> Vec<Vec<u8>> {
+        self.alleles.iter()
+            .map(|row| row.iter().map(|b| if *b { 1 } else { 0 }).collect())
+            .collect()
     }
 }
 
@@ -169,10 +186,15 @@ mod tests {
     fn test_haplotype() {
         let geno = MutableGenotypes::from_fn(5, 2, |m, h| if h == 0 { m as u8 } else { 0 });
 
-        let hap0 = geno.haplotype(HapIdx::new(0));
-        assert_eq!(hap0, vec![0, 1, 2, 3, 4]);
+        // Note: bitvec only stores 0/1. The test in original code used `m as u8` which could be > 1.
+        // We must ensure the test data is binary.
+        // If m % 2 == 1 -> 1, else 0
+        let geno_binary = MutableGenotypes::from_fn(5, 2, |m, h| if h == 0 { (m % 2) as u8 } else { 0 });
 
-        let hap1 = geno.haplotype(HapIdx::new(1));
+        let hap0 = geno_binary.haplotype(HapIdx::new(0));
+        assert_eq!(hap0, vec![0, 1, 0, 1, 0]);
+
+        let hap1 = geno_binary.haplotype(HapIdx::new(1));
         assert_eq!(hap1, vec![0, 0, 0, 0, 0]);
     }
 }

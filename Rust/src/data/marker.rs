@@ -130,9 +130,6 @@ pub struct Marker {
     pub chrom: ChromIdx,
     /// 1-based genomic position (start)
     pub pos: u32,
-    /// 1-based end position (from INFO/END tag for SVs, or pos + len(ref) - 1 for SNVs/indels)
-    /// This is used for gVCF blocks and structural variants.
-    pub end: u32,
     /// Variant ID (rsID or similar), None if missing
     pub id: Option<Arc<str>>,
     /// Reference allele
@@ -153,7 +150,6 @@ impl Marker {
         Self {
             chrom,
             pos,
-            end: pos,
             id,
             ref_allele,
             alt_alleles,
@@ -175,15 +171,6 @@ impl Marker {
         self.ref_allele.is_snv() && self.alt_alleles.iter().all(|a| a.is_snv())
     }
 
-    /// Get allele by index (0 = ref, 1+ = alt)
-    pub fn allele(&self, idx: usize) -> Option<&Allele> {
-        if idx == 0 {
-            Some(&self.ref_allele)
-        } else {
-            self.alt_alleles.get(idx - 1)
-        }
-    }
-
     /// Number of bits needed to store an allele index
     pub fn bits_per_allele(&self) -> u32 {
         let n = self.n_alleles();
@@ -195,10 +182,11 @@ impl Marker {
     }
 
     /// Create a new marker with explicit end position (for SVs and gVCF blocks)
+    /// Note: end parameter is ignored as struct no longer stores it
     pub fn with_end(
         chrom: ChromIdx,
         pos: u32,
-        end: u32,
+        _end: u32,
         id: Option<Arc<str>>,
         ref_allele: Allele,
         alt_alleles: Vec<Allele>,
@@ -206,26 +194,10 @@ impl Marker {
         Self {
             chrom,
             pos,
-            end,
             id,
             ref_allele,
             alt_alleles,
         }
-    }
-
-    /// Get the span of this marker (end - pos + 1)
-    pub fn span(&self) -> u32 {
-        self.end.saturating_sub(self.pos) + 1
-    }
-
-    /// Check if this marker overlaps with a position range
-    pub fn overlaps(&self, start: u32, end: u32) -> bool {
-        self.pos <= end && self.end >= start
-    }
-
-    /// Check if this marker has a non-trivial END value (spans multiple positions)
-    pub fn has_end_value(&self) -> bool {
-        self.end > self.pos
     }
 }
 

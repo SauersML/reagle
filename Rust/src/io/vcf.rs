@@ -890,10 +890,9 @@ mod tests {
     }
 }
 #[test]
-#[test]
 fn test_dictionary_compression_integration() {
     use crate::data::marker::MarkerIdx;
-    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::data::storage::GenotypeColumn;
     use std::io::Cursor;
 
     // Create VCF with 70 markers (batch size 64 + 6 remainder)

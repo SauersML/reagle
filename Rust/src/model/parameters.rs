@@ -9,10 +9,6 @@
 /// Parameters are tuned based on the Java Beagle defaults and formulas.
 #[derive(Clone, Debug)]
 pub struct ModelParams {
-    /// Effective population size (Ne)
-    /// Default: 1_000_000 (Beagle default)
-    pub ne: u64,
-
     /// Per-site allele mismatch probability
     pub p_mismatch: f32,
 
@@ -39,15 +35,9 @@ pub struct ModelParams {
 
     /// Initial likelihood ratio threshold
     pub initial_lr: f32,
-
-    /// Whether to use EM parameter estimation
-    pub use_em: bool,
 }
 
 impl ModelParams {
-    /// Default Ne value from Beagle
-    pub const DEFAULT_NE: u64 = 1_000_000;
-
     /// Default phase states
     pub const DEFAULT_PHASE_STATES: usize = 280;
 
@@ -66,7 +56,6 @@ impl ModelParams {
     /// Create default parameters
     pub fn new() -> Self {
         Self {
-            ne: Self::DEFAULT_NE,
             p_mismatch: 0.0001,
             recomb_intensity: 1.0,
             n_states: Self::DEFAULT_PHASE_STATES,
@@ -75,7 +64,6 @@ impl ModelParams {
             iterations: Self::DEFAULT_ITERATIONS,
             lr_threshold: f32::INFINITY,
             initial_lr: Self::DEFAULT_INITIAL_LR,
-            use_em: true,
         }
     }
 
@@ -84,12 +72,11 @@ impl ModelParams {
     /// # Arguments
     /// * `n_haps` - Total number of haplotypes (target + reference)
     pub fn for_phasing(n_haps: usize) -> Self {
-        let ne = Self::DEFAULT_NE;
+        let ne = 1_000_000u64;
         // Formula from Java PhaseData constructor
         let recomb_intensity = 0.04 * ne as f32 / n_haps as f32;
 
         Self {
-            ne,
             p_mismatch: Self::li_stephens_p_mismatch(n_haps),
             recomb_intensity,
             n_states: Self::DEFAULT_PHASE_STATES.min(n_haps.saturating_sub(2)),
@@ -98,7 +85,6 @@ impl ModelParams {
             iterations: Self::DEFAULT_ITERATIONS,
             lr_threshold: f32::INFINITY, // Set per iteration
             initial_lr: Self::DEFAULT_INITIAL_LR,
-            use_em: true,
         }
     }
 
@@ -108,7 +94,6 @@ impl ModelParams {
     /// * `n_ref_haps` - Number of reference haplotypes
     pub fn for_imputation(n_ref_haps: usize) -> Self {
         Self {
-            ne: Self::DEFAULT_NE,
             p_mismatch: Self::li_stephens_p_mismatch(n_ref_haps),
             recomb_intensity: 1.0,
             n_states: Self::DEFAULT_IMP_STATES.min(n_ref_haps),
@@ -117,7 +102,6 @@ impl ModelParams {
             iterations: 1,
             lr_threshold: 1.0,
             initial_lr: Self::DEFAULT_INITIAL_LR,
-            use_em: false,
         }
     }
 
@@ -173,16 +157,6 @@ impl ModelParams {
         (-f64::exp_m1(c * gen_dist_cm)) as f32
     }
 
-    /// Calculate switch probability between markers using recombIntensity
-    pub fn switch_prob(&self, gen_dist_cm: f64) -> f32 {
-        self.p_recomb(gen_dist_cm)
-    }
-
-    /// Calculate no-switch probability
-    pub fn no_switch_prob(&self, gen_dist_cm: f64) -> f32 {
-        1.0 - self.switch_prob(gen_dist_cm)
-    }
-
     /// Calculate emission probability for matching allele
     pub fn emit_match(&self) -> f32 {
         1.0 - self.p_mismatch
@@ -223,27 +197,9 @@ impl ModelParams {
         (25.0 * self.recomb_intensity as f64 * self.n_haps as f64).ceil() as u64
     }
 
-    /// Set effective population size and update recombIntensity
-    pub fn set_ne(&mut self, ne: u64) {
-        self.ne = ne;
-        if self.n_haps > 0 {
-            self.recomb_intensity = 0.04 * ne as f32 / self.n_haps as f32;
-        }
-    }
-
     /// Set number of states
     pub fn set_n_states(&mut self, n_states: usize) {
         self.n_states = n_states;
-    }
-
-    /// Set number of haplotypes
-    pub fn set_n_haps(&mut self, n_haps: usize) {
-        self.n_haps = n_haps;
-        // Recalculate dependent parameters
-        self.p_mismatch = Self::li_stephens_p_mismatch(n_haps);
-        if self.ne > 0 {
-            self.recomb_intensity = 0.04 * self.ne as f32 / n_haps as f32;
-        }
     }
 }
 

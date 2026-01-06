@@ -64,8 +64,6 @@ pub struct StreamWindow {
     pub output_end: usize,
     /// Whether this is the first window
     pub is_first: bool,
-    /// Whether this is the last window
-    pub is_last: bool,
 }
 
 /// Buffered marker data for streaming
@@ -261,7 +259,6 @@ impl StreamingVcfReader {
             output_start,
             output_end,
             is_first: self.window_num == 0,
-            is_last,
         };
 
         // Remove processed markers from buffer (keep overlap)

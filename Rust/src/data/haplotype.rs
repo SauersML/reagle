@@ -115,32 +115,10 @@ pub struct Samples {
 }
 
 impl Samples {
-    /// Create an empty sample collection
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Create from a vector of sample IDs (all diploid)
     pub fn from_ids(ids: Vec<String>) -> Self {
         let ids: Vec<Arc<str>> = ids.into_iter().map(|s| s.into()).collect();
         let is_diploid = vec![true; ids.len()];
-        let id_to_idx = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.clone(), SampleIdx::new(i as u32)))
-            .collect();
-
-        Self {
-            ids,
-            is_diploid,
-            id_to_idx,
-        }
-    }
-
-    /// Create from IDs with ploidy information
-    pub fn from_ids_with_ploidy(ids: Vec<String>, is_diploid: Vec<bool>) -> Self {
-        assert_eq!(ids.len(), is_diploid.len());
-        let ids: Vec<Arc<str>> = ids.into_iter().map(|s| s.into()).collect();
         let id_to_idx = ids
             .iter()
             .enumerate()
@@ -159,19 +137,9 @@ impl Samples {
         self.ids.len()
     }
 
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
-    }
-
     /// Number of haplotypes (2 per diploid sample, 1 per haploid)
     pub fn n_haps(&self) -> usize {
         self.is_diploid.iter().map(|&d| if d { 2 } else { 1 }).sum()
-    }
-
-    /// Get sample ID by index
-    pub fn id(&self, idx: SampleIdx) -> &str {
-        &self.ids[idx.as_usize()]
     }
 
     /// Get sample index by ID
@@ -179,48 +147,9 @@ impl Samples {
         self.id_to_idx.get(id).copied()
     }
 
-    /// Check if sample is diploid
-    pub fn is_diploid(&self, idx: SampleIdx) -> bool {
-        self.is_diploid[idx.as_usize()]
-    }
-
-    /// Add a sample
-    pub fn push(&mut self, id: String, diploid: bool) {
-        let idx = SampleIdx::new(self.ids.len() as u32);
-        let id: Arc<str> = id.into();
-        self.id_to_idx.insert(id.clone(), idx);
-        self.ids.push(id);
-        self.is_diploid.push(diploid);
-    }
-
     /// Get all sample IDs
     pub fn ids(&self) -> &[Arc<str>] {
         &self.ids
-    }
-
-    /// Iterate over sample indices
-    pub fn iter(&self) -> impl Iterator<Item = SampleIdx> {
-        (0..self.ids.len()).map(|i| SampleIdx::new(i as u32))
-    }
-
-    /// Iterate over haplotype indices
-    pub fn hap_iter(&self) -> impl Iterator<Item = HapIdx> + '_ {
-        self.iter().flat_map(move |s| {
-            if self.is_diploid(s) {
-                vec![s.hap1(), s.hap2()]
-            } else {
-                vec![s.hap1()]
-            }
-        })
-    }
-
-    /// Combine two sample collections
-    pub fn combine(first: &Samples, second: &Samples) -> Self {
-        let mut combined = first.clone();
-        for (id, &is_diploid) in second.ids.iter().zip(second.is_diploid.iter()) {
-            combined.push(id.to_string(), is_diploid);
-        }
-        combined
     }
 }
 

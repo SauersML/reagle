@@ -30,8 +30,6 @@ pub struct CodedStep {
     hap_to_pattern: Vec<u16>,
     /// Allele sequences for each pattern: patterns[pattern_idx][marker_offset] = allele
     patterns: Vec<Vec<u8>>,
-    /// Allele at first marker for each pattern (for fast access)
-    first_allele: Vec<u8>,
 }
 
 impl CodedStep {
@@ -51,7 +49,6 @@ impl CodedStep {
                 n_patterns: 0,
                 hap_to_pattern: vec![0; n_haps],
                 patterns: Vec::new(),
-                first_allele: Vec::new(),
             };
         }
 
@@ -87,18 +84,12 @@ impl CodedStep {
             hap_to_pattern.push(pattern_idx);
         }
 
-        let first_allele: Vec<u8> = patterns
-            .iter()
-            .map(|p| p.first().copied().unwrap_or(255))
-            .collect();
-
         Self {
             start,
             end,
             n_patterns: patterns.len(),
             hap_to_pattern,
             patterns,
-            first_allele,
         }
     }
 
@@ -122,35 +113,10 @@ impl CodedStep {
         self.hap_to_pattern[hap.0 as usize]
     }
 
-    /// Get allele at a marker for a pattern
-    pub fn allele(&self, pattern: u16, marker_offset: usize) -> u8 {
-        self.patterns[pattern as usize][marker_offset]
-    }
-
     /// Get allele at a marker for a haplotype
     pub fn hap_allele(&self, hap: HapIdx, marker_offset: usize) -> u8 {
         let pattern = self.hap_to_pattern[hap.0 as usize] as usize;
         self.patterns[pattern][marker_offset]
-    }
-
-    /// Get first allele for a pattern (fast access for PBWT)
-    pub fn first_allele(&self, pattern: u16) -> u8 {
-        self.first_allele[pattern as usize]
-    }
-
-    /// Get all alleles for a pattern
-    pub fn pattern_alleles(&self, pattern: u16) -> &[u8] {
-        &self.patterns[pattern as usize]
-    }
-
-    /// Get all haplotypes with a given pattern
-    pub fn haps_with_pattern(&self, pattern: u16) -> Vec<HapIdx> {
-        self.hap_to_pattern
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| **p == pattern)
-            .map(|(h, _)| HapIdx::new(h as u32))
-            .collect()
     }
 
     /// Compression ratio (n_haps / n_patterns)
@@ -412,15 +378,6 @@ impl CodedPbwt {
         result
     }
 
-    /// Reset PBWT state
-    pub fn reset(&mut self) {
-        for (i, p) in self.prefix.iter_mut().enumerate() {
-            *p = i as u32;
-        }
-        self.divergence.fill(0);
-        self.current_step = 0;
-    }
-
     /// Current step index
     pub fn current_step(&self) -> usize {
         self.current_step
@@ -603,15 +560,6 @@ impl<'a> CodedPbwtView<'a> {
         }
 
         result
-    }
-
-    /// Reset PBWT state
-    pub fn reset(&mut self) {
-        for (i, p) in self.prefix.iter_mut().enumerate() {
-            *p = i as u32;
-        }
-        self.divergence.fill(0);
-        self.current_step = 0;
     }
 
     /// Current step index

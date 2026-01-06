@@ -41,14 +41,8 @@ pub struct Workspace {
     /// PBWT divergence array
     pub divergence: Vec<u32>,
 
-    /// Selected reference haplotype indices
-    pub ref_haps: Vec<HapIdx>,
-
     /// Allele buffer for current marker
     pub alleles: Vec<u8>,
-
-    /// Switch probability buffer
-    pub switch_probs: Vec<f32>,
 
     /// Emission probability buffer
     pub emit_probs: Vec<f32>,
@@ -70,9 +64,7 @@ impl Workspace {
             tmp: vec![0.0; n_states],
             prefix: (0..n_haps as u32).collect(),
             divergence: vec![0; n_haps],
-            ref_haps: Vec::with_capacity(n_states),
             alleles: vec![0; n_haps],
-            switch_probs: vec![0.0; n_markers],
             emit_probs: vec![0.0; n_states],
             rng_state: 0,
         }
@@ -116,55 +108,6 @@ impl Workspace {
         }
 
         self.emit_probs.resize(n_states, 0.0);
-    }
-
-    /// Clear all buffers (set to zero)
-    pub fn clear(&mut self) {
-        self.fwd.fill(0.0);
-        self.bwd.fill(0.0);
-        for probs in &mut self.state_probs {
-            probs.fill(0.0);
-        }
-        for probs in &mut self.fwd_combined {
-            probs.fill(0.0);
-        }
-        for probs in &mut self.fwd1 {
-            probs.fill(0.0);
-        }
-        for probs in &mut self.fwd2 {
-            probs.fill(0.0);
-        }
-        self.tmp.fill(0.0);
-        self.ref_haps.clear();
-        self.switch_probs.fill(0.0);
-        self.emit_probs.fill(0.0);
-    }
-
-    /// Reset PBWT arrays to identity permutation
-    pub fn reset_pbwt(&mut self, n_haps: usize) {
-        self.prefix.truncate(n_haps);
-        self.prefix.resize(n_haps, 0);
-        for (i, p) in self.prefix.iter_mut().enumerate() {
-            *p = i as u32;
-        }
-        self.divergence.truncate(n_haps);
-        self.divergence.resize(n_haps, 0);
-        self.divergence.fill(0);
-    }
-
-    /// Initialize forward probabilities uniformly
-    pub fn init_fwd_uniform(&mut self, n_states: usize) {
-        let prob = 1.0 / n_states as f32;
-        self.fwd.truncate(n_states);
-        self.fwd.resize(n_states, prob);
-        self.fwd.fill(prob);
-    }
-
-    /// Initialize backward probabilities to 1.0
-    pub fn init_bwd_ones(&mut self, n_states: usize) {
-        self.bwd.truncate(n_states);
-        self.bwd.resize(n_states, 1.0);
-        self.bwd.fill(1.0);
     }
 
     /// Set random seed
@@ -357,22 +300,6 @@ impl ImpWorkspace {
         // Resize counting sort scratch buffers
         self.sort_prefix_scratch.resize(n_ref_haps, 0);
         self.sort_div_scratch.resize(n_ref_haps + 1, 0);
-    }
-
-    /// Clear buffers
-    pub fn clear(&mut self) {
-        self.fwd.fill(0.0);
-        self.bwd.fill(0.0);
-        self.dosages.fill(0.0);
-        for p in &mut self.allele_probs {
-            *p = [0.0; 3];
-        }
-        self.tmp.fill(0.0);
-        // Reset PBWT arrays to identity
-        for (i, p) in self.pbwt_prefix.iter_mut().enumerate() {
-            *p = i as u32;
-        }
-        self.pbwt_divergence.fill(0);
     }
 }
 

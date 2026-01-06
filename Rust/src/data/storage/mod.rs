@@ -126,24 +126,6 @@ impl GenotypeColumn {
             ))
         }
     }
-
-    /// Check if this is a biallelic column
-    pub fn is_biallelic(&self) -> bool {
-        match self {
-            Self::Dense(col) => col.bits_per_allele() == 1,
-            Self::Sparse(_) => true, // Sparse is always biallelic
-            Self::Dictionary(col, _) => col.is_biallelic(),
-        }
-    }
-
-    /// Iterate over all alleles
-    pub fn iter(&self) -> Box<dyn Iterator<Item = u8> + '_> {
-        match self {
-            Self::Dense(col) => Box::new(col.iter()),
-            Self::Sparse(col) => Box::new(col.iter()),
-            Self::Dictionary(col, offset) => Box::new(col.iter_marker(*offset)),
-        }
-    }
 }
 
 impl Default for GenotypeColumn {

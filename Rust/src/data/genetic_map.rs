@@ -54,15 +54,6 @@ impl GeneticMap {
         }
     }
 
-    /// Create a position-based map (no genetic map file)
-    ///
-    /// This matches Java `vcf/PositionMap.java`
-    /// Converts genome coordinates to genetic units by multiplying by scale_factor.
-    /// Default scale_factor = 1e-6 (1 cM per Mb)
-    pub fn position_map(scale_factor: f64) -> PositionMap {
-        PositionMap { scale_factor }
-    }
-
     /// Load from PLINK format map file
     ///
     /// Format: chrom position_bp rate_cM_per_Mb position_cM
@@ -230,21 +221,6 @@ impl GeneticMap {
         }
     }
 
-    /// Number of map entries
-    pub fn len(&self) -> usize {
-        self.positions.len()
-    }
-
-    /// Check if map is empty
-    pub fn is_empty(&self) -> bool {
-        self.positions.is_empty()
-    }
-
-    /// Chromosome index
-    pub fn chrom(&self) -> ChromIdx {
-        self.chrom
-    }
-
     /// Set chromosome index
     pub fn set_chrom(&mut self, chrom: ChromIdx) {
         self.chrom = chrom;
@@ -352,32 +328,6 @@ impl MarkerMap {
         Self { gen_pos, gen_dist }
     }
 
-    /// Create from genetic map without minimum distance enforcement
-    pub fn from_gen_map(markers: &Markers, gen_map: &GeneticMap) -> Self {
-        let n = markers.len();
-        if n == 0 {
-            return Self {
-                gen_pos: Vec::new(),
-                gen_dist: Vec::new(),
-            };
-        }
-
-        let mut gen_pos = Vec::with_capacity(n);
-        let mut gen_dist = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let pos = markers.get(MarkerIdx::from(i)).map(|m| m.pos).unwrap_or(0);
-            gen_pos.push(gen_map.gen_pos(pos));
-            if i == 0 {
-                gen_dist.push(0.0);
-            } else {
-                gen_dist.push((gen_pos[i] - gen_pos[i - 1]) as f32);
-            }
-        }
-
-        Self { gen_pos, gen_dist }
-    }
-
     /// Create using default position-based map (1 cM per Mb)
     pub fn from_positions(markers: &Markers) -> Self {
         let n = markers.len();
@@ -444,16 +394,6 @@ impl MarkerMap {
         self.gen_pos.len()
     }
 
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.gen_pos.is_empty()
-    }
-
-    /// Get genetic position for marker at index
-    pub fn gen_pos(&self, index: usize) -> f64 {
-        self.gen_pos[index]
-    }
-
     /// Get genetic distance from previous marker
     pub fn gen_dist(&self, index: usize) -> f32 {
         self.gen_dist[index]
@@ -462,11 +402,6 @@ impl MarkerMap {
     /// Get all genetic positions
     pub fn gen_positions(&self) -> &[f64] {
         &self.gen_pos
-    }
-
-    /// Get all genetic distances
-    pub fn gen_distances(&self) -> &[f32] {
-        &self.gen_dist
     }
 
     /// Calculate recombination probabilities for given recombination intensity

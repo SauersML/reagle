@@ -12,3 +12,5 @@ pub mod ibs2;
 pub mod imp_states;
 pub mod parameters;
 pub mod pbwt;
+pub mod phase_ibs;
+pub mod online_hmm;
