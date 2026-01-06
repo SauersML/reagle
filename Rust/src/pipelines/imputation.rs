@@ -620,7 +620,7 @@ fn run_hmm_forward_backward(
     p_mismatch: f32,
     n_states: usize,
     workspace: &mut ImpWorkspace,
-) -> Vec<Vec<f32>> {
+) -> Vec<f32> {
     let n_markers = target_alleles.len();
     if n_markers == 0 || n_states == 0 {
         return Vec::new();
@@ -632,8 +632,9 @@ fn run_hmm_forward_backward(
     // Ensure workspace is sized correctly
     workspace.resize(n_states, n_markers);
 
-    // Use pre-allocated forward storage
-    let mut fwd: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_markers];
+    // Use pre-allocated forward storage (flat)
+    let total_size = n_markers * n_states;
+    let mut fwd: Vec<f32> = vec![0.0; total_size];
     let mut fwd_sum = 1.0f32;
 
     // Forward pass using workspace.tmp for temporary calculations
@@ -644,6 +645,8 @@ fn run_hmm_forward_backward(
 
         let mut new_sum = 0.0f32;
         let matches = &allele_match[m];
+        let row_offset = m * n_states;
+        let prev_row_offset = if m > 0 { (m - 1) * n_states } else { 0 };
 
         for k in 0..n_states.min(matches.len()) {
             let emit = if matches[k] {
@@ -651,12 +654,15 @@ fn run_hmm_forward_backward(
             } else {
                 emit_probs[1]
             };
-            fwd[m][k] = if m == 0 {
+            
+            let val = if m == 0 {
                 emit / n_states as f32
             } else {
-                emit * (scale * fwd[m - 1][k] + shift)
+                emit * (scale * fwd[prev_row_offset + k] + shift)
             };
-            new_sum += fwd[m][k];
+            
+            fwd[row_offset + k] = val;
+            new_sum += val;
         }
         fwd_sum = new_sum;
     }
@@ -668,6 +674,8 @@ fn run_hmm_forward_backward(
     let mut bwd_sum = 1.0f32;
 
     for m in (0..n_markers).rev() {
+        let row_offset = m * n_states;
+        
         // Apply transition for backward (except at last marker)
         if m < n_markers - 1 {
             let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
@@ -682,14 +690,16 @@ fn run_hmm_forward_backward(
         // Compute posterior: fwd * bwd
         let mut state_sum = 0.0f32;
         for k in 0..n_states {
-            fwd[m][k] *= bwd[k];
-            state_sum += fwd[m][k];
+            let idx = row_offset + k;
+            fwd[idx] *= bwd[k];
+            state_sum += fwd[idx];
         }
 
         // Normalize
         if state_sum > 0.0 {
+            let inv_sum = 1.0 / state_sum;
             for k in 0..n_states {
-                fwd[m][k] /= state_sum;
+                fwd[row_offset + k] *= inv_sum;
             }
         }
 

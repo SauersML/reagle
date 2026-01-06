@@ -8,7 +8,6 @@ pub struct OnlineHmm {
     prev_states: Vec<u32>,
     
     /// Normalized forward probabilities for Combined (unphased-like) pass
-    /// Corresponds to P(X | state)
     prev_fwd_combined: Vec<f32>,
     
     /// Normalized forward probabilities for Hap1
@@ -16,6 +15,19 @@ pub struct OnlineHmm {
     
     /// Normalized forward probabilities for Hap2
     prev_fwd2: Vec<f32>,
+
+    /// Generation counter for O(1) state lookup
+    generation: u16,
+
+    /// Global usage map: maps global_hap_idx -> (generation, local_idx_in_prev_states)
+    /// Used to quickly find if a haplotype was present in the previous step and where.
+    global_state_map: Vec<StateEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StateEntry {
+    generation: u16,
+    index: u16, // Assuming max K < 65536, which is extremely likely (default K=100-200)
 }
 
 impl OnlineHmm {
@@ -26,6 +38,8 @@ impl OnlineHmm {
             prev_fwd_combined: Vec::new(),
             prev_fwd1: Vec::new(),
             prev_fwd2: Vec::new(),
+            generation: 1, // Start at 1 because 0 is the default/empty state in the map
+            global_state_map: Vec::new(),
         }
     }
     
@@ -39,6 +53,22 @@ impl OnlineHmm {
         self.prev_fwd_combined = vec![init_prob; n];
         self.prev_fwd1 = vec![init_prob; n];
         self.prev_fwd2 = vec![init_prob; n];
+
+        // Initialize map
+        self.generation = 1;
+        // Ensure map is large enough for max haplotype index found
+        if let Some(&max_hap) = initial_states.iter().max() {
+            if self.global_state_map.len() <= max_hap as usize {
+                self.global_state_map.resize(max_hap as usize + 1, StateEntry::default());
+            }
+        }
+        
+        for (i, &hap) in initial_states.iter().enumerate() {
+             self.global_state_map[hap as usize] = StateEntry {
+                 generation: self.generation,
+                 index: i as u16,
+             };
+        }
     }
     
     /// Advance one step in the HMM
@@ -61,35 +91,25 @@ impl OnlineHmm {
     where F: FnMut(u32) -> (f32, f32, f32)
     {
         let n_new = new_states.len();
-        if n_new == 0 {
-            self.prev_states.clear();
-            self.prev_fwd_combined.clear();
-            self.prev_fwd1.clear();
-            self.prev_fwd2.clear();
-            return;
+        // REMOVED early return: Must process even if empty to update generation and sync state
+        // if n_new == 0 { ... }
+
+
+        // Resize map if needed
+        if self.global_state_map.len() < n_total_haps {
+            self.global_state_map.resize(n_total_haps, StateEntry::default());
         }
 
         // Calculate transition terms
         // T(j -> k) = (1-rho) * delta(j,k) + rho/N
         // P(S_m = k) = sum_j P(S_{m-1}=j) * T(j->k)
         //            = sum_j P(j) * (rho/N) + P(k)*(1-rho) [if k was active]
-        //            = (rho/N) * sum_j P(j) + (1-rho) * P(prev=k)
+        //            = (rho/N) * sum_j P(j) + (1-rho) * P_prev(k)
         // Since P(j) are normalized, sum_j P(j) = 1.0 (approximately)
         // So P_trans(k) = (rho/N) + (1-rho) * P_prev(k)
         
         let shift = p_recomb / n_total_haps as f32;
         let stay = 1.0 - p_recomb; // Probability of NOT recombining globally
-        // Note: Li-Stephens usually uses N_states in denominator. 
-        // If we use N_total_haps, we account for transitions to non-active states implicitly?
-        // Standard Li-Stephens: T(j->k) = r/N where N is number of *reference* haplotypes. 
-        // Here n_total_haps is correct.
-        
-        // Build map of previous states to indices for O(1) matching
-        // Since K is small (~100), linear scan or hash map is fine.
-        // Actually, if we keep vectors sorted, we can merge.
-        // But PBWT neighbors come sorted? Usually yes because PPA is sorted.
-        // Let's assume sorted inputs to optimize matching in future.
-        // For now, naive lookup or simple iterate.
         
         let mut new_fwd_c = Vec::with_capacity(n_new);
         let mut new_fwd1 = Vec::with_capacity(n_new);
@@ -99,16 +119,23 @@ impl OnlineHmm {
         let mut sum1 = 0.0f32;
         let mut sum2 = 0.0f32;
         
+        // Use current generation to identify previous states
+        let prev_gen = self.generation;
+
         for &k in new_states {
-            // Find prob of k in previous step
-            // Use linear search for now (K is small)
-            // Can optimize later.
-            let idx_prev = self.prev_states.iter().position(|&p| p == k);
+            // O(1) Lookup
+            let mut idx_prev = None;
+            if (k as usize) < self.global_state_map.len() {
+                let entry = self.global_state_map[k as usize];
+                if entry.generation == prev_gen {
+                    idx_prev = Some(entry.index as usize);
+                }
+            }
             
             let term_c = if let Some(idx) = idx_prev {
                 self.prev_fwd_combined[idx] * stay + shift
             } else {
-                shift // If not present, only recombination mass comes here
+                shift 
             };
             
             let term1 = if let Some(idx) = idx_prev {
@@ -140,7 +167,6 @@ impl OnlineHmm {
         }
         
         // Normalize
-        // Avoid division by zero
         let norm_c = if sum_c > 1e-30 { 1.0 / sum_c } else { 1.0 };
         let norm_1 = if sum1 > 1e-30 { 1.0 / sum1 } else { 1.0 };
         let norm_2 = if sum2 > 1e-30 { 1.0 / sum2 } else { 1.0 };
@@ -154,6 +180,33 @@ impl OnlineHmm {
         self.prev_fwd_combined = new_fwd_c;
         self.prev_fwd1 = new_fwd1;
         self.prev_fwd2 = new_fwd2;
+
+        // Advance generation and populate map for NEXT step
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Overflow handling: Clear the map to avoid collisions with old generation 0
+            // Or just reset all to 0. Since 0 is now current, next check will fail unless we set it.
+            // Wait, if we wrap to 0, anything with 0 (from long ago) might be considered valid.
+            // But we actually only care about `prev_states`.
+            // So we need to ensure that when we wrap, we invalidate all old entries.
+            // Simplest way: if wrapped to 0, memset the whole array to (0,0) [invalid gen] or just skip 0?
+            // Safer: Use generation > 0 always. 
+            // If wrap to 0 -> set to 1, and clear the vector.
+            // This happens once every 65k steps. Cheap enough.
+            self.generation = 1;
+            self.global_state_map.fill(StateEntry::default());
+        }
+
+        // Populate map for the NEW states which become the PREVIOUS states in the next call
+        for (i, &hap) in self.prev_states.iter().enumerate() {
+            // Safe because we resized above
+            if (hap as usize) < self.global_state_map.len() {
+                self.global_state_map[hap as usize] = StateEntry {
+                    generation: self.generation,
+                    index: i as u16,
+                };
+            }
+        }
     }
     
     /// Calculate current phase likelihood ratio (log scale or probability)
@@ -234,8 +287,21 @@ impl OnlineHmm {
             let e_a1 = emit(a1, ref_a);
             let e_a2 = emit(a2, ref_a);
             
-            // Calculate prior P(S_m=k | prev) using same logic as step
-            let idx_prev = self.prev_states.iter().position(|&p| p == k);
+            // Calculate prior P(S_m=k | prev) using O(1) lookup
+            let prev_gen = self.generation;
+            let mut idx_prev = None;
+            if (k as usize) < self.global_state_map.len() {
+                // Safety: decide_phase relies on 'generation' but it assumes 'generation' corresponds to 'prev_states'.
+                // 'step' updates generation at the END. So 'generation' field currently points to 'prev_states'.
+                // Yes, initialized to 1 in init().
+                // step() updates to new generation for NEXT step.
+                // So current self.generation IS the generation for the current self.prev_states.
+                
+                let entry = self.global_state_map[k as usize];
+                if entry.generation == prev_gen {
+                    idx_prev = Some(entry.index as usize);
+                }
+            }
             
             let term1 = if let Some(idx) = idx_prev {
                 self.prev_fwd1[idx] * stay + shift
@@ -266,5 +332,111 @@ impl OnlineHmm {
         
         // Return true if swap is preferred
         likelihood_swap > likelihood_current
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hmm_transition_correctness() {
+        let mut hmm = OnlineHmm::new();
+        let initial_states = vec![10, 20, 30];
+        hmm.init(&initial_states);
+
+        // Verify init
+        assert_eq!(hmm.prev_states, initial_states);
+        assert_eq!(hmm.global_state_map.len(), 31);
+        assert_eq!(hmm.global_state_map[10].index, 0);
+        assert_eq!(hmm.global_state_map[20].index, 1);
+        assert_eq!(hmm.global_state_map[30].index, 2);
+        assert_eq!(hmm.generation, 1);
+
+        // Step 1: Some overlapping states, some new
+        let new_states = vec![20, 30, 40];
+        let p_recomb = 0.01;
+        let n_total_haps = 100;
+
+        hmm.step(
+            &new_states,
+            |_| (1.0, 1.0, 1.0), // All emissions 1.0 for simplicity
+            p_recomb,
+            n_total_haps,
+        );
+
+        // Check map expansion
+        assert!(hmm.global_state_map.len() >= 100);
+        
+        // Verify previous states (which are now 'new_states') are mapped correctly in the NEW generation
+        // After step(), generation is incremented (now 2).
+        // The map should store indices for the states we just transitioned TO (which are now 'prev').
+        assert_eq!(hmm.generation, 2);
+        assert_eq!(hmm.prev_states, new_states);
+        assert_eq!(hmm.global_state_map[20].generation, 2);
+        assert_eq!(hmm.global_state_map[20].index, 0);
+        assert_eq!(hmm.global_state_map[30].generation, 2);
+        assert_eq!(hmm.global_state_map[30].index, 1);
+        assert_eq!(hmm.global_state_map[40].generation, 2);
+        assert_eq!(hmm.global_state_map[40].index, 2);
+        
+        // Old state 10 should still have old generation (1) or be untouched
+        assert_eq!(hmm.global_state_map[10].generation, 1);
+    }
+
+    #[test]
+    fn test_generation_overflow() {
+        let mut hmm = OnlineHmm::new();
+        let initial_states = vec![5];
+        hmm.init(&initial_states);
+        
+        // Artificially set generation near overflow
+        hmm.generation = 65535;
+        
+        // Update map manually to match this generation manually for state 5
+        hmm.global_state_map[5] = StateEntry { generation: 65535, index: 0 };
+
+        let new_states = vec![5, 6];
+        hmm.step(
+            &new_states,
+            |_| (1.0, 1.0, 1.0),
+            0.01,
+            100
+        );
+
+        // Should have wrapped to 1
+        assert_eq!(hmm.generation, 1);
+        
+        // Map should have been cleared/reset. 
+        // State 5 is in new_states, so it should be present with new generation 1.
+        assert_eq!(hmm.global_state_map[5].generation, 1);
+        assert_eq!(hmm.global_state_map[5].index, 0);
+        
+        // State 6 is new, should be present
+        assert_eq!(hmm.global_state_map[6].generation, 1);
+        assert_eq!(hmm.global_state_map[6].index, 1);
+        
+        // Ensure some random other slot is empty/0
+        assert_eq!(hmm.global_state_map[99].generation, 0);
+    }
+
+    #[test]
+    fn test_step_without_init() {
+        let mut hmm = OnlineHmm::new();
+        // Should start with generation 1
+        assert_eq!(hmm.generation, 1);
+        
+        let new_states = vec![10, 20];
+        // This used to panic because generation 0 matched default map entries (0)
+        hmm.step(
+            &new_states,
+            |_| (1.0, 1.0, 1.0),
+            0.01,
+            100
+        );
+        
+        // After step, should be gen 2
+        assert_eq!(hmm.generation, 2);
+        assert_eq!(hmm.prev_states, new_states);
     }
 }
