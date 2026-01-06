@@ -14,37 +14,26 @@
 pub struct Workspace {
     /// Forward probabilities (n_states)
     pub fwd: Vec<f32>,
-
     /// Backward probabilities (n_states)
     pub bwd: Vec<f32>,
-
     /// State probabilities at each marker (flattened: n_markers * n_states)
     pub state_probs: Vec<f32>,
-
     /// Forward pass combined (flattened: n_markers * n_states) - for phasing HMM
     pub fwd_combined: Vec<f32>,
-
     /// Forward pass hap1 (flattened: n_markers * n_states) - for phasing HMM
     pub fwd1: Vec<f32>,
-
     /// Forward pass hap2 (flattened: n_markers * n_states) - for phasing HMM
     pub fwd2: Vec<f32>,
-
     /// Temporary buffer
     pub tmp: Vec<f32>,
-
     /// PBWT prefix array
     pub prefix: Vec<u32>,
-
     /// PBWT divergence array
     pub divergence: Vec<i32>,
-
     /// Allele buffer for PBWT updates
     pub alleles: Vec<u8>,
-
     /// Emission probabilities buffer
     pub emit_probs: Vec<f32>,
-
     /// Random number generator state
     pub rng_state: u64,
 }
@@ -77,14 +66,12 @@ impl Workspace {
     pub fn resize(&mut self, n_states: usize, n_markers: usize, n_haps: usize) {
         self.fwd.resize(n_states, 0.0);
         self.bwd.resize(n_states, 0.0);
-
         let total_size = n_markers * n_states;
         self.state_probs.resize(total_size, 0.0);
         self.fwd_combined.resize(total_size, 0.0);
         self.fwd1.resize(total_size, 0.0);
         self.fwd2.resize(total_size, 0.0);
         self.tmp.resize(n_states, 0.0);
-
         if n_haps > self.prefix.len() {
             let old_len = self.prefix.len();
             self.prefix.resize(n_haps, 0);
@@ -94,7 +81,6 @@ impl Workspace {
             self.divergence.resize(n_haps, 0);
             self.alleles.resize(n_haps, 0);
         }
-
         self.emit_probs.resize(n_states, 0.0);
     }
 
@@ -124,7 +110,6 @@ impl Workspace {
         if sum <= 0.0 {
             return 0;
         }
-
         let threshold = self.next_f32() * sum;
         let mut cumsum = 0.0;
         for (i, &p) in probs.iter().enumerate() {
@@ -142,43 +127,30 @@ impl Workspace {
 pub struct ImpWorkspace {
     /// Forward probabilities
     pub fwd: Vec<f32>,
-
     /// Backward probabilities
     pub bwd: Vec<f32>,
-
     /// Allele dosages at each marker
     pub dosages: Vec<f32>,
-
     /// Allele probabilities at each marker (for GP output)
     pub allele_probs: Vec<[f32; 3]>,
-
     /// Temporary buffer
     pub tmp: Vec<f32>,
-
     /// State to allele mapping
     pub state_alleles: Vec<u8>,
-
     /// PBWT prefix array (for CodedPbwtView) - forward direction
     pub pbwt_prefix: Vec<u32>,
-
     /// PBWT divergence array (for CodedPbwtView) - forward direction
     pub pbwt_divergence: Vec<i32>,
-
     /// PBWT prefix array for backward direction
     pub pbwt_prefix_bwd: Vec<u32>,
-
     /// PBWT divergence array for backward direction
     pub pbwt_divergence_bwd: Vec<i32>,
-
     /// Pattern counts for counting sort
     pub sort_counts: Vec<usize>,
-
     /// Cumulative offsets for counting sort
     pub sort_offsets: Vec<usize>,
-
     /// Scratch buffer for new prefix order
     pub sort_prefix_scratch: Vec<u32>,
-
     /// Scratch buffer for new divergence values
     pub sort_div_scratch: Vec<i32>,
 }
@@ -190,7 +162,6 @@ impl ImpWorkspace {
         let pbwt_divergence = vec![0; n_states + 1];
         let pbwt_prefix_bwd = (0..n_states as u32).collect();
         let pbwt_divergence_bwd = vec![0; n_states + 1];
-
         Self {
             fwd: vec![0.0; n_states],
             bwd: vec![0.0; n_states],
@@ -215,7 +186,6 @@ impl ImpWorkspace {
         let pbwt_divergence = vec![0; n_ref_haps + 1];
         let pbwt_prefix_bwd = (0..n_ref_haps as u32).collect();
         let pbwt_divergence_bwd = vec![0; n_ref_haps + 1];
-
         Self {
             fwd: vec![0.0; n_states],
             bwd: vec![0.0; n_states],
@@ -252,7 +222,6 @@ impl ImpWorkspace {
         self.allele_probs.resize(n_markers, [0.0; 3]);
         self.tmp.resize(n_states, 0.0);
         self.state_alleles.resize(n_states, 0);
-
         if self.pbwt_prefix.len() != n_ref_haps {
             self.pbwt_prefix.resize(n_ref_haps, 0);
             for (i, p) in self.pbwt_prefix.iter_mut().enumerate() {
@@ -261,7 +230,6 @@ impl ImpWorkspace {
         }
         self.pbwt_divergence.resize(n_ref_haps + 1, 0);
         self.pbwt_divergence.fill(0);
-
         if self.pbwt_prefix_bwd.len() != n_ref_haps {
             self.pbwt_prefix_bwd.resize(n_ref_haps, 0);
             for (i, p) in self.pbwt_prefix_bwd.iter_mut().enumerate() {
@@ -270,7 +238,6 @@ impl ImpWorkspace {
         }
         self.pbwt_divergence_bwd.resize(n_ref_haps + 1, 0);
         self.pbwt_divergence_bwd.fill(0);
-
         self.sort_prefix_scratch.resize(n_ref_haps, 0);
         self.sort_div_scratch.resize(n_ref_haps + 1, 0);
     }
@@ -307,15 +274,12 @@ mod tests {
     fn test_random_sampling() {
         let mut ws = Workspace::minimal();
         ws.set_seed(12345);
-
         let probs = vec![0.1, 0.2, 0.3, 0.4];
         let mut counts = vec![0usize; 4];
-
         for _ in 0..10000 {
             let idx = ws.sample_index(&probs);
             counts[idx] += 1;
         }
-
         assert!(counts[3] > counts[0]);
     }
 }

@@ -84,3 +84,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LOCAL_LOG_FILE: build.log
           LOCAL_BUILD_STATUS: ${{ steps.verify.outputs.status }}
+        run: python scripts/jules_loop.py
