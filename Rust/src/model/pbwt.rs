@@ -604,7 +604,8 @@ impl PbwtDivUpdater {
             let old_v = v;
 
             if can_u && (!can_v || prefer_u(u, v)) {
-                // Expand u (backward)
+                // Expand u (backward) - we know we can expand by at least 1 since can_expand_u passed
+                u -= 1;
                 let scan_limit = n_candidates - (v - u);
                 if is_backward {
                     u = SimdScanner::scan_back_while_ge(divergence, u, u.saturating_sub(scan_limit), marker);

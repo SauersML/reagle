@@ -15,7 +15,8 @@
 
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
-use crate::data::storage::GenotypeMatrix;
+use crate::data::storage::matrix::GenotypeMatrix;
+use crate::data::storage::phase_state::PhaseState;
 
 /// A single coded step containing dictionary-compressed haplotypes
 #[derive(Clone, Debug)]
@@ -301,9 +302,9 @@ impl RefPanelCoded {
     /// * `map_allele` - Function to map target allele to reference allele space
     ///
     /// After this call, the panel contains `n_ref_haps + n_target_haps` haplotypes.
-    pub fn append_target_haplotypes<F>(
+    pub fn append_target_haplotypes<S: PhaseState, F>(
         &mut self,
-        target_gt: &GenotypeMatrix,
+        target_gt: &GenotypeMatrix<S>,
         ref_to_target: &[i32],
         map_allele: F,
     ) where
