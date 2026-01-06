@@ -27,7 +27,7 @@ use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
 use crate::model::hmm::LiStephensHmm;
 use crate::model::parameters::ModelParams;
-use crate::model::phase_ibs::{BidirectionalPhaseIbs, GlobalPhaseIbs};
+use crate::model::phase_ibs::BidirectionalPhaseIbs;
 
 /// Phasing pipeline
 pub struct PhasingPipeline {
@@ -789,72 +789,6 @@ impl PhasingPipeline {
         }
     }
 
-    /// Select optimal HMM states using PBWT-based dynamic state selection
-    ///
-    /// This method uses GlobalPhaseIbs to find IBS neighbors at a specific marker,
-    /// incorporating divergence information for accurate long-match detection.
-    /// This is closer to Beagle's dynamic state selection approach.
-    ///
-    /// # Arguments
-    /// * `hap_idx` - The haplotype to find neighbors for
-    /// * `marker_idx` - Current marker index for localized IBS matching
-    /// * `phase_ibs` - Global PBWT state tracker
-    /// * `ibs2` - IBS2 segments for guaranteed long-range matches
-    /// * `n_states_wanted` - Number of reference haplotypes to select
-    /// * `n_total_haps` - Total haplotypes available
-    fn select_states_pbwt(
-        &self,
-        hap_idx: HapIdx,
-        marker_idx: usize,
-        phase_ibs: &GlobalPhaseIbs,
-        ibs2: &Ibs2,
-        n_states_wanted: usize,
-        n_total_haps: usize,
-        seed: i64,
-        iteration: usize,
-    ) -> Vec<HapIdx> {
-        use rand::seq::SliceRandom;
-        use rand::SeedableRng;
-
-        // Use PBWT neighbor finding with divergence-aware selection
-        // Request more candidates than needed to allow random selection
-        let n_candidates = (n_states_wanted * 2).min(n_total_haps);
-        let neighbors = phase_ibs.find_neighbors(
-            hap_idx.0,
-            marker_idx,
-            ibs2,
-            n_candidates,
-        );
-
-        let mut states: Vec<HapIdx> = neighbors.into_iter().map(HapIdx::new).collect();
-
-        // Fill remaining if PBWT didn't find enough neighbors
-        if states.len() < n_states_wanted {
-            let sample = SampleIdx::new(hap_idx.0 / 2);
-            let mut i = 0;
-            while states.len() < n_states_wanted && i < n_total_haps {
-                let h = HapIdx::new(i as u32);
-                if h != sample.hap1() && h != sample.hap2() && !states.contains(&h) {
-                    states.push(h);
-                }
-                i += 1;
-            }
-        }
-
-        // Apply iteration-varying randomness to state selection
-        // Seed combines: config seed + iteration + haplotype index (like Java: seed + it)
-        let combined_seed = (seed as u64)
-            .wrapping_add(iteration as u64)
-            .wrapping_add(hap_idx.0 as u64);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(combined_seed);
-
-        // Shuffle candidates and select top n_states_wanted
-        // This allows different iterations to explore different state combinations
-        states.shuffle(&mut rng);
-        states.truncate(n_states_wanted);
-        states
-    }
-
     /// Select HMM states using bidirectional PBWT (forward + backward neighbors)
     fn select_states_bidirectional(
         &self,
@@ -895,21 +829,6 @@ impl PhasingPipeline {
         states.shuffle(&mut rng);
         states.truncate(n_states_wanted);
         states
-    }
-
-    /// Build forward-only PBWT state for streaming/window-based phasing
-    fn build_phase_pbwt(&self, geno: &MutableGenotypes, n_markers: usize, n_haps: usize) -> GlobalPhaseIbs {
-        let mut phase_ibs = GlobalPhaseIbs::new(n_haps);
-
-        for m in 0..n_markers {
-            let mut alleles = Vec::with_capacity(n_haps);
-            for h in 0..n_haps {
-                alleles.push(geno.get(m, HapIdx::new(h as u32)));
-            }
-            phase_ibs.advance(&alleles, m);
-        }
-
-        phase_ibs
     }
 
     /// Build bidirectional PBWT for full chromosome phasing
