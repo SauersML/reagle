@@ -29,7 +29,8 @@ pub use data::storage::GenotypeMatrix;
 pub use error::{ReagleError, Result};
 pub use io::bref3::Bref3Reader;
 pub use io::vcf::{VcfReader, VcfWriter};
-pub use model::hmm::LiStephensHmm;
+pub use model::hmm::BeagleHmm;
+pub use model::states::ThreadedHaps;
 pub use model::parameters::ModelParams;
 
 pub use pipelines::{ImputationPipeline, PhasingPipeline};

@@ -18,19 +18,6 @@ use crate::data::{HapIdx, MarkerIdx};
 use crate::model::parameters::ModelParams;
 use wide::f32x8;
 
-/// Result of HMM forward-backward computation
-#[derive(Debug, Clone)]
-pub struct HmmResult {
-    /// Posterior state probabilities at each marker (flattened: n_markers * n_states)
-    pub state_probs: Vec<f32>,
-    /// Number of states (to reconstruct dimensions)
-    pub n_states: usize,
-    /// Sampled state path (one state per marker)
-    pub sampled_path: Vec<usize>,
-    /// Log-likelihood of the data
-    pub log_likelihood: f64,
-}
-
 /// Static HMM update functions matching Java HmmUpdater
 pub struct HmmUpdater;
 
@@ -519,220 +506,6 @@ impl<'a> BeagleHmm<'a> {
     }
 }
 
-// ============================================================================
-// LiStephensHmm: Static-State Wrapper for BeagleHmm
-// ============================================================================
-
-/// Static-state Li-Stephens HMM that wraps BeagleHmm for backwards compatibility.
-///
-/// This provides the same API as the original LiStephensHmm but uses the unified
-/// BeagleHmm internally with a static `ThreadedHaps` (single segment per state).
-///
-/// Use this when states are selected once via PBWT and remain constant for the
-/// entire forward-backward run (typical in phasing).
-pub struct LiStephensHmm<'a> {
-    /// Reference panel genotypes
-    ref_gt: GenotypeView<'a>,
-    /// Model parameters
-    params: &'a ModelParams,
-    /// Static haplotype indices (one per state)
-    ref_haps: Vec<HapIdx>,
-    /// Recombination probabilities between consecutive markers
-    p_recomb: Vec<f32>,
-}
-
-impl<'a> LiStephensHmm<'a> {
-    /// Create a new static Li-Stephens HMM
-    ///
-    /// # Arguments
-    /// * `ref_gt` - Reference panel genotypes
-    /// * `params` - Model parameters
-    /// * `ref_haps` - Reference haplotype indices for each state (constant across markers)
-    /// * `p_recomb` - Recombination probabilities
-    pub fn new(
-        ref_gt: impl Into<GenotypeView<'a>>,
-        params: &'a ModelParams,
-        ref_haps: Vec<HapIdx>,
-        p_recomb: Vec<f32>,
-    ) -> Self {
-        Self {
-            ref_gt: ref_gt.into(),
-            params,
-            ref_haps,
-            p_recomb,
-        }
-    }
-
-    /// Number of HMM states
-    pub fn n_states(&self) -> usize {
-        self.ref_haps.len()
-    }
-
-    /// Number of markers
-    pub fn n_markers(&self) -> usize {
-        self.ref_gt.n_markers()
-    }
-
-    /// Run forward-backward algorithm and return full result with posteriors
-    ///
-    /// This is the high-level API that returns normalized posteriors and sampled path.
-    pub fn forward_backward(
-        &self,
-        target_alleles: &[u8],
-        fwd: &mut Vec<f32>,
-        bwd: &mut Vec<f32>,
-    ) -> HmmResult {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states();
-
-        if n_markers == 0 || n_states == 0 {
-            return HmmResult {
-                state_probs: Vec::new(),
-                n_states: 0,
-                sampled_path: Vec::new(),
-                log_likelihood: 0.0,
-            };
-        }
-
-        // Create static ThreadedHaps (single segment per state)
-        let threaded_haps = ThreadedHaps::from_static_haps(&self.ref_haps, n_markers);
-
-        // Create BeagleHmm and run forward-backward
-        let beagle_hmm = BeagleHmm::new(
-            self.ref_gt,
-            self.params,
-            n_states,
-            self.p_recomb.clone(),
-        );
-
-        let log_likelihood = beagle_hmm.forward_backward_raw(
-            target_alleles,
-            &threaded_haps,
-            fwd,
-            bwd,
-        );
-
-        // Compute normalized posteriors: state_probs = fwd * bwd (normalized per marker)
-        let total_size = n_markers * n_states;
-        let mut state_probs = vec![0.0f32; total_size];
-
-        for m in 0..n_markers {
-            let row_start = m * n_states;
-            let row_end = row_start + n_states;
-
-            let mut sum = 0.0f32;
-            for k in 0..n_states {
-                let p = fwd[row_start + k] * bwd[row_start + k];
-                state_probs[row_start + k] = p;
-                sum += p;
-            }
-
-            // Normalize
-            if sum > 0.0 {
-                let inv_sum = 1.0 / sum;
-                for k in 0..n_states {
-                    state_probs[row_start + k] *= inv_sum;
-                }
-            }
-        }
-
-        // Sample path (simple argmax for now)
-        let sampled_path: Vec<usize> = (0..n_markers)
-            .map(|m| {
-                let row_start = m * n_states;
-                (0..n_states)
-                    .max_by(|&a, &b| {
-                        state_probs[row_start + a]
-                            .partial_cmp(&state_probs[row_start + b])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap_or(0)
-            })
-            .collect();
-
-        HmmResult {
-            state_probs,
-            n_states,
-            sampled_path,
-            log_likelihood,
-        }
-    }
-
-    /// Run forward-backward and return raw buffers (for phasing pipeline)
-    ///
-    /// Returns log-likelihood. The fwd/bwd buffers contain scaled (but not normalized)
-    /// forward/backward values.
-    pub fn forward_backward_raw(
-        &self,
-        target_alleles: &[u8],
-        fwd: &mut Vec<f32>,
-        bwd: &mut Vec<f32>,
-    ) -> f64 {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states();
-
-        if n_markers == 0 || n_states == 0 {
-            return 0.0;
-        }
-
-        // Create static ThreadedHaps
-        let threaded_haps = ThreadedHaps::from_static_haps(&self.ref_haps, n_markers);
-
-        // Create BeagleHmm and delegate
-        let beagle_hmm = BeagleHmm::new(
-            self.ref_gt,
-            self.params,
-            n_states,
-            self.p_recomb.clone(),
-        );
-
-        beagle_hmm.forward_backward_raw(target_alleles, &threaded_haps, fwd, bwd)
-    }
-
-    /// Compute expected allele dosage at a marker given state probabilities
-    pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
-        let mut dosage = 0.0f32;
-        for (k, &prob) in state_probs.iter().enumerate() {
-            if k < self.ref_haps.len() {
-                let hap = self.ref_haps[k];
-                let allele = self.ref_gt.allele(marker, hap);
-                if allele != 255 {
-                    dosage += prob * allele as f32;
-                }
-            }
-        }
-        dosage
-    }
-
-    /// Collect statistics for EM parameter estimation
-    pub fn collect_stats(
-        &self,
-        target_alleles: &[u8],
-        gen_dists: &[f64],
-        estimates: &mut crate::model::parameters::ParamEstimates,
-    ) {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states();
-
-        if n_markers < 2 || n_states <= 1 {
-            return;
-        }
-
-        // Create static ThreadedHaps
-        let threaded_haps = ThreadedHaps::from_static_haps(&self.ref_haps, n_markers);
-
-        // Create BeagleHmm and delegate
-        let beagle_hmm = BeagleHmm::new(
-            self.ref_gt,
-            self.params,
-            n_states,
-            self.p_recomb.clone(),
-        );
-
-        beagle_hmm.collect_stats(target_alleles, &threaded_haps, gen_dists, estimates)
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -804,45 +577,43 @@ mod tests {
     }
 
     #[test]
-    fn test_hmm_forward_backward() {
+    fn test_beagle_hmm_forward_backward() {
         let ref_panel = make_test_ref_panel();
         let params = ModelParams::for_phasing(6, 10000.0, None);
         let ref_haps: Vec<HapIdx> = (0..6).map(|i| HapIdx::new(i)).collect();
         let p_recomb = vec![0.0, 0.01, 0.01, 0.01, 0.01];
 
-        let hmm = LiStephensHmm::new(&ref_panel, &params, ref_haps, p_recomb);
+        let n_markers = 5;
+        let n_states = ref_haps.len();
+        let threaded_haps = ThreadedHaps::from_static_haps(&ref_haps, n_markers);
+        let hmm = BeagleHmm::new(&ref_panel, &params, n_states, p_recomb);
 
         let target_alleles = vec![0, 0, 0, 1, 0]; // Should match haplotype 0 or 4
         let mut fwd = Vec::new();
         let mut bwd = Vec::new();
 
-        let result = hmm.forward_backward(&target_alleles, &mut fwd, &mut bwd);
+        let log_likelihood = hmm.forward_backward_raw(&target_alleles, &threaded_haps, &mut fwd, &mut bwd);
 
-        assert_eq!(result.state_probs.len(), 5 * 6); // 5 markers * 6 states
-        assert_eq!(result.sampled_path.len(), 5);
-        assert!(result.log_likelihood.is_finite());
-
-        // Check probabilities sum to ~1 at each marker
-        for m in 0..5 {
-            let start = m * 6;
-            let end = start + 6;
-            let sum: f32 = result.state_probs[start..end].iter().sum();
-            assert!((sum - 1.0).abs() < 0.01, "Sum at marker {} was {}", m, sum);
-        }
+        assert_eq!(fwd.len(), 5 * 6); // 5 markers * 6 states
+        assert_eq!(bwd.len(), 5 * 6);
+        assert!(log_likelihood.is_finite());
     }
 
     #[test]
-    fn test_dosage_computation() {
+    fn test_beagle_hmm_dosage() {
         let ref_panel = make_test_ref_panel();
         let params = ModelParams::for_phasing(6, 10000.0, None);
         let ref_haps: Vec<HapIdx> = (0..6).map(|i| HapIdx::new(i)).collect();
         let p_recomb = vec![0.0, 0.01, 0.01, 0.01, 0.01];
 
-        let hmm = LiStephensHmm::new(&ref_panel, &params, ref_haps, p_recomb);
+        let n_markers = 5;
+        let n_states = ref_haps.len();
+        let hmm = BeagleHmm::new(&ref_panel, &params, n_states, p_recomb);
 
         // Uniform state probs
         let state_probs = vec![1.0 / 6.0; 6];
-        let dosage = hmm.compute_dosage(MarkerIdx::new(0), &state_probs);
+        let marker_haps: Vec<u32> = ref_haps.iter().map(|h| h.0).collect();
+        let dosage = hmm.compute_dosage(MarkerIdx::new(0), &state_probs, &marker_haps);
 
         // Marker 0 alleles: [0, 0, 1, 1, 0, 1] -> mean = 0.5
         assert!((dosage - 0.5).abs() < 0.01);

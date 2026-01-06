@@ -25,7 +25,8 @@ use crate::error::Result;
 use crate::io::streaming::{PhasedOverlap, StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
-use crate::model::hmm::LiStephensHmm;
+use crate::model::hmm::BeagleHmm;
+use crate::model::states::ThreadedHaps;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 
@@ -912,29 +913,26 @@ impl PhasingPipeline {
             let seq1 = ref_geno.haplotype(hap1);
             let seq2 = ref_geno.haplotype(hap2);
 
-            // 3. Run HMM Forward-Backward for H1
-            let hmm1 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
-            
+            // 3. Run HMM Forward-Backward for H1 and H2
+            let n_states = states.len();
+            let threaded_haps = ThreadedHaps::from_static_haps(&states, n_markers);
+            let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
+
             // Collect EM statistics if requested
             if let Some(atomic) = atomic_estimates {
                 let mut local_est = crate::model::parameters::ParamEstimates::new();
-                hmm1.collect_stats(&seq1, gen_dists, &mut local_est);
-                
-                let hmm2 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
-                hmm2.collect_stats(&seq2, gen_dists, &mut local_est);
-                
+                hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
+                hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
                 atomic.add_estimation_data(&local_est);
             }
 
             let mut fwd1 = Vec::new();
             let mut bwd1 = Vec::new();
-            hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
+            hmm.forward_backward_raw(&seq1, &threaded_haps, &mut fwd1, &mut bwd1);
 
-            // 4. Run HMM Forward-Backward for H2
-            let hmm2 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
             let mut fwd2 = Vec::new();
             let mut bwd2 = Vec::new();
-            hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
+            hmm.forward_backward_raw(&seq2, &threaded_haps, &mut fwd2, &mut bwd2);
 
             // 5. Decide Phase using BLOCK-BASED phasing
             // Instead of per-marker decisions, identify contiguous heterozygous blocks
@@ -1100,33 +1098,29 @@ impl PhasingPipeline {
                 let seq1: Vec<u8> = (0..n_markers).map(|m| sp.allele1(m)).collect();
                 let seq2: Vec<u8> = (0..n_markers).map(|m| sp.allele2(m)).collect();
 
-                // Run HMM Forward-Backward for H1
-                let hmm1 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
-                
+                // Run HMM Forward-Backward for H1 and H2
+                let n_states = states.len();
+                let threaded_haps = ThreadedHaps::from_static_haps(&states, n_markers);
+                let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
+
                 // Collect EM statistics if requested
                 if let Some(atomic) = atomic_estimates {
                     let mut local_est = crate::model::parameters::ParamEstimates::new();
-                    hmm1.collect_stats(&seq1, gen_dists, &mut local_est);
-                    
-                    let hmm2 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
-                    hmm2.collect_stats(&seq2, gen_dists, &mut local_est);
-                    
+                    hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
+                    hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
                     atomic.add_estimation_data(&local_est);
                 }
 
                 let mut fwd1 = Vec::new();
                 let mut bwd1 = Vec::new();
-                hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
+                hmm.forward_backward_raw(&seq1, &threaded_haps, &mut fwd1, &mut bwd1);
 
-                // Run HMM Forward-Backward for H2
-                let hmm2 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
                 let mut fwd2 = Vec::new();
                 let mut bwd2 = Vec::new();
-                hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
+                hmm.forward_backward_raw(&seq2, &threaded_haps, &mut fwd2, &mut bwd2);
 
                 // Identify heterozygous blocks AFTER the overlap region
                 // Overlap markers are already phased and should not change
-                let n_states = states.len();
                 let mut het_blocks: Vec<(usize, usize)> = Vec::new();
                 let mut block_start: Option<usize> = None;
                 
@@ -1295,30 +1289,29 @@ impl PhasingPipeline {
                 let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
                 let seq2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele2(m)).collect();
 
-                let hmm1 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
+                // Run HMM Forward-Backward for H1 and H2 on Stage 1 markers
+                let n_states = states.len();
+                let n_hi_freq_markers = hi_freq_to_orig.len();
+                let threaded_haps = ThreadedHaps::from_static_haps(&states, n_hi_freq_markers);
+                let hmm = BeagleHmm::new(subset_view, &self.params, n_states, stage1_p_recomb.to_vec());
 
                 // Collect EM statistics if requested
                 if let Some(atomic) = atomic_estimates {
                     let mut local_est = crate::model::parameters::ParamEstimates::new();
-                    hmm1.collect_stats(&seq1, stage1_gen_dists, &mut local_est);
-
-                    let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
-                    hmm2.collect_stats(&seq2, stage1_gen_dists, &mut local_est);
-
+                    hmm.collect_stats(&seq1, &threaded_haps, stage1_gen_dists, &mut local_est);
+                    hmm.collect_stats(&seq2, &threaded_haps, stage1_gen_dists, &mut local_est);
                     atomic.add_estimation_data(&local_est);
                 }
 
                 let mut fwd1 = Vec::new();
                 let mut bwd1 = Vec::new();
-                hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
+                hmm.forward_backward_raw(&seq1, &threaded_haps, &mut fwd1, &mut bwd1);
 
-                let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
                 let mut fwd2 = Vec::new();
                 let mut bwd2 = Vec::new();
-                hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
+                hmm.forward_backward_raw(&seq2, &threaded_haps, &mut fwd2, &mut bwd2);
 
                 // BLOCK-BASED phasing for Stage 1
-                let n_states = states.len();
                 let n_hi_freq = hi_freq_to_orig.len();
 
                 // Identify UNPHASED heterozygous blocks in hi-freq marker space
@@ -1551,15 +1544,16 @@ impl PhasingPipeline {
                 let seq2: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele2(m)).collect();
 
                 // Run HMM forward-backward for both haplotypes on Stage 1 markers
-                let hmm1 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
+                let threaded_haps = ThreadedHaps::from_static_haps(&states, n_stage1);
+                let hmm = BeagleHmm::new(subset_view, &self.params, n_states, stage1_p_recomb.to_vec());
+
                 let mut fwd1 = Vec::new();
                 let mut bwd1 = Vec::new();
-                hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
+                hmm.forward_backward_raw(&seq1, &threaded_haps, &mut fwd1, &mut bwd1);
 
-                let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
                 let mut fwd2 = Vec::new();
                 let mut bwd2 = Vec::new();
-                hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
+                hmm.forward_backward_raw(&seq2, &threaded_haps, &mut fwd2, &mut bwd2);
 
                 // Compute posterior state probabilities at each Stage 1 marker
                 let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
