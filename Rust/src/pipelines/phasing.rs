@@ -481,7 +481,6 @@ impl PhasingPipeline {
         self.params
             .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
 
-        let mut missing_mask_vecs: Vec<BitVec<u8, Lsb0>> = vec![BitVec::with_capacity(n_markers); n_haps];
         let mut geno = MutableGenotypes::new(n_markers, n_haps);
 
         for m in 0..n_markers {
@@ -489,16 +488,11 @@ impl PhasingPipeline {
             for h in 0..n_haps {
                 let h_idx = HapIdx::new(h as u32);
                 let allele = target_gt.allele(m_idx, h_idx);
-                missing_mask_vecs[h].push(allele == 255);
                 if allele != 0 && allele != 255 {
                     geno.set(m, h_idx, 1);
                 }
             }
         }
-        let missing_mask: Vec<BitBox<u8, Lsb0>> = missing_mask_vecs
-            .into_iter()
-            .map(|v| v.into_boxed_bitslice())
-            .collect();
 
         let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
         let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
@@ -537,7 +531,6 @@ impl PhasingPipeline {
             self.run_phase_baum_iteration(
                 &target_gt,
                 &mut geno,
-                &missing_mask,
                 &p_recomb,
                 &gen_dists,
                 &ibs2,
@@ -962,9 +955,8 @@ impl PhasingPipeline {
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        _: &[BitBox<u8, Lsb0>],
         p_recomb: &[f32],
-        gen_dists: &[f64], // Pass genetic distances for EM
+        gen_dists: &[f64],
         ibs2: &Ibs2,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
@@ -1357,9 +1349,6 @@ impl PhasingPipeline {
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
-        // Compute total haplotype count (target + reference)
-        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
-
         let ref_geno = geno.clone();
         let ref_view = GenotypeView::from((&ref_geno, markers));
 
@@ -1653,9 +1642,6 @@ impl PhasingPipeline {
 
         // Update sample_phases to match
         for (s, sp) in sample_phases.iter_mut().enumerate() {
-            let hap1 = HapIdx::new((s * 2) as u32);
-            let hap2 = HapIdx::new((s * 2 + 1) as u32);
-
             for m in overlap_markers..n_markers {
                 if swap_masks[s][m] {
                     sp.swap_alleles(m);

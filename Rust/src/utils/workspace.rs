@@ -9,7 +9,9 @@
 //! borrow checker issues), we create a separate Workspace that owns all
 //! temporary buffers and pass `&mut Workspace` to computation functions.
 
-
+/// Workspace for phasing HMM computations
+#[derive(Debug)]
+pub struct Workspace {
     /// Forward probabilities (n_states)
     pub fwd: Vec<f32>,
 
@@ -47,7 +49,24 @@
     pub rng_state: u64,
 }
 
-
+impl Workspace {
+    /// Create a new workspace with given capacities
+    pub fn new(n_states: usize, n_markers: usize, n_haps: usize) -> Self {
+        Self {
+            fwd: vec![0.0; n_states],
+            bwd: vec![0.0; n_states],
+            state_probs: vec![0.0; n_markers * n_states],
+            fwd_combined: vec![0.0; n_markers * n_states],
+            fwd1: vec![0.0; n_markers * n_states],
+            fwd2: vec![0.0; n_markers * n_states],
+            tmp: vec![0.0; n_states],
+            prefix: (0..n_haps as u32).collect(),
+            divergence: vec![0; n_haps],
+            alleles: vec![0; n_haps],
+            emit_probs: vec![0.0; n_states],
+            rng_state: 0,
+        }
+    }
 
     /// Create a minimal workspace for testing
     pub fn minimal() -> Self {
@@ -58,7 +77,7 @@
     pub fn resize(&mut self, n_states: usize, n_markers: usize, n_haps: usize) {
         self.fwd.resize(n_states, 0.0);
         self.bwd.resize(n_states, 0.0);
-        
+
         let total_size = n_markers * n_states;
         self.state_probs.resize(total_size, 0.0);
         self.fwd_combined.resize(total_size, 0.0);
@@ -118,8 +137,6 @@
     }
 }
 
-
-
 /// Workspace for imputation HMM computations
 #[derive(Debug)]
 pub struct ImpWorkspace {
@@ -153,7 +170,6 @@ pub struct ImpWorkspace {
     /// PBWT divergence array for backward direction
     pub pbwt_divergence_bwd: Vec<i32>,
 
-    // === Counting sort scratch buffers for optimized PBWT updates ===
     /// Pattern counts for counting sort
     pub sort_counts: Vec<usize>,
 
@@ -170,7 +186,6 @@ pub struct ImpWorkspace {
 impl ImpWorkspace {
     /// Create a new imputation workspace
     pub fn new(n_states: usize, n_markers: usize) -> Self {
-        // Initialize PBWT arrays with identity permutation
         let pbwt_prefix = (0..n_states as u32).collect();
         let pbwt_divergence = vec![0; n_states + 1];
         let pbwt_prefix_bwd = (0..n_states as u32).collect();
@@ -187,7 +202,6 @@ impl ImpWorkspace {
             pbwt_divergence,
             pbwt_prefix_bwd,
             pbwt_divergence_bwd,
-            // Counting sort buffers - start small, will resize as needed
             sort_counts: Vec::new(),
             sort_offsets: Vec::new(),
             sort_prefix_scratch: vec![0; n_states],
@@ -197,7 +211,6 @@ impl ImpWorkspace {
 
     /// Create workspace with reference panel size
     pub fn with_ref_size(n_states: usize, n_markers: usize, n_ref_haps: usize) -> Self {
-        // PBWT arrays sized for reference panel
         let pbwt_prefix = (0..n_ref_haps as u32).collect();
         let pbwt_divergence = vec![0; n_ref_haps + 1];
         let pbwt_prefix_bwd = (0..n_ref_haps as u32).collect();
@@ -214,7 +227,6 @@ impl ImpWorkspace {
             pbwt_divergence,
             pbwt_prefix_bwd,
             pbwt_divergence_bwd,
-            // Counting sort buffers - sized for reference panel
             sort_counts: Vec::new(),
             sort_offsets: Vec::new(),
             sort_prefix_scratch: vec![0; n_ref_haps],
@@ -230,7 +242,6 @@ impl ImpWorkspace {
         self.allele_probs.resize(n_markers, [0.0; 3]);
         self.tmp.resize(n_states, 0.0);
         self.state_alleles.resize(n_states, 0);
-        // PBWT arrays keep their size (based on reference panel)
     }
 
     /// Resize including PBWT buffers
@@ -242,7 +253,6 @@ impl ImpWorkspace {
         self.tmp.resize(n_states, 0.0);
         self.state_alleles.resize(n_states, 0);
 
-        // Resize forward PBWT arrays if needed
         if self.pbwt_prefix.len() != n_ref_haps {
             self.pbwt_prefix.resize(n_ref_haps, 0);
             for (i, p) in self.pbwt_prefix.iter_mut().enumerate() {
@@ -252,7 +262,6 @@ impl ImpWorkspace {
         self.pbwt_divergence.resize(n_ref_haps + 1, 0);
         self.pbwt_divergence.fill(0);
 
-        // Resize backward PBWT arrays if needed
         if self.pbwt_prefix_bwd.len() != n_ref_haps {
             self.pbwt_prefix_bwd.resize(n_ref_haps, 0);
             for (i, p) in self.pbwt_prefix_bwd.iter_mut().enumerate() {
@@ -262,7 +271,6 @@ impl ImpWorkspace {
         self.pbwt_divergence_bwd.resize(n_ref_haps + 1, 0);
         self.pbwt_divergence_bwd.fill(0);
 
-        // Resize counting sort scratch buffers
         self.sort_prefix_scratch.resize(n_ref_haps, 0);
         self.sort_div_scratch.resize(n_ref_haps + 1, 0);
     }
@@ -308,7 +316,6 @@ mod tests {
             counts[idx] += 1;
         }
 
-        // Check rough distribution
-        assert!(counts[3] > counts[0]); // 0.4 should be sampled more than 0.1
+        assert!(counts[3] > counts[0]);
     }
 }
