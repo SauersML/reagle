@@ -977,10 +977,70 @@ impl<'a> ImpStates<'a> {
         }
     }
 
-    /// Select IBS-based HMM states for a target haplotype
+    /// Select IBS-based HMM states for a target haplotype using recursive partitioning
     ///
-    /// Uses BOTH forward and backward PBWT passes to find IBS matches,
-    /// matching Java Beagle's behavior in LowFreqPhaseStates.
+    /// This is the correct Java Beagle algorithm from `ImpIbs.java`:
+    /// - Uses pre-computed IBS haplotypes from recursive partitioning
+    /// - Groups haplotypes by shared allele sequences at each step
+    ///
+    /// # Arguments
+    /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
+    /// * `target_alleles` - Target haplotype alleles at genotyped markers
+    /// * `ibs_finder` - Pre-computed recursive partitioning IBS finder
+    /// * `target_hap` - Global target haplotype index (ref_haps + target_offset)
+    /// * `hap_indices` - Output: reference haplotype for each state at each marker
+    /// * `allele_match` - Output: whether state allele matches target at each marker
+    ///
+    /// # Returns
+    /// Number of states
+    pub fn ibs_states_partition<F>(
+        &mut self,
+        get_ref_allele: F,
+        target_alleles: &[u8],
+        ibs_finder: &RecursivePartitionIbs,
+        target_hap: usize,
+        hap_indices: &mut Vec<Vec<u32>>,
+        allele_match: &mut Vec<Vec<bool>>,
+    ) -> usize
+    where
+        F: Fn(usize, u32) -> u8,
+    {
+        self.initialize();
+
+        let n_steps = self.ref_panel.n_steps();
+
+        // Process each step and get IBS haplotypes from recursive partitioning
+        for step_idx in 0..n_steps {
+            let ibs_haps = ibs_finder.get_ibs_haps(target_hap, step_idx);
+
+            // Update composite haplotypes with IBS matches
+            for &hap in ibs_haps {
+                self.update_with_ibs_hap(hap, step_idx as i32);
+            }
+        }
+
+        // If queue is empty, fill with random haplotypes
+        if self.queue.is_empty() {
+            self.fill_with_random_haps();
+        }
+
+        // Build output arrays
+        let n_states = self.queue.len().min(self.max_states);
+        self.build_output(
+            get_ref_allele,
+            target_alleles,
+            n_states,
+            hap_indices,
+            allele_match,
+        );
+
+        n_states
+    }
+
+    /// Legacy method using PBWT-based IBS (kept for compatibility)
+    ///
+    /// Uses BOTH forward and backward PBWT passes to find IBS matches.
+    /// For the correct Java Beagle behavior, use `ibs_states_partition` instead.
     ///
     /// # Arguments
     /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
@@ -991,6 +1051,7 @@ impl<'a> ImpStates<'a> {
     ///
     /// # Returns
     /// Number of states
+    #[allow(dead_code)]
     pub fn ibs_states<F>(
         &mut self,
         get_ref_allele: F,
@@ -1007,6 +1068,7 @@ impl<'a> ImpStates<'a> {
         // Create CodedPbwtView from workspace buffers
         let n_ref_haps = self.ref_panel.n_haps();
         let n_steps = self.ref_panel.n_steps();
+        let n_ibs_haps = 8; // Default value
         workspace.resize_with_ref(self.max_states, self.n_markers, n_ref_haps);
 
         // Store backward IBS haps for each step (to use during forward pass)
@@ -1038,14 +1100,14 @@ impl<'a> ImpStates<'a> {
                 let bwd_ibs: Vec<u32> =
                     if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
                         pbwt_bwd
-                            .find_ibs(target_pattern, coded_step, self.n_ibs_haps)
+                            .find_ibs(target_pattern, coded_step, n_ibs_haps)
                             .into_iter()
                             .map(|h| h.0)
                             .collect()
                     } else {
                         let closest_pattern = coded_step.closest_pattern(&target_seq);
                         pbwt_bwd
-                            .find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
+                            .find_ibs(closest_pattern, coded_step, n_ibs_haps)
                             .into_iter()
                             .map(|h| h.0)
                             .collect()
@@ -1086,14 +1148,14 @@ impl<'a> ImpStates<'a> {
                 let fwd_ibs: Vec<u32> =
                     if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
                         pbwt_fwd
-                            .find_ibs(target_pattern, coded_step, self.n_ibs_haps)
+                            .find_ibs(target_pattern, coded_step, n_ibs_haps)
                             .into_iter()
                             .map(|h| h.0)
                             .collect()
                     } else {
                         let closest_pattern = coded_step.closest_pattern(&target_seq);
                         pbwt_fwd
-                            .find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
+                            .find_ibs(closest_pattern, coded_step, n_ibs_haps)
                             .into_iter()
                             .map(|h| h.0)
                             .collect()

@@ -246,20 +246,21 @@ impl PhasingPipeline {
             }
         }
 
-        // STAGE 2: Interpolate rare marker phases from flanking high-frequency markers
-        // Uses genetic-distance-weighted interpolation for improved accuracy
-        if !rare_markers.is_empty() {
+        // STAGE 2: Phase rare markers using HMM state probability interpolation
+        // This implements the proper algorithm from Java Beagle's Stage2Baum.java
+        if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
             eprintln!(
-                "Stage 2: Phasing {} rare markers by interpolation...",
+                "Stage 2: Phasing {} rare markers using HMM interpolation...",
                 rare_markers.len()
             );
-            // Pass genetic positions for recombination-based weighting
-            let gen_pos_ref = if !gen_positions.is_empty() {
-                Some(gen_positions.as_slice())
-            } else {
-                None
-            };
-            self.phase_rare_markers(&mut geno, &rare_markers, &hi_freq_markers, gen_pos_ref);
+            self.phase_rare_markers_with_hmm(
+                &target_gt,
+                &mut geno,
+                &hi_freq_markers,
+                &gen_positions,
+                &stage1_p_recomb,
+                &ibs2,
+            );
         }
 
         // Build final GenotypeMatrix from mutable genotypes
@@ -937,154 +938,370 @@ impl PhasingPipeline {
         GenotypeMatrix::new_phased(markers, columns, samples)
     }
 
-    /// Stage 2: Phase rare markers by interpolation from flanking high-frequency markers
-    /// Phase rare markers using interpolation from flanking high-frequency markers.
+    /// Stage 2: Phase rare markers using HMM state probability interpolation
     ///
-    /// This improved method uses genetic-distance-weighted interpolation following
-    /// the approach in Java Beagle's Stage2Baum.java. The key idea is:
+    /// This implements the proper algorithm from Java Beagle's Stage2Baum.java:
     ///
-    /// 1. For each rare heterozygous marker, find flanking high-frequency het markers
-    /// 2. Weight the phase evidence from each flanking marker by genetic distance
-    /// 3. Use recombination probability to compute the likelihood of each phase
-    /// 4. Choose the phase with higher likelihood
-    ///
-    /// The probability of no recombination between markers i and j is approximately:
-    /// P(no_recomb) = exp(-recomb_intensity * genetic_distance)
-    ///
-    /// When genetic map is not available, falls back to physical-distance heuristic
-    /// with assumed 1 cM/Mb rate.
-    fn phase_rare_markers(
+    /// 1. Run HMM on high-frequency markers to get state probabilities for each haplotype
+    /// 2. For each rare heterozygote:
+    ///    - Find flanking high-frequency markers (mkrA, mkrB)
+    ///    - Interpolate state probabilities: prob = wt*probsA[j] + (1-wt)*probsB[j]
+    ///    - Accumulate allele probabilities from reference haplotypes
+    /// 3. Decide phase: p1 = alProbs1[a1] * alProbs2[a2], p2 = alProbs1[a2] * alProbs2[a1]
+    ///    Switch if p2 > p1
+    fn phase_rare_markers_with_hmm(
         &self,
+        target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        rare_markers: &[usize],
         hi_freq_markers: &[usize],
-        gen_positions: Option<&[f64]>,
+        gen_positions: &[f64],
+        stage1_p_recomb: &[f32],
+        ibs2: &Ibs2,
     ) {
         let n_samples = geno.n_haps() / 2;
+        let n_markers = geno.n_markers();
+        let n_haps = geno.n_haps();
+        let n_stage1 = hi_freq_markers.len();
 
-        if rare_markers.is_empty() || hi_freq_markers.is_empty() {
+        if n_stage1 < 2 {
             return;
         }
 
-        // Precompute recombination intensity
-        let recomb_intensity = self.params.recomb_intensity as f64;
+        // Build Stage 2 interpolation mappings
+        let stage2_phaser = Stage2Phaser::new(hi_freq_markers, gen_positions, n_markers);
 
-        for s in 0..n_samples {
-            let sample_idx = SampleIdx::new(s as u32);
-            let hap1 = sample_idx.hap1();
-            let hap2 = sample_idx.hap2();
+        // Clone current genotypes to use as a frozen reference panel
+        let ref_geno = geno.clone();
+        let markers = target_gt.markers();
+        let subset_view = GenotypeView::MutableSubset {
+            geno: &ref_geno,
+            markers,
+            subset: hi_freq_markers,
+        };
 
-            let alleles1 = geno.haplotype(hap1);
-            let alleles2 = geno.haplotype(hap2);
+        // Build PBWT for state selection
+        let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
 
-            // Find rare heterozygotes for this sample
-            let rare_het: Vec<usize> = rare_markers
-                .iter()
-                .copied()
-                .filter(|&m| alleles1[m] != alleles2[m] && alleles1[m] != 255 && alleles2[m] != 255)
-                .collect();
+        // Process samples in parallel - collect results, then apply
+        let phase_changes: Vec<Vec<usize>> = (0..n_samples)
+            .into_par_iter()
+            .map(|s| {
+                let sample_idx = SampleIdx::new(s as u32);
+                let hap1 = sample_idx.hap1();
+                let hap2 = sample_idx.hap2();
 
-            if rare_het.is_empty() {
-                continue;
-            }
+                // Select HMM states using PBWT
+                let mid_marker = n_stage1 / 2;
+                let mid_orig = hi_freq_markers.get(mid_marker).copied().unwrap_or(0);
+                let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps);
+                let n_states = states.len();
 
-            // Find high-frequency heterozygotes for this sample
-            let hf_het: Vec<usize> = hi_freq_markers
-                .iter()
-                .copied()
-                .filter(|&m| alleles1[m] != alleles2[m] && alleles1[m] != 255 && alleles2[m] != 255)
-                .collect();
+                // Extract Stage 1 alleles
+                let seq1: Vec<u8> = hi_freq_markers.iter().map(|&m| ref_geno.get(m, hap1)).collect();
+                let seq2: Vec<u8> = hi_freq_markers.iter().map(|&m| ref_geno.get(m, hap2)).collect();
 
-            if hf_het.is_empty() {
-                continue;
-            }
+                // Run HMM forward-backward for both haplotypes on Stage 1 markers
+                let hmm1 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
+                let mut fwd1 = Vec::new();
+                let mut bwd1 = Vec::new();
+                hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
 
-            for &rare_m in &rare_het {
-                let left_hf = hf_het.iter().copied().filter(|&m| m < rare_m).max();
-                let right_hf = hf_het.iter().copied().filter(|&m| m > rare_m).min();
+                let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
+                let mut fwd2 = Vec::new();
+                let mut bwd2 = Vec::new();
+                hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
 
-                // Calculate phase probabilities using genetic distance weighting
-                let (p_keep, p_swap) = match (left_hf, right_hf) {
-                    (Some(left), Some(right)) => {
-                        // Both flanking markers available - interpolate using
-                        // probability of no recombination from each side
-                        let left_hap1_allele = alleles1[left];
-                        let right_hap1_allele = alleles1[right];
+                // Compute posterior state probabilities at each Stage 1 marker
+                // probs[hap_bit][marker_idx][state_idx]
+                let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
+                let probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
 
-                        // Genetic distances (or fallback to physical distance as proxy)
-                        let (gen_dist_left, gen_dist_right) = if let Some(gen_pos) = gen_positions {
-                            let d_left = (gen_pos[rare_m] - gen_pos[left]).abs();
-                            let d_right = (gen_pos[right] - gen_pos[rare_m]).abs();
-                            (d_left, d_right)
-                        } else {
-                            // Fallback: assume 1 cM per marker as rough proxy
-                            ((rare_m - left) as f64 * 0.001, (right - rare_m) as f64 * 0.001)
-                        };
+                // Collect markers to swap for this sample
+                let mut markers_to_swap = Vec::new();
 
-                        // Probability of no recombination from each flanking marker
-                        // P(no_recomb) = exp(-intensity * distance)
-                        let p_no_recomb_left = (-recomb_intensity * gen_dist_left).exp();
-                        let p_no_recomb_right = (-recomb_intensity * gen_dist_right).exp();
+                // Process all Stage 2 markers (rare markers between Stage 1 markers)
+                for start_idx in 0..n_stage1 {
+                    let start_m = hi_freq_markers[start_idx];
+                    let end_m = if start_idx + 1 < n_stage1 {
+                        hi_freq_markers[start_idx + 1]
+                    } else {
+                        n_markers
+                    };
 
-                        // Phase contribution from left marker
-                        // If hap1 has REF at left (allele=0), phase_from_left suggests hap1 should
-                        // continue with same pattern. If hap1 has ALT (allele=1), suggests swap.
-                        let left_suggests_keep = left_hap1_allele == 0;
-                        let right_suggests_keep = right_hap1_allele == 0;
+                    for m in (start_m + 1)..end_m {
+                        let a1 = ref_geno.get(m, hap1);
+                        let a2 = ref_geno.get(m, hap2);
 
-                        // Weight the suggestions by recombination probability
-                        // Higher p_no_recomb means more confidence from that flanking marker
-                        let weight_left = p_no_recomb_left;
-                        let weight_right = p_no_recomb_right;
-                        let total_weight = weight_left + weight_right;
+                        // Only process heterozygotes
+                        if a1 == a2 || a1 == 255 || a2 == 255 {
+                            continue;
+                        }
 
-                        if total_weight < 1e-10 {
-                            // Both flanking markers too far - no strong evidence
-                            (0.5, 0.5)
-                        } else {
-                            // Normalized weighted vote
-                            let p_keep = (if left_suggests_keep { weight_left } else { 0.0 }
-                                + if right_suggests_keep { weight_right } else { 0.0 })
-                                / total_weight;
-                            let p_swap = 1.0 - p_keep;
-                            (p_keep, p_swap)
+                        // Compute interpolated allele probabilities for each haplotype
+                        let al_probs1 = stage2_phaser.interpolated_allele_probs(
+                            m, &probs1, &states, &ref_geno, n_haps, a1, a2,
+                        );
+                        let al_probs2 = stage2_phaser.interpolated_allele_probs(
+                            m, &probs2, &states, &ref_geno, n_haps, a1, a2,
+                        );
+
+                        // p1 = P(hap1 has a1, hap2 has a2)
+                        // p2 = P(hap1 has a2, hap2 has a1)
+                        let p1 = al_probs1[a1 as usize] * al_probs2[a2 as usize];
+                        let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
+
+                        if p2 > p1 {
+                            markers_to_swap.push(m);
                         }
                     }
-                    (Some(left), None) => {
-                        // Only left flanking marker
-                        let left_suggests_keep = alleles1[left] == 0;
-                        if left_suggests_keep {
-                            (0.9, 0.1) // High confidence to keep
-                        } else {
-                            (0.1, 0.9) // High confidence to swap
-                        }
-                    }
-                    (None, Some(right)) => {
-                        // Only right flanking marker
-                        let right_suggests_keep = alleles1[right] == 0;
-                        if right_suggests_keep {
-                            (0.9, 0.1)
-                        } else {
-                            (0.1, 0.9)
-                        }
-                    }
-                    (None, None) => continue,
-                };
-
-                // Decide based on probability comparison
-                let rare_hap1_has_0 = alleles1[rare_m] == 0;
-                let should_swap = p_swap > p_keep;
-
-                // Apply swap if needed
-                // If should_swap XOR rare_hap1_has_0, we need to actually swap
-                if should_swap == rare_hap1_has_0 {
-                    let a1 = alleles1[rare_m];
-                    let a2 = alleles2[rare_m];
-                    geno.set(rare_m, hap1, a2);
-                    geno.set(rare_m, hap2, a1);
                 }
+
+                // Also process markers before first Stage 1 marker
+                if !hi_freq_markers.is_empty() {
+                    let first_hf = hi_freq_markers[0];
+                    for m in 0..first_hf {
+                        let a1 = ref_geno.get(m, hap1);
+                        let a2 = ref_geno.get(m, hap2);
+
+                        if a1 == a2 || a1 == 255 || a2 == 255 {
+                            continue;
+                        }
+
+                        let al_probs1 = stage2_phaser.interpolated_allele_probs(
+                            m, &probs1, &states, &ref_geno, n_haps, a1, a2,
+                        );
+                        let al_probs2 = stage2_phaser.interpolated_allele_probs(
+                            m, &probs2, &states, &ref_geno, n_haps, a1, a2,
+                        );
+
+                        let p1 = al_probs1[a1 as usize] * al_probs2[a2 as usize];
+                        let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
+
+                        if p2 > p1 {
+                            markers_to_swap.push(m);
+                        }
+                    }
+                }
+
+                markers_to_swap
+            })
+            .collect();
+
+        // Apply phase changes
+        let mut total_switches = 0;
+        for (s, markers_to_swap) in phase_changes.into_iter().enumerate() {
+            let hap1 = HapIdx::new((s * 2) as u32);
+            let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+            for m in markers_to_swap {
+                geno.swap(m, hap1, hap2);
+                total_switches += 1;
             }
         }
+
+        eprintln!("Stage 2: Applied {} phase switches (HMM interpolation)", total_switches);
+    }
+}
+
+/// Compute normalized posterior state probabilities from forward-backward arrays
+fn compute_state_posteriors(
+    fwd: &[f32],
+    bwd: &[f32],
+    n_markers: usize,
+    n_states: usize,
+) -> Vec<Vec<f32>> {
+    let mut probs = vec![vec![0.0f32; n_states]; n_markers];
+
+    for m in 0..n_markers {
+        let row_start = m * n_states;
+        let mut sum = 0.0f32;
+
+        for k in 0..n_states {
+            let p = fwd[row_start + k] * bwd[row_start + k];
+            probs[m][k] = p;
+            sum += p;
+        }
+
+        // Normalize
+        if sum > 0.0 {
+            for k in 0..n_states {
+                probs[m][k] /= sum;
+            }
+        }
+    }
+
+    probs
+}
+
+/// Stage 2 phaser with HMM state probability interpolation
+///
+/// Implements the algorithm from Java Beagle's Stage2Baum.java for phasing
+/// rare variants using interpolated HMM state probabilities.
+struct Stage2Phaser {
+    /// For each Stage 2 marker, the index of the preceding Stage 1 marker
+    prev_stage1_marker: Vec<usize>,
+    /// For each Stage 2 marker, the interpolation weight (0.0 to 1.0)
+    /// wt = 1.0 means use prev marker fully, wt = 0.0 means use next marker fully
+    prev_stage1_wt: Vec<f32>,
+    /// Number of Stage 1 markers
+    n_stage1: usize,
+}
+
+impl Stage2Phaser {
+    /// Create a new Stage2Phaser
+    ///
+    /// # Arguments
+    /// * `hi_freq_markers` - Indices of high-frequency (Stage 1) markers in original space
+    /// * `gen_positions` - Genetic positions (cM) for all markers
+    /// * `n_total_markers` - Total number of markers
+    fn new(hi_freq_markers: &[usize], gen_positions: &[f64], n_total_markers: usize) -> Self {
+        let n_stage1 = hi_freq_markers.len();
+
+        // Build prevStage1Marker: for each marker, which Stage 1 marker precedes it
+        let mut prev_stage1_marker = vec![0usize; n_total_markers];
+
+        if n_stage1 >= 2 {
+            // Fill markers before first Stage 1 marker with 0
+            let first_hf = hi_freq_markers[0];
+            for m in 0..=first_hf {
+                prev_stage1_marker[m] = 0;
+            }
+
+            // Fill between Stage 1 markers
+            for j in 1..n_stage1 {
+                let prev_hf = hi_freq_markers[j - 1];
+                let curr_hf = hi_freq_markers[j];
+                for m in (prev_hf + 1)..=curr_hf {
+                    prev_stage1_marker[m] = j - 1;
+                }
+            }
+
+            // Fill after last Stage 1 marker
+            let last_hf = hi_freq_markers[n_stage1 - 1];
+            for m in (last_hf + 1)..n_total_markers {
+                prev_stage1_marker[m] = n_stage1 - 1;
+            }
+        }
+
+        // Build prevStage1Wt: interpolation weight based on genetic position
+        // wt = (posB - pos) / (posB - posA) where posA is prev Stage1, posB is next Stage1
+        let mut prev_stage1_wt = vec![1.0f32; n_total_markers];
+
+        if n_stage1 >= 2 {
+            // Markers before first Stage 1 marker: wt = 1.0 (use first marker)
+            // Already initialized to 1.0
+
+            // Between Stage 1 markers: interpolate
+            for j in 0..(n_stage1 - 1) {
+                let start = hi_freq_markers[j];
+                let end = hi_freq_markers[j + 1];
+                let pos_a = gen_positions[start];
+                let pos_b = gen_positions[end];
+                let d = pos_b - pos_a;
+
+                prev_stage1_wt[start] = 1.0;
+
+                if d > 1e-10 {
+                    for m in (start + 1)..end {
+                        prev_stage1_wt[m] = ((pos_b - gen_positions[m]) / d) as f32;
+                    }
+                } else {
+                    // Zero distance, use equal weight
+                    for m in (start + 1)..end {
+                        prev_stage1_wt[m] = 0.5;
+                    }
+                }
+            }
+
+            // Markers at and after last Stage 1 marker: wt = 1.0
+            let last_hf = hi_freq_markers[n_stage1 - 1];
+            for m in last_hf..n_total_markers {
+                prev_stage1_wt[m] = 1.0;
+            }
+        }
+
+        Self {
+            prev_stage1_marker,
+            prev_stage1_wt,
+            n_stage1,
+        }
+    }
+
+    /// Compute interpolated allele probabilities for a rare marker
+    ///
+    /// Following Java Stage2Baum.unscaledAlProbs:
+    /// - For each HMM state, interpolate probability from flanking Stage 1 markers
+    /// - Accumulate allele probabilities based on reference haplotype alleles
+    fn interpolated_allele_probs(
+        &self,
+        marker: usize,
+        state_probs: &[Vec<f32>], // [stage1_marker][state]
+        states: &[HapIdx],        // HMM state haplotype indices
+        ref_geno: &MutableGenotypes,
+        n_haps: usize,
+        a1: u8,
+        a2: u8,
+    ) -> [f32; 2] {
+        let mut al_probs = [0.0f32; 2];
+
+        let mkr_a = self.prev_stage1_marker[marker];
+        let mkr_b = (mkr_a + 1).min(self.n_stage1 - 1);
+        let wt = self.prev_stage1_wt[marker];
+
+        let probs_a = &state_probs[mkr_a];
+        let probs_b = &state_probs[mkr_b];
+
+        for (j, &hap_idx) in states.iter().enumerate() {
+            let hap = hap_idx.0 as usize;
+            
+            // Get allele from reference haplotype at rare marker
+            let b1 = ref_geno.get(marker, hap_idx);
+            
+            // Get allele from paired haplotype (for het reference haplotypes)
+            let paired_hap = hap ^ 1;
+            let b2 = if paired_hap < n_haps {
+                ref_geno.get(marker, HapIdx::new(paired_hap as u32))
+            } else {
+                b1
+            };
+
+            if b1 == 255 || b2 == 255 {
+                continue;
+            }
+
+            // Interpolate state probability
+            let prob = wt * probs_a.get(j).copied().unwrap_or(0.0)
+                + (1.0 - wt) * probs_b.get(j).copied().unwrap_or(0.0);
+
+            if b1 == b2 {
+                // Homozygous reference haplotype
+                if b1 == a1 {
+                    al_probs[0] += prob;
+                } else if b1 == a2 {
+                    al_probs[1] += prob;
+                }
+            } else {
+                // Heterozygous reference haplotype - use rare allele matching
+                // Following Java Stage2Baum logic for rare allele disambiguation
+                let rare1 = a1; // In our simplified model, assume a1 could be rare
+                let rare2 = a2;
+
+                let match1 = rare1 == b1 || rare1 == b2;
+                let match2 = rare2 == b1 || rare2 == b2;
+
+                if match1 != match2 {
+                    // Only one allele matches - use that information
+                    if match1 {
+                        al_probs[0] += prob;
+                    } else {
+                        al_probs[1] += prob;
+                    }
+                }
+                // If both or neither match, no contribution (ambiguous)
+            }
+        }
+
+        al_probs
     }
 }
 
