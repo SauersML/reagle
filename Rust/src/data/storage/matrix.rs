@@ -2,16 +2,36 @@
 //!
 //! The main data structure: a matrix of genotypes (markers x haplotypes).
 //! Replaces `vcf/RefGT.java`, `vcf/BasicGT.java`, and related classes.
+//!
+//! ## Type State Pattern
+//!
+//! The matrix uses a generic `State` parameter to track phasing status at compile time:
+//!
+//! ```ignore
+//! // Unphased data from VCF reader
+//! let unphased: GenotypeMatrix<Unphased> = vcf_reader.read()?;
+//!
+//! // Phasing transforms to phased type
+//! let phased: GenotypeMatrix<Phased> = phasing_pipeline.run(unphased)?;
+//!
+//! // Imputation requires phased - enforced at compile time!
+//! imputation_pipeline.run(&phased)?;
+//! ```
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
 use crate::data::marker::{Marker, MarkerIdx, Markers};
+use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
 use crate::data::storage::GenotypeColumn;
 
-/// The main genotype matrix structure
+/// The main genotype matrix structure.
+///
+/// Type parameter `State` encodes whether data is phased at compile time,
+/// enabling the compiler to enforce correct pipeline usage.
 #[derive(Clone, Debug)]
-pub struct GenotypeMatrix {
+pub struct GenotypeMatrix<State: PhaseState = Unphased> {
     /// Marker metadata
     markers: Markers,
 
@@ -21,11 +41,11 @@ pub struct GenotypeMatrix {
     /// Sample metadata
     samples: Arc<Samples>,
 
-    /// Whether the data is phased
-    is_phased: bool,
-
     /// Whether markers are in reverse order
     is_reversed: bool,
+
+    /// Phantom data to hold the State type parameter (zero-sized)
+    _state: PhantomData<State>,
 }
 
 impl GenotypeMatrix {

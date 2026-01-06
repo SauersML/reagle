@@ -15,7 +15,8 @@ use bitvec::prelude::*;
 pub struct MutableGenotypes {
     /// Alleles indexed by [marker][haplotype]
     /// Using Lsb0 order: bit 0 is hap 0, bit 1 is hap 1, etc.
-    alleles: Vec<BitBox<u8, Lsb0>>,
+    /// Changed to u64 for SIMD/Bit-parallel alignment.
+    alleles: Vec<BitBox<u64, Lsb0>>,
     /// Number of haplotypes
     n_haps: usize,
 }
@@ -24,7 +25,7 @@ impl MutableGenotypes {
     /// Create from existing allele data
     pub fn new(n_markers: usize, n_haps: usize) -> Self {
         // Initialize with all zeros
-        let empty_row = bitbox![u8, Lsb0; 0; n_haps];
+        let empty_row = bitbox![u64, Lsb0; 0; n_haps];
         Self {
             alleles: vec![empty_row; n_markers],
             n_haps,
@@ -39,7 +40,7 @@ impl MutableGenotypes {
         let mut alleles = Vec::with_capacity(n_markers);
         
         for m in 0..n_markers {
-            let mut row = BitVec::<u8, Lsb0>::with_capacity(n_haps);
+            let mut row = BitVec::<u64, Lsb0>::with_capacity(n_haps);
             for h in 0..n_haps {
                 let val = f(m, h) != 0;
                 row.push(val);
@@ -82,8 +83,14 @@ impl MutableGenotypes {
 
     /// Get all alleles at a marker as a BitSlice
     #[inline]
-    pub fn marker_alleles(&self, marker: usize) -> &BitSlice<u8, Lsb0> {
+    pub fn marker_alleles(&self, marker: usize) -> &BitSlice<u64, Lsb0> {
         &self.alleles[marker]
+    }
+    
+    /// Get all alleles at a marker as a slice of packed u64 words
+    #[inline]
+    pub fn marker_alleles_packed(&self, marker: usize) -> &[u64] {
+        self.alleles[marker].as_raw_slice()
     }
 
     /// Get all alleles for a haplotype

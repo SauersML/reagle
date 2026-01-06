@@ -554,7 +554,7 @@ impl PhasingPipeline {
             });
             
             // 5. Advance PBWT
-            ibs.advance(&final_alleles, m);
+            ibs.advance_packed(geno.marker_alleles_packed(m), m);
         }
 
         eprintln!("Applied {} phase switches (Standard)", total_switches.load(Ordering::Relaxed));
@@ -598,6 +598,119 @@ impl PhasingPipeline {
         stage1_p_recomb: &[f32],
         stage1_gen_dists: &[f64],
         stage1_gen_positions: &[f64],
+        hi_freq_to_orig: &[usize],  // This was missing from view, need to be careful
+        ibs2: &Ibs2,
+        collect_em: bool,
+    ) -> Result<()> {
+        let n_markers = hi_freq_to_orig.len();
+        let n_haps = geno.n_haps();
+        let n_samples = n_haps / 2;
+
+        let mut ibs = GlobalPhaseIbs::new(n_haps);
+        let mut online_hmms: Vec<OnlineHmm> = (0..n_samples)
+            .map(|_| OnlineHmm::new())
+            .collect();
+        
+        let total_switches = AtomicUsize::new(0);
+
+        for i in 0..n_markers {
+            let m = hi_freq_to_orig[i];
+            let pr = stage1_p_recomb[i];
+
+            // 1. Parallel Decision (using original marker index m)
+            let alleles_bits = geno.marker_alleles(m);
+            // Create local byte copy for HMM
+            let alleles_bytes: Vec<u8> = (0..n_haps).map(|h| {
+                 let is_missing = missing_mask[h].get(m).as_deref().copied().unwrap_or(false);
+                 if is_missing { 255 } else { if alleles_bits[h] { 1 } else { 0 } }
+            }).collect();
+
+            let results: Vec<(bool, Vec<u32>, Vec<u32>)> = online_hmms
+                .par_iter()
+                .enumerate()
+                .map(|(s, hmm)| {
+                    let hap1 = (s * 2) as u32;
+                    let hap2 = (s * 2 + 1) as u32;
+                    let k = 100;
+                    
+                    let n1 = ibs.find_neighbors(hap1, i, ibs2, k); // Use 'i' (stage1 index) or 'm'? GlobalPhaseIbs tracks own index? 
+                    // GlobalPhaseIbs just stores ppa/div. 'marker_idx' in find_neighbors is mainly for IBS2 filtering?
+                    // ibs2.segments(sample) returns segments with GLOBAL marker indices?
+                    // Yes, Ibs2 is built on full GenotypeMatrix.
+                    // So we must pass 'm' (global index) if find_neighbors uses it for IBS2.
+                    // Let's check find_neighbors implementation.
+                    // It iterates ibs2 segments and checks `seg.contains(marker_idx)`.
+                    // So we must pass 'm'.
+                    let n2 = ibs.find_neighbors(hap2, m, ibs2, k); 
+                    
+                    let a1 = alleles_bytes[hap1 as usize];
+                    let a2 = alleles_bytes[hap2 as usize];
+                    
+                    let swap = hmm.decide_phase_at_step(
+                        &n1,
+                        a1,
+                        a2,
+                        |h_idx| { alleles_bytes[h_idx as usize] },
+                        pr,
+                        n_haps,
+                        &self.params,
+                    );
+                    (swap, n1, n2) // Note: returning n2 instead of call? Wait, code above calls find_neighbors for n1 then n2.
+                 })
+                .collect();
+
+            // 2. Apply Swaps
+            let mut step_switches = 0;
+            for (s, (swap, _, _)) in results.iter().enumerate() {
+                if *swap {
+                    geno.swap(m, HapIdx::new((s*2) as u32), HapIdx::new((s*2+1) as u32));
+                    step_switches += 1;
+                }
+            }
+            total_switches.fetch_add(step_switches, Ordering::Relaxed);
+
+            // 3. Update HMM
+            // Need final alleles for HMM update (reflecting swaps)
+             let mut final_alleles = alleles_bytes;
+             for (s, (swap, _, _)) in results.iter().enumerate() {
+                 if *swap {
+                     final_alleles.swap(s*2, s*2+1);
+                 }
+             }
+
+             online_hmms.par_iter_mut().zip(results.into_par_iter()).enumerate().for_each(|(s, (hmm, (_, n1, n2)))| {
+                 let mut states = n1;
+                 states.extend(n2);
+                 states.sort_unstable();
+                 states.dedup();
+                 
+                 let my_h1 = s * 2;
+                 let my_h2 = s * 2 + 1;
+                 let a1 = final_alleles[my_h1];
+                 let a2 = final_alleles[my_h2];
+                 let p_match = self.params.emit_match();
+                 let p_mismatch = self.params.emit_mismatch();
+                 
+                 hmm.step(
+                     &states,
+                     |h_idx| { 
+                         let ref_a = final_alleles[h_idx as usize];
+                         let e1 = if a1 == 255 || ref_a == 255 { 1.0 } else if a1 == ref_a { p_match } else { p_mismatch };
+                         let e2 = if a2 == 255 || ref_a == 255 { 1.0 } else if a2 == ref_a { p_match } else { p_mismatch };
+                         (1.0, e1, e2) 
+                     },
+                     pr,
+                     n_haps,
+                 );
+             });
+
+            // 5. Advance PBWT
+            ibs.advance_packed(geno.marker_alleles_packed(m), m);
+        }
+        
+        eprintln!("Applied {} phase switches (Stage 1)", total_switches.load(Ordering::Relaxed));
+        Ok(())
+    }
         hi_freq_to_orig: &[usize],
         ibs2: &Ibs2,
         collect_em: bool,

@@ -5,7 +5,9 @@
 
 use bitvec::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::data::storage::AlleleAccess;
 use crate::data::HapIdx;
 
 /// Dictionary-compressed storage for haplotype blocks
@@ -139,6 +141,72 @@ impl DictionaryColumn {
         pattern_bytes
             + self.hap_to_pattern.len() * std::mem::size_of::<u16>()
             + std::mem::size_of::<Self>()
+    }
+}
+
+// ============================================================================
+// DictionaryColumnView - Zero-cost view into a single marker
+// ============================================================================
+
+/// A view into a single marker within a dictionary-compressed block.
+///
+/// This wrapper enables `AlleleAccess` trait implementation for dictionary columns
+/// by binding a specific marker offset. It's a zero-cost abstraction - just two
+/// pointers and an integer.
+///
+/// # Example
+///
+/// ```ignore
+/// let dict: Arc<DictionaryColumn> = ...;
+/// let view = DictionaryColumnView::new(&dict, marker_offset);
+///
+/// // Now view implements AlleleAccess
+/// let allele = view.get(HapIdx::new(0));
+/// ```
+#[derive(Clone, Debug)]
+pub struct DictionaryColumnView<'a> {
+    /// Reference to the dictionary column
+    column: &'a DictionaryColumn,
+    /// Marker offset within the dictionary block
+    offset: usize,
+}
+
+impl<'a> DictionaryColumnView<'a> {
+    /// Create a new view into a dictionary column at a specific marker offset
+    #[inline]
+    pub fn new(column: &'a DictionaryColumn, offset: usize) -> Self {
+        Self { column, offset }
+    }
+
+    /// Create a view from an Arc reference
+    #[inline]
+    pub fn from_arc(column: &'a Arc<DictionaryColumn>, offset: usize) -> Self {
+        Self {
+            column: column.as_ref(),
+            offset,
+        }
+    }
+
+    /// Get the marker offset
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Get the underlying dictionary column
+    pub fn column(&self) -> &'a DictionaryColumn {
+        self.column
+    }
+}
+
+/// Implement AlleleAccess for DictionaryColumnView
+impl<'a> AlleleAccess for DictionaryColumnView<'a> {
+    #[inline]
+    fn get(&self, hap: HapIdx) -> u8 {
+        self.column.get(self.offset, hap)
+    }
+
+    fn n_haplotypes(&self) -> usize {
+        self.column.n_haplotypes()
     }
 }
 

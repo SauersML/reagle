@@ -1,0 +1,737 @@
+   Compiling reagle v0.1.0 (/Users/user/reagle/Rust)
+warning: unused import: `crate::data::HapIdx`
+  --> src/utils/workspace.rs:12:5
+   |
+12 | use crate::data::HapIdx;
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `geno`
+   --> src/data/storage/mutable.rs:187:13
+    |
+187 | ... let geno = Mut...
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_geno`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `gen_dists`
+   --> src/pipelines/phasing.rs:455:9
+    |
+455 | ...   gen_dists: &...
+    |       ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gen_dists`
+
+warning: unused variable: `gen_positions`
+   --> src/pipelines/phasing.rs:456:9
+    |
+456 | ...   gen_positions: &...
+    |       ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gen_positions`
+
+warning: unused variable: `collect_em`
+   --> src/pipelines/phasing.rs:458:9
+    |
+458 | ...   collect_em: b...
+    |       ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_collect_em`
+
+warning: variable does not need to be mutable
+   --> src/pipelines/phasing.rs:620:21
+    |
+620 | ...et mut hmm = On...
+    |       ----^^^
+    |       |
+    |       help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `stage1_gen_dists`
+   --> src/pipelines/phasing.rs:600:9
+    |
+600 | ...   stage1_gen_dists: &...
+    |       ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_stage1_gen_dists`
+
+warning: unused variable: `stage1_gen_positions`
+   --> src/pipelines/phasing.rs:601:9
+    |
+601 | ...   stage1_gen_positions: &...
+    |       ^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_stage1_gen_positions`
+
+warning: unused variable: `collect_em`
+   --> src/pipelines/phasing.rs:604:9
+    |
+604 | ...   collect_em: b...
+    |       ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_collect_em`
+
+warning: unused variable: `n_markers`
+   --> src/pipelines/phasing.rs:798:13
+    |
+798 | ...et n_markers = ...
+    |       ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_n_markers`
+
+warning: unused variable: `gen_dists`
+   --> src/pipelines/phasing.rs:455:9
+    |
+455 | ...   gen_dists: &...
+    |       ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gen_dists`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `phase_sample_with_hmm` is never used
+   --> src/pipelines/phasing.rs:921:4
+    |
+921 | fn phase_sample_with_hmm(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `reagle` (lib) generated 10 warnings (8 duplicates) (run `cargo fix --lib -p reagle` to apply 2 suggestions)
+warning: `reagle` (lib test) generated 11 warnings (1 duplicate) (run `cargo fix --lib -p reagle --tests` to apply 9 suggestions)
+warning: methods `is_empty`, `gen_pos`, and `gen_distances` are never used
+   --> src/data/genetic_map.rs:398:12
+    |
+269 | impl MarkerMap {
+    | -------------- methods in this implementation
+...
+398 |     pub fn is_empty(&self) ...
+    |            ^^^^^^^^
+...
+403 |     pub fn gen_pos(&self, i...
+    |            ^^^^^^^
+...
+418 |     pub fn gen_distances(&s...
+    |            ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: multiple associated items are never used
+   --> src/data/haplotype.rs:119:12
+    |
+117 | impl Samples {
+    | ------------ associated items in this implementation
+118 |     /// Create an empty sample col...
+119 |     pub fn new() -> Self {
+    |            ^^^
+...
+141 |     pub fn from_ids_with_ploidy(id...
+    |            ^^^^^^^^^^^^^^^^^^^^
+...
+163 |     pub fn is_empty(&self) -> bool {
+    |            ^^^^^^^^
+...
+173 |     pub fn id(&self, idx: SampleId...
+    |            ^^
+...
+183 |     pub fn is_diploid(&self, idx: ...
+    |            ^^^^^^^^^^
+...
+188 |     pub fn push(&mut self, id: Str...
+    |            ^^^^
+...
+202 |     pub fn iter(&self) -> impl Ite...
+    |            ^^^^
+...
+207 |     pub fn hap_iter(&self) -> impl...
+    |            ^^^^^^^^
+...
+218 |     pub fn combine(first: &Samples...
+    |            ^^^^^^^
+
+warning: methods `is_missing` and `is_empty` are never used
+  --> src/data/marker.rs:82:12
+   |
+52 | impl Allele {
+   | ----------- methods in this implementation
+...
+82 |     pub fn is_missing(&s...
+   |            ^^^^^^^^^^
+...
+96 |     pub fn is_empty(&sel...
+   |            ^^^^^^^^
+
+warning: associated functions `identity` and `no_match` are never used
+   --> src/data/marker.rs:219:12
+    |
+217 | impl AlleleMapping {
+    | ------------------ associated functions in this implementation
+218 |     /// Create an iden...
+219 |     pub fn identity(n_...
+    |            ^^^^^^^^
+...
+228 |     pub fn no_match(n_...
+    |            ^^^^^^^^
+
+warning: associated items `from_vec`, `is_empty`, and `iter` are never used
+   --> src/data/marker.rs:433:12
+    |
+426 | impl Markers {
+    | ------------ associated items in this implementation
+...
+433 |     pub fn from_vec(ma...
+    |            ^^^^^^^^
+...
+446 |     pub fn is_empty(&s...
+    |            ^^^^^^^^
+...
+484 |     pub fn iter(&self)...
+    |            ^^^^
+
+warning: methods `is_biallelic` and `iter` are never used
+   --> src/data/storage/mod.rs:131:12
+    |
+ 41 | impl GenotypeColumn {
+    | ------------------- methods in this implementation
+...
+131 |     pub fn is_biallelic(&s...
+    |            ^^^^^^^^^^^^
+...
+140 |     pub fn iter(&self) -> ...
+    |            ^^^^
+
+warning: field `first_allele` is never read
+  --> src/data/storage/coded_steps.rs:34:5
+   |
+22 | pub struct CodedStep {
+   |            --------- field in this struct
+...
+34 |     first_allele: Vec<u8>,
+   |     ^^^^^^^^^^^^
+   |
+   = note: `CodedStep` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: methods `allele`, `first_allele`, `pattern_alleles`, and `haps_with_pattern` are never used
+   --> src/data/storage/coded_steps.rs:126:12
+    |
+ 37 | impl CodedStep {
+    | -------------- methods in this implementation
+...
+126 |     pub fn allele(&self, patter...
+    |            ^^^^^^
+...
+137 |     pub fn first_allele(&self, ...
+    |            ^^^^^^^^^^^^
+...
+142 |     pub fn pattern_alleles(&sel...
+    |            ^^^^^^^^^^^^^^^
+...
+147 |     pub fn haps_with_pattern(&s...
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: method `reset` is never used
+   --> src/data/storage/coded_steps.rs:416:12
+    |
+332 | impl CodedPbwt {
+    | -------------- method in this implementation
+...
+416 |     pub fn reset(&m...
+    |            ^^^^^
+
+warning: methods `reset` and `current_step` are never used
+   --> src/data/storage/coded_steps.rs:609:12
+    |
+442 | impl<'a> CodedPbwtView<'a> {
+    | -------------------------- methods in this implementation
+...
+609 |     pub fn reset(&mut self) {
+    |            ^^^^^
+...
+618 |     pub fn current_step(&self...
+    |            ^^^^^^^^^^^^
+
+warning: methods `raw_bits` and `raw_u64s` are never used
+   --> src/data/storage/dense.rs:132:12
+    |
+ 25 | impl DenseColumn {
+    | ---------------- methods in this implementation
+...
+132 |     pub fn raw_bits(&s...
+    |            ^^^^^^^^
+...
+137 |     pub fn raw_u64s(&s...
+    |            ^^^^^^^^
+
+warning: associated items `new`, `is_biallelic`, `iter_marker`, and `haplotypes_with_pattern` are never used
+   --> src/data/storage/dictionary.rs:30:12
+    |
+ 28 | impl DictionaryColumn {
+    | --------------------- associated items in this implementation
+ 29 |     /// Create a new dictionary colum...
+ 30 |     pub fn new(
+    |            ^^^
+...
+132 |     pub fn is_biallelic(&self) -> bool {
+    |            ^^^^^^^^^^^^
+...
+148 |     pub fn iter_marker(&self, marker_...
+    |            ^^^^^^^^^^^
+...
+158 |     pub fn haplotypes_with_pattern(&s...
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/data/storage/matrix.rs:50:12
+    |
+ 31 | impl GenotypeMatrix {
+    | ------------------- associated items in this implementation
+...
+ 50 |     pub fn empty(samples: Arc<S...
+    |            ^^^^^
+...
+ 81 |     pub fn is_reversed(&self) -...
+    |            ^^^^^^^^^^^
+...
+ 96 |     pub fn samples(&self) -> &S...
+    |            ^^^^^^^
+...
+135 |     pub fn restrict_markers(&se...
+    |            ^^^^^^^^^^^^^^^^
+...
+155 |     pub fn iter(&self) -> impl ...
+    |            ^^^^
+...
+163 |     pub fn marker_indices(&self...
+    |            ^^^^^^^^^^^^^^
+...
+168 |     pub fn haplotype_indices(&s...
+    |            ^^^^^^^^^^^^^^^^^
+...
+173 |     pub fn haplotype(&self, hap...
+    |            ^^^^^^^^^
+...
+178 |     pub fn alleles_at_marker(&s...
+    |            ^^^^^^^^^^^^^^^^^
+...
+186 |     pub fn set_phased(&mut self...
+    |            ^^^^^^^^^^
+...
+191 |     pub fn set_reversed(&mut se...
+    |            ^^^^^^^^^^^^
+...
+202 |     pub fn column_mut(&mut self...
+    |            ^^^^^^^^^^
+...
+207 |     pub fn set_column(&mut self...
+    |            ^^^^^^^^^^
+...
+212 |     pub fn push(&mut self, mark...
+    |            ^^^^
+
+warning: methods `marker_alleles_mut`, `swap_range`, `swap_contiguous`, `copy_from`, and `to_raw_alleles` are never used
+   --> src/data/storage/mutable.rs:91:12
+    |
+ 23 | impl MutableGenotypes {
+    | --------------------- methods in this implementation
+...
+ 91 |     pub fn marker_alleles_mut(&m...
+    |            ^^^^^^^^^^^^^^^^^^
+...
+113 |     pub fn swap_range(&mut self,...
+    |            ^^^^^^^^^^
+...
+123 |     pub fn swap_contiguous(&mut ...
+    |            ^^^^^^^^^^^^^^^
+...
+132 |     pub fn copy_from(&mut self, ...
+    |            ^^^^^^^^^
+...
+143 |     pub fn to_raw_alleles(&self)...
+    |            ^^^^^^^^^^^^^^
+
+warning: methods `is_carrier`, `maf`, and `iter` are never used
+   --> src/data/storage/sparse.rs:73:12
+    |
+ 22 | impl SparseColumn {
+    | ----------------- methods in this implementation
+...
+ 73 |     pub fn is_carrier(&s...
+    |            ^^^^^^^^^^
+...
+ 97 |     pub fn maf(&self) ->...
+    |            ^^^
+...
+112 |     pub fn iter(&self) -...
+    |            ^^^^
+
+warning: method `markers` is never used
+  --> src/data/storage/view.rs:72:12
+   |
+24 | impl<'a> GenotypeView<'a> {
+   | ------------------------- method in this implementation
+...
+72 |     pub fn markers(&self) ->...
+   |            ^^^^^^^
+
+warning: associated function `from_mutable` is never used
+  --> src/data/storage/view.rs:96:12
+   |
+94 | impl<'a> GenotypeView<'a> {
+   | ------------------------- associated function in this implementation
+95 |     /// Create a view over m...
+96 |     pub fn from_mutable(geno...
+   |            ^^^^^^^^^^^^
+
+warning: variants `InvalidData` and `Algorithm` are never constructed
+  --> src/error.rs:21:5
+   |
+10 | pub enum ReagleError {
+   |          ----------- variants in this enum
+...
+21 |     InvalidData { messa...
+   |     ^^^^^^^^^^^
+...
+25 |     Algorithm { message...
+   |     ^^^^^^^^^
+   |
+   = note: `ReagleError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: associated functions `invalid_data` and `algorithm` are never used
+  --> src/error.rs:52:12
+   |
+43 | impl ReagleError {
+   | ---------------- associated functions in this implementation
+...
+52 |     pub fn invalid_data(me...
+   |            ^^^^^^^^^^^^
+...
+59 |     pub fn algorithm(messa...
+   |            ^^^^^^^^^
+
+warning: method `samples` is never used
+   --> src/io/streaming.rs:176:12
+    |
+102 | impl StreamingVcfReader {
+    | ----------------------- method in this implementation
+...
+176 |     pub fn samples(&self) ...
+    |            ^^^^^^^
+
+warning: method `add_haploid` is never used
+  --> src/io/vcf.rs:64:12
+   |
+35 | impl MarkerImputationStats {
+   | -------------------------- method in this implementation
+...
+64 |     pub fn add_haploid(&mut s...
+   |            ^^^^^^^^^^^
+
+warning: field `header` is never read
+   --> src/io/vcf.rs:159:5
+    |
+157 | pub struct VcfReader {
+    |            --------- field in this struct
+158 |     /// The VCF header
+159 |     header: Header,
+    |     ^^^^^^
+
+warning: methods `samples` and `header` are never used
+   --> src/io/vcf.rs:223:12
+    |
+164 | impl VcfReader {
+    | -------------- methods in this implementation
+...
+223 |     pub fn samples(&s...
+    |            ^^^^^^^
+...
+233 |     pub fn header(&se...
+    |            ^^^^^^
+
+warning: fields `ref_gt`, `gen_map`, and `indices` are never read
+  --> src/io/window.rs:17:9
+   |
+12 | ...truct Window {
+   |          ------ fields in this struct
+...
+17 | ...ub ref_gt: Optio...
+   |       ^^^^^^
+...
+20 | ...ub gen_map: Gene...
+   |       ^^^^^^^
+...
+23 | ...ub indices: Wind...
+   |       ^^^^^^^
+   |
+   = note: `Window` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> src/io/window.rs:33:9
+   |
+31 | ...truct WindowIndices {
+   |          ------------- fields in this struct
+32 | ...// Start marker index ...
+33 | ...ub start: usize,
+   |       ^^^^^
+34 | ...// End marker index (e...
+35 | ...ub end: usize,
+   |       ^^^
+36 | ...// Previous splice poi...
+37 | ...ub prev_splice: usize,
+   |       ^^^^^^^^^^^
+38 | ...// Next splice point (...
+39 | ...ub next_splice: usize,
+   |       ^^^^^^^^^^^
+40 | ...// Overlap start (wher...
+41 | ...ub overlap_start: usize,
+   |       ^^^^^^^^^^^^^
+42 | ...// Number of target ma...
+43 | ...ub n_targ_markers: usize,
+   |       ^^^^^^^^^^^^^^
+44 | ...// Number of reference...
+45 | ...ub n_ref_markers: usize,
+   |       ^^^^^^^^^^^^^
+   |
+   = note: `WindowIndices` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: methods `n_markers` and `n_output_markers` are never used
+  --> src/io/window.rs:50:12
+   |
+48 | impl WindowIndices {
+   | ------------------ methods in this implementation
+49 |     /// Number of markers in t...
+50 |     pub fn n_markers(&self) ->...
+   |            ^^^^^^^^^
+...
+55 |     pub fn n_output_markers(&s...
+   |            ^^^^^^^^^^^^^^^^
+
+warning: methods `n_samples`, `n_haplotypes`, `has_ref`, and `gen_dist` are never used
+  --> src/io/window.rs:84:12
+   |
+60 | impl Window {
+   | ----------- methods in this implementation
+...
+84 |     pub fn n_samples(&self...
+   |            ^^^^^^^^^
+...
+89 |     pub fn n_haplotypes(&s...
+   |            ^^^^^^^^^^^^
+...
+94 |     pub fn has_ref(&self) ...
+   |            ^^^^^^^
+...
+99 |     pub fn gen_dist(&self,...
+   |            ^^^^^^^^
+
+warning: field `buffer_cm` is never read
+   --> src/io/window.rs:115:5
+    |
+107 | pub struct WindowBuilder {
+    |            ------------- field in this struct
+...
+115 |     buffer_cm: f32,
+    |     ^^^^^^^^^
+
+warning: methods `max_markers` and `buffer_cm` are never used
+   --> src/io/window.rs:142:12
+    |
+118 | impl WindowBuilder {
+    | ------------------ methods in this implementation
+...
+142 |     pub fn max_markers(mu...
+    |            ^^^^^^^^^^^
+...
+148 |     pub fn buffer_cm(mut ...
+    |            ^^^^^^^^^
+
+warning: associated functions `fwd_update_alleles` and `bwd_update_alleles` are never used
+   --> src/model/hmm.rs:108:12
+    |
+ 34 | impl HmmUpdater {
+    | --------------- associated functions in this implementation
+...
+108 |     pub fn fwd_update_alleles(
+    |            ^^^^^^^^^^^^^^^^^^
+...
+142 |     pub fn bwd_update_alleles(
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_gen_dists` is never used
+   --> src/model/hmm.rs:212:12
+    |
+189 | impl<'a> LiStephensHmm<'a> {
+    | -------------------------- associated function in this implementation
+...
+212 |     pub fn from_gen_dists(
+    |            ^^^^^^^^^^^^^^
+
+warning: field `n_markers` is never read
+  --> src/model/ibs2.rs:59:5
+   |
+57 | pub struct Ibs2 {
+   |            ---- field in this struct
+58 |     /// Number of ...
+59 |     n_markers: usize,
+   |     ^^^^^^^^^
+
+warning: methods `n_markers`, `are_ibs2`, `are_ibs2_in_interval`, and `ibs2_samples_at` are never used
+   --> src/model/ibs2.rs:241:12
+    |
+ 64 | impl Ibs2 {
+    | --------- methods in this implementation
+...
+241 |     pub fn n_markers(&self) -> usi...
+    |            ^^^^^^^^^
+...
+259 |     pub fn are_ibs2(&self, sample:...
+    |            ^^^^^^^^
+...
+279 |     pub fn are_ibs2_in_interval(
+    |            ^^^^^^^^^^^^^^^^^^^^
+...
+316 |     pub fn ibs2_samples_at(&self, ...
+    |            ^^^^^^^^^^^^^^^
+
+warning: fields `bwd_prefix` and `bwd_divergence` are never read
+   --> src/model/imp_states.rs:209:5
+    |
+201 | pub struct ImpIbs {
+    |            ------ fields in this struct
+...
+209 |     bwd_prefix: Vec<u...
+    |     ^^^^^^^^^^
+210 |     /// Backward dive...
+211 |     bwd_divergence: V...
+    |     ^^^^^^^^^^^^^^
+
+warning: methods `reset`, `reset_fwd`, `reset_bwd`, `update_bwd`, `find_bwd_ibs_haps_for_allele`, and `find_bwd_allele_region` are never used
+   --> src/model/imp_states.rs:233:12
+    |
+218 | impl ImpIbs {
+    | ----------- methods in this implementation
+...
+233 |     pub fn reset(&mut self) {
+    |            ^^^^^
+...
+245 |     pub fn reset_fwd(&mut self) {
+    |            ^^^^^^^^^
+...
+253 |     pub fn reset_bwd(&mut self) {
+    |            ^^^^^^^^^
+...
+277 |     pub fn update_bwd(&mut self, alleles: ...
+    |            ^^^^^^^^^^
+...
+419 |     pub fn find_bwd_ibs_haps_for_allele(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+502 |     fn find_bwd_allele_region(&self, targe...
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ImpStatesMutable` is never constructed
+   --> src/model/imp_states.rs:525:12
+    |
+525 | ...ct ImpStatesMutable {
+    |       ^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+    --> src/model/imp_states.rs:872:12
+     |
+ 870 | impl ImpStatesMutable {
+     | --------------------- associated items in this implementation
+ 871 |     /// Create a new state sele...
+ 872 |     pub fn new(
+     |            ^^^
+...
+ 896 |     pub fn ibs_states<F>(
+     |            ^^^^^^^^^^
+...
+ 991 |     fn initialize(&mut self) {
+     |        ^^^^^^^^^^
+...
+ 998 |     fn update_with_ibs_hap(&mut...
+     |        ^^^^^^^^^^^^^^^^^^^
+...
+1043 |     fn update_queue_head(&mut s...
+     |        ^^^^^^^^^^^^^^^^^
+...
+1061 |     fn fill_with_random_haps(&m...
+     |        ^^^^^^^^^^^^^^^^^^^^^
+...
+1085 |     fn build_output<F>(
+     |        ^^^^^^^^^^^^
+
+warning: methods `update_p_mismatch` and `update_recomb_intensity` are never used
+   --> src/model/parameters.rs:174:12
+    |
+ 40 | impl ModelParams {
+    | ---------------- methods in this implementation
+...
+174 |     pub fn update_p_mismatch(&mut sel...
+    |            ^^^^^^^^^^^^^^^^^
+...
+184 |     pub fn update_recomb_intensity(&m...
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `recomb_intensity`, `p_mismatch`, and `n_emit_obs` are never used
+   --> src/model/parameters.rs:277:12
+    |
+233 | impl ParamEstimates {
+    | ------------------- methods in this implementation
+...
+277 |     pub fn recomb_intensity(&s...
+    |            ^^^^^^^^^^^^^^^^
+...
+288 |     pub fn p_mismatch(&self) -...
+    |            ^^^^^^^^^^
+...
+302 |     pub fn n_emit_obs(&self) -...
+    |            ^^^^^^^^^^
+
+warning: struct `AtomicParamEstimates` is never constructed
+   --> src/model/parameters.rs:311:12
+    |
+311 | ...ct AtomicParamEstimates {
+    |       ^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `add_estimation_data`, and `to_estimates` are never used
+   --> src/model/parameters.rs:317:12
+    |
+315 | impl AtomicParamEstimates {
+    | ------------------------- associated items in this implementation
+316 |     /// Create new empty estimates
+317 |     pub fn new() -> Self {
+    |            ^^^
+...
+324 |     pub fn add_estimation_data(&s...
+    |            ^^^^^^^^^^^^^^^^^^^
+...
+331 |     pub fn to_estimates(&self) ->...
+    |            ^^^^^^^^^^^^
+
+warning: method `bwd_update` is never used
+   --> src/model/pbwt.rs:118:12
+    |
+ 34 | impl PbwtDivUpdater {
+    | ------------------- method in this implementation
+...
+118 |     pub fn bwd_update(
+    |            ^^^^^^^^^^
+
+warning: method `init` is never used
+  --> src/model/online_hmm.rs:33:12
+   |
+21 | impl OnlineHmm {
+   | -------------- method in this implementation
+...
+33 |     pub fn init(&mu...
+   |            ^^^^
+
+warning: function `phase_sample_with_hmm` is never used
+   --> src/pipelines/phasing.rs:921:4
+    |
+921 | fn phase_sample_with_hmm(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `reagle` (bin "reagle" test) generated 54 warnings (10 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.26s
+     Running unittests src/lib.rs (target/debug/deps/reagle-0adb5573e8cca178)
+
+running 1 test
+test pipelines::phasing::tests::test_run_phase ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.10s
+
+     Running unittests src/main.rs (target/debug/deps/reagle-2fc023c265027039)
+
+running 1 test
+test pipelines::phasing::tests::test_run_phase ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 0.12s
+

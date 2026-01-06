@@ -36,23 +36,19 @@ impl GlobalPhaseIbs {
     /// Advance the PBWT state to the next marker using the given alleles.
     /// Alleles must be finalized (phased) for this marker.
     pub fn advance(&mut self, alleles: &[u8], marker_idx: usize) {
-        // The updater updates `ppa` and `div` in-place
-        // We need to keep a copy of ppa if we don't have temp buffers,
-        // but PbwtDivUpdater likely handles this.
-        // Let's check PbwtDivUpdater::fwd_update signature.
-        // It takes `prefix: &mut [u32], divergence: &mut [i32]`.
-        // It likely does the update.
-        // Wait, standard PBWT update requires creating a NEW ppa.
-        // PbwtDivUpdater might update in place if it uses internal buffers, 
-        // OR it expects us to handle the swap.
-        // Let's assume for now we call it directly.
-        // Note: PbwtDivUpdater in this codebase seems to be a helper.
-        // We might need to check if it clobbers ppa correctly.
-        
         self.updater.fwd_update(alleles, 2, marker_idx, &mut self.ppa, &mut self.div);
         
         // Rebuild OPA (Inverse PPA)
-        // OPA is needed to find the sorted position of a specific haplotype
+        for (sorted_pos, &hap_idx) in self.ppa.iter().enumerate() {
+            self.opa[hap_idx as usize] = sorted_pos as u32;
+        }
+    }
+    
+    /// Advance the PBWT state using packed alleles (u64 words)
+    pub fn advance_packed(&mut self, alleles_packed: &[u64], marker_idx: usize) {
+        self.updater.fwd_update_packed(alleles_packed, marker_idx, &mut self.ppa, &mut self.div);
+        
+        // Rebuild OPA (Inverse PPA)
         for (sorted_pos, &hap_idx) in self.ppa.iter().enumerate() {
             self.opa[hap_idx as usize] = sorted_pos as u32;
         }
