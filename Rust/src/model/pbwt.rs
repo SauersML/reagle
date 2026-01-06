@@ -113,10 +113,11 @@ impl PbwtDivUpdater {
             // Check bounds (shouldn't happen with valid data)
             let allele = if allele >= n_alleles { 0 } else { allele };
 
-            // Update p (Max Divergence Propagation)
-            // p[allele] = max(p[allele], div)
-            if div > self.p[allele] {
-                self.p[allele] = div;
+            // Update p (Max Divergence Propagation) for ALL alleles
+            for j in 0..n_alleles {
+                if div > self.p[j] {
+                    self.p[j] = div;
+                }
             }
             
             self.counts[allele] += 1;
@@ -130,54 +131,6 @@ impl PbwtDivUpdater {
         }
         
         // 4. Scatter to scratch buffers (Counting Sort Phase 3)
-        // We need to track current write position for each allele
-        // We reuse `counts` to track current offset from start
-        self.counts[..n_alleles].fill(0);
-
-        for i in 0..self.n_haps {
-            let hap = prefix[i];
-            let div = divergence[i]; // Reading OLD divergence
-            let allele = alleles[hap as usize] as usize;
-            let allele = if allele >= n_alleles { 0 } else { allele };
-
-            let base = self.offsets[allele];
-            let offset = self.counts[allele];
-            let pos = base + offset;
-
-            self.scratch_a[pos] = hap;
-            
-            // Calculate NEW divergence
-            // If this is the first element in the bucket (offset == 0),
-            // take the propagated p value. Ideally we need to store the *start* p values.
-            // Wait, standard PBWT definition:
-            // d[i] is divergence between i and i-1.
-            // For first element of a block 'c', d is propagation of max divergence.
-            // But we modified p in place during pass 1!
-            // 'p' at end of pass 1 contains max divergence for that block.
-            // BUT we need the divergence *at the moment we enter the block* during linear scan?
-            // No, Durbin's algorithm accumulates p.
-            // 
-            // Let's re-read the original logic:
-            // for i in 0..N:
-            //    p[allele] = max(p[allele], div)
-            //    push (hap, p[allele]) to bucket
-            //    p[allele] = 0 (reset)
-            // 
-            // My Counting Sort breaks this "accumulate and push" flow because we can't 
-            // calculate the *exact* divergence value for the *specific* position 
-            // without doing the linear scan or storing intermediate 'p' values.
-            //
-            // Actually, we can just do the scatter pass and maintain 'p' *during* scatter?
-            // Yes! We can re-compute the divergence propagation during the scatter pass.
-            // We just need `p` to be maintained per-bucket.
-            
-            // Re-initialize p for scatter pass
-            // We actually need a separate 'p' state for each bucket during scatter.
-            // Let's use `p` array for that.
-            
-            self.counts[allele] += 1;
-        }
-        
         // Reset counts and p for the SCATTER pass
         self.counts[..n_alleles].fill(0);
         self.p[..n_alleles].fill(init_value);
@@ -188,9 +141,11 @@ impl PbwtDivUpdater {
             let allele = alleles[hap as usize] as usize;
             let allele = if allele >= n_alleles { 0 } else { allele };
 
-            // Update p for this allele stream
-            if div > self.p[allele] {
-                self.p[allele] = div;
+            // Update p for all alleles
+            for j in 0..n_alleles {
+                if div > self.p[j] {
+                    self.p[j] = div;
+                }
             }
 
             let base = self.offsets[allele];
@@ -249,10 +204,9 @@ impl PbwtDivUpdater {
             // We trust caller (DenseColumn) provides correct slice length
             let allele = ((alleles_packed[word_idx] >> bit_idx) & 1) as usize;
             
-            // Update p: max(p, div)
-            if div > self.p[allele] {
-                self.p[allele] = div;
-            }
+            // Update p for ALL alleles
+            if div > self.p[0] { self.p[0] = div; }
+            if div > self.p[1] { self.p[1] = div; }
             
             self.counts[allele] += 1;
         }
@@ -277,9 +231,9 @@ impl PbwtDivUpdater {
             let bit_idx = hap % 64;
             let allele = ((alleles_packed[word_idx] >> bit_idx) & 1) as usize;
 
-            if div > self.p[allele] {
-                self.p[allele] = div;
-            }
+            // Update p for ALL alleles
+            if div > self.p[0] { self.p[0] = div; }
+            if div > self.p[1] { self.p[1] = div; }
 
             let base = self.offsets[allele];
             let offset = self.counts[allele];
@@ -342,9 +296,11 @@ impl PbwtDivUpdater {
             let allele = alleles[hap as usize] as usize;
             let allele = if allele >= n_alleles { 0 } else { allele };
 
-            // Update p: min(p, div) for backward
-            if div < self.p[allele] {
-                self.p[allele] = div;
+            // Update p: min(p, div) for backward, for ALL alleles
+            for j in 0..n_alleles {
+                if div < self.p[j] {
+                    self.p[j] = div;
+                }
             }
 
             let base = self.offsets[allele];
@@ -411,10 +367,9 @@ impl PbwtDivUpdater {
             let bit_idx = hap % 64;
             let allele = ((alleles_packed[word_idx] >> bit_idx) & 1) as usize;
 
-            // Update p: min(p, div) for backward
-            if div < self.p[allele] {
-                self.p[allele] = div;
-            }
+            // Update p: min(p, div) for backward, for ALL alleles
+            if div < self.p[0] { self.p[0] = div; }
+            if div < self.p[1] { self.p[1] = div; }
 
             let base = self.offsets[allele];
             let offset = self.counts[allele];

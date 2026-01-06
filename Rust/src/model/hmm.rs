@@ -20,8 +20,10 @@ use crate::model::parameters::ModelParams;
 /// Result of HMM forward-backward computation
 #[derive(Debug, Clone)]
 pub struct HmmResult {
-    /// Posterior state probabilities at each marker (n_markers x n_states)
-    pub state_probs: Vec<Vec<f32>>,
+    /// Posterior state probabilities at each marker (flattened: n_markers * n_states)
+    pub state_probs: Vec<f32>,
+    /// Number of states (to reconstruct dimensions)
+    pub n_states: usize,
     /// Sampled state path (one state per marker)
     pub sampled_path: Vec<usize>,
     /// Log-likelihood of the data
@@ -167,7 +169,7 @@ impl<'a> LiStephensHmm<'a> {
     ///
     /// # Arguments
     /// * `target_alleles` - Alleles of the target haplotype at each marker
-    /// * `fwd` - Pre-allocated forward buffer [n_markers][n_states]
+    /// * `fwd` - Pre-allocated forward buffer [n_markers * n_states]
     /// * `bwd` - Pre-allocated backward buffer [n_states]
     ///
     /// # Returns
@@ -175,7 +177,7 @@ impl<'a> LiStephensHmm<'a> {
     pub fn forward_backward(
         &self,
         target_alleles: &[u8],
-        fwd: &mut Vec<Vec<f32>>,
+        fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
     ) -> HmmResult {
         let n_markers = self.n_markers();
@@ -184,16 +186,15 @@ impl<'a> LiStephensHmm<'a> {
         if n_markers == 0 || n_states == 0 {
             return HmmResult {
                 state_probs: Vec::new(),
+                n_states,
                 sampled_path: Vec::new(),
                 log_likelihood: 0.0,
             };
         }
 
         // Ensure buffers are sized correctly
-        fwd.resize(n_markers, vec![0.0; n_states]);
-        for row in fwd.iter_mut() {
-            row.resize(n_states, 0.0);
-        }
+        let total_size = n_markers * n_states;
+        fwd.resize(total_size, 0.0);
         bwd.resize(n_states, 0.0);
 
         let p_err = self.params.p_mismatch;
@@ -213,6 +214,7 @@ impl<'a> LiStephensHmm<'a> {
         for m in (0..n_markers).rev() {
             let marker_idx = MarkerIdx::new(m as u32);
             let targ_al = target_alleles[m];
+            let row_offset = m * n_states;
 
             // Compute mismatches for this marker
             let ref_alleles = self.state_alleles(marker_idx);
@@ -235,14 +237,16 @@ impl<'a> LiStephensHmm<'a> {
             // Compute state probabilities: fwd * bwd
             let mut state_sum = 0.0f32;
             for k in 0..n_states {
-                fwd[m][k] *= bwd[k];
-                state_sum += fwd[m][k];
+                let idx = row_offset + k;
+                fwd[idx] *= bwd[k];
+                state_sum += fwd[idx];
             }
 
             // Normalize
             if state_sum > 0.0 {
+                let inv_sum = 1.0 / state_sum;
                 for k in 0..n_states {
-                    fwd[m][k] /= state_sum;
+                    fwd[row_offset + k] *= inv_sum;
                 }
             }
 
@@ -264,16 +268,18 @@ impl<'a> LiStephensHmm<'a> {
 
         HmmResult {
             state_probs: fwd.clone(),
+            n_states,
             sampled_path,
             log_likelihood,
         }
     }
 
     /// Forward pass following Java ImpLSBaum.setFwdValues
+    /// Forward pass following Java ImpLSBaum.setFwdValues
     fn forward_pass(
         &self,
         target_alleles: &[u8],
-        fwd: &mut Vec<Vec<f32>>,
+        fwd: &mut Vec<f32>,
         emit_probs: &[f32; 2],
     ) -> f32 {
         let n_markers = self.n_markers();
@@ -290,6 +296,9 @@ impl<'a> LiStephensHmm<'a> {
             let scale = (1.0 - p_recomb) / fwd_sum;
 
             let mut new_sum = 0.0f32;
+            let row_offset = m * n_states;
+            let prev_row_offset = if m > 0 { (m - 1) * n_states } else { 0 };
+
             for k in 0..n_states {
                 let ref_al = self.state_allele(marker_idx, k);
                 let emit = if ref_al == targ_al {
@@ -298,12 +307,14 @@ impl<'a> LiStephensHmm<'a> {
                     emit_probs[1]
                 };
 
-                fwd[m][k] = if m == 0 {
+                let val = if m == 0 {
                     emit / n_states as f32
                 } else {
-                    emit * (scale * fwd[m - 1][k] + shift)
+                    emit * (scale * fwd[prev_row_offset + k] + shift)
                 };
-                new_sum += fwd[m][k];
+                
+                fwd[row_offset + k] = val;
+                new_sum += val;
             }
             fwd_sum = new_sum;
         }
@@ -314,19 +325,21 @@ impl<'a> LiStephensHmm<'a> {
     /// Sample a state path from posterior probabilities
     fn sample_path(
         &self,
-        state_probs: &[Vec<f32>],
+        state_probs: &[f32],
         n_markers: usize,
         n_states: usize,
     ) -> Vec<usize> {
         let mut path = Vec::with_capacity(n_markers);
 
         for m in 0..n_markers {
+            let row_offset = m * n_states;
             // Find max probability state (Viterbi-style for deterministic output)
             let mut max_state = 0;
-            let mut max_prob = state_probs[m][0];
+            let mut max_prob = state_probs[row_offset];
             for k in 1..n_states {
-                if state_probs[m][k] > max_prob {
-                    max_prob = state_probs[m][k];
+                let prob = state_probs[row_offset + k];
+                if prob > max_prob {
+                    max_prob = prob;
                     max_state = k;
                 }
             }
@@ -431,14 +444,16 @@ mod tests {
 
         let result = hmm.forward_backward(&target_alleles, &mut fwd, &mut bwd);
 
-        assert_eq!(result.state_probs.len(), 5);
+        assert_eq!(result.state_probs.len(), 5 * 6); // 5 markers * 6 states
         assert_eq!(result.sampled_path.len(), 5);
         assert!(result.log_likelihood.is_finite());
 
         // Check probabilities sum to ~1 at each marker
-        for probs in &result.state_probs {
-            let sum: f32 = probs.iter().sum();
-            assert!((sum - 1.0).abs() < 0.01, "Sum was {}", sum);
+        for m in 0..5 {
+            let start = m * 6;
+            let end = start + 6;
+            let sum: f32 = result.state_probs[start..end].iter().sum();
+            assert!((sum - 1.0).abs() < 0.01, "Sum at marker {} was {}", m, sum);
         }
     }
 

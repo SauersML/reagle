@@ -61,6 +61,13 @@ impl GlobalPhaseIbs {
     /// * `marker_idx` - Current marker index
     /// * `ibs2` - IBS2 structure for filtering/prioritizing
     /// * `n_candidates` - Number of candidates to check on each side
+    /// Find best neighbors for a haplotype using the current PBWT state.
+    ///
+    /// # Arguments
+    /// * `hap_idx` - The haplotype to find neighbors for
+    /// * `marker_idx` - Current marker index
+    /// * `ibs2` - IBS2 structure for filtering/prioritizing
+    /// * `n_candidates` - Number of candidates to check on each side
     pub fn find_neighbors(
         &self,
         hap_idx: u32,
@@ -69,6 +76,20 @@ impl GlobalPhaseIbs {
         n_candidates: usize,
     ) -> Vec<u32> {
         let mut neighbors = Vec::with_capacity(n_candidates * 2 + 10);
+        self.find_neighbors_buf(hap_idx, marker_idx, ibs2, n_candidates, &mut neighbors);
+        neighbors
+    }
+
+    /// Find best neighbors writing into a reusable buffer
+    pub fn find_neighbors_buf(
+        &self,
+        hap_idx: u32,
+        marker_idx: usize,
+        ibs2: &Ibs2,
+        n_candidates: usize,
+        neighbors: &mut Vec<u32>,
+    ) {
+        neighbors.clear();
         let sample = SampleIdx::new(hap_idx / 2);
 
         // 1. Add guaranteed IBS2 matches
@@ -135,7 +156,5 @@ impl GlobalPhaseIbs {
             v += 1;
             count += 1;
         }
-        
-        neighbors
     }
 }

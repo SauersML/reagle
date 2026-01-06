@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::data::genetic_map::{GeneticMaps, MarkerMap};
 use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes};
+use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes, PhaseState, Phased, Unphased};
 use crate::error::Result;
 use crate::io::streaming::{StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfReader, VcfWriter};
@@ -353,12 +353,12 @@ impl PhasingPipeline {
         &mut self,
         target_gt: &GenotypeMatrix,
         gen_maps: &GeneticMaps,
-    ) -> Result<GenotypeMatrix> {
+    ) -> Result<GenotypeMatrix<crate::data::storage::phase_state::Phased>> {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
 
         if n_markers == 0 {
-            return Ok(target_gt.clone());
+            return Ok(target_gt.clone().into_phased());
         }
 
         // Initialize parameters
@@ -451,10 +451,10 @@ impl PhasingPipeline {
         geno: &mut MutableGenotypes,
         missing_mask: &[BitBox<u8, Lsb0>],
         p_recomb: &[f32],
-        gen_dists: &[f64],
-        gen_positions: &[f64],
+        _gen_dists: &[f64],
+        _gen_positions: &[f64],
         ibs2: &Ibs2,
-        collect_em: bool,
+        _collect_em: bool,
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
@@ -468,6 +468,26 @@ impl PhasingPipeline {
             .map(|_| OnlineHmm::new())
             .collect();
 
+        // SCRATCH BUFFERS (Hoisted)
+        // 1. Alleles bytes buffer
+        let mut alleles_bytes: Vec<u8> = vec![0; n_haps];
+        
+        // 2. Per-sample results buffers
+        // We need a vector of (swap, n1, n2) to parallelize over
+        // n1 and n2 are vectors that need to be cleared/reused
+        struct ResultSlot {
+            swap: bool,
+            n1: Vec<u32>,
+            n2: Vec<u32>,
+        }
+        let mut results_workspace: Vec<ResultSlot> = (0..n_samples)
+            .map(|_| ResultSlot {
+                swap: false,
+                n1: Vec::with_capacity(250),
+                n2: Vec::with_capacity(250),
+            })
+            .collect();
+
         let total_switches = AtomicUsize::new(0);
         
         // Markers Loop (Standard: All markers)
@@ -476,27 +496,43 @@ impl PhasingPipeline {
             
             // 1. Parallel Decision Phase
             let alleles_bits = geno.marker_alleles(m);
-            let alleles_bytes: Vec<u8> = (0..n_haps).map(|h| {
+            // Copy alleles to byte buffer (sequential is fine, it's fast linear scan)
+            // Or parallelize if n_haps is huge, but it's likely memory bound.
+            // Using loop to avoid allocation
+            for h in 0..n_haps {
                  let is_missing = missing_mask[h].get(m).as_deref().copied().unwrap_or(false);
-                 if is_missing { 255 } else { if alleles_bits[h] { 1 } else { 0 } }
-            }).collect();
+                 alleles_bytes[h] = if is_missing { 255 } else { if alleles_bits[h] { 1 } else { 0 } };
+            }
             
-            let results: Vec<(bool, Vec<u32>, Vec<u32>)> = online_hmms
-                .par_iter()
+            // Parallel process samples writing into pre-allocated workspace
+            online_hmms
+                .par_iter_mut()
+                .zip(&mut results_workspace)
                 .enumerate()
-                .map(|(s, hmm)| {
+                .for_each(|(s, (hmm, res))| {
                     let hap1 = (s * 2) as u32;
                     let hap2 = (s * 2 + 1) as u32;
                     let k = 100;
                     
-                    let n1 = ibs.find_neighbors(hap1, m, ibs2, k);
-                    let n2 = ibs.find_neighbors(hap2, m, ibs2, k);
+                    // Clear previous neighbors (important!)
+                    // We can reuse the vectors
+                    res.n1.clear();
+                    res.n2.clear();
+
+                    // Find neighbors writing directly to workspace buffers
+                    ibs.find_neighbors_buf(hap1, m, ibs2, k, &mut res.n1);
+                    ibs.find_neighbors_buf(hap2, m, ibs2, k, &mut res.n2);
                     
                     let a1 = alleles_bytes[hap1 as usize];
                     let a2 = alleles_bytes[hap2 as usize];
                     
-                    let swap = hmm.decide_phase_at_step(
-                        &n1,
+                    // Read-only access to alleles_bytes is fine in parallel if it's shared reference
+                    // But we can't capture &alleles_bytes in for_each easily if it's a slice? 
+                    // Rayon allows shared reference capture.
+
+                    res.swap = hmm.decide_phase_at_step(
+                        &res.n1,
+                        &res.n2,
                         a1,
                         a2,
                         |h_idx| { alleles_bytes[h_idx as usize] },
@@ -504,53 +540,59 @@ impl PhasingPipeline {
                         n_haps,
                         &self.params,
                     );
-                    (swap, n1, n2)
-                })
-                .collect();
+                });
             
-            // 2. Apply Swaps
+            // 2. Apply Swaps AND Finalize Alleles (Combined loop to avoid iterating twice)
+            // But we can't swap in geno and update alleles_bytes in parallel easily?
+            // Geno swap is on bitvecs.
             let mut step_switches = 0;
-            for (s, (swap, _, _)) in results.iter().enumerate() {
-                if *swap {
+            
+            // Apply swaps to geno (sequential or parallel chunked?)
+            // Geno is not Sync for writes probably (MutableGenotypes needs check).
+            // Assuming sequential swap is okay or we rely on internal mutability if it exists.
+            // Let's do as before.
+            for (s, res) in results_workspace.iter().enumerate() {
+                if res.swap {
                     geno.swap(m, HapIdx::new((s*2) as u32), HapIdx::new((s*2+1) as u32));
+                    // Update local copy too so HMM step sees correct finalized alleles
+                    alleles_bytes.swap(s*2, s*2+1);
                     step_switches += 1;
                 }
             }
             total_switches.fetch_add(step_switches, Ordering::Relaxed);
 
-            // 3. Finalize Alleles
-            let mut final_alleles = alleles_bytes;
-            for (s, (swap, _, _)) in results.iter().enumerate() {
-                if *swap {
-                    final_alleles.swap(s*2, s*2+1);
-                }
-            }
-
             // 4. Update HMM
-            online_hmms.par_iter_mut().zip(results.into_par_iter()).enumerate().for_each(|(s, (hmm, (_, n1, n2)))| {
-                let mut states = n1;
-                states.extend(n2);
-                states.sort_unstable();
-                states.dedup();
-                
-                let my_h1 = s * 2;
-                let my_h2 = s * 2 + 1;
-                let a1 = final_alleles[my_h1];
-                let a2 = final_alleles[my_h2];
-                let p_match = self.params.emit_match();
-                let p_mismatch = self.params.emit_mismatch();
-                
-                hmm.step(
-                    &states,
-                    |h_idx| { 
-                        let ref_a = final_alleles[h_idx as usize];
-                        let e1 = if a1 == 255 || ref_a == 255 { 1.0 } else if a1 == ref_a { p_match } else { p_mismatch };
-                        let e2 = if a2 == 255 || ref_a == 255 { 1.0 } else if a2 == ref_a { p_match } else { p_mismatch };
-                        (1.0, e1, e2) 
-                    },
-                    pr,
-                    n_haps,
-                );
+            online_hmms.par_iter_mut().zip(&results_workspace).enumerate().for_each(|(s, (hmm, res))| {
+                 // Reuse n1/n2 from workspace. 
+                 // Note: We need a merged list of states. 
+                 // Allocating 'states' vector here is still an allocation!
+                 // OPTIMIZATION: Add a scratch buffer for specific states to OnlineHmm or ResultSlot?
+                 // For now, let's just do the vector allocation here as it's smaller (2*K).
+                 // Or we can add a 'merged_states' buffer to ResultSlot.
+                 
+                 let mut states = res.n1.clone(); 
+                 states.extend(&res.n2);
+                 states.sort_unstable();
+                 states.dedup();
+                 
+                 let my_h1 = s * 2;
+                 let my_h2 = s * 2 + 1;
+                 let a1 = alleles_bytes[my_h1];
+                 let a2 = alleles_bytes[my_h2];
+                 let p_match = self.params.emit_match();
+                 let p_mismatch = self.params.emit_mismatch();
+                 
+                 hmm.step(
+                     &states,
+                     |h_idx| { 
+                         let ref_a = alleles_bytes[h_idx as usize];
+                         let e1 = if a1 == 255 || ref_a == 255 { 1.0 } else if a1 == ref_a { p_match } else { p_mismatch };
+                         let e2 = if a2 == 255 || ref_a == 255 { 1.0 } else if a2 == ref_a { p_match } else { p_mismatch };
+                         (1.0, e1, e2) 
+                     },
+                     pr,
+                     n_haps,
+                 );
             });
             
             // 5. Advance PBWT
@@ -566,7 +608,7 @@ impl PhasingPipeline {
         &self,
         original: &GenotypeMatrix,
         geno: &MutableGenotypes,
-    ) -> GenotypeMatrix {
+    ) -> GenotypeMatrix<crate::data::storage::phase_state::Phased> {
         let markers = original.markers().clone();
         let samples = original.samples_arc();
         let n_markers = geno.n_markers();
@@ -579,7 +621,7 @@ impl PhasingPipeline {
             })
             .collect();
 
-        GenotypeMatrix::new(markers, columns, samples, true)
+        GenotypeMatrix::new_phased(markers, columns, samples)
     }
 
     /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only
@@ -596,11 +638,11 @@ impl PhasingPipeline {
         geno: &mut MutableGenotypes,
         missing_mask: &[BitBox<u8, Lsb0>],
         stage1_p_recomb: &[f32],
-        stage1_gen_dists: &[f64],
-        stage1_gen_positions: &[f64],
-        hi_freq_to_orig: &[usize],  // This was missing from view, need to be careful
+        _stage1_gen_dists: &[f64],
+        _stage1_gen_positions: &[f64],
+        hi_freq_to_orig: &[usize],
         ibs2: &Ibs2,
-        collect_em: bool,
+        _collect_em: bool,
     ) -> Result<()> {
         let n_markers = hi_freq_to_orig.len();
         let n_haps = geno.n_haps();
@@ -611,6 +653,22 @@ impl PhasingPipeline {
             .map(|_| OnlineHmm::new())
             .collect();
         
+        // SCRATCH BUFFERS (Hoisted)
+        // Same as run_iteration_with_hmm
+        let mut alleles_bytes: Vec<u8> = vec![0; n_haps];
+        struct ResultSlot {
+            swap: bool,
+            n1: Vec<u32>,
+            n2: Vec<u32>,
+        }
+        let mut results_workspace: Vec<ResultSlot> = (0..n_samples)
+            .map(|_| ResultSlot {
+                swap: false,
+                n1: Vec::with_capacity(250),
+                n2: Vec::with_capacity(250),
+            })
+            .collect();
+
         let total_switches = AtomicUsize::new(0);
 
         for i in 0..n_markers {
@@ -619,35 +677,36 @@ impl PhasingPipeline {
 
             // 1. Parallel Decision (using original marker index m)
             let alleles_bits = geno.marker_alleles(m);
-            // Create local byte copy for HMM
-            let alleles_bytes: Vec<u8> = (0..n_haps).map(|h| {
+            // Re-fill alleles_bytes buffer
+            for h in 0..n_haps {
                  let is_missing = missing_mask[h].get(m).as_deref().copied().unwrap_or(false);
-                 if is_missing { 255 } else { if alleles_bits[h] { 1 } else { 0 } }
-            }).collect();
+                 alleles_bytes[h] = if is_missing { 255 } else { if alleles_bits[h] { 1 } else { 0 } };
+            }
 
-            let results: Vec<(bool, Vec<u32>, Vec<u32>)> = online_hmms
-                .par_iter()
+            // Parallel process samples writing into pre-allocated workspace
+            online_hmms
+                .par_iter_mut()
+                .zip(&mut results_workspace)
                 .enumerate()
-                .map(|(s, hmm)| {
+                .for_each(|(s, (hmm, res))| {
                     let hap1 = (s * 2) as u32;
                     let hap2 = (s * 2 + 1) as u32;
                     let k = 100;
                     
-                    let n1 = ibs.find_neighbors(hap1, i, ibs2, k); // Use 'i' (stage1 index) or 'm'? GlobalPhaseIbs tracks own index? 
-                    // GlobalPhaseIbs just stores ppa/div. 'marker_idx' in find_neighbors is mainly for IBS2 filtering?
-                    // ibs2.segments(sample) returns segments with GLOBAL marker indices?
-                    // Yes, Ibs2 is built on full GenotypeMatrix.
-                    // So we must pass 'm' (global index) if find_neighbors uses it for IBS2.
-                    // Let's check find_neighbors implementation.
-                    // It iterates ibs2 segments and checks `seg.contains(marker_idx)`.
-                    // So we must pass 'm'.
-                    let n2 = ibs.find_neighbors(hap2, m, ibs2, k); 
+                    // Clear previous neighbors
+                    res.n1.clear();
+                    res.n2.clear();
+                    
+                    // Find neighbors using buffer
+                    ibs.find_neighbors_buf(hap1, m, ibs2, k, &mut res.n1);
+                    ibs.find_neighbors_buf(hap2, m, ibs2, k, &mut res.n2);
                     
                     let a1 = alleles_bytes[hap1 as usize];
                     let a2 = alleles_bytes[hap2 as usize];
                     
-                    let swap = hmm.decide_phase_at_step(
-                        &n1,
+                    res.swap = hmm.decide_phase_at_step(
+                        &res.n1,
+                        &res.n2,
                         a1,
                         a2,
                         |h_idx| { alleles_bytes[h_idx as usize] },
@@ -655,46 +714,38 @@ impl PhasingPipeline {
                         n_haps,
                         &self.params,
                     );
-                    (swap, n1, n2) // Note: returning n2 instead of call? Wait, code above calls find_neighbors for n1 then n2.
-                 })
-                .collect();
+                });
 
-            // 2. Apply Swaps
+            // 2. Apply Swaps & Finalize Alleles
             let mut step_switches = 0;
-            for (s, (swap, _, _)) in results.iter().enumerate() {
-                if *swap {
+            for (s, res) in results_workspace.iter().enumerate() {
+                if res.swap {
                     geno.swap(m, HapIdx::new((s*2) as u32), HapIdx::new((s*2+1) as u32));
+                    alleles_bytes.swap(s*2, s*2+1);
                     step_switches += 1;
                 }
             }
             total_switches.fetch_add(step_switches, Ordering::Relaxed);
 
             // 3. Update HMM
-            // Need final alleles for HMM update (reflecting swaps)
-             let mut final_alleles = alleles_bytes;
-             for (s, (swap, _, _)) in results.iter().enumerate() {
-                 if *swap {
-                     final_alleles.swap(s*2, s*2+1);
-                 }
-             }
-
-             online_hmms.par_iter_mut().zip(results.into_par_iter()).enumerate().for_each(|(s, (hmm, (_, n1, n2)))| {
-                 let mut states = n1;
-                 states.extend(n2);
+            online_hmms.par_iter_mut().zip(&results_workspace).enumerate().for_each(|(s, (hmm, res))| {
+                 // Reuse n1/n2 from workspace
+                 let mut states = res.n1.clone();
+                 states.extend(&res.n2);
                  states.sort_unstable();
                  states.dedup();
                  
                  let my_h1 = s * 2;
                  let my_h2 = s * 2 + 1;
-                 let a1 = final_alleles[my_h1];
-                 let a2 = final_alleles[my_h2];
+                 let a1 = alleles_bytes[my_h1];
+                 let a2 = alleles_bytes[my_h2];
                  let p_match = self.params.emit_match();
                  let p_mismatch = self.params.emit_mismatch();
                  
                  hmm.step(
                      &states,
                      |h_idx| { 
-                         let ref_a = final_alleles[h_idx as usize];
+                         let ref_a = alleles_bytes[h_idx as usize];
                          let e1 = if a1 == 255 || ref_a == 255 { 1.0 } else if a1 == ref_a { p_match } else { p_mismatch };
                          let e2 = if a2 == 255 || ref_a == 255 { 1.0 } else if a2 == ref_a { p_match } else { p_mismatch };
                          (1.0, e1, e2) 
@@ -709,185 +760,6 @@ impl PhasingPipeline {
         }
         
         eprintln!("Applied {} phase switches (Stage 1)", total_switches.load(Ordering::Relaxed));
-        Ok(())
-    }
-        hi_freq_to_orig: &[usize],
-        ibs2: &Ibs2,
-        collect_em: bool,
-    ) -> Result<()> {
-        let n_samples = geno.n_haps() / 2;
-        let n_haps = geno.n_haps();
-        let n_hi_freq = hi_freq_to_orig.len();
-        
-        if n_hi_freq == 0 {
-            return Ok(());
-        }
-
-        // Initialize Global PBWT
-        let mut ibs = GlobalPhaseIbs::new(n_haps);
-        
-        // Initialize Online HMMs for each sample
-        let mut online_hmms: Vec<OnlineHmm> = (0..n_samples)
-            .map(|_| {
-                let mut hmm = OnlineHmm::new();
-                // Initialize with all haplotypes as potential states (uniform prior)
-                // Or let the first step handle it?
-                // Better to start fresh.
-                hmm
-            })
-            .collect();
-
-        // Atomic for statistics
-        let total_switches = AtomicUsize::new(0);
-
-        // Iterate through High-Frequency markers
-        for (i, &orig_m) in hi_freq_to_orig.iter().enumerate() {
-            let p_recomb = stage1_p_recomb[i];
-            
-            // 1. Parallel Step: Find Neighbors & Decide Phase
-            // We need to access 'geno' (bits) in parallel. Thread-safe as we don't write.
-            // But MutableGenotypes::haplotype returns vectors/refs?
-            // MutableGenotypes stores columns? No, rows (haplotypes).
-            // Accessing column m is slow if row-store?
-            // MutableGenotypes has `marker_alleles(m)` which returns Vec<bool>.
-            // That creates a copy. O(N).
-            // We can distribute this read-only buffer to threads.
-            
-            let alleles_bits = geno.marker_alleles(orig_m); // Vec<bool> of size n_haps
-            let alleles_bytes: Vec<u8> = (0..n_haps).map(|h| {
-                 let is_missing = missing_mask[h].get(orig_m).as_deref().copied().unwrap_or(false);
-                 if is_missing { 255 } else { if alleles_bits[h] { 1 } else { 0 } }
-            }).collect();
-            
-            // Collect results: (swaps, neighbors)
-            let results: Vec<(bool, Vec<u32>, Vec<u32>)> = online_hmms
-                .par_iter()
-                .enumerate()
-                .map(|(s, hmm)| {
-                    let hap1 = (s * 2) as u32;
-                    let hap2 = (s * 2 + 1) as u32;
-                    
-                    // Find neighbors using Global PBWT state
-                    // Use somewhat large K for accuracy
-                    let k = 100; 
-                    let n1 = ibs.find_neighbors(hap1, i, ibs2, k);
-                    let n2 = ibs.find_neighbors(hap2, i, ibs2, k);
-                    
-                    // Current alleles
-                    let a1 = alleles_bytes[hap1 as usize];
-                    let a2 = alleles_bytes[hap2 as usize];
-                    
-                    // Decide Phase
-                    let swap = hmm.decide_phase_at_step(
-                        &n1, // using neighbors of hap1 as states for hap1 HMM?
-                             // Wait. If swapped, hap1 originates from s2-like states?
-                             // Standard HMM: fwd1 tracks "Hap1 physics".
-                             // States are "reference haps".
-                             // If we swap, we swap observations.
-                             // decided_phase_at_step handles logic.
-                        a1,
-                        a2,
-                        |h_idx| { // Lookup ref allele from current marker alleles
-                            alleles_bytes[h_idx as usize]
-                        },
-                        p_recomb,
-                        n_haps,
-                        &self.params,
-                    );
-                    
-                    (swap, n1, n2)
-                })
-                .collect();
-            
-            // 2. Apply Swaps & Count
-            let mut step_switches = 0;
-            for (s, (swap, _, _)) in results.iter().enumerate() {
-                if *swap {
-                    // Swap at this marker means we change physical alleles
-                    // This affects subsequent steps and final output
-                    // We only swap AT this marker? 
-                    // No, usually "phase switch" means "alleles from here on are flipped relative to previous"
-                    // But here we are building the haplotype.
-                    // If we decide "swap", we flip the bits at `orig_m`.
-                    // And we flip the HMM state mapping?
-                    // "Online Phasing" builds the haplotypes marker by marker.
-                    // If we swap, we physically swap the bits in `geno`.
-                    // Does this affect `prev` history?
-                    // Only in that we are establishing the physical haplotype sequence 0..m.
-                    // The HMM state tracks likelihood of this sequence.
-                    geno.swap(orig_m, HapIdx::new((s*2) as u32), HapIdx::new((s*2+1) as u32));
-                    step_switches += 1;
-                }
-            }
-            total_switches.fetch_add(step_switches, Ordering::Relaxed);
-            
-            // 3. Reconstruct FINAL alleles for HMM Update and PBWT Advance
-            // Optimization: modify `alleles_bytes` in place based on swaps
-            let mut final_alleles = alleles_bytes; // move
-            for (s, (swap, _, _)) in results.iter().enumerate() {
-                if *swap {
-                    final_alleles.swap(s*2, s*2+1);
-                }
-            }
-            
-            // 4. Update HMM States (Parallel)
-            online_hmms.par_iter_mut().zip(results.into_par_iter()).enumerate().for_each(|(s, (hmm, (_, n1, n2)))| {
-                // Merge neighbors to form the state set for this step
-                let mut states = n1;
-                states.extend(n2);
-                states.sort_unstable();
-                states.dedup();
-                
-                // Get final alleles for this sample
-                // Note: final_alleles is shared across threads, read-only here
-                let my_h1 = s * 2;
-                let my_h2 = s * 2 + 1;
-                let a1 = final_alleles[my_h1];
-                let a2 = final_alleles[my_h2];
-                
-                let p_match = self.params.emit_match();
-                let p_mismatch = self.params.emit_mismatch();
-                
-                hmm.step(
-                    &states,
-                    |h_idx| { 
-                        let ref_a = final_alleles[h_idx as usize];
-                        
-                        let e1 = if a1 == 255 || ref_a == 255 { 
-                            1.0 
-                        } else if a1 == ref_a { 
-                            p_match 
-                        } else { 
-                            p_mismatch 
-                        };
-                        
-                        let e2 = if a2 == 255 || ref_a == 255 { 
-                            1.0 
-                        } else if a2 == ref_a { 
-                            p_match 
-                        } else { 
-                            p_mismatch 
-                        };
-                        
-                        // Combined emission ignored for phasing
-                        (1.0, e1, e2) 
-                    },
-                    p_recomb,
-                    n_haps,
-                );
-            });
-            
-            // 5. Advance Global PBWT
-            // Note: advance takes marker_idx which is 'i' in hi-freq space?
-            // No, strictly PBWT relies on bit patterns.
-            // But if we skip markers, PBWT will be approximate?
-            // For Stage 1, we ONLY run on Hi-Freq markers.
-            // So we treat the Hi-Freq markers as the ONLY markers.
-            // The PBWT state evolves along the Hi-Freq backbone.
-            ibs.advance(&final_alleles, i);
-        }
-        
-        eprintln!("Applied {} switches in Stage 1", total_switches.load(Ordering::Relaxed));
         Ok(())
     }
 
@@ -907,7 +779,6 @@ impl PhasingPipeline {
         hi_freq_markers: &[usize],
     ) {
         let n_samples = geno.n_haps() / 2;
-        let n_markers = geno.n_markers();
 
         if rare_markers.is_empty() || hi_freq_markers.is_empty() {
             return;
@@ -990,7 +861,13 @@ impl PhasingPipeline {
 
                 // Apply phase: if should_swap, ensure hap1 has allele 1, else allele 0
                 let rare_hap1_has_0 = alleles1[rare_m] == 0;
-                if should_swap != rare_hap1_has_0 {
+                
+                // FIX: logic was inverted. 
+                // should_swap means "target phase is 1".
+                // rare_hap1_has_0 means "current phase is 0".
+                // If target is 1 (true) and current is 0 (true), we swap. (true == true)
+                // If target is 0 (false) and current is 1 (false), we swap. (false == false)
+                if should_swap == rare_hap1_has_0 {
                     // Need to swap this marker
                     let a1 = alleles1[rare_m];
                     let a2 = alleles2[rare_m];

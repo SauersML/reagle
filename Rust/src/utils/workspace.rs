@@ -18,17 +18,17 @@ pub struct Workspace {
     /// Backward probabilities (n_states)
     pub bwd: Vec<f32>,
 
-    /// State probabilities at each marker (n_markers x n_states)
-    pub state_probs: Vec<Vec<f32>>,
+    /// State probabilities at each marker (flattened: n_markers * n_states)
+    pub state_probs: Vec<f32>,
 
-    /// Forward pass combined (n_markers x n_states) - for phasing HMM
-    pub fwd_combined: Vec<Vec<f32>>,
+    /// Forward pass combined (flattened: n_markers * n_states) - for phasing HMM
+    pub fwd_combined: Vec<f32>,
 
-    /// Forward pass hap1 (n_markers x n_states) - for phasing HMM
-    pub fwd1: Vec<Vec<f32>>,
+    /// Forward pass hap1 (flattened: n_markers * n_states) - for phasing HMM
+    pub fwd1: Vec<f32>,
 
-    /// Forward pass hap2 (n_markers x n_states) - for phasing HMM
-    pub fwd2: Vec<Vec<f32>>,
+    /// Forward pass hap2 (flattened: n_markers * n_states) - for phasing HMM
+    pub fwd2: Vec<f32>,
 
     /// Temporary buffer for state updates
     pub tmp: Vec<f32>,
@@ -55,10 +55,10 @@ impl Workspace {
         Self {
             fwd: vec![0.0; n_states],
             bwd: vec![0.0; n_states],
-            state_probs: vec![vec![0.0; n_states]; n_markers],
-            fwd_combined: vec![vec![0.0; n_states]; n_markers],
-            fwd1: vec![vec![0.0; n_states]; n_markers],
-            fwd2: vec![vec![0.0; n_states]; n_markers],
+            state_probs: vec![0.0; n_markers * n_states],
+            fwd_combined: vec![0.0; n_markers * n_states],
+            fwd1: vec![0.0; n_markers * n_states],
+            fwd2: vec![0.0; n_markers * n_states],
             tmp: vec![0.0; n_states],
             prefix: (0..n_haps as u32).collect(),
             divergence: vec![0; n_haps],
@@ -77,22 +77,12 @@ impl Workspace {
     pub fn resize(&mut self, n_states: usize, n_markers: usize, n_haps: usize) {
         self.fwd.resize(n_states, 0.0);
         self.bwd.resize(n_states, 0.0);
-        self.state_probs.resize(n_markers, vec![0.0; n_states]);
-        for probs in &mut self.state_probs {
-            probs.resize(n_states, 0.0);
-        }
-        self.fwd_combined.resize(n_markers, vec![0.0; n_states]);
-        for probs in &mut self.fwd_combined {
-            probs.resize(n_states, 0.0);
-        }
-        self.fwd1.resize(n_markers, vec![0.0; n_states]);
-        for probs in &mut self.fwd1 {
-            probs.resize(n_states, 0.0);
-        }
-        self.fwd2.resize(n_markers, vec![0.0; n_states]);
-        for probs in &mut self.fwd2 {
-            probs.resize(n_states, 0.0);
-        }
+        
+        let total_size = n_markers * n_states;
+        self.state_probs.resize(total_size, 0.0);
+        self.fwd_combined.resize(total_size, 0.0);
+        self.fwd1.resize(total_size, 0.0);
+        self.fwd2.resize(total_size, 0.0);
         self.tmp.resize(n_states, 0.0);
 
         if n_haps > self.prefix.len() {
@@ -315,16 +305,15 @@ mod tests {
     fn test_workspace_creation() {
         let ws = Workspace::new(100, 50, 1000);
         assert_eq!(ws.fwd.len(), 100);
-        assert_eq!(ws.state_probs.len(), 50);
+        assert_eq!(ws.state_probs.len(), 50 * 100);
         assert_eq!(ws.prefix.len(), 1000);
     }
 
-    #[test]
     fn test_workspace_resize() {
         let mut ws = Workspace::minimal();
         ws.resize(200, 100, 2000);
         assert_eq!(ws.fwd.len(), 200);
-        assert_eq!(ws.state_probs.len(), 100);
+        assert_eq!(ws.state_probs.len(), 100 * 200);
         assert_eq!(ws.prefix.len(), 2000);
     }
 

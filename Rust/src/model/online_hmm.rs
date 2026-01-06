@@ -195,7 +195,8 @@ impl OnlineHmm {
     /// We should separate them or use a helper to query "what if".
     pub fn decide_phase_at_step(
         &self,
-        new_states: &[u32],
+        states1: &[u32],
+        states2: &[u32],
         a1: u8,
         a2: u8,
         get_ref_allele: impl Fn(u32) -> u8,
@@ -227,15 +228,13 @@ impl OnlineHmm {
             else { p_mismatch }
         };
         
-        // To do this efficiently, we iterate new_states
-        for &k in new_states {
+        // Helper to process a state k
+        let mut process_state = |k: u32| {
             let ref_a = get_ref_allele(k);
             let e_a1 = emit(a1, ref_a);
             let e_a2 = emit(a2, ref_a);
             
             // Calculate prior P(S_m=k | prev) using same logic as step
-            // Optimize: we do this twice (here and in step). Can be merged?
-            // For now, recompute.
             let idx_prev = self.prev_states.iter().position(|&p| p == k);
             
             let term1 = if let Some(idx) = idx_prev {
@@ -250,6 +249,16 @@ impl OnlineHmm {
             total_prob1_a2 += term1 * e_a2;
             total_prob2_a1 += term2 * e_a1;
             total_prob2_a2 += term2 * e_a2;
+        };
+
+        // Iterate union of states1 and states2
+        for &k in states1 {
+            process_state(k);
+        }
+        for &k in states2 {
+            if !states1.contains(&k) {
+                process_state(k);
+            }
         }
         
         let likelihood_current = total_prob1_a1 * total_prob2_a2; // a1 on hap1, a2 on hap2

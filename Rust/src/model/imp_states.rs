@@ -74,6 +74,227 @@ impl CompositeHap {
     }
 }
 
+// ============================================================================
+// Structure of Arrays (SoA) Layout for Cache-Friendly Access
+// ============================================================================
+
+/// Structure-of-Arrays layout for composite haplotypes.
+///
+/// Flattens all segments into parallel arrays for cache-friendly sequential access.
+/// This eliminates the pointer chasing of `Vec<CompositeHap>` where each owns `Vec<HapSegment>`.
+///
+/// # Memory Layout
+///
+/// ```text
+/// AoS (before):
+/// comp_haps[0] -> Vec<HapSegment> -> [Seg0, Seg1]      (heap allocation)
+/// comp_haps[1] -> Vec<HapSegment> -> [Seg0]            (heap allocation)
+/// comp_haps[2] -> Vec<HapSegment> -> [Seg0, Seg1, Seg2] (heap allocation)
+///
+/// SoA (after):
+/// segments_start: [0, 2, 3, 6]  // Offsets (one extra for length)
+/// segment_hap:    [h0, h1, h2, h3, h4, h5]  // All haplotype IDs contiguous
+/// segment_end:    [e0, e1, e2, e3, e4, e5]  // All end markers contiguous
+/// current_seg:    [0, 0, 0]  // Current segment index per composite
+/// ```
+#[derive(Clone, Debug)]
+pub struct CompositeHapsSoA {
+    /// Start offset into flat arrays for each composite.
+    /// Length: n_composites + 1 (last element is total segment count)
+    segments_start: Vec<u32>,
+
+    /// Flat array of haplotype IDs for all segments
+    segment_hap: Vec<u32>,
+
+    /// Flat array of end markers (exclusive) for all segments
+    segment_end: Vec<u32>,
+
+    /// Current segment index for each composite (for iteration)
+    current_seg: Vec<u16>,
+
+    /// Total number of markers (for segment initialization)
+    n_markers: usize,
+}
+
+impl CompositeHapsSoA {
+    /// Create empty SoA with pre-allocated capacity
+    pub fn with_capacity(n_composites: usize, n_markers: usize) -> Self {
+        let mut segments_start = Vec::with_capacity(n_composites + 1);
+        segments_start.push(0);
+
+        Self {
+            segments_start,
+            segment_hap: Vec::with_capacity(n_composites * 4), // Estimate ~4 segments each
+            segment_end: Vec::with_capacity(n_composites * 4),
+            current_seg: Vec::with_capacity(n_composites),
+            n_markers,
+        }
+    }
+
+    /// Number of composite haplotypes
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.segments_start.len().saturating_sub(1)
+    }
+
+    /// Check if empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Add a new composite haplotype starting with given hap
+    pub fn push(&mut self, start_hap: u32) -> usize {
+        let idx = self.len();
+
+        // Add single segment spanning all markers
+        self.segment_hap.push(start_hap);
+        self.segment_end.push(self.n_markers as u32);
+        self.segments_start.push(self.segment_hap.len() as u32);
+        self.current_seg.push(0);
+
+        idx
+    }
+
+    /// Add a new segment to composite at idx, starting at given marker
+    ///
+    /// This truncates the previous segment's end and appends the new segment.
+    pub fn add_segment(&mut self, comp_idx: usize, hap: u32, start_marker: usize) {
+        let seg_start = self.segments_start[comp_idx] as usize;
+        let seg_end = self.segments_start[comp_idx + 1] as usize;
+
+        // Update end of last segment to be the start of new segment
+        if seg_end > seg_start {
+            self.segment_end[seg_end - 1] = start_marker as u32;
+        }
+
+        // Insert new segment at the end of this composite's segments
+        // This requires shifting subsequent composites' data - but we can optimize
+        // by appending and updating offsets for a simpler approach
+        let insert_pos = seg_end;
+
+        // Shift subsequent segment data
+        self.segment_hap.insert(insert_pos, hap);
+        self.segment_end.insert(insert_pos, self.n_markers as u32);
+
+        // Update all subsequent segment_start offsets
+        for i in (comp_idx + 1)..self.segments_start.len() {
+            self.segments_start[i] += 1;
+        }
+    }
+
+    /// Get haplotype at marker for a composite (with mutable current_seg tracking)
+    #[inline]
+    pub fn hap_at(&mut self, comp_idx: usize, marker: usize) -> u32 {
+        let seg_start = self.segments_start[comp_idx] as usize;
+        let seg_end = self.segments_start[comp_idx + 1] as usize;
+        let mut cur = seg_start + self.current_seg[comp_idx] as usize;
+
+        // Advance current segment if needed
+        while cur < seg_end.saturating_sub(1) && marker >= self.segment_end[cur] as usize {
+            cur += 1;
+        }
+        self.current_seg[comp_idx] = (cur - seg_start) as u16;
+
+        self.segment_hap[cur]
+    }
+
+    /// Get haplotype at marker for a composite (const, without updating current_seg)
+    #[inline]
+    pub fn hap_at_const(&self, comp_idx: usize, marker: usize) -> u32 {
+        let seg_start = self.segments_start[comp_idx] as usize;
+        let seg_end = self.segments_start[comp_idx + 1] as usize;
+
+        // Linear scan from beginning
+        for i in seg_start..seg_end {
+            if marker < self.segment_end[i] as usize {
+                return self.segment_hap[i];
+            }
+        }
+
+        // Fallback to last segment
+        if seg_end > seg_start {
+            self.segment_hap[seg_end - 1]
+        } else {
+            0
+        }
+    }
+
+    /// Reset all current segment indices for a new iteration
+    pub fn reset(&mut self) {
+        self.current_seg.fill(0);
+    }
+
+    /// Clear all data but keep capacity
+    pub fn clear(&mut self) {
+        self.segments_start.clear();
+        self.segments_start.push(0);
+        self.segment_hap.clear();
+        self.segment_end.clear();
+        self.current_seg.clear();
+    }
+
+    /// Get number of segments for a composite
+    #[inline]
+    pub fn n_segments(&self, comp_idx: usize) -> usize {
+        let start = self.segments_start[comp_idx] as usize;
+        let end = self.segments_start[comp_idx + 1] as usize;
+        end - start
+    }
+
+    /// Create a view for reading a single composite's segments
+    pub fn view(&self, comp_idx: usize) -> StateView<'_> {
+        StateView::new(self, comp_idx)
+    }
+}
+
+/// Cursor for iterating a single composite haplotype's segments.
+///
+/// This is a zero-cost abstraction - just references and indices.
+#[derive(Clone, Debug)]
+pub struct StateView<'a> {
+    soa: &'a CompositeHapsSoA,
+    comp_idx: usize,
+    current_seg: usize,
+}
+
+impl<'a> StateView<'a> {
+    /// Create a new view for a composite
+    pub fn new(soa: &'a CompositeHapsSoA, comp_idx: usize) -> Self {
+        Self {
+            soa,
+            comp_idx,
+            current_seg: 0,
+        }
+    }
+
+    /// Get haplotype at marker
+    #[inline]
+    pub fn hap_at(&mut self, marker: usize) -> u32 {
+        let seg_start = self.soa.segments_start[self.comp_idx] as usize;
+        let seg_end = self.soa.segments_start[self.comp_idx + 1] as usize;
+        let mut cur = seg_start + self.current_seg;
+
+        // Advance current segment if needed
+        while cur < seg_end.saturating_sub(1) && marker >= self.soa.segment_end[cur] as usize {
+            cur += 1;
+        }
+        self.current_seg = cur - seg_start;
+
+        self.soa.segment_hap[cur]
+    }
+
+    /// Reset cursor to start
+    pub fn reset(&mut self) {
+        self.current_seg = 0;
+    }
+
+    /// Number of segments in this composite
+    pub fn n_segments(&self) -> usize {
+        self.soa.n_segments(self.comp_idx)
+    }
+}
+
 /// Entry in the priority queue for state management
 #[derive(Clone, Debug)]
 struct CompHapEntry {

@@ -158,8 +158,6 @@ mod tests {
 
     #[test]
     fn test_haplotype() {
-        let geno = MutableGenotypes::from_fn(5, 2, |m, h| if h == 0 { m as u8 } else { 0 });
-
         // Note: bitvec only stores 0/1. The test in original code used `m as u8` which could be > 1.
         // We must ensure the test data is binary.
         // If m % 2 == 1 -> 1, else 0

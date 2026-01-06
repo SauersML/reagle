@@ -20,6 +20,7 @@ use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
+use crate::data::storage::phase_state::PhaseState;
 use crate::data::storage::coded_steps::RefPanelCoded;
 use crate::error::Result;
 use crate::io::vcf::{ImputationQuality, VcfReader, VcfWriter};
@@ -53,7 +54,7 @@ impl MarkerAlignment {
     ///
     /// This handles strand flips (A/T vs T/A) and allele swaps automatically
     /// using `compute_allele_mapping`.
-    pub fn new(target_gt: &GenotypeMatrix, ref_gt: &GenotypeMatrix) -> Self {
+    pub fn new<S1: PhaseState, S2: PhaseState>(target_gt: &GenotypeMatrix<S1>, ref_gt: &GenotypeMatrix<S2>) -> Self {
         use crate::data::marker::compute_allele_mapping;
 
         let n_ref_markers = ref_gt.n_markers();
@@ -206,7 +207,7 @@ impl StateProbs {
         n_markers: usize,
         n_states: usize,
         hap_indices: Vec<Vec<u32>>,
-        state_probs: Vec<Vec<f32>>,
+        state_probs: Vec<f32>,
     ) -> Self {
         let threshold = 0.005f32.min(0.9999 / n_states as f32);
 
@@ -216,19 +217,20 @@ impl StateProbs {
 
         for m in 0..n_markers {
             let m_p1 = (m + 1).min(n_markers - 1);
+            let row_offset = m * n_states;
+            let row_offset_p1 = m_p1 * n_states;
+            
             let mut haps = Vec::new();
             let mut probs = Vec::new();
             let mut probs_p1 = Vec::new();
 
             for j in 0..n_states.min(hap_indices.get(m).map(|v| v.len()).unwrap_or(0)) {
                 let prob_m = state_probs
-                    .get(m)
-                    .and_then(|v| v.get(j))
+                    .get(row_offset + j)
                     .copied()
                     .unwrap_or(0.0);
                 let prob_m_p1 = state_probs
-                    .get(m_p1)
-                    .and_then(|v| v.get(j))
+                    .get(row_offset_p1 + j)
                     .copied()
                     .unwrap_or(0.0);
 
@@ -355,30 +357,27 @@ impl ImputationPipeline {
             return Ok(());
         }
 
-        // Auto-phase target if unphased (imputation requires phased haplotypes)
-        let target_gt = if !target_gt.is_phased() {
-            eprintln!("Target VCF is unphased. Running phasing before imputation...");
+        // Phase target before imputation (imputation requires phased haplotypes)
+        // With type states, VcfReader returns GenotypeMatrix<Unphased>, so we always phase
+        eprintln!("Phasing target data before imputation...");
 
-            // Create phasing pipeline with current config
-            let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
+        // Create phasing pipeline with current config
+        let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
 
-            // Load genetic map if provided
-            let gen_maps = if let Some(ref map_path) = self.config.map {
-                let chrom_names: Vec<&str> = target_gt
-                    .markers()
-                    .chrom_names()
-                    .iter()
-                    .map(|s| s.as_ref())
-                    .collect();
-                GeneticMaps::from_plink_file(map_path, &chrom_names)?
-            } else {
-                GeneticMaps::new()
-            };
-
-            phasing.phase_in_memory(&target_gt, &gen_maps)?
+        // Load genetic map if provided
+        let gen_maps = if let Some(ref map_path) = self.config.map {
+            let chrom_names: Vec<&str> = target_gt
+                .markers()
+                .chrom_names()
+                .iter()
+                .map(|s| s.as_ref())
+                .collect();
+            GeneticMaps::from_plink_file(map_path, &chrom_names)?
         } else {
-            target_gt
+            GeneticMaps::new()
         };
+
+        let target_gt = phasing.phase_in_memory(&target_gt, &gen_maps)?;
 
         let n_ref_haps = ref_gt.n_haplotypes();
         let n_ref_markers = ref_gt.n_markers();

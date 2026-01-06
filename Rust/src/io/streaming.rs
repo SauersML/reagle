@@ -244,7 +244,7 @@ impl StreamingVcfReader {
             columns.push(GenotypeColumn::from_alleles(&bm.alleles, 2));
         }
 
-        let genotypes = GenotypeMatrix::new(markers, columns, Arc::clone(&self.samples), true);
+        let genotypes = GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples));
 
         let window = StreamWindow {
             genotypes,

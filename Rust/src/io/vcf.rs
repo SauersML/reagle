@@ -13,7 +13,7 @@ use noodles::vcf::Header;
 
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix, compress_block};
+use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
 use crate::error::{ReagleError, Result};
 
 /// Imputation quality statistics for a single marker
@@ -279,7 +279,10 @@ impl VcfReader {
             );
         }
 
-        let matrix = GenotypeMatrix::new(markers, columns, Arc::clone(&self.samples), is_phased);
+        // Return unphased by default - caller should phase if needed
+        // The is_phased detection is informational only
+        let _ = is_phased; // Suppress unused warning
+        let matrix = GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples));
         Ok(matrix)
     }
 
@@ -596,10 +599,10 @@ impl VcfWriter {
         Ok(())
     }
 
-    /// Write a phased genotype matrix
-    pub fn write_phased(
+    /// Write a genotype matrix (works with any phase state)
+    pub fn write_phased<S: PhaseState>(
         &mut self,
-        matrix: &GenotypeMatrix,
+        matrix: &GenotypeMatrix<S>,
         start: usize,
         end: usize,
     ) -> Result<()> {
