@@ -28,6 +28,7 @@ use crate::utils::workspace::ImpWorkspace;
 
 use crate::model::imp_states::{CodedStepsConfig, ImpStates};
 use crate::model::parameters::ModelParams;
+use crate::model::recursive_ibs::RecursiveIbs;
 
 /// Imputation pipeline
 pub struct ImputationPipeline {
@@ -463,7 +464,7 @@ impl ImputationPipeline {
 
         // Build coded reference panel for efficient PBWT operations
         eprintln!("Building coded reference panel...");
-        let ref_panel_coded = RefPanelCoded::from_gen_positions(
+        let mut ref_panel_coded = RefPanelCoded::from_gen_positions(
             &ref_gt,
             &ref_gen_positions,
             self.config.imp_step as f64,
@@ -473,6 +474,36 @@ impl ImputationPipeline {
             ref_panel_coded.n_steps(),
             ref_panel_coded.total_patterns(),
             ref_panel_coded.avg_compression_ratio()
+        );
+
+        // Append target haplotypes to coded panel for RecursiveIbs
+        eprintln!("Appending target haplotypes to coded panel...");
+        ref_panel_coded.append_target_haplotypes(
+            &target_gt,
+            alignment.ref_to_target(),
+            |target_m, allele| alignment.map_allele(target_m, allele),
+        );
+        eprintln!(
+            "  Combined panel: {} haplotypes ({} ref + {} target)",
+            ref_panel_coded.n_haps(),
+            n_ref_haps,
+            n_target_haps
+        );
+
+        // Initialize RecursiveIbs for efficient IBS haplotype finding
+        eprintln!("Building recursive IBS index...");
+        let recursive_ibs = RecursiveIbs::new(
+            &ref_panel_coded,
+            n_ref_haps,
+            n_target_haps,
+            self.config.seed as u64,
+            self.config.imp_nsteps,
+            8, // n_haps_per_step (default from Java Beagle)
+        );
+        eprintln!(
+            "  {} steps, {} IBS haps per step",
+            recursive_ibs.n_steps(),
+            recursive_ibs.n_haps_per_step()
         );
 
         eprintln!("Running imputation with dynamic state selection...");

@@ -47,6 +47,45 @@ impl Default for StreamingConfig {
     }
 }
 
+/// Phased genotypes from overlap region to seed next window
+///
+/// This carries the phased alleles from the overlap region of the previous window
+/// to constrain the next window's phasing for phase continuity at window boundaries.
+/// Based on Java's FixedPhaseData and SplicedGT classes.
+#[derive(Clone, Debug)]
+pub struct PhasedOverlap {
+    /// Number of markers in the overlap
+    pub n_markers: usize,
+    /// Phased alleles for each haplotype in the overlap region
+    /// Layout: alleles[hap * n_markers + marker]
+    pub alleles: Vec<u8>,
+    /// Number of haplotypes
+    pub n_haps: usize,
+}
+
+impl PhasedOverlap {
+    /// Create a new PhasedOverlap from phased genotype data
+    ///
+    /// # Arguments
+    /// * `n_markers` - Number of markers in the overlap region
+    /// * `n_haps` - Number of haplotypes
+    /// * `alleles` - Phased alleles, layout: alleles[hap * n_markers + marker]
+    pub fn new(n_markers: usize, n_haps: usize, alleles: Vec<u8>) -> Self {
+        debug_assert_eq!(alleles.len(), n_markers * n_haps);
+        Self {
+            n_markers,
+            alleles,
+            n_haps,
+        }
+    }
+
+    /// Get the allele for a specific haplotype at a specific marker
+    #[inline]
+    pub fn allele(&self, marker: usize, hap: usize) -> u8 {
+        self.alleles[hap * self.n_markers + marker]
+    }
+}
+
 /// A window of genotype data ready for processing
 #[derive(Clone, Debug)]
 pub struct StreamWindow {
@@ -64,6 +103,16 @@ pub struct StreamWindow {
     pub output_end: usize,
     /// Whether this is the first window
     pub is_first: bool,
+    /// Phased genotypes from overlap region of previous window
+    /// These should be used to constrain/seed the current window's phasing
+    pub phased_overlap: Option<PhasedOverlap>,
+}
+
+impl StreamWindow {
+    /// Returns true if this is the last window (no more data follows)
+    pub fn is_last(&self) -> bool {
+        self.output_end >= self.genotypes.n_markers()
+    }
 }
 
 /// Buffered marker data for streaming
@@ -254,6 +303,7 @@ impl StreamingVcfReader {
             output_start,
             output_end,
             is_first: self.window_num == 0,
+            phased_overlap: None, // Caller will set this from previous window's phased output
         };
 
         // Remove processed markers from buffer (keep overlap)

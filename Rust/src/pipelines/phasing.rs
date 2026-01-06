@@ -22,7 +22,7 @@ use crate::data::marker::MarkerIdx;
 use crate::data::storage::sample_phase::SamplePhase;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes, GenotypeView};
 use crate::error::Result;
-use crate::io::streaming::{StreamingConfig, StreamingVcfReader};
+use crate::io::streaming::{PhasedOverlap, StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
 use crate::model::hmm::LiStephensHmm;
@@ -221,6 +221,7 @@ impl PhasingPipeline {
                 &ibs2,
                 &mut sample_phases,
                 atomic_estimates.as_ref(),
+                it,
             )?;
 
             // Update parameters from EM estimates and recompute recombination probabilities
@@ -330,26 +331,35 @@ impl PhasingPipeline {
 
         let mut window_count = 0;
         let mut total_markers = 0;
+        
+        // Track phased overlap from previous window for phase continuity
+        let mut phased_overlap: Option<PhasedOverlap> = None;
 
         // Process windows
-        while let Some(window) = reader.next_window()? {
+        while let Some(mut window) = reader.next_window()? {
             window_count += 1;
             let n_markers = window.genotypes.n_markers();
             total_markers += window.output_end - window.output_start;
 
             eprintln!(
-                "Processing window {} ({} markers, output {}..{} in global {}:{}..{})",
+                "Processing window {} ({} markers, output {}..{}, overlap: {} markers)",
                 window_count,
                 n_markers,
                 window.output_start,
                 window.output_end,
-                window.window_num,
-                window.global_start,
-                window.global_end
+                phased_overlap.as_ref().map(|o| o.n_markers).unwrap_or(0)
             );
 
-            // Phase this window
-            let phased = self.phase_in_memory(&window.genotypes, &gen_maps)?;
+            // Set the phased overlap from previous window
+            window.phased_overlap = phased_overlap.take();
+
+            // Phase this window with overlap constraint
+            let phased = self.phase_in_memory_with_overlap(&window.genotypes, &gen_maps, window.phased_overlap.as_ref())?;
+
+            // Extract overlap for next window (markers from output_end to end of window)
+            if !window.is_last() {
+                phased_overlap = Some(self.extract_overlap(&phased, window.output_end, n_markers));
+            }
 
             // Write header on first window
             if window.is_first {
@@ -366,6 +376,33 @@ impl PhasingPipeline {
             window_count, total_markers
         );
         Ok(())
+    }
+    
+    /// Extract phased overlap region from a phased genotype matrix
+    ///
+    /// This extracts the overlap region (markers from `start` to `end`) to be used
+    /// as a constraint for the next window's phasing, ensuring phase continuity.
+    fn extract_overlap(
+        &self,
+        phased: &GenotypeMatrix<crate::data::storage::phase_state::Phased>,
+        start: usize,
+        end: usize,
+    ) -> PhasedOverlap {
+        let n_overlap = end - start;
+        let n_haps = phased.n_haplotypes();
+        
+        let mut alleles = Vec::with_capacity(n_overlap * n_haps);
+        
+        // Layout: alleles[hap * n_markers + marker]
+        for h in 0..n_haps {
+            let h_idx = HapIdx::new(h as u32);
+            for m in start..end {
+                let m_idx = MarkerIdx::new(m as u32);
+                alleles.push(phased.allele(m_idx, h_idx));
+            }
+        }
+        
+        PhasedOverlap::new(n_overlap, n_haps, alleles)
     }
 
     /// Automatically select between in-memory and streaming mode based on data size
@@ -470,6 +507,7 @@ impl PhasingPipeline {
                 &gen_dists,
                 &ibs2,
                 atomic_estimates.as_ref(),
+                it,
             )?;
 
             // Update parameters from EM estimates and recompute recombination probabilities
@@ -496,6 +534,197 @@ impl PhasingPipeline {
         }
 
         Ok(self.build_final_matrix(target_gt, &geno))
+    }
+    
+    /// Phase a GenotypeMatrix in-memory with overlap constraint from previous window
+    ///
+    /// This is like `phase_in_memory` but seeds the phasing with alleles from the
+    /// overlap region of the previous window, ensuring phase continuity at window
+    /// boundaries. Based on Java's FixedPhaseData and SplicedGT.
+    pub fn phase_in_memory_with_overlap(
+        &mut self,
+        target_gt: &GenotypeMatrix,
+        gen_maps: &GeneticMaps,
+        phased_overlap: Option<&PhasedOverlap>,
+    ) -> Result<GenotypeMatrix<crate::data::storage::phase_state::Phased>> {
+        let n_markers = target_gt.n_markers();
+        let n_haps = target_gt.n_haplotypes();
+
+        if n_markers == 0 {
+            return Ok(target_gt.clone().into_phased());
+        }
+
+        self.params = ModelParams::for_phasing(n_haps);
+        self.params
+            .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
+
+        let mut missing_mask_vecs: Vec<BitVec<u8, Lsb0>> = vec![BitVec::with_capacity(n_markers); n_haps];
+        let mut geno = MutableGenotypes::new(n_markers, n_haps);
+
+        for m in 0..n_markers {
+            let m_idx = MarkerIdx::new(m as u32);
+            for h in 0..n_haps {
+                let h_idx = HapIdx::new(h as u32);
+                let allele = target_gt.allele(m_idx, h_idx);
+                missing_mask_vecs[h].push(allele == 255);
+                if allele != 0 && allele != 255 {
+                    geno.set(m, h_idx, 1);
+                }
+            }
+        }
+        let missing_mask: Vec<BitBox<u8, Lsb0>> = missing_mask_vecs
+            .into_iter()
+            .map(|v| v.into_boxed_bitslice())
+            .collect();
+
+        // Apply overlap constraint: set alleles from previous window's phased overlap
+        // This seeds the phasing with the known phase from the overlap region
+        let overlap_markers = if let Some(overlap) = phased_overlap {
+            self.apply_overlap_constraint(&mut geno, overlap);
+            overlap.n_markers
+        } else {
+            0
+        };
+
+        let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
+        let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
+            .map(|m| {
+                let pos1 = target_gt.marker(MarkerIdx::new(m as u32)).pos;
+                let pos2 = target_gt.marker(MarkerIdx::new((m + 1) as u32)).pos;
+                gen_maps.gen_dist(chrom, pos1, pos2)
+            })
+            .collect();
+
+        let maf: Vec<f32> = (0..n_markers)
+            .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+            .collect();
+
+        let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
+
+        let n_burnin = self.config.burnin.min(3);
+        let n_iterations = self.config.iterations.min(6);
+        let total_iterations = n_burnin + n_iterations;
+
+        // Recombination probabilities - mutable so EM can update them
+        let mut p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+            .collect();
+
+        // Create sample phases with overlap markers pre-phased
+        let mut sample_phases = self.create_sample_phases_with_overlap(&geno, &missing_mask, overlap_markers);
+
+        for it in 0..total_iterations {
+            let is_burnin = it < n_burnin;
+            self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+            
+            let atomic_estimates = if is_burnin && self.config.em {
+                Some(crate::model::parameters::AtomicParamEstimates::new())
+            } else {
+                None
+            };
+
+            self.run_phase_baum_iteration_with_overlap(
+                &target_gt,
+                &mut geno,
+                &missing_mask,
+                &p_recomb,
+                &gen_dists,
+                &ibs2,
+                &mut sample_phases,
+                overlap_markers,
+                atomic_estimates.as_ref(),
+                it,
+            )?;
+
+            // Update parameters from EM estimates and recompute recombination probabilities
+            if let Some(ref atomic) = atomic_estimates {
+                let est = atomic.to_estimates();
+                let mut params_updated = false;
+                
+                if est.n_emit_obs() > 0 {
+                    self.params.update_p_mismatch(est.p_mismatch());
+                    params_updated = true;
+                }
+                if est.n_switch_obs() > 0 {
+                    self.params.update_recomb_intensity(est.recomb_intensity());
+                    params_updated = true;
+                }
+                
+                // Recompute recombination probabilities with updated intensity
+                if params_updated {
+                    p_recomb = std::iter::once(0.0f32)
+                        .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                        .collect();
+                }
+            }
+        }
+        
+        // Sync final phase state from SamplePhase to MutableGenotypes
+        self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
+
+        Ok(self.build_final_matrix(target_gt, &geno))
+    }
+    
+    /// Apply overlap constraint from previous window's phased output
+    ///
+    /// This sets the alleles in the overlap region to match the previous window's
+    /// phased output, ensuring phase continuity.
+    fn apply_overlap_constraint(&self, geno: &mut MutableGenotypes, overlap: &PhasedOverlap) {
+        let n_overlap = overlap.n_markers;
+        let n_haps = overlap.n_haps.min(geno.n_haps());
+        
+        for h in 0..n_haps {
+            let h_idx = HapIdx::new(h as u32);
+            for m in 0..n_overlap {
+                let allele = overlap.allele(m, h);
+                if allele != 255 {
+                    geno.set(m, h_idx, allele);
+                }
+            }
+        }
+    }
+    
+    /// Create SamplePhase instances with overlap markers pre-phased
+    ///
+    /// Markers in the overlap region (0..overlap_markers) are marked as already
+    /// phased since their phase comes from the previous window.
+    fn create_sample_phases_with_overlap(
+        &self,
+        geno: &MutableGenotypes,
+        missing_mask: &[BitBox<u8, Lsb0>],
+        overlap_markers: usize,
+    ) -> Vec<SamplePhase> {
+        let n_samples = geno.n_haps() / 2;
+        let n_markers = geno.n_markers();
+
+        (0..n_samples)
+            .map(|s| {
+                let hap1 = HapIdx::new((s * 2) as u32);
+                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+                let alleles1: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap1)).collect();
+                let alleles2: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap2)).collect();
+
+                // Identify missing markers
+                let missing: Vec<usize> = (0..n_markers)
+                    .filter(|&m| missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m])
+                    .collect();
+
+                // Hets in the overlap region are already phased (from previous window)
+                // Only hets AFTER the overlap region start as unphased
+                let unphased: Vec<usize> = (overlap_markers..n_markers)
+                    .filter(|&m| {
+                        let a1 = alleles1[m];
+                        let a2 = alleles2[m];
+                        a1 != a2
+                            && !missing_mask[hap1.as_usize()][m]
+                            && !missing_mask[hap2.as_usize()][m]
+                    })
+                    .collect();
+
+                SamplePhase::new(s as u32, n_markers, &alleles1, &alleles2, &unphased, &missing)
+            })
+            .collect()
     }
 
     /// Create SamplePhase instances for all samples
@@ -580,13 +809,20 @@ impl PhasingPipeline {
         ibs2: &Ibs2,
         n_states_wanted: usize,
         n_total_haps: usize,
+        seed: i64,
+        iteration: usize,
     ) -> Vec<HapIdx> {
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng;
+
         // Use PBWT neighbor finding with divergence-aware selection
+        // Request more candidates than needed to allow random selection
+        let n_candidates = (n_states_wanted * 2).min(n_total_haps);
         let neighbors = phase_ibs.find_neighbors(
             hap_idx.0,
             marker_idx,
             ibs2,
-            n_states_wanted,
+            n_candidates,
         );
 
         let mut states: Vec<HapIdx> = neighbors.into_iter().map(HapIdx::new).collect();
@@ -604,6 +840,16 @@ impl PhasingPipeline {
             }
         }
 
+        // Apply iteration-varying randomness to state selection
+        // Seed combines: config seed + iteration + haplotype index (like Java: seed + it)
+        let combined_seed = (seed as u64)
+            .wrapping_add(iteration as u64)
+            .wrapping_add(hap_idx.0 as u64);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(combined_seed);
+
+        // Shuffle candidates and select top n_states_wanted
+        // This allows different iterations to explore different state combinations
+        states.shuffle(&mut rng);
         states.truncate(n_states_wanted);
         states
     }
@@ -642,11 +888,13 @@ impl PhasingPipeline {
         gen_dists: &[f64], // Pass genetic distances for EM
         ibs2: &Ibs2,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
+        iteration: usize,
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let markers = target_gt.markers();
+        let seed = self.config.seed;
 
         // Clone current genotypes to use as a frozen reference panel
         let ref_geno = geno.clone();
@@ -666,7 +914,7 @@ impl PhasingPipeline {
 
             // Use midpoint marker for PBWT-based state selection
             let mid_marker = n_markers / 2;
-            let states = self.select_states_pbwt(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps);
+            let states = self.select_states_pbwt(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
             
             // 2. Extract current alleles for H1 and H2
             let seq1 = ref_geno.haplotype(hap1);
@@ -812,6 +1060,202 @@ impl PhasingPipeline {
         eprintln!("Applied {} phase switches (Forward-Backward)", total_switches);
         Ok(())
     }
+    
+    /// Run a phasing iteration with overlap constraint for streaming mode
+    ///
+    /// Similar to `run_phase_baum_iteration` but respects the overlap constraint:
+    /// markers in the overlap region (0..overlap_markers) have their phase locked
+    /// from the previous window and will not be changed.
+    fn run_phase_baum_iteration_with_overlap(
+        &mut self,
+        target_gt: &GenotypeMatrix,
+        geno: &mut MutableGenotypes,
+        missing_mask: &[BitBox<u8, Lsb0>],
+        p_recomb: &[f32],
+        gen_dists: &[f64],
+        ibs2: &Ibs2,
+        sample_phases: &mut [SamplePhase],
+        overlap_markers: usize,
+        atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
+        iteration: usize,
+    ) -> Result<()> {
+        let n_samples = geno.n_haps() / 2;
+        let n_markers = geno.n_markers();
+        let n_haps = geno.n_haps();
+        let markers = target_gt.markers();
+        let seed = self.config.seed;
+
+        // Clone current genotypes to use as a frozen reference panel
+        let ref_geno = geno.clone();
+        let ref_view = GenotypeView::from((&ref_geno, markers));
+
+        // Build PBWT for dynamic state selection (using current phased genotypes)
+        let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
+
+        // Collect phase decisions per sample for markers AFTER overlap region
+        type PhaseDecision = (usize, bool, f64); // (marker_idx, should_swap, log_lr)
+        let phase_decisions: Vec<Vec<PhaseDecision>> = sample_phases
+            .par_iter()
+            .enumerate()
+            .map(|(s, sp)| {
+                let sample_idx = SampleIdx::new(s as u32);
+                let hap1 = sample_idx.hap1();
+                let hap2 = sample_idx.hap2();
+
+                // Use midpoint marker for PBWT-based state selection
+                let mid_marker = n_markers / 2;
+                let states = self.select_states_pbwt(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
+
+                // Extract current alleles from SamplePhase
+                let seq1: Vec<u8> = (0..n_markers).map(|m| sp.allele1(m)).collect();
+                let seq2: Vec<u8> = (0..n_markers).map(|m| sp.allele2(m)).collect();
+
+                // Run HMM Forward-Backward for H1
+                let hmm1 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
+                
+                // Collect EM statistics if requested
+                if let Some(atomic) = atomic_estimates {
+                    let mut local_est = crate::model::parameters::ParamEstimates::new();
+                    hmm1.collect_stats(&seq1, gen_dists, &mut local_est);
+                    
+                    let hmm2 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
+                    hmm2.collect_stats(&seq2, gen_dists, &mut local_est);
+                    
+                    atomic.add_estimation_data(&local_est);
+                }
+
+                let mut fwd1 = Vec::new();
+                let mut bwd1 = Vec::new();
+                hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
+
+                // Run HMM Forward-Backward for H2
+                let hmm2 = LiStephensHmm::new(ref_view, &self.params, states.clone(), p_recomb.to_vec());
+                let mut fwd2 = Vec::new();
+                let mut bwd2 = Vec::new();
+                hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
+
+                // Identify heterozygous blocks AFTER the overlap region
+                // Overlap markers are already phased and should not change
+                let n_states = states.len();
+                let mut het_blocks: Vec<(usize, usize)> = Vec::new();
+                let mut block_start: Option<usize> = None;
+                
+                // Start looking for het blocks only after overlap region
+                for m in overlap_markers..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
+                    let is_het = !is_missing && a1 != a2;
+                    
+                    if is_het {
+                        if block_start.is_none() {
+                            block_start = Some(m);
+                        }
+                    } else if let Some(start) = block_start {
+                        het_blocks.push((start, m - 1));
+                        block_start = None;
+                    }
+                }
+                if let Some(start) = block_start {
+                    het_blocks.push((start, n_markers - 1));
+                }
+                
+                // Compute block-level likelihoods and make phase decisions
+                let mut decisions = Vec::new();
+                let mut current_swap = false;
+                let lr_threshold = self.params.lr_threshold as f64;
+                
+                for (block_start_m, block_end_m) in het_blocks {
+                    let mut log_l_keep = 0.0f64;
+                    let mut log_l_swap = 0.0f64;
+                    
+                    for m in block_start_m..=block_end_m {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
+                        
+                        if is_missing || a1 == a2 {
+                            continue;
+                        }
+                        
+                        let row_start = m * n_states;
+                        let row_end = row_start + n_states;
+                        
+                        let f1 = &fwd1[row_start..row_end];
+                        let b1 = &bwd1[row_start..row_end];
+                        let f2 = &fwd2[row_start..row_end];
+                        let b2 = &bwd2[row_start..row_end];
+
+                        let mut s11 = 0.0f64;
+                        let mut s22 = 0.0f64;
+                        let mut s12 = 0.0f64;
+                        let mut s21 = 0.0f64;
+
+                        for k in 0..n_states {
+                            s11 += f1[k] as f64 * b1[k] as f64;
+                            s22 += f2[k] as f64 * b2[k] as f64;
+                            s12 += f1[k] as f64 * b2[k] as f64;
+                            s21 += f2[k] as f64 * b1[k] as f64;
+                        }
+
+                        let eps = 1e-300f64;
+                        log_l_keep += (s11 * s22 + eps).ln();
+                        log_l_swap += (s12 * s21 + eps).ln();
+                    }
+                    
+                    let (log_l_stay, log_l_flip) = if current_swap {
+                        (log_l_swap, log_l_keep)
+                    } else {
+                        (log_l_keep, log_l_swap)
+                    };
+                    
+                    let log_threshold = lr_threshold.ln();
+                    if log_l_flip >= log_l_stay + log_threshold {
+                        current_swap = !current_swap;
+                    }
+                    
+                    // Record phase decision for each marker in block
+                    if current_swap {
+                        let log_lr = (log_l_flip - log_l_stay).abs();
+                        for m in block_start_m..=block_end_m {
+                            if !sp.is_phased(m) {
+                                decisions.push((m, true, log_lr));
+                            }
+                        }
+                    }
+                }
+                
+                decisions
+            })
+            .collect();
+
+        // Apply phase decisions to sample_phases
+        let mut total_switches = 0;
+        for (s, decisions) in phase_decisions.into_iter().enumerate() {
+            let sp = &mut sample_phases[s];
+            for (m, should_swap, log_lr) in decisions {
+                if sp.try_phase(m, should_swap, log_lr, self.params.lr_threshold as f64) {
+                    if should_swap {
+                        total_switches += 1;
+                    }
+                }
+            }
+        }
+
+        // Sync SamplePhase back to MutableGenotypes
+        for (s, sp) in sample_phases.iter().enumerate() {
+            let hap1 = HapIdx::new((s * 2) as u32);
+            let hap2 = HapIdx::new((s * 2 + 1) as u32);
+            
+            for m in 0..n_markers {
+                geno.set(m, hap1, sp.allele1(m));
+                geno.set(m, hap2, sp.allele2(m));
+            }
+        }
+        
+        eprintln!("Applied {} phase switches (with {} overlap markers locked)", total_switches, overlap_markers);
+        Ok(())
+    }
 
     /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only using FB HMM
     ///
@@ -827,10 +1271,12 @@ impl PhasingPipeline {
         ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
+        iteration: usize,
     ) -> Result<()> {
         let n_haps = geno.n_haps();
         let n_markers = geno.n_markers();
         let markers = target_gt.markers();
+        let seed = self.config.seed;
 
         // 1. Create Subset View for Stage 1 markers
         let ref_geno = geno.clone();
@@ -855,7 +1301,7 @@ impl PhasingPipeline {
                 // Use midpoint marker for PBWT-based state selection
                 let mid_marker = hi_freq_to_orig.len() / 2;
                 let mid_orig = hi_freq_to_orig.get(mid_marker).copied().unwrap_or(0);
-                let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps);
+                let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
 
                 // Extract alleles from SamplePhase for SUBSET of markers
                 let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
@@ -1076,6 +1522,7 @@ impl PhasingPipeline {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let n_stage1 = hi_freq_markers.len();
+        let seed = self.config.seed;
 
         if n_stage1 < 2 {
             return;
@@ -1097,6 +1544,7 @@ impl PhasingPipeline {
         let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
 
         // Process samples in parallel - collect results: (marker, should_swap)
+        // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
         let phase_changes: Vec<Vec<(usize, bool)>> = sample_phases
             .par_iter()
             .enumerate()
@@ -1107,7 +1555,7 @@ impl PhasingPipeline {
                 // Select HMM states using PBWT
                 let mid_marker = n_stage1 / 2;
                 let mid_orig = hi_freq_markers.get(mid_marker).copied().unwrap_or(0);
-                let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps);
+                let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, 0);
                 let n_states = states.len();
 
                 // Extract Stage 1 alleles from SamplePhase
@@ -1401,21 +1849,23 @@ impl Stage2Phaser {
             } else {
                 // Heterozygous reference haplotype - use rare allele matching
                 // Following Java Stage2Baum logic for rare allele disambiguation
-                let rare1 = a1; // In our simplified model, assume a1 could be rare
-                let rare2 = a2;
+                let match1 = a1 == b1 || a1 == b2;
+                let match2 = a2 == b1 || a2 == b2;
 
-                let match1 = rare1 == b1 || rare1 == b2;
-                let match2 = rare2 == b1 || rare2 == b2;
-
-                if match1 != match2 {
-                    // Only one allele matches - use that information
-                    if match1 {
-                        al_probs[0] += prob;
-                    } else {
-                        al_probs[1] += prob;
-                    }
+                if match1 && !match2 {
+                    // Only a1 matches - favor a1 with heuristic weight
+                    al_probs[0] += 0.55 * prob;
+                    al_probs[1] += 0.45 * prob;
+                } else if match2 && !match1 {
+                    // Only a2 matches - favor a2 with heuristic weight
+                    al_probs[0] += 0.45 * prob;
+                    al_probs[1] += 0.55 * prob;
+                } else {
+                    // Both match or neither match (ambiguous) - split 50/50
+                    // This preserves probabilistic information from the HMM
+                    al_probs[0] += 0.5 * prob;
+                    al_probs[1] += 0.5 * prob;
                 }
-                // If both or neither match, no contribution (ambiguous)
             }
         }
 

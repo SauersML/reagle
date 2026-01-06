@@ -557,6 +557,7 @@ impl<'a> LiStephensHmm<'a> {
     /// * `target_alleles` - Alleles of the target haplotype
     /// * `gen_dists` - Genetic distances between markers (in cM)
     /// * `estimates` - Estimates structure to accumulate results
+    #[allow(dead_code)]
     pub fn collect_stats(
         &self,
         target_alleles: &[u8],
@@ -657,6 +658,299 @@ impl<'a> LiStephensHmm<'a> {
 
             last_fwd_sum = next_fwd_sum;
         }
+    }
+}
+
+/// Li-Stephens HMM with composite (mosaic) reference states
+///
+/// Unlike the standard HMM where each state is a single reference haplotype,
+/// composite states can switch which reference haplotype they point to at
+/// different markers, following IBS sharing patterns.
+pub struct CompositeHmm<'a> {
+    /// Reference panel genotypes
+    ref_gt: GenotypeView<'a>,
+    /// Model parameters
+    params: &'a ModelParams,
+    /// State-to-haplotype mapping: state_map[marker * n_states + state] = ref_hap
+    state_map: Vec<HapIdx>,
+    /// Number of states
+    n_states: usize,
+    /// Recombination probabilities between consecutive markers
+    p_recomb: Vec<f32>,
+}
+
+impl<'a> CompositeHmm<'a> {
+    pub fn new(
+        ref_gt: impl Into<GenotypeView<'a>>,
+        params: &'a ModelParams,
+        state_map: Vec<HapIdx>,
+        n_states: usize,
+        p_recomb: Vec<f32>,
+    ) -> Self {
+        Self {
+            ref_gt: ref_gt.into(),
+            params,
+            state_map,
+            n_states,
+            p_recomb,
+        }
+    }
+
+    pub fn n_states(&self) -> usize {
+        self.n_states
+    }
+
+    pub fn n_markers(&self) -> usize {
+        self.ref_gt.n_markers()
+    }
+
+    /// Get reference allele at marker for composite state
+    /// Unlike static HMM, this looks up which ref hap the state points to at this marker
+    #[inline]
+    pub fn state_allele(&self, marker: MarkerIdx, state: usize) -> u8 {
+        let idx = marker.as_usize() * self.n_states + state;
+        let ref_hap = self.state_map[idx];
+        self.ref_gt.allele(marker, ref_hap)
+    }
+
+    /// Get all reference alleles for all states at a marker
+    pub fn state_alleles(&self, marker: MarkerIdx) -> Vec<u8> {
+        let m = marker.as_usize();
+        let base = m * self.n_states;
+        (0..self.n_states)
+            .map(|s| {
+                let ref_hap = self.state_map[base + s];
+                self.ref_gt.allele(marker, ref_hap)
+            })
+            .collect()
+    }
+
+    /// Compute expected allele dosage at a marker given state probabilities
+    pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
+        let mut dosage = 0.0f32;
+        for (k, &prob) in state_probs.iter().enumerate() {
+            let allele = self.state_allele(marker, k);
+            if allele != 255 {
+                dosage += prob * allele as f32;
+            }
+        }
+        dosage
+    }
+
+    /// Run forward-backward algorithm and return raw Forward and Backward tables
+    pub fn forward_backward_raw(
+        &self,
+        target_alleles: &[u8],
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> f64 {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states;
+        let total_size = n_markers * n_states;
+
+        if n_markers == 0 || n_states == 0 {
+            return 0.0;
+        }
+
+        fwd.resize(total_size, 0.0);
+        bwd.resize(total_size, 0.0);
+
+        let p_err = self.params.p_mismatch;
+        let p_no_err = 1.0 - p_err;
+        let emit_probs = [p_no_err, p_err];
+
+        let fwd_sum = self.forward_pass(target_alleles, fwd, &emit_probs);
+
+        let last_row = (n_markers - 1) * n_states;
+        let init_bwd = 1.0 / n_states as f32;
+        for k in 0..n_states {
+            bwd[last_row + k] = init_bwd;
+        }
+
+        for m in (0..n_markers - 1).rev() {
+            let m_next = m + 1;
+            let marker_next_idx = MarkerIdx::new(m_next as u32);
+            let targ_al_next = target_alleles[m_next];
+
+            let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
+
+            let ref_alleles = self.state_alleles(marker_next_idx);
+            let mismatches: Vec<u8> = ref_alleles
+                .iter()
+                .map(|&r| if r == targ_al_next { 0 } else { 1 })
+                .collect();
+
+            let curr_row = m * n_states;
+            let next_row = m_next * n_states;
+
+            for k in 0..n_states {
+                bwd[curr_row + k] = bwd[next_row + k];
+            }
+
+            let bwd_slice = &mut bwd[curr_row..curr_row + n_states];
+            HmmUpdater::bwd_update(bwd_slice, p_recomb, &emit_probs, &mismatches, n_states);
+        }
+
+        fwd_sum.ln() as f64
+    }
+
+    /// Run forward-backward algorithm for a target haplotype
+    pub fn forward_backward(
+        &self,
+        target_alleles: &[u8],
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> HmmResult {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states;
+
+        if n_markers == 0 || n_states == 0 {
+            return HmmResult {
+                state_probs: Vec::new(),
+                n_states,
+                sampled_path: Vec::new(),
+                log_likelihood: 0.0,
+            };
+        }
+
+        let total_size = n_markers * n_states;
+        fwd.resize(total_size, 0.0);
+        bwd.resize(n_states, 0.0);
+
+        let p_err = self.params.p_mismatch;
+        let p_no_err = 1.0 - p_err;
+        let emit_probs = [p_no_err, p_err];
+
+        let fwd_sum = self.forward_pass(target_alleles, fwd, &emit_probs);
+
+        let init_bwd = 1.0 / n_states as f32;
+        bwd.fill(init_bwd);
+        let mut bwd_sum = 1.0f32;
+
+        for m in (0..n_markers).rev() {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let targ_al = target_alleles[m];
+            let row_offset = m * n_states;
+
+            let ref_alleles = self.state_alleles(marker_idx);
+            let mismatches: Vec<u8> = ref_alleles
+                .iter()
+                .map(|&r| if r == targ_al { 0 } else { 1 })
+                .collect();
+
+            if m < n_markers - 1 {
+                let p_recomb = self.p_recomb.get(m + 1).copied().unwrap_or(0.0);
+                let shift = p_recomb / n_states as f32;
+                let scale = (1.0 - p_recomb) / bwd_sum;
+
+                for k in 0..n_states {
+                    bwd[k] = scale * bwd[k] + shift;
+                }
+            }
+
+            let mut state_sum = 0.0f32;
+            for k in 0..n_states {
+                let idx = row_offset + k;
+                fwd[idx] *= bwd[k];
+                state_sum += fwd[idx];
+            }
+
+            if state_sum > 0.0 {
+                let inv_sum = 1.0 / state_sum;
+                for k in 0..n_states {
+                    fwd[row_offset + k] *= inv_sum;
+                }
+            }
+
+            if m > 0 {
+                bwd_sum = 0.0;
+                for k in 0..n_states {
+                    bwd[k] *= emit_probs[mismatches[k] as usize];
+                    bwd_sum += bwd[k];
+                }
+            }
+        }
+
+        let sampled_path = self.sample_path(fwd, n_markers, n_states);
+        let log_likelihood = fwd_sum.ln() as f64;
+
+        HmmResult {
+            state_probs: fwd.clone(),
+            n_states,
+            sampled_path,
+            log_likelihood,
+        }
+    }
+
+    fn forward_pass(
+        &self,
+        target_alleles: &[u8],
+        fwd: &mut Vec<f32>,
+        emit_probs: &[f32; 2],
+    ) -> f32 {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states;
+
+        let mut fwd_sum = 1.0f32;
+
+        for m in 0..n_markers {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let targ_al = target_alleles[m];
+            let p_recomb = self.p_recomb.get(m).copied().unwrap_or(0.0);
+
+            let shift = p_recomb / n_states as f32;
+            let scale = (1.0 - p_recomb) / fwd_sum;
+
+            let mut new_sum = 0.0f32;
+            let row_offset = m * n_states;
+            let prev_row_offset = if m > 0 { (m - 1) * n_states } else { 0 };
+
+            for k in 0..n_states {
+                let ref_al = self.state_allele(marker_idx, k);
+                let emit = if ref_al == targ_al {
+                    emit_probs[0]
+                } else {
+                    emit_probs[1]
+                };
+
+                let val = if m == 0 {
+                    emit / n_states as f32
+                } else {
+                    emit * (scale * fwd[prev_row_offset + k] + shift)
+                };
+
+                fwd[row_offset + k] = val;
+                new_sum += val;
+            }
+            fwd_sum = new_sum;
+        }
+
+        fwd_sum
+    }
+
+    fn sample_path(
+        &self,
+        state_probs: &[f32],
+        n_markers: usize,
+        n_states: usize,
+    ) -> Vec<usize> {
+        let mut path = Vec::with_capacity(n_markers);
+
+        for m in 0..n_markers {
+            let row_offset = m * n_states;
+            let mut max_state = 0;
+            let mut max_prob = state_probs[row_offset];
+            for k in 1..n_states {
+                let prob = state_probs[row_offset + k];
+                if prob > max_prob {
+                    max_prob = prob;
+                    max_state = k;
+                }
+            }
+            path.push(max_state);
+        }
+
+        path
     }
 }
 
