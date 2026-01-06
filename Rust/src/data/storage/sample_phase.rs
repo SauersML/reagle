@@ -2,8 +2,9 @@
 //!
 //! Tracks the phase state of each marker cluster for a single sample.
 //! Based on Java's SamplePhase.java from Beagle.
-
-use bitvec::prelude::*;
+//!
+//! Supports multiallelic markers by storing full byte values (0-254 for alleles,
+//! 255 for missing). This matches Java Beagle's approach.
 
 /// Status of a genotype cluster
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,16 +28,19 @@ impl ClusterStatus {
 }
 
 /// Phase state tracking for a single sample
+///
+/// Uses byte storage (1 byte per allele) to support multiallelic markers.
+/// Allele values: 0 = REF, 1-254 = ALT alleles, 255 = missing
 #[derive(Clone, Debug)]
 pub struct SamplePhase {
     /// Sample index
     sample: u32,
     /// Number of markers
     n_markers: usize,
-    /// Alleles on first haplotype (one bit per marker for biallelic)
-    hap1: BitVec<u64, Lsb0>,
+    /// Alleles on first haplotype (byte per marker for multiallelic support)
+    hap1: Vec<u8>,
     /// Alleles on second haplotype
-    hap2: BitVec<u64, Lsb0>,
+    hap2: Vec<u8>,
     /// Status of each marker
     status: Vec<ClusterStatus>,
     /// Count of each status type for quick access
@@ -49,7 +53,7 @@ impl SamplePhase {
     /// # Arguments
     /// * `sample` - Sample index
     /// * `n_markers` - Number of markers
-    /// * `hap1_alleles` - Alleles on first haplotype (0 or 1 for biallelic)
+    /// * `hap1_alleles` - Alleles on first haplotype (0-254 for alleles, 255 for missing)
     /// * `hap2_alleles` - Alleles on second haplotype
     /// * `unphased_hets` - Sorted indices of markers that are unphased heterozygotes
     /// * `missing` - Sorted indices of markers with missing data
@@ -67,15 +71,9 @@ impl SamplePhase {
         assert_eq!(hap1_alleles.len(), n_markers, "hap1 length mismatch");
         assert_eq!(hap2_alleles.len(), n_markers, "hap2 length mismatch");
 
-        let mut hap1 = BitVec::<u64, Lsb0>::with_capacity(n_markers);
-        let mut hap2 = BitVec::<u64, Lsb0>::with_capacity(n_markers);
-
-        for &a in hap1_alleles {
-            hap1.push(a != 0);
-        }
-        for &a in hap2_alleles {
-            hap2.push(a != 0);
-        }
+        // Copy alleles directly - preserves multiallelic values
+        let hap1: Vec<u8> = hap1_alleles.to_vec();
+        let hap2: Vec<u8> = hap2_alleles.to_vec();
 
         let mut status = Vec::with_capacity(n_markers);
         let mut status_counts = [0usize; ClusterStatus::COUNT];
@@ -139,15 +137,17 @@ impl SamplePhase {
     }
 
     /// Returns the allele on haplotype 1 for the specified marker.
+    /// Values: 0 = REF, 1-254 = ALT alleles, 255 = missing
     #[inline]
     pub fn allele1(&self, marker: usize) -> u8 {
-        self.hap1[marker] as u8
+        self.hap1[marker]
     }
 
     /// Returns the allele on haplotype 2 for the specified marker.
+    /// Values: 0 = REF, 1-254 = ALT alleles, 255 = missing
     #[inline]
     pub fn allele2(&self, marker: usize) -> u8 {
-        self.hap2[marker] as u8
+        self.hap2[marker]
     }
 
     /// Returns the cluster status for the specified marker.
@@ -197,8 +197,8 @@ impl SamplePhase {
 
         if swap {
             let tmp = self.hap1[marker];
-            self.hap1.set(marker, self.hap2[marker]);
-            self.hap2.set(marker, tmp);
+            self.hap1[marker] = self.hap2[marker];
+            self.hap2[marker] = tmp;
         }
 
         if lr >= threshold {
@@ -219,8 +219,8 @@ impl SamplePhase {
         for m in start..end {
             if self.status[m] == ClusterStatus::Unphased {
                 let tmp = self.hap1[m];
-                self.hap1.set(m, self.hap2[m]);
-                self.hap2.set(m, tmp);
+                self.hap1[m] = self.hap2[m];
+                self.hap2[m] = tmp;
             }
         }
     }
@@ -235,9 +235,17 @@ impl SamplePhase {
     pub fn swap_haps_unchecked(&mut self, start: usize, end: usize) {
         for m in start..end {
             let tmp = self.hap1[m];
-            self.hap1.set(m, self.hap2[m]);
-            self.hap2.set(m, tmp);
+            self.hap1[m] = self.hap2[m];
+            self.hap2[m] = tmp;
         }
+    }
+
+    /// Swap alleles at a single marker unconditionally.
+    #[inline]
+    pub fn swap_alleles(&mut self, marker: usize) {
+        let tmp = self.hap1[marker];
+        self.hap1[marker] = self.hap2[marker];
+        self.hap2[marker] = tmp;
     }
 
     /// Mark a marker as phased.
@@ -316,24 +324,22 @@ impl SamplePhase {
         assert_eq!(hap1_out.len(), self.n_markers);
         assert_eq!(hap2_out.len(), self.n_markers);
 
-        for (i, out) in hap1_out.iter_mut().enumerate() {
-            *out = self.hap1[i] as u8;
-        }
-        for (i, out) in hap2_out.iter_mut().enumerate() {
-            *out = self.hap2[i] as u8;
-        }
+        hap1_out.copy_from_slice(&self.hap1);
+        hap2_out.copy_from_slice(&self.hap2);
     }
 
     /// Set allele on haplotype 1.
+    /// Values: 0 = REF, 1-254 = ALT alleles, 255 = missing
     #[inline]
     pub fn set_allele1(&mut self, marker: usize, allele: u8) {
-        self.hap1.set(marker, allele != 0);
+        self.hap1[marker] = allele;
     }
 
     /// Set allele on haplotype 2.
+    /// Values: 0 = REF, 1-254 = ALT alleles, 255 = missing
     #[inline]
     pub fn set_allele2(&mut self, marker: usize, allele: u8) {
-        self.hap2.set(marker, allele != 0);
+        self.hap2[marker] = allele;
     }
 }
 
@@ -558,5 +564,72 @@ mod tests {
 
         sp.mark_masked(3);
         assert!(sp.is_het(3)); // masked het
+    }
+
+    #[test]
+    fn test_multiallelic_support() {
+        // Test that multiallelic alleles (2, 3, etc.) are preserved correctly
+        let hap1 = vec![0, 1, 2, 3, 255]; // REF, ALT1, ALT2, ALT3, missing
+        let hap2 = vec![2, 0, 1, 2, 255]; // ALT2, REF, ALT1, ALT2, missing
+        let unphased = vec![1usize, 2, 3];
+        let missing = vec![4usize];
+
+        let sp = SamplePhase::new(0, 5, &hap1, &hap2, &unphased, &missing);
+
+        // Verify alleles are preserved exactly
+        assert_eq!(sp.allele1(0), 0);
+        assert_eq!(sp.allele2(0), 2);
+        assert_eq!(sp.allele1(1), 1);
+        assert_eq!(sp.allele2(1), 0);
+        assert_eq!(sp.allele1(2), 2); // ALT2 preserved (not coerced to 1)
+        assert_eq!(sp.allele2(2), 1);
+        assert_eq!(sp.allele1(3), 3); // ALT3 preserved (not coerced to 1)
+        assert_eq!(sp.allele2(3), 2);
+        assert_eq!(sp.allele1(4), 255); // Missing preserved
+        assert_eq!(sp.allele2(4), 255);
+
+        // Test copy_alleles preserves values
+        let mut out1 = vec![0u8; 5];
+        let mut out2 = vec![0u8; 5];
+        sp.copy_alleles(&mut out1, &mut out2);
+        assert_eq!(out1, hap1);
+        assert_eq!(out2, hap2);
+    }
+
+    #[test]
+    fn test_multiallelic_swap() {
+        let hap1 = vec![0, 2, 3]; // REF, ALT2, ALT3
+        let hap2 = vec![1, 0, 2]; // ALT1, REF, ALT2
+        let unphased = vec![0usize, 1, 2];
+
+        let mut sp = SamplePhase::new(0, 3, &hap1, &hap2, &unphased, &[]);
+
+        // Swap all haps
+        sp.swap_haps(0, 3);
+
+        // Verify alleles are swapped correctly
+        assert_eq!(sp.allele1(0), 1);
+        assert_eq!(sp.allele2(0), 0);
+        assert_eq!(sp.allele1(1), 0);
+        assert_eq!(sp.allele2(1), 2); // ALT2 preserved
+        assert_eq!(sp.allele1(2), 2); // ALT2 preserved
+        assert_eq!(sp.allele2(2), 3); // ALT3 preserved
+    }
+
+    #[test]
+    fn test_set_multiallelic() {
+        let hap1 = vec![0, 0, 0];
+        let hap2 = vec![0, 0, 0];
+
+        let mut sp = SamplePhase::new(0, 3, &hap1, &hap2, &[], &[]);
+
+        // Set multiallelic values
+        sp.set_allele1(0, 2); // ALT2
+        sp.set_allele1(1, 3); // ALT3
+        sp.set_allele2(2, 255); // Missing
+
+        assert_eq!(sp.allele1(0), 2);
+        assert_eq!(sp.allele1(1), 3);
+        assert_eq!(sp.allele2(2), 255);
     }
 }

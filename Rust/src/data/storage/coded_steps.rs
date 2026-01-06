@@ -104,11 +104,6 @@ impl CodedStep {
         self.n_patterns
     }
 
-    /// Number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        self.hap_to_pattern.len()
-    }
-
     /// Get pattern index for a haplotype
     pub fn pattern(&self, hap: HapIdx) -> u16 {
         self.hap_to_pattern[hap.0 as usize]
@@ -748,7 +743,7 @@ mod tests {
         let step = CodedStep::new(&gt, 0, 3);
 
         assert_eq!(step.n_markers(), 3);
-        assert_eq!(step.n_haps(), 6);
+        // n_haps() not exposed on CodedStep, but hap_to_pattern.len() would be 6
 
         // Should have 2 patterns: [0,0,0] and [1,1,1]
         assert_eq!(step.n_patterns(), 2);

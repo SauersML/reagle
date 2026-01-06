@@ -34,7 +34,8 @@ pub struct GeneticMap {
 }
 
 impl GeneticMap {
-    /// Create a new genetic map
+    /// Create a new genetic map (test-only)
+    #[cfg(test)]
     pub fn new(chrom: ChromIdx, positions: Vec<u32>, gen_positions: Vec<f64>) -> Self {
         assert_eq!(positions.len(), gen_positions.len());
         assert!(positions.windows(2).all(|w| w[0] <= w[1]));
@@ -45,7 +46,8 @@ impl GeneticMap {
         }
     }
 
-    /// Create an empty genetic map (uses default rate)
+    /// Create an empty genetic map (uses default rate, test-only)
+    #[cfg(test)]
     pub fn empty(chrom: ChromIdx) -> Self {
         Self {
             chrom,
@@ -201,22 +203,20 @@ impl PositionMap {
         phys_pos as f64 * self.scale_factor
     }
 
-    /// Get genetic distance between two positions
+    /// Get genetic distance between two positions (test-only)
+    #[cfg(test)]
     pub fn gen_dist(&self, pos1: u32, pos2: u32) -> f64 {
         ((pos2 as i64 - pos1 as i64).abs() as f64) * self.scale_factor
     }
 }
 
-/// Pre-computed genetic positions and distances for a set of markers
+/// Pre-computed genetic positions for a set of markers
 ///
 /// This matches Java `vcf/MarkerMap.java`
 #[derive(Clone, Debug)]
 pub struct MarkerMap {
     /// Genetic positions (cM) for each marker
     gen_pos: Vec<f64>,
-
-    /// Genetic distance from previous marker (first element is 0)
-    gen_dist: Vec<f32>,
 }
 
 impl MarkerMap {
@@ -226,10 +226,7 @@ impl MarkerMap {
     pub fn create(markers: &Markers, gen_map: &GeneticMap) -> Self {
         let n = markers.len();
         if n == 0 {
-            return Self {
-                gen_pos: Vec::new(),
-                gen_dist: Vec::new(),
-            };
+            return Self { gen_pos: Vec::new() };
         }
 
         // Calculate mean single-base genetic distance
@@ -249,14 +246,10 @@ impl MarkerMap {
     ) -> Self {
         let n = markers.len();
         if n == 0 {
-            return Self {
-                gen_pos: Vec::new(),
-                gen_dist: Vec::new(),
-            };
+            return Self { gen_pos: Vec::new() };
         }
 
         let mut gen_pos = Vec::with_capacity(n);
-        let mut gen_dist = Vec::with_capacity(n);
 
         // First marker
         let first_pos = markers
@@ -264,7 +257,6 @@ impl MarkerMap {
             .map(|m| m.pos)
             .unwrap_or(0);
         gen_pos.push(gen_map.gen_pos(first_pos));
-        gen_dist.push(0.0);
 
         let mut last_map_pos = gen_pos[0];
 
@@ -274,38 +266,28 @@ impl MarkerMap {
             let map_pos = gen_map.gen_pos(pos);
             let dist = (map_pos - last_map_pos).max(min_gen_dist);
             gen_pos.push(gen_pos[i - 1] + dist);
-            gen_dist.push(dist as f32);
             last_map_pos = map_pos;
         }
 
-        Self { gen_pos, gen_dist }
+        Self { gen_pos }
     }
 
     /// Create using default position-based map (1 cM per Mb)
     pub fn from_positions(markers: &Markers) -> Self {
         let n = markers.len();
         if n == 0 {
-            return Self {
-                gen_pos: Vec::new(),
-                gen_dist: Vec::new(),
-            };
+            return Self { gen_pos: Vec::new() };
         }
 
         let pos_map = PositionMap::new();
         let mut gen_pos = Vec::with_capacity(n);
-        let mut gen_dist = Vec::with_capacity(n);
 
         for i in 0..n {
             let pos = markers.get(MarkerIdx::from(i)).map(|m| m.pos).unwrap_or(0);
             gen_pos.push(pos_map.gen_pos(pos));
-            if i == 0 {
-                gen_dist.push(0.0);
-            } else {
-                gen_dist.push((gen_pos[i] - gen_pos[i - 1]) as f32);
-            }
         }
 
-        Self { gen_pos, gen_dist }
+        Self { gen_pos }
     }
 
     /// Mean single-base genetic distance
@@ -342,77 +324,9 @@ impl MarkerMap {
         mean.max(MIN_GEN_DIST)
     }
 
-    /// Number of markers
-    pub fn len(&self) -> usize {
-        self.gen_pos.len()
-    }
-
-    /// Get genetic distance from previous marker
-    pub fn gen_dist(&self, index: usize) -> f32 {
-        self.gen_dist[index]
-    }
-
     /// Get all genetic positions
     pub fn gen_positions(&self) -> &[f64] {
         &self.gen_pos
-    }
-
-    /// Calculate recombination probabilities for given recombination intensity
-    ///
-    /// From Java `MarkerMap.pRecomb(float recombIntensity)`:
-    /// ```java
-    /// double c = -recombIntensity;
-    /// pRecomb[m] = -Math.expm1(c * genDist.get(m))
-    /// ```
-    ///
-    /// Note: -expm1(x) = 1 - exp(x), more numerically stable for small x
-    pub fn p_recomb(&self, recomb_intensity: f32) -> Vec<f32> {
-        if recomb_intensity <= 0.0 || !recomb_intensity.is_finite() {
-            panic!(
-                "recomb_intensity must be positive and finite, got {}",
-                recomb_intensity
-            );
-        }
-
-        let c = -(recomb_intensity as f64);
-
-        self.gen_dist
-            .iter()
-            .map(|&d| (-f64::exp_m1(c * d as f64)) as f32)
-            .collect()
-    }
-
-    /// Restrict to a subset of markers
-    ///
-    /// From Java `MarkerMap.restrict(int[] indices)`
-    pub fn restrict(&self, indices: &[usize]) -> Self {
-        if indices.is_empty() {
-            return Self {
-                gen_pos: Vec::new(),
-                gen_dist: Vec::new(),
-            };
-        }
-
-        // Verify indices are sorted and increasing
-        for i in 1..indices.len() {
-            assert!(
-                indices[i] > indices[i - 1],
-                "Indices must be strictly increasing"
-            );
-        }
-
-        let mut gen_pos = Vec::with_capacity(indices.len());
-        let mut gen_dist = Vec::with_capacity(indices.len());
-
-        gen_pos.push(self.gen_pos[indices[0]]);
-        gen_dist.push(0.0);
-
-        for i in 1..indices.len() {
-            gen_pos.push(self.gen_pos[indices[i]]);
-            gen_dist.push((gen_pos[i] - gen_pos[i - 1]) as f32);
-        }
-
-        Self { gen_pos, gen_dist }
     }
 }
 
@@ -535,47 +449,17 @@ mod tests {
         let markers = make_test_markers();
         let mm = MarkerMap::from_positions(&markers);
 
-        assert_eq!(mm.len(), 5);
+        // Verify genetic positions are computed correctly
+        let positions = mm.gen_positions();
+        assert_eq!(positions.len(), 5);
 
-        // First marker: gen_dist = 0
-        assert_eq!(mm.gen_dist(0), 0.0);
+        // First marker at 1 Mb should have gen_pos = 1 cM (default rate: 1 cM/Mb)
+        assert!((positions[0] - 1.0).abs() < 0.001);
 
         // Other markers: ~1 cM apart (1 Mb * 1e-6 = 1 cM)
         for i in 1..5 {
-            assert!((mm.gen_dist(i) - 1.0).abs() < 0.001);
+            assert!((positions[i] - positions[i - 1] - 1.0).abs() < 0.001);
         }
-    }
-
-    #[test]
-    fn test_marker_map_p_recomb() {
-        let markers = make_test_markers();
-        let mm = MarkerMap::from_positions(&markers);
-
-        let p_recomb = mm.p_recomb(1.0);
-        assert_eq!(p_recomb.len(), 5);
-
-        // First marker: pRecomb = 0 (no previous marker)
-        assert!((p_recomb[0] - 0.0).abs() < 0.0001);
-
-        // Other markers: pRecomb = 1 - exp(-1 * 1.0) ≈ 0.632
-        for i in 1..5 {
-            let expected = 1.0 - (-1.0f64).exp();
-            assert!((p_recomb[i] as f64 - expected).abs() < 0.001);
-        }
-    }
-
-    #[test]
-    fn test_marker_map_restrict() {
-        let markers = make_test_markers();
-        let mm = MarkerMap::from_positions(&markers);
-
-        let restricted = mm.restrict(&[0, 2, 4]);
-        assert_eq!(restricted.len(), 3);
-
-        // Check distances are correct
-        assert_eq!(restricted.gen_dist(0), 0.0);
-        assert!((restricted.gen_dist(1) - 2.0).abs() < 0.001); // 2 cM (skipped one marker)
-        assert!((restricted.gen_dist(2) - 2.0).abs() < 0.001);
     }
 
     #[test]
@@ -584,6 +468,5 @@ mod tests {
 
         assert!((pm.gen_pos(1_000_000) - 1.0).abs() < 0.001);
         assert!((pm.gen_pos(2_000_000) - 2.0).abs() < 0.001);
-        assert!((pm.gen_dist(1_000_000, 2_000_000) - 1.0).abs() < 0.001);
     }
 }

@@ -151,26 +151,11 @@ impl PhasingPipeline {
         };
 
         // Create mutable genotype storage for phasing
-        // 1. Pre-compute missing mask (row-major: [hap][marker]) and init geno
-        // Optimize iteration order: iterate markers (cols), update haps (rows)
-        let mut missing_mask_vecs: Vec<BitVec<u8, Lsb0>> = vec![BitVec::with_capacity(n_markers); n_haps];
-        let mut geno = MutableGenotypes::new(n_markers, n_haps);
-
-        for m in 0..n_markers {
-            let m_idx = MarkerIdx::new(m as u32);
-            for h in 0..n_haps {
-                let h_idx = HapIdx::new(h as u32);
-                let allele = target_gt.allele(m_idx, h_idx);
-                missing_mask_vecs[h].push(allele == 255);
-                if allele != 0 && allele != 255 {
-                    geno.set(m, h_idx, 1);
-                }
-            }
-        }
-        let missing_mask: Vec<BitBox<u8, Lsb0>> = missing_mask_vecs
-            .into_iter()
-            .map(|v| v.into_boxed_bitslice())
-            .collect();
+        // MutableGenotypes now internally tracks missing data (allele = 255)
+        // so we can use from_fn to initialize all values including missing
+        let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
+            target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
 
         // Compute genetic distances and recombination probabilities using MarkerMap
         // This handles map interpolation and minimum distance enforcement
@@ -245,7 +230,7 @@ impl PhasingPipeline {
             .collect();
 
         // Create SamplePhase instances to track phase state
-        let mut sample_phases = self.create_sample_phases(&geno, &missing_mask);
+        let mut sample_phases = self.create_sample_phases(&geno);
 
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
@@ -263,7 +248,6 @@ impl PhasingPipeline {
             };
 
             self.run_phase_baum_iteration_stage1(
-                &target_gt,
                 &mut geno,
                 &stage1_p_recomb,
                 &stage1_gen_dists,
@@ -313,7 +297,6 @@ impl PhasingPipeline {
                 rare_markers.len()
             );
             self.phase_rare_markers_with_hmm(
-                &target_gt,
                 &mut geno,
                 &hi_freq_markers,
                 &gen_positions,
@@ -678,7 +661,6 @@ impl PhasingPipeline {
             self.run_phase_baum_iteration_with_overlap(
                 &target_gt,
                 &mut geno,
-                &missing_mask,
                 &p_recomb,
                 &gen_dists,
                 &ibs2,
@@ -785,7 +767,6 @@ impl PhasingPipeline {
     fn create_sample_phases(
         &self,
         geno: &MutableGenotypes,
-        missing_mask: &[BitBox<u8, Lsb0>],
     ) -> Vec<SamplePhase> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
@@ -795,22 +776,21 @@ impl PhasingPipeline {
                 let hap1 = HapIdx::new((s * 2) as u32);
                 let hap2 = HapIdx::new((s * 2 + 1) as u32);
 
+                // geno.get() now returns 255 for missing positions
                 let alleles1: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap1)).collect();
                 let alleles2: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap2)).collect();
 
-                // Identify missing markers
+                // Identify missing markers using the internal missing tracking
                 let missing: Vec<usize> = (0..n_markers)
-                    .filter(|&m| missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m])
+                    .filter(|&m| geno.is_missing(m, hap1) || geno.is_missing(m, hap2))
                     .collect();
 
-                // Initially all hets are unphased
+                // Initially all hets are unphased (het = different alleles, neither missing)
                 let unphased: Vec<usize> = (0..n_markers)
                     .filter(|&m| {
                         let a1 = alleles1[m];
                         let a2 = alleles2[m];
-                        a1 != a2
-                            && !missing_mask[hap1.as_usize()][m]
-                            && !missing_mask[hap2.as_usize()][m]
+                        a1 != a2 && a1 != 255 && a2 != 255
                     })
                     .collect();
 
@@ -982,7 +962,7 @@ impl PhasingPipeline {
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        missing_mask: &[BitBox<u8, Lsb0>],
+        _: &[BitBox<u8, Lsb0>],
         p_recomb: &[f32],
         gen_dists: &[f64], // Pass genetic distances for EM
         ibs2: &Ibs2,
@@ -1007,7 +987,6 @@ impl PhasingPipeline {
                 target: &ref_geno,
                 reference: ref_gt,
                 alignment,
-                markers,
                 n_target_haps: n_haps,
             }
         } else {
@@ -1053,12 +1032,23 @@ impl PhasingPipeline {
             let seq1 = ref_geno.haplotype(hap1);
             let seq2 = ref_geno.haplotype(hap2);
 
-            // 3. Run HMM Forward-Backward for H1 and H2
+            // 3. Run HMM with PER-HETEROZYGOTE phase decisions
+            // Following Java PhaseBaum2.java: interleave phase decisions in the forward pass.
+            //
+            // Key Algorithm (3-Track HMM):
+            // 1. Run backward pass for BOTH haplotypes first, storing backward values
+            // 2. Run forward pass marker-by-marker for BOTH haplotypes
+            // 3. At each het, compute phase decision using fwd and stored bwd
+            // 4. If swap decided, swap the allele sequences from that point forward
+            // 5. Continue forward pass with (potentially swapped) sequences
+            //
+            // This ensures forward probabilities after a het correctly reflect the phase decision
+            // by using the decided alleles for emission probabilities.
             let n_states = states.len();
             let threaded_haps = ThreadedHaps::from_static_haps(&states, n_markers);
-            let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
+            let hmm = BeagleHmm::new(ref_view.clone(), &self.params, n_states, p_recomb.to_vec());
 
-            // Collect EM statistics if requested
+            // Collect EM statistics if requested (using original sequences)
             if let Some(atomic) = atomic_estimates {
                 let mut local_est = crate::model::parameters::ParamEstimates::new();
                 hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
@@ -1066,107 +1056,256 @@ impl PhasingPipeline {
                 atomic.add_estimation_data(&local_est);
             }
 
-            let mut fwd1 = Vec::new();
-            let mut bwd1 = Vec::new();
-            hmm.forward_backward_raw(&seq1, &threaded_haps, &mut fwd1, &mut bwd1);
+            // 3-Track HMM with Prior-First Approach
+            //
+            // This implementation avoids the numerically unstable division hack.
+            // Instead, we:
+            // 1. Run sparse backward passes, storing only at het positions
+            // 2. Run forward with prior-first: compute transition before emission
+            // 3. At hets: use prior (no emission) to evaluate both hypotheses
+            // 4. Apply combined emission after decision for numerical stability
 
-            let mut fwd2 = Vec::new();
-            let mut bwd2 = Vec::new();
-            hmm.forward_backward_raw(&seq2, &threaded_haps, &mut fwd2, &mut bwd2);
-
-            // 5. Decide Phase using BLOCK-BASED phasing
-            // Instead of per-marker decisions, identify contiguous heterozygous blocks
-            // and compute block-level likelihoods to preserve linkage structure
-            let n_states = states.len();
-            
-            // Identify heterozygous blocks
-            let mut het_blocks: Vec<(usize, usize)> = Vec::new(); // (start, end) inclusive
-            let mut block_start: Option<usize> = None;
-            
-            for m in 0..n_markers {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
-                let is_het = !is_missing && a1 != a2;
-                
-                if is_het {
-                    if block_start.is_none() {
-                        block_start = Some(m);
-                    }
-                } else if let Some(start) = block_start {
-                    het_blocks.push((start, m - 1));
-                    block_start = None;
-                }
-            }
-            if let Some(start) = block_start {
-                het_blocks.push((start, n_markers - 1));
-            }
-            
-            // Compute block-level likelihoods and decide phase for each block
-            let mut current_swap = false;
-            let lr_threshold = self.params.lr_threshold as f64;
-            
-            for (block_start_m, block_end_m) in het_blocks {
-                // Compute log-likelihood ratio for the entire block
-                // L_keep = Π_{m in block} (Σ_k fwd1[m,k] * bwd1[m,k]) * (Σ_k fwd2[m,k] * bwd2[m,k])
-                // L_swap = Π_{m in block} (Σ_k fwd1[m,k] * bwd2[m,k]) * (Σ_k fwd2[m,k] * bwd1[m,k])
-                // Use log-domain for numerical stability
-                let mut log_l_keep = 0.0f64;
-                let mut log_l_swap = 0.0f64;
-                
-                for m in block_start_m..=block_end_m {
+            // Identify heterozygote positions first
+            let het_positions: Vec<usize> = (0..n_markers)
+                .filter(|&m| {
                     let a1 = seq1[m];
                     let a2 = seq2[m];
-                    let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
-                    
-                    if is_missing || a1 == a2 {
-                        continue; // Skip non-het markers in block
-                    }
-                    
-                    let row_start = m * n_states;
-                    let row_end = row_start + n_states;
-                    
-                    let f1 = &fwd1[row_start..row_end];
-                    let b1 = &bwd1[row_start..row_end];
-                    let f2 = &fwd2[row_start..row_end];
-                    let b2 = &bwd2[row_start..row_end];
+                    a1 != 255 && a2 != 255 && a1 != a2
+                })
+                .collect();
 
-                    let mut s11 = 0.0f64;
-                    let mut s22 = 0.0f64;
-                    let mut s12 = 0.0f64;
-                    let mut s21 = 0.0f64;
+            let p_err = self.params.p_mismatch;
+            let p_no_err = 1.0 - p_err;
+
+            // Helper to get reference allele at (marker, state)
+            let get_ref_allele = |m: usize, k: usize| -> u8 {
+                let h = states[k].as_usize();
+                if h < n_haps {
+                    ref_geno.get(m, states[k])
+                } else {
+                    let ref_h = (h - n_haps) as u32;
+                    if let (Some(ref_gt_inner), Some(align)) = (&self.reference_gt, &self.alignment) {
+                        if let Some(ref_m) = align.target_to_ref(m) {
+                            let ref_allele = ref_gt_inner.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
+                            align.reverse_map_allele(m, ref_allele)
+                        } else { 255 }
+                    } else { 255 }
+                }
+            };
+
+            // Sparse backward pass: only store values at het positions (O(N_hets × K) memory)
+            // For each het, store two vectors: bwd assuming seq1's future, bwd assuming seq2's future
+            let n_hets = het_positions.len();
+            let mut bwd1_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
+            let mut bwd2_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
+
+            // Run backward for seq1
+            {
+                let init_bwd = 1.0f32 / n_states as f32;
+                let mut bwd = vec![init_bwd; n_states];
+                let mut het_rev_idx = n_hets;
+
+                for m in (0..n_markers).rev() {
+                    // Check if this is a het position (going backwards)
+                    if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
+                        het_rev_idx -= 1;
+                        bwd1_cache[het_rev_idx].copy_from_slice(&bwd);
+                    }
+
+                    if m > 0 {
+                        // Backward update: bwd[m-1] from bwd[m]
+                        let p_recomb_m = p_recomb.get(m).copied().unwrap_or(0.0);
+                        let shift = p_recomb_m / n_states as f32;
+                        let stay = 1.0 - p_recomb_m;
+
+                        // Compute sum for normalization
+                        let mut bwd_sum = 0.0f32;
+                        for k in 0..n_states {
+                            let ref_al = get_ref_allele(m, k);
+                            let emit = if ref_al == seq1[m] || ref_al == 255 || seq1[m] == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            bwd[k] *= emit;
+                            bwd_sum += bwd[k];
+                        }
+
+                        // Apply transition (backward direction)
+                        let scale = stay / bwd_sum.max(1e-30);
+                        for k in 0..n_states {
+                            bwd[k] = scale * bwd[k] + shift;
+                        }
+                    }
+                }
+            }
+
+            // Run backward for seq2
+            {
+                let init_bwd = 1.0f32 / n_states as f32;
+                let mut bwd = vec![init_bwd; n_states];
+                let mut het_rev_idx = n_hets;
+
+                for m in (0..n_markers).rev() {
+                    if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
+                        het_rev_idx -= 1;
+                        bwd2_cache[het_rev_idx].copy_from_slice(&bwd);
+                    }
+
+                    if m > 0 {
+                        let p_recomb_m = p_recomb.get(m).copied().unwrap_or(0.0);
+                        let shift = p_recomb_m / n_states as f32;
+                        let stay = 1.0 - p_recomb_m;
+
+                        let mut bwd_sum = 0.0f32;
+                        for k in 0..n_states {
+                            let ref_al = get_ref_allele(m, k);
+                            let emit = if ref_al == seq2[m] || ref_al == 255 || seq2[m] == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            bwd[k] *= emit;
+                            bwd_sum += bwd[k];
+                        }
+
+                        let scale = stay / bwd_sum.max(1e-30);
+                        for k in 0..n_states {
+                            bwd[k] = scale * bwd[k] + shift;
+                        }
+                    }
+                }
+            }
+
+            // Interleaved forward pass with prior-first logic
+            // Maintain a single combined forward track (Track 0 in Java's 3-track HMM)
+            // At hets: compute prior, evaluate both hypotheses, apply "match" emission (neutral)
+            let mut seq1_working = seq1.clone();
+            let mut seq2_working = seq2.clone();
+
+            let init_val = 1.0f32 / n_states as f32;
+            let mut fwd = vec![init_val; n_states];
+            let mut fwd_prior = vec![0.0f32; n_states]; // Reuse buffer
+            let mut ref_alleles = vec![0u8; n_states];  // Cache ref alleles per marker
+            let mut fwd_sum = 1.0f32;
+
+            let mut het_idx = 0;
+            for m in 0..n_markers {
+                let allele1 = seq1_working[m];
+                let allele2 = seq2_working[m];
+                let is_het = het_idx < n_hets && het_positions[het_idx] == m;
+
+                // Cache reference alleles for this marker (avoid repeated lookups)
+                for k in 0..n_states {
+                    ref_alleles[k] = get_ref_allele(m, k);
+                }
+
+                // Compute PRIOR (transition only, no emission yet)
+                if m > 0 {
+                    let p_recomb_m = p_recomb.get(m).copied().unwrap_or(0.0);
+                    let shift = p_recomb_m / n_states as f32;
+                    let scale = (1.0 - p_recomb_m) / fwd_sum;
 
                     for k in 0..n_states {
-                        s11 += f1[k] as f64 * b1[k] as f64;
-                        s22 += f2[k] as f64 * b2[k] as f64;
-                        s12 += f1[k] as f64 * b2[k] as f64;
-                        s21 += f2[k] as f64 * b1[k] as f64;
+                        fwd_prior[k] = scale * fwd[k] + shift;
+                    }
+                } else {
+                    // First marker: prior is uniform
+                    for k in 0..n_states {
+                        fwd_prior[k] = init_val;
+                    }
+                }
+
+                if is_het {
+                    // At heterozygote: use prior to evaluate both phase hypotheses
+                    let b1 = &bwd1_cache[het_idx];
+                    let b2 = &bwd2_cache[het_idx];
+
+                    // Compute likelihoods - multiply prior by emission and backward
+                    let mut l1_keep = 0.0f64;
+                    let mut l2_keep = 0.0f64;
+                    let mut l1_swap = 0.0f64;
+                    let mut l2_swap = 0.0f64;
+
+                    for k in 0..n_states {
+                        let ref_al = ref_alleles[k];
+                        let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
+                            p_no_err
+                        } else {
+                            p_err
+                        };
+                        let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
+                            p_no_err
+                        } else {
+                            p_err
+                        };
+
+                        let prior_k = fwd_prior[k] as f64;
+                        let b1_k = b1[k] as f64;
+                        let b2_k = b2[k] as f64;
+
+                        // Keep: hap1 gets allele1 (emit1, bwd1), hap2 gets allele2 (emit2, bwd2)
+                        l1_keep += prior_k * (emit1 as f64) * b1_k;
+                        l2_keep += prior_k * (emit2 as f64) * b2_k;
+
+                        // Swap: hap1 gets allele2 (emit2, bwd2), hap2 gets allele1 (emit1, bwd1)
+                        l1_swap += prior_k * (emit2 as f64) * b2_k;
+                        l2_swap += prior_k * (emit1 as f64) * b1_k;
                     }
 
-                    // Avoid log(0) by adding small epsilon
-                    let eps = 1e-300f64;
-                    log_l_keep += (s11 * s22 + eps).ln();
-                    log_l_swap += (s12 * s21 + eps).ln();
-                }
-                
-                // Compare block-level likelihoods considering current phase state
-                let (log_l_stay, log_l_flip) = if current_swap {
-                    (log_l_swap, log_l_keep)
-                } else {
-                    (log_l_keep, log_l_swap)
-                };
-                
-                // Flip if log(L_flip) >= log(L_stay) + log(threshold)
-                let log_threshold = lr_threshold.ln();
-                if log_l_flip >= log_l_stay + log_threshold {
-                    current_swap = !current_swap;
-                }
-                
-                // Apply phase to entire block
-                if current_swap {
-                    for m in block_start_m..=block_end_m {
-                        mask.set(m, true);
+                    let l_keep = l1_keep * l2_keep;
+                    let l_swap = l1_swap * l2_swap;
+
+                    if l_swap > l_keep {
+                        // SWAP: exchange alleles from this position forward
+                        for m_swap in m..n_markers {
+                            std::mem::swap(&mut seq1_working[m_swap], &mut seq2_working[m_swap]);
+                        }
+                        // Swap backward caches for future het decisions
+                        for h in het_idx..n_hets {
+                            std::mem::swap(&mut bwd1_cache[h], &mut bwd2_cache[h]);
+                        }
                     }
+
+                    // Apply "match" emission at hets (neutral, like Java's combined track)
+                    // At a het, both alleles are present, so any matching state is a "match"
+                    fwd_sum = 0.0;
+                    for k in 0..n_states {
+                        let ref_al = ref_alleles[k];
+                        // Emit "match" if ref matches EITHER allele (het is A/B, so A or B is valid)
+                        let emit = if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                            p_no_err
+                        } else {
+                            p_err
+                        };
+                        fwd[k] = fwd_prior[k] * emit;
+                        fwd_sum += fwd[k];
+                    }
+                    fwd_sum = fwd_sum.max(1e-30);
+
+                    het_idx += 1;
+                } else {
+                    // Not a het: apply the observed emission directly
+                    let observed = if allele1 != 255 { allele1 } else { allele2 };
+                    fwd_sum = 0.0;
+                    for k in 0..n_states {
+                        let ref_al = ref_alleles[k];
+                        let emit = if ref_al == observed || ref_al == 255 || observed == 255 {
+                            p_no_err
+                        } else {
+                            p_err
+                        };
+                        fwd[k] = fwd_prior[k] * emit;
+                        fwd_sum += fwd[k];
+                    }
+                    fwd_sum = fwd_sum.max(1e-30);
+                }
+            }
+
+            // Determine which markers were swapped by comparing final working sequences to originals
+            for m in 0..n_markers {
+                if seq1_working[m] != seq1[m] {
+                    mask.set(m, true);
                 }
             }
         });
@@ -1196,11 +1335,15 @@ impl PhasingPipeline {
     /// Similar to `run_phase_baum_iteration` but respects the overlap constraint:
     /// markers in the overlap region (0..overlap_markers) have their phase locked
     /// from the previous window and will not be changed.
+    ///
+    /// Uses the same correct per-heterozygote decision algorithm as `run_phase_baum_iteration`:
+    /// - Sparse backward pass (O(N_hets × K) memory)
+    /// - Prior-first forward (no division)
+    /// - Match-any emission for combined track
     fn run_phase_baum_iteration_with_overlap(
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        missing_mask: &[BitBox<u8, Lsb0>],
         p_recomb: &[f32],
         gen_dists: &[f64],
         ibs2: &Ibs2,
@@ -1214,21 +1357,23 @@ impl PhasingPipeline {
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
+        // Compute total haplotype count (target + reference)
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+
         let ref_geno = geno.clone();
         let ref_view = GenotypeView::from((&ref_geno, markers));
 
         // Build bidirectional PBWT for better state selection around recombination hotspots
         let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps);
 
-        // Collect phase decisions per sample for markers AFTER overlap region
-        type PhaseDecision = (usize, bool, f64); // (marker_idx, should_swap, log_lr)
-        let phase_decisions: Vec<Vec<PhaseDecision>> = sample_phases
+        // Collect swap masks per sample
+        let n_samples = n_haps / 2;
+        let swap_masks: Vec<BitBox<u64, Lsb0>> = sample_phases
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
-                let hap2 = sample_idx.hap2();
 
                 // Use midpoint marker for PBWT-based state selection
                 let mid_marker = n_markers / 2;
@@ -1238,145 +1383,286 @@ impl PhasingPipeline {
                 let seq1: Vec<u8> = (0..n_markers).map(|m| sp.allele1(m)).collect();
                 let seq2: Vec<u8> = (0..n_markers).map(|m| sp.allele2(m)).collect();
 
-                // Run HMM Forward-Backward for H1 and H2
                 let n_states = states.len();
-                let threaded_haps = ThreadedHaps::from_static_haps(&states, n_markers);
-                let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
 
                 // Collect EM statistics if requested
                 if let Some(atomic) = atomic_estimates {
+                    let threaded_haps = ThreadedHaps::from_static_haps(&states, n_markers);
+                    let hmm = BeagleHmm::new(ref_view.clone(), &self.params, n_states, p_recomb.to_vec());
                     let mut local_est = crate::model::parameters::ParamEstimates::new();
                     hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
                     hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
                     atomic.add_estimation_data(&local_est);
                 }
 
-                let mut fwd1 = Vec::new();
-                let mut bwd1 = Vec::new();
-                hmm.forward_backward_raw(&seq1, &threaded_haps, &mut fwd1, &mut bwd1);
-
-                let mut fwd2 = Vec::new();
-                let mut bwd2 = Vec::new();
-                hmm.forward_backward_raw(&seq2, &threaded_haps, &mut fwd2, &mut bwd2);
-
-                // Identify heterozygous blocks AFTER the overlap region
-                // Overlap markers are already phased and should not change
-                let mut het_blocks: Vec<(usize, usize)> = Vec::new();
-                let mut block_start: Option<usize> = None;
-                
-                // Start looking for het blocks only after overlap region
-                for m in overlap_markers..n_markers {
-                    let a1 = seq1[m];
-                    let a2 = seq2[m];
-                    let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
-                    let is_het = !is_missing && a1 != a2;
-                    
-                    if is_het {
-                        if block_start.is_none() {
-                            block_start = Some(m);
-                        }
-                    } else if let Some(start) = block_start {
-                        het_blocks.push((start, m - 1));
-                        block_start = None;
-                    }
-                }
-                if let Some(start) = block_start {
-                    het_blocks.push((start, n_markers - 1));
-                }
-                
-                // Compute block-level likelihoods and make phase decisions
-                let mut decisions = Vec::new();
-                let mut current_swap = false;
-                let lr_threshold = self.params.lr_threshold as f64;
-                
-                for (block_start_m, block_end_m) in het_blocks {
-                    let mut log_l_keep = 0.0f64;
-                    let mut log_l_swap = 0.0f64;
-                    
-                    for m in block_start_m..=block_end_m {
+                // Identify heterozygote positions (ONLY after overlap region for decisions)
+                // But we still need full het list for backward pass
+                let het_positions: Vec<usize> = (0..n_markers)
+                    .filter(|&m| {
                         let a1 = seq1[m];
                         let a2 = seq2[m];
-                        let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
-                        
-                        if is_missing || a1 == a2 {
-                            continue;
-                        }
-                        
-                        let row_start = m * n_states;
-                        let row_end = row_start + n_states;
-                        
-                        let f1 = &fwd1[row_start..row_end];
-                        let b1 = &bwd1[row_start..row_end];
-                        let f2 = &fwd2[row_start..row_end];
-                        let b2 = &bwd2[row_start..row_end];
+                        a1 != 255 && a2 != 255 && a1 != a2
+                    })
+                    .collect();
 
-                        let mut s11 = 0.0f64;
-                        let mut s22 = 0.0f64;
-                        let mut s12 = 0.0f64;
-                        let mut s21 = 0.0f64;
+                // Find first het index after overlap region
+                let first_changeable_het = het_positions.iter().position(|&m| m >= overlap_markers).unwrap_or(het_positions.len());
 
-                        for k in 0..n_states {
-                            s11 += f1[k] as f64 * b1[k] as f64;
-                            s22 += f2[k] as f64 * b2[k] as f64;
-                            s12 += f1[k] as f64 * b2[k] as f64;
-                            s21 += f2[k] as f64 * b1[k] as f64;
-                        }
+                let p_err = self.params.p_mismatch;
+                let p_no_err = 1.0 - p_err;
 
-                        let eps = 1e-300f64;
-                        log_l_keep += (s11 * s22 + eps).ln();
-                        log_l_swap += (s12 * s21 + eps).ln();
-                    }
-                    
-                    let (log_l_stay, log_l_flip) = if current_swap {
-                        (log_l_swap, log_l_keep)
+                // Helper to get reference allele at (marker, state)
+                let get_ref_allele = |m: usize, k: usize| -> u8 {
+                    let h = states[k].as_usize();
+                    if h < n_haps {
+                        ref_geno.get(m, states[k])
                     } else {
-                        (log_l_keep, log_l_swap)
-                    };
-                    
-                    let log_threshold = lr_threshold.ln();
-                    if log_l_flip >= log_l_stay + log_threshold {
-                        current_swap = !current_swap;
+                        let ref_h = (h - n_haps) as u32;
+                        if let (Some(ref_gt_inner), Some(align)) = (&self.reference_gt, &self.alignment) {
+                            if let Some(ref_m) = align.target_to_ref(m) {
+                                let ref_allele = ref_gt_inner.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
+                                align.reverse_map_allele(m, ref_allele)
+                            } else { 255 }
+                        } else { 255 }
                     }
-                    
-                    // Record phase decision for each marker in block
-                    if current_swap {
-                        let log_lr = (log_l_flip - log_l_stay).abs();
-                        for m in block_start_m..=block_end_m {
-                            if !sp.is_phased(m) {
-                                decisions.push((m, true, log_lr));
+                };
+
+                // Sparse backward pass: only store values at het positions
+                let n_hets = het_positions.len();
+                let mut bwd1_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
+                let mut bwd2_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
+
+                // Run backward for seq1
+                {
+                    let init_bwd = 1.0f32 / n_states as f32;
+                    let mut bwd = vec![init_bwd; n_states];
+                    let mut het_rev_idx = n_hets;
+
+                    for m in (0..n_markers).rev() {
+                        if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
+                            het_rev_idx -= 1;
+                            bwd1_cache[het_rev_idx].copy_from_slice(&bwd);
+                        }
+
+                        if m > 0 {
+                            let p_recomb_m = p_recomb.get(m).copied().unwrap_or(0.0);
+                            let shift = p_recomb_m / n_states as f32;
+                            let stay = 1.0 - p_recomb_m;
+
+                            let mut bwd_sum = 0.0f32;
+                            for k in 0..n_states {
+                                let ref_al = get_ref_allele(m, k);
+                                let emit = if ref_al == seq1[m] || ref_al == 255 || seq1[m] == 255 {
+                                    p_no_err
+                                } else {
+                                    p_err
+                                };
+                                bwd[k] *= emit;
+                                bwd_sum += bwd[k];
+                            }
+
+                            let scale = stay / bwd_sum.max(1e-30);
+                            for k in 0..n_states {
+                                bwd[k] = scale * bwd[k] + shift;
                             }
                         }
                     }
                 }
-                
-                decisions
+
+                // Run backward for seq2
+                {
+                    let init_bwd = 1.0f32 / n_states as f32;
+                    let mut bwd = vec![init_bwd; n_states];
+                    let mut het_rev_idx = n_hets;
+
+                    for m in (0..n_markers).rev() {
+                        if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
+                            het_rev_idx -= 1;
+                            bwd2_cache[het_rev_idx].copy_from_slice(&bwd);
+                        }
+
+                        if m > 0 {
+                            let p_recomb_m = p_recomb.get(m).copied().unwrap_or(0.0);
+                            let shift = p_recomb_m / n_states as f32;
+                            let stay = 1.0 - p_recomb_m;
+
+                            let mut bwd_sum = 0.0f32;
+                            for k in 0..n_states {
+                                let ref_al = get_ref_allele(m, k);
+                                let emit = if ref_al == seq2[m] || ref_al == 255 || seq2[m] == 255 {
+                                    p_no_err
+                                } else {
+                                    p_err
+                                };
+                                bwd[k] *= emit;
+                                bwd_sum += bwd[k];
+                            }
+
+                            let scale = stay / bwd_sum.max(1e-30);
+                            for k in 0..n_states {
+                                bwd[k] = scale * bwd[k] + shift;
+                            }
+                        }
+                    }
+                }
+
+                // Interleaved forward pass with per-het decisions
+                let mut seq1_working = seq1.clone();
+                let mut seq2_working = seq2.clone();
+                let mut mask = bitbox![u64, Lsb0; 0; n_markers];
+
+                let init_val = 1.0f32 / n_states as f32;
+                let mut fwd = vec![init_val; n_states];
+                let mut fwd_prior = vec![0.0f32; n_states];
+                let mut ref_alleles = vec![0u8; n_states];
+                let mut fwd_sum = 1.0f32;
+
+                let mut het_idx = 0;
+                for m in 0..n_markers {
+                    let allele1 = seq1_working[m];
+                    let allele2 = seq2_working[m];
+                    let is_het = het_idx < n_hets && het_positions[het_idx] == m;
+
+                    // Cache reference alleles for this marker
+                    for k in 0..n_states {
+                        ref_alleles[k] = get_ref_allele(m, k);
+                    }
+
+                    // Compute PRIOR (transition only, no emission yet)
+                    if m > 0 {
+                        let p_recomb_m = p_recomb.get(m).copied().unwrap_or(0.0);
+                        let shift = p_recomb_m / n_states as f32;
+                        let scale = (1.0 - p_recomb_m) / fwd_sum;
+
+                        for k in 0..n_states {
+                            fwd_prior[k] = scale * fwd[k] + shift;
+                        }
+                    } else {
+                        for k in 0..n_states {
+                            fwd_prior[k] = init_val;
+                        }
+                    }
+
+                    if is_het {
+                        // Only make phase decisions for hets AFTER overlap region
+                        if het_idx >= first_changeable_het {
+                            let b1 = &bwd1_cache[het_idx];
+                            let b2 = &bwd2_cache[het_idx];
+
+                            let mut l1_keep = 0.0f64;
+                            let mut l2_keep = 0.0f64;
+                            let mut l1_swap = 0.0f64;
+                            let mut l2_swap = 0.0f64;
+
+                            for k in 0..n_states {
+                                let ref_al = ref_alleles[k];
+                                let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
+                                    p_no_err
+                                } else {
+                                    p_err
+                                };
+                                let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
+                                    p_no_err
+                                } else {
+                                    p_err
+                                };
+
+                                let prior_k = fwd_prior[k] as f64;
+                                let b1_k = b1[k] as f64;
+                                let b2_k = b2[k] as f64;
+
+                                l1_keep += prior_k * (emit1 as f64) * b1_k;
+                                l2_keep += prior_k * (emit2 as f64) * b2_k;
+                                l1_swap += prior_k * (emit2 as f64) * b2_k;
+                                l2_swap += prior_k * (emit1 as f64) * b1_k;
+                            }
+
+                            let l_keep = l1_keep * l2_keep;
+                            let l_swap = l1_swap * l2_swap;
+
+                            if l_swap > l_keep {
+                                // SWAP: exchange alleles from this position forward
+                                for m_swap in m..n_markers {
+                                    std::mem::swap(&mut seq1_working[m_swap], &mut seq2_working[m_swap]);
+                                }
+                                // Swap backward caches for future het decisions
+                                for h in het_idx..n_hets {
+                                    std::mem::swap(&mut bwd1_cache[h], &mut bwd2_cache[h]);
+                                }
+                            }
+                        }
+
+                        // Apply "match" emission at hets (neutral, like Java's combined track)
+                        fwd_sum = 0.0;
+                        for k in 0..n_states {
+                            let ref_al = ref_alleles[k];
+                            let emit = if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            fwd[k] = fwd_prior[k] * emit;
+                            fwd_sum += fwd[k];
+                        }
+                        fwd_sum = fwd_sum.max(1e-30);
+
+                        het_idx += 1;
+                    } else {
+                        // Not a het: apply the observed emission directly
+                        let observed = if allele1 != 255 { allele1 } else { allele2 };
+                        fwd_sum = 0.0;
+                        for k in 0..n_states {
+                            let ref_al = ref_alleles[k];
+                            let emit = if ref_al == observed || ref_al == 255 || observed == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            fwd[k] = fwd_prior[k] * emit;
+                            fwd_sum += fwd[k];
+                        }
+                        fwd_sum = fwd_sum.max(1e-30);
+                    }
+                }
+
+                // Record swaps by comparing final working sequences to originals
+                for m in overlap_markers..n_markers {
+                    if seq1_working[m] != seq1[m] {
+                        mask.set(m, true);
+                    }
+                }
+
+                mask
             })
             .collect();
 
-        // Apply phase decisions to sample_phases
+        // Apply Swaps
         let mut total_switches = 0;
-        for (s, decisions) in phase_decisions.into_iter().enumerate() {
-            let sp = &mut sample_phases[s];
-            for (m, should_swap, log_lr) in decisions {
-                if sp.try_phase(m, should_swap, log_lr, self.params.lr_threshold as f64) {
-                    if should_swap {
-                        total_switches += 1;
-                    }
+        for s in 0..n_samples {
+            let mask = &swap_masks[s];
+            if mask.any() {
+                let hap1 = HapIdx::new((s * 2) as u32);
+                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+                for m in mask.iter_ones() {
+                    geno.swap(m, hap1, hap2);
+                    total_switches += 1;
                 }
             }
         }
 
-        // Sync SamplePhase back to MutableGenotypes
-        for (s, sp) in sample_phases.iter().enumerate() {
+        // Update sample_phases to match
+        for (s, sp) in sample_phases.iter_mut().enumerate() {
             let hap1 = HapIdx::new((s * 2) as u32);
             let hap2 = HapIdx::new((s * 2 + 1) as u32);
-            
-            for m in 0..n_markers {
-                geno.set(m, hap1, sp.allele1(m));
-                geno.set(m, hap2, sp.allele2(m));
+
+            for m in overlap_markers..n_markers {
+                if swap_masks[s][m] {
+                    sp.swap_alleles(m);
+                }
             }
         }
-        
+
         eprintln!("Applied {} phase switches (with {} overlap markers locked)", total_switches, overlap_markers);
         Ok(())
     }
@@ -1386,7 +1672,6 @@ impl PhasingPipeline {
     /// Uses SamplePhase to track phase state and only phases unphased markers.
     fn run_phase_baum_iteration_stage1(
         &mut self,
-        target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
         stage1_p_recomb: &[f32],
         stage1_gen_dists: &[f64],
@@ -1397,7 +1682,6 @@ impl PhasingPipeline {
         iteration: usize,
     ) -> Result<()> {
         let n_haps = geno.n_haps();
-        let markers = target_gt.markers();
         let seed = self.config.seed;
 
         // Compute total haplotype count (target + reference)
@@ -1412,14 +1696,12 @@ impl PhasingPipeline {
                 target: &ref_geno,
                 reference: ref_gt,
                 alignment,
-                markers,
                 subset: hi_freq_to_orig,
                 n_target_haps: n_haps,
             }
         } else {
             GenotypeView::MutableSubset {
                 geno: &ref_geno,
-                markers,
                 subset: hi_freq_to_orig,
             }
         };
@@ -1670,7 +1952,6 @@ impl PhasingPipeline {
     /// **Key fix**: Only phases markers that are currently UNPHASED in SamplePhase.
     fn phase_rare_markers_with_hmm(
         &self,
-        target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
         hi_freq_markers: &[usize],
         gen_positions: &[f64],
@@ -1696,7 +1977,6 @@ impl PhasingPipeline {
 
         // Clone current genotypes to use as a frozen reference panel
         let ref_geno = geno.clone();
-        let markers = target_gt.markers();
 
         // Use CompositeSubset view when reference panel is available
         let subset_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
@@ -1704,14 +1984,12 @@ impl PhasingPipeline {
                 target: &ref_geno,
                 reference: ref_gt,
                 alignment,
-                markers,
                 subset: hi_freq_markers,
                 n_target_haps: n_haps,
             }
         } else {
             GenotypeView::MutableSubset {
                 geno: &ref_geno,
-                markers,
                 subset: hi_freq_markers,
             }
         };

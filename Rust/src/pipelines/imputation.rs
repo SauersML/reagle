@@ -44,7 +44,7 @@ pub struct MarkerAlignment {
     /// For each target marker, the index of the corresponding reference marker
     target_to_ref: Vec<usize>,
     /// Number of reference markers
-    n_ref_markers: usize,
+
     /// Allele mapping for each aligned marker (indexed by target marker)
     /// Maps target allele indices to reference allele indices
     allele_mappings: Vec<Option<crate::data::marker::AlleleMapping>>,
@@ -120,7 +120,6 @@ impl MarkerAlignment {
         Self {
             ref_to_target,
             target_to_ref,
-            n_ref_markers,
             allele_mappings,
         }
     }
@@ -480,7 +479,7 @@ impl ImputationPipeline {
                     // Combine config seed with haplotype index for reproducibility
                     let seed = (self.config.seed as u64).wrapping_add(h as u64);
                     let mut imp_states =
-                        ImpStates::new(&ref_panel_coded, n_states, n_ibs_haps, seed);
+                        ImpStates::new(&ref_panel_coded, n_ref_haps, n_states, n_ibs_haps, seed);
 
                     // Get reference allele closure (now indices are in reference space directly)
                     let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {

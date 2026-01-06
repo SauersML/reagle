@@ -69,6 +69,8 @@ pub struct ImpStates<'a> {
     queue: BinaryHeap<CompHapEntry>,
     /// Number of reference markers
     n_ref_markers: usize,
+    /// Number of reference haplotypes (excludes appended target haplotypes)
+    n_ref_haps: usize,
     /// Number of IBS haplotypes to find per step
     n_ibs_haps: usize,
     /// Random seed for reproducibility
@@ -80,11 +82,13 @@ impl<'a> ImpStates<'a> {
     ///
     /// # Arguments
     /// * `ref_panel` - Reference panel with coded steps (defines step boundaries)
+    /// * `n_ref_haps` - Number of reference haplotypes (excludes appended target haplotypes)
     /// * `max_states` - Maximum number of HMM states to track
     /// * `n_ibs_haps` - Number of IBS haplotypes to find per step
     /// * `seed` - Random seed for reproducibility
     pub fn new(
         ref_panel: &'a RefPanelCoded,
+        n_ref_haps: usize,
         max_states: usize,
         n_ibs_haps: usize,
         seed: u64,
@@ -98,6 +102,7 @@ impl<'a> ImpStates<'a> {
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
             n_ref_markers,
+            n_ref_haps,
             n_ibs_haps,
             seed,
         }
@@ -107,6 +112,10 @@ impl<'a> ImpStates<'a> {
     ///
     /// Uses BOTH forward and backward PBWT passes to find IBS matches,
     /// matching Java Beagle's bidirectional approach.
+    ///
+    /// **Sparse target handling:** Steps with all-missing target data are skipped
+    /// for IBS matching, preventing degenerate state selection when the target
+    /// is much sparser than the reference panel.
     ///
     /// # Arguments
     /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
@@ -131,10 +140,24 @@ impl<'a> ImpStates<'a> {
     {
         self.initialize();
 
-        let n_ref_haps = self.ref_panel.n_haps();
+        let n_ref_haps = self.n_ref_haps;
         let n_steps = self.ref_panel.n_steps();
         let n_ibs_haps = self.n_ibs_haps;
         workspace.resize_with_ref(self.max_states, self.n_ref_markers, n_ref_haps);
+
+        // Pre-compute which steps have informative target data
+        // Steps with all-missing data should be skipped for IBS matching
+        let step_has_data: Vec<bool> = (0..n_steps)
+            .map(|step_idx| {
+                let coded_step = self.ref_panel.step(step_idx);
+                let step_start = coded_step.start;
+                let step_end = coded_step.end;
+                // Check if any marker in this step has non-missing target data
+                (step_start..step_end).any(|m| {
+                    target_alleles.get(m).copied().unwrap_or(255) != 255
+                })
+            })
+            .collect();
 
         // Store backward IBS haps for each step (to use during forward pass)
         let mut bwd_ibs_per_step: Vec<Vec<u32>> = vec![Vec::new(); n_steps];
@@ -149,11 +172,15 @@ impl<'a> ImpStates<'a> {
 
             for step_idx in (0..n_steps).rev() {
                 let coded_step = self.ref_panel.step(step_idx);
-                // Use reference panel's step boundaries (the fix!)
                 let step_start = coded_step.start;
                 let step_end = coded_step.end;
 
                 pbwt_bwd.update_backward(coded_step, n_steps);
+
+                // Skip IBS matching if this step has no informative target data
+                if !step_has_data[step_idx] {
+                    continue;
+                }
 
                 // Extract target sequence for this step using reference marker indices
                 let target_seq: Vec<u8> = (step_start..step_end)
@@ -189,7 +216,6 @@ impl<'a> ImpStates<'a> {
 
             for step_idx in 0..n_steps {
                 let coded_step = self.ref_panel.step(step_idx);
-                // Use reference panel's step boundaries (the fix!)
                 let step_start = coded_step.start;
                 let step_end = coded_step.end;
 
@@ -200,6 +226,11 @@ impl<'a> ImpStates<'a> {
                     &mut workspace.sort_prefix_scratch,
                     &mut workspace.sort_div_scratch,
                 );
+
+                // Skip IBS matching if this step has no informative target data
+                if !step_has_data[step_idx] {
+                    continue;
+                }
 
                 // Extract target sequence for this step using reference marker indices
                 let target_seq: Vec<u8> = (step_start..step_end)
@@ -223,6 +254,7 @@ impl<'a> ImpStates<'a> {
                     };
 
                 // Update composite haplotypes with IBS matches from BOTH directions
+                // Use the step_idx for state recency tracking (matches Java behavior)
                 for hap in fwd_ibs {
                     self.update_with_ibs_hap(hap, step_idx as i32);
                 }
@@ -316,7 +348,8 @@ impl<'a> ImpStates<'a> {
         use rand::seq::SliceRandom;
         use rand::SeedableRng;
 
-        let n_ref_haps = self.ref_panel.n_haps();
+        // Use only reference haplotypes (exclude appended target haplotypes)
+        let n_ref_haps = self.n_ref_haps;
         let n_states = self.max_states.min(n_ref_haps);
 
         let mut rng = StdRng::seed_from_u64(self.seed);

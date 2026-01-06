@@ -9,9 +9,7 @@
 //! borrow checker issues), we create a separate Workspace that owns all
 //! temporary buffers and pass `&mut Workspace` to computation functions.
 
-/// Workspace for phasing HMM computations
-#[derive(Debug)]
-pub struct Workspace {
+
     /// Forward probabilities (n_states)
     pub fwd: Vec<f32>,
 
@@ -30,43 +28,26 @@ pub struct Workspace {
     /// Forward pass hap2 (flattened: n_markers * n_states) - for phasing HMM
     pub fwd2: Vec<f32>,
 
-    /// Temporary buffer for state updates
+    /// Temporary buffer
     pub tmp: Vec<f32>,
 
     /// PBWT prefix array
     pub prefix: Vec<u32>,
 
     /// PBWT divergence array
-    pub divergence: Vec<u32>,
+    pub divergence: Vec<i32>,
 
-    /// Allele buffer for current marker
+    /// Allele buffer for PBWT updates
     pub alleles: Vec<u8>,
 
-    /// Emission probability buffer
+    /// Emission probabilities buffer
     pub emit_probs: Vec<f32>,
 
     /// Random number generator state
     pub rng_state: u64,
 }
 
-impl Workspace {
-    /// Create a new workspace with given capacities
-    pub fn new(n_states: usize, n_markers: usize, n_haps: usize) -> Self {
-        Self {
-            fwd: vec![0.0; n_states],
-            bwd: vec![0.0; n_states],
-            state_probs: vec![0.0; n_markers * n_states],
-            fwd_combined: vec![0.0; n_markers * n_states],
-            fwd1: vec![0.0; n_markers * n_states],
-            fwd2: vec![0.0; n_markers * n_states],
-            tmp: vec![0.0; n_states],
-            prefix: (0..n_haps as u32).collect(),
-            divergence: vec![0; n_haps],
-            alleles: vec![0; n_haps],
-            emit_probs: vec![0.0; n_states],
-            rng_state: 0,
-        }
-    }
+
 
     /// Create a minimal workspace for testing
     pub fn minimal() -> Self {
@@ -137,11 +118,7 @@ impl Workspace {
     }
 }
 
-impl Default for Workspace {
-    fn default() -> Self {
-        Self::minimal()
-    }
-}
+
 
 /// Workspace for imputation HMM computations
 #[derive(Debug)]
