@@ -27,7 +27,7 @@ use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
 use crate::model::hmm::LiStephensHmm;
 use crate::model::parameters::ModelParams;
-use crate::model::phase_ibs::GlobalPhaseIbs;
+use crate::model::phase_ibs::{BidirectionalPhaseIbs, GlobalPhaseIbs};
 
 /// Phasing pipeline
 pub struct PhasingPipeline {
@@ -81,8 +81,8 @@ impl PhasingPipeline {
             target_gt.size_bytes() as f64 / 1024.0 / 1024.0
         );
 
-        // Initialize parameters based on sample size
-        self.params = ModelParams::for_phasing(n_haps);
+        // Initialize parameters based on sample size and CLI config
+        self.params = ModelParams::for_phasing(n_haps, self.config.ne, self.config.err);
         self.params
             .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
 
@@ -214,7 +214,6 @@ impl PhasingPipeline {
             self.run_phase_baum_iteration_stage1(
                 &target_gt,
                 &mut geno,
-                &missing_mask,
                 &stage1_p_recomb,
                 &stage1_gen_dists,
                 &hi_freq_to_orig,
@@ -342,9 +341,11 @@ impl PhasingPipeline {
             total_markers += window.output_end - window.output_start;
 
             eprintln!(
-                "Processing window {} ({} markers, output {}..{}, overlap: {} markers)",
-                window_count,
+                "Processing window {} ({} markers, global {}..{}, output {}..{}, overlap: {} markers)",
+                window.window_num,
                 n_markers,
+                window.global_start,
+                window.global_end,
                 window.output_start,
                 window.output_end,
                 phased_overlap.as_ref().map(|o| o.n_markers).unwrap_or(0)
@@ -442,7 +443,7 @@ impl PhasingPipeline {
             return Ok(target_gt.clone().into_phased());
         }
 
-        self.params = ModelParams::for_phasing(n_haps);
+        self.params = ModelParams::for_phasing(n_haps, self.config.ne, self.config.err);
         self.params
             .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
 
@@ -554,7 +555,7 @@ impl PhasingPipeline {
             return Ok(target_gt.clone().into_phased());
         }
 
-        self.params = ModelParams::for_phasing(n_haps);
+        self.params = ModelParams::for_phasing(n_haps, self.config.ne, self.config.err);
         self.params
             .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
 
@@ -854,16 +855,53 @@ impl PhasingPipeline {
         states
     }
 
-    /// Build and maintain PBWT state for dynamic state selection
-    ///
-    /// Creates a GlobalPhaseIbs and updates it with allele data, returning it
-    /// for use in select_states_pbwt.
+    /// Select HMM states using bidirectional PBWT (forward + backward neighbors)
+    fn select_states_bidirectional(
+        &self,
+        hap_idx: HapIdx,
+        marker_idx: usize,
+        phase_ibs: &BidirectionalPhaseIbs,
+        ibs2: &Ibs2,
+        n_states_wanted: usize,
+        n_total_haps: usize,
+        seed: i64,
+        iteration: usize,
+    ) -> Vec<HapIdx> {
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng;
+
+        let n_candidates = (n_states_wanted * 2).min(n_total_haps);
+        let neighbors = phase_ibs.find_neighbors(hap_idx.0, marker_idx, ibs2, n_candidates);
+
+        let mut states: Vec<HapIdx> = neighbors.into_iter().map(HapIdx::new).collect();
+
+        if states.len() < n_states_wanted {
+            let sample = SampleIdx::new(hap_idx.0 / 2);
+            let mut i = 0;
+            while states.len() < n_states_wanted && i < n_total_haps {
+                let h = HapIdx::new(i as u32);
+                if h != sample.hap1() && h != sample.hap2() && !states.contains(&h) {
+                    states.push(h);
+                }
+                i += 1;
+            }
+        }
+
+        let combined_seed = (seed as u64)
+            .wrapping_add(iteration as u64)
+            .wrapping_add(hap_idx.0 as u64);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(combined_seed);
+
+        states.shuffle(&mut rng);
+        states.truncate(n_states_wanted);
+        states
+    }
+
+    /// Build forward-only PBWT state for streaming/window-based phasing
     fn build_phase_pbwt(&self, geno: &MutableGenotypes, n_markers: usize, n_haps: usize) -> GlobalPhaseIbs {
         let mut phase_ibs = GlobalPhaseIbs::new(n_haps);
 
-        // Advance PBWT through all markers to build the divergence array
         for m in 0..n_markers {
-            // Collect alleles for this marker
             let mut alleles = Vec::with_capacity(n_haps);
             for h in 0..n_haps {
                 alleles.push(geno.get(m, HapIdx::new(h as u32)));
@@ -872,6 +910,46 @@ impl PhasingPipeline {
         }
 
         phase_ibs
+    }
+
+    /// Build bidirectional PBWT for full chromosome phasing
+    ///
+    /// This stores both forward and backward PBWT arrays to enable selecting
+    /// haplotypes that match well both upstream and downstream of each marker.
+    fn build_bidirectional_pbwt(&self, geno: &MutableGenotypes, n_markers: usize, n_haps: usize) -> BidirectionalPhaseIbs {
+        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_markers);
+        for m in 0..n_markers {
+            let mut alleles = Vec::with_capacity(n_haps);
+            for h in 0..n_haps {
+                alleles.push(geno.get(m, HapIdx::new(h as u32)));
+            }
+            alleles_by_marker.push(alleles);
+        }
+        BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_markers)
+    }
+
+    /// Build bidirectional PBWT for a subset of markers (e.g., high-frequency only)
+    ///
+    /// This ensures state selection is consistent with the HMM marker space
+    /// when phasing Stage 1 (high-frequency) markers.
+    fn build_bidirectional_pbwt_subset(
+        &self,
+        geno: &MutableGenotypes,
+        marker_indices: &[usize],
+        n_haps: usize,
+    ) -> BidirectionalPhaseIbs {
+        let n_subset = marker_indices.len();
+        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
+        
+        for &orig_m in marker_indices {
+            let mut alleles = Vec::with_capacity(n_haps);
+            for h in 0..n_haps {
+                alleles.push(geno.get(orig_m, HapIdx::new(h as u32)));
+            }
+            alleles_by_marker.push(alleles);
+        }
+        
+        BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_subset)
     }
 
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
@@ -896,25 +974,20 @@ impl PhasingPipeline {
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
-        // Clone current genotypes to use as a frozen reference panel
         let ref_geno = geno.clone();
         let ref_view = GenotypeView::from((&ref_geno, markers));
 
-        // Build PBWT for dynamic state selection (using current phased genotypes)
-        let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
+        let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps);
 
-        // Prepare swap masks (one BitVec per sample)
         let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
 
-        // Process samples in parallel
         swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
             let sample_idx = SampleIdx::new(s as u32);
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
 
-            // Use midpoint marker for PBWT-based state selection
             let mid_marker = n_markers / 2;
-            let states = self.select_states_pbwt(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
+            let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
             
             // 2. Extract current alleles for H1 and H2
             let seq1 = ref_geno.haplotype(hap1);
@@ -1079,18 +1152,16 @@ impl PhasingPipeline {
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
     ) -> Result<()> {
-        let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
-        // Clone current genotypes to use as a frozen reference panel
         let ref_geno = geno.clone();
         let ref_view = GenotypeView::from((&ref_geno, markers));
 
-        // Build PBWT for dynamic state selection (using current phased genotypes)
-        let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
+        // Build bidirectional PBWT for better state selection around recombination hotspots
+        let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps);
 
         // Collect phase decisions per sample for markers AFTER overlap region
         type PhaseDecision = (usize, bool, f64); // (marker_idx, should_swap, log_lr)
@@ -1104,7 +1175,7 @@ impl PhasingPipeline {
 
                 // Use midpoint marker for PBWT-based state selection
                 let mid_marker = n_markers / 2;
-                let states = self.select_states_pbwt(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
+                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
 
                 // Extract current alleles from SamplePhase
                 let seq1: Vec<u8> = (0..n_markers).map(|m| sp.allele1(m)).collect();
@@ -1264,7 +1335,6 @@ impl PhasingPipeline {
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        _missing_mask: &[BitBox<u8, Lsb0>],
         stage1_p_recomb: &[f32],
         stage1_gen_dists: &[f64],
         hi_freq_to_orig: &[usize],
@@ -1274,7 +1344,6 @@ impl PhasingPipeline {
         iteration: usize,
     ) -> Result<()> {
         let n_haps = geno.n_haps();
-        let n_markers = geno.n_markers();
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
@@ -1286,8 +1355,9 @@ impl PhasingPipeline {
             subset: hi_freq_to_orig,
         };
 
-        // 2. Build PBWT for dynamic state selection (using current phased genotypes)
-        let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
+        // 2. Build bidirectional PBWT on high-frequency markers only
+        // This ensures divergence metrics align with HMM marker space
+        let phase_ibs = self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps);
 
         // Collect phase decisions per sample: Vec<(hi_freq_idx, swap, lr)>
         type PhaseDecision = (usize, bool, f64); // (hi_freq_idx, should_swap, log_lr)
@@ -1298,10 +1368,9 @@ impl PhasingPipeline {
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
 
-                // Use midpoint marker for PBWT-based state selection
+                // Use midpoint of subset marker space for state selection
                 let mid_marker = hi_freq_to_orig.len() / 2;
-                let mid_orig = hi_freq_to_orig.get(mid_marker).copied().unwrap_or(0);
-                let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
+                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
 
                 // Extract alleles from SamplePhase for SUBSET of markers
                 let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
@@ -1540,8 +1609,9 @@ impl PhasingPipeline {
             subset: hi_freq_markers,
         };
 
-        // Build PBWT for state selection
-        let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
+        // Build bidirectional PBWT on hi-freq markers for consistent state selection
+        // This aligns PBWT divergence with the HMM marker space
+        let phase_ibs = self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps);
 
         // Process samples in parallel - collect results: (marker, should_swap)
         // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
@@ -1552,10 +1622,9 @@ impl PhasingPipeline {
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
 
-                // Select HMM states using PBWT
+                // Select HMM states using bidirectional PBWT on subset marker space
                 let mid_marker = n_stage1 / 2;
-                let mid_orig = hi_freq_markers.get(mid_marker).copied().unwrap_or(0);
-                let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, 0);
+                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, 0);
                 let n_states = states.len();
 
                 // Extract Stage 1 alleles from SamplePhase
@@ -1580,9 +1649,7 @@ impl PhasingPipeline {
                 // Collect phase decisions for this sample
                 let mut phase_decisions = Vec::new();
 
-                // Helper closure to process a marker
                 let mut process_marker = |m: usize| {
-                    // **KEY FIX**: Only process if marker is UNPHASED
                     if !sp.is_unphased(m) {
                         return;
                     }

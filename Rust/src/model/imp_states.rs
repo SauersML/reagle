@@ -773,19 +773,17 @@ impl<'a> ImpStates<'a> {
         // Create CodedPbwtView from workspace buffers
         let n_ref_haps = self.ref_panel.n_haps();
         let n_steps = self.ref_panel.n_steps();
-        let n_ibs_haps = 8; // Default value
+        let n_ibs_haps = self.n_ibs_haps;
         workspace.resize_with_ref(self.max_states, self.n_markers, n_ref_haps);
 
         // Store backward IBS haps for each step (to use during forward pass)
         let mut bwd_ibs_per_step: Vec<Vec<u32>> = vec![Vec::new(); n_steps];
 
-        // STEP 1: Build backward PBWT by processing steps in REVERSE order
-        // This allows finding haplotypes that match well going forward from each position
         {
-            // Create backward PBWT view
-            let mut pbwt_bwd = CodedPbwtView::new(
+            let mut pbwt_bwd = CodedPbwtView::new_backward(
                 &mut workspace.pbwt_prefix_bwd[..n_ref_haps],
                 &mut workspace.pbwt_divergence_bwd[..n_ref_haps + 1],
+                n_steps,
             );
 
             for step_idx in (0..n_steps).rev() {
@@ -793,8 +791,7 @@ impl<'a> ImpStates<'a> {
                 let step_start = self.coded_steps.step_start(step_idx);
                 let step_end = self.coded_steps.step_end(step_idx);
 
-                // Update backward PBWT (use legacy method since we don't have scratch access here)
-                pbwt_bwd.update(coded_step);
+                pbwt_bwd.update_backward(coded_step, n_steps);
 
                 // Extract target alleles for this step range
                 let target_seq: Vec<u8> = (step_start..step_end)

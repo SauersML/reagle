@@ -557,7 +557,6 @@ impl<'a> LiStephensHmm<'a> {
     /// * `target_alleles` - Alleles of the target haplotype
     /// * `gen_dists` - Genetic distances between markers (in cM)
     /// * `estimates` - Estimates structure to accumulate results
-    #[allow(dead_code)]
     pub fn collect_stats(
         &self,
         target_alleles: &[u8],
@@ -1026,7 +1025,7 @@ mod tests {
     #[test]
     fn test_hmm_forward_backward() {
         let ref_panel = make_test_ref_panel();
-        let params = ModelParams::for_phasing(6);
+        let params = ModelParams::for_phasing(6, 10000.0, None);
         let ref_haps: Vec<HapIdx> = (0..6).map(|i| HapIdx::new(i)).collect();
         let p_recomb = vec![0.0, 0.01, 0.01, 0.01, 0.01];
 
@@ -1054,7 +1053,7 @@ mod tests {
     #[test]
     fn test_dosage_computation() {
         let ref_panel = make_test_ref_panel();
-        let params = ModelParams::for_phasing(6);
+        let params = ModelParams::for_phasing(6, 10000.0, None);
         let ref_haps: Vec<HapIdx> = (0..6).map(|i| HapIdx::new(i)).collect();
         let p_recomb = vec![0.0, 0.01, 0.01, 0.01, 0.01];
 

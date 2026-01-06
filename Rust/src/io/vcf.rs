@@ -746,9 +746,9 @@ impl VcfWriter {
     /// * `quality` - Per-marker imputation quality statistics
     /// * `start` - Start marker index (inclusive)
     /// * `end` - End marker index (exclusive)
-    pub fn write_imputed_with_quality(
+    pub fn write_imputed_with_quality<S: PhaseState>(
         &mut self,
-        matrix: &GenotypeMatrix,
+        matrix: &GenotypeMatrix<S>,
         dosages: &[f32],
         quality: &ImputationQuality,
         start: usize,
@@ -846,9 +846,9 @@ impl VcfWriter {
     /// * `end` - End marker index (exclusive)
     /// * `include_gp` - Include GP field (genotype probabilities P(0/0), P(0/1), P(1/1))
     /// * `include_ap` - Include AP1/AP2 fields (per-haplotype allele probabilities)
-    pub fn write_imputed_with_probs(
+    pub fn write_imputed_with_probs<S: PhaseState>(
         &mut self,
-        matrix: &GenotypeMatrix,
+        matrix: &GenotypeMatrix<S>,
         dosages: &[f32],
         allele_probs: Option<&[f32]>,
         quality: &ImputationQuality,

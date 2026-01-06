@@ -64,3 +64,12 @@ impl From<noodles::vcf::header::ParseError> for ReagleError {
         }
     }
 }
+
+// Convert anyhow::Error to ReagleError (for BREF3 reader compatibility)
+impl From<anyhow::Error> for ReagleError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Vcf {
+            message: err.to_string(),
+        }
+    }
+}

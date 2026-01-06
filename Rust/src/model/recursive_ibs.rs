@@ -28,12 +28,6 @@ pub struct RecursiveIbs {
     n_ref_haps: usize,
     /// Number of target haplotypes
     n_targ_haps: usize,
-    /// Total haplotypes (ref + target)
-    n_haps: usize,
-    /// Random seed for reproducibility
-    seed: u64,
-    /// Number of steps to merge for IBS matching
-    n_steps_to_merge: usize,
     /// Target number of haplotypes per step
     n_haps_per_step: usize,
     /// Precomputed IBS haplotypes: ibs_haps[step][target_hap] -> Vec<ref_hap>
@@ -80,9 +74,6 @@ impl RecursiveIbs {
         Self {
             n_ref_haps,
             n_targ_haps,
-            n_haps,
-            seed,
-            n_steps_to_merge,
             n_haps_per_step,
             ibs_haps,
         }

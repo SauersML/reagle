@@ -71,13 +71,16 @@ impl ModelParams {
     ///
     /// # Arguments
     /// * `n_haps` - Total number of haplotypes (target + reference)
-    pub fn for_phasing(n_haps: usize) -> Self {
-        let ne = 1_000_000u64;
+    /// * `ne` - Effective population size (from CLI or default)
+    /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
+    pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne as f32 / n_haps as f32;
+        let recomb_intensity = 0.04 * ne / n_haps as f32;
+
+        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
         Self {
-            p_mismatch: Self::li_stephens_p_mismatch(n_haps),
+            p_mismatch,
             recomb_intensity,
             n_states: Self::DEFAULT_PHASE_STATES.min(n_haps.saturating_sub(2)),
             n_haps,
@@ -92,10 +95,15 @@ impl ModelParams {
     ///
     /// # Arguments
     /// * `n_ref_haps` - Number of reference haplotypes
-    pub fn for_imputation(n_ref_haps: usize) -> Self {
+    /// * `ne` - Effective population size (from CLI or default)
+    /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
+    pub fn for_imputation(n_ref_haps: usize, ne: f32, err: Option<f32>) -> Self {
+        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_ref_haps));
+        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+
         Self {
-            p_mismatch: Self::li_stephens_p_mismatch(n_ref_haps),
-            recomb_intensity: 1.0,
+            p_mismatch,
+            recomb_intensity,
             n_states: Self::DEFAULT_IMP_STATES.min(n_ref_haps),
             n_haps: n_ref_haps,
             burnin: 0,
@@ -359,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_recomb_intensity_formula() {
-        let params = ModelParams::for_phasing(1000);
+        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
         // Should be 0.04 * 1_000_000 / 1000 = 40.0
         let expected = 0.04 * 1_000_000.0 / 1000.0;
@@ -368,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_p_recomb() {
-        let params = ModelParams::for_phasing(1000);
+        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
         // No distance -> no recomb
         let p0 = params.p_recomb(0.0);
@@ -385,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_lr_threshold_for_iteration() {
-        let params = ModelParams::for_phasing(1000);
+        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
         // Burnin: infinity
         for it in 0..params.burnin {

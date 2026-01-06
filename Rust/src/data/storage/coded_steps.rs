@@ -39,7 +39,7 @@ impl CodedStep {
     /// OPTIMIZATION: Uses a reusable scratch buffer to avoid allocating a new Vec<u8>
     /// for every haplotype. Only unique patterns are allocated and stored.
     /// This reduces heap allocations from O(n_haps * n_steps) to O(n_unique_patterns).
-    pub fn new(gt: &GenotypeMatrix, start: usize, end: usize) -> Self {
+    pub fn new<S: PhaseState>(gt: &GenotypeMatrix<S>, start: usize, end: usize) -> Self {
         let n_haps = gt.n_haplotypes();
         let n_markers = end - start;
 
@@ -209,7 +209,7 @@ pub struct RefPanelCoded {
 
 impl RefPanelCoded {
     /// Create coded reference panel from genotype matrix
-    pub fn new(gt: &GenotypeMatrix, step_starts: &[usize]) -> Self {
+    pub fn new<S: PhaseState>(gt: &GenotypeMatrix<S>, step_starts: &[usize]) -> Self {
         let n_markers = gt.n_markers();
         let n_haps = gt.n_haplotypes();
 
@@ -228,7 +228,7 @@ impl RefPanelCoded {
     }
 
     /// Create from genetic positions with default step size
-    pub fn from_gen_positions(gt: &GenotypeMatrix, gen_positions: &[f64], step_cm: f64) -> Self {
+    pub fn from_gen_positions<S: PhaseState>(gt: &GenotypeMatrix<S>, gen_positions: &[f64], step_cm: f64) -> Self {
         let step_starts = compute_step_starts(gen_positions, step_cm);
         Self::new(gt, &step_starts)
     }
@@ -488,13 +488,24 @@ pub struct CodedPbwtView<'a> {
 }
 
 impl<'a> CodedPbwtView<'a> {
-    /// Create PBWT view from workspace buffers
+    /// Create forward PBWT view from workspace buffers
     pub fn new(prefix: &'a mut [u32], divergence: &'a mut [i32]) -> Self {
-        // Initialize prefix to identity permutation
         for (i, p) in prefix.iter_mut().enumerate() {
             *p = i as u32;
         }
         divergence.fill(0);
+
+        Self { prefix, divergence }
+    }
+
+    /// Create backward PBWT view from workspace buffers
+    ///
+    /// Initializes divergence to n_steps (end of chromosome) for min-aggregation
+    pub fn new_backward(prefix: &'a mut [u32], divergence: &'a mut [i32], n_steps: usize) -> Self {
+        for (i, p) in prefix.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        divergence.fill(n_steps as i32);
 
         Self { prefix, divergence }
     }
@@ -609,9 +620,44 @@ impl<'a> CodedPbwtView<'a> {
         }
     }
 
+    /// Backward update PBWT with a coded step
+    ///
+    /// For backward PBWT, divergence represents where the match ENDS (not starts).
+    /// We use min aggregation instead of max, and initialize with end-of-chromosome.
+    pub fn update_backward(&mut self, step: &CodedStep, n_steps: usize) {
+        let n_haps = self.prefix.len();
+        let n_patterns = step.n_patterns();
+
+        let mut buckets: Vec<Vec<(u32, i32)>> = vec![Vec::new(); n_patterns.max(1)];
+
+        for i in 0..n_haps {
+            let hap = self.prefix[i];
+            let div = self.divergence[i];
+            let pattern = step.pattern(HapIdx::new(hap)) as usize;
+            if pattern < buckets.len() {
+                buckets[pattern].push((hap, div));
+            }
+        }
+
+        let mut idx = 0;
+        let step_end = n_steps as i32;
+
+        for bucket in &buckets {
+            let bucket_start = idx;
+            for &(hap, div) in bucket {
+                self.prefix[idx] = hap;
+                self.divergence[idx] = if idx == bucket_start {
+                    step_end.min(div)
+                } else {
+                    div
+                };
+                idx += 1;
+            }
+        }
+    }
+
     /// Find IBS haplotypes for a target pattern at current step
     pub fn find_ibs(&self, target_pattern: u16, step: &CodedStep, n_matches: usize) -> Vec<HapIdx> {
-        // Find position of a haplotype with target pattern
         let mut target_pos = None;
         for (i, &hap) in self.prefix.iter().enumerate() {
             if step.pattern(HapIdx::new(hap)) == target_pattern {
@@ -625,7 +671,6 @@ impl<'a> CodedPbwtView<'a> {
             None => self.prefix.len() / 2,
         };
 
-        // Expand from target position
         let mut result = Vec::with_capacity(n_matches);
         let mut left = target_pos;
         let mut right = target_pos + 1;

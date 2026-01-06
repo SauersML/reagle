@@ -6,4 +6,3 @@
 pub mod bref3;
 pub mod streaming;
 pub mod vcf;
-pub mod window;

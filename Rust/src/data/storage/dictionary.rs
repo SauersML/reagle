@@ -5,7 +5,6 @@
 
 use bitvec::prelude::*;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::data::HapIdx;
 

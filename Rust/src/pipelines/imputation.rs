@@ -13,16 +13,16 @@
 
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
-use crate::data::storage::phase_state::PhaseState;
+use crate::data::storage::phase_state::{PhaseState, Phased};
 use crate::data::storage::coded_steps::RefPanelCoded;
 use crate::error::Result;
+use crate::io::bref3::Bref3Reader;
 use crate::io::vcf::{ImputationQuality, VcfReader, VcfWriter};
 use crate::utils::workspace::ImpWorkspace;
 
@@ -354,12 +354,21 @@ impl ImputationPipeline {
         let target_samples = target_reader.samples_arc();
         let target_gt = target_reader.read_all(target_file)?;
 
-        eprintln!("Loading reference VCF...");
+        eprintln!("Loading reference panel...");
         let ref_path = self.config.r#ref.as_ref().ok_or_else(|| {
             crate::error::ReagleError::config("Reference panel required for imputation")
         })?;
-        let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
-        let ref_gt = ref_reader.read_all(ref_file)?;
+
+        // Detect file format by extension and load accordingly
+        let ref_gt: GenotypeMatrix<Phased> = if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
+            eprintln!("  Detected BREF3 format");
+            let reader = Bref3Reader::open(ref_path)?;
+            reader.read_all()?
+        } else {
+            eprintln!("  Detected VCF format");
+            let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
+            ref_reader.read_all(ref_file)?.into_phased()
+        };
 
         if target_gt.n_markers() == 0 || ref_gt.n_markers() == 0 {
             return Ok(());
@@ -407,8 +416,8 @@ impl ImputationPipeline {
             n_genotyped, n_ref_markers
         );
 
-        // Initialize parameters
-        self.params = ModelParams::for_imputation(n_ref_haps);
+        // Initialize parameters with CLI config
+        self.params = ModelParams::for_imputation(n_ref_haps, self.config.ne, self.config.err);
         self.params
             .set_n_states(self.config.imp_states.min(n_ref_haps));
 
@@ -501,9 +510,11 @@ impl ImputationPipeline {
             8, // n_haps_per_step (default from Java Beagle)
         );
         eprintln!(
-            "  {} steps, {} IBS haps per step",
+            "  {} steps, {} IBS haps per step, {} ref haps, {} target haps",
             recursive_ibs.n_steps(),
-            recursive_ibs.n_haps_per_step()
+            recursive_ibs.n_haps_per_step(),
+            recursive_ibs.n_ref_haps(),
+            recursive_ibs.n_targ_haps()
         );
 
         eprintln!("Running imputation with dynamic state selection...");
@@ -581,70 +592,121 @@ impl ImputationPipeline {
                 1 + marker.alt_alleles.len()
             })
             .collect();
-        let quality = Mutex::new(ImputationQuality::new(&n_alleles_per_marker));
+        let mut quality = ImputationQuality::new(&n_alleles_per_marker);
 
         // Mark imputed markers (those not in target)
         for m in 0..n_ref_markers {
             let is_imputed = !alignment.is_genotyped(m);
-            quality.lock().unwrap().set_imputed(m, is_imputed);
+            quality.set_imputed(m, is_imputed);
         }
 
-        // Compute dosages at all reference markers (including ungenotyped)
-        // Also accumulate quality statistics
-        let sample_dosages: Vec<Vec<f32>> = (0..n_target_samples)
+        // Check if we need per-haplotype allele probabilities for AP/GP output
+        let need_allele_probs = self.config.ap || self.config.gp;
+
+        // Compute dosages per sample (parallel, no locks)
+        // Each sample returns: (dosages, allele_probs, quality_contributions)
+        // where quality_contributions = Vec<(marker_idx, probs1, probs2)> for biallelic sites
+        type QualityContrib = (usize, [f32; 2], [f32; 2]); // (marker, probs1, probs2)
+        let sample_results: Vec<(Vec<f32>, Option<Vec<f32>>, Vec<QualityContrib>)> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
                 let hap1_probs = &state_probs[s * 2];
                 let hap2_probs = &state_probs[s * 2 + 1];
 
-                let dosages: Vec<f32> = (0..n_ref_markers)
-                    .map(|m| {
-                        let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
-                            ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
-                        };
+                let mut dosages: Vec<f32> = Vec::with_capacity(n_ref_markers);
+                let mut allele_probs: Option<Vec<f32>> = if need_allele_probs {
+                    Some(Vec::with_capacity(n_ref_markers * 2))
+                } else {
+                    None
+                };
+                let mut quality_contribs: Vec<QualityContrib> = Vec::new();
 
-                        let d1 = hap1_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
-                        let d2 = hap2_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
+                for m in 0..n_ref_markers {
+                    let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
+                        ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
+                    };
 
-                        // For biallelic sites, convert dosage to allele probabilities for DR2
-                        // d1 = P(ALT) for hap1, d2 = P(ALT) for hap2
-                        let n_alleles = n_alleles_per_marker[m];
-                        if n_alleles == 2 {
-                            let probs1 = vec![1.0 - d1, d1];
-                            let probs2 = vec![1.0 - d2, d2];
-                            if let Ok(mut q) = quality.lock() {
-                                if let Some(stats) = q.get_mut(m) {
-                                    stats.add_sample(&probs1, &probs2);
-                                }
-                            }
-                        }
+                    let d1 = hap1_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
+                    let d2 = hap2_probs.interpolated_dosage(m, &alignment, &get_ref_allele);
 
-                        d1 + d2
-                    })
-                    .collect();
+                    // For biallelic sites, record contributions for DR2 calculation
+                    let n_alleles = n_alleles_per_marker[m];
+                    if n_alleles == 2 {
+                        quality_contribs.push((m, [1.0 - d1, d1], [1.0 - d2, d2]));
+                    }
 
-                dosages
+                    dosages.push(d1 + d2);
+
+                    // Store per-haplotype allele probabilities if needed
+                    if let Some(ref mut ap) = allele_probs {
+                        ap.push(d1); // P(ALT) for hap1
+                        ap.push(d2); // P(ALT) for hap2
+                    }
+                }
+
+                (dosages, allele_probs, quality_contribs)
             })
             .collect();
+
+        // Serial reduction: accumulate all quality contributions (fast, no contention)
+        for (_, _, quality_contribs) in &sample_results {
+            for &(m, probs1, probs2) in quality_contribs {
+                if let Some(stats) = quality.get_mut(m) {
+                    stats.add_sample(&probs1, &probs2);
+                }
+            }
+        }
 
         // Flatten dosages for output (marker-major order for the writer)
         // Reorder from [sample][marker] to [marker][sample]
         let mut flat_dosages: Vec<f32> = Vec::with_capacity(n_ref_markers * n_target_samples);
         for m in 0..n_ref_markers {
             for s in 0..n_target_samples {
-                flat_dosages.push(sample_dosages[s][m]);
+                flat_dosages.push(sample_results[s].0[m]);
             }
         }
 
-        // Get quality stats
-        let quality = quality.into_inner().unwrap();
+        // Flatten allele probabilities if needed
+        // Layout: [marker][sample*2 + hap_offset] -> P(ALT) for that haplotype
+        let flat_allele_probs: Option<Vec<f32>> = if need_allele_probs {
+            let mut probs = Vec::with_capacity(n_ref_markers * n_target_samples * 2);
+            for m in 0..n_ref_markers {
+                for s in 0..n_target_samples {
+                    if let Some(ref ap) = sample_results[s].1 {
+                        probs.push(ap[m * 2]);     // hap1
+                        probs.push(ap[m * 2 + 1]); // hap2
+                    }
+                }
+            }
+            Some(probs)
+        } else {
+            None
+        };
+
+
+        // quality is already owned - no mutex unwrapping needed
 
         // Write output with quality metrics
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples)?;
         writer.write_header_imputed(ref_gt.markers())?;
-        writer.write_imputed_with_quality(&ref_gt, &flat_dosages, &quality, 0, n_ref_markers)?;
+
+        // Use appropriate writer method based on AP/GP flags
+        if need_allele_probs {
+            writer.write_imputed_with_probs(
+                &ref_gt,
+                &flat_dosages,
+                flat_allele_probs.as_deref(),
+                &quality,
+                0,
+                n_ref_markers,
+                self.config.gp,
+                self.config.ap,
+            )?;
+        } else {
+            writer.write_imputed_with_quality(&ref_gt, &flat_dosages, &quality, 0, n_ref_markers)?;
+        }
         writer.flush()?;
 
         eprintln!("Imputation complete!");
