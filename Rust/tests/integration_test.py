@@ -13,6 +13,13 @@ Requirements:
 - bcftools, tabix
 - Java 11+ (for Beagle)
 - Reagle binary (cargo build --release)
+
+Usage:
+  python integration_test.py              # Run all stages
+  python integration_test.py prepare      # Download data and prepare VCFs
+  python integration_test.py beagle       # Run Beagle imputation only
+  python integration_test.py reagle       # Run Reagle imputation only
+  python integration_test.py metrics      # Calculate metrics only
 """
 
 import os
@@ -23,6 +30,7 @@ import gzip
 from pathlib import Path
 from collections import defaultdict
 import math
+import argparse
 
 
 def run(cmd, check=True, capture=False):
@@ -426,73 +434,82 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     return metrics
 
 
-def main():
-    print("=" * 60)
-    print("Reagle Integration Test - HGDP+1kG Imputation Benchmark")
-    print("=" * 60)
-
-    # Check dependencies
-    check_dependencies()
-
-    # Setup paths
+def get_paths():
+    """Get standard paths used across all stages."""
     script_dir = Path(__file__).parent
     project_dir = script_dir.parent
     data_dir = script_dir / "data"
     os.makedirs(data_dir, exist_ok=True)
+
+    return {
+        'script_dir': script_dir,
+        'project_dir': project_dir,
+        'data_dir': data_dir,
+        'chr22_bcf': data_dir / "hgdp1kg_chr22.bcf",
+        'chr22_vcf': data_dir / "hgdp1kg_chr22.vcf.gz",
+        'gsa_file': data_dir / "GSAv2_hg38.tsv",
+        'beagle_jar': data_dir / "beagle.jar",
+        'reagle_bin': project_dir / "target" / "release" / "reagle",
+        'ref_vcf': data_dir / "ref.vcf.gz",
+        'truth_vcf': data_dir / "truth.vcf.gz",
+        'input_vcf': data_dir / "input.vcf.gz",
+        'gsa_regions': data_dir / "gsa_chr22.regions",
+        'train_file': data_dir / "train_samples.txt",
+        'test_file': data_dir / "test_samples.txt",
+        'beagle_out': data_dir / "beagle_imputed",
+        'reagle_out': data_dir / "reagle_imputed",
+    }
+
+
+def stage_prepare():
+    """Download data and prepare reference/truth/input VCFs."""
+    print("=" * 60)
+    print("STAGE: PREPARE - Download and prepare data")
+    print("=" * 60)
+
+    paths = get_paths()
+
+    # Check dependencies
+    check_dependencies()
 
     # Download HGDP+1kG chr22
     print("\n" + "=" * 60)
     print("Downloading HGDP+1kG chr22...")
     print("=" * 60)
 
-    chr22_bcf = data_dir / "hgdp1kg_chr22.bcf"
-    chr22_vcf = data_dir / "hgdp1kg_chr22.vcf.gz"
-
     download_if_missing(
         "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf",
-        str(chr22_bcf)
+        str(paths['chr22_bcf'])
     )
     download_if_missing(
         "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf.csi",
-        str(chr22_bcf) + ".csi"
+        str(paths['chr22_bcf']) + ".csi"
     )
 
     # Convert BCF to VCF.gz for Java Beagle compatibility
-    if not chr22_vcf.exists():
+    if not paths['chr22_vcf'].exists():
         print("Converting BCF to VCF.gz...")
-        run(f"bcftools view {chr22_bcf} -O z -o {chr22_vcf}")
-        run(f"bcftools index -f {chr22_vcf}")
+        run(f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
+        run(f"bcftools index -f {paths['chr22_vcf']}")
 
     # Download GSA sites
     print("\n" + "=" * 60)
     print("Downloading GSA variant list...")
     print("=" * 60)
 
-    gsa_file = data_dir / "GSAv2_hg38.tsv"
     download_if_missing(
         "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv",
-        str(gsa_file)
+        str(paths['gsa_file'])
     )
 
     # Load GSA sites for chr22
-    gsa_sites = load_gsa_sites(str(gsa_file), chrom="22")
+    gsa_sites = load_gsa_sites(str(paths['gsa_file']), chrom="22")
 
     # Download Beagle
-    beagle_jar = data_dir / "beagle.jar"
     download_if_missing(
         "https://faculty.washington.edu/browning/beagle/beagle.22Jul22.46e.jar",
-        str(beagle_jar)
+        str(paths['beagle_jar'])
     )
-
-    # Find/build Reagle binary
-    reagle_bin = project_dir / "target" / "release" / "reagle"
-    if not reagle_bin.exists():
-        print("\nBuilding Reagle...")
-        try:
-            run(f"cd {project_dir} && cargo build --release")
-        except:
-            print("Warning: Failed to build Reagle")
-            reagle_bin = None
 
     # Split samples
     print("\n" + "=" * 60)
@@ -500,61 +517,142 @@ def main():
     print("=" * 60)
 
     train_file, test_file, train_samples, test_samples = split_samples(
-        str(chr22_vcf), str(data_dir), test_fraction=0.2, seed=42
+        str(paths['chr22_vcf']), str(paths['data_dir']), test_fraction=0.2, seed=42
     )
 
     # Create reference panel (train samples)
-    ref_vcf = str(data_dir / "ref.vcf.gz")
-    if not os.path.exists(ref_vcf):
+    if not paths['ref_vcf'].exists():
         print("Creating reference panel...")
-        run(f"bcftools view -S {train_file} {chr22_vcf} -O z -o {ref_vcf}")
-        run(f"bcftools index -f {ref_vcf}")
+        run(f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
+        run(f"bcftools index -f {paths['ref_vcf']}")
 
     # Create truth (test samples, full density)
-    truth_vcf = str(data_dir / "truth.vcf.gz")
-    if not os.path.exists(truth_vcf):
+    if not paths['truth_vcf'].exists():
         print("Creating truth VCF...")
-        run(f"bcftools view -S {test_file} {chr22_vcf} -O z -o {truth_vcf}")
-        run(f"bcftools index -f {truth_vcf}")
+        run(f"bcftools view -S {test_file} {paths['chr22_vcf']} -O z -o {paths['truth_vcf']}")
+        run(f"bcftools index -f {paths['truth_vcf']}")
 
     # Create input (test samples, downsampled to GSA sites)
-    input_vcf = str(data_dir / "input.vcf.gz")
-    gsa_regions = str(data_dir / "gsa_chr22.regions")
-
-    if not os.path.exists(input_vcf):
+    if not paths['input_vcf'].exists():
         print("Downsampling to GSA sites...")
-        create_regions_file(gsa_sites, gsa_regions)
-        run(f"bcftools view -R {gsa_regions} {truth_vcf} -O z -o {input_vcf}")
-        run(f"bcftools index -f {input_vcf}")
+        create_regions_file(gsa_sites, str(paths['gsa_regions']))
+        run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {paths['input_vcf']}")
+        run(f"bcftools index -f {paths['input_vcf']}")
 
     # Count variants
-    n_truth = run(f"bcftools view -H {truth_vcf} | wc -l", capture=True).stdout.strip()
-    n_input = run(f"bcftools view -H {input_vcf} | wc -l", capture=True).stdout.strip()
+    n_truth = run(f"bcftools view -H {paths['truth_vcf']} | wc -l", capture=True).stdout.strip()
+    n_input = run(f"bcftools view -H {paths['input_vcf']} | wc -l", capture=True).stdout.strip()
     print(f"\nTruth variants: {n_truth}")
     print(f"Input variants (GSA sites): {n_input}")
+    print(f"Reference samples: {len(train_samples)}")
+    print(f"Test samples: {len(test_samples)}")
 
-    # Run imputation
-    print("\n" + "=" * 60)
-    print("Running imputation...")
+    print("\nPrepare stage completed successfully.")
+
+
+def stage_beagle():
+    """Run Beagle imputation only."""
+    print("=" * 60)
+    print("STAGE: BEAGLE - Run Java Beagle imputation")
     print("=" * 60)
 
-    results = {}
+    paths = get_paths()
 
-    # Run Beagle
+    # Verify required files exist
+    for name in ['ref_vcf', 'input_vcf', 'beagle_jar']:
+        if not paths[name].exists():
+            print(f"ERROR: Required file not found: {paths[name]}")
+            print("Run 'prepare' stage first.")
+            sys.exit(1)
+
     print("\n--- Running Java Beagle ---")
-    beagle_out = str(data_dir / "beagle_imputed")
-    beagle_vcf = run_beagle(ref_vcf, input_vcf, beagle_out, str(beagle_jar), nthreads=2)
-    results['beagle'] = beagle_vcf
+    beagle_vcf = run_beagle(
+        str(paths['ref_vcf']),
+        str(paths['input_vcf']),
+        str(paths['beagle_out']),
+        str(paths['beagle_jar']),
+        nthreads=2
+    )
 
-    # Run Reagle
-    if reagle_bin and reagle_bin.exists():
-        print("\n--- Running Reagle ---")
-        reagle_out = str(data_dir / "reagle_imputed")
-        reagle_vcf = run_reagle(ref_vcf, input_vcf, reagle_out, str(reagle_bin))
+    if beagle_vcf and os.path.exists(beagle_vcf):
+        print(f"\nBeagle output: {beagle_vcf}")
+        print("Beagle stage completed successfully.")
+    else:
+        print("\nERROR: Beagle imputation failed!")
+        sys.exit(1)
+
+
+def stage_reagle():
+    """Run Reagle imputation only."""
+    print("=" * 60)
+    print("STAGE: REAGLE - Run Reagle imputation")
+    print("=" * 60)
+
+    paths = get_paths()
+
+    # Verify required files exist
+    for name in ['ref_vcf', 'input_vcf']:
+        if not paths[name].exists():
+            print(f"ERROR: Required file not found: {paths[name]}")
+            print("Run 'prepare' stage first.")
+            sys.exit(1)
+
+    if not paths['reagle_bin'].exists():
+        print(f"ERROR: Reagle binary not found: {paths['reagle_bin']}")
+        print("Build Reagle first with: cargo build --release")
+        sys.exit(1)
+
+    print("\n--- Running Reagle ---")
+    reagle_vcf = run_reagle(
+        str(paths['ref_vcf']),
+        str(paths['input_vcf']),
+        str(paths['reagle_out']),
+        str(paths['reagle_bin'])
+    )
+
+    if reagle_vcf and os.path.exists(reagle_vcf):
+        print(f"\nReagle output: {reagle_vcf}")
+        print("Reagle stage completed successfully.")
+    else:
+        print("\nERROR: Reagle imputation failed!")
+        sys.exit(1)
+
+
+def stage_metrics():
+    """Calculate and compare metrics for both tools."""
+    print("=" * 60)
+    print("STAGE: METRICS - Calculate accuracy metrics")
+    print("=" * 60)
+
+    paths = get_paths()
+
+    # Verify truth exists
+    if not paths['truth_vcf'].exists():
+        print(f"ERROR: Truth VCF not found: {paths['truth_vcf']}")
+        print("Run 'prepare' stage first.")
+        sys.exit(1)
+
+    # Check for imputed files
+    results = {}
+    beagle_vcf = str(paths['beagle_out']) + ".vcf.gz"
+    reagle_vcf = str(paths['reagle_out']) + ".vcf.gz"
+
+    if os.path.exists(beagle_vcf):
+        results['beagle'] = beagle_vcf
+    else:
+        print(f"Warning: Beagle output not found: {beagle_vcf}")
+        results['beagle'] = None
+
+    if os.path.exists(reagle_vcf):
         results['reagle'] = reagle_vcf
     else:
-        print("\n--- Skipping Reagle (binary not available) ---")
+        print(f"Warning: Reagle output not found: {reagle_vcf}")
         results['reagle'] = None
+
+    if not any(results.values()):
+        print("\nERROR: No imputed files found!")
+        print("Run 'beagle' and/or 'reagle' stages first.")
+        sys.exit(1)
 
     # Calculate metrics
     print("\n" + "=" * 60)
@@ -567,20 +665,32 @@ def main():
         print(f"{name.upper()} RESULTS")
         print(f"{'=' * 50}")
         if vcf and os.path.exists(vcf):
-            metrics = calculate_metrics(truth_vcf, vcf, str(data_dir / f"{name}_metrics"))
+            metrics = calculate_metrics(
+                str(paths['truth_vcf']),
+                vcf,
+                str(paths['data_dir'] / f"{name}")
+            )
             all_metrics[name] = metrics
         else:
             print(f"{name} output not found")
             all_metrics[name] = None
 
+    # Load sample counts
+    n_train = 0
+    n_test = 0
+    if paths['train_file'].exists():
+        with open(paths['train_file']) as f:
+            n_train = len([l for l in f if l.strip()])
+    if paths['test_file'].exists():
+        with open(paths['test_file']) as f:
+            n_test = len([l for l in f if l.strip()])
+
     # Final summary
     print("\n" + "=" * 60)
     print("FINAL SUMMARY")
     print("=" * 60)
-    print(f"Reference panel: {len(train_samples)} samples")
-    print(f"Test panel: {len(test_samples)} samples")
-    print(f"Truth variants: {n_truth}")
-    print(f"Input (GSA) variants: {n_input}")
+    print(f"Reference panel: {n_train} samples")
+    print(f"Test panel: {n_test} samples")
     print()
 
     for name, metrics in all_metrics.items():
@@ -596,10 +706,77 @@ def main():
 
     # Exit with appropriate code
     if not any(m for m in all_metrics.values()):
-        print("\nERROR: All tools failed!")
+        print("\nERROR: All metrics calculations failed!")
         sys.exit(1)
 
-    print("\nIntegration test completed successfully.")
+    print("\nMetrics stage completed successfully.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Reagle Integration Test - HGDP+1kG Imputation Benchmark",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Stages:
+  prepare   Download data and prepare reference/truth/input VCFs
+  beagle    Run Java Beagle imputation (requires prepare)
+  reagle    Run Reagle imputation (requires prepare + build)
+  metrics   Calculate and compare accuracy metrics (requires imputation)
+  all       Run all stages sequentially (default)
+
+Examples:
+  python integration_test.py              # Run all stages
+  python integration_test.py prepare      # Just prepare data
+  python integration_test.py beagle       # Just run Beagle
+  python integration_test.py metrics      # Just calculate metrics
+        """
+    )
+    parser.add_argument(
+        'stage',
+        nargs='?',
+        default='all',
+        choices=['all', 'prepare', 'beagle', 'reagle', 'metrics'],
+        help='Stage to run (default: all)'
+    )
+
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("Reagle Integration Test - HGDP+1kG Imputation Benchmark")
+    print("=" * 60)
+
+    if args.stage == 'prepare':
+        stage_prepare()
+    elif args.stage == 'beagle':
+        stage_beagle()
+    elif args.stage == 'reagle':
+        stage_reagle()
+    elif args.stage == 'metrics':
+        stage_metrics()
+    elif args.stage == 'all':
+        # Run all stages sequentially
+        stage_prepare()
+
+        paths = get_paths()
+
+        # Build Reagle if needed
+        if not paths['reagle_bin'].exists():
+            print("\nBuilding Reagle...")
+            try:
+                run(f"cd {paths['project_dir']} && cargo build --release")
+            except:
+                print("Warning: Failed to build Reagle")
+
+        stage_beagle()
+
+        if paths['reagle_bin'].exists():
+            stage_reagle()
+        else:
+            print("\n--- Skipping Reagle (binary not available) ---")
+
+        stage_metrics()
+
+        print("\nIntegration test completed successfully.")
 
 
 if __name__ == "__main__":
