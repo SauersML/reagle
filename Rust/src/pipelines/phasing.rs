@@ -2156,6 +2156,27 @@ impl PhasingPipeline {
                 // Collect phase decisions for this sample
                 let mut phase_decisions = Vec::new();
 
+                // Closure to get allele for any haplotype (target or reference)
+                let get_allele = |marker: usize, hap: usize| -> u8 {
+                    if hap < n_haps {
+                        // Target haplotype
+                        ref_geno.get(marker, HapIdx::new(hap as u32))
+                    } else {
+                        // Reference haplotype
+                        let ref_h = hap - n_haps;
+                        if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                            if let Some(ref_m) = alignment.target_to_ref(marker) {
+                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                alignment.reverse_map_allele(marker, ref_allele)
+                            } else {
+                                255 // Missing - marker not in reference
+                            }
+                        } else {
+                            255 // No reference panel
+                        }
+                    }
+                };
+
                 let mut process_marker = |m: usize| {
                     if !sp.is_unphased(m) {
                         return;
@@ -2171,10 +2192,10 @@ impl PhasingPipeline {
 
                     // Compute interpolated allele probabilities for each haplotype
                     let al_probs1 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs1, &states, &ref_geno, n_haps, a1, a2,
+                        m, &probs1, &states, &get_allele, a1, a2,
                     );
                     let al_probs2 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs2, &states, &ref_geno, n_haps, a1, a2,
+                        m, &probs2, &states, &get_allele, a1, a2,
                     );
 
                     // p1 = P(hap1 has a1, hap2 has a2)
@@ -2372,16 +2393,18 @@ impl Stage2Phaser {
     /// Following Java Stage2Baum.unscaledAlProbs:
     /// - For each HMM state, interpolate probability from flanking Stage 1 markers
     /// - Accumulate allele probabilities based on reference haplotype alleles
-    fn interpolated_allele_probs(
+    fn interpolated_allele_probs<F>(
         &self,
         marker: usize,
         state_probs: &[Vec<f32>], // [stage1_marker][state]
         states: &[HapIdx],        // HMM state haplotype indices
-        ref_geno: &MutableGenotypes,
-        n_haps: usize,
+        get_allele: &F,           // Closure to get allele for any haplotype
         a1: u8,
         a2: u8,
-    ) -> [f32; 2] {
+    ) -> [f32; 2]
+    where
+        F: Fn(usize, usize) -> u8, // (marker, hap_index) -> allele
+    {
         let mut al_probs = [0.0f32; 2];
 
         let mkr_a = self.prev_stage1_marker[marker];
@@ -2393,17 +2416,15 @@ impl Stage2Phaser {
 
         for (j, &hap_idx) in states.iter().enumerate() {
             let hap = hap_idx.0 as usize;
-            
-            // Get allele from reference haplotype at rare marker
-            let b1 = ref_geno.get(marker, hap_idx);
-            
-            // Get allele from paired haplotype (for het reference haplotypes)
+
+            // Get allele from this haplotype at rare marker (handles both target and reference)
+            let b1 = get_allele(marker, hap);
+
+            // Get allele from paired haplotype (for het handling)
+            // For target: paired_hap = hap ^ 1 (same sample, other haplotype)
+            // For reference: paired_hap = hap ^ 1 (same sample in ref panel)
             let paired_hap = hap ^ 1;
-            let b2 = if paired_hap < n_haps {
-                ref_geno.get(marker, HapIdx::new(paired_hap as u32))
-            } else {
-                b1
-            };
+            let b2 = get_allele(marker, paired_hap);
 
             if b1 == 255 || b2 == 255 {
                 continue;
