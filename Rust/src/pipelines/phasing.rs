@@ -1073,63 +1073,79 @@ impl PhasingPipeline {
                 }
             };
 
-            // Sparse backward pass: only store values at het positions (O(N_hets × K) memory)
-            // For each het, store two vectors: bwd assuming seq1's future, bwd assuming seq2's future
+            // ═══════════════════════════════════════════════════════════════════════
+            // 3-Track Backward Pass with Collapsing at Heterozygotes
+            // ═══════════════════════════════════════════════════════════════════════
+            //
+            // Mathematical Basis:
+            // ───────────────────────────────────────────────────────────────────────
+            // Let G_{1:M} be the sequence of unphased genotypes.
+            // Let Z_m ∈ {1...K} be the hidden state at marker m.
+            // Let φ_m ∈ {0,1} be the phase orientation at het m.
+            //
+            // The backward variable β_m(k) should represent:
+            //   β_m(k) = P(G_{m+1:M} | Z_m = k)
+            //
+            // This is the likelihood of future GENOTYPES, not future haplotype estimates.
+            //
+            // Bug in previous implementation:
+            // ───────────────────────────────────────────────────────────────────────
+            // The old code computed β^(1)_m(k) = P(Ĥ^(1)_{m+1:M} | Z_m = k) where Ĥ^(1)
+            // is the CURRENT haplotype-1 estimate. This conditions on the arbitrary
+            // initial phase assignment, biasing decisions toward preserving random
+            // initialization and preventing proper convergence.
+            //
+            // CORRECT ALGORITHM (Collapsing):
+            // ───────────────────────────────────────────────────────────────────────
+            // At each unphased het (going backward), the phase is AMBIGUOUS relative
+            // to upstream decisions. We must marginalize over this ambiguity:
+            //
+            //   P(G_{m+1:M} | Z_m) = Σ_{φ_{m+1}} P(G_{m+1:M} | Z_m, φ_{m+1}) P(φ_{m+1})
+            //
+            // The 3-track model implements this by COLLAPSING at each het:
+            //   1. Maintain 3 backward tracks: β^(0) (combined), β^(1), β^(2)
+            //   2. At each het position m (going backward):
+            //      a. STORE β^(1) and β^(2) for phase decision (they differ from prev het)
+            //      b. COLLAPSE: β^(1) ← β^(0), β^(2) ← β^(0)
+            //   3. Continue backward with collapsed values
+            //
+            // This ensures:
+            //   - Backward info at het m includes emission at m+1 (one het lookahead)
+            //   - Info from m+2, m+3, ... is MARGINALIZED (same for both tracks)
+            //   - No bias from initial phase assignment
+            // ═══════════════════════════════════════════════════════════════════════
+
             let n_hets = het_positions.len();
             let mut bwd1_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
             let mut bwd2_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
 
-            // Run backward for seq1
             {
                 let init_bwd = 1.0f32 / n_states as f32;
-                let mut bwd = vec![init_bwd; n_states];
+
+                // Three backward tracks (all start equal at the end)
+                let mut bwd0 = vec![init_bwd; n_states]; // Combined track (match-any at hets)
+                let mut bwd1 = vec![init_bwd; n_states]; // Track 1 (emits allele1 at hets)
+                let mut bwd2 = vec![init_bwd; n_states]; // Track 2 (emits allele2 at hets)
+
                 let mut het_rev_idx = n_hets;
 
                 for m in (0..n_markers).rev() {
-                    // Check if this is a het position (going backwards)
-                    if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
+                    let allele1 = seq1[m];
+                    let allele2 = seq2[m];
+                    let is_het = allele1 != 255 && allele2 != 255 && allele1 != allele2;
+
+                    // At het positions: STORE then COLLAPSE
+                    if is_het && het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
                         het_rev_idx -= 1;
-                        bwd1_cache[het_rev_idx].copy_from_slice(&bwd);
-                    }
 
-                    if m > 0 {
-                        // Backward update: bwd[m-1] from bwd[m]
-                        let p_recomb_m = p_recomb.get(m).copied().unwrap_or(0.0);
-                        let shift = p_recomb_m / n_states as f32;
-                        let stay = 1.0 - p_recomb_m;
+                        // Store BEFORE collapsing (tracks differ due to emission at m+1)
+                        bwd1_cache[het_rev_idx].copy_from_slice(&bwd1);
+                        bwd2_cache[het_rev_idx].copy_from_slice(&bwd2);
 
-                        // Compute sum for normalization
-                        let mut bwd_sum = 0.0f32;
-                        for k in 0..n_states {
-                            let ref_al = get_ref_allele(m, k);
-                            let emit = if ref_al == seq1[m] || ref_al == 255 || seq1[m] == 255 {
-                                p_no_err
-                            } else {
-                                p_err
-                            };
-                            bwd[k] *= emit;
-                            bwd_sum += bwd[k];
-                        }
-
-                        // Apply transition (backward direction)
-                        let scale = stay / bwd_sum.max(1e-30);
-                        for k in 0..n_states {
-                            bwd[k] = scale * bwd[k] + shift;
-                        }
-                    }
-                }
-            }
-
-            // Run backward for seq2
-            {
-                let init_bwd = 1.0f32 / n_states as f32;
-                let mut bwd = vec![init_bwd; n_states];
-                let mut het_rev_idx = n_hets;
-
-                for m in (0..n_markers).rev() {
-                    if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
-                        het_rev_idx -= 1;
-                        bwd2_cache[het_rev_idx].copy_from_slice(&bwd);
+                        // COLLAPSE: marginalize over phase ambiguity at this het
+                        // After this, backward info flowing to m-1 is phase-agnostic
+                        bwd1.copy_from_slice(&bwd0);
+                        bwd2.copy_from_slice(&bwd0);
                     }
 
                     if m > 0 {
@@ -1137,21 +1153,61 @@ impl PhasingPipeline {
                         let shift = p_recomb_m / n_states as f32;
                         let stay = 1.0 - p_recomb_m;
 
-                        let mut bwd_sum = 0.0f32;
+                        let mut bwd0_sum = 0.0f32;
+                        let mut bwd1_sum = 0.0f32;
+                        let mut bwd2_sum = 0.0f32;
+
                         for k in 0..n_states {
                             let ref_al = get_ref_allele(m, k);
-                            let emit = if ref_al == seq2[m] || ref_al == 255 || seq2[m] == 255 {
+
+                            // Track 0: Combined emission (match-any at hets)
+                            let emit0 = if is_het {
+                                if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                                    p_no_err
+                                } else {
+                                    p_err
+                                }
+                            } else {
+                                let obs = if allele1 != 255 { allele1 } else { allele2 };
+                                if ref_al == obs || ref_al == 255 || obs == 255 {
+                                    p_no_err
+                                } else {
+                                    p_err
+                                }
+                            };
+
+                            // Track 1: Emits allele1
+                            let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
                                 p_no_err
                             } else {
                                 p_err
                             };
-                            bwd[k] *= emit;
-                            bwd_sum += bwd[k];
+
+                            // Track 2: Emits allele2
+                            let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+
+                            bwd0[k] *= emit0;
+                            bwd1[k] *= emit1;
+                            bwd2[k] *= emit2;
+
+                            bwd0_sum += bwd0[k];
+                            bwd1_sum += bwd1[k];
+                            bwd2_sum += bwd2[k];
                         }
 
-                        let scale = stay / bwd_sum.max(1e-30);
+                        // Apply transition (backward direction) with normalization
+                        let scale0 = stay / bwd0_sum.max(1e-30);
+                        let scale1 = stay / bwd1_sum.max(1e-30);
+                        let scale2 = stay / bwd2_sum.max(1e-30);
+
                         for k in 0..n_states {
-                            bwd[k] = scale * bwd[k] + shift;
+                            bwd0[k] = scale0 * bwd0[k] + shift;
+                            bwd1[k] = scale1 * bwd1[k] + shift;
+                            bwd2[k] = scale2 * bwd2[k] + shift;
                         }
                     }
                 }
@@ -1440,21 +1496,35 @@ impl PhasingPipeline {
                     }
                 };
 
-                // Sparse backward pass: only store values at het positions
+                // ═══════════════════════════════════════════════════════════════════════
+                // 3-TRACK BACKWARD PASS WITH COLLAPSING (see run_phase_baum_iteration)
+                // ═══════════════════════════════════════════════════════════════════════
+                // At each het, we STORE then COLLAPSE to marginalize over phase ambiguity.
+                // This prevents the backward pass from conditioning on random initialization.
                 let n_hets = het_positions.len();
                 let mut bwd1_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
                 let mut bwd2_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
 
-                // Run backward for seq1
                 {
                     let init_bwd = 1.0f32 / n_states as f32;
-                    let mut bwd = vec![init_bwd; n_states];
+                    let mut bwd0 = vec![init_bwd; n_states]; // Combined track
+                    let mut bwd1 = vec![init_bwd; n_states]; // Track 1
+                    let mut bwd2 = vec![init_bwd; n_states]; // Track 2
                     let mut het_rev_idx = n_hets;
 
                     for m in (0..n_markers).rev() {
-                        if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
+                        let allele1 = seq1[m];
+                        let allele2 = seq2[m];
+                        let is_het = allele1 != 255 && allele2 != 255 && allele1 != allele2;
+
+                        // At het positions: STORE then COLLAPSE
+                        if is_het && het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
                             het_rev_idx -= 1;
-                            bwd1_cache[het_rev_idx].copy_from_slice(&bwd);
+                            bwd1_cache[het_rev_idx].copy_from_slice(&bwd1);
+                            bwd2_cache[het_rev_idx].copy_from_slice(&bwd2);
+                            // COLLAPSE: marginalize over phase
+                            bwd1.copy_from_slice(&bwd0);
+                            bwd2.copy_from_slice(&bwd0);
                         }
 
                         if m > 0 {
@@ -1462,58 +1532,57 @@ impl PhasingPipeline {
                             let shift = p_recomb_m / n_states as f32;
                             let stay = 1.0 - p_recomb_m;
 
-                            let mut bwd_sum = 0.0f32;
+                            let mut bwd0_sum = 0.0f32;
+                            let mut bwd1_sum = 0.0f32;
+                            let mut bwd2_sum = 0.0f32;
+
                             for k in 0..n_states {
                                 let ref_al = get_ref_allele(m, k);
-                                let emit = if ref_al == seq1[m] || ref_al == 255 || seq1[m] == 255 {
+
+                                // Track 0: Combined emission
+                                let emit0 = if is_het {
+                                    if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                                        p_no_err
+                                    } else {
+                                        p_err
+                                    }
+                                } else {
+                                    let obs = if allele1 != 255 { allele1 } else { allele2 };
+                                    if ref_al == obs || ref_al == 255 || obs == 255 {
+                                        p_no_err
+                                    } else {
+                                        p_err
+                                    }
+                                };
+
+                                let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
                                     p_no_err
                                 } else {
                                     p_err
                                 };
-                                bwd[k] *= emit;
-                                bwd_sum += bwd[k];
-                            }
 
-                            let scale = stay / bwd_sum.max(1e-30);
-                            for k in 0..n_states {
-                                bwd[k] = scale * bwd[k] + shift;
-                            }
-                        }
-                    }
-                }
-
-                // Run backward for seq2
-                {
-                    let init_bwd = 1.0f32 / n_states as f32;
-                    let mut bwd = vec![init_bwd; n_states];
-                    let mut het_rev_idx = n_hets;
-
-                    for m in (0..n_markers).rev() {
-                        if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
-                            het_rev_idx -= 1;
-                            bwd2_cache[het_rev_idx].copy_from_slice(&bwd);
-                        }
-
-                        if m > 0 {
-                            let p_recomb_m = p_recomb.get(m).copied().unwrap_or(0.0);
-                            let shift = p_recomb_m / n_states as f32;
-                            let stay = 1.0 - p_recomb_m;
-
-                            let mut bwd_sum = 0.0f32;
-                            for k in 0..n_states {
-                                let ref_al = get_ref_allele(m, k);
-                                let emit = if ref_al == seq2[m] || ref_al == 255 || seq2[m] == 255 {
+                                let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
                                     p_no_err
                                 } else {
                                     p_err
                                 };
-                                bwd[k] *= emit;
-                                bwd_sum += bwd[k];
+
+                                bwd0[k] *= emit0;
+                                bwd1[k] *= emit1;
+                                bwd2[k] *= emit2;
+                                bwd0_sum += bwd0[k];
+                                bwd1_sum += bwd1[k];
+                                bwd2_sum += bwd2[k];
                             }
 
-                            let scale = stay / bwd_sum.max(1e-30);
+                            let scale0 = stay / bwd0_sum.max(1e-30);
+                            let scale1 = stay / bwd1_sum.max(1e-30);
+                            let scale2 = stay / bwd2_sum.max(1e-30);
+
                             for k in 0..n_states {
-                                bwd[k] = scale * bwd[k] + shift;
+                                bwd0[k] = scale0 * bwd0[k] + shift;
+                                bwd1[k] = scale1 * bwd1[k] + shift;
+                                bwd2[k] = scale2 * bwd2[k] + shift;
                             }
                         }
                     }
@@ -1836,21 +1905,35 @@ impl PhasingPipeline {
                     }
                 };
 
-                // Sparse backward pass: only store values at het positions
+                // ═══════════════════════════════════════════════════════════════════════
+                // 3-TRACK BACKWARD PASS WITH COLLAPSING (see run_phase_baum_iteration)
+                // ═══════════════════════════════════════════════════════════════════════
+                // At each het, we STORE then COLLAPSE to marginalize over phase ambiguity.
+                // This prevents the backward pass from conditioning on random initialization.
                 let n_hets = het_positions.len();
                 let mut bwd1_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
                 let mut bwd2_cache: Vec<Vec<f32>> = vec![vec![0.0; n_states]; n_hets];
 
-                // Run backward for seq1
                 {
                     let init_bwd = 1.0f32 / n_states as f32;
-                    let mut bwd = vec![init_bwd; n_states];
+                    let mut bwd0 = vec![init_bwd; n_states]; // Combined track
+                    let mut bwd1 = vec![init_bwd; n_states]; // Track 1
+                    let mut bwd2 = vec![init_bwd; n_states]; // Track 2
                     let mut het_rev_idx = n_hets;
 
                     for i in (0..n_hi_freq).rev() {
-                        if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == i {
+                        let allele1 = seq1[i];
+                        let allele2 = seq2[i];
+                        let is_het = allele1 != 255 && allele2 != 255 && allele1 != allele2;
+
+                        // At het positions: STORE then COLLAPSE
+                        if is_het && het_rev_idx > 0 && het_positions[het_rev_idx - 1] == i {
                             het_rev_idx -= 1;
-                            bwd1_cache[het_rev_idx].copy_from_slice(&bwd);
+                            bwd1_cache[het_rev_idx].copy_from_slice(&bwd1);
+                            bwd2_cache[het_rev_idx].copy_from_slice(&bwd2);
+                            // COLLAPSE: marginalize over phase
+                            bwd1.copy_from_slice(&bwd0);
+                            bwd2.copy_from_slice(&bwd0);
                         }
 
                         if i > 0 {
@@ -1858,58 +1941,57 @@ impl PhasingPipeline {
                             let shift = p_recomb_i / n_states as f32;
                             let stay = 1.0 - p_recomb_i;
 
-                            let mut bwd_sum = 0.0f32;
+                            let mut bwd0_sum = 0.0f32;
+                            let mut bwd1_sum = 0.0f32;
+                            let mut bwd2_sum = 0.0f32;
+
                             for k in 0..n_states {
                                 let ref_al = get_ref_allele(i, k);
-                                let emit = if ref_al == seq1[i] || ref_al == 255 || seq1[i] == 255 {
+
+                                // Track 0: Combined emission
+                                let emit0 = if is_het {
+                                    if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                                        p_no_err
+                                    } else {
+                                        p_err
+                                    }
+                                } else {
+                                    let obs = if allele1 != 255 { allele1 } else { allele2 };
+                                    if ref_al == obs || ref_al == 255 || obs == 255 {
+                                        p_no_err
+                                    } else {
+                                        p_err
+                                    }
+                                };
+
+                                let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
                                     p_no_err
                                 } else {
                                     p_err
                                 };
-                                bwd[k] *= emit;
-                                bwd_sum += bwd[k];
-                            }
 
-                            let scale = stay / bwd_sum.max(1e-30);
-                            for k in 0..n_states {
-                                bwd[k] = scale * bwd[k] + shift;
-                            }
-                        }
-                    }
-                }
-
-                // Run backward for seq2
-                {
-                    let init_bwd = 1.0f32 / n_states as f32;
-                    let mut bwd = vec![init_bwd; n_states];
-                    let mut het_rev_idx = n_hets;
-
-                    for i in (0..n_hi_freq).rev() {
-                        if het_rev_idx > 0 && het_positions[het_rev_idx - 1] == i {
-                            het_rev_idx -= 1;
-                            bwd2_cache[het_rev_idx].copy_from_slice(&bwd);
-                        }
-
-                        if i > 0 {
-                            let p_recomb_i = stage1_p_recomb.get(i).copied().unwrap_or(0.0);
-                            let shift = p_recomb_i / n_states as f32;
-                            let stay = 1.0 - p_recomb_i;
-
-                            let mut bwd_sum = 0.0f32;
-                            for k in 0..n_states {
-                                let ref_al = get_ref_allele(i, k);
-                                let emit = if ref_al == seq2[i] || ref_al == 255 || seq2[i] == 255 {
+                                let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
                                     p_no_err
                                 } else {
                                     p_err
                                 };
-                                bwd[k] *= emit;
-                                bwd_sum += bwd[k];
+
+                                bwd0[k] *= emit0;
+                                bwd1[k] *= emit1;
+                                bwd2[k] *= emit2;
+                                bwd0_sum += bwd0[k];
+                                bwd1_sum += bwd1[k];
+                                bwd2_sum += bwd2[k];
                             }
 
-                            let scale = stay / bwd_sum.max(1e-30);
+                            let scale0 = stay / bwd0_sum.max(1e-30);
+                            let scale1 = stay / bwd1_sum.max(1e-30);
+                            let scale2 = stay / bwd2_sum.max(1e-30);
+
                             for k in 0..n_states {
-                                bwd[k] = scale * bwd[k] + shift;
+                                bwd0[k] = scale0 * bwd0[k] + shift;
+                                bwd1[k] = scale1 * bwd1[k] + shift;
+                                bwd2[k] = scale2 * bwd2[k] + shift;
                             }
                         }
                     }

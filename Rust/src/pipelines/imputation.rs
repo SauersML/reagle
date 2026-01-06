@@ -28,7 +28,6 @@ use crate::utils::workspace::ImpWorkspace;
 
 use crate::model::imp_states::ImpStates;
 use crate::model::parameters::ModelParams;
-use crate::model::recursive_ibs::RecursiveIbs;
 
 /// Imputation pipeline
 pub struct ImputationPipeline {
@@ -393,8 +392,36 @@ impl ImputationPipeline {
             .collect();
 
         // Build coded reference panel for efficient PBWT operations
+        //
+        // We build the dictionary using ONLY reference haplotypes.
+        // Do not append target haplotypes to this panel.
+        //
+        // Mathematical basis for this design:
+        // ─────────────────────────────────────────────────────────────────────
+        // Let M_ref be the set of reference markers, M_targ ⊂ M_ref be target markers.
+        // Let C: H → ℕ be the pattern coding function mapping allele sequences to indices.
+        //
+        // If we append target haplotypes with "missing" (255) at M_ref \ M_targ:
+        //   - Reference patterns: ∀m ∈ step, A(h_ref, m) ∈ {0, 1}
+        //   - Target patterns: ∃m ∈ step where A(h_targ, m) = 255
+        //   - Since 255 ≠ 0 and 255 ≠ 1: C(h_ref) ≠ C(h_targ) for any ref/targ pair
+        //   - The pattern sets are DISJOINT: {C(h_ref)} ∩ {C(h_targ)} = ∅
+        //
+        // This causes IBS matching to fail catastrophically:
+        //   1. match_sequence(target_seq) finds the target's own pattern (with 255s)
+        //   2. find_ibs() searches PBWT for ref haps with that pattern
+        //   3. No ref hap has patterns containing 255 → zero matches
+        //   4. Falls back to random selection → imputation accuracy destroyed
+        //
+        // Solution: Keep only reference patterns in the dictionary.
+        // The ImpStates::ibs_states() method uses:
+        //   - PBWT built on reference haplotypes only (n_ref_haps)
+        //   - closest_pattern() which correctly ignores 255s in distance calculation:
+        //       distance = Σ 𝟙[p_i ≠ a_i ∧ p_i ≠ 255 ∧ a_i ≠ 255]
+        //   - This finds the reference pattern that best matches at genotyped positions
+        // ─────────────────────────────────────────────────────────────────────
         eprintln!("Building coded reference panel...");
-        let mut ref_panel_coded = RefPanelCoded::from_gen_positions(
+        let ref_panel_coded = RefPanelCoded::from_gen_positions(
             &ref_gt,
             &ref_gen_positions,
             self.config.imp_step as f64,
@@ -404,38 +431,6 @@ impl ImputationPipeline {
             ref_panel_coded.n_steps(),
             ref_panel_coded.total_patterns(),
             ref_panel_coded.avg_compression_ratio()
-        );
-
-        // Append target haplotypes to coded panel for RecursiveIbs
-        eprintln!("Appending target haplotypes to coded panel...");
-        ref_panel_coded.append_target_haplotypes(
-            &target_gt,
-            alignment.ref_to_target(),
-            |target_m, allele| alignment.map_allele(target_m, allele),
-        );
-        eprintln!(
-            "  Combined panel: {} haplotypes ({} ref + {} target)",
-            ref_panel_coded.n_haps(),
-            n_ref_haps,
-            n_target_haps
-        );
-
-        // Initialize RecursiveIbs for efficient IBS haplotype finding
-        eprintln!("Building recursive IBS index...");
-        let recursive_ibs = RecursiveIbs::new(
-            &ref_panel_coded,
-            n_ref_haps,
-            n_target_haps,
-            self.config.seed as u64,
-            self.config.imp_nsteps,
-            8, // n_haps_per_step (default from Java Beagle)
-        );
-        eprintln!(
-            "  {} steps, {} IBS haps per step, {} ref haps, {} target haps",
-            recursive_ibs.n_steps(),
-            recursive_ibs.n_haps_per_step(),
-            recursive_ibs.n_ref_haps(),
-            recursive_ibs.n_targ_haps()
         );
 
         eprintln!("Running imputation with dynamic state selection...");
