@@ -194,8 +194,11 @@ impl Config {
 
     /// Get the number of threads to use
     pub fn nthreads(&self) -> usize {
-        self.nthreads
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+        self.nthreads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
     }
 
     /// Check if imputation mode (reference panel provided)
@@ -203,4 +206,3 @@ impl Config {
         self.r#ref.is_some()
     }
 }
-

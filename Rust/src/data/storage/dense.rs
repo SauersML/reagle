@@ -125,8 +125,7 @@ impl DenseColumn {
 
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
-        self.bits.as_raw_slice().len() * std::mem::size_of::<u64>()
-            + std::mem::size_of::<Self>()
+        self.bits.as_raw_slice().len() * std::mem::size_of::<u64>() + std::mem::size_of::<Self>()
     }
 
     /// Get raw bits for SIMD operations

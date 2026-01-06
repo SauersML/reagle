@@ -166,10 +166,7 @@ impl Samples {
 
     /// Number of haplotypes (2 per diploid sample, 1 per haploid)
     pub fn n_haps(&self) -> usize {
-        self.is_diploid
-            .iter()
-            .map(|&d| if d { 2 } else { 1 })
-            .sum()
+        self.is_diploid.iter().map(|&d| if d { 2 } else { 1 }).sum()
     }
 
     /// Get sample ID by index

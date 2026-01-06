@@ -53,13 +53,13 @@ fn run() -> Result<()> {
         eprintln!("Mode: Imputation");
         eprintln!("Target: {:?}", config.gt);
         eprintln!("Reference: {:?}", config.r#ref.as_ref().unwrap());
-        
+
         let mut pipeline = ImputationPipeline::new(config);
         pipeline.run()?;
     } else {
         eprintln!("Mode: Phasing");
         eprintln!("Input: {:?}", config.gt);
-        
+
         let mut pipeline = PhasingPipeline::new(config);
         pipeline.run_auto()?;
     }
@@ -83,6 +83,5 @@ mod tests {
         let _ = io::vcf::VcfReader::open;
         let _ = model::parameters::ModelParams::new;
         let _ = pipelines::PhasingPipeline::new;
-
     }
 }

@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use noodles::bgzf;
 
+use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, Markers};
-use crate::data::ChromIdx;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::error::{ReagleError, Result};
 
@@ -103,11 +103,7 @@ pub struct StreamingVcfReader {
 
 impl StreamingVcfReader {
     /// Open a VCF file for streaming
-    pub fn open(
-        path: &Path,
-        gen_maps: GeneticMaps,
-        config: StreamingConfig,
-    ) -> Result<Self> {
+    pub fn open(path: &Path, gen_maps: GeneticMaps, config: StreamingConfig) -> Result<Self> {
         let file = File::open(path)?;
 
         let is_gzipped = path
@@ -229,7 +225,9 @@ impl StreamingVcfReader {
             window_end
         } else {
             // Find overlap point
-            let overlap_gen = self.buffer.get(window_end.saturating_sub(1))
+            let overlap_gen = self
+                .buffer
+                .get(window_end.saturating_sub(1))
                 .map(|m| m.gen_pos - self.config.overlap_cm as f64)
                 .unwrap_or(0.0);
 
@@ -253,12 +251,7 @@ impl StreamingVcfReader {
             columns.push(GenotypeColumn::from_alleles(&bm.alleles, 2));
         }
 
-        let genotypes = GenotypeMatrix::new(
-            markers,
-            columns,
-            Arc::clone(&self.samples),
-            true,
-        );
+        let genotypes = GenotypeMatrix::new(markers, columns, Arc::clone(&self.samples), true);
 
         let window = StreamWindow {
             genotypes,
@@ -366,10 +359,7 @@ impl StreamingVcfReader {
         let ref_allele = Allele::from_str(fields[3]);
 
         // Parse ALT
-        let alt_alleles: Vec<Allele> = fields[4]
-            .split(',')
-            .map(|a| Allele::from_str(a))
-            .collect();
+        let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
 
         // Parse FORMAT to find GT position
         let format = fields[8];
@@ -383,10 +373,7 @@ impl StreamingVcfReader {
         let mut alleles = Vec::with_capacity(n_samples * 2);
 
         for sample_field in fields[9..].iter().take(n_samples) {
-            let gt_field = sample_field
-                .split(':')
-                .nth(gt_idx)
-                .unwrap_or("./.");
+            let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
 
             let (a1, a2) = parse_gt(gt_field);
             alleles.push(a1);
@@ -446,7 +433,6 @@ fn parse_allele_char(s: &str) -> u8 {
     }
     s.parse().unwrap_or(255)
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -134,7 +134,10 @@ impl GenotypeMatrix {
     /// Restrict to specific marker indices
     pub fn restrict_markers(&self, indices: &[usize]) -> Self {
         let markers = Markers::from_vec(
-            indices.iter().map(|&i| self.markers.marker(MarkerIdx::new(i as u32)).clone()).collect(),
+            indices
+                .iter()
+                .map(|&i| self.markers.marker(MarkerIdx::new(i as u32)).clone())
+                .collect(),
             self.markers.chrom_names().to_vec(),
         );
         let columns = indices.iter().map(|&i| self.columns[i].clone()).collect();
@@ -212,12 +215,11 @@ impl GenotypeMatrix {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::marker::Allele;
     use crate::data::ChromIdx;
+    use crate::data::marker::Allele;
 
     fn make_test_matrix() -> GenotypeMatrix {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));

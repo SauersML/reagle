@@ -6,7 +6,7 @@
 use crate::data::HapIdx;
 
 /// Mutable genotype storage for phasing
-/// 
+///
 /// Uses a simple Vec<Vec<u8>> layout for easy mutation.
 /// Less memory-efficient than dense/sparse but allows O(1) updates.
 #[derive(Clone, Debug)]
@@ -103,7 +103,7 @@ impl MutableGenotypes {
     }
 
     /// Swap alleles between two haplotypes for a contiguous range of markers
-    /// 
+    ///
     /// More efficient than swap_range for contiguous segments since it
     /// avoids the overhead of iterating a slice of indices.
     #[inline]
@@ -141,12 +141,12 @@ mod tests {
         assert_eq!(geno.n_markers(), 3);
         assert_eq!(geno.n_haps(), 4);
         assert_eq!(geno.n_samples(), 2);
-        
+
         // Set some values
         geno.set(0, HapIdx::new(0), 1);
         geno.set(1, HapIdx::new(1), 1);
         geno.set(2, HapIdx::new(2), 1);
-        
+
         assert_eq!(geno.get(0, HapIdx::new(0)), 1);
         assert_eq!(geno.get(0, HapIdx::new(1)), 0);
         assert_eq!(geno.get(1, HapIdx::new(1)), 1);
@@ -154,28 +154,24 @@ mod tests {
 
     #[test]
     fn test_swap() {
-        let mut geno = MutableGenotypes::from_fn(3, 4, |_, h| {
-            if h == 0 { 1 } else { 0 }
-        });
-        
+        let mut geno = MutableGenotypes::from_fn(3, 4, |_, h| if h == 0 { 1 } else { 0 });
+
         assert_eq!(geno.get(0, HapIdx::new(0)), 1);
         assert_eq!(geno.get(0, HapIdx::new(1)), 0);
-        
+
         geno.swap(0, HapIdx::new(0), HapIdx::new(1));
-        
+
         assert_eq!(geno.get(0, HapIdx::new(0)), 0);
         assert_eq!(geno.get(0, HapIdx::new(1)), 1);
     }
 
     #[test]
     fn test_haplotype() {
-        let geno = MutableGenotypes::from_fn(5, 2, |m, h| {
-            if h == 0 { m as u8 } else { 0 }
-        });
-        
+        let geno = MutableGenotypes::from_fn(5, 2, |m, h| if h == 0 { m as u8 } else { 0 });
+
         let hap0 = geno.haplotype(HapIdx::new(0));
         assert_eq!(hap0, vec![0, 1, 2, 3, 4]);
-        
+
         let hap1 = geno.haplotype(HapIdx::new(1));
         assert_eq!(hap1, vec![0, 0, 0, 0, 0]);
     }

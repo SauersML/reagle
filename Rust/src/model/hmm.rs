@@ -102,7 +102,7 @@ impl HmmUpdater {
     }
 
     /// Forward update with allele comparison (convenience wrapper)
-    /// 
+    ///
     /// Missing data (allele 255) is treated as uninformative (no emission penalty).
     #[inline]
     pub fn fwd_update_alleles(
@@ -136,7 +136,7 @@ impl HmmUpdater {
     }
 
     /// Backward update with allele comparison (convenience wrapper)
-    /// 
+    ///
     /// Missing data (allele 255) is treated as uninformative (no emission penalty).
     #[inline]
     pub fn bwd_update_alleles(
@@ -412,7 +412,12 @@ impl<'a> LiStephensHmm<'a> {
     }
 
     /// Sample a state path from posterior probabilities
-    fn sample_path(&self, state_probs: &[Vec<f32>], n_markers: usize, n_states: usize) -> Vec<usize> {
+    fn sample_path(
+        &self,
+        state_probs: &[Vec<f32>],
+        n_markers: usize,
+        n_states: usize,
+    ) -> Vec<usize> {
         let mut path = Vec::with_capacity(n_markers);
 
         for m in 0..n_markers {
@@ -445,10 +450,10 @@ impl<'a> LiStephensHmm<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
-    use crate::data::ChromIdx;
     use std::sync::Arc;
 
     fn make_test_ref_panel() -> GenotypeMatrix {

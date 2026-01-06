@@ -19,6 +19,7 @@ pub use sparse::SparseColumn;
 pub use view::GenotypeView;
 
 use crate::data::HapIdx;
+use std::sync::Arc;
 
 /// The core genotype storage enum - replaces Java's class hierarchy
 #[derive(Clone, Debug)]
@@ -33,7 +34,8 @@ pub enum GenotypeColumn {
 
     /// Dictionary-compressed blocks.
     /// For runs of similar haplotype patterns.
-    Dictionary(DictionaryColumn),
+    /// Stores (Shared Dictionary, Marker Offset in Dictionary)
+    Dictionary(Arc<DictionaryColumn>, usize),
 }
 
 impl GenotypeColumn {
@@ -43,7 +45,7 @@ impl GenotypeColumn {
         match self {
             Self::Dense(col) => col.get(hap),
             Self::Sparse(col) => col.get(hap),
-            Self::Dictionary(col) => col.get(0, hap), // Single marker
+            Self::Dictionary(col, offset) => col.get(*offset, hap),
         }
     }
 
@@ -52,7 +54,7 @@ impl GenotypeColumn {
         match self {
             Self::Dense(col) => col.n_haplotypes(),
             Self::Sparse(col) => col.n_haplotypes(),
-            Self::Dictionary(col) => col.n_haplotypes(),
+            Self::Dictionary(col, _) => col.n_haplotypes(),
         }
     }
 
@@ -61,7 +63,7 @@ impl GenotypeColumn {
         match self {
             Self::Dense(col) => col.alt_count(),
             Self::Sparse(col) => col.n_carriers(),
-            Self::Dictionary(col) => col.alt_count(0),
+            Self::Dictionary(col, offset) => col.alt_count(*offset),
         }
     }
 
@@ -81,7 +83,8 @@ impl GenotypeColumn {
         match self {
             Self::Dense(col) => col.size_bytes(),
             Self::Sparse(col) => col.size_bytes(),
-            Self::Dictionary(col) => col.size_bytes(),
+            // Report amortized size per marker to avoid over-counting shared memory
+            Self::Dictionary(col, _) => col.size_bytes() / col.n_markers().max(1),
         }
     }
 
@@ -100,7 +103,7 @@ impl GenotypeColumn {
         if maf < 0.01 && n_alleles == 2 {
             // Determine if we should store ALT or REF carriers (whichever is fewer)
             if alt_count <= n_haps / 2 {
-            let carriers: Vec<HapIdx> = alleles
+                let carriers: Vec<HapIdx> = alleles
                     .iter()
                     .enumerate()
                     .filter(|(_, a)| **a > 0)
@@ -117,7 +120,10 @@ impl GenotypeColumn {
                 Self::Sparse(SparseColumn::from_carriers(carriers, n_haps as u32, true))
             }
         } else {
-            Self::Dense(DenseColumn::from_alleles(alleles.iter().copied(), n_alleles))
+            Self::Dense(DenseColumn::from_alleles(
+                alleles.iter().copied(),
+                n_alleles,
+            ))
         }
     }
 
@@ -126,7 +132,7 @@ impl GenotypeColumn {
         match self {
             Self::Dense(col) => col.bits_per_allele() == 1,
             Self::Sparse(_) => true, // Sparse is always biallelic
-            Self::Dictionary(col) => col.is_biallelic(),
+            Self::Dictionary(col, _) => col.is_biallelic(),
         }
     }
 
@@ -135,7 +141,7 @@ impl GenotypeColumn {
         match self {
             Self::Dense(col) => Box::new(col.iter()),
             Self::Sparse(col) => Box::new(col.iter()),
-            Self::Dictionary(col) => Box::new(col.iter_marker(0)),
+            Self::Dictionary(col, offset) => Box::new(col.iter_marker(*offset)),
         }
     }
 }

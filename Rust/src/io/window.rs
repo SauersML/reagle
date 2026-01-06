@@ -280,7 +280,11 @@ impl<'a> Iterator for SlidingWindowIterator<'a> {
         // Calculate splice points
         let prev_splice = if self.window_num == 0 { 0 } else { start };
         let is_last = end >= n_markers;
-        let overlap_start = if is_last { end } else { self.find_overlap_start(end) };
+        let overlap_start = if is_last {
+            end
+        } else {
+            self.find_overlap_start(end)
+        };
         let next_splice = if is_last { end } else { overlap_start };
 
         // Calculate n_ref_markers from reference panel
@@ -325,10 +329,10 @@ impl<'a> Iterator for SlidingWindowIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
     use crate::data::storage::GenotypeColumn;
-    use crate::data::ChromIdx;
     use std::sync::Arc;
 
     fn make_test_matrix(n_markers: usize) -> GenotypeMatrix {

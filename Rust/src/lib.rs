@@ -29,5 +29,5 @@ pub use error::{ReagleError, Result};
 pub use io::vcf::{VcfReader, VcfWriter};
 pub use model::hmm::LiStephensHmm;
 pub use model::parameters::ModelParams;
-pub use model::pbwt::PbwtUpdater;
+
 pub use pipelines::{ImputationPipeline, PhasingPipeline};

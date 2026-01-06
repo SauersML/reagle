@@ -11,14 +11,12 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use crate::data::marker::{MarkerIdx, Markers};
 use crate::data::ChromIdx;
+use crate::data::marker::{MarkerIdx, Markers};
 use crate::error::{ReagleError, Result};
 
 /// Default scale factor: 1 cM per Mb (1e-6 cM per bp)
 pub const DEFAULT_SCALE_FACTOR: f64 = 1e-6;
-
-
 
 /// A genetic map for interpolating physical positions to genetic distances (cM)
 ///
@@ -96,14 +94,14 @@ impl GeneticMap {
                 continue;
             }
 
-            let pos: u32 = parts[1].parse().map_err(|_| {
-                ReagleError::parse(line_num + 1, "Invalid position")
-            })?;
+            let pos: u32 = parts[1]
+                .parse()
+                .map_err(|_| ReagleError::parse(line_num + 1, "Invalid position"))?;
 
             // Column 3 is rate (ignored), column 4 is genetic position
-            let gen_pos: f64 = parts[3].parse().map_err(|_| {
-                ReagleError::parse(line_num + 1, "Invalid genetic position")
-            })?;
+            let gen_pos: f64 = parts[3]
+                .parse()
+                .map_err(|_| ReagleError::parse(line_num + 1, "Invalid genetic position"))?;
 
             if !gen_pos.is_finite() {
                 return Err(ReagleError::parse(
@@ -269,7 +267,6 @@ impl PositionMap {
         }
     }
 
-
     /// Get genetic position from physical position
     pub fn gen_pos(&self, phys_pos: u32) -> f64 {
         phys_pos as f64 * self.scale_factor
@@ -333,7 +330,10 @@ impl MarkerMap {
         let mut gen_dist = Vec::with_capacity(n);
 
         // First marker
-        let first_pos = markers.get(MarkerIdx::from(0usize)).map(|m| m.pos).unwrap_or(0);
+        let first_pos = markers
+            .get(MarkerIdx::from(0usize))
+            .map(|m| m.pos)
+            .unwrap_or(0);
         gen_pos.push(gen_map.gen_pos(first_pos));
         gen_dist.push(0.0);
 
@@ -417,8 +417,14 @@ impl MarkerMap {
             return MIN_GEN_DIST;
         }
 
-        let first_pos = markers.get(MarkerIdx::from(0usize)).map(|m| m.pos).unwrap_or(0);
-        let last_pos = markers.get(MarkerIdx::from(n - 1)).map(|m| m.pos).unwrap_or(0);
+        let first_pos = markers
+            .get(MarkerIdx::from(0usize))
+            .map(|m| m.pos)
+            .unwrap_or(0);
+        let last_pos = markers
+            .get(MarkerIdx::from(n - 1))
+            .map(|m| m.pos)
+            .unwrap_or(0);
 
         if first_pos == last_pos {
             return MIN_GEN_DIST;
@@ -610,11 +616,7 @@ mod tests {
 
     #[test]
     fn test_extrapolation() {
-        let map = GeneticMap::new(
-            ChromIdx::new(0),
-            vec![1_000_000, 2_000_000],
-            vec![1.0, 2.0],
-        );
+        let map = GeneticMap::new(ChromIdx::new(0), vec![1_000_000, 2_000_000], vec![1.0, 2.0]);
 
         // Before first position
         let before = map.gen_pos(500_000);
@@ -634,11 +636,7 @@ mod tests {
 
     #[test]
     fn test_gen_dist() {
-        let map = GeneticMap::new(
-            ChromIdx::new(0),
-            vec![1_000_000, 2_000_000],
-            vec![0.0, 1.0],
-        );
+        let map = GeneticMap::new(ChromIdx::new(0), vec![1_000_000, 2_000_000], vec![0.0, 1.0]);
 
         assert!((map.gen_dist(1_000_000, 2_000_000) - 1.0).abs() < 0.001);
         assert!((map.gen_dist(1_000_000, 1_500_000) - 0.5).abs() < 0.001);

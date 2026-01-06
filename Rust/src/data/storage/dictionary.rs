@@ -224,6 +224,9 @@ mod tests {
         assert_eq!(dict.get(2, HapIdx::new(2)), 1);
 
         // Hap 0 and 1 should share a pattern
-        assert_eq!(dict.pattern_index(HapIdx::new(0)), dict.pattern_index(HapIdx::new(1)));
+        assert_eq!(
+            dict.pattern_index(HapIdx::new(0)),
+            dict.pattern_index(HapIdx::new(1))
+        );
     }
 }

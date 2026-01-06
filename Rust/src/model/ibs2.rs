@@ -10,11 +10,11 @@
 
 use std::collections::HashMap;
 
+use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::SampleIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
-use crate::data::ChromIdx;
 
 /// Minimum IBS2 segment length in cM
 const MIN_IBS2_CM: f64 = 2.0;
@@ -86,7 +86,14 @@ impl Ibs2 {
         let sample_segs: Vec<Vec<Ibs2Segment>> = (0..n_samples)
             .map(|s| {
                 let sample = SampleIdx::new(s as u32);
-                Self::build_sample_segments(gt, gen_maps, chrom, &marker_positions, &ibs2_sets, sample)
+                Self::build_sample_segments(
+                    gt,
+                    gen_maps,
+                    chrom,
+                    &marker_positions,
+                    &ibs2_sets,
+                    sample,
+                )
             })
             .collect();
 
@@ -142,11 +149,7 @@ impl Ibs2 {
                 let gap_cm = Self::gap_cm(&prev, &next, gen_maps, chrom, marker_positions);
                 if gap_cm <= MAX_IBS2_GAP_CM {
                     // Merge segments
-                    prev = Ibs2Segment::new(
-                        prev.other_sample,
-                        prev.start,
-                        next.incl_end,
-                    );
+                    prev = Ibs2Segment::new(prev.other_sample, prev.start, next.incl_end);
                     continue;
                 }
             }
@@ -227,8 +230,7 @@ impl Ibs2 {
         let b1 = gt.allele(m_idx, s2.hap1());
         let b2 = gt.allele(m_idx, s2.hap2());
 
-        Self::are_phase_consistent(a1, a2, b1, b2)
-            || Self::are_phase_consistent(a1, a2, b2, b1)
+        Self::are_phase_consistent(a1, a2, b1, b2) || Self::are_phase_consistent(a1, a2, b2, b1)
     }
 
     fn are_phase_consistent(a1: u8, a2: u8, b1: u8, b2: u8) -> bool {
@@ -370,8 +372,7 @@ impl Ibs2Sets {
         let n_samples = gt.n_samples();
         let n_info = ibs2_markers.len();
 
-        let mut ibs2_at_marker: Vec<HashMap<(u32, u32), ()>> =
-            vec![HashMap::new(); n_info];
+        let mut ibs2_at_marker: Vec<HashMap<(u32, u32), ()>> = vec![HashMap::new(); n_info];
 
         // For each informative marker, find IBS2 pairs
         for (info_idx, &marker) in ibs2_markers.informative.iter().enumerate() {

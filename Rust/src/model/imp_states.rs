@@ -8,12 +8,12 @@
 //! - PBWT finds IBS matches at each step (marker cluster)
 //! - A priority queue tracks which composite haplotypes to keep/replace
 
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
-use crate::data::storage::coded_steps::{RefPanelCoded, CodedPbwtView};
-use crate::utils::workspace::ImpWorkspace;
+use crate::data::storage::coded_steps::{CodedPbwtView, RefPanelCoded};
 use crate::model::pbwt::PbwtDivUpdater;
+use crate::utils::workspace::ImpWorkspace;
 
 /// A segment of a composite haplotype
 #[derive(Clone, Debug)]
@@ -269,8 +269,13 @@ impl ImpIbs {
     }
 
     /// Update backward PBWT with alleles at a marker
+    ///
+    /// NOTE: This correctly uses bwd_update() which has different logic than fwd_update():
+    /// - Initializes p array with marker-1 (not marker+1)
+    /// - Uses min() for propagation (not max())
+    /// - Resets p[allele] with i32::MAX (not i32::MIN)
     pub fn update_bwd(&mut self, alleles: &[u8], n_alleles: usize, marker: usize) {
-        self.pbwt_updater.fwd_update(
+        self.pbwt_updater.bwd_update(
             alleles,
             n_alleles,
             marker,
@@ -637,18 +642,21 @@ impl<'a> ImpStates<'a> {
                     .collect();
 
                 // Find backward IBS haplotypes
-                let bwd_ibs: Vec<u32> = if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
-                    pbwt_bwd.find_ibs(target_pattern, coded_step, self.n_ibs_haps)
-                        .into_iter()
-                        .map(|h| h.0)
-                        .collect()
-                } else {
-                    let closest_pattern = coded_step.closest_pattern(&target_seq);
-                    pbwt_bwd.find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
-                        .into_iter()
-                        .map(|h| h.0)
-                        .collect()
-                };
+                let bwd_ibs: Vec<u32> =
+                    if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                        pbwt_bwd
+                            .find_ibs(target_pattern, coded_step, self.n_ibs_haps)
+                            .into_iter()
+                            .map(|h| h.0)
+                            .collect()
+                    } else {
+                        let closest_pattern = coded_step.closest_pattern(&target_seq);
+                        pbwt_bwd
+                            .find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
+                            .into_iter()
+                            .map(|h| h.0)
+                            .collect()
+                    };
 
                 bwd_ibs_per_step[step_idx] = bwd_ibs;
             }
@@ -667,8 +675,14 @@ impl<'a> ImpStates<'a> {
                 let step_start = self.coded_steps.step_start(step_idx);
                 let step_end = self.coded_steps.step_end(step_idx);
 
-                // Update forward PBWT
-                pbwt_fwd.update(coded_step);
+                // Update forward PBWT using counting sort optimization
+                pbwt_fwd.update_counting_sort(
+                    coded_step,
+                    &mut workspace.sort_counts,
+                    &mut workspace.sort_offsets,
+                    &mut workspace.sort_prefix_scratch,
+                    &mut workspace.sort_div_scratch,
+                );
 
                 // Extract target alleles for this step range
                 let target_seq: Vec<u8> = (step_start..step_end)
@@ -676,18 +690,21 @@ impl<'a> ImpStates<'a> {
                     .collect();
 
                 // Find forward IBS haplotypes
-                let fwd_ibs: Vec<u32> = if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
-                    pbwt_fwd.find_ibs(target_pattern, coded_step, self.n_ibs_haps)
-                        .into_iter()
-                        .map(|h| h.0)
-                        .collect()
-                } else {
-                    let closest_pattern = coded_step.closest_pattern(&target_seq);
-                    pbwt_fwd.find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
-                        .into_iter()
-                        .map(|h| h.0)
-                        .collect()
-                };
+                let fwd_ibs: Vec<u32> =
+                    if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                        pbwt_fwd
+                            .find_ibs(target_pattern, coded_step, self.n_ibs_haps)
+                            .into_iter()
+                            .map(|h| h.0)
+                            .collect()
+                    } else {
+                        let closest_pattern = coded_step.closest_pattern(&target_seq);
+                        pbwt_fwd
+                            .find_ibs(closest_pattern, coded_step, self.n_ibs_haps)
+                            .into_iter()
+                            .map(|h| h.0)
+                            .collect()
+                    };
 
                 // Update composite haplotypes with IBS matches from BOTH directions
                 // Java Beagle: addIbsHap(ibsHaps.fwdIbsHap(...)); addIbsHap(ibsHaps.bwdIbsHap(...));
@@ -707,7 +724,13 @@ impl<'a> ImpStates<'a> {
 
         // Build output arrays
         let n_states = self.queue.len().min(self.max_states);
-        self.build_output(get_ref_allele, target_alleles, n_states, hap_indices, allele_match);
+        self.build_output(
+            get_ref_allele,
+            target_alleles,
+            n_states,
+            hap_indices,
+            allele_match,
+        );
 
         n_states
     }
@@ -766,7 +789,11 @@ impl<'a> ImpStates<'a> {
     fn update_queue_head(&mut self) {
         // Update the head's last_ibs_step if it has been seen more recently
         while let Some(head) = self.queue.peek() {
-            let last_ibs = self.hap_to_last_ibs.get(&head.hap).copied().unwrap_or(i32::MIN);
+            let last_ibs = self
+                .hap_to_last_ibs
+                .get(&head.hap)
+                .copied()
+                .unwrap_or(i32::MIN);
             if head.last_ibs_step != last_ibs {
                 let mut head = self.queue.pop().unwrap();
                 head.last_ibs_step = last_ibs;
@@ -778,8 +805,8 @@ impl<'a> ImpStates<'a> {
     }
 
     fn fill_with_random_haps(&mut self) {
-        use rand::seq::SliceRandom;
         use rand::rng;
+        use rand::seq::SliceRandom;
 
         let n_ref_haps = self.ref_panel.n_haps();
         let n_states = self.max_states.min(n_ref_haps);
@@ -924,11 +951,15 @@ impl ImpStatesMutable {
                 .collect();
 
             // Get IBS haps from FORWARD PBWT (matches from past)
-            let fwd_ibs_haps = self.ibs.find_ibs_haps_for_allele(target_allele, &ref_alleles, step);
+            let fwd_ibs_haps = self
+                .ibs
+                .find_ibs_haps_for_allele(target_allele, &ref_alleles, step);
 
             // Get IBS haps from BACKWARD PBWT (matches from future)
             // Java Beagle: addIbsHap(ibsHaps.fwdIbsHap(...)); addIbsHap(ibsHaps.bwdIbsHap(...));
-            let bwd_ibs_haps = self.ibs.find_bwd_ibs_haps_for_allele(target_allele, &ref_alleles, step);
+            let bwd_ibs_haps =
+                self.ibs
+                    .find_bwd_ibs_haps_for_allele(target_allele, &ref_alleles, step);
 
             // Update composite haplotypes with IBS matches from BOTH directions
             for hap in fwd_ibs_haps {
@@ -946,7 +977,13 @@ impl ImpStatesMutable {
 
         // Build output arrays
         let n_states = self.queue.len().min(self.max_states);
-        self.build_output(get_ref_allele, target_alleles, n_states, hap_indices, allele_match);
+        self.build_output(
+            get_ref_allele,
+            target_alleles,
+            n_states,
+            hap_indices,
+            allele_match,
+        );
 
         n_states
     }
@@ -1006,7 +1043,11 @@ impl ImpStatesMutable {
     fn update_queue_head(&mut self) {
         // Update the head's last_ibs_step if it has been seen more recently
         while let Some(head) = self.queue.peek() {
-            let last_ibs = self.hap_to_last_ibs.get(&head.hap).copied().unwrap_or(i32::MIN);
+            let last_ibs = self
+                .hap_to_last_ibs
+                .get(&head.hap)
+                .copied()
+                .unwrap_or(i32::MIN);
             if head.last_ibs_step != last_ibs {
                 let mut head = self.queue.pop().unwrap();
                 head.last_ibs_step = last_ibs;
@@ -1018,8 +1059,8 @@ impl ImpStatesMutable {
     }
 
     fn fill_with_random_haps(&mut self) {
-        use rand::seq::SliceRandom;
         use rand::rng;
+        use rand::seq::SliceRandom;
 
         let n_states = self.max_states.min(self.ibs.n_ref_haps);
         let mut rng = rng();

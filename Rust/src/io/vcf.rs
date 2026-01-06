@@ -13,7 +13,7 @@ use noodles::vcf::Header;
 
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+use crate::data::storage::{GenotypeColumn, GenotypeMatrix, compress_block};
 use crate::error::{ReagleError, Result};
 
 /// Imputation quality statistics for a single marker
@@ -51,8 +51,8 @@ impl MarkerImputationStats {
     pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
         self.n_haps += 2;
         for a in 1..self.sum_al_probs.len() {
-            let dose = probs1.get(a).copied().unwrap_or(0.0)
-                + probs2.get(a).copied().unwrap_or(0.0);
+            let dose =
+                probs1.get(a).copied().unwrap_or(0.0) + probs2.get(a).copied().unwrap_or(0.0);
             let dose2 = probs1.get(a).copied().unwrap_or(0.0).powi(2)
                 + probs2.get(a).copied().unwrap_or(0.0).powi(2);
             self.sum_al_probs[a] += dose;
@@ -182,7 +182,9 @@ impl VcfReader {
     }
 
     /// Create from a reader
-    pub fn from_reader(mut reader: Box<dyn BufRead + Send>) -> Result<(Self, Box<dyn BufRead + Send>)> {
+    pub fn from_reader(
+        mut reader: Box<dyn BufRead + Send>,
+    ) -> Result<(Self, Box<dyn BufRead + Send>)> {
         // Read header
         let mut header_str = String::new();
         loop {
@@ -201,7 +203,9 @@ impl VcfReader {
             }
         }
 
-        let header: Header = header_str.parse().map_err(|e| ReagleError::vcf(format!("{}", e)))?;
+        let header: Header = header_str
+            .parse()
+            .map_err(|e| ReagleError::vcf(format!("{}", e)))?;
 
         // Extract sample names
         let sample_names: Vec<String> = header
@@ -212,13 +216,7 @@ impl VcfReader {
 
         let samples = Arc::new(Samples::from_ids(sample_names));
 
-        Ok((
-            Self {
-                header,
-                samples,
-            },
-            reader,
-        ))
+        Ok((Self { header, samples }, reader))
     }
 
     /// Get samples
@@ -245,6 +243,12 @@ impl VcfReader {
         let mut line = String::new();
         let mut line_num = 0usize;
 
+        // Buffers for batch processing (Dictionary Compression)
+        const BATCH_SIZE: usize = 64;
+        let mut batch_markers: Vec<Marker> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_alleles: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_n_alleles: Vec<usize> = Vec::with_capacity(BATCH_SIZE);
+
         loop {
             line.clear();
             let bytes_read = reader.read_line(&mut line)?;
@@ -259,7 +263,8 @@ impl VcfReader {
             }
 
             // Parse VCF record
-            let (marker, alleles, record_phased) = self.parse_record(line, &mut markers, line_num)?;
+            let (marker, alleles, record_phased) =
+                self.parse_record(line, &mut markers, line_num)?;
 
             if !record_phased {
                 is_phased = false;
@@ -267,13 +272,96 @@ impl VcfReader {
 
             // Calculate actual number of alleles: 1 REF + N ALT
             let n_alleles = 1 + marker.alt_alleles.len();
-            markers.push(marker);
-            let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
-            columns.push(column);
+
+            // Buffer the marker data
+            batch_markers.push(marker);
+            batch_alleles.push(alleles);
+            batch_n_alleles.push(n_alleles);
+
+            // Process batch if full
+            if batch_markers.len() >= BATCH_SIZE {
+                Self::flush_batch(
+                    &mut markers,
+                    &mut columns,
+                    &mut batch_markers,
+                    &mut batch_alleles,
+                    &mut batch_n_alleles,
+                );
+            }
+        }
+
+        // Process remaining markers
+        if !batch_markers.is_empty() {
+            Self::flush_batch(
+                &mut markers,
+                &mut columns,
+                &mut batch_markers,
+                &mut batch_alleles,
+                &mut batch_n_alleles,
+            );
         }
 
         let matrix = GenotypeMatrix::new(markers, columns, Arc::clone(&self.samples), is_phased);
         Ok(matrix)
+    }
+
+    /// Flush a batch of markers, attempting dictionary compression
+    fn flush_batch(
+        markers: &mut Markers,
+        columns: &mut Vec<GenotypeColumn>,
+        batch_markers: &mut Vec<Marker>,
+        batch_alleles: &mut Vec<Vec<u8>>,
+        batch_n_alleles: &mut Vec<usize>,
+    ) {
+        if batch_markers.is_empty() {
+            return;
+        }
+
+        let n_markers = batch_markers.len();
+        let n_haps = batch_alleles[0].len();
+
+        // Check if we can compress (must have enough markers and be biallelic)
+        // Beagle usually only compresses biallelic markers
+        let all_biallelic = batch_n_alleles.iter().all(|&n| n == 2);
+
+        let compressed_dict = if n_markers >= 4 && all_biallelic {
+            // Create closure for allele access
+            let get_allele = |m: usize, h: crate::data::haplotype::HapIdx| -> u8 {
+                batch_alleles[m][h.as_usize()]
+            };
+
+            compress_block(get_allele, n_markers, n_haps, 1)
+        } else {
+            None
+        };
+
+        if let Some(dict) = compressed_dict {
+            // Success! Share the dictionary across all columns in this batch
+            let dict_arc = Arc::new(dict);
+
+            for (i, marker) in batch_markers.drain(..).enumerate() {
+                markers.push(marker);
+                columns.push(GenotypeColumn::Dictionary(Arc::clone(&dict_arc), i));
+            }
+        } else {
+            // Fallback to individual storage (Dense or Sparse)
+            for ((marker, alleles), n_alleles) in batch_markers
+                .drain(..)
+                .zip(batch_alleles.drain(..))
+                .zip(batch_n_alleles.drain(..))
+            {
+                markers.push(marker);
+                let col = GenotypeColumn::from_alleles(&alleles, n_alleles);
+                columns.push(col);
+            }
+        }
+
+        // Clear buffers (drain already emptied markers/alleles/n_alleles but verify)
+        // drain(..) removes elements, so they are already empty if matched.
+        // But batch_alleles and batch_n_alleles were not drained in the 'if' branch above.
+        batch_markers.clear();
+        batch_alleles.clear();
+        batch_n_alleles.clear();
     }
 
     /// Parse a single VCF record line
@@ -311,10 +399,7 @@ impl VcfReader {
         let ref_allele = Allele::from_str(fields[3]);
 
         // Parse ALT
-        let alt_alleles: Vec<Allele> = fields[4]
-            .split(',')
-            .map(|a| Allele::from_str(a))
-            .collect();
+        let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
 
         // Parse INFO field for END tag (field[7])
         // This is important for structural variants and gVCF blocks
@@ -337,14 +422,11 @@ impl VcfReader {
                 break;
             }
 
-            let gt_field = sample_field
-                .split(':')
-                .nth(gt_idx)
-                .unwrap_or("./.");
+            let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
 
             // Parse genotype (handle both phased | and unphased /)
             let (a1, a2, phased) = parse_genotype(gt_field)?;
-            
+
             if !phased {
                 is_phased = false;
             }
@@ -497,19 +579,37 @@ impl VcfWriter {
 
         // Write INFO lines for imputation
         if imputed {
-            writeln!(self.writer, "##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Dosage R-squared: estimated squared correlation between estimated REF dose and true REF dose\">")?;
-            writeln!(self.writer, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
-            writeln!(self.writer, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">")?;
+            writeln!(
+                self.writer,
+                "##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Dosage R-squared: estimated squared correlation between estimated REF dose and true REF dose\">"
+            )?;
+            writeln!(
+                self.writer,
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">"
+            )?;
+            writeln!(
+                self.writer,
+                "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">"
+            )?;
         }
 
         // Write FORMAT lines
-        writeln!(self.writer, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+        writeln!(
+            self.writer,
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+        )?;
         if imputed {
-            writeln!(self.writer, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Estimated ALT allele dosage\">")?;
+            writeln!(
+                self.writer,
+                "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Estimated ALT allele dosage\">"
+            )?;
         }
 
         // Write header line
-        write!(self.writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
+        write!(
+            self.writer,
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
+        )?;
         for sample in self.samples.ids() {
             write!(self.writer, "\t{}", sample)?;
         }
@@ -519,7 +619,12 @@ impl VcfWriter {
     }
 
     /// Write a phased genotype matrix
-    pub fn write_phased(&mut self, matrix: &GenotypeMatrix, start: usize, end: usize) -> Result<()> {
+    pub fn write_phased(
+        &mut self,
+        matrix: &GenotypeMatrix,
+        start: usize,
+        end: usize,
+    ) -> Result<()> {
         for m in start..end {
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = matrix.marker(marker_idx);
@@ -533,7 +638,12 @@ impl VcfWriter {
                 marker.pos,
                 marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
                 marker.ref_allele,
-                marker.alt_alleles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")
+                marker
+                    .alt_alleles
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             )?;
 
             // Write genotypes
@@ -619,7 +729,12 @@ impl VcfWriter {
                 marker.pos,
                 marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
                 marker.ref_allele,
-                marker.alt_alleles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","),
+                marker
+                    .alt_alleles
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
                 info_field
             )?;
 
@@ -701,7 +816,11 @@ mod tests {
 
         // DR2 should be high when there's variance and certainty
         let dr2 = stats.dr2(1);
-        assert!(dr2 >= 0.99, "DR2 should be ~1.0 with certain variable dosages, got {}", dr2);
+        assert!(
+            dr2 >= 0.99,
+            "DR2 should be ~1.0 with certain variable dosages, got {}",
+            dr2
+        );
     }
 
     #[test]
@@ -716,7 +835,11 @@ mod tests {
 
         // DR2 should be low for uncertain calls
         let dr2 = stats.dr2(1);
-        assert!(dr2 < 0.5, "DR2 should be low for uncertain calls, got {}", dr2);
+        assert!(
+            dr2 < 0.5,
+            "DR2 should be low for uncertain calls, got {}",
+            dr2
+        );
     }
 
     #[test]
@@ -730,7 +853,11 @@ mod tests {
         stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]); // Uncertain
 
         let dr2 = stats.dr2(1);
-        assert!(dr2 > 0.0 && dr2 < 1.0, "DR2 should be between 0 and 1, got {}", dr2);
+        assert!(
+            dr2 > 0.0 && dr2 < 1.0,
+            "DR2 should be between 0 and 1, got {}",
+            dr2
+        );
     }
 
     #[test]
@@ -760,5 +887,53 @@ mod tests {
 
         assert!(quality.get(2).unwrap().is_imputed);
         assert_eq!(quality.get(2).unwrap().n_haps, 2);
+    }
+}
+#[test]
+#[test]
+fn test_dictionary_compression_integration() {
+    use crate::data::marker::MarkerIdx;
+    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use std::io::Cursor;
+
+    // Create VCF with 70 markers (batch size 64 + 6 remainder)
+    // All identical for perfect compression
+    // Use explicit \t for tabs
+    let mut vcf_data = String::from(
+        "##fileformat=VCFv4.2\n##FILTER=<ID=PASS,Description=\"All filters passed\">\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1\tSAMPLE2\n",
+    );
+
+    for i in 1..=70 {
+        // All samples 0|0 (pattern 00)
+        vcf_data.push_str(&format!(
+            "chr1\t{}\t.\tA\tG\t.\tPASS\t.\tGT\t0|0\t0|0\n",
+            i * 1000
+        ));
+    }
+
+    let reader = Box::new(Cursor::new(vcf_data));
+    let (mut vcf_reader, reader) = VcfReader::from_reader(reader).unwrap();
+    let matrix = vcf_reader.read_all(reader).unwrap();
+
+    assert_eq!(matrix.n_markers(), 70);
+
+    // Check first batch (0..64) - should be dictionary compressed
+    if let GenotypeColumn::Dictionary(_, offset) = matrix.column(MarkerIdx::new(0)) {
+        assert_eq!(*offset, 0);
+    } else {
+        panic!("Expected Dictionary column for marker 0");
+    }
+
+    if let GenotypeColumn::Dictionary(_, offset) = matrix.column(MarkerIdx::new(63)) {
+        assert_eq!(*offset, 63);
+    } else {
+        panic!("Expected Dictionary column for marker 63");
+    }
+
+    // Check remainder (64..70) - 6 markers >= 4, should also be compressed!
+    if let GenotypeColumn::Dictionary(_, offset) = matrix.column(MarkerIdx::new(64)) {
+        assert_eq!(*offset, 0); // New dictionary, offset resets
+    } else {
+        panic!("Expected Dictionary column for marker 64");
     }
 }

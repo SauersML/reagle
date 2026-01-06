@@ -15,113 +15,6 @@
 //! Durbin, Richard (2014) Efficient haplotype matching and storage using the
 //! positional Burrows-Wheeler transform (PBWT).
 
-
-/// PBWT prefix array updater (without divergence tracking)
-///
-/// This matches Java PbwtUpdater exactly.
-#[derive(Debug)]
-pub struct PbwtUpdater {
-    /// Number of haplotypes
-    n_haps: usize,
-    /// Temporary storage for each allele bucket: a[allele] contains hap indices
-    a: Vec<Vec<u32>>,
-}
-
-impl PbwtUpdater {
-    /// Create a new PBWT updater
-    ///
-    /// # Arguments
-    /// * `n_haps` - Number of haplotypes at each position
-    pub fn new(n_haps: usize) -> Self {
-        let init_num_alleles = 4;
-        Self {
-            n_haps,
-            a: (0..init_num_alleles).map(|_| Vec::new()).collect(),
-        }
-    }
-
-    /// Number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        self.n_haps
-    }
-
-    /// Update prefix array using forward PBWT
-    ///
-    /// # Arguments
-    /// * `alleles` - Allele for each haplotype (indexed by haplotype, not prefix order)
-    /// * `n_alleles` - Number of distinct alleles
-    /// * `prefix` - Prefix array to update in-place
-    pub fn update(&mut self, alleles: &[u8], n_alleles: usize, prefix: &mut [u32]) {
-        assert_eq!(alleles.len(), self.n_haps, "alleles length mismatch");
-        assert_eq!(prefix.len(), self.n_haps, "prefix length mismatch");
-        assert!(n_alleles >= 1, "must have at least one allele");
-
-        self.ensure_capacity(n_alleles);
-
-        // Clear buckets
-        for bucket in &mut self.a[..n_alleles] {
-            bucket.clear();
-        }
-
-        // Distribute haplotypes to buckets based on allele
-        for &h in prefix.iter() {
-            let allele = alleles[h as usize] as usize;
-            assert!(allele < n_alleles, "allele {} out of bounds", allele);
-            self.a[allele].push(h);
-        }
-
-        // Concatenate buckets back to prefix array
-        let mut start = 0;
-        for al in 0..n_alleles {
-            let size = self.a[al].len();
-            prefix[start..start + size].copy_from_slice(&self.a[al]);
-            start += size;
-            self.a[al].clear();
-        }
-        debug_assert_eq!(start, self.n_haps);
-    }
-
-    /// Update prefix array using a closure for allele access
-    pub fn update_with<F>(&mut self, get_allele: F, n_alleles: usize, prefix: &mut [u32])
-    where
-        F: Fn(usize) -> u8,
-    {
-        assert_eq!(prefix.len(), self.n_haps, "prefix length mismatch");
-        assert!(n_alleles >= 1, "must have at least one allele");
-
-        self.ensure_capacity(n_alleles);
-
-        for bucket in &mut self.a[..n_alleles] {
-            bucket.clear();
-        }
-
-        for &h in prefix.iter() {
-            let allele = get_allele(h as usize) as usize;
-            assert!(allele < n_alleles, "allele {} out of bounds", allele);
-            self.a[allele].push(h);
-        }
-
-        let mut start = 0;
-        for al in 0..n_alleles {
-            let size = self.a[al].len();
-            prefix[start..start + size].copy_from_slice(&self.a[al]);
-            start += size;
-            self.a[al].clear();
-        }
-        debug_assert_eq!(start, self.n_haps);
-    }
-
-    fn ensure_capacity(&mut self, n_alleles: usize) {
-        if n_alleles > self.a.len() {
-            let old_len = self.a.len();
-            self.a.resize_with(n_alleles, Vec::new);
-            for bucket in &mut self.a[old_len..] {
-                bucket.clear();
-            }
-        }
-    }
-}
-
 /// PBWT updater with divergence array tracking
 ///
 /// This matches Java PbwtDivUpdater exactly, including the correct
@@ -149,8 +42,6 @@ impl PbwtDivUpdater {
             p: vec![0; init_num_alleles],
         }
     }
-
-
 
     /// Forward update of prefix and divergence arrays
     ///
@@ -210,10 +101,76 @@ impl PbwtDivUpdater {
         self.update_prefix_and_div(n_alleles, prefix, divergence);
     }
 
+    /// Backward update of prefix and divergence arrays
+    ///
+    /// This matches Java PbwtDivUpdater.bwdUpdate
+    /// The backward pass is NOT symmetric with forward - it uses:
+    /// - marker - 1 for initial p values (not marker + 1)
+    /// - min() for propagation (not max())
+    /// - i32::MAX for reset (not i32::MIN)
+    ///
+    /// # Arguments
+    /// * `alleles` - Allele for each haplotype
+    /// * `n_alleles` - Number of distinct alleles
+    /// * `marker` - Current marker index (processing in reverse order)
+    /// * `prefix` - Prefix array to update
+    /// * `divergence` - Divergence array to update
+    pub fn bwd_update(
+        &mut self,
+        alleles: &[u8],
+        n_alleles: usize,
+        marker: usize,
+        prefix: &mut [u32],
+        divergence: &mut [i32],
+    ) {
+        assert_eq!(alleles.len(), self.n_haps);
+        assert_eq!(prefix.len(), self.n_haps);
+        assert!(divergence.len() >= self.n_haps);
 
+        self.ensure_capacity(n_alleles);
+
+        // Initialize p array with marker-1 (backward direction)
+        // This tracks the END of the matching interval
+        let init_value = (marker as i32).saturating_sub(1);
+        for j in 0..n_alleles {
+            self.p[j] = init_value;
+        }
+
+        // Process haplotypes in prefix order
+        for i in 0..self.n_haps {
+            let hap = prefix[i];
+            let div = divergence[i];
+            let allele = alleles[hap as usize] as usize;
+            assert!(allele < n_alleles);
+
+            // Update p[j] = min(p[j], div) for all alleles (BACKWARD uses MIN)
+            // This propagates the minimum divergence seen so far
+            for j in 0..n_alleles {
+                if div < self.p[j] {
+                    self.p[j] = div;
+                }
+            }
+
+            // Store this haplotype with divergence = p[allele]
+            self.a[allele].push(hap);
+            self.d[allele].push(self.p[allele]);
+
+            // Reset p[allele] for the next hap with this allele
+            // Using i32::MAX so any real divergence will be smaller (for min)
+            self.p[allele] = i32::MAX;
+        }
+
+        // Concatenate buckets back to arrays
+        self.update_prefix_and_div(n_alleles, prefix, divergence);
+    }
 
     /// Concatenate allele buckets back to prefix and divergence arrays
-    fn update_prefix_and_div(&mut self, n_alleles: usize, prefix: &mut [u32], divergence: &mut [i32]) {
+    fn update_prefix_and_div(
+        &mut self,
+        n_alleles: usize,
+        prefix: &mut [u32],
+        divergence: &mut [i32],
+    ) {
         let mut start = 0;
         for al in 0..n_alleles {
             let size = self.a[al].len();
@@ -265,17 +222,11 @@ impl PbwtDivUpdater {
         // Set sentinels at boundaries
         let d0 = if is_backward { marker - 2 } else { marker + 2 };
 
-        let mut u = target_pos;       // inclusive start
-        let mut v = target_pos + 1;   // exclusive end
+        let mut u = target_pos; // inclusive start
+        let mut v = target_pos + 1; // exclusive end
 
         // Get divergence values, using sentinel for out-of-bounds
-        let get_div = |i: usize| -> i32 {
-            if i == 0 || i >= n {
-                d0
-            } else {
-                divergence[i]
-            }
-        };
+        let get_div = |i: usize| -> i32 { if i == 0 || i >= n { d0 } else { divergence[i] } };
 
         let mut u_next_match = get_div(u);
         let mut v_next_match = get_div(v);
@@ -321,29 +272,9 @@ impl PbwtDivUpdater {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_pbwt_update() {
-        let mut updater = PbwtUpdater::new(4);
-        let mut prefix: Vec<u32> = vec![0, 1, 2, 3];
-
-        // All same allele - order preserved
-        let alleles = vec![0u8, 0, 0, 0];
-        updater.update(&alleles, 2, &mut prefix);
-        assert_eq!(prefix, vec![0, 1, 2, 3]);
-
-        // Alternate alleles - should group by allele
-        let alleles = vec![0u8, 1, 0, 1];
-        updater.update(&alleles, 2, &mut prefix);
-        // Haps with allele 0 come first: 0, 2
-        // Haps with allele 1 come second: 1, 3
-        assert_eq!(prefix, vec![0, 2, 1, 3]);
-    }
 
     #[test]
     fn test_pbwt_div_fwd_update() {
@@ -370,7 +301,6 @@ mod tests {
         assert_eq!(divergence[2], 1); // Hap 1, first with allele 1
         assert_eq!(divergence[3], 0); // Hap 3, second with allele 1
     }
-
 
     #[test]
     fn test_find_ibs_neighbors() {

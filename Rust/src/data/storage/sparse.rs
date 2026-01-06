@@ -105,8 +105,7 @@ impl SparseColumn {
 
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
-        self.carriers.len() * std::mem::size_of::<HapIdx>()
-            + std::mem::size_of::<Self>()
+        self.carriers.len() * std::mem::size_of::<HapIdx>() + std::mem::size_of::<Self>()
     }
 
     /// Iterate all alleles
@@ -119,7 +118,6 @@ impl SparseColumn {
         self.inverted
     }
 }
-
 
 #[cfg(test)]
 mod tests {

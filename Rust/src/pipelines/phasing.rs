@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::Config;
-use crate::data::genetic_map::GeneticMaps;
+use crate::data::genetic_map::{GeneticMaps, MarkerMap};
 use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes};
@@ -27,8 +27,6 @@ use crate::model::ibs2::Ibs2;
 use crate::model::imp_states::{CodedStepsConfig, ImpStatesMutable};
 use crate::model::parameters::{AtomicParamEstimates, ModelParams, ParamEstimates};
 use crate::utils::workspace::Workspace;
-
-
 
 /// Phasing pipeline
 pub struct PhasingPipeline {
@@ -71,7 +69,8 @@ impl PhasingPipeline {
 
         // Initialize parameters based on sample size
         self.params = ModelParams::for_phasing(n_haps);
-        self.params.set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
+        self.params
+            .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
@@ -91,42 +90,87 @@ impl PhasingPipeline {
             target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
         });
 
-        // Compute genetic distances and recombination probabilities
+        // Compute genetic distances and recombination probabilities using MarkerMap
+        // This handles map interpolation and minimum distance enforcement
         let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
-        let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
-            .map(|m| {
-                let pos1 = target_gt.marker(MarkerIdx::new(m as u32)).pos;
-                let pos2 = target_gt.marker(MarkerIdx::new((m + 1) as u32)).pos;
-                gen_maps.gen_dist(chrom, pos1, pos2)
-            })
-            .collect();
-
-        // Convert to recombination probabilities
-        let p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-            .collect();
-
-        // Compute cumulative genetic positions for dynamic state selection
-        let gen_positions: Vec<f64> = {
-            let mut pos = vec![0.0];
-            for &d in &gen_dists {
-                pos.push(pos.last().unwrap() + d);
-            }
-            pos
+        let marker_map = if let Some(map) = gen_maps.get(chrom) {
+            MarkerMap::create(target_gt.markers(), map)
+        } else {
+            MarkerMap::from_positions(target_gt.markers())
         };
 
-        // Compute MAF for each marker (used by IBS2)
+        let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
+
+        // NOTE: These full-marker-set distances are kept for reference but not used in two-stage phasing.
+        // Stage 1 computes distances only between high-frequency markers (see stage1_gen_dists below).
+        let _gen_dists: Vec<f64> = marker_map
+            .gen_distances()
+            .iter()
+            .map(|&d| d as f64)
+            .collect();
+
+        // Full marker set p_recomb (not used in two-stage phasing)
+        let _p_recomb = marker_map.p_recomb(self.params.recomb_intensity);
+
+        // Compute MAF for each marker (used by IBS2 and two-stage phasing)
         let maf: Vec<f32> = (0..n_markers)
             .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+            .collect();
+
+        // TWO-STAGE PHASING: Classify markers by frequency
+        // Stage 1 (high-frequency): Run full HMM - these markers provide phasing signal
+        // Stage 2 (rare): Interpolate from flanking high-frequency markers
+        let rare_threshold = self.config.rare;
+        let hi_freq_markers: Vec<usize> = (0..n_markers)
+            .filter(|&m| maf[m] >= rare_threshold)
+            .collect();
+        let rare_markers: Vec<usize> = (0..n_markers)
+            .filter(|&m| maf[m] < rare_threshold && maf[m] > 0.0) // Exclude monomorphic
+            .collect();
+
+        let n_hi_freq = hi_freq_markers.len();
+        eprintln!(
+            "Two-stage phasing: {} high-frequency markers (MAF >= {}), {} rare markers",
+            n_hi_freq,
+            rare_threshold,
+            rare_markers.len()
+        );
+
+        // Create mapping from hi-freq index to original index
+        let hi_freq_to_orig: Vec<usize> = hi_freq_markers.clone();
+
+        // Compute genetic distances only for HIGH-FREQUENCY markers
+        // This is critical: recombination probabilities must be computed for the
+        // inter-marker distances between consecutive hi-freq markers, not all markers
+        let stage1_gen_positions: Vec<f64> =
+            hi_freq_markers.iter().map(|&m| gen_positions[m]).collect();
+
+        let stage1_gen_dists: Vec<f64> = if hi_freq_markers.len() > 1 {
+            hi_freq_markers
+                .windows(2)
+                .map(|w| gen_positions[w[1]] - gen_positions[w[0]])
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
             .collect();
 
         // Build IBS2 segments for phase consistency (uses PositionMap fallback if no --map)
         eprintln!("Building IBS2 segments...");
         let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
-        let n_with_ibs2 = (0..n_samples).filter(|&s| ibs2.n_segments(crate::data::haplotype::SampleIdx::new(s as u32)) > 0).count();
-        eprintln!("Found {} samples with IBS2 segments, {} total", n_with_ibs2, ibs2.n_samples());
+        let n_with_ibs2 = (0..n_samples)
+            .filter(|&s| ibs2.n_segments(crate::data::haplotype::SampleIdx::new(s as u32)) > 0)
+            .count();
+        eprintln!(
+            "Found {} samples with IBS2 segments, {} total",
+            n_with_ibs2,
+            ibs2.n_samples()
+        );
 
-        // Run phasing iterations
+        // Run phasing iterations (STAGE 1: high-frequency markers only)
         let n_burnin = self.config.burnin;
         let n_iterations = self.config.iterations;
         let total_iterations = n_burnin + n_iterations;
@@ -141,7 +185,24 @@ impl PhasingPipeline {
 
             // Run phasing iteration with EM estimation (if enabled and during burnin)
             let collect_em = self.config.em && is_burnin;
-            self.run_iteration_with_hmm(&mut geno, &p_recomb, &gen_dists, &gen_positions, &ibs2, collect_em)?;
+            self.run_iteration_with_hmm_stage1(
+                &mut geno,
+                &stage1_p_recomb,
+                &stage1_gen_dists,
+                &stage1_gen_positions,
+                &hi_freq_to_orig,
+                &ibs2,
+                collect_em,
+            )?;
+        }
+
+        // STAGE 2: Interpolate rare marker phases from flanking high-frequency markers
+        if !rare_markers.is_empty() {
+            eprintln!(
+                "Stage 2: Phasing {} rare markers by interpolation...",
+                rare_markers.len()
+            );
+            self.phase_rare_markers(&mut geno, &rare_markers, &hi_freq_markers);
         }
 
         // Build final GenotypeMatrix from mutable genotypes
@@ -178,17 +239,23 @@ impl PhasingPipeline {
         // The PositionMap fallback (1 cM per Mb) is used automatically
         let gen_maps = if let Some(ref map_path) = self.config.map {
             // Load all chromosomes from the map file
-            GeneticMaps::from_plink_file(map_path, &["chr1", "chr2", "chr3", "chr4", "chr5",
-                "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14",
-                "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chrX",
-                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14",
-                "15", "16", "17", "18", "19", "20", "21", "22", "X"])?
+            GeneticMaps::from_plink_file(
+                map_path,
+                &[
+                    "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9",
+                    "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17",
+                    "chr18", "chr19", "chr20", "chr21", "chr22", "chrX", "1", "2", "3", "4", "5",
+                    "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19",
+                    "20", "21", "22", "X",
+                ],
+            )?
         } else {
             GeneticMaps::new()
         };
 
         // Open streaming reader
-        let mut reader = StreamingVcfReader::open(&self.config.gt, gen_maps.clone(), streaming_config)?;
+        let mut reader =
+            StreamingVcfReader::open(&self.config.gt, gen_maps.clone(), streaming_config)?;
         let samples = reader.samples_arc();
 
         // Create output writer
@@ -223,7 +290,10 @@ impl PhasingPipeline {
         }
 
         writer.flush()?;
-        eprintln!("Streaming phasing complete: {} windows, {} markers", window_count, total_markers);
+        eprintln!(
+            "Streaming phasing complete: {} windows, {} markers",
+            window_count, total_markers
+        );
         Ok(())
     }
 
@@ -258,9 +328,13 @@ impl PhasingPipeline {
     }
 
     /// Phase a GenotypeMatrix in-memory and return the phased result
-    /// 
+    ///
     /// This is used by the imputation pipeline to auto-phase unphased inputs.
-    pub fn phase_in_memory(&mut self, target_gt: &GenotypeMatrix, gen_maps: &GeneticMaps) -> Result<GenotypeMatrix> {
+    pub fn phase_in_memory(
+        &mut self,
+        target_gt: &GenotypeMatrix,
+        gen_maps: &GeneticMaps,
+    ) -> Result<GenotypeMatrix> {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
 
@@ -270,7 +344,8 @@ impl PhasingPipeline {
 
         // Initialize parameters
         self.params = ModelParams::for_phasing(n_haps);
-        self.params.set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
+        self.params
+            .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
 
         // Create mutable genotype storage for phasing
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
@@ -317,7 +392,14 @@ impl PhasingPipeline {
             let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
             let collect_em = self.config.em && is_burnin;
-            self.run_iteration_with_hmm(&mut geno, &p_recomb, &gen_dists, &gen_positions, &ibs2, collect_em)?;
+            self.run_iteration_with_hmm(
+                &mut geno,
+                &p_recomb,
+                &gen_dists,
+                &gen_positions,
+                &ibs2,
+                collect_em,
+            )?;
         }
 
         // Build and return phased GenotypeMatrix
@@ -409,7 +491,8 @@ impl PhasingPipeline {
                     }
 
                     // Create ImpStatesMutable for dynamic state selection (phasing uses raw PBWT)
-                    let mut imp_states = ImpStatesMutable::new(n_haps, n_states, gen_positions, &steps_config);
+                    let mut imp_states =
+                        ImpStatesMutable::new(n_haps, n_states, gen_positions, &steps_config);
 
                     // Use hap1's alleles as the target for IBS matching
                     let target_alleles: Vec<u8> = alleles1.clone();
@@ -450,7 +533,7 @@ impl PhasingPipeline {
                             if other.as_usize() < n_samples {
                                 let other_h1 = &geno_snapshot[other.hap1().as_usize()];
                                 let other_h2 = &geno_snapshot[other.hap2().as_usize()];
-                                
+
                                 for m in seg.start..=seg.incl_end {
                                     // Only force phase if we are heterozygous at this marker
                                     if m < n_markers && alleles1[m] != alleles2[m] {
@@ -505,23 +588,30 @@ impl PhasingPipeline {
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
 
-            // Apply phase switches - swap SEGMENTS, not just switch points
-            // switch_markers contains boundaries where phase changes
-            // Segments [switch[0], switch[1]), [switch[2], switch[3]), etc. need swapping
+            // Apply phase switches - each switch_marker is a TOGGLE point
+            //
+            // Phase switch semantics (matching Java PhaseBaum2):
+            // - Each switch marker toggles the phase from that point onwards
+            // - An even number of switches between two points cancels out
+            // - Result: swap regions where odd number of toggles have occurred
+            //
+            // Example: switch_markers = [10, 20, 30]
+            //   0..10:  original (0 toggles)
+            //   10..20: swapped  (1 toggle at 10)
+            //   20..30: original (2 toggles at 10, 20)
+            //   30..end: swapped (3 toggles at 10, 20, 30)
             if !switch_markers.is_empty() {
-                let mut i = 0;
-                while i < switch_markers.len() {
-                    let start = switch_markers[i];
-                    let end = if i + 1 < switch_markers.len() {
-                        switch_markers[i + 1]
-                    } else {
-                        n_markers
-                    };
-
-                    // Swap all markers in this segment using contiguous swap
-                    geno.swap_contiguous(start, end, hap1, hap2);
-
-                    i += 2; // Skip to next swapped segment
+                let mut prev_switch = 0usize;
+                for (i, &switch_m) in switch_markers.iter().enumerate() {
+                    // After an odd-indexed toggle, swap the region from the previous toggle
+                    if i % 2 == 1 {
+                        geno.swap_contiguous(prev_switch, switch_m, hap1, hap2);
+                    }
+                    prev_switch = switch_m;
+                }
+                // If odd total toggles, swap from last toggle to end
+                if switch_markers.len() % 2 == 1 {
+                    geno.swap_contiguous(*switch_markers.last().unwrap(), n_markers, hap1, hap2);
                 }
             }
 
@@ -541,7 +631,10 @@ impl PhasingPipeline {
             if estimates.n_switch_obs() > 0 {
                 let new_recomb = estimates.recomb_intensity();
                 self.params.update_recomb_intensity(new_recomb);
-                eprintln!("  Updated recomb_intensity to {:.4}", self.params.recomb_intensity);
+                eprintln!(
+                    "  Updated recomb_intensity to {:.4}",
+                    self.params.recomb_intensity
+                );
             }
             if estimates.n_emit_obs() > 0 {
                 let new_p_mismatch = estimates.p_mismatch();
@@ -571,6 +664,373 @@ impl PhasingPipeline {
             .collect();
 
         GenotypeMatrix::new(markers, columns, samples, true)
+    }
+
+    /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only
+    ///
+    /// This is the key to two-stage phasing: by running the HMM only on high-frequency
+    /// markers, we get:
+    /// 1. Correct recombination probabilities (distances between common variants)
+    /// 2. Better computational efficiency (fewer markers in O(n²) HMM)
+    /// 3. More robust phasing signal (rare variants are noisy)
+    ///
+    /// Switch markers returned are in ORIGINAL marker indices for correct application.
+    fn run_iteration_with_hmm_stage1(
+        &mut self,
+        geno: &mut MutableGenotypes,
+        stage1_p_recomb: &[f32],
+        stage1_gen_dists: &[f64],
+        stage1_gen_positions: &[f64],
+        hi_freq_to_orig: &[usize],
+        ibs2: &Ibs2,
+        collect_em: bool,
+    ) -> Result<()> {
+        let n_samples = geno.n_haps() / 2;
+        let n_markers_total = geno.n_markers();
+        let n_haps = geno.n_haps();
+        let n_states = self.params.n_states;
+        let n_hi_freq = hi_freq_to_orig.len();
+
+        if n_hi_freq == 0 {
+            return Ok(());
+        }
+
+        // Create reverse mapping: original index -> hi-freq index (or None)
+        let mut orig_to_hi_freq: Vec<Option<usize>> = vec![None; n_markers_total];
+        for (hi_idx, &orig_idx) in hi_freq_to_orig.iter().enumerate() {
+            orig_to_hi_freq[orig_idx] = Some(hi_idx);
+        }
+
+        // Atomic counters for statistics
+        let total_switches = AtomicUsize::new(0);
+        let em_estimates = if collect_em {
+            Some(AtomicParamEstimates::new())
+        } else {
+            None
+        };
+
+        // Configuration for dynamic state selection
+        let steps_config = CodedStepsConfig::default();
+
+        // Take snapshot of genotypes for thread-safe access
+        let geno_snapshot: Vec<Vec<u8>> = (0..n_haps)
+            .map(|h| geno.haplotype(HapIdx::new(h as u32)))
+            .collect();
+
+        // Phase each sample in parallel
+        let updates: Vec<(SampleIdx, Vec<usize>, Vec<(usize, u8, u8)>)> = (0..n_samples)
+            .into_par_iter()
+            .map_init(
+                || Workspace::new(n_states, n_hi_freq, n_haps),
+                |workspace, s| {
+                    let sample_idx = SampleIdx::new(s as u32);
+                    let hap1 = sample_idx.hap1();
+                    let hap2 = sample_idx.hap2();
+
+                    // Get current alleles for this sample
+                    let alleles1_full = &geno_snapshot[hap1.0 as usize];
+                    let alleles2_full = &geno_snapshot[hap2.0 as usize];
+
+                    // Extract alleles at HIGH-FREQUENCY markers only
+                    let alleles1_hf: Vec<u8> = hi_freq_to_orig
+                        .iter()
+                        .map(|&orig_m| alleles1_full[orig_m])
+                        .collect();
+                    let alleles2_hf: Vec<u8> = hi_freq_to_orig
+                        .iter()
+                        .map(|&orig_m| alleles2_full[orig_m])
+                        .collect();
+
+                    // Find heterozygous markers among hi-freq markers (in hi-freq index space)
+                    let all_het_hf: Vec<usize> = (0..n_hi_freq)
+                        .filter(|&hf_m| alleles1_hf[hf_m] != alleles2_hf[hf_m])
+                        .collect();
+
+                    if all_het_hf.is_empty() {
+                        return None;
+                    }
+
+                    // Get IBS2 segments and filter het markers
+                    let ibs2_segs = ibs2.segments(sample_idx);
+                    let het_hf: Vec<usize> = if ibs2_segs.is_empty() {
+                        all_het_hf
+                    } else {
+                        all_het_hf
+                            .into_iter()
+                            .filter(|&hf_m| {
+                                let orig_m = hi_freq_to_orig[hf_m];
+                                !ibs2_segs.iter().any(|seg| seg.contains(orig_m))
+                            })
+                            .collect()
+                    };
+
+                    // Find missing markers among hi-freq (in hi-freq index space)
+                    let missing_hf: Vec<usize> = (0..n_hi_freq)
+                        .filter(|&hf_m| alleles1_hf[hf_m] == 255 || alleles2_hf[hf_m] == 255)
+                        .collect();
+
+                    if het_hf.is_empty() && missing_hf.is_empty() {
+                        return None;
+                    }
+
+                    // Create ImpStatesMutable for hi-freq markers
+                    let mut imp_states = ImpStatesMutable::new(
+                        n_haps,
+                        n_states,
+                        stage1_gen_positions,
+                        &steps_config,
+                    );
+
+                    // Get ref allele at hi-freq index, looking up from original
+                    let get_ref_allele_hf = |hf_m: usize, h: u32| -> u8 {
+                        let orig_m = hi_freq_to_orig[hf_m];
+                        geno_snapshot
+                            .get(h as usize)
+                            .and_then(|hap| hap.get(orig_m).copied())
+                            .unwrap_or(255)
+                    };
+
+                    // Build dynamic state mapping using hi-freq alleles
+                    let mut hap_indices: Vec<Vec<u32>> = Vec::new();
+                    let mut allele_match: Vec<Vec<bool>> = Vec::new();
+                    let actual_n_states = imp_states.ibs_states(
+                        get_ref_allele_hf,
+                        &alleles1_hf,
+                        &mut hap_indices,
+                        &mut allele_match,
+                    );
+
+                    if actual_n_states == 0 {
+                        return None;
+                    }
+
+                    workspace.resize(actual_n_states, n_hi_freq, n_haps);
+
+                    // Collect forced alleles from IBS2 segments (in original marker space)
+                    let mut forced_alleles = Vec::new();
+                    if !ibs2_segs.is_empty() {
+                        for seg in ibs2_segs {
+                            let other = seg.other_sample;
+                            if other.as_usize() < n_samples {
+                                let other_h1 = &geno_snapshot[other.hap1().as_usize()];
+                                let other_h2 = &geno_snapshot[other.hap2().as_usize()];
+
+                                for m in seg.start..=seg.incl_end {
+                                    if m < n_markers_total && alleles1_full[m] != alleles2_full[m] {
+                                        if other_h1[m] != other_h2[m] {
+                                            forced_alleles.push((m, other_h1[m], other_h2[m]));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Run phase decision on hi-freq markers
+                    let (switch_hf, imputed_hf, local_em) = phase_sample_with_hmm(
+                        &alleles1_hf,
+                        &alleles2_hf,
+                        &het_hf,
+                        &missing_hf,
+                        &hap_indices,
+                        &geno_snapshot, // Full snapshot for state allele lookup
+                        stage1_p_recomb,
+                        stage1_gen_dists,
+                        &self.params,
+                        collect_em,
+                        workspace,
+                    );
+
+                    // Convert switch markers from hi-freq indices to ORIGINAL indices
+                    let switch_markers: Vec<usize> = switch_hf
+                        .iter()
+                        .map(|&hf_m| hi_freq_to_orig[hf_m])
+                        .collect();
+
+                    // Convert imputed genotypes to original indices
+                    let mut imputed: Vec<(usize, u8, u8)> = imputed_hf
+                        .into_iter()
+                        .map(|(hf_m, a1, a2)| (hi_freq_to_orig[hf_m], a1, a2))
+                        .collect();
+
+                    imputed.extend(forced_alleles);
+
+                    if let (Some(global_em), Some(local)) = (&em_estimates, local_em) {
+                        global_em.add_estimation_data(&local);
+                    }
+
+                    if switch_markers.is_empty() && imputed.is_empty() {
+                        None
+                    } else {
+                        total_switches.fetch_add(switch_markers.len(), Ordering::Relaxed);
+                        Some((sample_idx, switch_markers, imputed))
+                    }
+                },
+            )
+            .flatten()
+            .collect();
+
+        // Apply phase switches and imputed genotypes
+        for (sample_idx, switch_markers, imputed) in updates {
+            let hap1 = sample_idx.hap1();
+            let hap2 = sample_idx.hap2();
+
+            // Apply phase switches using toggle semantics
+            if !switch_markers.is_empty() {
+                let mut prev_switch = 0usize;
+                for (i, &switch_m) in switch_markers.iter().enumerate() {
+                    if i % 2 == 1 {
+                        geno.swap_contiguous(prev_switch, switch_m, hap1, hap2);
+                    }
+                    prev_switch = switch_m;
+                }
+                if switch_markers.len() % 2 == 1 {
+                    geno.swap_contiguous(
+                        *switch_markers.last().unwrap(),
+                        n_markers_total,
+                        hap1,
+                        hap2,
+                    );
+                }
+            }
+
+            for (m, a1, a2) in imputed {
+                geno.set(m, hap1, a1);
+                geno.set(m, hap2, a2);
+            }
+        }
+
+        let n_switches = total_switches.load(Ordering::Relaxed);
+        eprintln!("  Applied {} phase switches (Stage 1)", n_switches);
+
+        if let Some(global_em) = em_estimates {
+            let estimates = global_em.to_estimates();
+            if estimates.n_switch_obs() > 0 {
+                let new_recomb = estimates.recomb_intensity();
+                self.params.update_recomb_intensity(new_recomb);
+                eprintln!(
+                    "  Updated recomb_intensity to {:.4}",
+                    self.params.recomb_intensity
+                );
+            }
+            if estimates.n_emit_obs() > 0 {
+                let new_p_mismatch = estimates.p_mismatch();
+                self.params.update_p_mismatch(new_p_mismatch);
+                eprintln!("  Updated p_mismatch to {:.6}", self.params.p_mismatch);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Stage 2: Phase rare markers by interpolation from flanking high-frequency markers
+    ///
+    /// For each rare heterozygous marker, we determine its phase by looking at the
+    /// closest flanking high-frequency heterozygous markers. If both flanking markers
+    /// have the same phase relationship (both swapped or both unswapped relative to
+    /// some reference), the rare marker inherits that phase. If they disagree or
+    /// only one exists, we use the closest one.
+    ///
+    /// This matches Java Beagle's PhaseLS.runStage2() approach.
+    fn phase_rare_markers(
+        &self,
+        geno: &mut MutableGenotypes,
+        rare_markers: &[usize],
+        hi_freq_markers: &[usize],
+    ) {
+        let n_samples = geno.n_haps() / 2;
+        let n_markers = geno.n_markers();
+
+        if rare_markers.is_empty() || hi_freq_markers.is_empty() {
+            return;
+        }
+
+        // For each sample, phase rare heterozygous markers
+        for s in 0..n_samples {
+            let sample_idx = SampleIdx::new(s as u32);
+            let hap1 = sample_idx.hap1();
+            let hap2 = sample_idx.hap2();
+
+            // Get current alleles
+            let alleles1 = geno.haplotype(hap1);
+            let alleles2 = geno.haplotype(hap2);
+
+            // Find heterozygous rare markers for this sample
+            let rare_het: Vec<usize> = rare_markers
+                .iter()
+                .copied()
+                .filter(|&m| alleles1[m] != alleles2[m] && alleles1[m] != 255 && alleles2[m] != 255)
+                .collect();
+
+            if rare_het.is_empty() {
+                continue;
+            }
+
+            // Find heterozygous high-frequency markers
+            let hf_het: Vec<usize> = hi_freq_markers
+                .iter()
+                .copied()
+                .filter(|&m| alleles1[m] != alleles2[m] && alleles1[m] != 255 && alleles2[m] != 255)
+                .collect();
+
+            if hf_het.is_empty() {
+                // No hi-freq hets to interpolate from - leave rare markers as-is
+                continue;
+            }
+
+            // For each rare het marker, find flanking hi-freq hets and interpolate phase
+            for &rare_m in &rare_het {
+                // Find closest hi-freq het markers on each side
+                let left_hf = hf_het.iter().copied().filter(|&m| m < rare_m).max();
+                let right_hf = hf_het.iter().copied().filter(|&m| m > rare_m).min();
+
+                // Determine phase from flanking markers
+                // We compare which allele is on hap1 at the flanking positions
+                let should_swap = match (left_hf, right_hf) {
+                    (Some(left), Some(right)) => {
+                        // Both flanking markers exist - use consensus
+                        // Check if hap1 has allele 0 or 1 at each position
+                        let left_hap1_has_0 = alleles1[left] == 0;
+                        let right_hap1_has_0 = alleles1[right] == 0;
+                        // If they disagree, use closer one
+                        if left_hap1_has_0 != right_hap1_has_0 {
+                            let dist_left = rare_m - left;
+                            let dist_right = right - rare_m;
+                            if dist_left <= dist_right {
+                                !left_hap1_has_0
+                            } else {
+                                !right_hap1_has_0
+                            }
+                        } else {
+                            // Both agree - inherit that phase
+                            !left_hap1_has_0
+                        }
+                    }
+                    (Some(left), None) => {
+                        // Only left marker exists
+                        alleles1[left] != 0
+                    }
+                    (None, Some(right)) => {
+                        // Only right marker exists
+                        alleles1[right] != 0
+                    }
+                    (None, None) => {
+                        // No flanking hets (shouldn't happen if hf_het is non-empty)
+                        continue;
+                    }
+                };
+
+                // Apply phase: if should_swap, ensure hap1 has allele 1, else allele 0
+                let rare_hap1_has_0 = alleles1[rare_m] == 0;
+                if should_swap != rare_hap1_has_0 {
+                    // Need to swap this marker
+                    let a1 = alleles1[rare_m];
+                    let a2 = alleles2[rare_m];
+                    geno.set(rare_m, hap1, a2);
+                    geno.set(rare_m, hap2, a1);
+                }
+            }
+        }
     }
 }
 
@@ -632,7 +1092,7 @@ fn phase_sample_with_hmm(
     let emit = |target: u8, reference: u8| -> f32 {
         // Missing data (255) should be treated as uninformative, not as mismatch
         if target == 255 || reference == 255 {
-            1.0  // Uninformative - probability is uniform across states
+            1.0 // Uninformative - probability is uniform across states
         } else if target == reference {
             p_match
         } else {
@@ -696,7 +1156,8 @@ fn phase_sample_with_hmm(
                 fwd1[m][s] = init * emit1;
                 fwd2[m][s] = init * emit2;
             } else {
-                fwd_combined[m][s] = emit_combined * (scale_combined * fwd_combined[m - 1][s] + shift);
+                fwd_combined[m][s] =
+                    emit_combined * (scale_combined * fwd_combined[m - 1][s] + shift);
                 fwd1[m][s] = emit1 * (scale1 * fwd1[m - 1][s] + shift);
                 fwd2[m][s] = emit2 * (scale2 * fwd2[m - 1][s] + shift);
             }
@@ -874,14 +1335,20 @@ fn phase_sample_with_hmm(
                     let ref_a = get_ref_allele(m, s);
                     let emit_s = emit(alleles1[m], ref_a).max(emit(alleles2[m], ref_a));
                     // Use bwd1 for EM (could also average bwd1 and bwd2)
-                    let bwd_s = bwd1_at_het.get(idx).and_then(|v| v.get(s)).copied().unwrap_or(1.0 / n_states as f32);
+                    let bwd_s = bwd1_at_het
+                        .get(idx)
+                        .and_then(|v| v.get(s))
+                        .copied()
+                        .unwrap_or(1.0 / n_states as f32);
 
                     // No-switch: stay in state s
-                    let no_switch_s = fwd1[m - 1][s] as f64 * p_no_rec as f64 * emit_s as f64 * bwd_s as f64;
+                    let no_switch_s =
+                        fwd1[m - 1][s] as f64 * p_no_rec as f64 * emit_s as f64 * bwd_s as f64;
                     no_switch_mass += no_switch_s;
 
                     // All transitions into state s (for total mass)
-                    let switch_into_s = fwd1_sum as f64 * shift as f64 * emit_s as f64 * bwd_s as f64;
+                    let switch_into_s =
+                        fwd1_sum as f64 * shift as f64 * emit_s as f64 * bwd_s as f64;
                     total_mass += no_switch_s + switch_into_s;
                 }
 
@@ -997,5 +1464,4 @@ mod tests {
         let pipeline = PhasingPipeline::new(config);
         assert_eq!(pipeline.params.n_states, 280);
     }
-
 }

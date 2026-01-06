@@ -101,10 +101,10 @@ impl<'a> GenotypeView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker};
     use crate::data::storage::GenotypeColumn;
-    use crate::data::ChromIdx;
     use std::sync::Arc;
 
     fn make_test_matrix() -> GenotypeMatrix {

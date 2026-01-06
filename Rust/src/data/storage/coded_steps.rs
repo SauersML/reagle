@@ -13,8 +13,6 @@
 //! 2. Operating on pattern indices rather than raw alleles
 //! 3. Enabling efficient PBWT operations on the compressed representation
 
-use std::collections::HashMap;
-
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
@@ -38,6 +36,10 @@ pub struct CodedStep {
 
 impl CodedStep {
     /// Create a new coded step from genotype data
+    ///
+    /// OPTIMIZATION: Uses a reusable scratch buffer to avoid allocating a new Vec<u8>
+    /// for every haplotype. Only unique patterns are allocated and stored.
+    /// This reduces heap allocations from O(n_haps * n_steps) to O(n_unique_patterns).
     pub fn new(gt: &GenotypeMatrix, start: usize, end: usize) -> Self {
         let n_haps = gt.n_haplotypes();
         let n_markers = end - start;
@@ -53,28 +55,34 @@ impl CodedStep {
             };
         }
 
-        // Build sequence -> pattern_idx mapping
-        let mut seq_to_pattern: HashMap<Vec<u8>, u16> = HashMap::new();
+        // Pre-allocate scratch buffer - reused for each haplotype (avoids O(n_haps) allocations)
+        let mut scratch = vec![0u8; n_markers];
+
+        // Store unique patterns and their indices
         let mut patterns: Vec<Vec<u8>> = Vec::new();
         let mut hap_to_pattern = Vec::with_capacity(n_haps);
 
         for h in 0..n_haps {
             let hap = HapIdx::new(h as u32);
 
-            // Extract allele sequence for this haplotype
-            let seq: Vec<u8> = (start..end)
-                .map(|m| gt.allele(MarkerIdx::new(m as u32), hap))
-                .collect();
+            // Fill scratch buffer in-place (NO allocation)
+            for (i, m) in (start..end).enumerate() {
+                scratch[i] = gt.allele(MarkerIdx::new(m as u32), hap);
+            }
 
-            // Look up or create pattern
-            let pattern_idx = if let Some(&idx) = seq_to_pattern.get(&seq) {
-                idx
-            } else {
-                let idx = patterns.len() as u16;
-                seq_to_pattern.insert(seq.clone(), idx);
-                patterns.push(seq);
-                idx
-            };
+            // Look up pattern using linear search for small pattern counts
+            // This is typically faster than HashMap for <100 patterns due to cache locality,
+            // and reference panels typically have high compression ratios (many haps per pattern)
+            let pattern_idx = patterns
+                .iter()
+                .position(|p| p.as_slice() == scratch.as_slice())
+                .map(|i| i as u16)
+                .unwrap_or_else(|| {
+                    // Only allocate when we discover a NEW unique pattern
+                    let idx = patterns.len() as u16;
+                    patterns.push(scratch.clone()); // Only allocation per unique pattern
+                    idx
+                });
 
             hap_to_pattern.push(pattern_idx);
         }
@@ -162,7 +170,8 @@ impl CodedStep {
         }
 
         // Look for exact match in patterns
-        self.patterns.iter()
+        self.patterns
+            .iter()
             .position(|p| p == alleles)
             .map(|idx| idx as u16)
     }
@@ -179,7 +188,8 @@ impl CodedStep {
         let mut best_distance = usize::MAX;
 
         for (idx, pattern) in self.patterns.iter().enumerate() {
-            let distance = pattern.iter()
+            let distance = pattern
+                .iter()
                 .zip(alleles.iter())
                 .filter(|(p, a)| **p != **a && **p != 255 && **a != 255)
                 .count();
@@ -459,7 +469,7 @@ impl<'a> CodedPbwtView<'a> {
     ) {
         let n_haps = self.prefix.len();
         let n_patterns = step.n_patterns();
-        
+
         if n_patterns == 0 || n_haps == 0 {
             self.current_step += 1;
             return;
@@ -495,11 +505,11 @@ impl<'a> CodedPbwtView<'a> {
             let hap = self.prefix[i];
             let div = self.divergence[i];
             let pattern = step.pattern(HapIdx::new(hap)) as usize;
-            
+
             if pattern < n_patterns {
                 let bucket_start = offsets[pattern];
                 let pos = write_pos[pattern];
-                
+
                 prefix_scratch[pos] = hap;
                 // Divergence: first element in bucket gets max(step_start, div)
                 div_scratch[pos] = if pos == bucket_start {
@@ -507,7 +517,7 @@ impl<'a> CodedPbwtView<'a> {
                 } else {
                     div
                 };
-                
+
                 write_pos[pattern] += 1;
             }
         }
@@ -515,7 +525,7 @@ impl<'a> CodedPbwtView<'a> {
         // Step 4: Copy results back to main arrays
         self.prefix[..n_haps].copy_from_slice(&prefix_scratch[..n_haps]);
         self.divergence[..n_haps].copy_from_slice(&div_scratch[..n_haps]);
-        
+
         self.current_step += 1;
     }
 
@@ -613,10 +623,10 @@ impl<'a> CodedPbwtView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
     use crate::data::storage::GenotypeColumn;
-    use crate::data::ChromIdx;
     use std::sync::Arc;
 
     fn make_test_matrix() -> GenotypeMatrix {

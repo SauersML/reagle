@@ -19,18 +19,14 @@ use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
-use crate::data::storage::coded_steps::RefPanelCoded;
 use crate::data::storage::GenotypeMatrix;
+use crate::data::storage::coded_steps::RefPanelCoded;
 use crate::error::Result;
-use crate::io::vcf::{VcfReader, VcfWriter, ImputationQuality};
+use crate::io::vcf::{ImputationQuality, VcfReader, VcfWriter};
 use crate::utils::workspace::ImpWorkspace;
-
 
 use crate::model::imp_states::{CodedStepsConfig, ImpStates};
 use crate::model::parameters::ModelParams;
-
-
-
 
 /// Imputation pipeline
 pub struct ImputationPipeline {
@@ -135,11 +131,7 @@ impl MarkerAlignment {
     /// Get target marker index for a reference marker (returns None if not genotyped)
     pub fn target_marker(&self, ref_marker: usize) -> Option<usize> {
         let idx = self.ref_to_target.get(ref_marker).copied().unwrap_or(-1);
-        if idx >= 0 {
-            Some(idx as usize)
-        } else {
-            None
-        }
+        if idx >= 0 { Some(idx as usize) } else { None }
     }
 
     /// Get reference marker index for a target marker
@@ -229,8 +221,16 @@ impl StateProbs {
             let mut probs_p1 = Vec::new();
 
             for j in 0..n_states.min(hap_indices.get(m).map(|v| v.len()).unwrap_or(0)) {
-                let prob_m = state_probs.get(m).and_then(|v| v.get(j)).copied().unwrap_or(0.0);
-                let prob_m_p1 = state_probs.get(m_p1).and_then(|v| v.get(j)).copied().unwrap_or(0.0);
+                let prob_m = state_probs
+                    .get(m)
+                    .and_then(|v| v.get(j))
+                    .copied()
+                    .unwrap_or(0.0);
+                let prob_m_p1 = state_probs
+                    .get(m_p1)
+                    .and_then(|v| v.get(j))
+                    .copied()
+                    .unwrap_or(0.0);
 
                 if prob_m > threshold || prob_m_p1 > threshold {
                     haps.push(hap_indices[m][j]);
@@ -284,7 +284,12 @@ impl StateProbs {
         }
     }
 
-    fn dosage_at_genotyped<F>(&self, target_marker: usize, ref_marker: usize, get_ref_allele: &F) -> f32
+    fn dosage_at_genotyped<F>(
+        &self,
+        target_marker: usize,
+        ref_marker: usize,
+        get_ref_allele: &F,
+    ) -> f32
     where
         F: Fn(usize, u32) -> u8,
     {
@@ -353,10 +358,10 @@ impl ImputationPipeline {
         // Auto-phase target if unphased (imputation requires phased haplotypes)
         let target_gt = if !target_gt.is_phased() {
             eprintln!("Target VCF is unphased. Running phasing before imputation...");
-            
+
             // Create phasing pipeline with current config
             let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
-            
+
             // Load genetic map if provided
             let gen_maps = if let Some(ref map_path) = self.config.map {
                 let chrom_names: Vec<&str> = target_gt
@@ -369,7 +374,7 @@ impl ImputationPipeline {
             } else {
                 GeneticMaps::new()
             };
-            
+
             phasing.phase_in_memory(&target_gt, &gen_maps)?
         } else {
             target_gt
@@ -397,7 +402,8 @@ impl ImputationPipeline {
 
         // Initialize parameters
         self.params = ModelParams::for_imputation(n_ref_haps);
-        self.params.set_n_states(self.config.imp_states.min(n_ref_haps));
+        self.params
+            .set_n_states(self.config.imp_states.min(n_ref_haps));
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
@@ -486,12 +492,8 @@ impl ImputationPipeline {
                         .collect();
 
                     // Create ImpStates for dynamic state selection with RefPanelCoded
-                    let mut imp_states = ImpStates::new(
-                        &ref_panel_coded,
-                        n_states,
-                        &gen_positions,
-                        &steps_config,
-                    );
+                    let mut imp_states =
+                        ImpStates::new(&ref_panel_coded, n_states, &gen_positions, &steps_config);
 
                     // Get reference allele closure
                     let get_ref_allele = |m: usize, hap: u32| -> u8 {
@@ -645,7 +647,11 @@ fn run_hmm_forward_backward(
         let matches = &allele_match[m];
 
         for k in 0..n_states.min(matches.len()) {
-            let emit = if matches[k] { emit_probs[0] } else { emit_probs[1] };
+            let emit = if matches[k] {
+                emit_probs[0]
+            } else {
+                emit_probs[1]
+            };
             fwd[m][k] = if m == 0 {
                 emit / n_states as f32
             } else {
@@ -693,7 +699,11 @@ fn run_hmm_forward_backward(
             let matches = &allele_match[m];
             bwd_sum = 0.0;
             for k in 0..n_states.min(matches.len()) {
-                let emit = if matches[k] { emit_probs[0] } else { emit_probs[1] };
+                let emit = if matches[k] {
+                    emit_probs[0]
+                } else {
+                    emit_probs[1]
+                };
                 bwd[k] *= emit;
                 bwd_sum += bwd[k];
             }
@@ -702,4 +712,3 @@ fn run_hmm_forward_backward(
 
     fwd
 }
-

@@ -349,7 +349,7 @@ impl ParamEstimates {
 }
 
 /// Thread-safe wrapper for ParamEstimates using Mutex
-/// 
+///
 /// Uses interior mutability for correct float accumulation across threads.
 #[derive(Debug)]
 pub struct AtomicParamEstimates {
@@ -461,11 +461,11 @@ mod tests {
     #[test]
     fn test_param_estimates_merge() {
         let mut e1 = ParamEstimates::new();
-        e1.add_switch(0.5, 2.0);  // 0.5 cM genetic distance
+        e1.add_switch(0.5, 2.0); // 0.5 cM genetic distance
         e1.add_emission(0.9, 0.1);
 
         let mut e2 = ParamEstimates::new();
-        e2.add_switch(0.3, 1.5);  // 0.3 cM genetic distance
+        e2.add_switch(0.3, 1.5); // 0.3 cM genetic distance
         e2.add_emission(0.8, 0.2);
 
         e1.merge(&e2);

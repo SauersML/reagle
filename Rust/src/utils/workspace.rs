@@ -246,7 +246,6 @@ pub struct ImpWorkspace {
     pub pbwt_divergence_bwd: Vec<i32>,
 
     // === Counting sort scratch buffers for optimized PBWT updates ===
-    
     /// Pattern counts for counting sort
     pub sort_counts: Vec<usize>,
 
