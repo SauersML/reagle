@@ -6,7 +6,9 @@
 //! - `PBWT`: Positional Burrows-Wheeler Transform for efficient haplotype matching
 //! - `HMM`: Li-Stephens Hidden Markov Model for phasing and imputation
 //! - `Parameters`: Model hyperparameters (Ne, error rates)
+//! - `CompositeStates`: Composite haplotype construction for dynamic HMM states
 
+pub mod composite_states;
 pub mod hmm;
 pub mod ibs2;
 pub mod imp_states;
