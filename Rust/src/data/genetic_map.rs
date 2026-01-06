@@ -174,53 +174,6 @@ impl GeneticMap {
         (self.gen_pos(pos2) - self.gen_pos(pos1)).abs()
     }
 
-    /// Slice the genetic map to cover a physical position range
-    ///
-    /// The slice includes all map points within `[min_bp, max_bp]`, plus
-    /// immediately surrounding points to ensure correct interpolation/extrapolation.
-    pub fn slice(&self, min_bp: u32, max_bp: u32) -> Self {
-        if self.positions.is_empty() {
-            return self.clone();
-        }
-
-        // Find start index: binary_search gives Ok(i) or Err(i)
-        let start_idx = match self.positions.binary_search(&min_bp) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-
-        // Find end index
-        let end_idx = match self.positions.binary_search(&max_bp) {
-            Ok(j) => j,
-            Err(j) => j.min(self.positions.len() - 1),
-        };
-
-        // Ensure we preserve extrapolation slopes at the edges
-        let mut final_start = start_idx;
-        let mut final_end = end_idx;
-
-        // If slice starts at 0, include index 1 to preserve initial slope
-        if final_start == 0 && self.positions.len() > 1 {
-            final_end = final_end.max(1);
-        }
-
-        // If slice ends at last, include second-to-last to preserve final slope
-        if final_end == self.positions.len() - 1 && self.positions.len() > 1 {
-            final_start = final_start.min(self.positions.len() - 2);
-        }
-
-        // Ensure start <= end
-        if final_start > final_end {
-            final_end = final_start;
-        }
-
-        Self {
-            chrom: self.chrom,
-            positions: self.positions[final_start..=final_end].to_vec(),
-            gen_positions: self.gen_positions[final_start..=final_end].to_vec(),
-        }
-    }
-
     /// Set chromosome index
     pub fn set_chrom(&mut self, chrom: ChromIdx) {
         self.chrom = chrom;

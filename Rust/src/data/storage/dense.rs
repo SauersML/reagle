@@ -5,7 +5,6 @@
 
 use bitvec::prelude::*;
 
-use crate::data::storage::AlleleAccess;
 use crate::data::HapIdx;
 
 /// Dense bit-packed storage for genotype data
@@ -158,27 +157,6 @@ impl DenseColumn {
             + std::mem::size_of::<Self>()
     }
 
-    /// Access the underlying raw u64 storage slice for alleles
-    pub fn as_raw_slice(&self) -> &[u64] {
-        self.bits.as_raw_slice()
-    }
-
-    /// Access the underlying raw u64 storage slice for missing data mask
-    pub fn missing_raw_slice(&self) -> &[u64] {
-        self.missing.as_raw_slice()
-    }
-}
-
-/// Implement AlleleAccess for zero-cost abstraction in hot paths
-impl AlleleAccess for DenseColumn {
-    #[inline]
-    fn get(&self, hap: HapIdx) -> u8 {
-        DenseColumn::get(self, hap)
-    }
-
-    fn n_haplotypes(&self) -> usize {
-        DenseColumn::n_haplotypes(self)
-    }
 }
 
 #[cfg(test)]

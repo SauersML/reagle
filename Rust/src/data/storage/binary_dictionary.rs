@@ -8,7 +8,6 @@ use memmap2::Mmap;
 use bytemuck::pod_read_unaligned;
 
 use crate::data::HapIdx;
-use crate::data::storage::AlleleAccess;
 
 /// A dictionary-compressed block backed by a memory map.
 ///
@@ -122,29 +121,3 @@ impl BinaryDictionaryColumn {
     }
 }
 
-// ============================================================================
-// BinaryDictionaryColumnView - View for AlleleAccess
-// ============================================================================
-
-#[derive(Clone, Debug)]
-pub struct BinaryDictionaryColumnView<'a> {
-    column: &'a BinaryDictionaryColumn,
-    offset: usize,
-}
-
-impl<'a> BinaryDictionaryColumnView<'a> {
-    pub fn new(column: &'a BinaryDictionaryColumn, offset: usize) -> Self {
-        Self { column, offset }
-    }
-}
-
-impl<'a> AlleleAccess for BinaryDictionaryColumnView<'a> {
-    #[inline]
-    fn get(&self, hap: HapIdx) -> u8 {
-        self.column.get(self.offset, hap)
-    }
-
-    fn n_haplotypes(&self) -> usize {
-        self.column.n_haplotypes()
-    }
-}

@@ -309,6 +309,7 @@ mod tests {
         assert_eq!(ws.prefix.len(), 1000);
     }
 
+    #[test]
     fn test_workspace_resize() {
         let mut ws = Workspace::minimal();
         ws.resize(200, 100, 2000);

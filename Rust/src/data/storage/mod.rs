@@ -2,13 +2,6 @@
 //!
 //! Polymorphic storage for genotype data. Replaces Java's `GTRec` class hierarchy
 //! with a single Rust enum.
-//!
-//! ## Zero-Cost Abstraction via AlleleAccess Trait
-//!
-//! The [`AlleleAccess`] trait enables monomorphization for hot-path algorithms.
-//! Instead of matching on the enum for every allele access, algorithms can be
-//! generic over `T: AlleleAccess`, allowing the compiler to inline and optimize
-//! each storage type separately.
 
 pub mod coded_steps;
 pub mod dense;
@@ -16,13 +9,14 @@ pub mod dictionary;
 pub mod matrix;
 pub mod mutable;
 pub mod phase_state;
+pub mod sample_phase;
 pub mod sparse;
 pub mod view;
 pub mod binary_dictionary;
 
 pub use dense::DenseColumn;
-pub use dictionary::{DictionaryColumn, DictionaryColumnView};
-pub use binary_dictionary::{BinaryDictionaryColumn, BinaryDictionaryColumnView};
+pub use dictionary::DictionaryColumn;
+pub use binary_dictionary::BinaryDictionaryColumn;
 pub use matrix::GenotypeMatrix;
 pub use mutable::MutableGenotypes;
 pub use phase_state::PhaseState;
@@ -31,35 +25,6 @@ pub use view::GenotypeView;
 
 use crate::data::HapIdx;
 use std::sync::Arc;
-
-// ============================================================================
-// AlleleAccess Trait - Zero-Cost Abstraction for Hot Paths
-// ============================================================================
-
-/// Trait for allele access - enables monomorphization in hot paths.
-///
-/// By making PBWT and HMM algorithms generic over `T: AlleleAccess`, the compiler
-/// generates specialized machine code for each storage type (Dense, Sparse, Dictionary),
-/// eliminating the `match` dispatch overhead inside tight loops.
-pub trait AlleleAccess {
-    /// Get allele for a specific haplotype (0 = REF, 1+ = ALT)
-    fn get(&self, hap: HapIdx) -> u8;
-
-    /// Number of haplotypes in this column
-    fn n_haplotypes(&self) -> usize;
-}
-
-/// Implement AlleleAccess for references to AlleleAccess types
-impl<T: AlleleAccess + ?Sized> AlleleAccess for &T {
-    #[inline]
-    fn get(&self, hap: HapIdx) -> u8 {
-        (*self).get(hap)
-    }
-
-    fn n_haplotypes(&self) -> usize {
-        (*self).n_haplotypes()
-    }
-}
 
 /// The core genotype storage enum - replaces Java's class hierarchy
 #[derive(Clone, Debug)]
@@ -198,79 +163,6 @@ impl GenotypeColumn {
         }
     }
 
-    // ========================================================================
-    // Visitor Pattern for Monomorphized Hot Paths
-    // ========================================================================
-
-    /// Visit with a closure that receives a concrete AlleleAccess type.
-    ///
-    /// This enables monomorphization: the compiler generates specialized code
-    /// for each storage type, eliminating the match dispatch from inner loops.
-    #[inline]
-    pub fn visit_with<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&dyn AlleleAccess) -> R,
-    {
-        match self {
-            Self::Dense(col) => f(col),
-            Self::Sparse(col) => f(col),
-            Self::Dictionary(col, offset) => {
-                let view = DictionaryColumnView::new(col, *offset);
-                f(&view)
-            }
-            Self::BinaryDictionary(col, offset) => {
-                let view = BinaryDictionaryColumnView::new(col, *offset);
-                f(&view)
-            }
-        }
-    }
-
-    /// Visit with separate closures for each storage type (maximum monomorphization).
-    ///
-    /// This is the most performant option when you need the compiler to generate
-    /// fully specialized code for each storage type. Each closure receives a
-    /// concrete type, not a trait object.
-    #[inline]
-    pub fn visit_typed<F1, F2, F3, F4, R>(
-        &self, 
-        dense_fn: F1, 
-        sparse_fn: F2, 
-        dict_fn: F3,
-        bin_dict_fn: F4
-    ) -> R
-    where
-        F1: FnOnce(&DenseColumn) -> R,
-        F2: FnOnce(&SparseColumn) -> R,
-        F3: FnOnce(&DictionaryColumnView<'_>) -> R,
-        F4: FnOnce(&BinaryDictionaryColumnView<'_>) -> R,
-    {
-        match self {
-            Self::Dense(col) => dense_fn(col),
-            Self::Sparse(col) => sparse_fn(col),
-            Self::Dictionary(col, offset) => {
-                let view = DictionaryColumnView::new(col, *offset);
-                dict_fn(&view)
-            }
-            Self::BinaryDictionary(col, offset) => {
-                let view = BinaryDictionaryColumnView::new(col, *offset);
-                bin_dict_fn(&view)
-            }
-        }
-    }
-}
-
-/// Implement AlleleAccess for GenotypeColumn (still uses enum dispatch)
-impl AlleleAccess for GenotypeColumn {
-    #[inline]
-    fn get(&self, hap: HapIdx) -> u8 {
-        // Delegate to the inherent method
-        GenotypeColumn::get(self, hap)
-    }
-
-    fn n_haplotypes(&self) -> usize {
-        // Delegate to the inherent method
-        GenotypeColumn::n_haplotypes(self)
-    }
 }
 
 impl Default for GenotypeColumn {

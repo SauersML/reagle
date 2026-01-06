@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::data::genetic_map::{GeneticMaps, MarkerMap};
 use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
+use crate::data::storage::sample_phase::SamplePhase;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes, GenotypeView};
 use crate::error::Result;
 use crate::io::streaming::{StreamingConfig, StreamingVcfReader};
@@ -192,6 +193,9 @@ impl PhasingPipeline {
             .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
             .collect();
 
+        // Create SamplePhase instances to track phase state
+        let mut sample_phases = self.create_sample_phases(&geno, &missing_mask);
+
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             let iter_type = if is_burnin { "burnin" } else { "main" };
@@ -215,6 +219,7 @@ impl PhasingPipeline {
                 &stage1_gen_dists,
                 &hi_freq_to_orig,
                 &ibs2,
+                &mut sample_phases,
                 atomic_estimates.as_ref(),
             )?;
 
@@ -246,6 +251,9 @@ impl PhasingPipeline {
             }
         }
 
+        // Sync final phase state from SamplePhase to MutableGenotypes
+        self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
+
         // STAGE 2: Phase rare markers using HMM state probability interpolation
         // This implements the proper algorithm from Java Beagle's Stage2Baum.java
         if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
@@ -260,7 +268,11 @@ impl PhasingPipeline {
                 &gen_positions,
                 &stage1_p_recomb,
                 &ibs2,
+                &mut sample_phases,
             );
+            
+            // Sync again after Stage 2
+            self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
         }
 
         // Build final GenotypeMatrix from mutable genotypes
@@ -484,6 +496,67 @@ impl PhasingPipeline {
         }
 
         Ok(self.build_final_matrix(target_gt, &geno))
+    }
+
+    /// Create SamplePhase instances for all samples
+    ///
+    /// This initializes phase tracking state from the current genotype data.
+    fn create_sample_phases(
+        &self,
+        geno: &MutableGenotypes,
+        missing_mask: &[BitBox<u8, Lsb0>],
+    ) -> Vec<SamplePhase> {
+        let n_samples = geno.n_haps() / 2;
+        let n_markers = geno.n_markers();
+
+        (0..n_samples)
+            .map(|s| {
+                let hap1 = HapIdx::new((s * 2) as u32);
+                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+                let alleles1: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap1)).collect();
+                let alleles2: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap2)).collect();
+
+                // Identify missing markers
+                let missing: Vec<usize> = (0..n_markers)
+                    .filter(|&m| missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m])
+                    .collect();
+
+                // Initially all hets are unphased
+                let unphased: Vec<usize> = (0..n_markers)
+                    .filter(|&m| {
+                        let a1 = alleles1[m];
+                        let a2 = alleles2[m];
+                        a1 != a2
+                            && !missing_mask[hap1.as_usize()][m]
+                            && !missing_mask[hap2.as_usize()][m]
+                    })
+                    .collect();
+
+                SamplePhase::new(s as u32, n_markers, &alleles1, &alleles2, &unphased, &missing)
+            })
+            .collect()
+    }
+
+    /// Sync SamplePhase alleles back to MutableGenotypes
+    fn sync_sample_phases_to_geno(
+        &self,
+        sample_phases: &[SamplePhase],
+        geno: &mut MutableGenotypes,
+    ) {
+        let n_markers = geno.n_markers();
+
+        for (s, sp) in sample_phases.iter().enumerate() {
+            let hap1 = HapIdx::new((s * 2) as u32);
+            let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+            for m in 0..n_markers {
+                let a1 = sp.allele1(m);
+                let a2 = sp.allele2(m);
+                geno.set(m, hap1, a1);
+                geno.set(m, hap2, a2);
+            }
+        }
     }
 
     /// Select optimal HMM states using PBWT-based dynamic state selection
@@ -741,18 +814,20 @@ impl PhasingPipeline {
     }
 
     /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only using FB HMM
+    ///
+    /// Uses SamplePhase to track phase state and only phases unphased markers.
     fn run_phase_baum_iteration_stage1(
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        missing_mask: &[BitBox<u8, Lsb0>],
+        _missing_mask: &[BitBox<u8, Lsb0>],
         stage1_p_recomb: &[f32],
         stage1_gen_dists: &[f64],
         hi_freq_to_orig: &[usize],
         ibs2: &Ibs2,
+        sample_phases: &mut [SamplePhase],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
     ) -> Result<()> {
-        let n_samples = geno.n_haps() / 2;
         let n_haps = geno.n_haps();
         let n_markers = geno.n_markers();
         let markers = target_gt.markers();
@@ -768,152 +843,189 @@ impl PhasingPipeline {
         // 2. Build PBWT for dynamic state selection (using current phased genotypes)
         let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
 
-        let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, hi_freq_to_orig.len()); n_samples];
+        // Collect phase decisions per sample: Vec<(hi_freq_idx, swap, lr)>
+        type PhaseDecision = (usize, bool, f64); // (hi_freq_idx, should_swap, log_lr)
+        let phase_decisions: Vec<Vec<PhaseDecision>> = sample_phases
+            .par_iter()
+            .enumerate()
+            .map(|(s, sp)| {
+                let sample_idx = SampleIdx::new(s as u32);
+                let hap1 = sample_idx.hap1();
 
-        swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
-            let sample_idx = SampleIdx::new(s as u32);
-            let hap1 = sample_idx.hap1();
-            let hap2 = sample_idx.hap2();
+                // Use midpoint marker for PBWT-based state selection
+                let mid_marker = hi_freq_to_orig.len() / 2;
+                let mid_orig = hi_freq_to_orig.get(mid_marker).copied().unwrap_or(0);
+                let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps);
 
-            // Use midpoint marker for PBWT-based state selection
-            // This gives a representative set of IBS neighbors for the window
-            let mid_marker = hi_freq_to_orig.len() / 2;
-            let mid_orig = hi_freq_to_orig.get(mid_marker).copied().unwrap_or(0);
-            let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps);
-            
-            // Extract Alleles for SUBSET of markers
-            let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| ref_geno.get(m, hap1)).collect();
-            let seq2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| ref_geno.get(m, hap2)).collect();
+                // Extract alleles from SamplePhase for SUBSET of markers
+                let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
+                let seq2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele2(m)).collect();
 
-            let hmm1 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
-            
-            // Collect EM statistics if requested
-            if let Some(atomic) = atomic_estimates {
-                let mut local_est = crate::model::parameters::ParamEstimates::new();
-                hmm1.collect_stats(&seq1, stage1_gen_dists, &mut local_est);
-                
-                let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
-                hmm2.collect_stats(&seq2, stage1_gen_dists, &mut local_est);
-                
-                atomic.add_estimation_data(&local_est);
-            }
+                let hmm1 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
 
-            let mut fwd1 = Vec::new();
-            let mut bwd1 = Vec::new();
-            hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
+                // Collect EM statistics if requested
+                if let Some(atomic) = atomic_estimates {
+                    let mut local_est = crate::model::parameters::ParamEstimates::new();
+                    hmm1.collect_stats(&seq1, stage1_gen_dists, &mut local_est);
 
-            let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
-            let mut fwd2 = Vec::new();
-            let mut bwd2 = Vec::new();
-            hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
+                    let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
+                    hmm2.collect_stats(&seq2, stage1_gen_dists, &mut local_est);
 
-            // BLOCK-BASED phasing for Stage 1
-            let n_states = states.len();
-            let n_hi_freq = hi_freq_to_orig.len();
-            
-            // Identify heterozygous blocks in hi-freq marker space
-            let mut het_blocks: Vec<(usize, usize)> = Vec::new(); // (start, end) inclusive in hi-freq index
-            let mut block_start: Option<usize> = None;
-            
-            for i in 0..n_hi_freq {
-                let m = hi_freq_to_orig[i];
-                let a1 = seq1[i];
-                let a2 = seq2[i];
-                let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
-                let is_het = !is_missing && a1 != a2;
-                
-                if is_het {
-                    if block_start.is_none() {
-                        block_start = Some(i);
-                    }
-                } else if let Some(start) = block_start {
-                    het_blocks.push((start, i - 1));
-                    block_start = None;
+                    atomic.add_estimation_data(&local_est);
                 }
-            }
-            if let Some(start) = block_start {
-                het_blocks.push((start, n_hi_freq - 1));
-            }
-            
-            // Compute block-level likelihoods and decide phase for each block
-            let mut current_swap = false;
-            let lr_threshold = self.params.lr_threshold as f64;
-            
-            for (block_start_i, block_end_i) in het_blocks {
-                let mut log_l_keep = 0.0f64;
-                let mut log_l_swap = 0.0f64;
-                
-                for i in block_start_i..=block_end_i {
+
+                let mut fwd1 = Vec::new();
+                let mut bwd1 = Vec::new();
+                hmm1.forward_backward_raw(&seq1, &mut fwd1, &mut bwd1);
+
+                let hmm2 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
+                let mut fwd2 = Vec::new();
+                let mut bwd2 = Vec::new();
+                hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
+
+                // BLOCK-BASED phasing for Stage 1
+                let n_states = states.len();
+                let n_hi_freq = hi_freq_to_orig.len();
+
+                // Identify UNPHASED heterozygous blocks in hi-freq marker space
+                let mut het_blocks: Vec<(usize, usize)> = Vec::new(); // (start, end) inclusive
+                let mut block_start: Option<usize> = None;
+
+                for i in 0..n_hi_freq {
                     let m = hi_freq_to_orig[i];
                     let a1 = seq1[i];
                     let a2 = seq2[i];
-                    let is_missing = missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m];
-                    
-                    if is_missing || a1 == a2 {
+                    let is_het = a1 != a2;
+                    // Only consider UNPHASED heterozygotes
+                    let is_unphased_het = is_het && sp.is_unphased(m);
+
+                    if is_unphased_het {
+                        if block_start.is_none() {
+                            block_start = Some(i);
+                        }
+                    } else if let Some(start) = block_start {
+                        het_blocks.push((start, i - 1));
+                        block_start = None;
+                    }
+                }
+                if let Some(start) = block_start {
+                    het_blocks.push((start, n_hi_freq - 1));
+                }
+
+                // Compute block-level likelihoods and collect phase decisions
+                let mut decisions = Vec::new();
+                let mut current_swap = false;
+                let lr_threshold = self.params.lr_threshold as f64;
+
+                for (block_start_i, block_end_i) in het_blocks {
+                    let mut log_l_keep = 0.0f64;
+                    let mut log_l_swap = 0.0f64;
+                    let mut has_unphased = false;
+
+                    for i in block_start_i..=block_end_i {
+                        let m = hi_freq_to_orig[i];
+                        let a1 = seq1[i];
+                        let a2 = seq2[i];
+
+                        // Only count unphased hets in likelihood
+                        if a1 == a2 || !sp.is_unphased(m) {
+                            continue;
+                        }
+                        has_unphased = true;
+
+                        let row_start = i * n_states;
+                        let row_end = row_start + n_states;
+
+                        let f1 = &fwd1[row_start..row_end];
+                        let b1 = &bwd1[row_start..row_end];
+                        let f2 = &fwd2[row_start..row_end];
+                        let b2 = &bwd2[row_start..row_end];
+
+                        let mut s11 = 0.0f64;
+                        let mut s22 = 0.0f64;
+                        let mut s12 = 0.0f64;
+                        let mut s21 = 0.0f64;
+
+                        for k in 0..n_states {
+                            s11 += f1[k] as f64 * b1[k] as f64;
+                            s22 += f2[k] as f64 * b2[k] as f64;
+                            s12 += f1[k] as f64 * b2[k] as f64;
+                            s21 += f2[k] as f64 * b1[k] as f64;
+                        }
+
+                        let eps = 1e-300f64;
+                        log_l_keep += (s11 * s22 + eps).ln();
+                        log_l_swap += (s12 * s21 + eps).ln();
+                    }
+
+                    if !has_unphased {
                         continue;
                     }
-                    
-                    let row_start = i * n_states;
-                    let row_end = row_start + n_states;
-                    
-                    let f1 = &fwd1[row_start..row_end];
-                    let b1 = &bwd1[row_start..row_end];
-                    let f2 = &fwd2[row_start..row_end];
-                    let b2 = &bwd2[row_start..row_end];
 
-                    let mut s11 = 0.0f64;
-                    let mut s22 = 0.0f64;
-                    let mut s12 = 0.0f64;
-                    let mut s21 = 0.0f64;
+                    let (log_l_stay, log_l_flip) = if current_swap {
+                        (log_l_swap, log_l_keep)
+                    } else {
+                        (log_l_keep, log_l_swap)
+                    };
 
-                    for k in 0..n_states {
-                        s11 += f1[k] as f64 * b1[k] as f64;
-                        s22 += f2[k] as f64 * b2[k] as f64;
-                        s12 += f1[k] as f64 * b2[k] as f64;
-                        s21 += f2[k] as f64 * b1[k] as f64;
+                    let log_threshold = lr_threshold.ln();
+                    if log_l_flip >= log_l_stay + log_threshold {
+                        current_swap = !current_swap;
                     }
 
-                    let eps = 1e-300f64;
-                    log_l_keep += (s11 * s22 + eps).ln();
-                    log_l_swap += (s12 * s21 + eps).ln();
-                }
-                
-                let (log_l_stay, log_l_flip) = if current_swap {
-                    (log_l_swap, log_l_keep)
-                } else {
-                    (log_l_keep, log_l_swap)
-                };
-                
-                let log_threshold = lr_threshold.ln();
-                if log_l_flip >= log_l_stay + log_threshold {
-                    current_swap = !current_swap;
-                }
-                
-                if current_swap {
+                    // Compute absolute log-LR for phasing confidence
+                    let log_lr = (log_l_keep - log_l_swap).abs();
+
+                    // Record decisions for each unphased marker in block
                     for i in block_start_i..=block_end_i {
-                        mask.set(i, true);
+                        let m = hi_freq_to_orig[i];
+                        if sp.is_unphased(m) && seq1[i] != seq2[i] {
+                            decisions.push((i, current_swap, log_lr));
+                        }
                     }
                 }
-            }
-        });
 
-        // Apply Swaps
+                decisions
+            })
+            .collect();
+
+        // Apply phase decisions to SamplePhase
         let mut total_switches = 0;
-        for s in 0..n_samples {
-            let mask = &swap_masks[s];
-            if mask.any() {
-                let hap1 = HapIdx::new((s * 2) as u32);
-                let hap2 = HapIdx::new((s * 2 + 1) as u32);
-                
-                for i in mask.iter_ones() {
-                    let m = hi_freq_to_orig[i];
-                    geno.swap(m, hap1, hap2);
+        let mut total_phased = 0;
+        let log_lr_threshold = (self.params.lr_threshold as f64).ln();
+
+        for (s, decisions) in phase_decisions.into_iter().enumerate() {
+            let sp = &mut sample_phases[s];
+
+            for (hi_freq_idx, should_swap, log_lr) in decisions {
+                let m = hi_freq_to_orig[hi_freq_idx];
+
+                // Only process if still unphased
+                if !sp.is_unphased(m) {
+                    continue;
+                }
+
+                // Apply swap if needed
+                if should_swap {
+                    sp.swap_haps(m, m + 1);
                     total_switches += 1;
+                }
+
+                // Mark as phased if LR exceeds threshold
+                if log_lr >= log_lr_threshold {
+                    sp.mark_phased(m);
+                    total_phased += 1;
                 }
             }
         }
-        
-        eprintln!("Applied {} phase switches (Stage 1 FB)", total_switches);
+
+        // Also update MutableGenotypes to keep in sync for next iteration's PBWT
+        self.sync_sample_phases_to_geno(sample_phases, geno);
+
+        eprintln!(
+            "Applied {} phase switches, {} markers phased (Stage 1 FB)",
+            total_switches, total_phased
+        );
         Ok(())
     }
     
@@ -949,6 +1061,8 @@ impl PhasingPipeline {
     ///    - Accumulate allele probabilities from reference haplotypes
     /// 3. Decide phase: p1 = alProbs1[a1] * alProbs2[a2], p2 = alProbs1[a2] * alProbs2[a1]
     ///    Switch if p2 > p1
+    ///
+    /// **Key fix**: Only phases markers that are currently UNPHASED in SamplePhase.
     fn phase_rare_markers_with_hmm(
         &self,
         target_gt: &GenotypeMatrix,
@@ -957,8 +1071,8 @@ impl PhasingPipeline {
         gen_positions: &[f64],
         stage1_p_recomb: &[f32],
         ibs2: &Ibs2,
+        sample_phases: &mut [SamplePhase],
     ) {
-        let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let n_stage1 = hi_freq_markers.len();
@@ -982,13 +1096,13 @@ impl PhasingPipeline {
         // Build PBWT for state selection
         let phase_ibs = self.build_phase_pbwt(&ref_geno, n_markers, n_haps);
 
-        // Process samples in parallel - collect results, then apply
-        let phase_changes: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|s| {
+        // Process samples in parallel - collect results: (marker, should_swap)
+        let phase_changes: Vec<Vec<(usize, bool)>> = sample_phases
+            .par_iter()
+            .enumerate()
+            .map(|(s, sp)| {
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
-                let hap2 = sample_idx.hap2();
 
                 // Select HMM states using PBWT
                 let mid_marker = n_stage1 / 2;
@@ -996,9 +1110,9 @@ impl PhasingPipeline {
                 let states = self.select_states_pbwt(hap1, mid_orig, &phase_ibs, ibs2, self.params.n_states, n_haps);
                 let n_states = states.len();
 
-                // Extract Stage 1 alleles
-                let seq1: Vec<u8> = hi_freq_markers.iter().map(|&m| ref_geno.get(m, hap1)).collect();
-                let seq2: Vec<u8> = hi_freq_markers.iter().map(|&m| ref_geno.get(m, hap2)).collect();
+                // Extract Stage 1 alleles from SamplePhase
+                let seq1: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele1(m)).collect();
+                let seq2: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele2(m)).collect();
 
                 // Run HMM forward-backward for both haplotypes on Stage 1 markers
                 let hmm1 = LiStephensHmm::new(subset_view, &self.params, states.clone(), stage1_p_recomb.to_vec());
@@ -1012,12 +1126,51 @@ impl PhasingPipeline {
                 hmm2.forward_backward_raw(&seq2, &mut fwd2, &mut bwd2);
 
                 // Compute posterior state probabilities at each Stage 1 marker
-                // probs[hap_bit][marker_idx][state_idx]
                 let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
                 let probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
 
-                // Collect markers to swap for this sample
-                let mut markers_to_swap = Vec::new();
+                // Collect phase decisions for this sample
+                let mut phase_decisions = Vec::new();
+
+                // Helper closure to process a marker
+                let mut process_marker = |m: usize| {
+                    // **KEY FIX**: Only process if marker is UNPHASED
+                    if !sp.is_unphased(m) {
+                        return;
+                    }
+
+                    let a1 = sp.allele1(m);
+                    let a2 = sp.allele2(m);
+
+                    // Only process heterozygotes
+                    if a1 == a2 {
+                        return;
+                    }
+
+                    // Compute interpolated allele probabilities for each haplotype
+                    let al_probs1 = stage2_phaser.interpolated_allele_probs(
+                        m, &probs1, &states, &ref_geno, n_haps, a1, a2,
+                    );
+                    let al_probs2 = stage2_phaser.interpolated_allele_probs(
+                        m, &probs2, &states, &ref_geno, n_haps, a1, a2,
+                    );
+
+                    // p1 = P(hap1 has a1, hap2 has a2)
+                    // p2 = P(hap1 has a2, hap2 has a1)
+                    let p1 = al_probs1[a1 as usize] * al_probs2[a2 as usize];
+                    let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
+
+                    // Record decision: (marker, should_swap)
+                    phase_decisions.push((m, p2 > p1));
+                };
+
+                // Process markers before first Stage 1 marker
+                if !hi_freq_markers.is_empty() {
+                    let first_hf = hi_freq_markers[0];
+                    for m in 0..first_hf {
+                        process_marker(m);
+                    }
+                }
 
                 // Process all Stage 2 markers (rare markers between Stage 1 markers)
                 for start_idx in 0..n_stage1 {
@@ -1029,77 +1182,42 @@ impl PhasingPipeline {
                     };
 
                     for m in (start_m + 1)..end_m {
-                        let a1 = ref_geno.get(m, hap1);
-                        let a2 = ref_geno.get(m, hap2);
-
-                        // Only process heterozygotes
-                        if a1 == a2 || a1 == 255 || a2 == 255 {
-                            continue;
-                        }
-
-                        // Compute interpolated allele probabilities for each haplotype
-                        let al_probs1 = stage2_phaser.interpolated_allele_probs(
-                            m, &probs1, &states, &ref_geno, n_haps, a1, a2,
-                        );
-                        let al_probs2 = stage2_phaser.interpolated_allele_probs(
-                            m, &probs2, &states, &ref_geno, n_haps, a1, a2,
-                        );
-
-                        // p1 = P(hap1 has a1, hap2 has a2)
-                        // p2 = P(hap1 has a2, hap2 has a1)
-                        let p1 = al_probs1[a1 as usize] * al_probs2[a2 as usize];
-                        let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
-
-                        if p2 > p1 {
-                            markers_to_swap.push(m);
-                        }
+                        process_marker(m);
                     }
                 }
 
-                // Also process markers before first Stage 1 marker
-                if !hi_freq_markers.is_empty() {
-                    let first_hf = hi_freq_markers[0];
-                    for m in 0..first_hf {
-                        let a1 = ref_geno.get(m, hap1);
-                        let a2 = ref_geno.get(m, hap2);
-
-                        if a1 == a2 || a1 == 255 || a2 == 255 {
-                            continue;
-                        }
-
-                        let al_probs1 = stage2_phaser.interpolated_allele_probs(
-                            m, &probs1, &states, &ref_geno, n_haps, a1, a2,
-                        );
-                        let al_probs2 = stage2_phaser.interpolated_allele_probs(
-                            m, &probs2, &states, &ref_geno, n_haps, a1, a2,
-                        );
-
-                        let p1 = al_probs1[a1 as usize] * al_probs2[a2 as usize];
-                        let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
-
-                        if p2 > p1 {
-                            markers_to_swap.push(m);
-                        }
-                    }
-                }
-
-                markers_to_swap
+                phase_decisions
             })
             .collect();
 
-        // Apply phase changes
+        // Apply phase changes to SamplePhase
         let mut total_switches = 0;
-        for (s, markers_to_swap) in phase_changes.into_iter().enumerate() {
-            let hap1 = HapIdx::new((s * 2) as u32);
-            let hap2 = HapIdx::new((s * 2 + 1) as u32);
+        let mut total_phased = 0;
 
-            for m in markers_to_swap {
-                geno.swap(m, hap1, hap2);
-                total_switches += 1;
+        for (s, decisions) in phase_changes.into_iter().enumerate() {
+            let sp = &mut sample_phases[s];
+
+            for (m, should_swap) in decisions {
+                // Double-check still unphased (should always be true)
+                if !sp.is_unphased(m) {
+                    continue;
+                }
+
+                if should_swap {
+                    sp.swap_haps(m, m + 1);
+                    total_switches += 1;
+                }
+
+                // Mark as phased after Stage 2 processing
+                sp.mark_phased(m);
+                total_phased += 1;
             }
         }
 
-        eprintln!("Stage 2: Applied {} phase switches (HMM interpolation)", total_switches);
+        eprintln!(
+            "Stage 2: Applied {} phase switches, {} markers phased (HMM interpolation)",
+            total_switches, total_phased
+        );
     }
 }
 

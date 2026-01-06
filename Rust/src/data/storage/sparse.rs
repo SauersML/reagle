@@ -3,7 +3,6 @@
 //! Efficient storage for rare variants (MAF < 1%) by storing only carrier indices.
 //! Replaces `vcf/LowMafGTRec.java`.
 
-use crate::data::storage::AlleleAccess;
 use crate::data::HapIdx;
 
 /// Sparse storage for rare variants
@@ -96,18 +95,6 @@ impl SparseColumn {
     /// Is this an inverted representation?
     pub fn is_inverted(&self) -> bool {
         self.inverted
-    }
-}
-
-/// Implement AlleleAccess for zero-cost abstraction in hot paths
-impl AlleleAccess for SparseColumn {
-    #[inline]
-    fn get(&self, hap: HapIdx) -> u8 {
-        SparseColumn::get(self, hap)
-    }
-
-    fn n_haplotypes(&self) -> usize {
-        SparseColumn::n_haplotypes(self)
     }
 }
 

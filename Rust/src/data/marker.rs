@@ -80,24 +80,6 @@ impl Allele {
         matches!(self, Self::Base(_))
     }
 
-    /// Check if this is missing
-    pub fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing)
-    }
-
-    /// Get the length of this allele in bases
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Base(_) => 1,
-            Self::Seq(s) => s.len(),
-            Self::Missing => 0,
-        }
-    }
-
-    /// Check if allele is empty (missing)
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 
     /// Get complement (for strand flipping)
     pub fn complement(&self) -> Self {
@@ -212,22 +194,6 @@ impl Marker {
             alt_alleles,
         }
     }
-
-    /// Get the end position of this marker
-    ///
-    /// Returns the END field value if present, otherwise returns pos
-    /// (point marker).
-    pub fn end_pos(&self) -> u32 {
-        self.end.unwrap_or(self.pos)
-    }
-
-    /// Check if a position falls within this marker's range
-    ///
-    /// For gVCF blocks, this checks if pos <= target_pos <= end.
-    /// For regular markers, returns true only if target_pos == pos.
-    pub fn contains_position(&self, target_pos: u32) -> bool {
-        target_pos >= self.pos && target_pos <= self.end_pos()
-    }
 }
 
 /// Allele mapping from target to reference panel
@@ -244,24 +210,6 @@ pub struct AlleleMapping {
 }
 
 impl AlleleMapping {
-    /// Create an identity mapping (no transformation needed)
-    pub fn identity(n_alleles: usize) -> Self {
-        Self {
-            targ_to_ref: (0..n_alleles as i8).collect(),
-            strand_flipped: false,
-            alleles_swapped: false,
-        }
-    }
-
-    /// Create a mapping indicating no match is possible
-    pub fn no_match(n_alleles: usize) -> Self {
-        Self {
-            targ_to_ref: vec![-1; n_alleles],
-            strand_flipped: false,
-            alleles_swapped: false,
-        }
-    }
-
     /// Map a target allele to reference allele
     /// Returns None if the allele cannot be mapped
     pub fn map_allele(&self, targ_allele: u8) -> Option<u8> {

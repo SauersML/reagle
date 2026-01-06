@@ -527,6 +527,13 @@ impl PbwtDivUpdater {
     /// * `divergence` - Current divergence array (with sentinel at end)
     /// * `marker` - Current marker
     /// * `n_candidates` - Maximum number of candidates to find
+    /// * `is_backward` - True for backward PBWT semantics
+    ///
+    /// # Divergence Semantics
+    /// - Forward PBWT: divergence[i] = marker where match STARTS (looking backward)
+    ///   Small divergence = long match. Expand while divergence <= marker.
+    /// - Backward PBWT: divergence[i] = marker where match ENDS (looking forward)
+    ///   Large divergence = long match. Expand while divergence >= marker.
     ///
     /// # Returns
     /// (start_pos, end_pos) indices in prefix array of matching neighbors
@@ -540,146 +547,84 @@ impl PbwtDivUpdater {
     ) -> (usize, usize) {
         let n = prefix.len();
 
-        // Set sentinels at boundaries
-        let d0 = if is_backward { marker - 2 } else { marker + 2 };
-
         let mut u = target_pos; // inclusive start
         let mut v = target_pos + 1; // exclusive end
 
-        // Get divergence values, using sentinel for out-of-bounds
-        let get_div = |i: usize| -> i32 { if i == 0 || i >= n { d0 } else { divergence[i] } };
-
-        let mut u_next_match = get_div(u);
-        let mut v_next_match = get_div(v);
-
-        // Expand range until we have enough candidates or hit boundaries
-        // Expand range until we have enough candidates or hit boundaries
-        while (v - u) < n_candidates {
+        // Helper to check if we can expand in a direction
+        // For forward PBWT: expand while divergence <= marker (small = good)
+        // For backward PBWT: expand while divergence >= marker (large = good)
+        let can_expand_u = |u: usize| -> bool {
+            if u == 0 {
+                return false;
+            }
             if is_backward {
-                // Backward PBWT: Expand toward LARGER divergence (closest neighbors have largest divergence <= marker)
-                // We want to find range [u, v) where divergence[i] > marker (meaning match extends PAST this marker)
-                // Wait, PBWT definition: 
-                // d[i] is divergence between a[i] and a[i-1].
-                // We expand while d[i] > marker? No.
-                //
-                // Standard: d[i] is FIRST marker where mismatch occurs.
-                // Match length is "marker index".
-                // We want matches that extend at least as far as current marker.
-                // For Backward: match extends "backward" to marker M-L.
-                // 
-                // Let's stick to the REFERENCE implementation Durbin (2014) logic:
-                // Expand while divergence[u] > k or divergence[v] > k.
-                // This means the match extends *beyond* the current threshold k.
-                
-                // My existing logic was:
-                // marker <= u_next_match || marker <= v_next_match
-                // where u_next_match = divergence[u]
-                
-                // Let's optimize the bulk expansion.
-                
-                // Try scanning forward for v: find next v where divergence[v] < marker
-                // Scan backward for u: find next u where divergence[u] < marker
-                
-                // However, standard neighbor finding is greedy: expand better side first.
-                // SimdScanner is useful if we want to expand *aggressively* in one direction.
-                
-                // Let's support the greedy strategy but in blocks if possible? 
-                // Or just use SimdScanner for "check if we can jump 8 steps".
-                
-                // Actually, the simplest speedup is: 
-                // If u_next >= marker AND v_next >= marker:
-                // We can expand both u and v until they hit a low divergence.
-                
-                // Let's keep the greedy structure but use scanner for the chosen direction.
-                
-                if u_next_match <= v_next_match {
-                    if marker <= v_next_match {
-                        let scan_limit = n_candidates - (v - u); // Max we can expand
-                        let next_v = SimdScanner::scan_while_le(divergence, v + 1, v + 1 + scan_limit.min(n - 1 - v), marker - 1);
-                        v = next_v;
-                        v_next_match = get_div(v).min(v_next_match);
-                    } else {
-                         if marker <= u_next_match {
-                             if u > 0 { 
-                                 let scan_limit = n_candidates - (v - u);
-                                 let next_u = SimdScanner::scan_back_while_le(divergence, u, u.saturating_sub(scan_limit), marker - 1);
-                                 u = next_u;
-                                 u_next_match = get_div(u).min(u_next_match);
-                             } else {
-                                break;
-                             }
-                         } else {
-                             break;
-                         }
-                    }
-                } else {
-                     if marker <= u_next_match {
-                        if u > 0 { 
-                             let scan_limit = n_candidates - (v - u);
-                             let next_u = SimdScanner::scan_back_while_le(divergence, u, u.saturating_sub(scan_limit), marker - 1);
-                             u = next_u;
-                             u_next_match = get_div(u).min(u_next_match);
-                        } else {
-                           break;
-                        }
-                     } else {
-                        if marker <= v_next_match {
-                             let scan_limit = n_candidates - (v - u);
-                             let next_v = SimdScanner::scan_while_le(divergence, v + 1, v + 1 + scan_limit.min(n - 1 - v), marker - 1);
-                             v = next_v;
-                             v_next_match = get_div(v).min(v_next_match);
-                         } else {
-                             break;
-                         }
-                     }
-                }
+                divergence[u] >= marker
             } else {
-                // Forward PBWT: Look for SMALL divergence (matching far back)
-                // Expand while divergence[u] <= marker OR divergence[v] <= marker
-                // i.e. NOT (divergence > marker)
-                // Find first i where divergence[i] > marker.
-                
-                if v_next_match <= u_next_match {
-                    if v_next_match <= marker {
-                         let scan_limit = n_candidates - (v - u);
-                         let next_v = SimdScanner::scan_while_le(divergence, v + 1, v + 1 + scan_limit.min(n - 1 - v), marker);
-                         v = next_v;
-                         v_next_match = get_div(v).max(v_next_match);
-                    } else {
-                        if u_next_match <= marker {
-                             if u > 0 { 
-                                 let scan_limit = n_candidates - (v - u);
-                                 let next_u = SimdScanner::scan_back_while_le(divergence, u, u.saturating_sub(scan_limit), marker);
-                                 u = next_u;
-                                 u_next_match = get_div(u).max(u_next_match);
-                             } else {
-                                break;
-                             }
-                        } else {
-                            break;
-                        }
-                    }
+                divergence[u] <= marker
+            }
+        };
+
+        let can_expand_v = |v: usize| -> bool {
+            if v >= n {
+                return false;
+            }
+            if is_backward {
+                divergence[v] >= marker
+            } else {
+                divergence[v] <= marker
+            }
+        };
+
+        // Compare which side is "better" to expand
+        // For forward: smaller divergence is better
+        // For backward: larger divergence is better
+        let prefer_u = |u: usize, v: usize| -> bool {
+            if u == 0 {
+                return false;
+            }
+            if v >= n {
+                return true;
+            }
+            if is_backward {
+                divergence[u] >= divergence[v]
+            } else {
+                divergence[u] <= divergence[v]
+            }
+        };
+
+        while (v - u) < n_candidates {
+            let can_u = can_expand_u(u);
+            let can_v = can_expand_v(v);
+
+            if !can_u && !can_v {
+                break;
+            }
+
+            let old_u = u;
+            let old_v = v;
+
+            if can_u && (!can_v || prefer_u(u, v)) {
+                // Expand u (backward)
+                let scan_limit = n_candidates - (v - u);
+                if is_backward {
+                    u = SimdScanner::scan_back_while_ge(divergence, u, u.saturating_sub(scan_limit), marker);
                 } else {
-                     if u_next_match <= marker {
-                         if u > 0 { 
-                             let scan_limit = n_candidates - (v - u);
-                             let next_u = SimdScanner::scan_back_while_le(divergence, u, u.saturating_sub(scan_limit), marker);
-                             u = next_u;
-                             u_next_match = get_div(u).max(u_next_match);
-                         } else {
-                             break;
-                         }
-                     } else {
-                         if v_next_match <= marker {
-                              let scan_limit = n_candidates - (v - u);
-                              let next_v = SimdScanner::scan_while_le(divergence, v + 1, v + 1 + scan_limit.min(n - 1 - v), marker);
-                              v = next_v;
-                              v_next_match = get_div(v).max(v_next_match);
-                         } else {
-                             break;
-                         }
-                     }
+                    u = SimdScanner::scan_back_while_le(divergence, u, u.saturating_sub(scan_limit), marker);
                 }
+            } else if can_v {
+                // Expand v (forward)
+                let scan_limit = n_candidates - (v - u);
+                let end = (v + 1 + scan_limit).min(n);
+                if is_backward {
+                    v = SimdScanner::scan_while_ge(divergence, v + 1, end, marker);
+                } else {
+                    v = SimdScanner::scan_while_le(divergence, v + 1, end, marker);
+                }
+            }
+
+            // If no progress was made, break to avoid infinite loop
+            if u == old_u && v == old_v {
+                break;
             }
         }
 
@@ -734,6 +679,41 @@ impl SimdScanner {
         end
     }
 
+    /// Find the first index `i` in `[start, end)` where `data[i] < threshold`.
+    ///
+    /// This corresponds to finding the boundary of a block where all values are `>= threshold`.
+    /// Used for backward PBWT neighbor finding.
+    #[inline]
+    pub fn scan_while_ge(data: &[i32], start: usize, end: usize, threshold: i32) -> usize {
+        let mut i = start;
+        
+        while i + 8 <= end {
+            let chunk = &data[i..i+8];
+            let mut violated = false;
+            for &val in chunk {
+                if val < threshold {
+                    violated = true;
+                    break;
+                }
+            }
+            
+            if violated {
+                break;
+            }
+            i += 8;
+        }
+
+        // Scalar cleanup
+        while i < end {
+            if data[i] < threshold {
+                return i;
+            }
+            i += 1;
+        }
+        
+        end
+    }
+
     /// Find the first index `i` moving backwards from `start` (exclusive) to `limit` (inclusive)
     /// where `data[i] > threshold`.
     ///
@@ -766,6 +746,47 @@ impl SimdScanner {
         // Scalar cleanup
         while i > limit {
             if data[i - 1] > threshold {
+                return i;
+            }
+            i -= 1;
+        }
+        
+        i
+    }
+
+    /// Find the first index `i` moving backwards from `start` (exclusive) to `limit` (inclusive)
+    /// where `data[i] < threshold`.
+    ///
+    /// Returns the index `i` (exclusive boundary). 
+    /// If `data[start-1] < threshold`, returns `start`.
+    /// If all `data[limit..start] >= threshold`, returns `limit`.
+    /// Used for backward PBWT neighbor finding.
+    pub fn scan_back_while_ge(data: &[i32], start: usize, limit: usize, threshold: i32) -> usize {
+        let mut i = start;
+        
+        // Unrolled backward scan
+        while i >= limit + 8 {
+            let chunk_end = i;
+            let chunk_start = i - 8;
+            let chunk = &data[chunk_start..chunk_end];
+            let mut violated = false;
+            
+            for &val in chunk {
+                if val < threshold {
+                    violated = true;
+                    break;
+                }
+            }
+            
+            if violated {
+                break;
+            }
+            i -= 8;
+        }
+        
+        // Scalar cleanup
+        while i > limit {
+            if data[i - 1] < threshold {
                 return i;
             }
             i -= 1;
