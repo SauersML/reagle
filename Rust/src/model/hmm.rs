@@ -665,6 +665,10 @@ impl<'a> LiStephensHmm<'a> {
 /// Unlike the standard HMM where each state is a single reference haplotype,
 /// composite states can switch which reference haplotype they point to at
 /// different markers, following IBS sharing patterns.
+///
+/// **DEPRECATED**: Use `BeagleHmm` with `MosaicCursor` instead for better
+/// memory efficiency (O(K*segments) vs O(M*K) for state_map).
+#[deprecated(since = "0.2.0", note = "Use BeagleHmm with MosaicCursor for O(K*segments) memory")]
 pub struct CompositeHmm<'a> {
     /// Reference panel genotypes
     ref_gt: GenotypeView<'a>,
