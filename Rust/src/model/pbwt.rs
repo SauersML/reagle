@@ -155,6 +155,8 @@ impl PbwtDivUpdater {
 
         self.ensure_capacity(2);
 
+        // For i32, saturating_sub(1) correctly yields -1 for marker 0
+        // (saturates at i32::MIN, not 0). This allows detecting "match extends past start".
         let init_value = (marker as i32).saturating_sub(1);
 
         // Pass 1: Count zeros
@@ -399,6 +401,7 @@ impl PbwtDivUpdater {
         self.ensure_capacity(n_alleles);
 
         // 1. Initialize p array (propagation) - Backward Direction
+        // For i32, saturating_sub(1) correctly yields -1 for marker 0.
         let init_value = (marker as i32).saturating_sub(1);
         // 2. Count frequencies
         self.counts[..n_alleles].fill(0);
@@ -464,6 +467,7 @@ impl PbwtDivUpdater {
         self.ensure_capacity(n_alleles);
 
         // 1. Initialize p array (propagation) - Backward Direction
+        // For i32, saturating_sub(1) correctly yields -1 for marker 0.
         let init_value = (marker as i32).saturating_sub(1);
         
         // 2. Count frequencies

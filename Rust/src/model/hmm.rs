@@ -510,7 +510,10 @@ impl<'a> BeagleHmm<'a> {
             if m > 0 && state_sum > 0.0 {
                 let switch_prob = h_factor * (1.0 - joint_state_sum / state_sum);
                 if switch_prob > 0.0 {
-                    let gen_dist = gen_dists.get(m).copied().unwrap_or(0.0);
+                    // The transition at marker m corresponds to the interval from m-1 to m
+                    // gen_dists[i] = distance from marker i to marker i+1
+                    // So for transition at m, we need gen_dists[m-1]
+                    let gen_dist = gen_dists.get(m - 1).copied().unwrap_or(0.0);
                     estimates.add_switch(gen_dist, switch_prob as f64);
                 }
             }

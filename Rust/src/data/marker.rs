@@ -203,6 +203,8 @@ impl Marker {
 pub struct AlleleMapping {
     /// For each target allele index, the corresponding reference allele index (-1 if no match)
     pub targ_to_ref: Vec<i8>,
+    /// For each reference allele index, the corresponding target allele index (-1 if no match)
+    pub ref_to_targ: Vec<i8>,
     /// Whether strand was flipped
     pub strand_flipped: bool,
     /// Whether Ref/Alt were swapped
@@ -210,12 +212,37 @@ pub struct AlleleMapping {
 }
 
 impl AlleleMapping {
+    /// Create an AlleleMapping with automatic reverse mapping computation
+    pub fn new(targ_to_ref: Vec<i8>, n_ref_alleles: usize, strand_flipped: bool, alleles_swapped: bool) -> Self {
+        // Build reverse mapping
+        let mut ref_to_targ = vec![-1i8; n_ref_alleles];
+        for (targ_idx, &ref_idx) in targ_to_ref.iter().enumerate() {
+            if ref_idx >= 0 && (ref_idx as usize) < n_ref_alleles {
+                ref_to_targ[ref_idx as usize] = targ_idx as i8;
+            }
+        }
+        Self {
+            targ_to_ref,
+            ref_to_targ,
+            strand_flipped,
+            alleles_swapped,
+        }
+    }
+
     /// Map a target allele to reference allele
     /// Returns None if the allele cannot be mapped
     pub fn map_allele(&self, targ_allele: u8) -> Option<u8> {
         self.targ_to_ref
             .get(targ_allele as usize)
             .and_then(|&r| if r >= 0 { Some(r as u8) } else { None })
+    }
+
+    /// Map a reference allele to target allele (reverse mapping)
+    /// Returns None if the allele cannot be mapped
+    pub fn reverse_map_allele(&self, ref_allele: u8) -> Option<u8> {
+        self.ref_to_targ
+            .get(ref_allele as usize)
+            .and_then(|&t| if t >= 0 { Some(t as u8) } else { None })
     }
 
     /// Check if all target alleles can be mapped
@@ -295,13 +322,10 @@ fn try_direct_match(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping>
 
     // Check if Ref alleles match (identity) or are swapped
     let alleles_swapped = targ_to_ref.get(0) == Some(&1);
+    let n_ref_alleles = ref_marker.n_alleles();
 
     if all_matched {
-        Some(AlleleMapping {
-            targ_to_ref,
-            strand_flipped: false,
-            alleles_swapped,
-        })
+        Some(AlleleMapping::new(targ_to_ref, n_ref_alleles, false, alleles_swapped))
     } else {
         None
     }
@@ -338,13 +362,10 @@ fn try_strand_flip(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping> 
     }
 
     let alleles_swapped = targ_to_ref.get(0) == Some(&1);
+    let n_ref_alleles = ref_marker.n_alleles();
 
     if all_matched {
-        Some(AlleleMapping {
-            targ_to_ref,
-            strand_flipped: true,
-            alleles_swapped,
-        })
+        Some(AlleleMapping::new(targ_to_ref, n_ref_alleles, true, alleles_swapped))
     } else {
         None
     }

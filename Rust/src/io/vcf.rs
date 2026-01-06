@@ -759,7 +759,6 @@ impl VcfWriter {
         for (local_m, m) in (start..end).enumerate() {
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = matrix.marker(marker_idx);
-            let column = matrix.column(marker_idx);
             let n_alleles = 1 + marker.alt_alleles.len();
 
             // Get quality stats for this marker
@@ -815,17 +814,11 @@ impl VcfWriter {
             )?;
 
             // Write genotypes with dosages
+            // GT is derived from dosage, NOT from reference panel!
             for s in 0..n_samples {
-                let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
-                let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
-                let a1 = column.get(hap1);
-                let a2 = column.get(hap2);
                 let ds_idx = local_m * n_samples + s;
-                let ds = if ds_idx < dosages.len() {
-                    dosages[ds_idx]
-                } else {
-                    (a1 + a2) as f32
-                };
+                let ds = dosages.get(ds_idx).copied().unwrap_or(0.0);
+                let (a1, a2) = gt_from_dosage(ds);
                 write!(self.writer, "\t{}|{}:{:.2}", a1, a2, ds)?;
             }
             writeln!(self.writer)?;
@@ -875,7 +868,6 @@ impl VcfWriter {
         for (local_m, m) in (start..end).enumerate() {
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = matrix.marker(marker_idx);
-            let column = matrix.column(marker_idx);
             let n_alleles = 1 + marker.alt_alleles.len();
 
             // Get quality stats for this marker
@@ -929,30 +921,23 @@ impl VcfWriter {
             )?;
 
             // Write genotypes with probabilities
+            // GT is derived from dosage, NOT from reference panel!
             for s in 0..n_samples {
-                let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
-                let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
-                let a1 = column.get(hap1);
-                let a2 = column.get(hap2);
-
                 // Dosage
                 let ds_idx = local_m * n_samples + s;
-                let ds = if ds_idx < dosages.len() {
-                    dosages[ds_idx]
-                } else {
-                    (a1 + a2) as f32
-                };
+                let ds = dosages.get(ds_idx).copied().unwrap_or(0.0);
+                let (a1, a2) = gt_from_dosage(ds);
 
                 // Allele probabilities (probability of ALT for each haplotype)
                 let (ap1, ap2) = if let Some(probs) = allele_probs {
                     let hap1_idx = local_m * n_samples * 2 + s * 2;
                     let hap2_idx = hap1_idx + 1;
-                    let p1 = probs.get(hap1_idx).copied().unwrap_or(a1 as f32);
-                    let p2 = probs.get(hap2_idx).copied().unwrap_or(a2 as f32);
+                    let p1 = probs.get(hap1_idx).copied().unwrap_or(ds / 2.0);
+                    let p2 = probs.get(hap2_idx).copied().unwrap_or(ds / 2.0);
                     (p1, p2)
                 } else {
-                    // If no probabilities provided, use deterministic values from genotypes
-                    (a1 as f32, a2 as f32)
+                    // If no probabilities provided, assume equal contribution from each hap
+                    (ds / 2.0, ds / 2.0)
                 };
 
                 // Start building sample field
@@ -990,6 +975,23 @@ impl VcfWriter {
 impl Drop for VcfWriter {
     fn drop(&mut self) {
         let _ = self.flush();
+    }
+}
+
+/// Derive hard-call GT from ALT dosage
+///
+/// This matches Java Beagle's ImputedRecBuilder behavior:
+/// - DS < 0.5 → 0|0 (homozygous REF)
+/// - 0.5 <= DS < 1.5 → 0|1 (heterozygous)
+/// - DS >= 1.5 → 1|1 (homozygous ALT)
+#[inline]
+fn gt_from_dosage(ds: f32) -> (u8, u8) {
+    if ds < 0.5 {
+        (0, 0)
+    } else if ds < 1.5 {
+        (0, 1)
+    } else {
+        (1, 1)
     }
 }
 

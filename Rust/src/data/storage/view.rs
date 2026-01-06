@@ -7,6 +7,7 @@
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::{Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeMatrix, MutableGenotypes, phase_state};
+use crate::pipelines::imputation::MarkerAlignment;
 
 /// A read-only view of genotype data - allows HMM to work with either
 /// GenotypeMatrix or MutableGenotypes without caring about concrete type
@@ -30,6 +31,25 @@ pub enum GenotypeView<'a> {
         markers: &'a Markers,
         subset: &'a [usize],
     },
+    /// Composite view: Target (mutable) + Reference (immutable)
+    /// Haplotype indices 0..n_target_haps -> target, n_target_haps..n_total -> reference
+    Composite {
+        target: &'a MutableGenotypes,
+        reference: &'a GenotypeMatrix<phase_state::Phased>,
+        alignment: &'a MarkerAlignment,
+        markers: &'a Markers,
+        n_target_haps: usize,
+    },
+    /// Composite view over a marker subset (for Stage 1 hi-freq markers)
+    /// Combines target + reference with marker subset mapping
+    CompositeSubset {
+        target: &'a MutableGenotypes,
+        reference: &'a GenotypeMatrix<phase_state::Phased>,
+        alignment: &'a MarkerAlignment,
+        markers: &'a Markers,
+        subset: &'a [usize],
+        n_target_haps: usize,
+    },
 }
 
 impl<'a> GenotypeView<'a> {
@@ -41,6 +61,8 @@ impl<'a> GenotypeView<'a> {
             GenotypeView::Mutable { geno, .. } => geno.n_markers(),
             GenotypeView::MatrixSubset { subset, .. } => subset.len(),
             GenotypeView::MutableSubset { subset, .. } => subset.len(),
+            GenotypeView::Composite { target, .. } => target.n_markers(),
+            GenotypeView::CompositeSubset { subset, .. } => subset.len(),
         }
     }
 
@@ -52,6 +74,12 @@ impl<'a> GenotypeView<'a> {
             GenotypeView::Mutable { geno, .. } => geno.n_haps(),
             GenotypeView::MatrixSubset { matrix, .. } => matrix.n_haplotypes(),
             GenotypeView::MutableSubset { geno, .. } => geno.n_haps(),
+            GenotypeView::Composite { target, reference, .. } => {
+                target.n_haps() + reference.n_haplotypes()
+            }
+            GenotypeView::CompositeSubset { target, reference, .. } => {
+                target.n_haps() + reference.n_haplotypes()
+            }
         }
     }
 
@@ -63,6 +91,9 @@ impl<'a> GenotypeView<'a> {
             GenotypeView::Mutable { geno, .. } => geno.n_samples(),
             GenotypeView::MatrixSubset { matrix, .. } => matrix.n_samples(),
             GenotypeView::MutableSubset { geno, .. } => geno.n_samples(),
+            // For composite views, return target samples (we're phasing the target)
+            GenotypeView::Composite { target, .. } => target.n_samples(),
+            GenotypeView::CompositeSubset { target, .. } => target.n_samples(),
         }
     }
 
@@ -80,6 +111,42 @@ impl<'a> GenotypeView<'a> {
                 let real_idx = subset[marker.as_usize()];
                 geno.get(real_idx, hap)
             }
+            GenotypeView::Composite { target, reference, alignment, n_target_haps, .. } => {
+                let hap_idx = hap.as_usize();
+                if hap_idx < *n_target_haps {
+                    // Target haplotype - direct lookup
+                    target.get(marker.as_usize(), hap)
+                } else {
+                    // Reference haplotype - translate marker index, look up, and map allele to target encoding
+                    let ref_hap = hap_idx - n_target_haps;
+                    let target_marker = marker.as_usize();
+                    if let Some(ref_m) = alignment.target_to_ref(target_marker) {
+                        let ref_allele = reference.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_hap as u32));
+                        // Map reference allele back to target encoding (handles strand flips)
+                        alignment.reverse_map_allele(target_marker, ref_allele)
+                    } else {
+                        255 // Marker not in reference - return missing
+                    }
+                }
+            }
+            GenotypeView::CompositeSubset { target, reference, alignment, subset, n_target_haps, .. } => {
+                let orig_marker = subset[marker.as_usize()]; // Subset index -> original target marker index
+                let hap_idx = hap.as_usize();
+                if hap_idx < *n_target_haps {
+                    // Target haplotype - direct lookup using original marker index
+                    target.get(orig_marker, hap)
+                } else {
+                    // Reference haplotype - translate marker, look up, and map allele to target encoding
+                    let ref_hap = hap_idx - n_target_haps;
+                    if let Some(ref_m) = alignment.target_to_ref(orig_marker) {
+                        let ref_allele = reference.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_hap as u32));
+                        // Map reference allele back to target encoding (handles strand flips)
+                        alignment.reverse_map_allele(orig_marker, ref_allele)
+                    } else {
+                        255 // Marker not in reference - return missing
+                    }
+                }
+            }
         }
     }
 
@@ -94,6 +161,11 @@ impl<'a> GenotypeView<'a> {
                 matrix.marker(MarkerIdx::new(real_idx as u32))
             }
             GenotypeView::MutableSubset { markers, subset, .. } => {
+                let real_idx = subset[marker.as_usize()];
+                markers.marker(MarkerIdx::new(real_idx as u32))
+            }
+            GenotypeView::Composite { markers, .. } => markers.marker(marker),
+            GenotypeView::CompositeSubset { markers, subset, .. } => {
                 let real_idx = subset[marker.as_usize()];
                 markers.marker(MarkerIdx::new(real_idx as u32))
             }

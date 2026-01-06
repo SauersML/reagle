@@ -159,11 +159,50 @@ impl MarkerAlignment {
         }
     }
 
+    /// Map a reference allele to target allele space (reverse mapping)
+    ///
+    /// Returns the target allele index for a given reference allele,
+    /// handling strand flips and swaps automatically.
+    /// Returns 255 (missing) if no valid mapping exists.
+    pub fn reverse_map_allele(&self, target_marker: usize, ref_allele: u8) -> u8 {
+        if ref_allele == 255 {
+            return 255; // Missing stays missing
+        }
+
+        if let Some(Some(mapping)) = self.allele_mappings.get(target_marker) {
+            mapping.reverse_map_allele(ref_allele).unwrap_or(255)
+        } else {
+            // No mapping means identity (direct match assumed)
+            ref_allele
+        }
+    }
+
     /// Get the ref_to_target mapping array
     ///
     /// For each reference marker, returns the corresponding target marker index (-1 if not in target)
     pub fn ref_to_target(&self) -> &[i32] {
         &self.ref_to_target
+    }
+
+    /// Get reference marker index for a target marker (returns None if not aligned)
+    pub fn target_to_ref(&self, target_marker: usize) -> Option<usize> {
+        // Check allele_mappings to ensure the marker actually aligns.
+        // The raw target_to_ref vector initializes with 0s, which is ambiguous.
+        if self.allele_mappings.get(target_marker).and_then(|m| m.as_ref()).is_some() {
+            Some(self.target_to_ref[target_marker])
+        } else {
+            None
+        }
+    }
+
+    /// Get the number of markers that were successfully aligned
+    pub fn n_aligned(&self) -> usize {
+        self.ref_to_target.iter().filter(|&&x| x >= 0).count()
+    }
+
+    /// Get the allele mapping for a target marker (for strand flip/swap handling)
+    pub fn allele_mapping(&self, target_marker: usize) -> Option<&crate::data::marker::AlleleMapping> {
+        self.allele_mappings.get(target_marker)?.as_ref()
     }
 }
 /// State probabilities from HMM forward-backward on reference markers.

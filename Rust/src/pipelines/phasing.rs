@@ -20,8 +20,10 @@ use crate::data::genetic_map::{GeneticMaps, MarkerMap};
 use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::sample_phase::SamplePhase;
+use crate::data::storage::phase_state::Phased;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes, GenotypeView};
 use crate::error::Result;
+use crate::io::bref3::Bref3Reader;
 use crate::io::streaming::{PhasedOverlap, StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
@@ -29,18 +31,28 @@ use crate::model::hmm::BeagleHmm;
 use crate::model::states::ThreadedHaps;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
+use crate::pipelines::imputation::MarkerAlignment;
 
 /// Phasing pipeline
 pub struct PhasingPipeline {
     config: Config,
     params: ModelParams,
+    /// Reference panel for reference-guided phasing (optional)
+    reference_gt: Option<GenotypeMatrix<Phased>>,
+    /// Marker alignment between target and reference
+    alignment: Option<MarkerAlignment>,
 }
 
 impl PhasingPipeline {
     /// Create a new phasing pipeline
     pub fn new(config: Config) -> Self {
         let params = ModelParams::new();
-        Self { config, params }
+        Self {
+            config,
+            params,
+            reference_gt: None,
+            alignment: None,
+        }
     }
 
     /// Run the phasing pipeline
@@ -82,10 +94,48 @@ impl PhasingPipeline {
             target_gt.size_bytes() as f64 / 1024.0 / 1024.0
         );
 
-        // Initialize parameters based on sample size and CLI config
-        self.params = ModelParams::for_phasing(n_haps, self.config.ne, self.config.err);
+        // Load reference panel if provided (for reference-guided phasing)
+        if let Some(ref_path) = &self.config.r#ref {
+            eprintln!("Loading reference panel for phasing...");
+            let ref_gt: GenotypeMatrix<Phased> = if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
+                eprintln!("  Detected BREF3 format");
+                let reader = Bref3Reader::open(ref_path)?;
+                reader.read_all()?
+            } else {
+                eprintln!("  Detected VCF format");
+                let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
+                ref_reader.read_all(ref_file)?.into_phased()
+            };
+            eprintln!(
+                "  Reference: {} markers, {} haplotypes",
+                ref_gt.n_markers(),
+                ref_gt.n_haplotypes()
+            );
+
+            // Create marker alignment between target and reference
+            let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+            eprintln!("  Aligned {} reference markers to target", alignment.n_aligned());
+
+            // Store in pipeline struct for use during phasing iterations
+            self.alignment = Some(alignment);
+            self.reference_gt = Some(ref_gt);
+        }
+
+        // Compute combined haplotype count
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
+
+        if n_ref_haps > 0 {
+            eprintln!(
+                "Combined haplotype space: {} target + {} reference = {} total",
+                n_haps, n_ref_haps, n_total_haps
+            );
+        }
+
+        // Initialize parameters based on TOTAL haplotype count (target + ref)
+        self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
         self.params
-            .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
+            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
@@ -872,6 +922,57 @@ impl PhasingPipeline {
         BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_subset)
     }
 
+    /// Build bidirectional PBWT for combined target + reference haplotype space
+    ///
+    /// This builds the PBWT over all haplotypes (target and reference) to enable
+    /// finding IBS matches in both pools during reference-guided phasing.
+    fn build_bidirectional_pbwt_combined<F>(
+        &self,
+        get_allele: F,
+        n_markers: usize,
+        n_total_haps: usize,
+    ) -> BidirectionalPhaseIbs
+    where
+        F: Fn(usize, usize) -> u8,  // (marker_idx, hap_idx) -> allele
+    {
+        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_markers);
+        for m in 0..n_markers {
+            let mut alleles = Vec::with_capacity(n_total_haps);
+            for h in 0..n_total_haps {
+                alleles.push(get_allele(m, h));
+            }
+            alleles_by_marker.push(alleles);
+        }
+        BidirectionalPhaseIbs::build(&alleles_by_marker, n_total_haps, n_markers)
+    }
+
+    /// Build bidirectional PBWT for combined haplotype space on a marker subset
+    ///
+    /// Used for Stage 1 phasing with reference panel - indexes both target and
+    /// reference haplotypes but only on high-frequency markers.
+    fn build_bidirectional_pbwt_combined_subset<F>(
+        &self,
+        get_allele: F,
+        marker_indices: &[usize],
+        n_total_haps: usize,
+    ) -> BidirectionalPhaseIbs
+    where
+        F: Fn(usize, usize) -> u8,  // (orig_marker_idx, hap_idx) -> allele
+    {
+        let n_subset = marker_indices.len();
+        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
+
+        for &orig_m in marker_indices {
+            let mut alleles = Vec::with_capacity(n_total_haps);
+            for h in 0..n_total_haps {
+                alleles.push(get_allele(orig_m, h));
+            }
+            alleles_by_marker.push(alleles);
+        }
+
+        BidirectionalPhaseIbs::build(&alleles_by_marker, n_total_haps, n_subset)
+    }
+
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
     ///
     /// This uses the full Forward-Backward algorithm to compute posterior probabilities
@@ -894,10 +995,48 @@ impl PhasingPipeline {
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
-        let ref_geno = geno.clone();
-        let ref_view = GenotypeView::from((&ref_geno, markers));
+        // Compute total haplotype count (target + reference)
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
 
-        let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps);
+        let ref_geno = geno.clone();
+
+        // Use Composite view when reference panel is available
+        let ref_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            GenotypeView::Composite {
+                target: &ref_geno,
+                reference: ref_gt,
+                alignment,
+                markers,
+                n_target_haps: n_haps,
+            }
+        } else {
+            GenotypeView::from((&ref_geno, markers))
+        };
+
+        // Build PBWT over combined haplotype space when reference is available
+        let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            self.build_bidirectional_pbwt_combined(
+                |m, h| {
+                    if h < n_haps {
+                        ref_geno.get(m, HapIdx::new(h as u32))
+                    } else {
+                        let ref_h = h - n_haps;
+                        if let Some(ref_m) = alignment.target_to_ref(m) {
+                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                            // Map reference allele to target encoding (handles strand flips)
+                            alignment.reverse_map_allele(m, ref_allele)
+                        } else {
+                            255 // Missing - marker not in reference
+                        }
+                    }
+                },
+                n_markers,
+                n_total_haps,
+            )
+        } else {
+            self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps)
+        };
 
         let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
 
@@ -907,7 +1046,8 @@ impl PhasingPipeline {
             let hap2 = sample_idx.hap2();
 
             let mid_marker = n_markers / 2;
-            let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
+            // Use n_total_haps to allow selecting reference haplotypes as states
+            let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_total_haps, seed, iteration);
             
             // 2. Extract current alleles for H1 and H2
             let seq1 = ref_geno.haplotype(hap1);
@@ -1260,17 +1400,54 @@ impl PhasingPipeline {
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
+        // Compute total haplotype count (target + reference)
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
+
         // 1. Create Subset View for Stage 1 markers
+        // Use CompositeSubset when reference panel is available
         let ref_geno = geno.clone();
-        let subset_view = GenotypeView::MutableSubset {
-            geno: &ref_geno,
-            markers: markers,
-            subset: hi_freq_to_orig,
+        let subset_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            GenotypeView::CompositeSubset {
+                target: &ref_geno,
+                reference: ref_gt,
+                alignment,
+                markers,
+                subset: hi_freq_to_orig,
+                n_target_haps: n_haps,
+            }
+        } else {
+            GenotypeView::MutableSubset {
+                geno: &ref_geno,
+                markers,
+                subset: hi_freq_to_orig,
+            }
         };
 
         // 2. Build bidirectional PBWT on high-frequency markers only
-        // This ensures divergence metrics align with HMM marker space
-        let phase_ibs = self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps);
+        // When reference is available, include reference haplotypes in the PBWT
+        let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            self.build_bidirectional_pbwt_combined_subset(
+                |orig_m, h| {
+                    if h < n_haps {
+                        ref_geno.get(orig_m, HapIdx::new(h as u32))
+                    } else {
+                        let ref_h = h - n_haps;
+                        if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                            // Map reference allele to target encoding (handles strand flips)
+                            alignment.reverse_map_allele(orig_m, ref_allele)
+                        } else {
+                            255 // Missing - marker not in reference
+                        }
+                    }
+                },
+                hi_freq_to_orig,
+                n_total_haps,
+            )
+        } else {
+            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps)
+        };
 
         // Collect phase decisions per sample: Vec<(hi_freq_idx, swap, lr)>
         type PhaseDecision = (usize, bool, f64); // (hi_freq_idx, should_swap, log_lr)
@@ -1283,7 +1460,8 @@ impl PhasingPipeline {
 
                 // Use midpoint of subset marker space for state selection
                 let mid_marker = hi_freq_to_orig.len() / 2;
-                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
+                // Use n_total_haps to allow selecting reference haplotypes as states
+                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_total_haps, seed, iteration);
 
                 // Extract alleles from SamplePhase for SUBSET of markers
                 let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
@@ -1509,21 +1687,59 @@ impl PhasingPipeline {
             return;
         }
 
+        // Compute total haplotype count (target + reference)
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
+
         // Build Stage 2 interpolation mappings
         let stage2_phaser = Stage2Phaser::new(hi_freq_markers, gen_positions, n_markers);
 
         // Clone current genotypes to use as a frozen reference panel
         let ref_geno = geno.clone();
         let markers = target_gt.markers();
-        let subset_view = GenotypeView::MutableSubset {
-            geno: &ref_geno,
-            markers,
-            subset: hi_freq_markers,
+
+        // Use CompositeSubset view when reference panel is available
+        let subset_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            GenotypeView::CompositeSubset {
+                target: &ref_geno,
+                reference: ref_gt,
+                alignment,
+                markers,
+                subset: hi_freq_markers,
+                n_target_haps: n_haps,
+            }
+        } else {
+            GenotypeView::MutableSubset {
+                geno: &ref_geno,
+                markers,
+                subset: hi_freq_markers,
+            }
         };
 
         // Build bidirectional PBWT on hi-freq markers for consistent state selection
-        // This aligns PBWT divergence with the HMM marker space
-        let phase_ibs = self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps);
+        // When reference is available, include reference haplotypes
+        let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            self.build_bidirectional_pbwt_combined_subset(
+                |orig_m, h| {
+                    if h < n_haps {
+                        ref_geno.get(orig_m, HapIdx::new(h as u32))
+                    } else {
+                        let ref_h = h - n_haps;
+                        if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                            // Map reference allele to target encoding (handles strand flips)
+                            alignment.reverse_map_allele(orig_m, ref_allele)
+                        } else {
+                            255 // Missing - marker not in reference
+                        }
+                    }
+                },
+                hi_freq_markers,
+                n_total_haps,
+            )
+        } else {
+            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps)
+        };
 
         // Process samples in parallel - collect results: (marker, should_swap)
         // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
@@ -1536,7 +1752,8 @@ impl PhasingPipeline {
 
                 // Select HMM states using bidirectional PBWT on subset marker space
                 let mid_marker = n_stage1 / 2;
-                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, 0);
+                // Use n_total_haps to allow selecting reference haplotypes as states
+                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_total_haps, seed, 0);
                 let n_states = states.len();
 
                 // Extract Stage 1 alleles from SamplePhase
