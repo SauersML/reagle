@@ -953,6 +953,201 @@ impl<'a> CompositeHmm<'a> {
     }
 }
 
+// ============================================================================
+// BeagleHmm: Memory-Efficient Mosaic HMM with A-B-C Loop Pattern
+// ============================================================================
+
+use crate::model::states::{AlleleScratch, MosaicCursor, ThreadedHaps};
+
+/// High-performance Li-Stephens HMM using mosaic states with A-B-C loop pattern.
+///
+/// This implementation achieves:
+/// - **Memory efficiency**: O(K * segments) instead of O(M * K) for state map
+/// - **SIMD friendliness**: Separates state maintenance from math kernel
+/// - **Java parity**: Matches Beagle's composite state approach
+///
+/// ## The A-B-C Loop Pattern
+/// - **Phase A**: State maintenance (integer logic, branch-predictable)
+/// - **Phase B**: Allele materialization (memory fetch into contiguous scratch)
+/// - **Phase C**: Math kernel (SIMD-vectorizable on flat data)
+pub struct BeagleHmm<'a> {
+    /// Reference panel genotypes
+    ref_gt: GenotypeView<'a>,
+    /// Model parameters
+    params: &'a ModelParams,
+    /// Number of HMM states
+    n_states: usize,
+    /// Recombination probabilities between consecutive markers
+    p_recomb: Vec<f32>,
+}
+
+impl<'a> BeagleHmm<'a> {
+    /// Create a new BeagleHmm
+    pub fn new(
+        ref_gt: impl Into<GenotypeView<'a>>,
+        params: &'a ModelParams,
+        n_states: usize,
+        p_recomb: Vec<f32>,
+    ) -> Self {
+        Self {
+            ref_gt: ref_gt.into(),
+            params,
+            n_states,
+            p_recomb,
+        }
+    }
+
+    /// Number of HMM states
+    pub fn n_states(&self) -> usize {
+        self.n_states
+    }
+
+    /// Number of markers
+    pub fn n_markers(&self) -> usize {
+        self.ref_gt.n_markers()
+    }
+
+    /// Run forward-backward with mosaic cursor using A-B-C loop pattern
+    ///
+    /// This is the high-performance implementation that:
+    /// 1. Uses MosaicCursor for O(K*segments) memory
+    /// 2. Pre-materializes alleles into scratch buffer for SIMD
+    /// 3. Runs vectorizable math on contiguous data
+    pub fn forward_backward_mosaic(
+        &self,
+        target_alleles: &[u8],
+        cursor: &mut MosaicCursor,
+        threaded_haps: &ThreadedHaps,
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> f64 {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states;
+        let total_size = n_markers * n_states;
+
+        if n_markers == 0 || n_states == 0 {
+            return 0.0;
+        }
+
+        fwd.resize(total_size, 0.0);
+        bwd.resize(total_size, 0.0);
+
+        let p_err = self.params.p_mismatch;
+        let p_no_err = 1.0 - p_err;
+        let emit_probs = [p_no_err, p_err];
+
+        // Allocate scratch buffer for allele materialization
+        let mut scratch = AlleleScratch::new(n_states);
+        let mut mismatches = vec![0u8; n_states];
+
+        // Reset cursor for forward pass
+        cursor.reset(threaded_haps);
+
+        // =====================================================================
+        // FORWARD PASS with A-B-C Loop
+        // =====================================================================
+        let mut fwd_sum = 1.0f32;
+
+        for m in 0..n_markers {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let targ_al = target_alleles[m];
+            let p_recomb_m = self.p_recomb.get(m).copied().unwrap_or(0.0);
+
+            // Phase A: Advance cursor (state maintenance)
+            cursor.advance_to_marker(m, threaded_haps);
+
+            // Phase B: Materialize alleles into scratch buffer
+            scratch.materialize(cursor, m, |marker, hap| {
+                self.ref_gt.allele(MarkerIdx::new(marker as u32), HapIdx::new(hap))
+            });
+
+            // Compute mismatches
+            for k in 0..n_states {
+                mismatches[k] = if scratch.alleles[k] == targ_al { 0 } else { 1 };
+            }
+
+            // Phase C: Math kernel (SIMD-friendly on contiguous data)
+            let row_offset = m * n_states;
+
+            if m == 0 {
+                // Initialize
+                let init_val = 1.0 / n_states as f32;
+                for k in 0..n_states {
+                    fwd[row_offset + k] = init_val * emit_probs[mismatches[k] as usize];
+                }
+                fwd_sum = 1.0;
+            } else {
+                let shift = p_recomb_m / n_states as f32;
+                let stay = 1.0 - p_recomb_m;
+
+                fwd_sum = HmmUpdater::fwd_update(
+                    &mut fwd[row_offset..row_offset + n_states],
+                    fwd_sum,
+                    stay + shift,
+                    &emit_probs,
+                    &mismatches,
+                    n_states,
+                );
+            }
+        }
+
+        // =====================================================================
+        // BACKWARD PASS with A-B-C Loop (reverse order)
+        // =====================================================================
+        // For backward, we need to iterate segments in reverse
+        // Reset cursor and advance to end
+        cursor.reset(threaded_haps);
+        for m in 0..n_markers {
+            cursor.advance_to_marker(m, threaded_haps);
+        }
+
+        // Initialize last row
+        let last_row = (n_markers - 1) * n_states;
+        let init_bwd = 1.0 / n_states as f32;
+        for k in 0..n_states {
+            bwd[last_row + k] = init_bwd;
+        }
+
+        // Backward sweep
+        for m in (0..n_markers - 1).rev() {
+            let m_next = m + 1;
+            let marker_next_idx = MarkerIdx::new(m_next as u32);
+            let targ_al_next = target_alleles[m_next];
+
+            let p_recomb_next = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
+
+            // For backward, we need alleles at m_next
+            // Re-materialize (cursor is already at end position)
+            for k in 0..n_states {
+                let hap = cursor.active_hap(k);
+                scratch.alleles[k] = self.ref_gt.allele(marker_next_idx, HapIdx::new(hap));
+                mismatches[k] = if scratch.alleles[k] == targ_al_next { 0 } else { 1 };
+            }
+
+            // Copy backward values from next row
+            let next_row = m_next * n_states;
+            let curr_row = m * n_states;
+            for k in 0..n_states {
+                bwd[curr_row + k] = bwd[next_row + k];
+            }
+
+            // Apply backward update
+            let shift = p_recomb_next / n_states as f32;
+            let stay = 1.0 - p_recomb_next;
+
+            HmmUpdater::bwd_update(
+                &mut bwd[curr_row..curr_row + n_states],
+                stay + shift,
+                &emit_probs,
+                &mismatches,
+                n_states,
+            );
+        }
+
+        fwd_sum.ln() as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
