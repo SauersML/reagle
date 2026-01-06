@@ -97,6 +97,19 @@ impl ThreadedHaps {
         self.state_heads.len()
     }
 
+    /// Create ThreadedHaps from a static list of haplotypes (one segment per state)
+    ///
+    /// This is used when states are selected via PBWT and remain constant
+    /// for the entire forward-backward run (e.g., in phasing).
+    pub fn from_static_haps(haps: &[HapIdx], n_markers: usize) -> Self {
+        let n_states = haps.len();
+        let mut th = Self::new(n_states, n_states, n_markers);
+        for &hap in haps {
+            th.push_new(hap.0);
+        }
+        th
+    }
+
     /// Initialize a new state starting with given hap
     /// Returns the state index
     pub fn push_new(&mut self, start_hap: u32) -> usize {

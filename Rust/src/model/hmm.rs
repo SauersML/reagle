@@ -200,763 +200,6 @@ impl HmmUpdater {
     }
 }
 
-/// Li-Stephens HMM for a single target haplotype
-pub struct LiStephensHmm<'a> {
-    /// Reference panel genotypes (can be GenotypeMatrix or MutableGenotypes via GenotypeView)
-    ref_gt: GenotypeView<'a>,
-    /// Model parameters
-    params: &'a ModelParams,
-    /// Selected reference haplotype indices (the HMM states)
-    ref_haps: Vec<HapIdx>,
-    /// Recombination probabilities between consecutive markers
-    p_recomb: Vec<f32>,
-}
-
-impl<'a> LiStephensHmm<'a> {
-    /// Create a new HMM for the given reference panel
-    ///
-    /// # Arguments
-    /// * `ref_gt` - Reference genotype view (can be Matrix or Mutable)
-    /// * `params` - Model parameters
-    /// * `ref_haps` - Selected reference haplotypes to use as HMM states
-    /// * `p_recomb` - Recombination probabilities for each marker (first element is 0)
-    pub fn new(
-        ref_gt: impl Into<GenotypeView<'a>>,
-        params: &'a ModelParams,
-        ref_haps: Vec<HapIdx>,
-        p_recomb: Vec<f32>,
-    ) -> Self {
-        Self {
-            ref_gt: ref_gt.into(),
-            params,
-            ref_haps,
-            p_recomb,
-        }
-    }
-
-    /// Number of HMM states
-    pub fn n_states(&self) -> usize {
-        self.ref_haps.len()
-    }
-
-    /// Number of markers
-    pub fn n_markers(&self) -> usize {
-        self.ref_gt.n_markers()
-    }
-
-    /// Get reference allele at marker for state
-    #[inline]
-    pub fn state_allele(&self, marker: MarkerIdx, state: usize) -> u8 {
-        self.ref_gt.allele(marker, self.ref_haps[state])
-    }
-
-    /// Get reference alleles at marker for all states
-    pub fn state_alleles(&self, marker: MarkerIdx) -> Vec<u8> {
-        self.ref_haps
-            .iter()
-            .map(|&h| self.ref_gt.allele(marker, h))
-            .collect()
-    }
-
-    /// Compute expected allele dosage at a marker given state probabilities
-    ///
-    /// Returns the expected ALT allele count (0.0 to 1.0 for a single haplotype)
-    pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
-        let mut dosage = 0.0f32;
-        for (k, &prob) in state_probs.iter().enumerate() {
-            let allele = self.state_allele(marker, k);
-            if allele != 255 {
-                dosage += prob * allele as f32;
-            }
-        }
-        dosage
-    }
-
-    /// Run forward-backward algorithm and return raw Forward and Backward tables
-    ///
-    /// This separates the forward and backward passes to allow cross-haplotype
-    /// calculations (e.g. Fwd1 * Bwd2) needed for phasing.
-    ///
-    /// # Arguments
-    /// * `target_alleles` - Alleles of the target haplotype
-    /// * `fwd` - Pre-allocated forward buffer [n_markers * n_states]
-    /// * `bwd` - Pre-allocated backward buffer [n_markers * n_states]
-    ///
-    /// # Returns
-    /// Log-likelihood of the data
-    pub fn forward_backward_raw(
-        &self,
-        target_alleles: &[u8],
-        fwd: &mut Vec<f32>,
-        bwd: &mut Vec<f32>,
-    ) -> f64 {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states();
-        let total_size = n_markers * n_states;
-
-        if n_markers == 0 || n_states == 0 {
-            return 0.0;
-        }
-
-        // Resize buffers
-        fwd.resize(total_size, 0.0);
-        bwd.resize(total_size, 0.0);
-
-        let p_err = self.params.p_mismatch;
-        let p_no_err = 1.0 - p_err;
-        let emit_probs = [p_no_err, p_err];
-
-        // 1. Forward Pass
-        let fwd_sum = self.forward_pass(target_alleles, fwd, &emit_probs);
-
-        // 2. Backward Pass
-        // Initialize last marker of backward table
-        let last_row = (n_markers - 1) * n_states;
-        let init_bwd = 1.0 / n_states as f32;
-        for k in 0..n_states {
-            bwd[last_row + k] = init_bwd;
-        }
-
-        // Iterate backwards from M-2 to 0
-        // (The last marker M-1 is already initialized)
-        for m in (0..n_markers - 1).rev() {
-            // Setup for step FROM m+1 TO m
-            // But bwd_update computes values at m based on m+1
-            let m_next = m + 1;
-            let marker_next_idx = MarkerIdx::new(m_next as u32);
-            let targ_al_next = target_alleles[m_next];
-            
-            // Recombination from m to m+1
-            let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
-            
-            // Compute mismatches at m+1
-            let ref_alleles = self.state_alleles(marker_next_idx);
-            let mismatches: Vec<u8> = ref_alleles
-                .iter()
-                .map(|&r| if r == targ_al_next { 0 } else { 1 })
-                .collect();
-
-            // Calculate Bwd[m] based on Bwd[m+1]
-            // We need to copy Bwd[m+1] to Bwd[m] then update in place
-            let curr_row = m * n_states;
-            let next_row = m_next * n_states;
-            
-            // Copy next row values to current row to prepare for update
-            for k in 0..n_states {
-                bwd[curr_row + k] = bwd[next_row + k];
-            }
-            
-            // Update in place (this matches HmmUpdater::bwd_update logic)
-            // It multiplies by emission at m+1, then applies transition from m to m+1
-            // Result is Prob(Tail | State at m)
-            
-            // Apply bwd_update on the slice
-            let bwd_slice = &mut bwd[curr_row..curr_row + n_states];
-            
-            // HmmUpdater::bwd_update normalizes using bwd_sum? 
-            // Wait, HmmUpdater::bwd_update calculates its OWN scale based on sum.
-            // But we need to be careful about scaling consistency with Forward?
-            // Usually we just normalize Bwd to sum to 1 to prevent underflow.
-            
-            HmmUpdater::bwd_update(bwd_slice, p_recomb, &emit_probs, &mismatches, n_states);
-        }
-
-        fwd_sum.ln() as f64
-    }
-
-    /// Run forward-backward algorithm for a target haplotype
-    ///
-    /// This implements the Baum-Welch style forward-backward following
-    /// the Java ImpLSBaum implementation.
-    ///
-    /// # Arguments
-    /// * `target_alleles` - Alleles of the target haplotype at each marker
-    /// * `fwd` - Pre-allocated forward buffer [n_markers * n_states]
-    /// * `bwd` - Pre-allocated backward buffer [n_states] (scratch)
-    ///
-    /// # Returns
-    /// HMM result with posterior probabilities
-    pub fn forward_backward(
-        &self,
-        target_alleles: &[u8],
-        fwd: &mut Vec<f32>,
-        bwd: &mut Vec<f32>,
-    ) -> HmmResult {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states();
-
-        if n_markers == 0 || n_states == 0 {
-            return HmmResult {
-                state_probs: Vec::new(),
-                n_states,
-                sampled_path: Vec::new(),
-                log_likelihood: 0.0,
-            };
-        }
-
-        // Ensure buffers are sized correctly
-        let total_size = n_markers * n_states;
-        fwd.resize(total_size, 0.0);
-        bwd.resize(n_states, 0.0);
-
-        let p_err = self.params.p_mismatch;
-        let p_no_err = 1.0 - p_err;
-        let emit_probs = [p_no_err, p_err];
-
-        // Forward pass
-        let fwd_sum = self.forward_pass(target_alleles, fwd, &emit_probs);
-
-        // Backward pass and compute posteriors
-        // Initialize backward values
-        let init_bwd = 1.0 / n_states as f32;
-        bwd.fill(init_bwd);
-        let mut bwd_sum = 1.0f32;
-
-        // Process from last marker to first
-        for m in (0..n_markers).rev() {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let targ_al = target_alleles[m];
-            let row_offset = m * n_states;
-
-            // Compute mismatches for this marker
-            let ref_alleles = self.state_alleles(marker_idx);
-            let mismatches: Vec<u8> = ref_alleles
-                .iter()
-                .map(|&r| if r == targ_al { 0 } else { 1 })
-                .collect();
-
-            // Finish backward transition, combine with forward to get posteriors
-            if m < n_markers - 1 {
-                let p_recomb = self.p_recomb.get(m + 1).copied().unwrap_or(0.0);
-                let shift = p_recomb / n_states as f32;
-                let scale = (1.0 - p_recomb) / bwd_sum;
-
-                for k in 0..n_states {
-                    bwd[k] = scale * bwd[k] + shift;
-                }
-            }
-
-            // Compute state probabilities: fwd * bwd
-            let mut state_sum = 0.0f32;
-            for k in 0..n_states {
-                let idx = row_offset + k;
-                fwd[idx] *= bwd[k];
-                state_sum += fwd[idx];
-            }
-
-            // Normalize
-            if state_sum > 0.0 {
-                let inv_sum = 1.0 / state_sum;
-                for k in 0..n_states {
-                    fwd[row_offset + k] *= inv_sum;
-                }
-            }
-
-            // Apply emission for backward (for next iteration)
-            if m > 0 {
-                bwd_sum = 0.0;
-                for k in 0..n_states {
-                    bwd[k] *= emit_probs[mismatches[k] as usize];
-                    bwd_sum += bwd[k];
-                }
-            }
-        }
-
-        // Sample path from posteriors
-        let sampled_path = self.sample_path(fwd, n_markers, n_states);
-
-        // Compute log-likelihood (approximate from forward sums)
-        let log_likelihood = fwd_sum.ln() as f64;
-
-        HmmResult {
-            state_probs: fwd.clone(),
-            n_states,
-            sampled_path,
-            log_likelihood,
-        }
-    }
-
-    /// Forward pass following Java ImpLSBaum.setFwdValues
-    /// Forward pass following Java ImpLSBaum.setFwdValues
-    fn forward_pass(
-        &self,
-        target_alleles: &[u8],
-        fwd: &mut Vec<f32>,
-        emit_probs: &[f32; 2],
-    ) -> f32 {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states();
-
-        let mut fwd_sum = 1.0f32;
-
-        for m in 0..n_markers {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let targ_al = target_alleles[m];
-            let p_recomb = self.p_recomb.get(m).copied().unwrap_or(0.0);
-
-            let shift = p_recomb / n_states as f32;
-            let scale = (1.0 - p_recomb) / fwd_sum;
-
-            let mut new_sum = 0.0f32;
-            let row_offset = m * n_states;
-            let prev_row_offset = if m > 0 { (m - 1) * n_states } else { 0 };
-
-            for k in 0..n_states {
-                let ref_al = self.state_allele(marker_idx, k);
-                let emit = if ref_al == targ_al {
-                    emit_probs[0]
-                } else {
-                    emit_probs[1]
-                };
-
-                let val = if m == 0 {
-                    emit / n_states as f32
-                } else {
-                    emit * (scale * fwd[prev_row_offset + k] + shift)
-                };
-                
-                fwd[row_offset + k] = val;
-                new_sum += val;
-            }
-            fwd_sum = new_sum;
-        }
-
-        fwd_sum
-    }
-
-    /// Sample a state path from posterior probabilities
-    fn sample_path(
-        &self,
-        state_probs: &[f32],
-        n_markers: usize,
-        n_states: usize,
-    ) -> Vec<usize> {
-        let mut path = Vec::with_capacity(n_markers);
-
-        for m in 0..n_markers {
-            let row_offset = m * n_states;
-            // Find max probability state (Viterbi-style for deterministic output)
-            let mut max_state = 0;
-            let mut max_prob = state_probs[row_offset];
-            for k in 1..n_states {
-                let prob = state_probs[row_offset + k];
-                if prob > max_prob {
-                    max_prob = prob;
-                    max_state = k;
-                }
-            }
-            path.push(max_state);
-        }
-
-        path
-    }
-
-    /// Collect statistics for EM parameter estimation
-    ///
-    /// # Arguments
-    /// * `target_alleles` - Alleles of the target haplotype
-    /// * `gen_dists` - Genetic distances between markers (in cM)
-    /// * `estimates` - Estimates structure to accumulate results
-    pub fn collect_stats(
-        &self,
-        target_alleles: &[u8],
-        gen_dists: &[f64],
-        estimates: &mut crate::model::parameters::ParamEstimates,
-    ) {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states();
-        if n_markers < 2 || n_states <= 1 {
-            return;
-        }
-
-        let p_err = self.params.p_mismatch;
-        let p_no_err = 1.0 - p_err;
-        let emit_probs = [p_no_err, p_err];
-
-        // 1. Backward pass: compute all backward values
-        let mut saved_bwd = vec![0.0f32; n_markers * n_states];
-        let mut bwd = vec![1.0f32; n_states];
-        
-        // Initialize last row
-        let last_row_start = (n_markers - 1) * n_states;
-        saved_bwd[last_row_start..last_row_start + n_states].fill(1.0);
-
-        for m in (0..n_markers - 1).rev() {
-            let m_next = m + 1;
-            let marker_next_idx = MarkerIdx::new(m_next as u32);
-            let targ_al_next = target_alleles[m_next];
-            let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
-            
-            let ref_alleles = self.state_alleles(marker_next_idx);
-            let mismatches: Vec<u8> = ref_alleles
-                .iter()
-                .map(|&r| if r == targ_al_next { 0 } else { 1 })
-                .collect();
-
-            HmmUpdater::bwd_update(&mut bwd, p_recomb, &emit_probs, &mismatches, n_states);
-            let row_start = m * n_states;
-            saved_bwd[row_start..row_start + n_states].copy_from_slice(&bwd);
-        }
-
-        // 2. Forward pass and accumulate stats
-        let h_factor = n_states as f32 / (n_states - 1) as f32;
-        let mut fwd = vec![1.0f32 / n_states as f32; n_states];
-        let mut last_fwd_sum = 1.0f32;
-
-        for m in 0..n_markers {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let targ_al = target_alleles[m];
-            let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0);
-            let shift = p_switch / n_states as f32;
-            let scale = (1.0 - p_switch) / last_fwd_sum;
-            let no_switch_scale = ((1.0 - p_switch) + shift) / last_fwd_sum;
-
-            let mut joint_state_sum = 0.0f32;
-            let mut state_sum = 0.0f32;
-            let mut mismatch_sum = 0.0f32;
-            let mut next_fwd_sum = 0.0f32;
-
-            let bwd_m = &saved_bwd[m * n_states .. (m + 1) * n_states];
-            let ref_alleles = self.state_alleles(marker_idx);
-
-            for k in 0..n_states {
-                let is_mismatch = ref_alleles[k] != targ_al;
-                let em = if is_mismatch { p_err } else { p_no_err };
-                
-                // P(State_m = k, State_{m-1} = k, Data_m)
-                joint_state_sum += bwd_m[k] * em * no_switch_scale * fwd[k];
-                
-                // Update fwd for next marker
-                fwd[k] = em * (scale * fwd[k] + shift);
-                next_fwd_sum += fwd[k];
-                
-                // Posterior P(State_m = k | Data) * P(Data)
-                let state_prob = fwd[k] * bwd_m[k];
-                state_sum += state_prob;
-                if is_mismatch {
-                    mismatch_sum += state_prob;
-                }
-            }
-
-            // Accumulate mismatch stats
-            if state_sum > 0.0 {
-                estimates.add_emission(
-                    (1.0 - mismatch_sum / state_sum) as f64,
-                    (mismatch_sum / state_sum) as f64
-                );
-            }
-
-            // Accumulate switch stats
-            if m > 0 && state_sum > 0.0 {
-                let switch_prob = h_factor * (1.0 - joint_state_sum / state_sum);
-                if switch_prob > 0.0 {
-                    let gen_dist = gen_dists.get(m).copied().unwrap_or(0.0);
-                    estimates.add_switch(gen_dist, switch_prob as f64);
-                }
-            }
-
-            last_fwd_sum = next_fwd_sum;
-        }
-    }
-}
-
-/// Li-Stephens HMM with composite (mosaic) reference states
-///
-/// Unlike the standard HMM where each state is a single reference haplotype,
-/// composite states can switch which reference haplotype they point to at
-/// different markers, following IBS sharing patterns.
-///
-/// **DEPRECATED**: Use `BeagleHmm` with `MosaicCursor` instead for better
-/// memory efficiency (O(K*segments) vs O(M*K) for state_map).
-#[deprecated(since = "0.2.0", note = "Use BeagleHmm with MosaicCursor for O(K*segments) memory")]
-pub struct CompositeHmm<'a> {
-    /// Reference panel genotypes
-    ref_gt: GenotypeView<'a>,
-    /// Model parameters
-    params: &'a ModelParams,
-    /// State-to-haplotype mapping: state_map[marker * n_states + state] = ref_hap
-    state_map: Vec<HapIdx>,
-    /// Number of states
-    n_states: usize,
-    /// Recombination probabilities between consecutive markers
-    p_recomb: Vec<f32>,
-}
-
-impl<'a> CompositeHmm<'a> {
-    pub fn new(
-        ref_gt: impl Into<GenotypeView<'a>>,
-        params: &'a ModelParams,
-        state_map: Vec<HapIdx>,
-        n_states: usize,
-        p_recomb: Vec<f32>,
-    ) -> Self {
-        Self {
-            ref_gt: ref_gt.into(),
-            params,
-            state_map,
-            n_states,
-            p_recomb,
-        }
-    }
-
-    pub fn n_states(&self) -> usize {
-        self.n_states
-    }
-
-    pub fn n_markers(&self) -> usize {
-        self.ref_gt.n_markers()
-    }
-
-    /// Get reference allele at marker for composite state
-    /// Unlike static HMM, this looks up which ref hap the state points to at this marker
-    #[inline]
-    pub fn state_allele(&self, marker: MarkerIdx, state: usize) -> u8 {
-        let idx = marker.as_usize() * self.n_states + state;
-        let ref_hap = self.state_map[idx];
-        self.ref_gt.allele(marker, ref_hap)
-    }
-
-    /// Get all reference alleles for all states at a marker
-    pub fn state_alleles(&self, marker: MarkerIdx) -> Vec<u8> {
-        let m = marker.as_usize();
-        let base = m * self.n_states;
-        (0..self.n_states)
-            .map(|s| {
-                let ref_hap = self.state_map[base + s];
-                self.ref_gt.allele(marker, ref_hap)
-            })
-            .collect()
-    }
-
-    /// Compute expected allele dosage at a marker given state probabilities
-    pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
-        let mut dosage = 0.0f32;
-        for (k, &prob) in state_probs.iter().enumerate() {
-            let allele = self.state_allele(marker, k);
-            if allele != 255 {
-                dosage += prob * allele as f32;
-            }
-        }
-        dosage
-    }
-
-    /// Run forward-backward algorithm and return raw Forward and Backward tables
-    pub fn forward_backward_raw(
-        &self,
-        target_alleles: &[u8],
-        fwd: &mut Vec<f32>,
-        bwd: &mut Vec<f32>,
-    ) -> f64 {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states;
-        let total_size = n_markers * n_states;
-
-        if n_markers == 0 || n_states == 0 {
-            return 0.0;
-        }
-
-        fwd.resize(total_size, 0.0);
-        bwd.resize(total_size, 0.0);
-
-        let p_err = self.params.p_mismatch;
-        let p_no_err = 1.0 - p_err;
-        let emit_probs = [p_no_err, p_err];
-
-        let fwd_sum = self.forward_pass(target_alleles, fwd, &emit_probs);
-
-        let last_row = (n_markers - 1) * n_states;
-        let init_bwd = 1.0 / n_states as f32;
-        for k in 0..n_states {
-            bwd[last_row + k] = init_bwd;
-        }
-
-        for m in (0..n_markers - 1).rev() {
-            let m_next = m + 1;
-            let marker_next_idx = MarkerIdx::new(m_next as u32);
-            let targ_al_next = target_alleles[m_next];
-
-            let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
-
-            let ref_alleles = self.state_alleles(marker_next_idx);
-            let mismatches: Vec<u8> = ref_alleles
-                .iter()
-                .map(|&r| if r == targ_al_next { 0 } else { 1 })
-                .collect();
-
-            let curr_row = m * n_states;
-            let next_row = m_next * n_states;
-
-            for k in 0..n_states {
-                bwd[curr_row + k] = bwd[next_row + k];
-            }
-
-            let bwd_slice = &mut bwd[curr_row..curr_row + n_states];
-            HmmUpdater::bwd_update(bwd_slice, p_recomb, &emit_probs, &mismatches, n_states);
-        }
-
-        fwd_sum.ln() as f64
-    }
-
-    /// Run forward-backward algorithm for a target haplotype
-    pub fn forward_backward(
-        &self,
-        target_alleles: &[u8],
-        fwd: &mut Vec<f32>,
-        bwd: &mut Vec<f32>,
-    ) -> HmmResult {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states;
-
-        if n_markers == 0 || n_states == 0 {
-            return HmmResult {
-                state_probs: Vec::new(),
-                n_states,
-                sampled_path: Vec::new(),
-                log_likelihood: 0.0,
-            };
-        }
-
-        let total_size = n_markers * n_states;
-        fwd.resize(total_size, 0.0);
-        bwd.resize(n_states, 0.0);
-
-        let p_err = self.params.p_mismatch;
-        let p_no_err = 1.0 - p_err;
-        let emit_probs = [p_no_err, p_err];
-
-        let fwd_sum = self.forward_pass(target_alleles, fwd, &emit_probs);
-
-        let init_bwd = 1.0 / n_states as f32;
-        bwd.fill(init_bwd);
-        let mut bwd_sum = 1.0f32;
-
-        for m in (0..n_markers).rev() {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let targ_al = target_alleles[m];
-            let row_offset = m * n_states;
-
-            let ref_alleles = self.state_alleles(marker_idx);
-            let mismatches: Vec<u8> = ref_alleles
-                .iter()
-                .map(|&r| if r == targ_al { 0 } else { 1 })
-                .collect();
-
-            if m < n_markers - 1 {
-                let p_recomb = self.p_recomb.get(m + 1).copied().unwrap_or(0.0);
-                let shift = p_recomb / n_states as f32;
-                let scale = (1.0 - p_recomb) / bwd_sum;
-
-                for k in 0..n_states {
-                    bwd[k] = scale * bwd[k] + shift;
-                }
-            }
-
-            let mut state_sum = 0.0f32;
-            for k in 0..n_states {
-                let idx = row_offset + k;
-                fwd[idx] *= bwd[k];
-                state_sum += fwd[idx];
-            }
-
-            if state_sum > 0.0 {
-                let inv_sum = 1.0 / state_sum;
-                for k in 0..n_states {
-                    fwd[row_offset + k] *= inv_sum;
-                }
-            }
-
-            if m > 0 {
-                bwd_sum = 0.0;
-                for k in 0..n_states {
-                    bwd[k] *= emit_probs[mismatches[k] as usize];
-                    bwd_sum += bwd[k];
-                }
-            }
-        }
-
-        let sampled_path = self.sample_path(fwd, n_markers, n_states);
-        let log_likelihood = fwd_sum.ln() as f64;
-
-        HmmResult {
-            state_probs: fwd.clone(),
-            n_states,
-            sampled_path,
-            log_likelihood,
-        }
-    }
-
-    fn forward_pass(
-        &self,
-        target_alleles: &[u8],
-        fwd: &mut Vec<f32>,
-        emit_probs: &[f32; 2],
-    ) -> f32 {
-        let n_markers = self.n_markers();
-        let n_states = self.n_states;
-
-        let mut fwd_sum = 1.0f32;
-
-        for m in 0..n_markers {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let targ_al = target_alleles[m];
-            let p_recomb = self.p_recomb.get(m).copied().unwrap_or(0.0);
-
-            let shift = p_recomb / n_states as f32;
-            let scale = (1.0 - p_recomb) / fwd_sum;
-
-            let mut new_sum = 0.0f32;
-            let row_offset = m * n_states;
-            let prev_row_offset = if m > 0 { (m - 1) * n_states } else { 0 };
-
-            for k in 0..n_states {
-                let ref_al = self.state_allele(marker_idx, k);
-                let emit = if ref_al == targ_al {
-                    emit_probs[0]
-                } else {
-                    emit_probs[1]
-                };
-
-                let val = if m == 0 {
-                    emit / n_states as f32
-                } else {
-                    emit * (scale * fwd[prev_row_offset + k] + shift)
-                };
-
-                fwd[row_offset + k] = val;
-                new_sum += val;
-            }
-            fwd_sum = new_sum;
-        }
-
-        fwd_sum
-    }
-
-    fn sample_path(
-        &self,
-        state_probs: &[f32],
-        n_markers: usize,
-        n_states: usize,
-    ) -> Vec<usize> {
-        let mut path = Vec::with_capacity(n_markers);
-
-        for m in 0..n_markers {
-            let row_offset = m * n_states;
-            let mut max_state = 0;
-            let mut max_prob = state_probs[row_offset];
-            for k in 1..n_states {
-                let prob = state_probs[row_offset + k];
-                if prob > max_prob {
-                    max_prob = prob;
-                    max_state = k;
-                }
-            }
-            path.push(max_state);
-        }
-
-        path
-    }
-}
-
 // ============================================================================
 // BeagleHmm: Memory-Efficient Mosaic HMM with A-B-C Loop Pattern
 // ============================================================================
@@ -1017,10 +260,11 @@ impl<'a> BeagleHmm<'a> {
     /// 1. Uses MosaicCursor for O(K*segments) memory
     /// 2. Pre-materializes alleles into scratch buffer for SIMD
     /// 3. Runs vectorizable math on contiguous data
-    pub fn forward_backward_mosaic(
+    ///
+    /// Returns (log_likelihood, fwd_buffer, bwd_buffer)
+    pub fn forward_backward_raw(
         &self,
         target_alleles: &[u8],
-        cursor: &mut MosaicCursor,
         threaded_haps: &ThreadedHaps,
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
@@ -1044,24 +288,29 @@ impl<'a> BeagleHmm<'a> {
         let mut scratch = AlleleScratch::new(n_states);
         let mut mismatches = vec![0u8; n_states];
 
-        // Reset cursor for forward pass
-        cursor.reset(threaded_haps);
+        // Create cursor for traversal
+        let mut cursor = MosaicCursor::from_threaded(threaded_haps);
 
         // =====================================================================
         // FORWARD PASS with A-B-C Loop
         // =====================================================================
         let mut fwd_sum = 1.0f32;
 
+        // Store active haps at each marker for backward pass
+        let mut marker_haps: Vec<Vec<u32>> = Vec::with_capacity(n_markers);
+
         for m in 0..n_markers {
-            let marker_idx = MarkerIdx::new(m as u32);
             let targ_al = target_alleles[m];
             let p_recomb_m = self.p_recomb.get(m).copied().unwrap_or(0.0);
 
             // Phase A: Advance cursor (state maintenance)
             cursor.advance_to_marker(m, threaded_haps);
+            
+            // Store snapshot of active haps for backward pass
+            marker_haps.push(cursor.active_haps().to_vec());
 
             // Phase B: Materialize alleles into scratch buffer
-            scratch.materialize(cursor, m, |marker, hap| {
+            scratch.materialize(&cursor, m, |marker, hap| {
                 self.ref_gt.allele(MarkerIdx::new(marker as u32), HapIdx::new(hap))
             });
 
@@ -1096,14 +345,8 @@ impl<'a> BeagleHmm<'a> {
         }
 
         // =====================================================================
-        // BACKWARD PASS with A-B-C Loop (reverse order)
+        // BACKWARD PASS using stored marker haplotypes
         // =====================================================================
-        // For backward, we need to iterate segments in reverse
-        // Reset cursor and advance to end
-        cursor.reset(threaded_haps);
-        for m in 0..n_markers {
-            cursor.advance_to_marker(m, threaded_haps);
-        }
 
         // Initialize last row
         let last_row = (n_markers - 1) * n_states;
@@ -1112,7 +355,7 @@ impl<'a> BeagleHmm<'a> {
             bwd[last_row + k] = init_bwd;
         }
 
-        // Backward sweep
+        // Backward sweep using stored haplotypes
         for m in (0..n_markers - 1).rev() {
             let m_next = m + 1;
             let marker_next_idx = MarkerIdx::new(m_next as u32);
@@ -1120,10 +363,9 @@ impl<'a> BeagleHmm<'a> {
 
             let p_recomb_next = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
 
-            // For backward, we need alleles at m_next
-            // Re-materialize (cursor is already at end position)
+            // Use stored haplotypes for marker m_next
             for k in 0..n_states {
-                let hap = cursor.active_hap(k);
+                let hap = marker_haps[m_next][k];
                 scratch.alleles[k] = self.ref_gt.allele(marker_next_idx, HapIdx::new(hap));
                 mismatches[k] = if scratch.alleles[k] == targ_al_next { 0 } else { 1 };
             }
@@ -1150,7 +392,347 @@ impl<'a> BeagleHmm<'a> {
 
         fwd_sum.ln() as f64
     }
+
+    /// Compute expected allele dosage at a marker given state probabilities
+    pub fn compute_dosage(
+        &self,
+        marker: MarkerIdx,
+        state_probs: &[f32],
+        marker_haps: &[u32],
+    ) -> f32 {
+        let mut dosage = 0.0f32;
+        for (k, &prob) in state_probs.iter().enumerate() {
+            let hap = marker_haps[k];
+            let allele = self.ref_gt.allele(marker, HapIdx::new(hap));
+            if allele != 255 {
+                dosage += prob * allele as f32;
+            }
+        }
+        dosage
+    }
+
+    /// Collect statistics for EM parameter estimation
+    pub fn collect_stats(
+        &self,
+        target_alleles: &[u8],
+        threaded_haps: &ThreadedHaps,
+        gen_dists: &[f64],
+        estimates: &mut crate::model::parameters::ParamEstimates,
+    ) {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states;
+        if n_markers < 2 || n_states <= 1 {
+            return;
+        }
+
+        let p_err = self.params.p_mismatch;
+        let p_no_err = 1.0 - p_err;
+        let emit_probs = [p_no_err, p_err];
+
+        // Create cursor and store haps at each marker
+        let mut cursor = MosaicCursor::from_threaded(threaded_haps);
+        let mut marker_haps: Vec<Vec<u32>> = Vec::with_capacity(n_markers);
+        for m in 0..n_markers {
+            cursor.advance_to_marker(m, threaded_haps);
+            marker_haps.push(cursor.active_haps().to_vec());
+        }
+
+        // 1. Backward pass: compute all backward values
+        let mut saved_bwd = vec![0.0f32; n_markers * n_states];
+        let mut bwd = vec![1.0f32; n_states];
+        
+        let last_row_start = (n_markers - 1) * n_states;
+        saved_bwd[last_row_start..last_row_start + n_states].fill(1.0);
+
+        for m in (0..n_markers - 1).rev() {
+            let m_next = m + 1;
+            let marker_next_idx = MarkerIdx::new(m_next as u32);
+            let targ_al_next = target_alleles[m_next];
+            let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
+            
+            let mismatches: Vec<u8> = marker_haps[m_next].iter()
+                .map(|&h| {
+                    let r = self.ref_gt.allele(marker_next_idx, HapIdx::new(h));
+                    if r == targ_al_next { 0 } else { 1 }
+                })
+                .collect();
+
+            HmmUpdater::bwd_update(&mut bwd, p_recomb, &emit_probs, &mismatches, n_states);
+            let row_start = m * n_states;
+            saved_bwd[row_start..row_start + n_states].copy_from_slice(&bwd);
+        }
+
+        // 2. Forward pass and accumulate stats
+        let h_factor = n_states as f32 / (n_states - 1) as f32;
+        let mut fwd = vec![1.0f32 / n_states as f32; n_states];
+        let mut last_fwd_sum = 1.0f32;
+
+        for m in 0..n_markers {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let targ_al = target_alleles[m];
+            let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0);
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) / last_fwd_sum;
+            let no_switch_scale = ((1.0 - p_switch) + shift) / last_fwd_sum;
+
+            let mut joint_state_sum = 0.0f32;
+            let mut state_sum = 0.0f32;
+            let mut mismatch_sum = 0.0f32;
+            let mut next_fwd_sum = 0.0f32;
+
+            let bwd_m = &saved_bwd[m * n_states .. (m + 1) * n_states];
+
+            for k in 0..n_states {
+                let ref_al = self.ref_gt.allele(marker_idx, HapIdx::new(marker_haps[m][k]));
+                let is_mismatch = ref_al != targ_al;
+                let em = if is_mismatch { p_err } else { p_no_err };
+                
+                joint_state_sum += bwd_m[k] * em * no_switch_scale * fwd[k];
+                
+                fwd[k] = em * (scale * fwd[k] + shift);
+                next_fwd_sum += fwd[k];
+                
+                let state_prob = fwd[k] * bwd_m[k];
+                state_sum += state_prob;
+                if is_mismatch {
+                    mismatch_sum += state_prob;
+                }
+            }
+
+            if state_sum > 0.0 {
+                estimates.add_emission(
+                    (1.0 - mismatch_sum / state_sum) as f64,
+                    (mismatch_sum / state_sum) as f64
+                );
+            }
+
+            if m > 0 && state_sum > 0.0 {
+                let switch_prob = h_factor * (1.0 - joint_state_sum / state_sum);
+                if switch_prob > 0.0 {
+                    let gen_dist = gen_dists.get(m).copied().unwrap_or(0.0);
+                    estimates.add_switch(gen_dist, switch_prob as f64);
+                }
+            }
+
+            last_fwd_sum = next_fwd_sum;
+        }
+    }
 }
+
+// ============================================================================
+// LiStephensHmm: Static-State Wrapper for BeagleHmm
+// ============================================================================
+
+/// Static-state Li-Stephens HMM that wraps BeagleHmm for backwards compatibility.
+///
+/// This provides the same API as the original LiStephensHmm but uses the unified
+/// BeagleHmm internally with a static `ThreadedHaps` (single segment per state).
+///
+/// Use this when states are selected once via PBWT and remain constant for the
+/// entire forward-backward run (typical in phasing).
+pub struct LiStephensHmm<'a> {
+    /// Reference panel genotypes
+    ref_gt: GenotypeView<'a>,
+    /// Model parameters
+    params: &'a ModelParams,
+    /// Static haplotype indices (one per state)
+    ref_haps: Vec<HapIdx>,
+    /// Recombination probabilities between consecutive markers
+    p_recomb: Vec<f32>,
+}
+
+impl<'a> LiStephensHmm<'a> {
+    /// Create a new static Li-Stephens HMM
+    ///
+    /// # Arguments
+    /// * `ref_gt` - Reference panel genotypes
+    /// * `params` - Model parameters
+    /// * `ref_haps` - Reference haplotype indices for each state (constant across markers)
+    /// * `p_recomb` - Recombination probabilities
+    pub fn new(
+        ref_gt: impl Into<GenotypeView<'a>>,
+        params: &'a ModelParams,
+        ref_haps: Vec<HapIdx>,
+        p_recomb: Vec<f32>,
+    ) -> Self {
+        Self {
+            ref_gt: ref_gt.into(),
+            params,
+            ref_haps,
+            p_recomb,
+        }
+    }
+
+    /// Number of HMM states
+    pub fn n_states(&self) -> usize {
+        self.ref_haps.len()
+    }
+
+    /// Number of markers
+    pub fn n_markers(&self) -> usize {
+        self.ref_gt.n_markers()
+    }
+
+    /// Run forward-backward algorithm and return full result with posteriors
+    ///
+    /// This is the high-level API that returns normalized posteriors and sampled path.
+    pub fn forward_backward(
+        &self,
+        target_alleles: &[u8],
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> HmmResult {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states();
+
+        if n_markers == 0 || n_states == 0 {
+            return HmmResult {
+                state_probs: Vec::new(),
+                n_states: 0,
+                sampled_path: Vec::new(),
+                log_likelihood: 0.0,
+            };
+        }
+
+        // Create static ThreadedHaps (single segment per state)
+        let threaded_haps = ThreadedHaps::from_static_haps(&self.ref_haps, n_markers);
+
+        // Create BeagleHmm and run forward-backward
+        let beagle_hmm = BeagleHmm::new(
+            self.ref_gt,
+            self.params,
+            n_states,
+            self.p_recomb.clone(),
+        );
+
+        let log_likelihood = beagle_hmm.forward_backward_raw(
+            target_alleles,
+            &threaded_haps,
+            fwd,
+            bwd,
+        );
+
+        // Compute normalized posteriors: state_probs = fwd * bwd (normalized per marker)
+        let total_size = n_markers * n_states;
+        let mut state_probs = vec![0.0f32; total_size];
+
+        for m in 0..n_markers {
+            let row_start = m * n_states;
+            let row_end = row_start + n_states;
+
+            let mut sum = 0.0f32;
+            for k in 0..n_states {
+                let p = fwd[row_start + k] * bwd[row_start + k];
+                state_probs[row_start + k] = p;
+                sum += p;
+            }
+
+            // Normalize
+            if sum > 0.0 {
+                let inv_sum = 1.0 / sum;
+                for k in 0..n_states {
+                    state_probs[row_start + k] *= inv_sum;
+                }
+            }
+        }
+
+        // Sample path (simple argmax for now)
+        let sampled_path: Vec<usize> = (0..n_markers)
+            .map(|m| {
+                let row_start = m * n_states;
+                (0..n_states)
+                    .max_by(|&a, &b| {
+                        state_probs[row_start + a]
+                            .partial_cmp(&state_probs[row_start + b])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        HmmResult {
+            state_probs,
+            n_states,
+            sampled_path,
+            log_likelihood,
+        }
+    }
+
+    /// Run forward-backward and return raw buffers (for phasing pipeline)
+    ///
+    /// Returns log-likelihood. The fwd/bwd buffers contain scaled (but not normalized)
+    /// forward/backward values.
+    pub fn forward_backward_raw(
+        &self,
+        target_alleles: &[u8],
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> f64 {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states();
+
+        if n_markers == 0 || n_states == 0 {
+            return 0.0;
+        }
+
+        // Create static ThreadedHaps
+        let threaded_haps = ThreadedHaps::from_static_haps(&self.ref_haps, n_markers);
+
+        // Create BeagleHmm and delegate
+        let beagle_hmm = BeagleHmm::new(
+            self.ref_gt,
+            self.params,
+            n_states,
+            self.p_recomb.clone(),
+        );
+
+        beagle_hmm.forward_backward_raw(target_alleles, &threaded_haps, fwd, bwd)
+    }
+
+    /// Compute expected allele dosage at a marker given state probabilities
+    pub fn compute_dosage(&self, marker: MarkerIdx, state_probs: &[f32]) -> f32 {
+        let mut dosage = 0.0f32;
+        for (k, &prob) in state_probs.iter().enumerate() {
+            if k < self.ref_haps.len() {
+                let hap = self.ref_haps[k];
+                let allele = self.ref_gt.allele(marker, hap);
+                if allele != 255 {
+                    dosage += prob * allele as f32;
+                }
+            }
+        }
+        dosage
+    }
+
+    /// Collect statistics for EM parameter estimation
+    pub fn collect_stats(
+        &self,
+        target_alleles: &[u8],
+        gen_dists: &[f64],
+        estimates: &mut crate::model::parameters::ParamEstimates,
+    ) {
+        let n_markers = self.n_markers();
+        let n_states = self.n_states();
+
+        if n_markers < 2 || n_states <= 1 {
+            return;
+        }
+
+        // Create static ThreadedHaps
+        let threaded_haps = ThreadedHaps::from_static_haps(&self.ref_haps, n_markers);
+
+        // Create BeagleHmm and delegate
+        let beagle_hmm = BeagleHmm::new(
+            self.ref_gt,
+            self.params,
+            n_states,
+            self.p_recomb.clone(),
+        );
+
+        beagle_hmm.collect_stats(target_alleles, &threaded_haps, gen_dists, estimates)
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
