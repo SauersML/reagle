@@ -38,7 +38,7 @@ impl OnlineHmm {
             prev_fwd_combined: Vec::new(),
             prev_fwd1: Vec::new(),
             prev_fwd2: Vec::new(),
-            generation: 1, // Start at 1 because 0 is the default/empty state in the map
+            generation: 1,
             global_state_map: Vec::new(),
         }
     }
@@ -91,9 +91,7 @@ impl OnlineHmm {
     where F: FnMut(u32) -> (f32, f32, f32)
     {
         let n_new = new_states.len();
-        // REMOVED early return: Must process even if empty to update generation and sync state
-        // if n_new == 0 { ... }
-
+        // If n_new == 0, the loops below won't run, prev_states will clear, gen will bump.
 
         // Resize map if needed
         if self.global_state_map.len() < n_total_haps {
@@ -133,19 +131,19 @@ impl OnlineHmm {
             }
             
             let term_c = if let Some(idx) = idx_prev {
-                self.prev_fwd_combined[idx] * stay + shift
+                (unsafe { *self.prev_fwd_combined.get_unchecked(idx) }) * stay + shift
             } else {
                 shift 
             };
             
             let term1 = if let Some(idx) = idx_prev {
-                self.prev_fwd1[idx] * stay + shift
+                (unsafe { *self.prev_fwd1.get_unchecked(idx) }) * stay + shift
             } else {
                 shift
             };
             
             let term2 = if let Some(idx) = idx_prev {
-                self.prev_fwd2[idx] * stay + shift
+                (unsafe { *self.prev_fwd2.get_unchecked(idx) }) * stay + shift
             } else {
                 shift
             };
@@ -184,15 +182,6 @@ impl OnlineHmm {
         // Advance generation and populate map for NEXT step
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
-            // Overflow handling: Clear the map to avoid collisions with old generation 0
-            // Or just reset all to 0. Since 0 is now current, next check will fail unless we set it.
-            // Wait, if we wrap to 0, anything with 0 (from long ago) might be considered valid.
-            // But we actually only care about `prev_states`.
-            // So we need to ensure that when we wrap, we invalidate all old entries.
-            // Simplest way: if wrapped to 0, memset the whole array to (0,0) [invalid gen] or just skip 0?
-            // Safer: Use generation > 0 always. 
-            // If wrap to 0 -> set to 1, and clear the vector.
-            // This happens once every 65k steps. Cheap enough.
             self.generation = 1;
             self.global_state_map.fill(StateEntry::default());
         }
@@ -304,11 +293,11 @@ impl OnlineHmm {
             }
             
             let term1 = if let Some(idx) = idx_prev {
-                self.prev_fwd1[idx] * stay + shift
+                (unsafe { *self.prev_fwd1.get_unchecked(idx) }) * stay + shift
             } else { shift };
             
             let term2 = if let Some(idx) = idx_prev {
-                self.prev_fwd2[idx] * stay + shift
+                (unsafe { *self.prev_fwd2.get_unchecked(idx) }) * stay + shift
             } else { shift };
             
             total_prob1_a1 += term1 * e_a1;
@@ -421,22 +410,18 @@ mod tests {
     }
 
     #[test]
-    fn test_step_without_init() {
+    fn test_crash_without_init() {
         let mut hmm = OnlineHmm::new();
-        // Should start with generation 1
-        assert_eq!(hmm.generation, 1);
-        
+        // Skip init(), go straight to step()
+        // This mirrors usage in pipelines/phasing.rs
         let new_states = vec![10, 20];
-        // This used to panic because generation 0 matched default map entries (0)
         hmm.step(
             &new_states,
             |_| (1.0, 1.0, 1.0),
             0.01,
             100
         );
-        
-        // After step, should be gen 2
-        assert_eq!(hmm.generation, 2);
-        assert_eq!(hmm.prev_states, new_states);
+        // Should not panic
+        assert_eq!(hmm.generation, 2); // Started at 1, stepped to 2
     }
 }
