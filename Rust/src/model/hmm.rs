@@ -315,13 +315,16 @@ impl<'a> BeagleHmm<'a> {
                 }
                 fwd_sum = 1.0;
             } else {
-                let shift = p_recomb_m / n_states as f32;
-                let stay = 1.0 - p_recomb_m;
-
+                // Li-Stephens HMM transition update:
+                //   fwd[k] = emit[k] * ((1-ρ)/Σfwd * fwd[k] + ρ/K)
+                // where ρ = p_recomb_m (recombination probability), K = n_states
+                //
+                // The fwd_update function expects p_switch = ρ (raw recombination prob)
+                // and internally computes: shift = ρ/K, scale = (1-ρ)/fwd_sum
                 fwd_sum = HmmUpdater::fwd_update(
                     &mut fwd[row_offset..row_offset + n_states],
                     fwd_sum,
-                    stay + shift,
+                    p_recomb_m, // Pass raw recombination probability
                     &emit_probs,
                     &mismatches,
                     n_states,
@@ -366,13 +369,11 @@ impl<'a> BeagleHmm<'a> {
                 bwd[curr_row + k] = bwd[next_row + k];
             }
 
-            // Apply backward update
-            let shift = p_recomb_next / n_states as f32;
-            let stay = 1.0 - p_recomb_next;
-
+            // Apply backward update (same Li-Stephens formula, different direction)
+            // bwd_update expects p_switch = ρ (raw recombination probability)
             HmmUpdater::bwd_update(
                 &mut bwd[curr_row..curr_row + n_states],
-                stay + shift,
+                p_recomb_next, // Pass raw recombination probability
                 &emit_probs,
                 &mismatches,
                 n_states,

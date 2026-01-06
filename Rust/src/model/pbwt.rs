@@ -76,6 +76,12 @@ impl PbwtDivUpdater {
     /// Forward update optimized for biallelic markers (2 alleles)
     ///
     /// Uses dual-stream writing to avoid random memory access patterns in the scatter phase.
+    ///
+    /// # Forward PBWT Semantics
+    /// - divergence[i] = marker where match STARTS (looking backward)
+    /// - Small divergence = long match (started far back)
+    /// - Uses MAX propagation: we propagate the latest divergence point
+    /// - Reset to MIN_VALUE after output
     pub fn fwd_update_biallelic(
         &mut self,
         alleles: &[u8],
@@ -143,6 +149,9 @@ impl PbwtDivUpdater {
     }
 
     /// Backward update optimized for biallelic markers
+    ///
+    /// See `bwd_update` for documentation on backward vs forward PBWT semantics.
+    /// This is an optimized version for the common biallelic case.
     pub fn bwd_update_biallelic(
         &mut self,
         alleles: &[u8],
@@ -155,10 +164,9 @@ impl PbwtDivUpdater {
 
         self.ensure_capacity(2);
 
-        // For backward PBWT, divergence indicates how far FORWARD (toward higher indices)
-        // the match extends. Larger divergence = longer match.
-        // Initialize to current marker: "match starts here"
-        let init_value = marker as i32;
+        // Backward PBWT: divergence[i] = marker where match ENDS (looking forward)
+        // Initialize to (marker - 1) following Java Beagle convention
+        let init_value = (marker as i32) - 1;
 
         // Pass 1: Count zeros
         let mut c0 = 0;
@@ -168,11 +176,12 @@ impl PbwtDivUpdater {
             }
         }
 
-        // Pass 2: Scatter
+        // Pass 2: Scatter with MIN propagation
         let mut idx0 = 0;
         let mut idx1 = c0;
 
-        // For backward PBWT: use max() to propagate (larger = longer match)
+        // For backward PBWT: use min() to propagate
+        // Smaller divergence = earlier end point = we propagate the "worst case"
         let mut p0 = init_value;
         let mut p1 = init_value;
 
@@ -181,23 +190,23 @@ impl PbwtDivUpdater {
             let div = unsafe { *divergence.get_unchecked(i) };
             let allele = unsafe { *alleles.get_unchecked(hap as usize) };
 
-            // Backward PBWT uses max() for propagation (larger divergence = longer match)
-            if div > p0 { p0 = div; }
-            if div > p1 { p1 = div; }
+            // Backward PBWT uses min() for propagation
+            if div < p0 { p0 = div; }
+            if div < p1 { p1 = div; }
 
             if allele == 0 {
                 unsafe {
                     *self.scratch_a.get_unchecked_mut(idx0) = hap;
                     *self.scratch_d.get_unchecked_mut(idx0) = p0;
                 }
-                p0 = init_value; // Reset to current marker for next group
+                p0 = i32::MAX; // Reset to MAX so next haplotype takes its own divergence
                 idx0 += 1;
             } else {
                 unsafe {
                     *self.scratch_a.get_unchecked_mut(idx1) = hap;
                     *self.scratch_d.get_unchecked_mut(idx1) = p1;
                 }
-                p1 = init_value; // Reset to current marker for next group
+                p1 = i32::MAX; // Reset to MAX so next haplotype takes its own divergence
                 idx1 += 1;
             }
         }
@@ -210,6 +219,18 @@ impl PbwtDivUpdater {
     /// Forward update of prefix and divergence arrays
     ///
     /// Uses In-Place Counting Sort to remove allocations.
+    ///
+    /// # Forward PBWT Semantics (vs Backward)
+    ///
+    /// - **Forward PBWT** (markers 0 → M-1): divergence[i] = marker where match STARTS
+    ///   - Small divergence = long match (started far back)
+    ///   - Uses MAX propagation: latest divergence point limits the match
+    ///   - Reset to MIN_VALUE after output
+    ///
+    /// - **Backward PBWT** (markers M-1 → 0): divergence[i] = marker where match ENDS
+    ///   - Small divergence = short match (ends soon)
+    ///   - Uses MIN propagation: earliest end point limits the match
+    ///   - Reset to MAX_VALUE after output
     ///
     /// # Arguments
     /// * `alleles` - Allele for each haplotype
@@ -388,6 +409,20 @@ impl PbwtDivUpdater {
     /// Backward update of prefix and divergence arrays
     ///
     /// Uses In-Place Counting Sort.
+    ///
+    /// # Backward PBWT Semantics (vs Forward)
+    ///
+    /// - **Forward PBWT** (markers 0 → M-1): divergence[i] = marker where match STARTS
+    ///   - Small divergence = long match (started far back)
+    ///   - Uses MAX propagation: latest divergence point limits the match
+    ///   - Reset to MIN_VALUE after output
+    ///
+    /// - **Backward PBWT** (markers M-1 → 0): divergence[i] = marker where match ENDS
+    ///   - Small divergence = short match (ends soon)
+    ///   - Uses MIN propagation: earliest end point limits the match
+    ///   - Reset to MAX_VALUE after output
+    ///
+    /// This matches the Java Beagle implementation in PbwtDivUpdater.bwdUpdate.
     pub fn bwd_update(
         &mut self,
         alleles: &[u8],
@@ -402,10 +437,10 @@ impl PbwtDivUpdater {
 
         self.ensure_capacity(n_alleles);
 
-        // 1. Initialize p array (propagation) - Backward Direction
-        // For backward PBWT, divergence indicates how far FORWARD the match extends.
-        // Larger divergence = longer match. Initialize to current marker.
-        let init_value = marker as i32;
+        // 1. Initialize p array - Backward uses (marker - 1) as init value
+        // This represents "just diverged at previous marker" for haplotypes
+        // that haven't been seen yet in this allele group.
+        let init_value = (marker as i32) - 1;
 
         // 2. Count frequencies
         self.counts[..n_alleles].fill(0);
@@ -423,7 +458,8 @@ impl PbwtDivUpdater {
             running += self.counts[i];
         }
 
-        // 4. Scatter (maintaining max divergence for backward PBWT)
+        // 4. Scatter with MIN propagation for backward PBWT
+        // p[j] tracks the minimum divergence seen since last output for allele j
         self.counts[..n_alleles].fill(0);
         self.p[..n_alleles].fill(init_value);
 
@@ -433,9 +469,11 @@ impl PbwtDivUpdater {
             let allele = alleles[hap as usize] as usize;
             let allele = if allele >= n_alleles { 0 } else { allele };
 
-            // Update p: max(p, div) for backward (larger = longer match)
+            // Update p: min(p, div) for backward PBWT
+            // Smaller divergence = earlier end point = shorter match
+            // We propagate the minimum to find the "worst case" match length
             for j in 0..n_alleles {
-                if div > self.p[j] {
+                if div < self.p[j] {
                     self.p[j] = div;
                 }
             }
@@ -447,7 +485,8 @@ impl PbwtDivUpdater {
             self.scratch_a[pos] = hap;
             self.scratch_d[pos] = self.p[allele];
 
-            self.p[allele] = init_value; // Reset to current marker for next group
+            // Reset to MAX so next haplotype takes its own divergence
+            self.p[allele] = i32::MAX;
             self.counts[allele] += 1;
         }
 
@@ -457,6 +496,9 @@ impl PbwtDivUpdater {
     }
 
     /// Backward update of prefix and divergence arrays using bit-packed alleles
+    ///
+    /// See `bwd_update` for documentation on backward vs forward PBWT semantics.
+    /// This is an optimized version for bit-packed biallelic data.
     pub fn bwd_update_packed(
         &mut self,
         alleles_packed: &[u64],
@@ -470,10 +512,8 @@ impl PbwtDivUpdater {
         let n_alleles = 2;
         self.ensure_capacity(n_alleles);
 
-        // 1. Initialize p array (propagation) - Backward Direction
-        // For backward PBWT, divergence indicates how far FORWARD the match extends.
-        // Larger divergence = longer match. Initialize to current marker.
-        let init_value = marker as i32;
+        // 1. Initialize p array - Backward uses (marker - 1) as init value
+        let init_value = (marker as i32) - 1;
 
         // 2. Count frequencies
         self.counts[0] = 0;
@@ -491,7 +531,7 @@ impl PbwtDivUpdater {
         self.offsets[0] = 0;
         self.offsets[1] = self.counts[0];
 
-        // 4. Scatter (maintaining max divergence for backward PBWT)
+        // 4. Scatter with MIN propagation for backward PBWT
         self.counts[0] = 0;
         self.counts[1] = 0;
 
@@ -506,9 +546,9 @@ impl PbwtDivUpdater {
             let bit_idx = hap % 64;
             let allele = ((alleles_packed[word_idx] >> bit_idx) & 1) as usize;
 
-            // Update p: max(p, div) for backward (larger = longer match)
-            if div > self.p[0] { self.p[0] = div; }
-            if div > self.p[1] { self.p[1] = div; }
+            // Update p: min(p, div) for backward PBWT
+            if div < self.p[0] { self.p[0] = div; }
+            if div < self.p[1] { self.p[1] = div; }
 
             let base = self.offsets[allele];
             let offset = self.counts[allele];
@@ -517,7 +557,8 @@ impl PbwtDivUpdater {
             self.scratch_a[pos] = hap as u32;
             self.scratch_d[pos] = self.p[allele];
 
-            self.p[allele] = init_value; // Reset to current marker for next group
+            // Reset to MAX so next haplotype takes its own divergence
+            self.p[allele] = i32::MAX;
             self.counts[allele] += 1;
         }
 
