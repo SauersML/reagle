@@ -7,3 +7,4 @@ build.log
 **/build
 Rust/.gitignore
 **/Cargo.lock
+Rust/target
