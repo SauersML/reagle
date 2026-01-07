@@ -947,14 +947,13 @@ impl VcfWriter {
             )?;
 
             // Write genotypes with probabilities
-            // GT is derived from dosage, NOT from reference panel!
             for s in 0..n_samples {
                 // Dosage
                 let ds_idx = local_m * n_samples + s;
                 let ds = dosages.get(ds_idx).copied().unwrap_or(0.0);
-                let (a1, a2) = gt_from_dosage(ds);
 
                 // Allele probabilities (probability of ALT for each haplotype)
+                // Compute these FIRST so GT can be derived from them (preserves haplotype independence)
                 let (ap1, ap2) = if let Some(probs) = allele_probs {
                     let hap1_idx = local_m * n_samples * 2 + s * 2;
                     let hap2_idx = hap1_idx + 1;
@@ -964,6 +963,14 @@ impl VcfWriter {
                 } else {
                     // If no probabilities provided, assume equal contribution from each hap
                     (ds / 2.0, ds / 2.0)
+                };
+
+                // GT: Derive from per-haplotype probabilities when available (preserves independence)
+                // Falls back to dosage-based derivation only when no per-hap probs exist
+                let (a1, a2) = if allele_probs.is_some() {
+                    gt_from_haplotype_probs(ap1, ap2)
+                } else {
+                    gt_from_dosage(ds)
                 };
 
                 // Start building sample field
@@ -1019,6 +1026,16 @@ fn gt_from_dosage(ds: f32) -> (u8, u8) {
     } else {
         (1, 1)
     }
+}
+
+/// Derives GT from per-haplotype allele probabilities (preserves haplotype independence)
+/// Returns (a1, a2) where a1 = max-likelihood allele for haplotype 1, a2 = for haplotype 2
+#[inline]
+fn gt_from_haplotype_probs(ap1: f32, ap2: f32) -> (u8, u8) {
+    // Each haplotype independently: ALT if P(ALT) >= 0.5, else REF
+    let a1 = if ap1 >= 0.5 { 1 } else { 0 };
+    let a2 = if ap2 >= 0.5 { 1 } else { 0 };
+    (a1, a2)
 }
 
 #[cfg(test)]

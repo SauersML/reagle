@@ -2463,8 +2463,9 @@ impl PhasingPipeline {
 
                     // p1 = P(hap1 has a1, hap2 has a2)
                     // p2 = P(hap1 has a2, hap2 has a1)
-                    let p1 = al_probs1[a1 as usize] * al_probs2[a2 as usize];
-                    let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
+                    // al_probs[0] = P(allele a1), al_probs[1] = P(allele a2) - semantic indices, not allele values
+                    let p1 = al_probs1[0] * al_probs2[1];
+                    let p2 = al_probs1[1] * al_probs2[0];
 
                     // Record decision: (marker, should_swap, likelihood_ratio)
                     // When probabilities are equal (ambiguous phase), use random tie-breaking
