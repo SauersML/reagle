@@ -2558,16 +2558,15 @@ fn compute_state_posteriors(
         let row_start = m * n_states;
         let mut sum = 0.0f32;
 
-        for k in 0..n_states {
-            let p = fwd[row_start + k] * bwd[row_start + k];
-            probs[m][k] = p;
-            sum += p;
+        for (k, p) in probs[m].iter_mut().enumerate().take(n_states) {
+            *p = fwd[row_start + k] * bwd[row_start + k];
+            sum += *p;
         }
 
         // Normalize
         if sum > 0.0 {
-            for k in 0..n_states {
-                probs[m][k] /= sum;
+            for p in probs[m].iter_mut().take(n_states) {
+                *p /= sum;
             }
         }
     }
@@ -2605,24 +2604,18 @@ impl Stage2Phaser {
         if n_stage1 >= 2 {
             // Fill markers before first Stage 1 marker with 0
             let first_hf = hi_freq_markers[0];
-            for m in 0..=first_hf {
-                prev_stage1_marker[m] = 0;
-            }
+            prev_stage1_marker[..=first_hf].fill(0);
 
             // Fill between Stage 1 markers
             for j in 1..n_stage1 {
                 let prev_hf = hi_freq_markers[j - 1];
                 let curr_hf = hi_freq_markers[j];
-                for m in (prev_hf + 1)..=curr_hf {
-                    prev_stage1_marker[m] = j - 1;
-                }
+                prev_stage1_marker[(prev_hf + 1)..=curr_hf].fill(j - 1);
             }
 
             // Fill after last Stage 1 marker
             let last_hf = hi_freq_markers[n_stage1 - 1];
-            for m in (last_hf + 1)..n_total_markers {
-                prev_stage1_marker[m] = n_stage1 - 1;
-            }
+            prev_stage1_marker[(last_hf + 1)..].fill(n_stage1 - 1);
         }
 
         // Build prevStage1Wt: interpolation weight based on genetic position
@@ -2644,22 +2637,18 @@ impl Stage2Phaser {
                 prev_stage1_wt[start] = 1.0;
 
                 if d > 1e-10 {
-                    for m in (start + 1)..end {
-                        prev_stage1_wt[m] = ((pos_b - gen_positions[m]) / d) as f32;
+                    for (m, wt) in prev_stage1_wt.iter_mut().enumerate().take(end).skip(start + 1) {
+                        *wt = ((pos_b - gen_positions[m]) / d) as f32;
                     }
                 } else {
                     // Zero distance, use equal weight
-                    for m in (start + 1)..end {
-                        prev_stage1_wt[m] = 0.5;
-                    }
+                    prev_stage1_wt[(start + 1)..end].fill(0.5);
                 }
             }
 
             // Markers at and after last Stage 1 marker: wt = 1.0
             let last_hf = hi_freq_markers[n_stage1 - 1];
-            for m in last_hf..n_total_markers {
-                prev_stage1_wt[m] = 1.0;
-            }
+            prev_stage1_wt[last_hf..].fill(1.0);
         }
 
         Self {
