@@ -193,13 +193,14 @@ impl MarkerAlignment {
 ///
 /// The HMM runs only on GENOTYPED markers (where target has data), matching
 /// Java Beagle's efficient approach. State probabilities for ungenotyped markers
-/// are computed via linear interpolation in genetic distance space.
+/// are computed via linear interpolation of ALLELE POSTERIORS (not state probs).
 ///
 /// This provides ~100x speedup over running HMM on all reference markers.
 ///
-/// **Important**: This structure stores `probs_p1` (probabilities at the next marker)
-/// to enable proper interpolation matching Java Beagle's approach. This ensures
-/// the **same** haplotype is used with smoothly transitioning probability weights.
+/// **Design Note**: We store allele posteriors (P(ALT)) at each genotyped marker,
+/// not state probabilities. This is because IBS state selection chooses DIFFERENT
+/// haplotypes at each genotyped marker, so state indices don't correspond across
+/// markers. Interpolating at the allele level avoids this mismatch.
 #[derive(Clone, Debug)]
 pub struct StateProbs {
     /// Indices of genotyped markers in reference space
@@ -209,9 +210,6 @@ pub struct StateProbs {
     hap_indices: Vec<Vec<u32>>,
     /// State probabilities at each genotyped marker
     probs: Vec<Vec<f32>>,
-    /// State probabilities at the **next** genotyped marker (for interpolation)
-    /// At the last marker, this equals probs (no next marker)
-    probs_p1: Vec<Vec<f32>>,
     /// Genetic positions of ALL reference markers (for interpolation)
     /// Uses Arc to share across all haplotypes (avoids cloning ~8MB per haplotype)
     gen_positions: std::sync::Arc<Vec<f64>>,
@@ -227,10 +225,12 @@ impl StateProbs {
     /// * `state_probs` - Flattened state probabilities from HMM (genotyped markers only)
     /// * `gen_positions` - Genetic positions of ALL reference markers
     ///
-    /// # Java Compatibility
-    /// Stores `probs_p1` (probability at next marker) to match Java Beagle's
-    /// `StateProbsFactory.stateProbs()` which stores both `probs[m]` and `probsP1[m]`
-    /// for proper interpolation of ungenotyped markers.
+    /// # Design
+    /// Stores state probabilities at each genotyped marker. For interpolation at
+    /// ungenotyped markers, we compute allele posteriors from BOTH adjacent genotyped
+    /// markers (using their respective haplotype sets) and interpolate by position.
+    /// This avoids the bug of mixing state indices across markers where IBS selection
+    /// chooses different haplotypes.
     pub fn new(
         genotyped_markers: std::sync::Arc<Vec<usize>>,
         n_states: usize,
@@ -238,46 +238,32 @@ impl StateProbs {
         state_probs: Vec<f32>,
         gen_positions: std::sync::Arc<Vec<f64>>,
     ) -> Self {
-        let threshold = 0.005f32.min(0.9999 / n_states as f32);
         let n_genotyped = genotyped_markers.len();
-        let n_genotyped_m1 = n_genotyped.saturating_sub(1);
 
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
-        let mut filtered_probs_p1 = Vec::with_capacity(n_genotyped);
 
+        // Keep ALL states - no filtering to avoid probability mass loss
         for sparse_m in 0..n_genotyped {
             let row_offset = sparse_m * n_states;
-            // For probs_p1, use next marker's probs, or same marker if at end
-            let sparse_m_p1 = if sparse_m < n_genotyped_m1 { sparse_m + 1 } else { sparse_m };
-            let row_offset_p1 = sparse_m_p1 * n_states;
 
             let mut haps = Vec::new();
             let mut probs = Vec::new();
-            let mut probs_p1 = Vec::new();
 
-            // Match Java: include state if prob at m OR prob at m+1 exceeds threshold
             for j in 0..n_states.min(hap_indices.get(sparse_m).map(|v| v.len()).unwrap_or(0)) {
                 let prob = state_probs.get(row_offset + j).copied().unwrap_or(0.0);
-                let prob_p1 = state_probs.get(row_offset_p1 + j).copied().unwrap_or(0.0);
-
-                if prob > threshold || prob_p1 > threshold {
-                    haps.push(hap_indices[sparse_m][j]);
-                    probs.push(prob);
-                    probs_p1.push(prob_p1);
-                }
+                haps.push(hap_indices[sparse_m][j]);
+                probs.push(prob);
             }
 
             filtered_haps.push(haps);
             filtered_probs.push(probs);
-            filtered_probs_p1.push(probs_p1);
         }
 
         Self {
             genotyped_markers,
             hap_indices: filtered_haps,
             probs: filtered_probs,
-            probs_p1: filtered_probs_p1,
             gen_positions,
         }
     }
@@ -338,6 +324,10 @@ impl StateProbs {
     }
 
     /// Per-allele probabilities at an ungenotyped marker via interpolation
+    ///
+    /// Computes allele posteriors at the ungenotyped marker using BOTH adjacent
+    /// genotyped markers' state sets, then interpolates the allele posteriors.
+    /// This avoids the bug of mixing state indices across markers.
     #[inline]
     fn posteriors_interpolated<F>(
         &self,
@@ -366,10 +356,11 @@ impl StateProbs {
             return self.posteriors_at_genotyped(n_genotyped - 1, ref_marker, n_alleles, get_ref_allele);
         }
 
-        // Interpolate using left marker's haplotypes
+        // Get adjacent genotyped marker indices
         let left_sparse = insert_pos - 1;
+        let right_sparse = insert_pos;
         let left_ref = self.genotyped_markers[left_sparse];
-        let right_ref = self.genotyped_markers[insert_pos];
+        let right_ref = self.genotyped_markers[right_sparse];
 
         let pos_left = self.gen_positions[left_ref];
         let pos_right = self.gen_positions[right_ref];
@@ -381,32 +372,64 @@ impl StateProbs {
         } else {
             0.5
         };
+        let weight_right = 1.0 - weight_left;
 
-        let haps = &self.hap_indices[left_sparse];
-        let probs = &self.probs[left_sparse];
-        let probs_p1 = &self.probs_p1[left_sparse];
+        // Compute allele posteriors from LEFT marker's states at the interpolated position
+        let haps_left = &self.hap_indices[left_sparse];
+        let probs_left = &self.probs[left_sparse];
+
+        // Compute allele posteriors from RIGHT marker's states at the interpolated position
+        let haps_right = &self.hap_indices[right_sparse];
+        let probs_right = &self.probs[right_sparse];
 
         if n_alleles == 2 {
-            // Optimized biallelic path
-            let mut p_alt = 0.0f32;
-            for (j, &hap) in haps.iter().enumerate() {
+            // Compute P(ALT at ref_marker) using left marker's states
+            let mut p_alt_left = 0.0f32;
+            for (j, &hap) in haps_left.iter().enumerate() {
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele == 1 {
-                    let interpolated_prob = weight_left * probs[j] + (1.0 - weight_left) * probs_p1[j];
-                    p_alt += interpolated_prob;
+                    p_alt_left += probs_left[j];
                 }
             }
+
+            // Compute P(ALT at ref_marker) using right marker's states
+            let mut p_alt_right = 0.0f32;
+            for (j, &hap) in haps_right.iter().enumerate() {
+                let allele = get_ref_allele(ref_marker, hap);
+                if allele == 1 {
+                    p_alt_right += probs_right[j];
+                }
+            }
+
+            // Interpolate the allele posteriors (not state probabilities!)
+            let p_alt = weight_left * p_alt_left + weight_right * p_alt_right;
             AllelePosteriors::Biallelic(p_alt)
         } else {
-            // Full multiallelic
-            let mut al_probs = vec![0.0f32; n_alleles];
-            for (j, &hap) in haps.iter().enumerate() {
+            // Compute allele posteriors from left marker's states
+            let mut al_probs_left = vec![0.0f32; n_alleles];
+            for (j, &hap) in haps_left.iter().enumerate() {
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele != 255 && (allele as usize) < n_alleles {
-                    let interpolated_prob = weight_left * probs[j] + (1.0 - weight_left) * probs_p1[j];
-                    al_probs[allele as usize] += interpolated_prob;
+                    al_probs_left[allele as usize] += probs_left[j];
                 }
             }
+
+            // Compute allele posteriors from right marker's states
+            let mut al_probs_right = vec![0.0f32; n_alleles];
+            for (j, &hap) in haps_right.iter().enumerate() {
+                let allele = get_ref_allele(ref_marker, hap);
+                if allele != 255 && (allele as usize) < n_alleles {
+                    al_probs_right[allele as usize] += probs_right[j];
+                }
+            }
+
+            // Interpolate the allele posteriors
+            let al_probs: Vec<f32> = al_probs_left
+                .iter()
+                .zip(al_probs_right.iter())
+                .map(|(&l, &r)| weight_left * l + weight_right * r)
+                .collect();
+
             AllelePosteriors::Multiallelic(al_probs)
         }
     }
@@ -1793,4 +1816,5 @@ mod tests {
             _ => panic!("Expected Biallelic"),
         }
     }
+
 }
