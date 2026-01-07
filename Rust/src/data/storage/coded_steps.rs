@@ -349,13 +349,28 @@ impl<'a> CodedPbwtView<'a> {
             return;
         }
 
-        // Step 1: Count frequency of each pattern
+        // Step 1: Count frequency of each pattern AND compute rank for virtual insertion
+        // Fused loop: count patterns while tracking rank up to virtual_pos
+        // This avoids a second O(N) scan for the rank calculation.
         counts.clear();
         counts.resize(n_patterns, 0);
+
+        // Extract virtual position info for fused computation
+        let (has_vpos, target_pattern, current_vpos) = match &virtual_pos {
+            Some((vpos, pattern)) => (true, *pattern as usize, (**vpos).min(n_haps)),
+            None => (false, 0, 0),
+        };
+        let mut rank_at_vpos = 0usize;
+
         for i in 0..n_haps {
             let hap = self.prefix[i];
             let pattern = step.pattern(HapIdx::new(hap)) as usize;
             if pattern < n_patterns {
+                // Track rank for virtual insertion (fused with counting)
+                // Rank = count of target_pattern haps in prefix[0..current_vpos]
+                if has_vpos && pattern == target_pattern && i < current_vpos {
+                    rank_at_vpos += 1;
+                }
                 counts[pattern] += 1;
             }
         }
@@ -370,18 +385,11 @@ impl<'a> CodedPbwtView<'a> {
         }
         offsets[n_patterns] = running;
 
-        // Step 2.5: Calculate new virtual position BEFORE prefix mutation (LF-mapping)
+        // Step 2.5: Apply LF-mapping for virtual insertion using pre-computed rank
         // u_{k+1} = Offset[c] + Rank(Prefix_k[0..u_k], c)
-        if let Some((vpos, target_pattern)) = virtual_pos {
-            let pattern_idx = target_pattern as usize;
-            if pattern_idx < offsets.len() {
-                // Count haps with target_pattern in prefix[0..current_vpos]
-                let current_vpos = (*vpos).min(n_haps);
-                let rank = self.prefix[..current_vpos]
-                    .iter()
-                    .filter(|&&hap| step.pattern(HapIdx::new(hap)) == target_pattern)
-                    .count();
-                *vpos = offsets[pattern_idx] + rank;
+        if let Some((vpos, _)) = virtual_pos {
+            if target_pattern < offsets.len() {
+                *vpos = offsets[target_pattern] + rank_at_vpos;
             }
         }
 
@@ -440,31 +448,36 @@ impl<'a> CodedPbwtView<'a> {
 
         let mut buckets: Vec<Vec<(u32, i32)>> = vec![Vec::new(); n_patterns.max(1)];
 
+        // Extract virtual position info for fused rank computation
+        let (vpos_ref, target_pattern, current_vpos) = match &virtual_pos {
+            Some((vpos, pattern)) => (true, *pattern as usize, (**vpos).min(n_haps)),
+            None => (false, 0, 0),
+        };
+        let mut rank_at_vpos = 0usize;
+
+        // Build buckets AND compute rank in single pass (fused loop)
         for i in 0..n_haps {
             let hap = self.prefix[i];
             let div = self.divergence[i];
             let pattern = step.pattern(HapIdx::new(hap)) as usize;
             if pattern < buckets.len() {
+                // Track rank for virtual insertion (fused with bucket building)
+                if vpos_ref && pattern == target_pattern && i < current_vpos {
+                    rank_at_vpos += 1;
+                }
                 buckets[pattern].push((hap, div));
             }
         }
 
-        // Calculate new virtual position BEFORE modifying prefix (LF-mapping)
-        if let Some((vpos, target_pattern)) = virtual_pos {
-            let pattern_idx = target_pattern as usize;
-            if pattern_idx < buckets.len() {
+        // Calculate new virtual position using pre-computed rank (LF-mapping)
+        if let Some((vpos, _)) = virtual_pos {
+            if target_pattern < buckets.len() {
                 // Compute offset for target pattern (sum of bucket sizes before it)
                 let mut pattern_offset = 0;
-                for bucket in buckets.iter().take(pattern_idx) {
+                for bucket in buckets.iter().take(target_pattern) {
                     pattern_offset += bucket.len();
                 }
-                // Rank = count of target_pattern haps before current vpos in OLD prefix
-                let current_vpos = (*vpos).min(n_haps);
-                let rank = self.prefix[..current_vpos]
-                    .iter()
-                    .filter(|&&hap| step.pattern(HapIdx::new(hap)) == target_pattern)
-                    .count();
-                *vpos = pattern_offset + rank;
+                *vpos = pattern_offset + rank_at_vpos;
             }
         }
 
