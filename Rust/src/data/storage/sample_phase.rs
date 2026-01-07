@@ -147,9 +147,7 @@ impl SamplePhase {
     pub fn swap_haps(&mut self, start: usize, end: usize) {
         for m in start..end {
             if self.status[m] == ClusterStatus::Unphased {
-                let tmp = self.hap1[m];
-                self.hap1[m] = self.hap2[m];
-                self.hap2[m] = tmp;
+                std::mem::swap(&mut self.hap1[m], &mut self.hap2[m]);
             }
         }
     }
@@ -157,9 +155,7 @@ impl SamplePhase {
     /// Swap alleles at a single marker unconditionally.
     #[inline]
     pub fn swap_alleles(&mut self, marker: usize) {
-        let tmp = self.hap1[marker];
-        self.hap1[marker] = self.hap2[marker];
-        self.hap2[marker] = tmp;
+        std::mem::swap(&mut self.hap1[marker], &mut self.hap2[marker]);
     }
 
     /// Mark a marker as phased.
