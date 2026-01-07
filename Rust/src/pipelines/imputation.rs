@@ -203,7 +203,8 @@ impl MarkerAlignment {
 #[derive(Clone, Debug)]
 pub struct StateProbs {
     /// Indices of genotyped markers in reference space
-    genotyped_markers: Vec<usize>,
+    /// Uses Arc to share across all haplotypes (avoids cloning per sample)
+    genotyped_markers: std::sync::Arc<Vec<usize>>,
     /// Reference haplotype indices at each genotyped marker
     hap_indices: Vec<Vec<u32>>,
     /// State probabilities at each genotyped marker
@@ -231,7 +232,7 @@ impl StateProbs {
     /// `StateProbsFactory.stateProbs()` which stores both `probs[m]` and `probsP1[m]`
     /// for proper interpolation of ungenotyped markers.
     pub fn new(
-        genotyped_markers: Vec<usize>,
+        genotyped_markers: std::sync::Arc<Vec<usize>>,
         n_states: usize,
         hap_indices: Vec<Vec<u32>>,
         state_probs: Vec<f32>,
@@ -566,9 +567,12 @@ impl ImputationPipeline {
 
         // Build genotyped markers list (reference markers that have target data)
         // This is the sparse set the HMM will run on
-        let genotyped_markers: Vec<usize> = (0..n_ref_markers)
-            .filter(|&m| alignment.is_genotyped(m))
-            .collect();
+        // Wrapped in Arc to share across all haplotypes without cloning
+        let genotyped_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(
+            (0..n_ref_markers)
+                .filter(|&m| alignment.is_genotyped(m))
+                .collect()
+        );
         let n_genotyped = genotyped_markers.len();
         let n_to_impute = n_ref_markers - n_genotyped;
         eprintln!(
@@ -670,11 +674,11 @@ impl ImputationPipeline {
 
                     // Create StateProbs with interpolation support
                     StateProbs::new(
-                        genotyped_markers.clone(),
+                        std::sync::Arc::clone(&genotyped_markers),
                         actual_n_states,
                         sparse_hap_indices,
                         hmm_state_probs,
-                        gen_positions.clone(),
+                        std::sync::Arc::clone(&gen_positions),
                     )
                 },
             )
