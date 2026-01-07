@@ -830,26 +830,13 @@ impl ImputationPipeline {
         // Genotyped markers for interpolation (still needed for StateProbs)
         let genotyped_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(genotyped_markers_vec.clone());
 
-        // Compute sparse recombination probabilities between CLUSTERS (not individual markers)
-        // Uses genetic distance between cluster midpoints
+        // Compute recombination probabilities for EACH genotyped marker
+        // Each marker i > 0 gets p_recomb based on genetic distance from marker i-1
         let sparse_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain(clusters.windows(2).map(|w| {
-                // Use midpoint of each cluster for recombination calculation
-                let mid1 = if w[0].end > w[0].start {
-                    (gen_positions[genotyped_markers[w[0].start]]
-                        + gen_positions[genotyped_markers[w[0].end - 1]])
-                        / 2.0
-                } else {
-                    gen_positions[genotyped_markers[w[0].start]]
-                };
-                let mid2 = if w[1].end > w[1].start {
-                    (gen_positions[genotyped_markers[w[1].start]]
-                        + gen_positions[genotyped_markers[w[1].end - 1]])
-                        / 2.0
-                } else {
-                    gen_positions[genotyped_markers[w[1].start]]
-                };
-                let gen_dist = mid2 - mid1;
+            .chain((1..n_genotyped).map(|i| {
+                let ref_m_prev = genotyped_markers[i - 1];
+                let ref_m = genotyped_markers[i];
+                let gen_dist = gen_positions[ref_m] - gen_positions[ref_m_prev];
                 self.params.p_recomb(gen_dist)
             }))
             .collect();

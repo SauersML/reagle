@@ -325,4 +325,58 @@ mod tests {
         // Should have replaced one of the original haps
         assert_eq!(ps.n_states(), 2);
     }
+
+    #[test]
+    fn test_composite_haps_have_multiple_segments() {
+        let mut ps = PhaseStates::new(2, 1000);
+
+        // Add haplotype 0 at marker 0
+        ps.add_ibs_hap(0, 0);
+
+        // Add haplotype 2 at marker 0 (second state)
+        ps.add_ibs_hap(2, 0);
+
+        // Now simulate IBS matches later that should cause segment changes
+        // After min_segment_len markers, a new IBS hap should replace a segment
+        // min_segment_len is approximately max(50, n_markers/100) = max(50, 10) = 50
+
+        // Add haplotype 10 repeatedly starting at marker 100
+        // This should eventually replace one of the original states' segments
+        for m in 100..300 {
+            ps.add_ibs_hap(10, m);
+        }
+
+        ps.finalize();
+
+        // Get the threaded_haps and check if any state has multiple segments
+        let th = &ps.threaded_haps;
+
+        // We should have 2 states
+        assert_eq!(th.n_states(), 2, "Should have exactly 2 states");
+
+        // Verify that at least one state has had a segment change by checking
+        // if the haplotype changes across markers
+        let mut found_segment_change = false;
+        let mut th_clone = th.clone();
+
+        for state in 0..th.n_states() {
+            th_clone.reset_cursors();
+            let hap_at_start = th_clone.hap_at_raw(state, 0);
+            let hap_at_middle = th_clone.hap_at_raw(state, 150);
+            let hap_at_end = th_clone.hap_at_raw(state, 999);
+
+            if hap_at_start != hap_at_middle || hap_at_middle != hap_at_end {
+                found_segment_change = true;
+                break;
+            }
+        }
+
+        assert!(
+            found_segment_change,
+            "CRITICAL: No segment changes detected! PhaseStates is NOT creating \
+             dynamic composite haplotypes. All states have the same haplotype \
+             from start to end, meaning we're back to static state selection. \
+             This defeats the purpose of the PhaseStates implementation."
+        );
+    }
 }
