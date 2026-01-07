@@ -2205,9 +2205,7 @@ fn strip_comments_and_strings_for_tokens(source: &str) -> Vec<u8> {
                     continue;
                 }
                 if let Some((hashes, consumed)) = raw_string_start(bytes, i) {
-                    for _ in 0..consumed {
-                        out.push(b' ');
-                    }
+                    out.extend(std::iter::repeat_n(b' ', consumed));
                     i += consumed;
                     state = State::RawString(hashes);
                     continue;
@@ -2314,10 +2312,8 @@ fn strip_comments_and_strings_for_tokens(source: &str) -> Vec<u8> {
                 if b == b'"' && raw_string_end(bytes, i, hashes) {
                     out.push(b' ');
                     i += 1;
-                    for _ in 0..hashes {
-                        out.push(b' ');
-                        i += 1;
-                    }
+                    out.extend(std::iter::repeat_n(b' ', hashes));
+                    i += hashes;
                     state = State::Normal;
                     continue;
                 }
@@ -2369,9 +2365,7 @@ fn strip_comments_and_strings_for_content(source: &str) -> Vec<u8> {
                     continue;
                 }
                 if let Some((hashes, consumed)) = raw_string_start(bytes, i) {
-                    for _ in 0..consumed {
-                        out.push(b'x');
-                    }
+                    out.extend(std::iter::repeat_n(b'x', consumed));
                     i += consumed;
                     state = State::RawString(hashes);
                     continue;
@@ -2478,10 +2472,8 @@ fn strip_comments_and_strings_for_content(source: &str) -> Vec<u8> {
                 if b == b'"' && raw_string_end(bytes, i, hashes) {
                     out.push(b'x');
                     i += 1;
-                    for _ in 0..hashes {
-                        out.push(b'x');
-                        i += 1;
-                    }
+                    out.extend(std::iter::repeat_n(b'x', hashes));
+                    i += hashes;
                     state = State::Normal;
                     continue;
                 }
