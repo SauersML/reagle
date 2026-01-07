@@ -132,13 +132,18 @@ impl<'a> ImpStates<'a> {
     /// for IBS matching, preventing degenerate state selection when the target
     /// is much sparser than the reference panel.
     ///
+    /// **Memory optimization:** Output arrays are sized for genotyped markers only,
+    /// not all reference markers. This reduces memory from O(n_ref_markers * n_states)
+    /// to O(n_genotyped_markers * n_states), typically 10-100x savings.
+    ///
     /// # Arguments
     /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
     /// * `target_alleles` - Target alleles in **reference marker space** (length = n_ref_markers)
     ///                      Use 255 for markers not genotyped in target
+    /// * `genotyped_markers` - Indices of genotyped markers in reference space (sparse subset)
     /// * `workspace` - Pre-allocated workspace buffers
-    /// * `hap_indices` - Output: reference haplotype indices at each marker
-    /// * `allele_match` - Output: whether each state matches target at each marker
+    /// * `hap_indices` - Output: reference haplotype indices at each GENOTYPED marker
+    /// * `allele_match` - Output: whether each state matches target at each GENOTYPED marker
     ///
     /// # Returns
     /// Number of states selected
@@ -146,6 +151,7 @@ impl<'a> ImpStates<'a> {
         &mut self,
         get_ref_allele: F,
         target_alleles: &[u8],
+        genotyped_markers: &[usize],
         workspace: &mut ImpWorkspace,
         hap_indices: &mut Vec<Vec<u32>>,
         allele_match: &mut Vec<Vec<bool>>,
@@ -286,11 +292,12 @@ impl<'a> ImpStates<'a> {
             self.fill_with_random_haps(target_hap);
         }
 
-        // Build output arrays
+        // Build output arrays for GENOTYPED markers only (memory optimization)
         let n_states = self.queue.len().min(self.max_states);
-        self.build_output(
+        self.build_output_sparse(
             get_ref_allele,
             target_alleles,
+            genotyped_markers,
             n_states,
             hap_indices,
             allele_match,
@@ -387,36 +394,43 @@ impl<'a> ImpStates<'a> {
         }
     }
 
-    fn build_output<F>(
+    /// Build output arrays for GENOTYPED markers only (memory-efficient sparse version)
+    ///
+    /// Instead of allocating for all n_ref_markers (potentially millions), this only
+    /// allocates for the genotyped markers (typically thousands), reducing memory by 10-100x.
+    fn build_output_sparse<F>(
         &mut self,
         get_ref_allele: F,
         target_alleles: &[u8],
+        genotyped_markers: &[usize],
         n_states: usize,
         hap_indices: &mut Vec<Vec<u32>>,
         allele_match: &mut Vec<Vec<bool>>,
     ) where
         F: Fn(usize, u32) -> u8,
     {
+        let n_genotyped = genotyped_markers.len();
+
+        // Allocate only for genotyped markers, not all reference markers
         hap_indices.clear();
-        hap_indices.resize(self.n_ref_markers, vec![0; n_states]);
+        hap_indices.resize(n_genotyped, vec![0; n_states]);
         allele_match.clear();
-        allele_match.resize(self.n_ref_markers, vec![false; n_states]);
+        allele_match.resize(n_genotyped, vec![false; n_states]);
 
         self.threaded_haps.reset_cursors();
 
-        for m in 0..self.n_ref_markers {
-            let target_allele = target_alleles.get(m).copied().unwrap_or(255);
+        // Process only genotyped markers
+        for (sparse_idx, &ref_m) in genotyped_markers.iter().enumerate() {
+            let target_allele = target_alleles.get(ref_m).copied().unwrap_or(255);
 
             for (j, entry) in self.queue.iter().take(n_states).enumerate() {
                 if entry.comp_hap_idx < self.threaded_haps.n_states() {
-                    let hap = self.threaded_haps.hap_at_raw(entry.comp_hap_idx, m);
-                    hap_indices[m][j] = hap;
+                    let hap = self.threaded_haps.hap_at_raw(entry.comp_hap_idx, ref_m);
+                    hap_indices[sparse_idx][j] = hap;
 
-                    let ref_allele = get_ref_allele(m, hap);
+                    let ref_allele = get_ref_allele(ref_m, hap);
                     // For missing target alleles (255), treat as mismatch (matches Java behavior)
-                    // In Java, targAllele=-1 won't match refAllele=0 or 1
-                    // For present target alleles, check exact match
-                    allele_match[m][j] = target_allele != 255 && ref_allele == target_allele;
+                    allele_match[sparse_idx][j] = target_allele != 255 && ref_allele == target_allele;
                 }
             }
         }

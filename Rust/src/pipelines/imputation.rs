@@ -282,60 +282,70 @@ impl StateProbs {
         }
     }
 
-    /// Compute dosage at a reference marker with interpolation for ungenotyped markers.
-    ///
-    /// For genotyped markers: direct lookup of HMM posterior probabilities.
-    /// For ungenotyped markers: linear interpolation in genetic distance space
-    /// between flanking genotyped markers, matching Java Beagle's approach.
+    /// Compute per-allele probabilities at a reference marker.
+    /// Returns optimized representation: Biallelic for 2-allele sites, Multiallelic for others.
     #[inline]
-    pub fn dosage<F>(&self, ref_marker: usize, get_ref_allele: F) -> f32
+    pub fn allele_posteriors<F>(&self, ref_marker: usize, n_alleles: usize, get_ref_allele: F) -> AllelePosteriors
     where
         F: Fn(usize, u32) -> u8,
     {
-        // Binary search to find position in genotyped markers
         match self.genotyped_markers.binary_search(&ref_marker) {
             Ok(sparse_idx) => {
-                // Exact match - this is a genotyped marker
-                self.dosage_at_genotyped(sparse_idx, ref_marker, &get_ref_allele)
+                self.posteriors_at_genotyped(sparse_idx, ref_marker, n_alleles, &get_ref_allele)
             }
             Err(insert_pos) => {
-                // Not genotyped - interpolate between flanking genotyped markers
-                self.dosage_interpolated(ref_marker, insert_pos, &get_ref_allele)
+                self.posteriors_interpolated(ref_marker, insert_pos, n_alleles, &get_ref_allele)
             }
         }
     }
 
-    /// Compute dosage at a genotyped marker (direct lookup)
+    /// Per-allele probabilities at a genotyped marker
     #[inline]
-    fn dosage_at_genotyped<F>(&self, sparse_idx: usize, ref_marker: usize, get_ref_allele: &F) -> f32
+    fn posteriors_at_genotyped<F>(
+        &self,
+        sparse_idx: usize,
+        ref_marker: usize,
+        n_alleles: usize,
+        get_ref_allele: &F,
+    ) -> AllelePosteriors
     where
         F: Fn(usize, u32) -> u8,
     {
         let haps = &self.hap_indices[sparse_idx];
         let probs = &self.probs[sparse_idx];
 
-        let mut dosage = 0.0f32;
-        for (j, &hap) in haps.iter().enumerate() {
-            let allele = get_ref_allele(ref_marker, hap);
-            if allele != 255 {
-                dosage += probs[j] * allele as f32;
+        if n_alleles == 2 {
+            // Optimized biallelic path - just compute P(ALT)
+            let mut p_alt = 0.0f32;
+            for (j, &hap) in haps.iter().enumerate() {
+                let allele = get_ref_allele(ref_marker, hap);
+                if allele == 1 {
+                    p_alt += probs[j];
+                }
             }
+            AllelePosteriors::Biallelic(p_alt)
+        } else {
+            // Full multiallelic - compute PMF
+            let mut al_probs = vec![0.0f32; n_alleles];
+            for (j, &hap) in haps.iter().enumerate() {
+                let allele = get_ref_allele(ref_marker, hap);
+                if allele != 255 && (allele as usize) < n_alleles {
+                    al_probs[allele as usize] += probs[j];
+                }
+            }
+            AllelePosteriors::Multiallelic(al_probs)
         }
-        dosage
     }
 
-    /// Compute dosage at an ungenotyped marker via interpolation
-    ///
-    /// # Java Compatibility
-    /// Matches Java Beagle's `ImputedVcfWriter.setAlProbs()`:
-    /// - Uses the **same** haplotypes from the left flanking marker
-    /// - Interpolates **probability weights** using `probs` and `probs_p1`
-    /// - Formula: `allele * (wt * prob + (1-wt) * probP1)`
-    ///
-    /// This ensures smooth probability transitions across marker boundaries,
-    /// maintaining calibration and avoiding discontinuities from switching haplotype sets.
+    /// Per-allele probabilities at an ungenotyped marker via interpolation
     #[inline]
-    fn dosage_interpolated<F>(&self, ref_marker: usize, insert_pos: usize, get_ref_allele: &F) -> f32
+    fn posteriors_interpolated<F>(
+        &self,
+        ref_marker: usize,
+        insert_pos: usize,
+        n_alleles: usize,
+        get_ref_allele: &F,
+    ) -> AllelePosteriors
     where
         F: Fn(usize, u32) -> u8,
     {
@@ -343,27 +353,24 @@ impl StateProbs {
 
         // Handle edge cases
         if n_genotyped == 0 {
-            return 0.0;
+            return if n_alleles == 2 {
+                AllelePosteriors::Biallelic(0.0)
+            } else {
+                AllelePosteriors::Multiallelic(vec![0.0f32; n_alleles])
+            };
         }
         if insert_pos == 0 {
-            // Before first genotyped marker - use first marker's probs
-            return self.dosage_at_genotyped(0, ref_marker, get_ref_allele);
+            return self.posteriors_at_genotyped(0, ref_marker, n_alleles, get_ref_allele);
         }
         if insert_pos >= n_genotyped {
-            // After last genotyped marker - use last marker's probs
-            return self.dosage_at_genotyped(n_genotyped - 1, ref_marker, get_ref_allele);
+            return self.posteriors_at_genotyped(n_genotyped - 1, ref_marker, n_alleles, get_ref_allele);
         }
 
-        // Use left marker's haplotypes with interpolated probabilities
-        // This matches Java's approach of using the same haplotype set
-        // with smoothly transitioning probability weights
+        // Interpolate using left marker's haplotypes
         let left_sparse = insert_pos - 1;
         let left_ref = self.genotyped_markers[left_sparse];
         let right_ref = self.genotyped_markers[insert_pos];
 
-        // Compute interpolation weight based on genetic distance
-        // Java: wt = (cumPos[nextStart] - cumPos[m]) / (cumPos[nextStart] - cumPos[end-1])
-        // This gives wt=1.0 at left marker (use probs), wt=0.0 at right marker (use probs_p1)
         let pos_left = self.gen_positions[left_ref];
         let pos_right = self.gen_positions[right_ref];
         let pos_marker = self.gen_positions[ref_marker];
@@ -372,26 +379,88 @@ impl StateProbs {
         let weight_left = if total_dist > 1e-10 {
             ((pos_right - pos_marker) / total_dist) as f32
         } else {
-            0.5 // Equal weight if markers are at same position
+            0.5
         };
 
-        // Compute dosage using the SAME haplotypes from left marker
-        // with interpolated probability weights
         let haps = &self.hap_indices[left_sparse];
         let probs = &self.probs[left_sparse];
         let probs_p1 = &self.probs_p1[left_sparse];
 
-        let mut dosage = 0.0f32;
-        for (j, &hap) in haps.iter().enumerate() {
-            let allele = get_ref_allele(ref_marker, hap);
-            if allele != 255 {
-                // Interpolate probability: wt*prob + (1-wt)*probP1
-                let interpolated_prob = weight_left * probs[j] + (1.0 - weight_left) * probs_p1[j];
-                dosage += interpolated_prob * allele as f32;
+        if n_alleles == 2 {
+            // Optimized biallelic path
+            let mut p_alt = 0.0f32;
+            for (j, &hap) in haps.iter().enumerate() {
+                let allele = get_ref_allele(ref_marker, hap);
+                if allele == 1 {
+                    let interpolated_prob = weight_left * probs[j] + (1.0 - weight_left) * probs_p1[j];
+                    p_alt += interpolated_prob;
+                }
+            }
+            AllelePosteriors::Biallelic(p_alt)
+        } else {
+            // Full multiallelic
+            let mut al_probs = vec![0.0f32; n_alleles];
+            for (j, &hap) in haps.iter().enumerate() {
+                let allele = get_ref_allele(ref_marker, hap);
+                if allele != 255 && (allele as usize) < n_alleles {
+                    let interpolated_prob = weight_left * probs[j] + (1.0 - weight_left) * probs_p1[j];
+                    al_probs[allele as usize] += interpolated_prob;
+                }
+            }
+            AllelePosteriors::Multiallelic(al_probs)
+        }
+    }
+}
+
+/// Per-haplotype allele posterior probabilities.
+/// Optimized: uses compact representation for biallelic (99% of sites).
+#[derive(Clone, Debug)]
+pub enum AllelePosteriors {
+    /// Biallelic site: just store P(ALT)
+    Biallelic(f32),
+    /// Multiallelic site: full PMF where index i = P(allele i)
+    Multiallelic(Vec<f32>),
+}
+
+impl AllelePosteriors {
+    /// Get P(allele i)
+    #[inline]
+    pub fn prob(&self, allele: usize) -> f32 {
+        match self {
+            AllelePosteriors::Biallelic(p_alt) => {
+                if allele == 0 { 1.0 - p_alt } else if allele == 1 { *p_alt } else { 0.0 }
+            }
+            AllelePosteriors::Multiallelic(probs) => {
+                probs.get(allele).copied().unwrap_or(0.0)
             }
         }
-        dosage
     }
+
+    /// Compute dosage = expected allele index = sum(i * P(i))
+    #[inline]
+    pub fn dosage(&self) -> f32 {
+        match self {
+            AllelePosteriors::Biallelic(p_alt) => *p_alt,
+            AllelePosteriors::Multiallelic(probs) => {
+                probs.iter().enumerate().map(|(i, &p)| i as f32 * p).sum()
+            }
+        }
+    }
+
+    /// Get the most likely allele (argmax)
+    #[inline]
+    pub fn max_allele(&self) -> u8 {
+        match self {
+            AllelePosteriors::Biallelic(p_alt) => if *p_alt >= 0.5 { 1 } else { 0 },
+            AllelePosteriors::Multiallelic(probs) => {
+                probs.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u8)
+                    .unwrap_or(0)
+            }
+        }
+    }
+
 }
 
 impl ImputationPipeline {
@@ -637,26 +706,21 @@ impl ImputationPipeline {
                         ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
 
-                    // Get IBS-based states (runs on all ref markers for state selection)
-                    let mut full_hap_indices: Vec<Vec<u32>> = Vec::new();
-                    let mut full_allele_match: Vec<Vec<bool>> = Vec::new();
+                    // Get IBS-based states with SPARSE output (genotyped markers only)
+                    // Memory optimization: allocates O(n_genotyped * n_states) instead of
+                    // O(n_ref_markers * n_states), typically 10-100x memory savings
+                    let mut sparse_hap_indices: Vec<Vec<u32>> = Vec::new();
+                    let mut sparse_allele_match: Vec<Vec<bool>> = Vec::new();
                     let actual_n_states = imp_states.ibs_states(
                         get_ref_allele,
                         &target_alleles,
+                        &genotyped_markers,
                         workspace,
-                        &mut full_hap_indices,
-                        &mut full_allele_match,
+                        &mut sparse_hap_indices,
+                        &mut sparse_allele_match,
                     );
 
-                    // Extract sparse data for genotyped markers only
-                    let sparse_hap_indices: Vec<Vec<u32>> = genotyped_markers
-                        .iter()
-                        .map(|&m| full_hap_indices.get(m).cloned().unwrap_or_default())
-                        .collect();
-                    let sparse_allele_match: Vec<Vec<bool>> = genotyped_markers
-                        .iter()
-                        .map(|&m| full_allele_match.get(m).cloned().unwrap_or_default())
-                        .collect();
+                    // Extract sparse target alleles for HMM
                     let sparse_target_alleles: Vec<u8> = genotyped_markers
                         .iter()
                         .map(|&m| target_alleles[m])
@@ -705,18 +769,19 @@ impl ImputationPipeline {
         let need_allele_probs = self.config.ap || self.config.gp;
 
         // Compute dosages per sample (parallel, no locks)
-        // Each sample returns: (dosages, allele_probs, quality_contributions)
-        // where quality_contributions = Vec<(marker_idx, probs1, probs2)> for biallelic sites
+        // Each sample returns: (dosages, allele_posteriors, quality_contributions)
+        // Uses optimized AllelePosteriors enum (compact for biallelic, full for multiallelic)
         type QualityContrib = (usize, [f32; 2], [f32; 2]); // (marker, probs1, probs2)
-        let sample_results: Vec<(Vec<f32>, Option<Vec<f32>>, Vec<QualityContrib>)> = (0..n_target_samples)
+        type HapPosteriors = Vec<(AllelePosteriors, AllelePosteriors)>; // [marker] -> (hap1, hap2)
+        let sample_results: Vec<(Vec<f32>, Option<HapPosteriors>, Vec<QualityContrib>)> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
                 let hap1_probs = &state_probs[s * 2];
                 let hap2_probs = &state_probs[s * 2 + 1];
 
                 let mut dosages: Vec<f32> = Vec::with_capacity(n_ref_markers);
-                let mut allele_probs: Option<Vec<f32>> = if need_allele_probs {
-                    Some(Vec::with_capacity(n_ref_markers * 2))
+                let mut posteriors: Option<HapPosteriors> = if need_allele_probs {
+                    Some(Vec::with_capacity(n_ref_markers))
                 } else {
                     None
                 };
@@ -727,25 +792,30 @@ impl ImputationPipeline {
                         ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
 
-                    let d1 = hap1_probs.dosage(m, &get_ref_allele);
-                    let d2 = hap2_probs.dosage(m, &get_ref_allele);
-
-                    // For biallelic sites, record contributions for DR2 calculation
                     let n_alleles = n_alleles_per_marker[m];
-                    if n_alleles == 2 {
-                        quality_contribs.push((m, [1.0 - d1, d1], [1.0 - d2, d2]));
-                    }
 
+                    // Compute per-allele posteriors (optimized enum)
+                    let post1 = hap1_probs.allele_posteriors(m, n_alleles, &get_ref_allele);
+                    let post2 = hap2_probs.allele_posteriors(m, n_alleles, &get_ref_allele);
+
+                    // Dosage = expected ALT allele count for both haplotypes
+                    let d1 = post1.dosage();
+                    let d2 = post2.dosage();
                     dosages.push(d1 + d2);
 
-                    // Store per-haplotype allele probabilities if needed
-                    if let Some(ref mut ap) = allele_probs {
-                        ap.push(d1); // P(ALT) for hap1
-                        ap.push(d2); // P(ALT) for hap2
+                    // Record contributions for DR2 calculation (all sites)
+                    quality_contribs.push((m,
+                        [post1.prob(0), post1.prob(1)],
+                        [post2.prob(0), post2.prob(1)]
+                    ));
+
+                    // Store posteriors if needed for output
+                    if let Some(ref mut p) = posteriors {
+                        p.push((post1, post2));
                     }
                 }
 
-                (dosages, allele_probs, quality_contribs)
+                (dosages, posteriors, quality_contribs)
             })
             .collect();
 
@@ -767,25 +837,23 @@ impl ImputationPipeline {
             }
         }
 
-        // Flatten allele probabilities if needed
-        // Layout: [marker][sample*2 + hap_offset] -> P(ALT) for that haplotype
-        let flat_allele_probs: Option<Vec<f32>> = if need_allele_probs {
-            let mut probs = Vec::with_capacity(n_ref_markers * n_target_samples * 2);
+        // Reorganize posteriors if needed: [marker][sample] -> (hap1_posteriors, hap2_posteriors)
+        // Uses references to avoid cloning the AllelePosteriors enums
+        let posteriors_by_marker: Option<Vec<Vec<(&AllelePosteriors, &AllelePosteriors)>>> = if need_allele_probs {
+            let mut marker_posts = Vec::with_capacity(n_ref_markers);
             for m in 0..n_ref_markers {
+                let mut sample_posts = Vec::with_capacity(n_target_samples);
                 for s in 0..n_target_samples {
-                    if let Some(ref ap) = sample_results[s].1 {
-                        probs.push(ap[m * 2]);     // hap1
-                        probs.push(ap[m * 2 + 1]); // hap2
+                    if let Some(ref posts) = sample_results[s].1 {
+                        sample_posts.push((&posts[m].0, &posts[m].1));
                     }
                 }
+                marker_posts.push(sample_posts);
             }
-            Some(probs)
+            Some(marker_posts)
         } else {
             None
         };
-
-
-        // quality is already owned - no mutex unwrapping needed
 
         // Write output with quality metrics
         let output_path = self.config.out.with_extension("vcf.gz");
@@ -795,10 +863,10 @@ impl ImputationPipeline {
 
         // Use appropriate writer method based on AP/GP flags
         if need_allele_probs {
-            writer.write_imputed_with_probs(
+            writer.write_imputed_with_posteriors(
                 &ref_gt,
                 &flat_dosages,
-                flat_allele_probs.as_deref(),
+                posteriors_by_marker.as_ref(),
                 &quality,
                 0,
                 n_ref_markers,

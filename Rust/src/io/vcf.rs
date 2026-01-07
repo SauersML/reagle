@@ -854,22 +854,22 @@ impl VcfWriter {
     }
 
     /// Write imputed genotypes with GP (genotype probabilities) and/or AP (allele probabilities)
+    /// using optimized AllelePosteriors enum for proper multiallelic support.
     ///
     /// # Arguments
     /// * `matrix` - Genotype matrix with imputed alleles
     /// * `dosages` - Flattened dosage array [marker][sample]
-    /// * `allele_probs` - Per-haplotype allele probabilities (optional, for AP output)
-    ///                    Layout: [marker][sample*2 + hap_offset] -> probability of ALT
+    /// * `posteriors` - Per-allele posteriors: [marker][sample] -> (&AllelePosteriors, &AllelePosteriors)
     /// * `quality` - Per-marker imputation quality statistics
     /// * `start` - Start marker index (inclusive)
     /// * `end` - End marker index (exclusive)
-    /// * `include_gp` - Include GP field (genotype probabilities P(0/0), P(0/1), P(1/1))
+    /// * `include_gp` - Include GP field (genotype probabilities)
     /// * `include_ap` - Include AP1/AP2 fields (per-haplotype allele probabilities)
-    pub fn write_imputed_with_probs<S: PhaseState>(
+    pub fn write_imputed_with_posteriors<S: PhaseState>(
         &mut self,
         matrix: &GenotypeMatrix<S>,
         dosages: &[f32],
-        allele_probs: Option<&[f32]>,
+        posteriors: Option<&Vec<Vec<(&crate::pipelines::imputation::AllelePosteriors, &crate::pipelines::imputation::AllelePosteriors)>>>,
         quality: &ImputationQuality,
         start: usize,
         end: usize,
@@ -878,23 +878,23 @@ impl VcfWriter {
     ) -> Result<()> {
         let n_samples = self.samples.len();
 
-        // Build FORMAT string based on which fields are requested
-        let format_str = {
-            let mut parts = vec!["GT", "DS"];
-            if include_gp {
-                parts.push("GP");
-            }
-            if include_ap {
-                parts.push("AP1");
-                parts.push("AP2");
-            }
-            parts.join(":")
-        };
-
         for (local_m, m) in (start..end).enumerate() {
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = matrix.marker(marker_idx);
             let n_alleles = 1 + marker.alt_alleles.len();
+
+            // Build FORMAT string
+            let format_str = {
+                let mut parts = vec!["GT", "DS"];
+                if include_gp {
+                    parts.push("GP");
+                }
+                if include_ap {
+                    parts.push("AP1");
+                    parts.push("AP2");
+                }
+                parts.join(":")
+            };
 
             // Get quality stats for this marker
             let stats = quality.get(m);
@@ -952,44 +952,71 @@ impl VcfWriter {
                 let ds_idx = local_m * n_samples + s;
                 let ds = dosages.get(ds_idx).copied().unwrap_or(0.0);
 
-                // Allele probabilities (probability of ALT for each haplotype)
-                // Compute these FIRST so GT can be derived from them (preserves haplotype independence)
-                let (ap1, ap2) = if let Some(probs) = allele_probs {
-                    let hap1_idx = local_m * n_samples * 2 + s * 2;
-                    let hap2_idx = hap1_idx + 1;
-                    let p1 = probs.get(hap1_idx).copied().unwrap_or(ds / 2.0);
-                    let p2 = probs.get(hap2_idx).copied().unwrap_or(ds / 2.0);
-                    (p1, p2)
+                // Get posteriors for this sample
+                let (post1, post2) = if let Some(all_posts) = posteriors {
+                    if let Some(&(p1, p2)) = all_posts.get(local_m).and_then(|mp| mp.get(s)) {
+                        (Some(p1), Some(p2))
+                    } else {
+                        (None, None)
+                    }
                 } else {
-                    // If no probabilities provided, assume equal contribution from each hap
-                    (ds / 2.0, ds / 2.0)
+                    (None, None)
                 };
 
-                // GT: Derive from per-haplotype probabilities when available (preserves independence)
-                // Falls back to dosage-based derivation only when no per-hap probs exist
-                let (a1, a2) = if allele_probs.is_some() {
-                    gt_from_haplotype_probs(ap1, ap2)
-                } else {
-                    gt_from_dosage(ds)
-                };
+                // GT: Find most likely allele for each haplotype
+                let a1 = post1.map(|p| p.max_allele()).unwrap_or(0);
+                let a2 = post2.map(|p| p.max_allele()).unwrap_or(0);
 
                 // Start building sample field
                 write!(self.writer, "\t{}|{}:{:.2}", a1, a2, ds)?;
 
-                // GP: Genotype probabilities P(0/0), P(0/1), P(1/1)
-                // Calculated from allele probabilities assuming independence
+                // GP: Genotype probabilities - N*(N+1)/2 values per VCF spec
                 if include_gp {
-                    let p_ref1 = 1.0 - ap1;
-                    let p_ref2 = 1.0 - ap2;
-                    let gp00 = p_ref1 * p_ref2;           // P(both REF)
-                    let gp01 = p_ref1 * ap2 + ap1 * p_ref2; // P(het)
-                    let gp11 = ap1 * ap2;                  // P(both ALT)
-                    write!(self.writer, ":{:.2},{:.2},{:.2}", gp00, gp01, gp11)?;
+                    if let (Some(p1), Some(p2)) = (post1, post2) {
+                        write!(self.writer, ":")?;
+                        let mut first = true;
+                        for i2 in 0..n_alleles {
+                            for i1 in 0..=i2 {
+                                if !first { write!(self.writer, ",")?; }
+                                first = false;
+                                // P(genotype i1/i2) = P(hap1=i1)*P(hap2=i2) + P(hap1=i2)*P(hap2=i1) if i1!=i2
+                                let prob = if i1 == i2 {
+                                    p1.prob(i1) * p2.prob(i2)
+                                } else {
+                                    p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1)
+                                };
+                                write!(self.writer, "{:.2}", prob)?;
+                            }
+                        }
+                    } else {
+                        // Fallback: output zeros
+                        let n_gp = n_alleles * (n_alleles + 1) / 2;
+                        write!(self.writer, ":{}", vec!["0.00"; n_gp].join(","))?;
+                    }
                 }
 
-                // AP1, AP2: Per-haplotype allele probabilities
+                // AP1, AP2: Per-haplotype per-allele probabilities (ALT alleles only per VCF spec)
                 if include_ap {
-                    write!(self.writer, ":{:.2}:{:.2}", ap1, ap2)?;
+                    // AP1: probabilities for haplotype 1 (each ALT allele)
+                    write!(self.writer, ":")?;
+                    if let Some(p1) = post1 {
+                        let ap1_str: Vec<String> = (1..n_alleles)
+                            .map(|a| format!("{:.2}", p1.prob(a)))
+                            .collect();
+                        write!(self.writer, "{}", if ap1_str.is_empty() { "0.00".to_string() } else { ap1_str.join(",") })?;
+                    } else {
+                        write!(self.writer, "{}", vec!["0.00"; n_alleles.saturating_sub(1).max(1)].join(","))?;
+                    }
+                    // AP2: probabilities for haplotype 2
+                    write!(self.writer, ":")?;
+                    if let Some(p2) = post2 {
+                        let ap2_str: Vec<String> = (1..n_alleles)
+                            .map(|a| format!("{:.2}", p2.prob(a)))
+                            .collect();
+                        write!(self.writer, "{}", if ap2_str.is_empty() { "0.00".to_string() } else { ap2_str.join(",") })?;
+                    } else {
+                        write!(self.writer, "{}", vec!["0.00"; n_alleles.saturating_sub(1).max(1)].join(","))?;
+                    }
                 }
             }
             writeln!(self.writer)?;
@@ -1028,15 +1055,6 @@ fn gt_from_dosage(ds: f32) -> (u8, u8) {
     }
 }
 
-/// Derives GT from per-haplotype allele probabilities (preserves haplotype independence)
-/// Returns (a1, a2) where a1 = max-likelihood allele for haplotype 1, a2 = for haplotype 2
-#[inline]
-fn gt_from_haplotype_probs(ap1: f32, ap2: f32) -> (u8, u8) {
-    // Each haplotype independently: ALT if P(ALT) >= 0.5, else REF
-    let a1 = if ap1 >= 0.5 { 1 } else { 0 };
-    let a2 = if ap2 >= 0.5 { 1 } else { 0 };
-    (a1, a2)
-}
 
 #[cfg(test)]
 mod tests {
