@@ -303,12 +303,16 @@ impl<'a> BeagleHmm<'a> {
             let row_offset = m * n_states;
 
             if m == 0 {
-                // Initialize
+                // Initialize: following Java ImpLSBaum, m=0 uses just emission probs
+                // The 1/n_states factor is a normalization convention; what matters is
+                // that fwd_sum is the actual sum for correct scaling at marker 1.
                 let init_val = 1.0 / n_states as f32;
+                fwd_sum = 0.0;
                 for k in 0..n_states {
-                    fwd[row_offset + k] = init_val * emit_probs[mismatches[k] as usize];
+                    let val = init_val * emit_probs[mismatches[k] as usize];
+                    fwd[row_offset + k] = val;
+                    fwd_sum += val;
                 }
-                fwd_sum = 1.0;
             } else {
                 // Li-Stephens HMM transition update:
                 //   fwd[k] = emit[k] * ((1-ρ)/Σfwd * fwd[k] + ρ/K)
