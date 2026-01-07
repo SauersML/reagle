@@ -1945,9 +1945,12 @@ impl PhasingPipeline {
             self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps, Some(&stage1_gen_positions))
         };
 
-        // Collect phase decisions per sample using correct per-het algorithm
-        // Returns: Vec of (hi_freq_idx, should_swap) for each sample
-        let phase_decisions: Vec<Vec<(usize, bool, f32)>> = sample_phases
+        // Collect phase decisions per sample using correct per-het algorithm.
+        // Returns: (swap_mask, het_lr_values) per sample where:
+        //   - swap_mask[i] = true if hi_freq marker i should be swapped (derived by comparing
+        //     final working sequences to originals, capturing cumulative effect of all swaps)
+        //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
+        let phase_decisions: Vec<(Vec<bool>, Vec<(usize, f32)>)> = sample_phases
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
@@ -1986,7 +1989,8 @@ impl PhasingPipeline {
                     .collect();
 
                 if het_positions.is_empty() {
-                    return Vec::new();
+                    // No hets to phase: no swaps needed, no LR values
+                    return (vec![false; n_hi_freq], Vec::new());
                 }
 
                 let p_err = self.params.p_mismatch;
@@ -2257,7 +2261,22 @@ impl PhasingPipeline {
                     }
                 }
 
-                decisions
+                // Compute swap mask by comparing final working sequences to originals.
+                // This correctly captures the cumulative effect: when the HMM decides to swap
+                // at het i, it swaps seq_working from i to end. A subsequent "keep" at het j
+                // means "keep the current (already-swapped) orientation", so markers between
+                // i and j remain swapped. Comparing to originals captures this.
+                let swap_mask: Vec<bool> = (0..n_hi_freq)
+                    .map(|i| seq1_working[i] != seq1[i])
+                    .collect();
+
+                // Extract just (position, LR) for het phased-marking threshold checks
+                let het_lr_values: Vec<(usize, f32)> = decisions
+                    .into_iter()
+                    .map(|(idx, _, lr)| (idx, lr))
+                    .collect();
+
+                (swap_mask, het_lr_values)
             })
             .collect();
 
@@ -2269,25 +2288,26 @@ impl PhasingPipeline {
         let is_burnin = iteration < self.config.burnin;
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, decisions) in phase_decisions.into_iter().enumerate() {
+        for (s, (swap_mask, het_lr_values)) in phase_decisions.into_iter().enumerate() {
             let sp = &mut sample_phases[s];
 
-            for (hi_freq_idx, should_swap, lr) in decisions {
-                let m = hi_freq_to_orig[hi_freq_idx];
-
-                // Apply swap if needed
+            // Apply swaps using the mask (correctly handles cumulative swap propagation)
+            for (hi_freq_idx, should_swap) in swap_mask.into_iter().enumerate() {
                 if should_swap {
+                    let m = hi_freq_to_orig[hi_freq_idx];
                     sp.swap_alleles(m);
                     total_switches += 1;
                 }
+            }
 
-                // Only mark as phased if:
-                // 1. Not in burn-in, AND
-                // 2. Likelihood ratio exceeds threshold
-                // This matches Java Beagle's PhaseBaum2.phaseHet behavior
-                if !is_burnin && lr >= lr_threshold {
-                    sp.mark_phased(m);
-                    total_phased += 1;
+            // Mark hets as phased if LR exceeds threshold (independent of swap decision)
+            if !is_burnin {
+                for (hi_freq_idx, lr) in het_lr_values {
+                    if lr >= lr_threshold {
+                        let m = hi_freq_to_orig[hi_freq_idx];
+                        sp.mark_phased(m);
+                        total_phased += 1;
+                    }
                 }
             }
         }
