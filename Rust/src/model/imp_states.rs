@@ -93,8 +93,6 @@ pub struct ImpStates<'a> {
     n_ref_haps: usize,
     /// Number of IBS haplotypes to find per step
     n_ibs_haps: usize,
-    /// Random seed for reproducibility
-    seed: u64,
 }
 
 impl<'a> ImpStates<'a> {
@@ -105,13 +103,11 @@ impl<'a> ImpStates<'a> {
     /// * `n_ref_haps` - Number of reference haplotypes (excludes appended target haplotypes)
     /// * `max_states` - Maximum number of HMM states to track
     /// * `n_ibs_haps` - Number of IBS haplotypes to find per step
-    /// * `seed` - Random seed for reproducibility
     pub fn new(
         ref_panel: &'a RefPanelCoded,
         n_ref_haps: usize,
         max_states: usize,
         n_ibs_haps: usize,
-        seed: u64,
     ) -> Self {
         let n_ref_markers = ref_panel.n_markers();
 
@@ -124,7 +120,6 @@ impl<'a> ImpStates<'a> {
             n_ref_markers,
             n_ref_haps,
             n_ibs_haps,
-            seed,
         }
     }
 
@@ -285,8 +280,10 @@ impl<'a> ImpStates<'a> {
         }
 
         // If queue is empty, fill with random haplotypes
+        // Use hash of target alleles as target_hap seed for reproducibility
         if self.queue.is_empty() {
-            self.fill_with_random_haps();
+            let target_hap = target_alleles.iter().fold(0u32, |acc, &a| acc.wrapping_mul(31).wrapping_add(a as u32));
+            self.fill_with_random_haps(target_hap);
         }
 
         // Build output arrays
@@ -363,26 +360,30 @@ impl<'a> ImpStates<'a> {
         }
     }
 
-    fn fill_with_random_haps(&mut self) {
+    fn fill_with_random_haps(&mut self, target_hap_hash: u32) {
         use rand::rngs::StdRng;
-        use rand::seq::SliceRandom;
+        use rand::Rng;
         use rand::SeedableRng;
 
         // Use only reference haplotypes (exclude appended target haplotypes)
         let n_ref_haps = self.n_ref_haps;
         let n_states = self.max_states.min(n_ref_haps);
 
-        let mut rng = StdRng::seed_from_u64(self.seed);
-        let mut hap_indices: Vec<u32> = (0..n_ref_haps as u32).collect();
-        hap_indices.shuffle(&mut rng);
+        // Match Java: seed with target haplotype index for reproducibility
+        // In imputation, target haps are separate from reference, so no exclusion needed
+        let mut rng = StdRng::seed_from_u64(target_hap_hash as u64);
 
-        for &h in hap_indices.iter().take(n_states) {
+        let ibs_step = 0;
+        let mut states_added = 0;
+        while states_added < n_states {
+            let h = rng.random_range(0..n_ref_haps as u32);
             let comp_hap_idx = self.threaded_haps.push_new(h);
             self.queue.push(CompHapEntry {
                 comp_hap_idx,
                 hap: h,
-                last_ibs_step: 0,
+                last_ibs_step: ibs_step,
             });
+            states_added += 1;
         }
     }
 
