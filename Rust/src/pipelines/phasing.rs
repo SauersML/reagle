@@ -74,7 +74,6 @@ impl PhasingPipeline {
         let (mut reader, file_reader) = VcfReader::open(&self.config.gt)?;
         reader.set_exclude_samples(&exclude_samples);
         reader.set_exclude_markers(exclude_markers);
-        let samples = reader.samples_arc();
         let target_gt = reader.read_all(file_reader)?;
 
         if target_gt.n_markers() == 0 {
@@ -218,6 +217,20 @@ impl PhasingPipeline {
             n_with_ibs2,
             ibs2.n_samples()
         );
+
+        // Log ploidy information from detected samples
+        let samples = target_gt.samples_arc();
+        let n_haploid = (0..n_samples)
+            .filter(|&s| !samples.is_diploid(SampleIdx::new(s as u32)))
+            .count();
+        if n_haploid > 0 {
+            eprintln!(
+                "Detected {} haploid samples ({} diploid), {} true haplotypes",
+                n_haploid,
+                n_samples - n_haploid,
+                samples.n_true_haps()
+            );
+        }
 
         // Run phasing iterations (STAGE 1: high-frequency markers only)
         let n_burnin = self.config.burnin;
@@ -845,11 +858,32 @@ impl PhasingPipeline {
         states
     }
 
+    /// Convert inter-marker genetic distances to cumulative genetic positions
+    ///
+    /// Given distances [d0, d1, d2, ...] between consecutive markers,
+    /// returns positions [0, d0, d0+d1, d0+d1+d2, ...]
+    fn gen_dists_to_positions(gen_dists: &[f64]) -> Vec<f64> {
+        let mut positions = Vec::with_capacity(gen_dists.len() + 1);
+        positions.push(0.0);
+        let mut cumulative = 0.0;
+        for &d in gen_dists {
+            cumulative += d;
+            positions.push(cumulative);
+        }
+        positions
+    }
+
     /// Build bidirectional PBWT for full chromosome phasing
     ///
     /// This stores both forward and backward PBWT arrays to enable selecting
     /// haplotypes that match well both upstream and downstream of each marker.
-    fn build_bidirectional_pbwt(&self, geno: &MutableGenotypes, n_markers: usize, n_haps: usize) -> BidirectionalPhaseIbs {
+    fn build_bidirectional_pbwt(
+        &self,
+        geno: &MutableGenotypes,
+        n_markers: usize,
+        n_haps: usize,
+        gen_positions: Option<&[f64]>,
+    ) -> BidirectionalPhaseIbs {
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_markers);
         for m in 0..n_markers {
             let mut alleles = Vec::with_capacity(n_haps);
@@ -858,7 +892,7 @@ impl PhasingPipeline {
             }
             alleles_by_marker.push(alleles);
         }
-        BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_markers)
+        BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_markers, gen_positions)
     }
 
     /// Build bidirectional PBWT for a subset of markers (e.g., high-frequency only)
@@ -870,10 +904,11 @@ impl PhasingPipeline {
         geno: &MutableGenotypes,
         marker_indices: &[usize],
         n_haps: usize,
+        gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs {
         let n_subset = marker_indices.len();
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
-        
+
         for &orig_m in marker_indices {
             let mut alleles = Vec::with_capacity(n_haps);
             for h in 0..n_haps {
@@ -881,8 +916,18 @@ impl PhasingPipeline {
             }
             alleles_by_marker.push(alleles);
         }
-        
-        BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_subset)
+
+        // Extract genetic positions for the subset markers
+        let subset_gen_positions: Option<Vec<f64>> = gen_positions.map(|gp| {
+            marker_indices.iter().map(|&m| gp[m]).collect()
+        });
+
+        BidirectionalPhaseIbs::build(
+            &alleles_by_marker,
+            n_haps,
+            n_subset,
+            subset_gen_positions.as_deref(),
+        )
     }
 
     /// Build bidirectional PBWT for combined target + reference haplotype space
@@ -894,6 +939,7 @@ impl PhasingPipeline {
         get_allele: F,
         n_markers: usize,
         n_total_haps: usize,
+        gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs
     where
         F: Fn(usize, usize) -> u8,  // (marker_idx, hap_idx) -> allele
@@ -906,7 +952,7 @@ impl PhasingPipeline {
             }
             alleles_by_marker.push(alleles);
         }
-        BidirectionalPhaseIbs::build(&alleles_by_marker, n_total_haps, n_markers)
+        BidirectionalPhaseIbs::build(&alleles_by_marker, n_total_haps, n_markers, gen_positions)
     }
 
     /// Build bidirectional PBWT for combined haplotype space on a marker subset
@@ -918,6 +964,7 @@ impl PhasingPipeline {
         get_allele: F,
         marker_indices: &[usize],
         n_total_haps: usize,
+        gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs
     where
         F: Fn(usize, usize) -> u8,  // (orig_marker_idx, hap_idx) -> allele
@@ -933,7 +980,17 @@ impl PhasingPipeline {
             alleles_by_marker.push(alleles);
         }
 
-        BidirectionalPhaseIbs::build(&alleles_by_marker, n_total_haps, n_subset)
+        // Extract genetic positions for the subset markers
+        let subset_gen_positions: Option<Vec<f64>> = gen_positions.map(|gp| {
+            marker_indices.iter().map(|&m| gp[m]).collect()
+        });
+
+        BidirectionalPhaseIbs::build(
+            &alleles_by_marker,
+            n_total_haps,
+            n_subset,
+            subset_gen_positions.as_deref(),
+        )
     }
 
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
@@ -960,6 +1017,9 @@ impl PhasingPipeline {
         // Compute total haplotype count (target + reference)
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
+
+        // Compute cumulative genetic positions from distances for PBWT backoff
+        let gen_positions: Vec<f64> = Self::gen_dists_to_positions(gen_dists);
 
         let ref_geno = geno.clone();
 
@@ -994,9 +1054,10 @@ impl PhasingPipeline {
                 },
                 n_markers,
                 n_total_haps,
+                Some(&gen_positions),
             )
         } else {
-            self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps)
+            self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps, Some(&gen_positions))
         };
 
         let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
@@ -1431,11 +1492,14 @@ impl PhasingPipeline {
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
+        // Compute cumulative genetic positions from distances for PBWT backoff
+        let gen_positions: Vec<f64> = Self::gen_dists_to_positions(gen_dists);
+
         let ref_geno = geno.clone();
         let ref_view = GenotypeView::from((&ref_geno, markers));
 
         // Build bidirectional PBWT for better state selection around recombination hotspots
-        let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps);
+        let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps, Some(&gen_positions));
 
         // Collect swap masks per sample
         let n_samples = n_haps / 2;
@@ -1820,6 +1884,10 @@ impl PhasingPipeline {
 
         // 2. Build bidirectional PBWT on high-frequency markers only
         // When reference is available, include reference haplotypes in the PBWT
+
+        // Compute cumulative genetic positions from Stage 1 distances for PBWT backoff
+        let stage1_gen_positions: Vec<f64> = Self::gen_dists_to_positions(stage1_gen_dists);
+
         let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
             self.build_bidirectional_pbwt_combined_subset(
                 |orig_m, h| {
@@ -1838,9 +1906,10 @@ impl PhasingPipeline {
                 },
                 hi_freq_to_orig,
                 n_total_haps,
+                Some(&stage1_gen_positions),
             )
         } else {
-            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps)
+            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps, Some(&stage1_gen_positions))
         };
 
         // Collect phase decisions per sample using correct per-het algorithm
@@ -2285,9 +2354,10 @@ impl PhasingPipeline {
                 },
                 hi_freq_markers,
                 n_total_haps,
+                Some(gen_positions),
             )
         } else {
-            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps)
+            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps, Some(gen_positions))
         };
 
         // Process samples in parallel - collect results: (marker, should_swap)
@@ -2296,6 +2366,14 @@ impl PhasingPipeline {
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
+                // Create deterministic RNG for this sample for random tie-breaking
+                // Seed combines global seed + sample index + constant for Stage 2 distinction
+                use rand::{Rng, SeedableRng};
+                let sample_seed = (seed as u64)
+                    .wrapping_add(s as u64)
+                    .wrapping_add(0xDEAD_BEEF_CAFE_u64); // Stage 2 distinction constant
+                let mut rng = rand::rngs::StdRng::seed_from_u64(sample_seed);
+
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
 
@@ -2349,7 +2427,7 @@ impl PhasingPipeline {
                     }
                 };
 
-                let mut process_marker = |m: usize| {
+                let mut process_marker = |m: usize, rng: &mut rand::rngs::StdRng| {
                     if !sp.is_unphased(m) {
                         return;
                     }
@@ -2384,14 +2462,18 @@ impl PhasingPipeline {
                     let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
 
                     // Record decision: (marker, should_swap)
-                    phase_decisions.push((m, p2 > p1));
+                    // When probabilities are equal (ambiguous phase), use random tie-breaking
+                    // to prevent systematic bias. This matches Java Beagle behavior:
+                    // switchAlleles = (p1<p2 || (p1==p2 && rand.nextBoolean()))
+                    let should_swap = p2 > p1 || (p1 == p2 && rng.random_bool(0.5));
+                    phase_decisions.push((m, should_swap));
                 };
 
                 // Process markers before first Stage 1 marker
                 if !hi_freq_markers.is_empty() {
                     let first_hf = hi_freq_markers[0];
                     for m in 0..first_hf {
-                        process_marker(m);
+                        process_marker(m, &mut rng);
                     }
                 }
 
@@ -2405,7 +2487,7 @@ impl PhasingPipeline {
                     };
 
                     for m in (start_m + 1)..end_m {
-                        process_marker(m);
+                        process_marker(m, &mut rng);
                     }
                 }
 

@@ -29,6 +29,7 @@ pub enum ReagleError {
     Parse { line: usize, message: String },
 }
 
+
 /// Type alias for Results using ReagleError
 pub type Result<T> = std::result::Result<T, ReagleError>;
 

@@ -144,6 +144,9 @@ pub struct VcfReader {
     include_sample_indices: Option<Vec<usize>>,
     /// Marker IDs to exclude (None = exclude none)
     exclude_marker_ids: Option<std::collections::HashSet<String>>,
+    /// Per-sample ploidy detected during reading (true = diploid, false = haploid)
+    /// Initialized on first variant, used to update Samples after reading
+    sample_ploidy: Option<Vec<bool>>,
 }
 
 impl VcfReader {
@@ -205,6 +208,7 @@ impl VcfReader {
             samples,
             include_sample_indices: None,
             exclude_marker_ids: None,
+            sample_ploidy: None,
         }, reader))
     }
 
@@ -340,6 +344,9 @@ impl VcfReader {
             );
         }
 
+        // Update Samples with detected ploidy information
+        self.finalize_samples();
+
         // Return unphased by default - caller should phase if needed
         // The is_phased detection is informational only
         let matrix = GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples));
@@ -474,6 +481,11 @@ impl VcfReader {
         let mut alleles = Vec::with_capacity(n_samples * 2);
         let mut is_phased = true;
 
+        // Initialize ploidy tracking on first variant if not already done
+        if self.sample_ploidy.is_none() {
+            self.sample_ploidy = Some(vec![true; n_samples]); // Assume all diploid initially
+        }
+
         for (sample_idx, sample_field) in fields[9..].iter().enumerate() {
             if sample_idx >= n_samples {
                 break;
@@ -482,10 +494,17 @@ impl VcfReader {
             let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
 
             // Parse genotype (handle both phased | and unphased /)
-            let (a1, a2, phased) = parse_genotype(gt_field)?;
+            let (a1, a2, phased, is_haploid) = parse_genotype(gt_field)?;
 
             if !phased {
                 is_phased = false;
+            }
+
+            // Track haploid samples - once detected as haploid, stays haploid
+            if is_haploid {
+                if let Some(ref mut ploidy) = self.sample_ploidy {
+                    ploidy[sample_idx] = false; // Mark as haploid
+                }
             }
 
             alleles.push(a1);
@@ -496,18 +515,32 @@ impl VcfReader {
 
         Ok((marker, alleles, is_phased))
     }
+
+    /// Rebuild Samples with detected ploidy information
+    ///
+    /// Call this after reading all variants to update the Samples struct
+    /// with accurate ploidy information detected during parsing.
+    pub fn finalize_samples(&mut self) {
+        if let Some(ref ploidy) = self.sample_ploidy {
+            let sample_ids: Vec<String> = self.samples.ids().iter()
+                .map(|s| s.to_string())
+                .collect();
+            self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
+        }
+    }
 }
 
 /// Parse a genotype field (e.g., "0|1", "0/1", ".")
 ///
 /// This follows the Java VcfRecGTParser behavior:
 /// - If one allele is missing, treat both as missing
-/// - Returns (allele1, allele2, is_phased)
+/// - Returns (allele1, allele2, is_phased, is_haploid)
 /// - Missing alleles are represented as 255
-fn parse_genotype(gt: &str) -> Result<(u8, u8, bool)> {
+/// - For haploid genotypes, allele2 is set to same as allele1 (for storage compatibility)
+fn parse_genotype(gt: &str) -> Result<(u8, u8, bool, bool)> {
     // Handle completely missing genotypes
     if gt == "." || gt == "./." || gt == ".|." {
-        return Ok((255, 255, true)); // Missing, treated as phased
+        return Ok((255, 255, true, false)); // Missing, treated as phased diploid
     }
 
     // Determine if phased (| separator) or unphased (/ separator)
@@ -517,16 +550,18 @@ fn parse_genotype(gt: &str) -> Result<(u8, u8, bool)> {
     // Split genotype into alleles
     let parts: Vec<&str> = gt.split(sep).collect();
 
-    // Handle haploid genotypes
+    // Handle haploid genotypes (single allele, e.g., "0" or "1")
     if parts.len() == 1 {
         let a1 = parse_allele(parts[0]);
-        return Ok((a1, a1, true)); // Haploid is always "phased"
+        // Store same allele in both positions for storage compatibility,
+        // but mark as haploid so phasing pipeline knows to skip
+        return Ok((a1, a1, true, true)); // Haploid is always "phased"
     }
 
     // Parse diploid genotypes
     if parts.len() != 2 {
         // Malformed, treat as missing
-        return Ok((255, 255, false));
+        return Ok((255, 255, false, false));
     }
 
     let a1 = parse_allele(parts[0]);
@@ -534,10 +569,10 @@ fn parse_genotype(gt: &str) -> Result<(u8, u8, bool)> {
 
     // Java behavior: if one allele is missing, treat both as missing
     if a1 == 255 || a2 == 255 {
-        return Ok((255, 255, false));
+        return Ok((255, 255, false, false));
     }
 
-    Ok((a1, a2, phased))
+    Ok((a1, a2, phased, false))
 }
 
 /// Maximum supported allele index (u8 limitation)
@@ -1001,17 +1036,26 @@ mod tests {
 
     #[test]
     fn test_parse_genotype() {
-        assert_eq!(parse_genotype("0|1").unwrap(), (0, 1, true));
-        assert_eq!(parse_genotype("1|0").unwrap(), (1, 0, true));
-        assert_eq!(parse_genotype("0/1").unwrap(), (0, 1, false));
-        assert_eq!(parse_genotype("./.").unwrap(), (255, 255, true));
-        assert_eq!(parse_genotype(".|.").unwrap(), (255, 255, true));
+        // Diploid genotypes: (a1, a2, is_phased, is_haploid)
+        assert_eq!(parse_genotype("0|1").unwrap(), (0, 1, true, false));
+        assert_eq!(parse_genotype("1|0").unwrap(), (1, 0, true, false));
+        assert_eq!(parse_genotype("0/1").unwrap(), (0, 1, false, false));
+        assert_eq!(parse_genotype("./.").unwrap(), (255, 255, true, false));
+        assert_eq!(parse_genotype(".|.").unwrap(), (255, 255, true, false));
     }
 
     #[test]
     fn test_parse_genotype_multiallelic() {
-        assert_eq!(parse_genotype("0|2").unwrap(), (0, 2, true));
-        assert_eq!(parse_genotype("1|2").unwrap(), (1, 2, true));
+        assert_eq!(parse_genotype("0|2").unwrap(), (0, 2, true, false));
+        assert_eq!(parse_genotype("1|2").unwrap(), (1, 2, true, false));
+    }
+
+    #[test]
+    fn test_parse_genotype_haploid() {
+        // Haploid genotypes: single allele, duplicated for storage
+        assert_eq!(parse_genotype("0").unwrap(), (0, 0, true, true));
+        assert_eq!(parse_genotype("1").unwrap(), (1, 1, true, true));
+        assert_eq!(parse_genotype(".").unwrap(), (255, 255, true, false)); // Missing is diploid
     }
 
     #[test]
