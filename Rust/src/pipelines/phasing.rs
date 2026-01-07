@@ -1079,7 +1079,7 @@ impl PhasingPipeline {
 
             // 3-Track HMM with Prior-First Approach
             //
-            // This implementation avoids the numerically unstable division hack.
+            // This implementation avoids the numerically unstable division workaround.
             // Instead, we:
             // 1. Run sparse backward passes, storing only at het positions
             // 2. Run forward with prior-first: compute transition before emission

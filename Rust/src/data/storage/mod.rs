@@ -123,7 +123,7 @@ impl GenotypeColumn {
         // Note: SparseColumn currently doesn't support missing data explicitly,
         // so we only use it if there are no missing alleles or if we are okay
         // with missing being treated as REF/ALT in sparse storage (usually rare variants don't have many missing).
-        // For correctness, if there's missing data, we might want to stick to Dense for now.
+        // For correctness, if there's missing data, use Dense storage.
         let has_missing = alleles.iter().any(|&a| a == 255);
 
         if maf < 0.01 && n_alleles == 2 && !has_missing {

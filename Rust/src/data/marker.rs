@@ -261,7 +261,7 @@ pub fn compute_allele_mapping(targ: &Marker, ref_marker: &Marker) -> Option<Alle
         return None;
     }
 
-    // Only handle SNVs for now (strand flip only makes sense for SNVs)
+    // Only handle SNVs (strand flip only makes sense for SNVs)
     if !targ.is_snv() || !ref_marker.is_snv() {
         // For non-SNVs, try direct match only
         return try_direct_match(targ, ref_marker);
@@ -494,25 +494,4 @@ mod tests {
         assert!(marker.is_biallelic());
     }
 
-    // TODO: bits_per_allele method not implemented on Marker
-    // #[test]
-    // fn test_bits_per_allele() {
-    //     let marker2 = Marker::new(
-    //         ChromIdx(0),
-    //         100,
-    //         None,
-    //         Allele::Base(0),
-    //         vec![Allele::Base(1)],
-    //     );
-    //     assert_eq!(marker2.bits_per_allele(), 1);
-    //
-    //     let marker4 = Marker::new(
-    //         ChromIdx(0),
-    //         100,
-    //         None,
-    //         Allele::Base(0),
-    //         vec![Allele::Base(1), Allele::Base(2), Allele::Base(3)],
-    //     );
-    //     assert_eq!(marker4.bits_per_allele(), 2);
-    // }
 }

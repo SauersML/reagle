@@ -312,14 +312,16 @@ impl StateProbs {
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
 
-        // Sparse storage threshold: min(0.005, 1/K) - matches Java
-        let threshold = (0.005f32).min(1.0 / n_states.max(1) as f32);
+        // Sparse storage threshold: min(0.005, 0.9999/K) - matches Java exactly
+        // Java: Math.min(0.005f, 0.9999f/nStates)
+        let threshold = (0.005f32).min(0.9999 / n_states.max(1) as f32);
 
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
         let mut filtered_probs_p1 = Vec::with_capacity(n_genotyped);
 
         // Filter states by probability threshold (sparse storage)
+        // Java does NOT renormalize after filtering - it stores raw probabilities
         for sparse_m in 0..n_genotyped {
             let row_offset = sparse_m * n_states;
             // For probs_p1, use the next marker if available, else same marker
@@ -329,39 +331,20 @@ impl StateProbs {
             let mut haps = Vec::new();
             let mut probs = Vec::new();
             let mut probs_p1 = Vec::new();
-            let mut total_prob = 0.0f32;
 
-            // First pass: collect states above threshold
+            // Collect states ABOVE threshold (Java uses >, not >=)
             for j in 0..n_states.min(hap_indices.get(sparse_m).map(|v| v.len()).unwrap_or(0)) {
                 let prob = state_probs.get(row_offset + j).copied().unwrap_or(0.0);
-                // Keep state if prob >= threshold OR if prob_p1 >= threshold
-                // (need state for interpolation even if current prob is low)
                 let prob_p1 = state_probs.get(row_offset_p1 + j).copied().unwrap_or(0.0);
-                if prob >= threshold || prob_p1 >= threshold {
+                // Java: if (stateProbs[m][j] > threshold || stateProbs[mP1][j] > threshold)
+                if prob > threshold || prob_p1 > threshold {
                     haps.push(hap_indices[sparse_m][j]);
                     probs.push(prob);
                     probs_p1.push(prob_p1);
-                    total_prob += prob;
                 }
             }
 
-            // Renormalize to sum to 1.0 (compensate for dropped probability mass)
-            if total_prob > 0.0 && total_prob < 0.999 {
-                let scale = 1.0 / total_prob;
-                for p in &mut probs {
-                    *p *= scale;
-                }
-            }
-
-            // Renormalize probs_p1 separately
-            let total_p1: f32 = probs_p1.iter().sum();
-            if total_p1 > 0.0 && total_p1 < 0.999 {
-                let scale = 1.0 / total_p1;
-                for p in &mut probs_p1 {
-                    *p *= scale;
-                }
-            }
-
+            // Java does NOT renormalize - stores raw filtered probabilities
             filtered_haps.push(haps);
             filtered_probs.push(probs);
             filtered_probs_p1.push(probs_p1);
