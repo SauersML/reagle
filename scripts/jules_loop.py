@@ -270,33 +270,62 @@ def main():
         "- Run 'cargo check' and 'cargo test' to verify your changes compile.\n"
     )
 
+    # Detect if it was a test failure vs build failure by checking logs
+    build_passed_tests_failed = (
+        conclusion == "failure" and "Cargo check passed" in logs
+    )
+
+    # Core philosophy that applies to all prompts
+    philosophy = (
+        "\n\nPHILOSOPHY:\n"
+        "- Tests are INFORMATION, not goals. Never aim for 'green CI'. Failing tests are valuable.\n"
+        "- New tests that FAIL are more useful than passing tests - they reveal bugs.\n"
+        "- Never weaken, delete, or #[ignore] tests to make them pass. That destroys information.\n"
+        "- Only fix a test if the test itself is genuinely wrong (not just failing).\n"
+        "- Commit and push frequently if code compiles, even with failing tests.\n"
+        "- Correctness matters: this code affects real health outcomes via polygenic scores.\n"
+        "- No 'for now' thinking. Do the proper fix, not a hack.\n"
+        "- Reference Java/ for correct behavior, but Rust can take better approaches.\n"
+    )
+
     if conclusion == "success":
         prompt = (
-            "The Rust build passed successfully. "
-            "Please find one thing to implement, improve, or optimize in the Rust code "
-            "(specifically files in Rust/src/). You must successfully compile the code yourself. "
-            "If the build fails, do not submit and keep working. "
-            "This is a port of BEAGLE (a genotype phasing and imputation tool) from Java to Rust. "
-            "You can: implement missing functionality by referencing Java/, optimize hot paths, "
-            "add proper error handling, implement tests, or improve the data structures. "
-            "Feel free to try big or multiple tasks. "
-            "IMPORTANT: Ensure your changes compile with 'cargo check' and pass 'cargo test'. "
-            "Do not break existing functionality."
+            "The Rust build and tests passed. Find something to improve:\n"
+            "- Make code faster or more memory efficient\n"
+            "- Create difficult tests that might fail (exposing bugs is valuable!)\n"
+            "- Strengthen test assertions until they fail\n"
+            "- Find logical/mathematical flaws by referencing Java/\n"
+            "- Track down factors hurting phasing/imputation accuracy\n"
+            "- Fix bugs or implement missing functionality\n"
+            "- Benchmark and optimize hot paths\n\n"
+            "This is a port of BEAGLE (genotype phasing/imputation) from Java to Rust. "
+            "Feel free to tackle complex tasks. Push to main frequently if code compiles."
+            + philosophy
+            + version_restriction
+        )
+    elif build_passed_tests_failed:
+        prompt = (
+            f"The Rust code compiles but some tests failed.\n"
+            f"Logs:\n\n{logs}\n\n"
+            "Investigate the root cause. Tests are information telling you something is wrong. "
+            "Options:\n"
+            "- Fix the implementation bug that the test exposed (reference Java/ for correct behavior)\n"
+            "- If investigating reveals a deeper issue, create a NEW failing test that exposes it better\n"
+            "- Improve speed/memory while investigating\n"
+            "- Strengthen other test assertions to find more bugs\n\n"
+            "This is a port of BEAGLE (genotype phasing/imputation) from Java to Rust. "
+            "Commit progress even if tests still fail - progress is good."
+            + philosophy
             + version_restriction
         )
     else:
         prompt = (
-            f"The Rust build failed. "
-            f"Here are the logs from the run (ANSI colors stripped):\n\n{logs}\n\n"
-            "Please analyze the logs and fix the errors in the Rust code. "
-            "If the code does not compile, you can commit a small improvement even if not complete. "
-            "You can search the web to find documentation for crates you're using. "
+            f"The Rust build failed to compile.\n"
+            f"Logs:\n\n{logs}\n\n"
+            "Fix the compilation errors. Reference Java/ if needed to understand intent. "
             "This is a port of BEAGLE (genotype phasing/imputation) from Java to Rust. "
-            "Reference Java/ for the original implementation if helpful. "
-            "You should check if your changes compile with 'cargo check'. "
-            "However, if the code does not compile, improve what you can before submitting. "
-            "It's okay if it still fails as long as it is in a better state. "
-            "Feel free to fix multiple issues at once. You can do it!"
+            "Once it compiles, push to main even if tests fail - compilation is progress."
+            + philosophy
             + version_restriction
         )
 
