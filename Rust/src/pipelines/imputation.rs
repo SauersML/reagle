@@ -503,8 +503,13 @@ impl ImputationPipeline {
         // Number of IBS haplotypes to find per step
         // Java: nHapsPerStep = imp_states / (imp_segment / imp_step)
         //     = 1600 / (6.0 / 0.1) = 1600 / 60 ≈ 26
+        // We add a minimum of sqrt(imp_states) to handle low imp_states values.
+        // Without this floor, imp_states=50 with 60 steps/segment gives 50/60=0,
+        // causing IBS matching to fail completely.
         let n_steps_per_segment = (self.config.imp_segment / self.config.imp_step).round() as usize;
-        let n_ibs_haps = (self.config.imp_states / n_steps_per_segment.max(1)).max(1);
+        let computed = self.config.imp_states / n_steps_per_segment.max(1);
+        let min_ibs = (self.config.imp_states as f64).sqrt() as usize;
+        let n_ibs_haps = computed.max(min_ibs).max(1);
 
         // Compute genetic positions at ALL reference markers (for RefPanelCoded)
         let ref_gen_positions: Vec<f64> = (0..n_ref_markers)

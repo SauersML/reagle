@@ -881,31 +881,12 @@ impl PhasingPipeline {
         states
     }
 
-    /// Convert inter-marker genetic distances to cumulative genetic positions
-    ///
-    /// Given distances [d0, d1, d2, ...] between consecutive markers,
-    /// returns positions [0, d0, d0+d1, d0+d1+d2, ...]
-    fn gen_dists_to_positions(gen_dists: &[f64]) -> Vec<f64> {
-        let mut positions = Vec::with_capacity(gen_dists.len() + 1);
-        positions.push(0.0);
-        let mut cumulative = 0.0;
-        for &d in gen_dists {
-            cumulative += d;
-            positions.push(cumulative);
-        }
-        positions
-    }
-
     /// Build bidirectional PBWT for full chromosome phasing
-    ///
-    /// This stores both forward and backward PBWT arrays to enable selecting
-    /// haplotypes that match well both upstream and downstream of each marker.
     fn build_bidirectional_pbwt(
         &self,
         geno: &MutableGenotypes,
         n_markers: usize,
         n_haps: usize,
-        gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs {
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_markers);
         for m in 0..n_markers {
@@ -915,26 +896,15 @@ impl PhasingPipeline {
             }
             alleles_by_marker.push(alleles);
         }
-        BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_markers, gen_positions)
+        BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_markers)
     }
 
     /// Build bidirectional PBWT for a subset of markers (e.g., high-frequency only)
-    ///
-    /// This ensures state selection is consistent with the HMM marker space
-    /// when phasing Stage 1 (high-frequency) markers. The subset-to-global marker
-    /// mapping is stored so that IBS2 lookups (which use global indices) work correctly.
-    ///
-    /// # Arguments
-    /// * `geno` - Genotype data (uses global marker indices internally)
-    /// * `marker_indices` - Global indices of markers in the subset (subset-to-global mapping)
-    /// * `n_haps` - Number of haplotypes
-    /// * `subset_gen_positions` - Genetic positions already in subset space (length = n_subset)
     fn build_bidirectional_pbwt_subset(
         &self,
         geno: &MutableGenotypes,
         marker_indices: &[usize],
         n_haps: usize,
-        subset_gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs {
         let n_subset = marker_indices.len();
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
@@ -947,30 +917,23 @@ impl PhasingPipeline {
             alleles_by_marker.push(alleles);
         }
 
-        // Use build_for_subset to store the marker mapping for IBS2 coordinate conversion
-        // Note: gen_positions are already in subset space, no extraction needed
         BidirectionalPhaseIbs::build_for_subset(
             &alleles_by_marker,
             n_haps,
             n_subset,
-            subset_gen_positions,
             marker_indices,
         )
     }
 
     /// Build bidirectional PBWT for combined target + reference haplotype space
-    ///
-    /// This builds the PBWT over all haplotypes (target and reference) to enable
-    /// finding IBS matches in both pools during reference-guided phasing.
     fn build_bidirectional_pbwt_combined<F>(
         &self,
         get_allele: F,
         n_markers: usize,
         n_total_haps: usize,
-        gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs
     where
-        F: Fn(usize, usize) -> u8,  // (marker_idx, hap_idx) -> allele
+        F: Fn(usize, usize) -> u8,
     {
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_markers);
         for m in 0..n_markers {
@@ -980,29 +943,18 @@ impl PhasingPipeline {
             }
             alleles_by_marker.push(alleles);
         }
-        BidirectionalPhaseIbs::build(&alleles_by_marker, n_total_haps, n_markers, gen_positions)
+        BidirectionalPhaseIbs::build(&alleles_by_marker, n_total_haps, n_markers)
     }
 
     /// Build bidirectional PBWT for combined haplotype space on a marker subset
-    ///
-    /// Used for Stage 1 phasing with reference panel - indexes both target and
-    /// reference haplotypes but only on high-frequency markers. The subset-to-global
-    /// marker mapping is stored so that IBS2 lookups work correctly.
-    ///
-    /// # Arguments
-    /// * `get_allele` - Closure to get allele at (global_marker_idx, hap_idx)
-    /// * `marker_indices` - Global indices of markers in the subset (subset-to-global mapping)
-    /// * `n_total_haps` - Number of haplotypes (target + reference)
-    /// * `subset_gen_positions` - Genetic positions already in subset space (length = n_subset)
     fn build_bidirectional_pbwt_combined_subset<F>(
         &self,
         get_allele: F,
         marker_indices: &[usize],
         n_total_haps: usize,
-        subset_gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs
     where
-        F: Fn(usize, usize) -> u8,  // (orig_marker_idx, hap_idx) -> allele
+        F: Fn(usize, usize) -> u8,
     {
         let n_subset = marker_indices.len();
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
@@ -1015,13 +967,10 @@ impl PhasingPipeline {
             alleles_by_marker.push(alleles);
         }
 
-        // Use build_for_subset to store the marker mapping for IBS2 coordinate conversion
-        // Note: gen_positions are already in subset space, no extraction needed
         BidirectionalPhaseIbs::build_for_subset(
             &alleles_by_marker,
             n_total_haps,
             n_subset,
-            subset_gen_positions,
             marker_indices,
         )
     }
@@ -1050,9 +999,6 @@ impl PhasingPipeline {
         // Compute total haplotype count (target + reference)
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
-
-        // Compute cumulative genetic positions from distances for PBWT backoff
-        let gen_positions: Vec<f64> = Self::gen_dists_to_positions(gen_dists);
 
         let ref_geno = geno.clone();
 
@@ -1087,10 +1033,9 @@ impl PhasingPipeline {
                 },
                 n_markers,
                 n_total_haps,
-                Some(&gen_positions),
             )
         } else {
-            self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps, Some(&gen_positions))
+            self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps)
         };
 
         let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
@@ -1525,14 +1470,11 @@ impl PhasingPipeline {
         let markers = target_gt.markers();
         let seed = self.config.seed;
 
-        // Compute cumulative genetic positions from distances for PBWT backoff
-        let gen_positions: Vec<f64> = Self::gen_dists_to_positions(gen_dists);
-
         let ref_geno = geno.clone();
         let ref_view = GenotypeView::from((&ref_geno, markers));
 
         // Build bidirectional PBWT for better state selection around recombination hotspots
-        let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps, Some(&gen_positions));
+        let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps);
 
         // Collect swap masks per sample
         let n_samples = n_haps / 2;
@@ -1918,9 +1860,6 @@ impl PhasingPipeline {
         // 2. Build bidirectional PBWT on high-frequency markers only
         // When reference is available, include reference haplotypes in the PBWT
 
-        // Compute cumulative genetic positions from Stage 1 distances for PBWT backoff
-        let stage1_gen_positions: Vec<f64> = Self::gen_dists_to_positions(stage1_gen_dists);
-
         let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
             self.build_bidirectional_pbwt_combined_subset(
                 |orig_m, h| {
@@ -1939,10 +1878,9 @@ impl PhasingPipeline {
                 },
                 hi_freq_to_orig,
                 n_total_haps,
-                Some(&stage1_gen_positions),
             )
         } else {
-            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps, Some(&stage1_gen_positions))
+            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps)
         };
 
         // Collect phase decisions per sample using correct per-het algorithm.
@@ -2402,9 +2340,6 @@ impl PhasingPipeline {
             }
         };
 
-        // Extract subset genetic positions for PBWT backoff computation
-        let subset_gen_positions: Vec<f64> = hi_freq_markers.iter().map(|&m| gen_positions[m]).collect();
-
         // Build bidirectional PBWT on hi-freq markers for consistent state selection
         // When reference is available, include reference haplotypes
         let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
@@ -2425,10 +2360,9 @@ impl PhasingPipeline {
                 },
                 hi_freq_markers,
                 n_total_haps,
-                Some(&subset_gen_positions),
             )
         } else {
-            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps, Some(&subset_gen_positions))
+            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps)
         };
 
         // Process samples in parallel - collect results: (marker, should_swap)
