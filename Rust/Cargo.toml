@@ -47,3 +47,7 @@ walkdir = "2.5"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[lints.rust]
+# Treat all warnings as errors
+warnings = "deny"
