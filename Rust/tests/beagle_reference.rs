@@ -582,17 +582,20 @@ fn run_imputation_comparison(source: &TestDataSource) {
     if !dosage_diffs.is_empty() {
         let mean_diff: f64 = dosage_diffs.iter().sum::<f64>() / dosage_diffs.len() as f64;
         let max_diff: f64 = dosage_diffs.iter().cloned().fold(0.0, f64::max);
-        let within_05: usize = dosage_diffs.iter().filter(|&&d| d < 0.05).count();
-        let pct_within_05 = 100.0 * within_05 as f64 / dosage_diffs.len() as f64;
+        let within_02: usize = dosage_diffs.iter().filter(|&&d| d < 0.02).count();
+        let within_01: usize = dosage_diffs.iter().filter(|&&d| d < 0.01).count();
+        let pct_within_02 = 100.0 * within_02 as f64 / dosage_diffs.len() as f64;
+        let pct_within_01 = 100.0 * within_01 as f64 / dosage_diffs.len() as f64;
 
-        println!("[{}] Dosage comparison: {} values, mean diff={:.4}, max diff={:.4}",
+        println!("[{}] Dosage comparison: {} values, mean diff={:.6}, max diff={:.6}",
                  source.name, dosage_diffs.len(), mean_diff, max_diff);
-        println!("[{}] Dosages within 0.05 tolerance: {:.1}%", source.name, pct_within_05);
+        println!("[{}] Dosages within 0.01: {:.1}%, within 0.02: {:.1}%",
+                 source.name, pct_within_01, pct_within_02);
 
-        // Strict tolerance: mean dosage difference should be small
-        assert!(mean_diff < 0.05, "{}: Mean dosage diff too high: {:.4}", source.name, mean_diff);
-        // At least 95% of dosages should be within 0.05 of Java
-        assert!(pct_within_05 >= 95.0, "{}: Only {:.1}% of dosages within 0.05 tolerance", source.name, pct_within_05);
+        // STRICT: Mean dosage difference must be very small
+        assert!(mean_diff < 0.02, "{}: STRICT FAIL: Mean dosage diff {:.6} >= 0.02", source.name, mean_diff);
+        // STRICT: 99% of dosages must be within 0.02 of Java
+        assert!(pct_within_02 >= 99.0, "{}: STRICT FAIL: Only {:.1}% of dosages within 0.02", source.name, pct_within_02);
     }
 }
 
@@ -709,20 +712,22 @@ fn test_imputation_bref3_ref_rust_vs_java() {
     if !dosage_diffs.is_empty() {
         let mean_diff: f64 = dosage_diffs.iter().sum::<f64>() / dosage_diffs.len() as f64;
         let max_diff: f64 = dosage_diffs.iter().cloned().fold(0.0, f64::max);
-        let within_05: usize = dosage_diffs.iter().filter(|&&d| d < 0.05).count();
-        let pct_within_05 = 100.0 * within_05 as f64 / dosage_diffs.len() as f64;
+        let within_02: usize = dosage_diffs.iter().filter(|&&d| d < 0.02).count();
+        let within_01: usize = dosage_diffs.iter().filter(|&&d| d < 0.01).count();
+        let pct_within_02 = 100.0 * within_02 as f64 / dosage_diffs.len() as f64;
+        let pct_within_01 = 100.0 * within_01 as f64 / dosage_diffs.len() as f64;
 
-        println!("Dosage comparison: {} values, mean diff={:.4}, max diff={:.4}",
+        println!("Dosage comparison: {} values, mean diff={:.6}, max diff={:.6}",
                  dosage_diffs.len(), mean_diff, max_diff);
-        println!("Dosages within 0.05 tolerance: {:.1}%", pct_within_05);
+        println!("Dosages within 0.01: {:.1}%, within 0.02: {:.1}%", pct_within_01, pct_within_02);
 
-        // Strict tolerance: mean dosage difference should be small
-        assert!(mean_diff < 0.05, "Mean dosage diff too high: {:.4}", mean_diff);
-        // At least 95% of dosages should be within 0.05 of Java
-        assert!(pct_within_05 >= 95.0, "Only {:.1}% of dosages within 0.05 tolerance", pct_within_05);
+        // STRICT: Mean dosage difference must be very small
+        assert!(mean_diff < 0.02, "STRICT FAIL: Mean dosage diff {:.6} >= 0.02", mean_diff);
+        // STRICT: 99% of dosages must be within 0.02 of Java
+        assert!(pct_within_02 >= 99.0, "STRICT FAIL: Only {:.1}% of dosages within 0.02", pct_within_02);
     }
 
-    println!("bref3 imputation: Rust matches Java!");
+    println!("bref3 imputation: Rust matches Java (STRICT)!");
 }
 
 #[test]
@@ -1475,44 +1480,36 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     assert!(java_acc.concordance() > 0.80, "{}: Java concordance too low", source.name);
     assert!(rust_acc.concordance() > 0.80, "{}: Rust concordance too low", source.name);
 
-    // Additional metrics: Rust must NOT be worse than Java
-    let brier_tolerance = 0.02; // Allow 2% worse Brier score at most
+    // STRICT: Rust must be AT LEAST as good as Java - NO TOLERANCE
+    // Brier score: lower is better, so Rust <= Java
     if !java_acc.brier_score().is_nan() && !rust_acc.brier_score().is_nan() {
         assert!(
-            rust_acc.brier_score() <= java_acc.brier_score() + brier_tolerance,
-            "{}: Rust Brier score ({:.4}) must be <= Java ({:.4}) + {:.2}",
+            rust_acc.brier_score() <= java_acc.brier_score(),
+            "{}: STRICT FAIL: Rust Brier score ({:.6}) WORSE than Java ({:.6})",
             source.name,
             rust_acc.brier_score(),
-            java_acc.brier_score(),
-            brier_tolerance
+            java_acc.brier_score()
         );
     }
 
-    // Rare variant F1 should also be competitive
-    let rare_f1_tolerance = 0.05;
+    // Rare variant F1: higher is better, so Rust >= Java
     if rust_acc.rare_total > 0 && java_acc.rare_total > 0 {
         assert!(
-            rust_acc.rare_f1() >= java_acc.rare_f1() - rare_f1_tolerance,
-            "{}: Rust rare F1 ({:.3}) must be >= Java ({:.3}) - {:.2}",
+            rust_acc.rare_f1() >= java_acc.rare_f1(),
+            "{}: STRICT FAIL: Rust rare F1 ({:.6}) WORSE than Java ({:.6})",
             source.name,
             rust_acc.rare_f1(),
-            java_acc.rare_f1(),
-            rare_f1_tolerance
+            java_acc.rare_f1()
         );
     }
 
-    // Compare Rust to Java - Rust should be competitive with Java
-    // Note: Rust uses PBWT-based IBS selection while Java uses partition-based IBS.
-    // This algorithmic difference can result in 1-2% lower concordance in some scenarios.
-    // The tolerance allows for these known differences while ensuring Rust remains competitive.
-    let tolerance = 0.02; // 2 percentage points - accounts for algorithmic differences
+    // Concordance: higher is better, so Rust >= Java - NO TOLERANCE
     assert!(
-        rust_acc.concordance() >= java_acc.concordance() - tolerance,
-        "{}: Rust concordance ({:.2}%) must be >= Java ({:.2}%) - {:.1}%",
+        rust_acc.concordance() >= java_acc.concordance(),
+        "{}: STRICT FAIL: Rust concordance ({:.4}%) WORSE than Java ({:.4}%)",
         source.name,
         rust_acc.concordance() * 100.0,
-        java_acc.concordance() * 100.0,
-        tolerance * 100.0
+        java_acc.concordance() * 100.0
     );
 
     println!("\n[{}] Mask-and-recover comparison passed!", source.name);
@@ -1622,22 +1619,22 @@ fn compare_against_beagle(
         beagle_baseline.brier_score
     );
 
-    // Pass if within tolerance of BEAGLE
-    let concordance_ok = accuracy.concordance() >= beagle_baseline.concordance - 0.005;
-    let rare_f1_ok = accuracy.rare_f1() >= beagle_baseline.rare_f1 - 0.05;
-    let calibration_ok = accuracy.calibration_error() <= beagle_baseline.calibration_error + 0.05;
+    // STRICT: Pass ONLY if AT LEAST as good as BEAGLE - NO TOLERANCE
+    let concordance_ok = accuracy.concordance() >= beagle_baseline.concordance;
+    let rare_f1_ok = accuracy.rare_f1() >= beagle_baseline.rare_f1;
+    let calibration_ok = accuracy.calibration_error() <= beagle_baseline.calibration_error;
     // Handle NaN: if both are NaN, consider it OK; otherwise use normal comparison
     let brier_ok = if accuracy.brier_score().is_nan() && beagle_baseline.brier_score.is_nan() {
         true
     } else {
-        accuracy.brier_score() <= beagle_baseline.brier_score + 0.02
+        accuracy.brier_score() <= beagle_baseline.brier_score
     };
 
-    println!("\nPass criteria:");
-    println!("  Concordance >= BEAGLE - 0.5%: {}", if concordance_ok { "PASS" } else { "FAIL" });
-    println!("  Rare F1 >= BEAGLE - 0.05: {}", if rare_f1_ok { "PASS" } else { "FAIL" });
-    println!("  Calibration <= BEAGLE + 0.05: {}", if calibration_ok { "PASS" } else { "FAIL" });
-    println!("  Brier Score <= BEAGLE + 0.02: {}", if brier_ok { "PASS" } else { "FAIL" });
+    println!("\nSTRICT Pass criteria (NO TOLERANCE - must be >= BEAGLE):");
+    println!("  Concordance >= BEAGLE: {}", if concordance_ok { "PASS" } else { "FAIL" });
+    println!("  Rare F1 >= BEAGLE: {}", if rare_f1_ok { "PASS" } else { "FAIL" });
+    println!("  Calibration <= BEAGLE: {}", if calibration_ok { "PASS" } else { "FAIL" });
+    println!("  Brier Score <= BEAGLE: {}", if brier_ok { "PASS" } else { "FAIL" });
 
     concordance_ok && rare_f1_ok && calibration_ok && brier_ok
 }

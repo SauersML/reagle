@@ -762,266 +762,105 @@ impl VcfWriter {
         Ok(())
     }
 
-    /// Write imputed genotypes with dosages and quality metrics (DR2, AF)
+    /// Write imputed genotypes with STREAMING access - no pre-allocation
     ///
-    /// This follows the Java ImputedRecBuilder output format.
-    ///
-    /// # Arguments
-    /// * `matrix` - Genotype matrix with imputed alleles
-    /// * `dosages` - Flattened dosage array [marker][sample]
-    /// * `quality` - Per-marker imputation quality statistics
-    /// * `start` - Start marker index (inclusive)
-    /// * `end` - End marker index (exclusive)
-    pub fn write_imputed_with_quality<S: PhaseState>(
+    /// Eliminates O(n_markers * n_samples) flat_dosages allocation by using
+    /// closures to access sample-major data directly during write.
+    pub fn write_imputed_streaming<S, F, G>(
         &mut self,
         matrix: &GenotypeMatrix<S>,
-        dosages: &[f32],
-        quality: &ImputationQuality,
-        start: usize,
-        end: usize,
-    ) -> Result<()> {
-        let n_samples = self.samples.len();
-
-        for (local_m, m) in (start..end).enumerate() {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let marker = matrix.marker(marker_idx);
-            let n_alleles = 1 + marker.alt_alleles.len();
-
-            // Get quality stats for this marker
-            let stats = quality.get(m);
-
-            // Build INFO field
-            let info_field = if let Some(stats) = stats {
-                let mut info_parts = Vec::new();
-
-                // DR2 for each ALT allele
-                if n_alleles > 1 {
-                    let dr2_values: Vec<String> = (1..n_alleles)
-                        .map(|a| format!("{:.2}", stats.dr2(a)))
-                        .collect();
-                    info_parts.push(format!("DR2={}", dr2_values.join(",")));
-
-                    // AF for each ALT allele
-                    let af_values: Vec<String> = (1..n_alleles)
-                        .map(|a| format!("{:.4}", stats.allele_freq(a)))
-                        .collect();
-                    info_parts.push(format!("AF={}", af_values.join(",")));
-                }
-
-                // IMP flag if this marker was imputed
-                if stats.is_imputed {
-                    info_parts.push("IMP".to_string());
-                }
-
-                if info_parts.is_empty() {
-                    ".".to_string()
-                } else {
-                    info_parts.join(";")
-                }
-            } else {
-                ".".to_string()
-            };
-
-            // Write fixed fields with INFO
-            write!(
-                self.writer,
-                "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\tGT:DS",
-                matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
-                marker.pos,
-                marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
-                marker.ref_allele,
-                marker
-                    .alt_alleles
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                info_field
-            )?;
-
-            // Write genotypes with dosages
-            // GT is derived from dosage, NOT from reference panel!
-            for s in 0..n_samples {
-                let ds_idx = local_m * n_samples + s;
-                let ds = dosages.get(ds_idx).copied().unwrap_or(0.0);
-                let (a1, a2) = gt_from_dosage(ds);
-                write!(self.writer, "\t{}|{}:{:.2}", a1, a2, ds)?;
-            }
-            writeln!(self.writer)?;
-        }
-
-        Ok(())
-    }
-
-    /// Write imputed genotypes with GP (genotype probabilities) and/or AP (allele probabilities)
-    /// using optimized AllelePosteriors enum for proper multiallelic support.
-    ///
-    /// # Arguments
-    /// * `matrix` - Genotype matrix with imputed alleles
-    /// * `dosages` - Flattened dosage array [marker][sample]
-    /// * `posteriors` - Per-allele posteriors: [marker][sample] -> (&AllelePosteriors, &AllelePosteriors)
-    /// * `quality` - Per-marker imputation quality statistics
-    /// * `start` - Start marker index (inclusive)
-    /// * `end` - End marker index (exclusive)
-    /// * `include_gp` - Include GP field (genotype probabilities)
-    /// * `include_ap` - Include AP1/AP2 fields (per-haplotype allele probabilities)
-    pub fn write_imputed_with_posteriors<S: PhaseState>(
-        &mut self,
-        matrix: &GenotypeMatrix<S>,
-        dosages: &[f32],
-        posteriors: Option<&Vec<Vec<(&crate::pipelines::imputation::AllelePosteriors, &crate::pipelines::imputation::AllelePosteriors)>>>,
+        get_dosage: F,
+        get_posteriors: Option<G>,
         quality: &ImputationQuality,
         start: usize,
         end: usize,
         include_gp: bool,
         include_ap: bool,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: PhaseState,
+        F: Fn(usize, usize) -> f32,
+        G: Fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors),
+    {
         let n_samples = self.samples.len();
 
-        for (local_m, m) in (start..end).enumerate() {
+        for m in start..end {
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = matrix.marker(marker_idx);
             let n_alleles = 1 + marker.alt_alleles.len();
 
-            // Build FORMAT string
             let format_str = {
                 let mut parts = vec!["GT", "DS"];
-                if include_gp {
-                    parts.push("GP");
-                }
-                if include_ap {
-                    parts.push("AP1");
-                    parts.push("AP2");
-                }
+                if include_gp { parts.push("GP"); }
+                if include_ap { parts.push("AP1"); parts.push("AP2"); }
                 parts.join(":")
             };
 
-            // Get quality stats for this marker
             let stats = quality.get(m);
-
-            // Build INFO field
             let info_field = if let Some(stats) = stats {
                 let mut info_parts = Vec::new();
-
                 if n_alleles > 1 {
-                    let dr2_values: Vec<String> = (1..n_alleles)
-                        .map(|a| format!("{:.2}", stats.dr2(a)))
-                        .collect();
+                    let dr2_values: Vec<String> = (1..n_alleles).map(|a| format!("{:.2}", stats.dr2(a))).collect();
                     info_parts.push(format!("DR2={}", dr2_values.join(",")));
-
-                    let af_values: Vec<String> = (1..n_alleles)
-                        .map(|a| format!("{:.4}", stats.allele_freq(a)))
-                        .collect();
+                    let af_values: Vec<String> = (1..n_alleles).map(|a| format!("{:.4}", stats.allele_freq(a))).collect();
                     info_parts.push(format!("AF={}", af_values.join(",")));
                 }
+                if stats.is_imputed { info_parts.push("IMP".to_string()); }
+                if info_parts.is_empty() { ".".to_string() } else { info_parts.join(";") }
+            } else { ".".to_string() };
 
-                if stats.is_imputed {
-                    info_parts.push("IMP".to_string());
-                }
-
-                if info_parts.is_empty() {
-                    ".".to_string()
-                } else {
-                    info_parts.join(";")
-                }
-            } else {
-                ".".to_string()
-            };
-
-            // Write fixed fields with INFO
-            write!(
-                self.writer,
-                "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
+            write!(self.writer, "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
                 matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
                 marker.pos,
                 marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
                 marker.ref_allele,
-                marker
-                    .alt_alleles
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                info_field,
-                format_str
-            )?;
+                marker.alt_alleles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","),
+                info_field, format_str)?;
 
-            // Write genotypes with probabilities
             for s in 0..n_samples {
-                // Dosage
-                let ds_idx = local_m * n_samples + s;
-                let ds = dosages.get(ds_idx).copied().unwrap_or(0.0);
+                let ds = get_dosage(m, s);
+                let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
+                let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
+                    (p1.max_allele(), p2.max_allele())
+                } else { gt_from_dosage(ds) };
 
-                // Get posteriors for this sample
-                let (post1, post2) = if let Some(all_posts) = posteriors {
-                    if let Some(&(p1, p2)) = all_posts.get(local_m).and_then(|mp| mp.get(s)) {
-                        (Some(p1), Some(p2))
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (None, None)
-                };
-
-                // GT: Find most likely allele for each haplotype
-                let a1 = post1.map(|p| p.max_allele()).unwrap_or(0);
-                let a2 = post2.map(|p| p.max_allele()).unwrap_or(0);
-
-                // Start building sample field
                 write!(self.writer, "\t{}|{}:{:.2}", a1, a2, ds)?;
 
-                // GP: Genotype probabilities - N*(N+1)/2 values per VCF spec
                 if include_gp {
-                    if let (Some(p1), Some(p2)) = (post1, post2) {
+                    if let Some((ref p1, ref p2)) = posteriors {
                         write!(self.writer, ":")?;
                         let mut first = true;
                         for i2 in 0..n_alleles {
                             for i1 in 0..=i2 {
                                 if !first { write!(self.writer, ",")?; }
                                 first = false;
-                                // P(genotype i1/i2) = P(hap1=i1)*P(hap2=i2) + P(hap1=i2)*P(hap2=i1) if i1!=i2
-                                let prob = if i1 == i2 {
-                                    p1.prob(i1) * p2.prob(i2)
-                                } else {
-                                    p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1)
-                                };
+                                let prob = if i1 == i2 { p1.prob(i1) * p2.prob(i2) }
+                                    else { p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1) };
                                 write!(self.writer, "{:.2}", prob)?;
                             }
                         }
                     } else {
-                        // Fallback: output zeros
-                        let n_gp = n_alleles * (n_alleles + 1) / 2;
-                        write!(self.writer, ":{}", vec!["0.00"; n_gp].join(","))?;
+                        write!(self.writer, ":{}", vec!["0.00"; n_alleles * (n_alleles + 1) / 2].join(","))?;
                     }
                 }
 
-                // AP1, AP2: Per-haplotype per-allele probabilities (ALT alleles only per VCF spec)
                 if include_ap {
-                    // AP1: probabilities for haplotype 1 (each ALT allele)
-                    write!(self.writer, ":")?;
-                    if let Some(p1) = post1 {
-                        let ap1_str: Vec<String> = (1..n_alleles)
-                            .map(|a| format!("{:.2}", p1.prob(a)))
-                            .collect();
-                        write!(self.writer, "{}", if ap1_str.is_empty() { "0.00".to_string() } else { ap1_str.join(",") })?;
+                    if let Some((ref p1, ref p2)) = posteriors {
+                        write!(self.writer, ":")?;
+                        let ap1: Vec<String> = (1..n_alleles).map(|a| format!("{:.2}", p1.prob(a))).collect();
+                        write!(self.writer, "{}", if ap1.is_empty() { "0.00".to_string() } else { ap1.join(",") })?;
+                        write!(self.writer, ":")?;
+                        let ap2: Vec<String> = (1..n_alleles).map(|a| format!("{:.2}", p2.prob(a))).collect();
+                        write!(self.writer, "{}", if ap2.is_empty() { "0.00".to_string() } else { ap2.join(",") })?;
                     } else {
-                        write!(self.writer, "{}", vec!["0.00"; n_alleles.saturating_sub(1).max(1)].join(","))?;
-                    }
-                    // AP2: probabilities for haplotype 2
-                    write!(self.writer, ":")?;
-                    if let Some(p2) = post2 {
-                        let ap2_str: Vec<String> = (1..n_alleles)
-                            .map(|a| format!("{:.2}", p2.prob(a)))
-                            .collect();
-                        write!(self.writer, "{}", if ap2_str.is_empty() { "0.00".to_string() } else { ap2_str.join(",") })?;
-                    } else {
-                        write!(self.writer, "{}", vec!["0.00"; n_alleles.saturating_sub(1).max(1)].join(","))?;
+                        let n_ap = n_alleles.saturating_sub(1).max(1);
+                        write!(self.writer, ":{}", vec!["0.00"; n_ap].join(","))?;
+                        write!(self.writer, ":{}", vec!["0.00"; n_ap].join(","))?;
                     }
                 }
             }
             writeln!(self.writer)?;
         }
-
         Ok(())
     }
 

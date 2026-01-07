@@ -828,54 +828,43 @@ impl ImputationPipeline {
             }
         }
 
-        // Flatten dosages for output (marker-major order for the writer)
-        // Reorder from [sample][marker] to [marker][sample]
-        let mut flat_dosages: Vec<f32> = Vec::with_capacity(n_ref_markers * n_target_samples);
-        for m in 0..n_ref_markers {
-            for s in 0..n_target_samples {
-                flat_dosages.push(sample_results[s].0[m]);
-            }
-        }
-
-        // Reorganize posteriors if needed: [marker][sample] -> (hap1_posteriors, hap2_posteriors)
-        // Uses references to avoid cloning the AllelePosteriors enums
-        let posteriors_by_marker: Option<Vec<Vec<(&AllelePosteriors, &AllelePosteriors)>>> = if need_allele_probs {
-            let mut marker_posts = Vec::with_capacity(n_ref_markers);
-            for m in 0..n_ref_markers {
-                let mut sample_posts = Vec::with_capacity(n_target_samples);
-                for s in 0..n_target_samples {
-                    if let Some(ref posts) = sample_results[s].1 {
-                        sample_posts.push((&posts[m].0, &posts[m].1));
-                    }
-                }
-                marker_posts.push(sample_posts);
-            }
-            Some(marker_posts)
-        } else {
-            None
-        };
-
-        // Write output with quality metrics
+        // STREAMING OUTPUT: No flat_dosages allocation!
+        // Access sample_results directly via closures during write.
+        // Memory savings: eliminates O(n_markers * n_samples) transposed array
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples)?;
         writer.write_header_extended(ref_gt.markers(), true, self.config.gp, self.config.ap)?;
 
-        // Use appropriate writer method based on AP/GP flags
-        if need_allele_probs {
-            writer.write_imputed_with_posteriors(
-                &ref_gt,
-                &flat_dosages,
-                posteriors_by_marker.as_ref(),
-                &quality,
-                0,
-                n_ref_markers,
-                self.config.gp,
-                self.config.ap,
-            )?;
-        } else {
-            writer.write_imputed_with_quality(&ref_gt, &flat_dosages, &quality, 0, n_ref_markers)?;
-        }
+        // Streaming closure: get dosage directly from sample-major storage
+        let get_dosage = |m: usize, s: usize| -> f32 {
+            sample_results[s].0[m]
+        };
+
+        // Streaming closure: get posteriors (clones one at a time during write)
+        let get_posteriors: Option<Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>> =
+            if need_allele_probs {
+                Some(Box::new(|m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
+                    if let Some(ref posts) = sample_results[s].1 {
+                        (posts[m].0.clone(), posts[m].1.clone())
+                    } else {
+                        (AllelePosteriors::Biallelic(0.0), AllelePosteriors::Biallelic(0.0))
+                    }
+                }))
+            } else {
+                None
+            };
+
+        writer.write_imputed_streaming(
+            &ref_gt,
+            get_dosage,
+            get_posteriors,
+            &quality,
+            0,
+            n_ref_markers,
+            self.config.gp,
+            self.config.ap,
+        )?;
         writer.flush()?;
 
         eprintln!("Imputation complete!");
