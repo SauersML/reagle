@@ -748,3 +748,247 @@ fn test_phasing_perfect_ld() {
     }
 }
 
+// Difficult edge case tests to expose potential issues
+
+/// Test imputation of a singleton (variant present in only ONE reference haplotype)
+/// This is the hardest case for imputation - must correctly identify the single carrier
+#[test]
+fn test_singleton_imputation() {
+    // Reference panel: 100 haplotypes, marker 5 is a singleton (only hap 0 has ALT)
+    let n_ref_markers = 20;
+    let n_ref_samples = 50; // 100 haplotypes
+    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 50000 + 1).collect();
+
+    // Singleton at marker 5 - only haplotype 0 carries the ALT allele
+    let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
+        .positions(positions.clone())
+        .allele_generator(|m, h| {
+            if m == 5 && h == 0 { 1 } // Singleton on haplotype 0
+            else if m != 5 && h < 10 { 1 } // Some variation on other markers
+            else { 0 }
+        })
+        .build();
+
+    // Target: sparse panel with markers 0, 10, 19 genotyped
+    // Target should be similar to haplotype 0 to test singleton imputation
+    let target_file = SyntheticVcfBuilder::new(n_ref_markers, 1)
+        .positions(positions)
+        .allele_generator(|m, h| {
+            // Markers 0, 10, 19 are genotyped; match haplotype 0's pattern
+            if m == 0 || m == 10 || m == 19 {
+                if h == 0 { 1 } else { 0 } // Haplotype 0 matches ref hap 0
+            } else {
+                255 // Missing
+            }
+        })
+        .build();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("output_singleton");
+
+    let mut config = default_test_config();
+    config.gt = target_file.path().to_path_buf();
+    config.r#ref = Some(ref_file.path().to_path_buf());
+    config.out = out_prefix.clone();
+    config.imp_states = 50;
+    config.nthreads = Some(1);
+
+    let mut pipeline = ImputationPipeline::new(config);
+    pipeline.run().expect("Pipeline run success");
+
+    let out_vcf = temp_dir.path().join("output_singleton.vcf.gz");
+    let dosages = inspect_dosages(&out_vcf, 1);
+
+    // The singleton marker is marker 5
+    let singleton_dosage = dosages[5][0];
+    println!("Singleton dosage: {}", singleton_dosage);
+
+    // This is a STRICT test - if we correctly track IBS, we should see elevated dosage
+    // Note: this test may fail, which is useful information!
+    assert!(singleton_dosage > 0.01, "Singleton should have elevated dosage given matching background, got {}", singleton_dosage);
+}
+
+/// Test imputation with extremely high recombination rate
+/// This stress-tests the HMM's ability to handle rapid state switching
+#[test]
+fn test_high_recombination_stress() {
+    // Create a scenario with very high recombination (markers very far apart)
+    let n_ref_markers = 50;
+    let n_ref_samples = 20;
+    // 1 cM spacing between each marker = 50 cM total, extremely high recombination
+    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 1000000 + 1).collect();
+
+    // Alternating haplotype blocks in reference
+    let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
+        .positions(positions.clone())
+        .allele_generator(|m, h| {
+            // Create distinct haplotype patterns
+            ((m + h) % 2) as u8
+        })
+        .build();
+
+    // Target with sparse genotyping
+    let target_file = SyntheticVcfBuilder::new(n_ref_markers, 5)
+        .positions(positions)
+        .allele_generator(|m, _| {
+            if m % 5 == 0 { 0 } // Genotyped every 5th marker
+            else { 255 } // Missing
+        })
+        .build();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("output_high_recomb");
+
+    let mut config = default_test_config();
+    config.gt = target_file.path().to_path_buf();
+    config.r#ref = Some(ref_file.path().to_path_buf());
+    config.out = out_prefix.clone();
+    config.imp_states = 30;
+    config.nthreads = Some(1);
+
+    let mut pipeline = ImputationPipeline::new(config);
+    pipeline.run().expect("Pipeline should not crash with high recombination");
+
+    let out_vcf = temp_dir.path().join("output_high_recomb.vcf.gz");
+    let dosages = inspect_dosages(&out_vcf, 5);
+
+    // Verify dosages are valid (between 0 and 2)
+    for (m, marker_dosages) in dosages.iter().enumerate() {
+        for (s, ds) in marker_dosages.iter().enumerate() {
+            assert!(*ds >= 0.0 && *ds <= 2.0,
+                "Dosage out of range at marker {}, sample {}: {} (should be 0-2)", m, s, ds);
+        }
+    }
+}
+
+/// Test that very dense markers (nearly zero recombination) are handled correctly
+/// This tests the HMM scaling when p_recomb approaches 0
+#[test]
+fn test_ultra_dense_markers() {
+    // Markers only 1bp apart - essentially zero recombination
+    let n_ref_markers = 100;
+    let n_ref_samples = 10;
+    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m + 1).collect();
+
+    // Strong LD pattern
+    let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
+        .positions(positions.clone())
+        .allele_generator(|_, h| {
+            // Two haplotype groups
+            if h < 10 { 0 } else { 1 }
+        })
+        .build();
+
+    // Target with every 10th marker genotyped
+    let target_file = SyntheticVcfBuilder::new(n_ref_markers, 2)
+        .positions(positions)
+        .allele_generator(|m, h| {
+            if m % 10 == 0 {
+                if h < 2 { 0 } else { 1 } // Match first group
+            } else {
+                255
+            }
+        })
+        .build();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("output_dense");
+
+    let mut config = default_test_config();
+    config.gt = target_file.path().to_path_buf();
+    config.r#ref = Some(ref_file.path().to_path_buf());
+    config.out = out_prefix.clone();
+    config.imp_states = 20;
+    config.nthreads = Some(1);
+
+    let mut pipeline = ImputationPipeline::new(config);
+    pipeline.run().expect("Pipeline should handle ultra-dense markers");
+
+    let out_vcf = temp_dir.path().join("output_dense.vcf.gz");
+    let dosages = inspect_dosages(&out_vcf, 2);
+
+    // With perfect LD, imputed dosages should be very close to 0 (match target pattern)
+    let mut sum_dosage = 0.0f32;
+    let mut count = 0;
+    for marker_dosages in &dosages {
+        for ds in marker_dosages {
+            sum_dosage += ds;
+            count += 1;
+        }
+    }
+
+    let avg_dosage = sum_dosage / count as f32;
+    println!("Average dosage: {}", avg_dosage);
+    // Target matches haplotype group 0, so average dosage should be LOW
+    assert!(avg_dosage < 0.5, "Average dosage should be low for matching haplotype group, got {}", avg_dosage);
+}
+
+/// Test imputation accuracy when target has NO overlap with reference haplotypes
+/// This is an adversarial case that should still produce reasonable uncertainty
+#[test]
+fn test_adversarial_no_match() {
+    // Reference panel with specific pattern
+    let n_ref_markers = 30;
+    let n_ref_samples = 20;
+    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 50000 + 1).collect();
+
+    let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
+        .positions(positions.clone())
+        .allele_generator(|m, _| {
+            // Reference all has same pattern: marker % 2
+            (m % 2) as u8
+        })
+        .build();
+
+    // Target has OPPOSITE pattern at genotyped sites
+    let target_file = SyntheticVcfBuilder::new(n_ref_markers, 2)
+        .positions(positions)
+        .allele_generator(|m, _| {
+            if m % 3 == 0 {
+                // Genotyped markers have opposite of reference
+                ((m + 1) % 2) as u8
+            } else {
+                255
+            }
+        })
+        .build();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("output_adversarial");
+
+    let mut config = default_test_config();
+    config.gt = target_file.path().to_path_buf();
+    config.r#ref = Some(ref_file.path().to_path_buf());
+    config.out = out_prefix.clone();
+    config.imp_states = 20;
+    config.nthreads = Some(1);
+
+    let mut pipeline = ImputationPipeline::new(config);
+    pipeline.run().expect("Pipeline should handle adversarial case");
+
+    let out_vcf = temp_dir.path().join("output_adversarial.vcf.gz");
+    let dosages = inspect_dosages(&out_vcf, 2);
+
+    // In adversarial case, dosages should show high uncertainty
+    // Count how many dosages are at extremes (confident but wrong)
+    let mut extreme_count = 0;
+    let mut total = 0;
+    for marker_dosages in &dosages {
+        for ds in marker_dosages {
+            if *ds < 0.1 || *ds > 1.9 {
+                extreme_count += 1;
+            }
+            total += 1;
+        }
+    }
+
+    let extreme_pct = extreme_count as f64 / total as f64;
+    println!("Adversarial: {} extreme predictions out of {} ({:.1}%)",
+             extreme_count, total, extreme_pct * 100.0);
+
+    // If >80% of predictions are extreme, we're being overconfident
+    assert!(extreme_pct < 0.8,
+        "Algorithm is overconfident on adversarial data: {:.1}% extreme predictions",
+        extreme_pct * 100.0);
+}
+
