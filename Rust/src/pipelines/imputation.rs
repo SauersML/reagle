@@ -36,6 +36,63 @@ pub struct ImputationPipeline {
     params: ModelParams,
 }
 
+/// A cluster of nearby genotyped markers
+///
+/// Matches Java ImpData's targClustStartEnd concept.
+/// Markers within cluster_dist cM are grouped together.
+#[derive(Clone, Debug)]
+struct MarkerCluster {
+    /// Start index in the genotyped markers array (inclusive)
+    start: usize,
+    /// End index in the genotyped markers array (exclusive)
+    end: usize,
+}
+
+/// Compute marker clusters based on genetic distance
+///
+/// Matches Java ImpData.targClustStartEnd():
+/// - Groups markers that are within cluster_dist cM of each other
+/// - Each cluster contains one or more consecutive genotyped markers
+///
+/// # Arguments
+/// * `genotyped_markers` - Indices of genotyped markers in reference space
+/// * `gen_positions` - Cumulative genetic positions for ALL reference markers
+/// * `cluster_dist` - Maximum genetic distance within a cluster (cM)
+fn compute_marker_clusters(
+    genotyped_markers: &[usize],
+    gen_positions: &[f64],
+    cluster_dist: f64,
+) -> Vec<MarkerCluster> {
+    if genotyped_markers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut clusters = Vec::new();
+    let mut cluster_start = 0;
+    let mut start_pos = gen_positions[genotyped_markers[0]];
+
+    for m in 1..genotyped_markers.len() {
+        let pos = gen_positions[genotyped_markers[m]];
+        if pos - start_pos > cluster_dist {
+            // Start new cluster
+            clusters.push(MarkerCluster {
+                start: cluster_start,
+                end: m,
+            });
+            cluster_start = m;
+            start_pos = pos;
+        }
+    }
+
+    // Add final cluster
+    clusters.push(MarkerCluster {
+        start: cluster_start,
+        end: genotyped_markers.len(),
+    });
+
+    clusters
+}
+
 /// Marker alignment between target and reference panels
 #[derive(Clone, Debug)]
 pub struct MarkerAlignment {
@@ -694,22 +751,13 @@ impl ImputationPipeline {
         let n_states = self.params.n_states;
 
         // Build genotyped markers list (reference markers that have target data)
-        // This is the sparse set the HMM will run on
-        // Wrapped in Arc to share across all haplotypes without cloning
-        let genotyped_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(
-            (0..n_ref_markers)
-                .filter(|&m| alignment.is_genotyped(m))
-                .collect()
-        );
-        let n_genotyped = genotyped_markers.len();
+        let genotyped_markers_vec: Vec<usize> = (0..n_ref_markers)
+            .filter(|&m| alignment.is_genotyped(m))
+            .collect();
+        let n_genotyped = genotyped_markers_vec.len();
         let n_to_impute = n_ref_markers - n_genotyped;
-        eprintln!(
-            "  HMM on {} genotyped markers, interpolating {} ungenotyped",
-            n_genotyped,
-            n_to_impute
-        );
 
-        // Compute cumulative genetic positions for ALL reference markers (for interpolation)
+        // Compute cumulative genetic positions for ALL reference markers
         // Wrapped in Arc to share across all haplotypes without cloning
         let gen_positions: std::sync::Arc<Vec<f64>> = {
             let mut positions = Vec::with_capacity(n_ref_markers);
@@ -724,11 +772,57 @@ impl ImputationPipeline {
             std::sync::Arc::new(positions)
         };
 
-        // Compute sparse recombination probabilities (between consecutive GENOTYPED markers)
-        // This uses the genetic distance spanning potentially many ungenotyped markers
+        // Compute marker clusters based on genetic distance (matching Java ImpData)
+        // Markers within cluster_dist cM are grouped together
+        // This affects: (1) HMM step count, (2) error rate per step, (3) state probabilities
+        let cluster_dist = self.config.cluster as f64;
+        let clusters = compute_marker_clusters(&genotyped_markers_vec, &gen_positions, cluster_dist);
+        let n_clusters = clusters.len();
+
+        eprintln!(
+            "  HMM on {} clusters ({} genotyped markers), interpolating {} ungenotyped",
+            n_clusters, n_genotyped, n_to_impute
+        );
+
+        // Compute per-marker error probabilities (matching Java ImpData.err())
+        // Error rate for each marker depends on the size of its cluster
+        let base_err_rate = self.params.p_mismatch;
+        let per_marker_err: Vec<f32> = {
+            let mut errs = Vec::with_capacity(n_genotyped);
+            for cluster in &clusters {
+                let cluster_size = cluster.end - cluster.start;
+                let cluster_err = (base_err_rate * cluster_size as f32).min(0.5);
+                // All markers in this cluster get the same error probability
+                for _ in cluster.start..cluster.end {
+                    errs.push(cluster_err);
+                }
+            }
+            errs
+        };
+
+        // Genotyped markers for interpolation (still needed for StateProbs)
+        let genotyped_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(genotyped_markers_vec.clone());
+
+        // Compute sparse recombination probabilities between CLUSTERS (not individual markers)
+        // Uses genetic distance between cluster midpoints
         let sparse_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain(genotyped_markers.windows(2).map(|w| {
-                let gen_dist = gen_positions[w[1]] - gen_positions[w[0]];
+            .chain(clusters.windows(2).map(|w| {
+                // Use midpoint of each cluster for recombination calculation
+                let mid1 = if w[0].end > w[0].start {
+                    (gen_positions[genotyped_markers[w[0].start]]
+                        + gen_positions[genotyped_markers[w[0].end - 1]])
+                        / 2.0
+                } else {
+                    gen_positions[genotyped_markers[w[0].start]]
+                };
+                let mid2 = if w[1].end > w[1].start {
+                    (gen_positions[genotyped_markers[w[1].start]]
+                        + gen_positions[genotyped_markers[w[1].end - 1]])
+                        / 2.0
+                } else {
+                    gen_positions[genotyped_markers[w[1].start]]
+                };
+                let gen_dist = mid2 - mid1;
                 self.params.p_recomb(gen_dist)
             }))
             .collect();
@@ -786,11 +880,12 @@ impl ImputationPipeline {
                         .collect();
 
                     // Run forward-backward HMM on GENOTYPED markers only (~100x faster)
+                    // Uses per-marker error probabilities (scaled by cluster size)
                     let hmm_state_probs = run_hmm_forward_backward(
                         &sparse_target_alleles,
                         &sparse_allele_match,
                         &sparse_p_recomb,
-                        self.params.p_mismatch,
+                        &per_marker_err,
                         actual_n_states,
                         workspace,
                     );
@@ -932,11 +1027,19 @@ impl ImputationPipeline {
 }
 
 /// Run forward-backward HMM on IBS-selected states
+///
+/// # Arguments
+/// * `target_alleles` - Target haplotype alleles at each marker
+/// * `allele_match` - Whether each state matches target at each marker
+/// * `p_recomb` - Per-marker recombination probabilities
+/// * `p_mismatch` - Per-marker mismatch probabilities (scaled by cluster size)
+/// * `n_states` - Number of HMM states
+/// * `workspace` - Reusable workspace for temporary storage
 fn run_hmm_forward_backward(
     target_alleles: &[u8],
     allele_match: &[Vec<bool>],
     p_recomb: &[f32],
-    p_mismatch: f32,
+    p_mismatch: &[f32],  // Changed from scalar to per-marker
     n_states: usize,
     workspace: &mut ImpWorkspace,
 ) -> Vec<f32> {
@@ -945,11 +1048,11 @@ fn run_hmm_forward_backward(
         return Vec::new();
     }
 
-    let p_match = 1.0 - p_mismatch;
-    let emit_probs = [p_match, p_mismatch];
-
     // Ensure workspace is sized correctly
     workspace.resize(n_states, n_markers);
+
+    // Default error probability if p_mismatch is empty or too short
+    let default_err = if p_mismatch.is_empty() { 0.001 } else { p_mismatch[0] };
 
     // Use pre-allocated forward storage (flat)
     let total_size = n_markers * n_states;
@@ -962,17 +1065,17 @@ fn run_hmm_forward_backward(
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / fwd_sum;
 
+        // Get per-marker error probability (scaled by cluster size)
+        let p_err = p_mismatch.get(m).copied().unwrap_or(default_err);
+        let p_match = 1.0 - p_err;
+
         let mut new_sum = 0.0f32;
         let matches = &allele_match[m];
         let row_offset = m * n_states;
         let prev_row_offset = if m > 0 { (m - 1) * n_states } else { 0 };
 
         for k in 0..n_states.min(matches.len()) {
-            let emit = if matches[k] {
-                emit_probs[0]
-            } else {
-                emit_probs[1]
-            };
+            let emit = if matches[k] { p_match } else { p_err };
 
             // Match Java exactly: m==0 uses just emission, not divided by n_states
             // Java: fwdVal[m][j] = m==0 ? em : em*(scale*fwdVal[m-1][j] + shift);
@@ -1033,13 +1136,12 @@ fn run_hmm_forward_backward(
         // Apply emission for next backward iteration
         if m > 0 {
             let matches = &allele_match[m];
+            // Get per-marker error probability (scaled by cluster size)
+            let p_err = p_mismatch.get(m).copied().unwrap_or(default_err);
+            let p_match = 1.0 - p_err;
             bwd_sum = 0.0;
             for k in 0..n_states.min(matches.len()) {
-                let emit = if matches[k] {
-                    emit_probs[0]
-                } else {
-                    emit_probs[1]
-                };
+                let emit = if matches[k] { p_match } else { p_err };
                 bwd[k] *= emit;
                 bwd_sum += bwd[k];
             }
@@ -1212,11 +1314,12 @@ mod tests {
                     .collect();
 
                 let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+                let p_err = vec![0.01f32; n_markers];
                 let posteriors = run_hmm_forward_backward(
                     &target_alleles,
                     &allele_match,
                     &p_recomb,
-                    0.01,
+                    &p_err,
                     n_states,
                     &mut workspace,
                 );
@@ -1247,11 +1350,12 @@ mod tests {
         let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.05 }).collect();
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let p_err = vec![0.01f32; n_markers];
         let posteriors = run_hmm_forward_backward(
             &target_alleles,
             &allele_match,
             &p_recomb,
-            0.01,
+            &p_err,
             n_states,
             &mut workspace,
         );
@@ -1277,11 +1381,12 @@ mod tests {
         let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.001 }).collect();
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let p_err = vec![0.001f32; n_markers];
         let posteriors = run_hmm_forward_backward(
             &target_alleles,
             &allele_match,
             &p_recomb,
-            0.001,
+            &p_err,
             n_states,
             &mut workspace,
         );
@@ -1313,11 +1418,12 @@ mod tests {
         let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.01 }).collect();
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let p_err = vec![0.01f32; n_markers];
         let posteriors = run_hmm_forward_backward(
             &target_alleles,
             &allele_match,
             &p_recomb,
-            0.01,
+            &p_err,
             n_states,
             &mut workspace,
         );
@@ -1356,9 +1462,10 @@ mod tests {
         let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.05 }).collect();
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let p_err = vec![0.01f32; n_markers];
 
-        let post1 = run_hmm_forward_backward(&target_alleles, &match1, &p_recomb, 0.01, n_states, &mut workspace);
-        let post2 = run_hmm_forward_backward(&target_alleles, &match2, &p_recomb, 0.01, n_states, &mut workspace);
+        let post1 = run_hmm_forward_backward(&target_alleles, &match1, &p_recomb, &p_err, n_states, &mut workspace);
+        let post2 = run_hmm_forward_backward(&target_alleles, &match2, &p_recomb, &p_err, n_states, &mut workspace);
 
         // Posteriors should be swapped
         for m in 0..n_markers {
@@ -1453,11 +1560,12 @@ mod tests {
         let p_recomb = vec![0.0, rho];  // First marker has 0 recomb
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 10);
+        let p_err_vec = vec![p_err; n_markers];
         let posteriors = run_hmm_forward_backward(
             &target_alleles,
             &allele_match,
             &p_recomb,
-            p_err,
+            &p_err_vec,
             n_states,
             &mut workspace,
         );
@@ -1507,11 +1615,12 @@ mod tests {
                 .collect();
 
             let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+            let p_err = vec![0.01f32; n_markers];
             let posteriors = run_hmm_forward_backward(
                 &target_alleles,
                 &allele_match,
                 &p_recomb,
-                0.01,
+                &p_err,
                 n_states,
                 &mut workspace,
             );
@@ -1551,11 +1660,12 @@ mod tests {
         let p_recomb = vec![0.0f32; n_markers];
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let p_err = vec![0.01f32; n_markers];  // small mismatch prob
         let posteriors = run_hmm_forward_backward(
             &target_alleles,
             &allele_match,
             &p_recomb,
-            0.01,  // small mismatch prob
+            &p_err,
             n_states,
             &mut workspace,
         );
