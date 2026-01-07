@@ -2,10 +2,11 @@ debug
 target
 **/*.rs.bk
 **/mutants.out*/
-‎jules.patch‎
+jules.patch
 build.log
 **/build
 Rust/.gitignore
 **/Cargo.lock
 Rust/target
-# Track test fixtures (pre-generated, no downloads needed)
+.claude/
+*.csi
