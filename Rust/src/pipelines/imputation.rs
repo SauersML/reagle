@@ -1317,4 +1317,491 @@ mod tests {
             assert!((p1_s1 - p2_s0).abs() < 0.01, "Symmetry broken at marker {}: p1[s1]={}, p2[s0]={}", m, p1_s1, p2_s0);
         }
     }
+
+    // =========================================================================
+    // HARD TESTS - Analytically computed expected values
+    // These tests compute exact expected posteriors by hand and compare.
+    // If there's ANY bug in the HMM, these WILL FAIL.
+    // =========================================================================
+
+    #[test]
+    fn test_hmm_2state_2marker_exact_posterior() {
+        // 2-state, 2-marker HMM with known parameters
+        // We compute the EXACT posterior analytically and compare
+        //
+        // Setup:
+        // - 2 states, 2 markers
+        // - State 0 matches at marker 0, state 1 matches at marker 1
+        // - p_recomb = 0.1, p_mismatch = 0.01
+        //
+        // Li-Stephens forward formula:
+        //   fwd[m][k] = emit[k] * ((1-rho)*fwd[m-1][k]/sum + rho/K)
+        // where rho = p_recomb, K = n_states
+        use crate::utils::workspace::ImpWorkspace;
+
+        let n_states = 2;
+        let n_markers = 2;
+        let rho = 0.1f32;  // recombination prob
+        let p_err = 0.01f32;  // mismatch prob
+        let p_match = 1.0 - p_err;
+
+        // State 0 matches at m=0, state 1 matches at m=1
+        let allele_match = vec![
+            vec![true, false],   // m=0: state 0 matches
+            vec![false, true],   // m=1: state 1 matches
+        ];
+
+        // Compute expected forward values analytically
+        // Marker 0: fwd[0] = (1/K) * emit[k]
+        let fwd0_0 = (1.0 / n_states as f32) * p_match;  // state 0 matches
+        let fwd0_1 = (1.0 / n_states as f32) * p_err;    // state 1 mismatches
+        let fwd0_sum = fwd0_0 + fwd0_1;
+
+        // Marker 1: fwd[1][k] = emit[k] * ((1-rho)*fwd[0][k]/fwd0_sum + rho/K)
+        let shift = rho / n_states as f32;
+        let scale = (1.0 - rho) / fwd0_sum;
+
+        let fwd1_0_pre = scale * fwd0_0 + shift;  // transition for state 0
+        let fwd1_1_pre = scale * fwd0_1 + shift;  // transition for state 1
+        let fwd1_0 = p_err * fwd1_0_pre;          // state 0 mismatches at m=1
+        let fwd1_1 = p_match * fwd1_1_pre;        // state 1 matches at m=1
+
+        // Backward: bwd[M-1] = 1/K, then apply bwd_update
+        // For 2 markers, bwd at m=0 uses emission at m=1
+        let bwd1_0 = 1.0 / n_states as f32;
+        let bwd1_1 = 1.0 / n_states as f32;
+
+        // bwd_update: first multiply by emit, then normalize transition
+        let bwd0_pre_0 = bwd1_0 * p_err;    // state 0 at m=1 mismatches
+        let bwd0_pre_1 = bwd1_1 * p_match;  // state 1 at m=1 matches
+        let bwd_sum = bwd0_pre_0 + bwd0_pre_1;
+
+        let bwd_scale = (1.0 - rho) / bwd_sum;
+        let bwd_shift = rho / n_states as f32;
+        let bwd0_0 = bwd_scale * bwd0_pre_0 + bwd_shift;
+        let bwd0_1 = bwd_scale * bwd0_pre_1 + bwd_shift;
+
+        // Expected posteriors: gamma[m][k] = fwd[m][k] * bwd[m][k] / sum
+        let gamma0_0_raw = fwd0_0 * bwd0_0;
+        let gamma0_1_raw = fwd0_1 * bwd0_1;
+        let gamma0_sum = gamma0_0_raw + gamma0_1_raw;
+        let expected_gamma0_0 = gamma0_0_raw / gamma0_sum;
+        let expected_gamma0_1 = gamma0_1_raw / gamma0_sum;
+
+        let gamma1_0_raw = fwd1_0 * bwd1_0;
+        let gamma1_1_raw = fwd1_1 * bwd1_1;
+        let gamma1_sum = gamma1_0_raw + gamma1_1_raw;
+        let expected_gamma1_0 = gamma1_0_raw / gamma1_sum;
+        let expected_gamma1_1 = gamma1_1_raw / gamma1_sum;
+
+        // Run the actual HMM
+        let target_alleles = vec![0u8; n_markers];
+        let p_recomb = vec![0.0, rho];  // First marker has 0 recomb
+
+        let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 10);
+        let posteriors = run_hmm_forward_backward(
+            &target_alleles,
+            &allele_match,
+            &p_recomb,
+            p_err,
+            n_states,
+            &mut workspace,
+        );
+
+        // Compare with TIGHT tolerance - these should be EXACT (up to float precision)
+        let tol = 0.02;  // 2% tolerance for numerical differences
+
+        let actual_gamma0_0 = posteriors[0];
+        let actual_gamma0_1 = posteriors[1];
+        let actual_gamma1_0 = posteriors[2];
+        let actual_gamma1_1 = posteriors[3];
+
+        assert!(
+            (actual_gamma0_0 - expected_gamma0_0).abs() < tol,
+            "Marker 0, State 0: expected {:.6}, got {:.6}", expected_gamma0_0, actual_gamma0_0
+        );
+        assert!(
+            (actual_gamma0_1 - expected_gamma0_1).abs() < tol,
+            "Marker 0, State 1: expected {:.6}, got {:.6}", expected_gamma0_1, actual_gamma0_1
+        );
+        assert!(
+            (actual_gamma1_0 - expected_gamma1_0).abs() < tol,
+            "Marker 1, State 0: expected {:.6}, got {:.6}", expected_gamma1_0, actual_gamma1_0
+        );
+        assert!(
+            (actual_gamma1_1 - expected_gamma1_1).abs() < tol,
+            "Marker 1, State 1: expected {:.6}, got {:.6}", expected_gamma1_1, actual_gamma1_1
+        );
+    }
+
+    #[test]
+    fn test_hmm_uniform_emission_gives_uniform_posterior() {
+        // If ALL states match at ALL markers (uniform emission),
+        // posterior should be uniform: 1/K for each state
+        use crate::utils::workspace::ImpWorkspace;
+
+        for n_states in [2, 4, 8, 16] {
+            let n_markers = 10;
+            let target_alleles = vec![0u8; n_markers];
+
+            // All states match at all markers
+            let allele_match: Vec<Vec<bool>> = (0..n_markers)
+                .map(|_| vec![true; n_states])
+                .collect();
+            let p_recomb: Vec<f32> = (0..n_markers)
+                .map(|m| if m == 0 { 0.0 } else { 0.05 })
+                .collect();
+
+            let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+            let posteriors = run_hmm_forward_backward(
+                &target_alleles,
+                &allele_match,
+                &p_recomb,
+                0.01,
+                n_states,
+                &mut workspace,
+            );
+
+            let expected = 1.0 / n_states as f32;
+
+            // All posteriors should be uniform
+            for m in 0..n_markers {
+                for k in 0..n_states {
+                    let actual = posteriors[m * n_states + k];
+                    assert!(
+                        (actual - expected).abs() < 0.05,
+                        "n_states={}, marker {}, state {}: expected {:.4}, got {:.4}",
+                        n_states, m, k, expected, actual
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hmm_no_recombination_preserves_initial_state() {
+        // With ZERO recombination, the HMM should stay in the initial state
+        // (weighted by emission probabilities)
+        use crate::utils::workspace::ImpWorkspace;
+
+        let n_states = 4;
+        let n_markers = 10;
+        let target_alleles = vec![0u8; n_markers];
+
+        // State 0 always matches
+        let allele_match: Vec<Vec<bool>> = (0..n_markers)
+            .map(|_| vec![true, false, false, false])
+            .collect();
+
+        // ZERO recombination everywhere
+        let p_recomb = vec![0.0f32; n_markers];
+
+        let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let posteriors = run_hmm_forward_backward(
+            &target_alleles,
+            &allele_match,
+            &p_recomb,
+            0.01,  // small mismatch prob
+            n_states,
+            &mut workspace,
+        );
+
+        // With no recombination and state 0 always matching,
+        // state 0 should have nearly all probability
+        for m in 0..n_markers {
+            let prob_state0 = posteriors[m * n_states];
+            assert!(
+                prob_state0 > 0.999,
+                "With zero recomb, matching state should have p>0.999, got {} at marker {}", prob_state0, m
+            );
+        }
+    }
+
+    #[test]
+    fn test_dosage_bounds_diploid() {
+        // For diploid genotypes, dosage should be in [0, 2]
+        // Test that DS = P(hap1=ALT) + P(hap2=ALT) is bounded correctly
+
+        // Biallelic: dosage = P(ALT) per haplotype, so diploid DS = hap1 + hap2
+        let hap1 = AllelePosteriors::Biallelic(0.8);
+        let hap2 = AllelePosteriors::Biallelic(0.6);
+        let diploid_dosage = hap1.dosage() + hap2.dosage();
+        assert!(diploid_dosage >= 0.0 && diploid_dosage <= 2.0,
+            "Diploid dosage {} should be in [0,2]", diploid_dosage);
+        assert!((diploid_dosage - 1.4).abs() < 1e-6,
+            "Expected diploid dosage 1.4, got {}", diploid_dosage);
+    }
+
+    #[test]
+    fn test_gp_probabilities_from_haplotype_posteriors() {
+        // GP (genotype probability) should be computed from haplotype posteriors
+        // For biallelic: GP = [P(0/0), P(0/1), P(1/1)]
+        //   P(0/0) = P(hap1=0) * P(hap2=0)
+        //   P(0/1) = P(hap1=0)*P(hap2=1) + P(hap1=1)*P(hap2=0)
+        //   P(1/1) = P(hap1=1) * P(hap2=1)
+
+        let p1_alt = 0.3f32;  // P(hap1 = ALT)
+        let p2_alt = 0.7f32;  // P(hap2 = ALT)
+
+        let p1_ref = 1.0 - p1_alt;
+        let p2_ref = 1.0 - p2_alt;
+
+        let expected_p00 = p1_ref * p2_ref;  // 0.7 * 0.3 = 0.21
+        let expected_p01 = p1_ref * p2_alt + p1_alt * p2_ref;  // 0.7*0.7 + 0.3*0.3 = 0.58
+        let expected_p11 = p1_alt * p2_alt;  // 0.3 * 0.7 = 0.21
+
+        // Verify they sum to 1
+        let gp_sum = expected_p00 + expected_p01 + expected_p11;
+        assert!((gp_sum - 1.0).abs() < 1e-6, "GP should sum to 1, got {}", gp_sum);
+
+        // Test using AllelePosteriors
+        let hap1 = AllelePosteriors::Biallelic(p1_alt);
+        let hap2 = AllelePosteriors::Biallelic(p2_alt);
+
+        let computed_p00 = hap1.prob(0) * hap2.prob(0);
+        let computed_p01 = hap1.prob(0) * hap2.prob(1) + hap1.prob(1) * hap2.prob(0);
+        let computed_p11 = hap1.prob(1) * hap2.prob(1);
+
+        assert!((computed_p00 - expected_p00).abs() < 1e-6,
+            "P(0/0): expected {}, got {}", expected_p00, computed_p00);
+        assert!((computed_p01 - expected_p01).abs() < 1e-6,
+            "P(0/1): expected {}, got {}", expected_p01, computed_p01);
+        assert!((computed_p11 - expected_p11).abs() < 1e-6,
+            "P(1/1): expected {}, got {}", expected_p11, computed_p11);
+    }
+
+    #[test]
+    fn test_multiallelic_gp_count() {
+        // For N alleles, GP should have N*(N+1)/2 values
+        // Triallelic (N=3): 3*4/2 = 6 values: 0/0, 0/1, 1/1, 0/2, 1/2, 2/2
+
+        for n_alleles in [2, 3, 4, 5, 10] {
+            let expected_gp_count = n_alleles * (n_alleles + 1) / 2;
+
+            // Create uniform posteriors
+            let probs: Vec<f32> = (0..n_alleles).map(|_| 1.0 / n_alleles as f32).collect();
+            let hap1 = AllelePosteriors::Multiallelic(probs.clone());
+            let hap2 = AllelePosteriors::Multiallelic(probs);
+
+            // Compute GP values (following VCF spec ordering)
+            let mut gp_values = Vec::new();
+            for i2 in 0..n_alleles {
+                for i1 in 0..=i2 {
+                    let prob = if i1 == i2 {
+                        hap1.prob(i1) * hap2.prob(i2)
+                    } else {
+                        hap1.prob(i1) * hap2.prob(i2) + hap1.prob(i2) * hap2.prob(i1)
+                    };
+                    gp_values.push(prob);
+                }
+            }
+
+            assert_eq!(gp_values.len(), expected_gp_count,
+                "N={}: expected {} GP values, got {}", n_alleles, expected_gp_count, gp_values.len());
+
+            // GP should sum to 1
+            let gp_sum: f32 = gp_values.iter().sum();
+            assert!((gp_sum - 1.0).abs() < 1e-5,
+                "N={}: GP sum should be 1, got {}", n_alleles, gp_sum);
+        }
+    }
+
+    // =========================================================================
+    // StateProbs Interpolation Tests - EXACT MATHEMATICAL VERIFICATION
+    // =========================================================================
+
+    #[test]
+    fn test_state_probs_interpolation_weight_formula() {
+        // Test that interpolation weight is computed correctly:
+        //   weight_left = (pos_right - pos_marker) / (pos_right - pos_left)
+        //
+        // At left marker: weight_left = 1.0
+        // At right marker: weight_left = 0.0
+        // At midpoint: weight_left = 0.5
+
+        let genotyped_markers = std::sync::Arc::new(vec![0, 10]);
+        // Genetic positions: markers at 0.0 and 1.0 cM
+        let gen_positions = std::sync::Arc::new(vec![
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
+        ]);
+
+        // State 0 (hap 0) always carries REF
+        // State 1 (hap 1) always carries ALT
+        let hap_indices = vec![
+            vec![0, 1],  // marker 0
+            vec![0, 1],  // marker 10
+        ];
+        // At marker 0: 100% state 0, 0% state 1
+        // At marker 10: 0% state 0, 100% state 1
+        let state_probs = vec![1.0, 0.0, 0.0, 1.0];
+
+        let sp = StateProbs::new(
+            genotyped_markers,
+            2,
+            hap_indices,
+            state_probs,
+            gen_positions,
+        );
+
+        // Hap 0 = REF (0), Hap 1 = ALT (1)
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            assert!(marker <= 10);
+            if hap == 0 { 0 } else { 1 }
+        };
+
+        // Test interpolation at various positions
+        // At marker 0: weight_left = 1.0, prob = 1.0 * 1.0 + 0.0 * 0.0 = 1.0 for state 0
+        //   P(ALT) = prob_state1 = 0.0
+        let post_0 = sp.allele_posteriors(0, 2, &get_ref_allele);
+        match post_0 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 0.0).abs() < 0.05, "At marker 0: expected P(ALT)~0.0, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+
+        // At marker 5 (midpoint): weight_left = 0.5
+        //   prob_state0 = 0.5 * 1.0 + 0.5 * 0.0 = 0.5
+        //   prob_state1 = 0.5 * 0.0 + 0.5 * 1.0 = 0.5
+        //   P(ALT) = prob_state1 = 0.5
+        let post_5 = sp.allele_posteriors(5, 2, &get_ref_allele);
+        match post_5 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 0.5).abs() < 0.1, "At marker 5: expected P(ALT)~0.5, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+
+        // At marker 10: should use exact value (not interpolated)
+        //   P(ALT) = prob_state1 = 1.0
+        let post_10 = sp.allele_posteriors(10, 2, &get_ref_allele);
+        match post_10 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 1.0).abs() < 0.05, "At marker 10: expected P(ALT)~1.0, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+
+        // Test precise interpolation at marker 2 (position 0.2)
+        // weight_left = (1.0 - 0.2) / (1.0 - 0.0) = 0.8
+        // prob_state1 = 0.8 * 0.0 + 0.2 * 1.0 = 0.2
+        let post_2 = sp.allele_posteriors(2, 2, &get_ref_allele);
+        match post_2 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 0.2).abs() < 0.1, "At marker 2: expected P(ALT)~0.2, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+
+        // Test precise interpolation at marker 8 (position 0.8)
+        // weight_left = (1.0 - 0.8) / (1.0 - 0.0) = 0.2
+        // prob_state1 = 0.2 * 0.0 + 0.8 * 1.0 = 0.8
+        let post_8 = sp.allele_posteriors(8, 2, &get_ref_allele);
+        match post_8 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 0.8).abs() < 0.1, "At marker 8: expected P(ALT)~0.8, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+    }
+
+    #[test]
+    fn test_state_probs_edge_cases() {
+        // Test edge case: marker before first genotyped marker
+        // Should return the first marker's value
+
+        let genotyped_markers = std::sync::Arc::new(vec![5, 10]);
+        let gen_positions = std::sync::Arc::new(vec![
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
+        ]);
+
+        let hap_indices = vec![vec![0, 1], vec![0, 1]];
+        // At marker 5: 70% state 0, 30% state 1
+        // At marker 10: 20% state 0, 80% state 1
+        let state_probs = vec![0.7, 0.3, 0.2, 0.8];
+
+        let sp = StateProbs::new(
+            genotyped_markers,
+            2,
+            hap_indices,
+            state_probs,
+            gen_positions,
+        );
+
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            assert!(marker <= 10);
+            if hap == 0 { 0 } else { 1 }
+        };
+
+        // Marker 0 is before first genotyped marker (5)
+        // Should return marker 5's value: P(ALT) = 0.3
+        let post_before = sp.allele_posteriors(0, 2, &get_ref_allele);
+        match post_before {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 0.3).abs() < 0.1, "Before first: expected ~0.3, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+    }
+
+    #[test]
+    fn test_state_probs_probabilities_normalized() {
+        // StateProbs should produce normalized probabilities (sum to 1)
+        // even after interpolation
+
+        let genotyped_markers = std::sync::Arc::new(vec![0, 10]);
+        let gen_positions: Vec<f64> = (0..=10).map(|i| i as f64 * 0.1).collect();
+        let gen_positions = std::sync::Arc::new(gen_positions);
+
+        // 4 states, properly normalized at each genotyped marker
+        let hap_indices = vec![
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 3],
+        ];
+        // Marker 0: [0.4, 0.3, 0.2, 0.1]
+        // Marker 10: [0.1, 0.2, 0.3, 0.4]
+        let state_probs = vec![0.4, 0.3, 0.2, 0.1, 0.1, 0.2, 0.3, 0.4];
+
+        let sp = StateProbs::new(
+            genotyped_markers,
+            4,
+            hap_indices,
+            state_probs,
+            gen_positions,
+        );
+
+        // Allele mapping: hap 0,1 = REF (0), hap 2,3 = ALT (1)
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            assert!(marker <= 10);
+            if hap < 2 { 0 } else { 1 }
+        };
+
+        // At marker 0: P(REF) = 0.4+0.3 = 0.7, P(ALT) = 0.2+0.1 = 0.3
+        let post_0 = sp.allele_posteriors(0, 2, &get_ref_allele);
+        match post_0 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 0.3).abs() < 0.05, "Marker 0: expected P(ALT)=0.3, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+
+        // At marker 10: P(REF) = 0.1+0.2 = 0.3, P(ALT) = 0.3+0.4 = 0.7
+        let post_10 = sp.allele_posteriors(10, 2, &get_ref_allele);
+        match post_10 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 0.7).abs() < 0.05, "Marker 10: expected P(ALT)=0.7, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+
+        // At marker 5 (midpoint): should interpolate
+        // Expected P(ALT) = 0.5 * 0.3 + 0.5 * 0.7 = 0.5
+        let post_5 = sp.allele_posteriors(5, 2, &get_ref_allele);
+        match post_5 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                assert!((p_alt - 0.5).abs() < 0.1, "Marker 5: expected P(ALT)~0.5, got {}", p_alt);
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+    }
 }

@@ -597,4 +597,169 @@ mod tests {
         assert_eq!(bwd.len(), 5 * 6);
         assert!(log_likelihood.is_finite());
     }
+
+    // =========================================================================
+    // Rigorous HMM Updater Tests
+    // =========================================================================
+
+    #[test]
+    fn test_fwd_update_preserves_probability_mass() {
+        // After forward update, values should remain valid probabilities
+        for n_states in [4, 8, 16, 32] {
+            let mut fwd = vec![1.0 / n_states as f32; n_states];
+            let emit_probs = [0.99f32, 0.01];
+            let mismatches: Vec<u8> = (0..n_states).map(|k| (k % 2) as u8).collect();
+
+            let initial_sum: f32 = fwd.iter().sum();
+            let new_sum = HmmUpdater::fwd_update(&mut fwd, initial_sum, 0.05, &emit_probs, &mismatches, n_states);
+
+            // All values should be positive
+            for (k, &val) in fwd.iter().enumerate() {
+                assert!(val >= 0.0, "fwd[{}] = {} is negative", k, val);
+                assert!(val.is_finite(), "fwd[{}] = {} is not finite", k, val);
+            }
+
+            // Sum should be positive and finite
+            assert!(new_sum > 0.0, "new_sum {} should be positive", new_sum);
+            assert!(new_sum.is_finite(), "new_sum {} should be finite", new_sum);
+
+            // Verify returned sum matches actual sum
+            let actual_sum: f32 = fwd.iter().sum();
+            assert!(
+                (new_sum - actual_sum).abs() < 1e-5,
+                "Returned sum {} != actual sum {}", new_sum, actual_sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_bwd_update_normalizes_to_one() {
+        // After backward update, values should sum close to 1 (normalized)
+        for n_states in [4, 8, 16, 32] {
+            let mut bwd = vec![1.0 / n_states as f32; n_states];
+            let emit_probs = [0.99f32, 0.01];
+            let mismatches: Vec<u8> = (0..n_states).map(|k| (k % 2) as u8).collect();
+
+            HmmUpdater::bwd_update(&mut bwd, 0.05, &emit_probs, &mismatches, n_states);
+
+            // All values should be positive
+            for (k, &val) in bwd.iter().enumerate() {
+                assert!(val >= 0.0, "bwd[{}] = {} is negative", k, val);
+                assert!(val.is_finite(), "bwd[{}] = {} is not finite", k, val);
+            }
+
+            // Sum should be close to 1 after normalization
+            let sum: f32 = bwd.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 0.01,
+                "bwd sum {} should be ~1.0 (n_states={})", sum, n_states
+            );
+        }
+    }
+
+    #[test]
+    fn test_fwd_update_favors_matching_states() {
+        // States that match (mismatch=0) should have higher probability than mismatching states
+        let n_states = 8;
+        let mut fwd = vec![1.0 / n_states as f32; n_states];
+        let emit_probs = [0.99f32, 0.01]; // Strong preference for match
+
+        // First 4 states match, last 4 mismatch
+        let mismatches: Vec<u8> = vec![0, 0, 0, 0, 1, 1, 1, 1];
+
+        let initial_sum: f32 = fwd.iter().sum();
+        HmmUpdater::fwd_update(&mut fwd, initial_sum, 0.001, &emit_probs, &mismatches, n_states);
+
+        // Matching states should have higher values
+        let match_sum: f32 = fwd[0..4].iter().sum();
+        let mismatch_sum: f32 = fwd[4..8].iter().sum();
+
+        assert!(
+            match_sum > mismatch_sum * 10.0,
+            "Matching states ({}) should dominate mismatching ({})", match_sum, mismatch_sum
+        );
+    }
+
+    #[test]
+    fn test_simd_vectorized_matches_scalar() {
+        // Test that SIMD and scalar paths produce identical results
+        // by testing with n_states = 8 (pure SIMD) and n_states = 11 (SIMD + scalar tail)
+        for n_states in [8, 11, 16, 17, 24, 25] {
+            let initial_fwd: Vec<f32> = (0..n_states).map(|k| (k as f32 + 1.0) / 100.0).collect();
+            let initial_sum: f32 = initial_fwd.iter().sum();
+            let emit_probs = [0.95f32, 0.05];
+            let mismatches: Vec<u8> = (0..n_states).map(|k| ((k * 3) % 2) as u8).collect();
+
+            // Run forward update
+            let mut fwd = initial_fwd.clone();
+            let new_sum = HmmUpdater::fwd_update(&mut fwd, initial_sum, 0.02, &emit_probs, &mismatches, n_states);
+
+            // Verify basic properties
+            assert!(new_sum > 0.0);
+            let actual_sum: f32 = fwd.iter().sum();
+            assert!(
+                (new_sum - actual_sum).abs() < 1e-4,
+                "n_states={}: sum mismatch {} vs {}", n_states, new_sum, actual_sum
+            );
+
+            // Run backward update
+            let mut bwd: Vec<f32> = (0..n_states).map(|k| (k as f32 + 1.0) / 100.0).collect();
+            HmmUpdater::bwd_update(&mut bwd, 0.02, &emit_probs, &mismatches, n_states);
+
+            let bwd_sum: f32 = bwd.iter().sum();
+            assert!(
+                (bwd_sum - 1.0).abs() < 0.01,
+                "n_states={}: bwd sum {} should be ~1", n_states, bwd_sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_extreme_recombination_rates() {
+        // Test edge cases: no recombination and very high recombination
+        let n_states = 8;
+        let emit_probs = [0.99f32, 0.01];
+        let mismatches: Vec<u8> = vec![0, 1, 0, 1, 0, 1, 0, 1];
+
+        // Test with zero recombination (p_switch = 0)
+        let mut fwd_no_recomb = vec![0.5, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let initial_sum: f32 = fwd_no_recomb.iter().sum();
+        let new_sum = HmmUpdater::fwd_update(&mut fwd_no_recomb, initial_sum, 0.0, &emit_probs, &mismatches, n_states);
+
+        // With no recombination, only states with initial probability should have probability
+        // (though emission still affects all)
+        assert!(new_sum > 0.0);
+        assert!(new_sum.is_finite());
+
+        // Test with very high recombination (p_switch = 0.99)
+        let mut fwd_high_recomb = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let initial_sum_high: f32 = fwd_high_recomb.iter().sum();
+        HmmUpdater::fwd_update(&mut fwd_high_recomb, initial_sum_high, 0.99, &emit_probs, &mismatches, n_states);
+
+        // With high recombination, probability should spread to all states
+        let min_val = fwd_high_recomb.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            min_val > 0.0,
+            "With high recomb, all states should have some probability, min={}", min_val
+        );
+    }
+
+    #[test]
+    fn test_numerical_stability_small_values() {
+        // Test with very small initial values to check for underflow
+        let n_states = 16;
+        let mut fwd: Vec<f32> = vec![1e-30; n_states];
+        let emit_probs = [0.99f32, 0.01];
+        let mismatches: Vec<u8> = (0..n_states).map(|k| (k % 2) as u8).collect();
+
+        let initial_sum: f32 = fwd.iter().sum();
+
+        // Should not panic or produce NaN/Inf
+        let new_sum = HmmUpdater::fwd_update(&mut fwd, initial_sum, 0.01, &emit_probs, &mismatches, n_states);
+
+        assert!(new_sum.is_finite(), "new_sum should be finite, got {}", new_sum);
+        for (k, &val) in fwd.iter().enumerate() {
+            assert!(val.is_finite(), "fwd[{}] should be finite, got {}", k, val);
+        }
+    }
 }

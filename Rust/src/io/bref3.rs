@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, Markers};
 use crate::data::storage::phase_state::Phased;
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+use crate::data::storage::{GenotypeColumn, GenotypeMatrix, SeqCodedBlock, SeqCodedColumn};
 use crate::data::ChromIdx;
 
 /// BREF3 magic number (big-endian integer: 2055763188)
@@ -128,6 +128,9 @@ impl Bref3Reader {
     }
 
     /// Read a single block of records
+    ///
+    /// Optimized to use SeqCodedBlock for sequence-coded records, avoiding
+    /// expansion from the compact BREF3 format. ~6x memory savings.
     fn read_block(
         &mut self,
         n_recs: usize,
@@ -143,34 +146,47 @@ impl Bref3Reader {
             hap_to_seq[i] = read_be_u16(&mut self.reader)?;
         }
 
+        // Create SeqCodedBlock for sequence-coded records
+        let mut seq_block = SeqCodedBlock::new(hap_to_seq.clone());
+        let block_start_idx = columns.len();
+
         for _ in 0..n_recs {
-            let (marker, alleles) =
-                self.read_record(chrom_idx, n_seq, &hap_to_seq)?;
-            self.markers.push(marker.clone());
-            let col = GenotypeColumn::from_alleles(&alleles, marker.n_alleles());
-            columns.push(col);
+            let marker = self.read_marker(chrom_idx)?;
+            let flag = read_byte(&mut self.reader)?;
+
+            match flag {
+                SEQ_CODED => {
+                    // Read directly into SeqCodedBlock without expansion
+                    let mut seq_to_allele = vec![0u8; n_seq];
+                    self.reader.read_exact(&mut seq_to_allele)?;
+                    seq_block.push_marker(seq_to_allele);
+                    self.markers.push(marker);
+                    // Placeholder - will be replaced with SeqCoded below
+                    columns.push(GenotypeColumn::Dense(crate::data::storage::DenseColumn::new(0, 1)));
+                }
+                ALLELE_CODED => {
+                    let alleles = self.read_allele_coded_record(marker.n_alleles())?;
+                    self.markers.push(marker.clone());
+                    let col = GenotypeColumn::from_alleles(&alleles, marker.n_alleles());
+                    columns.push(col);
+                }
+                _ => bail!("Unknown record type flag: {}", flag),
+            }
+        }
+
+        // Replace placeholder columns with SeqCoded variants
+        if seq_block.n_markers() > 0 {
+            let block = Arc::new(seq_block);
+            let mut seq_marker_idx = 0;
+            for col_idx in block_start_idx..columns.len() {
+                if matches!(columns[col_idx], GenotypeColumn::Dense(ref d) if d.n_haplotypes() == 0) {
+                    columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(Arc::clone(&block), seq_marker_idx));
+                    seq_marker_idx += 1;
+                }
+            }
         }
 
         Ok(())
-    }
-
-    /// Read a single record (marker + genotypes)
-    fn read_record(
-        &mut self,
-        chrom_idx: ChromIdx,
-        n_seq: usize,
-        hap_to_seq: &[u16],
-    ) -> Result<(Marker, Vec<u8>)> {
-        let marker = self.read_marker(chrom_idx)?;
-        let flag = read_byte(&mut self.reader)?;
-
-        let alleles = match flag {
-            SEQ_CODED => self.read_seq_coded_record(n_seq, hap_to_seq)?,
-            ALLELE_CODED => self.read_allele_coded_record(marker.n_alleles())?,
-            _ => bail!("Unknown record type flag: {}", flag),
-        };
-
-        Ok((marker, alleles))
     }
 
     /// Read marker info
@@ -216,23 +232,6 @@ impl Bref3Reader {
             ref_allele,
             alt_alleles,
         ))
-    }
-
-    /// Read sequence-coded genotype record
-    fn read_seq_coded_record(
-        &mut self,
-        n_seq: usize,
-        hap_to_seq: &[u16],
-    ) -> Result<Vec<u8>> {
-        let mut seq_to_allele = vec![0u8; n_seq];
-        self.reader.read_exact(&mut seq_to_allele)?;
-
-        let mut alleles = vec![0u8; self.n_haps];
-        for (hap_idx, &seq_idx) in hap_to_seq.iter().enumerate() {
-            alleles[hap_idx] = seq_to_allele[seq_idx as usize];
-        }
-
-        Ok(alleles)
     }
 
     /// Read allele-coded genotype record

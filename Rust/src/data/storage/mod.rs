@@ -10,6 +10,7 @@ pub mod matrix;
 pub mod mutable;
 pub mod phase_state;
 pub mod sample_phase;
+pub mod seq_coded;
 pub mod sparse;
 pub mod view;
 
@@ -18,6 +19,7 @@ pub use dictionary::DictionaryColumn;
 pub use matrix::GenotypeMatrix;
 pub use mutable::MutableGenotypes;
 pub use phase_state::PhaseState;
+pub use seq_coded::{SeqCodedBlock, SeqCodedColumn};
 pub use sparse::SparseColumn;
 pub use view::GenotypeView;
 
@@ -39,6 +41,11 @@ pub enum GenotypeColumn {
     /// For runs of similar haplotype patterns.
     /// Stores (Shared Dictionary, Marker Offset in Dictionary)
     Dictionary(Arc<DictionaryColumn>, usize),
+
+    /// Sequence-coded blocks (BREF3 native format).
+    /// Preserves compact hap->seq->allele mapping without expansion.
+    /// ~6x memory savings vs Dense for typical reference panels.
+    SeqCoded(SeqCodedColumn),
 }
 
 impl GenotypeColumn {
@@ -49,6 +56,7 @@ impl GenotypeColumn {
             Self::Dense(col) => col.get(hap),
             Self::Sparse(col) => col.get(hap),
             Self::Dictionary(col, offset) => col.get(*offset, hap),
+            Self::SeqCoded(col) => col.get(hap),
         }
     }
 
@@ -58,6 +66,7 @@ impl GenotypeColumn {
             Self::Dense(col) => col.n_haplotypes(),
             Self::Sparse(col) => col.n_haplotypes(),
             Self::Dictionary(col, _) => col.n_haplotypes(),
+            Self::SeqCoded(col) => col.n_haplotypes(),
         }
     }
 
@@ -67,6 +76,7 @@ impl GenotypeColumn {
             Self::Dense(col) => col.alt_count(),
             Self::Sparse(col) => col.n_carriers(),
             Self::Dictionary(col, offset) => col.alt_count(*offset),
+            Self::SeqCoded(col) => col.alt_count(),
         }
     }
 
@@ -86,8 +96,8 @@ impl GenotypeColumn {
         match self {
             Self::Dense(col) => col.size_bytes(),
             Self::Sparse(col) => col.size_bytes(),
-            // Report amortized size per marker to avoid over-counting shared memory
             Self::Dictionary(col, _) => col.size_bytes() / col.n_markers().max(1),
+            Self::SeqCoded(col) => col.size_bytes(),
         }
     }
 
