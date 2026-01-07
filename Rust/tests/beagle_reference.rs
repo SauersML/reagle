@@ -61,107 +61,30 @@ fn get_all_data_sources() -> Vec<TestDataSource> {
     sources
 }
 
-/// Directory for downloaded test fixtures (cached across test runs)
+/// Directory for pre-generated test fixtures
 fn fixtures_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("beagle_reference");
-    fs::create_dir_all(&dir).expect("Create fixtures directory");
-    dir
+        .join("beagle_reference")
 }
 
-/// Download a file if it doesn't exist
-fn download_if_missing(url: &str, dest: &Path) {
-    if dest.exists() {
-        return;
-    }
-    println!("Downloading {} -> {}", url, dest.display());
-
-    let output = Command::new("curl")
-        .args(["-L", "-o", dest.to_str().unwrap(), url])
-        .output()
-        .expect("curl command failed");
-
-    if !output.status.success() {
-        panic!(
-            "Failed to download {}: {}",
-            url,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-/// Ensure all required files are downloaded and prepared
+/// Get pre-generated BEAGLE test files
 fn setup_test_files() -> TestFiles {
     let dir = fixtures_dir();
 
     let beagle_jar = dir.join("beagle.27Feb25.75f.jar");
     let bref3_jar = dir.join("bref3.27Feb25.75f.jar");
-    let test_vcf = dir.join("test.27Feb25.75f.vcf.gz");
     let ref_vcf = dir.join("ref.27Feb25.75f.vcf.gz");
     let target_vcf = dir.join("target.27Feb25.75f.vcf.gz");
-
-    // Download JARs and test data
-    download_if_missing(
-        "http://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar",
-        &beagle_jar,
-    );
-    download_if_missing(
-        "http://faculty.washington.edu/browning/beagle/bref3.27Feb25.75f.jar",
-        &bref3_jar,
-    );
-    download_if_missing(
-        "http://faculty.washington.edu/browning/beagle/test.beagle.vcf.gz",
-        &test_vcf,
-    );
-
-    // Create ref and target files if missing
-    if !ref_vcf.exists() || !target_vcf.exists() {
-        println!("Creating ref and target VCF files...");
-
-        // ref: first 181 samples, phased (columns 1-190, convert / to |)
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "gzip -dc {} | cut -f1-190 | tr '/' '|' | gzip > {}",
-                test_vcf.display(),
-                ref_vcf.display()
-            ))
-            .status()
-            .expect("Failed to create ref VCF");
-        assert!(status.success(), "Failed to create ref VCF");
-
-        // target: last 10 samples (columns 1-9 metadata + 191-200)
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "gzip -dc {} | cut -f1-9,191-200 | gzip > {}",
-                test_vcf.display(),
-                target_vcf.display()
-            ))
-            .status()
-            .expect("Failed to create target VCF");
-        assert!(status.success(), "Failed to create target VCF");
-    }
-
-    // Create sparse target (~10% of markers) for true imputation testing
     let target_sparse_vcf = dir.join("target_sparse.27Feb25.75f.vcf.gz");
-    if !target_sparse_vcf.exists() {
-        println!("Creating sparse target VCF for imputation testing...");
 
-        // Keep header lines + every 10th data line (gives ~10% of markers)
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "gzip -dc {} | awk 'NR <= 10 || /^#/ || NR % 10 == 0' | gzip > {}",
-                target_vcf.display(),
-                target_sparse_vcf.display()
-            ))
-            .status()
-            .expect("Failed to create sparse target VCF");
-        assert!(status.success(), "Failed to create sparse target VCF");
-    }
+    // Verify fixtures exist
+    assert!(beagle_jar.exists(), "BEAGLE JAR missing: {}", beagle_jar.display());
+    assert!(bref3_jar.exists(), "bref3 JAR missing: {}", bref3_jar.display());
+    assert!(ref_vcf.exists(), "ref VCF missing: {}", ref_vcf.display());
+    assert!(target_vcf.exists(), "target VCF missing: {}", target_vcf.display());
+    assert!(target_sparse_vcf.exists(), "sparse target VCF missing: {}", target_sparse_vcf.display());
 
     TestFiles {
         beagle_jar,
@@ -1739,6 +1662,7 @@ fn run_rust_imputation(
         "--ref", ref_path.to_str().unwrap(),
         "--out", out_prefix.to_str().unwrap(),
         "--seed", &seed.to_string(),
+        "--gp",
     ]);
     let mut pipeline = ImputationPipeline::new(config);
     pipeline.run()
