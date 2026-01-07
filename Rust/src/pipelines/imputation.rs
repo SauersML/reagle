@@ -994,3 +994,327 @@ fn run_hmm_forward_backward(
 
     fwd
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // AllelePosteriors Tests - RIGOROUS
+    // =========================================================================
+
+    #[test]
+    fn test_biallelic_prob_exact_math() {
+        // Test exact probability computation for biallelic sites
+        // P(REF) = 1 - P(ALT), must be EXACT to f32 precision
+        for p_alt_int in 0..=100 {
+            let p_alt = p_alt_int as f32 / 100.0;
+            let post = AllelePosteriors::Biallelic(p_alt);
+
+            let computed_ref = post.prob(0);
+            let computed_alt = post.prob(1);
+            let expected_ref = 1.0 - p_alt;
+
+            assert!(
+                (computed_ref - expected_ref).abs() < 1e-7,
+                "P(REF) wrong for p_alt={}: got {}, expected {}", p_alt, computed_ref, expected_ref
+            );
+            assert!(
+                (computed_alt - p_alt).abs() < 1e-7,
+                "P(ALT) wrong for p_alt={}: got {}, expected {}", p_alt, computed_alt, p_alt
+            );
+
+            // Probabilities MUST sum to exactly 1.0
+            let sum = computed_ref + computed_alt;
+            assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "Probabilities don't sum to 1 for p_alt={}: sum={}", p_alt, sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_biallelic_dosage_equals_p_alt() {
+        // Dosage for biallelic MUST equal P(ALT) exactly
+        // This is the definition: E[X] = 0*P(0) + 1*P(1) = P(1) = P(ALT)
+        for p_alt_int in 0..=100 {
+            let p_alt = p_alt_int as f32 / 100.0;
+            let post = AllelePosteriors::Biallelic(p_alt);
+
+            assert!(
+                (post.dosage() - p_alt).abs() < 1e-7,
+                "Dosage != P(ALT) for p_alt={}: dosage={}", p_alt, post.dosage()
+            );
+        }
+    }
+
+    #[test]
+    fn test_biallelic_max_allele_boundary() {
+        // Critical boundary: at exactly 0.5, should return 1 (ALT)
+        let at_boundary = AllelePosteriors::Biallelic(0.5);
+        assert_eq!(at_boundary.max_allele(), 1, "At p_alt=0.5, max_allele should be 1");
+
+        // Just below boundary
+        let below = AllelePosteriors::Biallelic(0.4999999);
+        assert_eq!(below.max_allele(), 0, "At p_alt=0.4999999, max_allele should be 0");
+
+        // Just above boundary
+        let above = AllelePosteriors::Biallelic(0.5000001);
+        assert_eq!(above.max_allele(), 1, "At p_alt=0.5000001, max_allele should be 1");
+
+        // Edge cases
+        assert_eq!(AllelePosteriors::Biallelic(0.0).max_allele(), 0);
+        assert_eq!(AllelePosteriors::Biallelic(1.0).max_allele(), 1);
+    }
+
+    #[test]
+    fn test_multiallelic_prob_sum_to_one() {
+        // Multiallelic probabilities must sum to 1 (if input sums to 1)
+        let probs = vec![0.1, 0.2, 0.3, 0.4]; // Sum = 1.0
+        let post = AllelePosteriors::Multiallelic(probs.clone());
+
+        let sum: f32 = (0..4).map(|i| post.prob(i)).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "Multiallelic probs don't sum to 1: sum={}", sum
+        );
+
+        // Verify each prob is correct
+        for (i, &expected) in probs.iter().enumerate() {
+            assert!(
+                (post.prob(i) - expected).abs() < 1e-7,
+                "P({}) wrong: got {}, expected {}", i, post.prob(i), expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_multiallelic_dosage_formula() {
+        // Dosage = E[X] = sum(i * P(i))
+        let probs = vec![0.1, 0.2, 0.3, 0.4]; // 4-allelic
+        let post = AllelePosteriors::Multiallelic(probs.clone());
+
+        // Expected: 0*0.1 + 1*0.2 + 2*0.3 + 3*0.4 = 0 + 0.2 + 0.6 + 1.2 = 2.0
+        let expected_dosage = 2.0f32;
+        assert!(
+            (post.dosage() - expected_dosage).abs() < 1e-6,
+            "Multiallelic dosage wrong: got {}, expected {}", post.dosage(), expected_dosage
+        );
+
+        // Test another case: 5-allelic
+        let probs2 = vec![0.5, 0.2, 0.1, 0.1, 0.1];
+        let post2 = AllelePosteriors::Multiallelic(probs2);
+        // Expected: 0*0.5 + 1*0.2 + 2*0.1 + 3*0.1 + 4*0.1 = 0 + 0.2 + 0.2 + 0.3 + 0.4 = 1.1
+        assert!(
+            (post2.dosage() - 1.1).abs() < 1e-6,
+            "5-allelic dosage wrong: got {}", post2.dosage()
+        );
+    }
+
+    #[test]
+    fn test_multiallelic_max_allele_all_cases() {
+        // Case 1: First allele is max
+        let post1 = AllelePosteriors::Multiallelic(vec![0.5, 0.3, 0.2]);
+        assert_eq!(post1.max_allele(), 0);
+
+        // Case 2: Middle allele is max
+        let post2 = AllelePosteriors::Multiallelic(vec![0.2, 0.6, 0.2]);
+        assert_eq!(post2.max_allele(), 1);
+
+        // Case 3: Last allele is max
+        let post3 = AllelePosteriors::Multiallelic(vec![0.1, 0.2, 0.7]);
+        assert_eq!(post3.max_allele(), 2);
+    }
+
+    #[test]
+    fn test_out_of_bounds_returns_zero() {
+        // Accessing probability of non-existent allele must return 0
+        let biallelic = AllelePosteriors::Biallelic(0.5);
+        assert_eq!(biallelic.prob(2), 0.0);
+        assert_eq!(biallelic.prob(100), 0.0);
+
+        let triallelic = AllelePosteriors::Multiallelic(vec![0.3, 0.3, 0.4]);
+        assert_eq!(triallelic.prob(3), 0.0);
+        assert_eq!(triallelic.prob(1000), 0.0);
+    }
+
+    // =========================================================================
+    // HMM Forward-Backward Tests - RIGOROUS
+    // =========================================================================
+
+    #[test]
+    fn test_hmm_posteriors_sum_to_one_strict() {
+        use crate::utils::workspace::ImpWorkspace;
+
+        // Test with various configurations
+        for n_markers in [2, 5, 10, 20] {
+            for n_states in [2, 4, 8] {
+                let target_alleles = vec![0u8; n_markers];
+                let allele_match: Vec<Vec<bool>> = (0..n_markers)
+                    .map(|m| (0..n_states).map(|k| (m + k) % 2 == 0).collect())
+                    .collect();
+                let p_recomb: Vec<f32> = (0..n_markers)
+                    .map(|m| if m == 0 { 0.0 } else { 0.01 })
+                    .collect();
+
+                let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+                let posteriors = run_hmm_forward_backward(
+                    &target_alleles,
+                    &allele_match,
+                    &p_recomb,
+                    0.01,
+                    n_states,
+                    &mut workspace,
+                );
+
+                // Posteriors MUST sum to 1.0 at EVERY marker
+                for m in 0..n_markers {
+                    let sum: f32 = (0..n_states).map(|k| posteriors[m * n_states + k]).sum();
+                    assert!(
+                        (sum - 1.0).abs() < 0.001,
+                        "n_markers={}, n_states={}, marker {}: posteriors sum to {}, not 1.0",
+                        n_markers, n_states, m, sum
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hmm_posteriors_non_negative() {
+        use crate::utils::workspace::ImpWorkspace;
+
+        let n_markers = 10;
+        let n_states = 4;
+        let target_alleles = vec![0u8; n_markers];
+        let allele_match: Vec<Vec<bool>> = (0..n_markers)
+            .map(|m| (0..n_states).map(|k| k == m % n_states).collect())
+            .collect();
+        let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.05 }).collect();
+
+        let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let posteriors = run_hmm_forward_backward(
+            &target_alleles,
+            &allele_match,
+            &p_recomb,
+            0.01,
+            n_states,
+            &mut workspace,
+        );
+
+        for (i, &p) in posteriors.iter().enumerate() {
+            assert!(p >= 0.0, "Posterior at index {} is negative: {}", i, p);
+            assert!(p <= 1.0, "Posterior at index {} exceeds 1: {}", i, p);
+        }
+    }
+
+    #[test]
+    fn test_hmm_perfect_match_gives_high_posterior() {
+        use crate::utils::workspace::ImpWorkspace;
+
+        let n_markers = 20;
+        let n_states = 4;
+        let target_alleles = vec![0u8; n_markers];
+
+        // State 0 always matches, others never match
+        let allele_match: Vec<Vec<bool>> = (0..n_markers)
+            .map(|_| vec![true, false, false, false])
+            .collect();
+        let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.001 }).collect();
+
+        let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let posteriors = run_hmm_forward_backward(
+            &target_alleles,
+            &allele_match,
+            &p_recomb,
+            0.001,
+            n_states,
+            &mut workspace,
+        );
+
+        // State 0 should have posterior > 0.99 at every marker
+        for m in 0..n_markers {
+            let prob_state0 = posteriors[m * n_states];
+            assert!(
+                prob_state0 > 0.99,
+                "Perfect match state should have p>0.99, got {} at marker {}", prob_state0, m
+            );
+        }
+    }
+
+    #[test]
+    fn test_hmm_state_switch_detection() {
+        use crate::utils::workspace::ImpWorkspace;
+
+        // Pattern: state 0 matches first half, state 1 matches second half
+        let n_markers = 20;
+        let n_states = 2;
+        let target_alleles = vec![0u8; n_markers];
+
+        let allele_match: Vec<Vec<bool>> = (0..n_markers)
+            .map(|m| {
+                if m < 10 { vec![true, false] } else { vec![false, true] }
+            })
+            .collect();
+        let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.01 }).collect();
+
+        let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+        let posteriors = run_hmm_forward_backward(
+            &target_alleles,
+            &allele_match,
+            &p_recomb,
+            0.01,
+            n_states,
+            &mut workspace,
+        );
+
+        // First half: state 0 should dominate
+        for m in 0..5 {
+            let prob_state0 = posteriors[m * n_states];
+            assert!(prob_state0 > 0.8, "First half, state 0 should dominate. marker {}: p0={}", m, prob_state0);
+        }
+
+        // Second half: state 1 should dominate
+        for m in 15..n_markers {
+            let prob_state1 = posteriors[m * n_states + 1];
+            assert!(prob_state1 > 0.8, "Second half, state 1 should dominate. marker {}: p1={}", m, prob_state1);
+        }
+    }
+
+    #[test]
+    fn test_hmm_symmetry() {
+        use crate::utils::workspace::ImpWorkspace;
+
+        let n_markers = 10;
+        let n_states = 2;
+        let target_alleles = vec![0u8; n_markers];
+
+        // Run 1: state 0 matches at even markers
+        let match1: Vec<Vec<bool>> = (0..n_markers)
+            .map(|m| if m % 2 == 0 { vec![true, false] } else { vec![false, true] })
+            .collect();
+
+        // Run 2: state 1 matches at even markers (swapped)
+        let match2: Vec<Vec<bool>> = (0..n_markers)
+            .map(|m| if m % 2 == 0 { vec![false, true] } else { vec![true, false] })
+            .collect();
+
+        let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.05 }).collect();
+
+        let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
+
+        let post1 = run_hmm_forward_backward(&target_alleles, &match1, &p_recomb, 0.01, n_states, &mut workspace);
+        let post2 = run_hmm_forward_backward(&target_alleles, &match2, &p_recomb, 0.01, n_states, &mut workspace);
+
+        // Posteriors should be swapped
+        for m in 0..n_markers {
+            let p1_s0 = post1[m * n_states];
+            let p1_s1 = post1[m * n_states + 1];
+            let p2_s0 = post2[m * n_states];
+            let p2_s1 = post2[m * n_states + 1];
+
+            assert!((p1_s0 - p2_s1).abs() < 0.01, "Symmetry broken at marker {}: p1[s0]={}, p2[s1]={}", m, p1_s0, p2_s1);
+            assert!((p1_s1 - p2_s0).abs() < 0.01, "Symmetry broken at marker {}: p1[s1]={}, p2[s0]={}", m, p1_s1, p2_s0);
+        }
+    }
+}
