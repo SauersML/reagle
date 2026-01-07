@@ -8,6 +8,7 @@
 //! - `ThreadedHaps` stores segments in a linked-list arena for O(1) updates
 //! - `MosaicCursor` provides SIMD-friendly state access for the HMM hot path
 
+#[cfg(test)]
 use crate::data::haplotype::HapIdx;
 
 /// Arena-based storage for composite haplotypes using threaded indices.
@@ -67,8 +68,9 @@ impl ThreadedHaps {
 
     /// Create ThreadedHaps from a static list of haplotypes (one segment per state)
     ///
-    /// This is used when states are selected via PBWT and remain constant
-    /// for the entire forward-backward run (e.g., in phasing).
+    /// This is used in tests where states are selected via PBWT and remain constant
+    /// for the entire forward-backward run.
+    #[cfg(test)]
     pub fn from_static_haps(haps: &[HapIdx], n_markers: usize) -> Self {
         let n_states = haps.len();
         let mut th = Self::new(n_states, n_states, n_markers);

@@ -30,9 +30,9 @@ use crate::io::streaming::{PhasedOverlap, StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
 use crate::model::hmm::BeagleHmm;
-use crate::model::states::ThreadedHaps;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
+use crate::model::phase_states::PhaseStates;
 use crate::pipelines::imputation::MarkerAlignment;
 
 /// Phasing pipeline
@@ -557,7 +557,6 @@ impl PhasingPipeline {
                 &gen_dists,
                 &ibs2,
                 atomic_estimates.as_ref(),
-                it,
             )?;
 
             // Update parameters from EM estimates and recompute recombination probabilities
@@ -678,7 +677,6 @@ impl PhasingPipeline {
                 &mut sample_phases,
                 overlap_markers,
                 atomic_estimates.as_ref(),
-                it,
             )?;
 
             // Update parameters from EM estimates and recompute recombination probabilities
@@ -831,56 +829,6 @@ impl PhasingPipeline {
         }
     }
 
-    /// Select HMM states using bidirectional PBWT (forward + backward neighbors)
-    fn select_states_bidirectional(
-        &self,
-        hap_idx: HapIdx,
-        marker_idx: usize,
-        phase_ibs: &BidirectionalPhaseIbs,
-        ibs2: &Ibs2,
-        n_states_wanted: usize,
-        n_total_haps: usize,
-        seed: i64,
-        iteration: usize,
-    ) -> Vec<HapIdx> {
-        use rand::seq::SliceRandom;
-        use rand::{Rng, SeedableRng};
-
-        // Create RNG early so it can be used for random state filling
-        let combined_seed = (seed as u64)
-            .wrapping_add(iteration as u64)
-            .wrapping_add(hap_idx.0 as u64);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(combined_seed);
-
-        let n_candidates = (n_states_wanted * 2).min(n_total_haps);
-        let neighbors = phase_ibs.find_neighbors(hap_idx.0, marker_idx, ibs2, n_candidates);
-
-        let mut states: Vec<HapIdx> = neighbors.into_iter().map(HapIdx::new).collect();
-
-        // Fill remaining slots with RANDOM haplotypes (not sequential)
-        // This matches Java Beagle's fillQWithRandomHaps behavior
-        let sample = SampleIdx::new(hap_idx.0 / 2);
-        // Cap states to available haplotypes (excluding self) to prevent infinite loop
-        let max_available = n_total_haps.saturating_sub(2); // exclude both haps of current sample
-        let target_states = n_states_wanted.min(max_available);
-
-        if states.len() < target_states {
-            // Use HashSet for O(1) duplicate checking
-            let mut seen: std::collections::HashSet<u32> = states.iter().map(|h| h.0).collect();
-            while states.len() < target_states {
-                let h = HapIdx::new(rng.random_range(0..n_total_haps as u32));
-                // Exclude self and duplicates
-                if h.sample() != sample && seen.insert(h.0) {
-                    states.push(h);
-                }
-            }
-        }
-
-        states.shuffle(&mut rng);
-        states.truncate(n_states_wanted);
-        states
-    }
-
     /// Build bidirectional PBWT for full chromosome phasing
     fn build_bidirectional_pbwt(
         &self,
@@ -988,13 +936,11 @@ impl PhasingPipeline {
         gen_dists: &[f64],
         ibs2: &Ibs2,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
-        iteration: usize,
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let markers = target_gt.markers();
-        let seed = self.config.seed;
 
         // Compute total haplotype count (target + reference)
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
@@ -1045,10 +991,18 @@ impl PhasingPipeline {
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
 
-            let mid_marker = n_markers / 2;
-            // Use n_total_haps to allow selecting reference haplotypes as states
-            let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_total_haps, seed, iteration);
-            
+            // Build dynamic composite haplotypes using PhaseStates
+            // This iterates through all markers and builds mosaic haplotypes
+            // that provide local IBS matches everywhere, not just at midpoint.
+            let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
+            let threaded_haps = phase_states.build_composite_haps(
+                s as u32,
+                &phase_ibs,
+                ibs2,
+                20, // n_candidates per marker
+            );
+            let n_states = phase_states.n_states();
+
             // 2. Extract current alleles for H1 and H2
             let seq1 = ref_geno.haplotype(hap1);
             let seq2 = ref_geno.haplotype(hap2);
@@ -1065,8 +1019,6 @@ impl PhasingPipeline {
             //
             // This ensures forward probabilities after a het correctly reflect the phase decision
             // by using the decided alleles for emission probabilities.
-            let n_states = states.len();
-            let threaded_haps = ThreadedHaps::from_static_haps(&states, n_markers);
             let hmm = BeagleHmm::new(ref_view.clone(), &self.params, n_states, p_recomb.to_vec());
 
             // Collect EM statistics if requested (using original sequences)
@@ -1098,11 +1050,24 @@ impl PhasingPipeline {
             let p_err = self.params.p_mismatch;
             let p_no_err = 1.0 - p_err;
 
+            // Pre-compute state->hap mapping for all (marker, state) pairs
+            // This is needed because ThreadedHaps uses cursor-based traversal
+            let state_haps: Vec<Vec<u32>> = {
+                let mut threaded_haps_mut = threaded_haps.clone();
+                (0..n_markers)
+                    .map(|m| {
+                        (0..n_states)
+                            .map(|k| threaded_haps_mut.hap_at_raw(k, m))
+                            .collect()
+                    })
+                    .collect()
+            };
+
             // Helper to get reference allele at (marker, state)
             let get_ref_allele = |m: usize, k: usize| -> u8 {
-                let h = states[k].as_usize();
+                let h = state_haps[m][k] as usize;
                 if h < n_haps {
-                    ref_geno.get(m, states[k])
+                    ref_geno.get(m, HapIdx::new(h as u32))
                 } else {
                     let ref_h = (h - n_haps) as u32;
                     if let (Some(ref_gt_inner), Some(align)) = (&self.reference_gt, &self.alignment) {
@@ -1463,12 +1428,10 @@ impl PhasingPipeline {
         sample_phases: &mut [SamplePhase],
         overlap_markers: usize,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
-        iteration: usize,
     ) -> Result<()> {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let markers = target_gt.markers();
-        let seed = self.config.seed;
 
         let ref_geno = geno.clone();
         let ref_view = GenotypeView::from((&ref_geno, markers));
@@ -1482,22 +1445,22 @@ impl PhasingPipeline {
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
-                let sample_idx = SampleIdx::new(s as u32);
-                let hap1 = sample_idx.hap1();
-
-                // Use midpoint marker for PBWT-based state selection
-                let mid_marker = n_markers / 2;
-                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_haps, seed, iteration);
+                // Build dynamic composite haplotypes using PhaseStates
+                let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
+                let threaded_haps = phase_states.build_composite_haps(
+                    s as u32,
+                    &phase_ibs,
+                    ibs2,
+                    20,
+                );
+                let n_states = phase_states.n_states();
 
                 // Extract current alleles from SamplePhase
                 let seq1: Vec<u8> = (0..n_markers).map(|m| sp.allele1(m)).collect();
                 let seq2: Vec<u8> = (0..n_markers).map(|m| sp.allele2(m)).collect();
 
-                let n_states = states.len();
-
                 // Collect EM statistics if requested
                 if let Some(atomic) = atomic_estimates {
-                    let threaded_haps = ThreadedHaps::from_static_haps(&states, n_markers);
                     let hmm = BeagleHmm::new(ref_view.clone(), &self.params, n_states, p_recomb.to_vec());
                     let mut local_est = crate::model::parameters::ParamEstimates::new();
                     hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
@@ -1521,11 +1484,23 @@ impl PhasingPipeline {
                 let p_err = self.params.p_mismatch;
                 let p_no_err = 1.0 - p_err;
 
+                // Pre-compute state->hap mapping for all (marker, state) pairs
+                let state_haps: Vec<Vec<u32>> = {
+                    let mut threaded_haps_mut = threaded_haps.clone();
+                    (0..n_markers)
+                        .map(|m| {
+                            (0..n_states)
+                                .map(|k| threaded_haps_mut.hap_at_raw(k, m))
+                                .collect()
+                        })
+                        .collect()
+                };
+
                 // Helper to get reference allele at (marker, state)
                 let get_ref_allele = |m: usize, k: usize| -> u8 {
-                    let h = states[k].as_usize();
+                    let h = state_haps[m][k] as usize;
                     if h < n_haps {
-                        ref_geno.get(m, states[k])
+                        ref_geno.get(m, HapIdx::new(h as u32))
                     } else {
                         let ref_h = (h - n_haps) as u32;
                         if let (Some(ref_gt_inner), Some(align)) = (&self.reference_gt, &self.alignment) {
@@ -1833,7 +1808,6 @@ impl PhasingPipeline {
         iteration: usize,
     ) -> Result<()> {
         let n_haps = geno.n_haps();
-        let seed = self.config.seed;
 
         // Compute total haplotype count (target + reference)
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
@@ -1892,23 +1866,24 @@ impl PhasingPipeline {
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
-                let sample_idx = SampleIdx::new(s as u32);
-                let hap1 = sample_idx.hap1();
+                let n_hi_freq = hi_freq_to_orig.len();
 
-                // Use midpoint of subset marker space for state selection
-                let mid_marker = hi_freq_to_orig.len() / 2;
-                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_total_haps, seed, iteration);
+                // Build dynamic composite haplotypes using PhaseStates
+                let mut phase_states = PhaseStates::new(self.params.n_states, n_hi_freq);
+                let threaded_haps = phase_states.build_composite_haps(
+                    s as u32,
+                    &phase_ibs,
+                    ibs2,
+                    20,
+                );
+                let n_states = phase_states.n_states();
 
                 // Extract alleles from SamplePhase for SUBSET of markers
                 let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
                 let seq2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele2(m)).collect();
 
-                let n_states = states.len();
-                let n_hi_freq = hi_freq_to_orig.len();
-
                 // Collect EM statistics if requested
                 if let Some(atomic) = atomic_estimates {
-                    let threaded_haps = ThreadedHaps::from_static_haps(&states, n_hi_freq);
                     let hmm = BeagleHmm::new(subset_view.clone(), &self.params, n_states, stage1_p_recomb.to_vec());
                     let mut local_est = crate::model::parameters::ParamEstimates::new();
                     hmm.collect_stats(&seq1, &threaded_haps, stage1_gen_dists, &mut local_est);
@@ -1934,12 +1909,24 @@ impl PhasingPipeline {
                 let p_err = self.params.p_mismatch;
                 let p_no_err = 1.0 - p_err;
 
+                // Pre-compute state->hap mapping for all (hi_freq_idx, state) pairs
+                let state_haps: Vec<Vec<u32>> = {
+                    let mut threaded_haps_mut = threaded_haps.clone();
+                    (0..n_hi_freq)
+                        .map(|m| {
+                            (0..n_states)
+                                .map(|k| threaded_haps_mut.hap_at_raw(k, m))
+                                .collect()
+                        })
+                        .collect()
+                };
+
                 // Helper to get reference allele at (hi_freq_idx, state)
                 let get_ref_allele = |i: usize, k: usize| -> u8 {
-                    let h = states[k].as_usize();
+                    let h = state_haps[i][k] as usize;
                     let orig_m = hi_freq_to_orig[i];
                     if h < n_haps {
-                        ref_geno.get(orig_m, states[k])
+                        ref_geno.get(orig_m, HapIdx::new(h as u32))
                     } else {
                         let ref_h = (h - n_haps) as u32;
                         if let (Some(ref_gt_inner), Some(align)) = (&self.reference_gt, &self.alignment) {
@@ -2379,21 +2366,19 @@ impl PhasingPipeline {
                     .wrapping_add(0xDEAD_BEEF_CAFE_u64); // Stage 2 distinction constant
                 let mut rng = rand::rngs::StdRng::seed_from_u64(sample_seed);
 
-                let sample_idx = SampleIdx::new(s as u32);
-                let hap1 = sample_idx.hap1();
-
-                // Select HMM states using bidirectional PBWT on subset marker space
-                let mid_marker = n_stage1 / 2;
-                // Use n_total_haps to allow selecting reference haplotypes as states
-                let states = self.select_states_bidirectional(hap1, mid_marker, &phase_ibs, ibs2, self.params.n_states, n_total_haps, seed, 0);
-                let n_states = states.len();
+                // Build dynamic composite haplotypes using PhaseStates
+                let mut phase_states = PhaseStates::new(self.params.n_states, n_stage1);
+                let threaded_haps = phase_states.build_composite_haps(
+                    s as u32,
+                    &phase_ibs,
+                    ibs2,
+                    20,
+                );
+                let n_states = phase_states.n_states();
 
                 // Extract Stage 1 alleles from SamplePhase
                 let seq1: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele1(m)).collect();
                 let seq2: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele2(m)).collect();
-
-                // Run HMM forward-backward for both haplotypes on Stage 1 markers
-                let threaded_haps = ThreadedHaps::from_static_haps(&states, n_stage1);
                 let hmm = BeagleHmm::new(subset_view, &self.params, n_states, stage1_p_recomb.to_vec());
 
                 let mut fwd1 = Vec::new();
@@ -2407,6 +2392,19 @@ impl PhasingPipeline {
                 // Compute posterior state probabilities at each Stage 1 marker
                 let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
                 let probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
+
+                // Pre-compute state->hap mapping for all Stage 1 markers
+                // This is needed because ThreadedHaps uses cursor-based traversal
+                let state_haps_stage1: Vec<Vec<u32>> = {
+                    let mut threaded_haps_mut = threaded_haps.clone();
+                    (0..n_stage1)
+                        .map(|m| {
+                            (0..n_states)
+                                .map(|k| threaded_haps_mut.hap_at_raw(k, m))
+                                .collect()
+                        })
+                        .collect()
+                };
 
                 // Collect phase decisions for this sample
                 let mut phase_decisions = Vec::new();
@@ -2455,10 +2453,10 @@ impl PhasingPipeline {
 
                     // Compute interpolated allele probabilities for each haplotype
                     let al_probs1 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs1, &states, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
+                        m, &probs1, &state_haps_stage1, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
                     );
                     let al_probs2 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs2, &states, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
+                        m, &probs2, &state_haps_stage1, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
                     );
 
                     // p1 = P(hap1 has a1, hap2 has a2)
@@ -2672,9 +2670,9 @@ impl Stage2Phaser {
     fn interpolated_allele_probs<F>(
         &self,
         marker: usize,
-        state_probs: &[Vec<f32>], // [stage1_marker][state]
-        states: &[HapIdx],        // HMM state haplotype indices
-        get_allele: &F,           // Closure to get allele for any haplotype
+        state_probs: &[Vec<f32>],      // [stage1_marker][state]
+        state_haps_stage1: &[Vec<u32>], // [stage1_marker][state] -> hap
+        get_allele: &F,                 // Closure to get allele for any haplotype
         a1: u8,
         a2: u8,
         is_a1_rare: bool,
@@ -2692,8 +2690,12 @@ impl Stage2Phaser {
         let probs_a = &state_probs[mkr_a];
         let probs_b = &state_probs[mkr_b];
 
-        for (j, &hap_idx) in states.iter().enumerate() {
-            let hap = hap_idx.0 as usize;
+        // Use state haps at flanking Stage 1 marker A (following Java Stage2Baum)
+        let haps_at_mkr_a = &state_haps_stage1[mkr_a];
+        let n_states = haps_at_mkr_a.len();
+
+        for j in 0..n_states {
+            let hap = haps_at_mkr_a[j] as usize;
 
             // Get allele from this haplotype at rare marker (handles both target and reference)
             let b1 = get_allele(marker, hap);

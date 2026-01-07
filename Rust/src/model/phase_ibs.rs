@@ -257,4 +257,9 @@ impl BidirectionalPhaseIbs {
 
         result
     }
+
+    /// Get the number of haplotypes
+    pub fn n_haps(&self) -> usize {
+        self.n_haps
+    }
 }
