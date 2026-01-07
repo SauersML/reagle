@@ -1748,3 +1748,340 @@ fn run_rust_imputation(
     pipeline.run()
 }
 
+// =============================================================================
+// STRICT Quality Metrics Comparison Tests
+// =============================================================================
+
+/// Compare DR2 values between Java and Rust (STRICT: Rust must be >= Java)
+fn compare_dr2_values(java_records: &[ParsedRecord], rust_records: &[ParsedRecord], name: &str) {
+    let java_dr2: Vec<f64> = java_records
+        .iter()
+        .filter_map(|r| r.info.get("DR2").and_then(|v| v.parse().ok()))
+        .collect();
+    let rust_dr2: Vec<f64> = rust_records
+        .iter()
+        .filter_map(|r| r.info.get("DR2").and_then(|v| v.parse().ok()))
+        .collect();
+
+    if java_dr2.is_empty() || rust_dr2.is_empty() {
+        println!("[{}] DR2: Skipping comparison (Java: {}, Rust: {})", name, java_dr2.len(), rust_dr2.len());
+        return;
+    }
+
+    let java_mean: f64 = java_dr2.iter().sum::<f64>() / java_dr2.len() as f64;
+    let rust_mean: f64 = rust_dr2.iter().sum::<f64>() / rust_dr2.len() as f64;
+
+    // Compute DR2 correlation between Java and Rust
+    let min_len = java_dr2.len().min(rust_dr2.len());
+    let dr2_correlation = if min_len > 1 {
+        dosage_correlation(&java_dr2[..min_len], &rust_dr2[..min_len])
+    } else {
+        0.0
+    };
+
+    println!("[{}] DR2 Comparison:", name);
+    println!("  Java mean DR2: {:.4}", java_mean);
+    println!("  Rust mean DR2: {:.4}", rust_mean);
+    println!("  DR2 correlation: {:.4}", dr2_correlation);
+
+    // STRICT: Rust mean DR2 should be >= Java (higher DR2 = better quality)
+    // Allow 0.01 tolerance for numerical differences
+    assert!(
+        rust_mean >= java_mean - 0.01,
+        "[{}] STRICT FAIL: Rust mean DR2 ({:.4}) WORSE than Java ({:.4})",
+        name, rust_mean, java_mean
+    );
+
+    // DR2 values should be highly correlated between implementations
+    assert!(
+        dr2_correlation > 0.90,
+        "[{}] DR2 correlation too low: {:.4} (expected > 0.90)",
+        name, dr2_correlation
+    );
+}
+
+/// Compare dosage values between Java and Rust
+fn compare_dosages(java_records: &[ParsedRecord], rust_records: &[ParsedRecord], name: &str) {
+    let java_ds = extract_dosages(java_records);
+    let rust_ds = extract_dosages(rust_records);
+
+    if java_ds.is_empty() || rust_ds.is_empty() {
+        println!("[{}] Dosages: Skipping comparison", name);
+        return;
+    }
+
+    let min_len = java_ds.len().min(rust_ds.len());
+    let ds_correlation = if min_len > 1 {
+        dosage_correlation(&java_ds[..min_len], &rust_ds[..min_len])
+    } else {
+        0.0
+    };
+
+    // Mean absolute difference
+    let mad: f64 = java_ds.iter().zip(rust_ds.iter())
+        .map(|(j, r)| (j - r).abs())
+        .sum::<f64>() / min_len as f64;
+
+    println!("[{}] Dosage Comparison:", name);
+    println!("  Dosage correlation: {:.6}", ds_correlation);
+    println!("  Mean absolute diff: {:.6}", mad);
+
+    // STRICT: Dosages should be highly correlated
+    assert!(
+        ds_correlation > 0.95,
+        "[{}] Dosage correlation too low: {:.6} (expected > 0.95)",
+        name, ds_correlation
+    );
+}
+
+#[test]
+fn test_strict_dr2_and_dosage_comparison() {
+    // Comprehensive quality metrics comparison between Rust and Java
+    for source in get_all_data_sources() {
+        println!("\n{}", "=".repeat(70));
+        println!("=== STRICT Quality Metrics Test: {} ===", source.name);
+        println!("{}", "=".repeat(70));
+
+        let files = setup_test_files();
+        let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+        // Copy files
+        let ref_path = work_dir.path().join("ref.vcf.gz");
+        fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+        let target_path = work_dir.path().join("target_sparse.vcf.gz");
+        fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+        // Run Java BEAGLE
+        let java_out = work_dir.path().join("java_out");
+        let java_output = run_beagle(
+            &files.beagle_jar,
+            &[
+                ("ref", ref_path.to_str().unwrap()),
+                ("gt", target_path.to_str().unwrap()),
+                ("out", java_out.to_str().unwrap()),
+                ("seed", "42"),
+                ("gp", "true"),
+            ],
+            work_dir.path(),
+        );
+        assert!(java_output.status.success(), "{}: Java BEAGLE failed", source.name);
+
+        // Run Rust
+        let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+        let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+        let rust_out = work_dir.path().join("rust_out");
+        let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+        assert!(rust_result.is_ok(), "{}: Rust imputation failed: {:?}", source.name, rust_result.err());
+
+        // Parse outputs
+        let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+        let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+
+        // Compare DR2 values (STRICT)
+        compare_dr2_values(&java_records, &rust_records, source.name);
+
+        // Compare dosages
+        compare_dosages(&java_records, &rust_records, source.name);
+
+        println!("\n[{}] STRICT quality metrics test PASSED!", source.name);
+    }
+}
+
+#[test]
+fn test_diverse_mask_scenarios() {
+    // Test imputation with different masking fractions
+    let source = &get_all_data_sources()[0]; // Use first data source
+    let files = setup_test_files();
+
+    // Test multiple masking scenarios
+    let scenarios = [
+        ("Light masking (10%)", 0.10, 42),
+        ("Medium masking (30%)", 0.30, 123),
+        ("Heavy masking (50%)", 0.50, 456),
+    ];
+
+    for (scenario_name, mask_fraction, seed) in scenarios {
+        println!("\n{}", "=".repeat(60));
+        println!("=== Scenario: {} ===", scenario_name);
+        println!("{}", "=".repeat(60));
+
+        let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+        // Copy files
+        let ref_path = work_dir.path().join("ref.vcf.gz");
+        fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+        let target_path = work_dir.path().join("target_sparse.vcf.gz");
+        fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+        // Create masked version
+        let masked_path = work_dir.path().join("masked.vcf");
+        let truth_map = create_masked_vcf(&target_path, &masked_path, mask_fraction, seed);
+        println!("Masked {} genotypes ({:.0}%)", truth_map.len(), mask_fraction * 100.0);
+
+        // Compress masked file
+        let masked_gz = work_dir.path().join("masked.vcf.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .stdin(File::open(&masked_path).unwrap())
+            .stdout(File::create(&masked_gz).unwrap())
+            .status()
+            .expect("gzip failed");
+        assert!(status.success());
+
+        // Run Java BEAGLE
+        let java_out = work_dir.path().join("java_imputed");
+        let java_output = run_beagle(
+            &files.beagle_jar,
+            &[
+                ("ref", ref_path.to_str().unwrap()),
+                ("gt", masked_gz.to_str().unwrap()),
+                ("out", java_out.to_str().unwrap()),
+                ("seed", &seed.to_string()),
+                ("gp", "true"),
+            ],
+            work_dir.path(),
+        );
+        assert!(java_output.status.success(), "Java BEAGLE failed for {}", scenario_name);
+
+        // Run Rust
+        let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+        let rust_out = work_dir.path().join("rust_imputed");
+        let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, seed as i64);
+        assert!(rust_result.is_ok(), "Rust imputation failed for {}: {:?}", scenario_name, rust_result.err());
+
+        // Parse and evaluate
+        let (_, target_records) = parse_vcf(&target_path);
+        let (_, java_records) = parse_vcf(&work_dir.path().join("java_imputed.vcf.gz"));
+        let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_imputed.vcf.gz"));
+
+        let java_acc = evaluate_imputation(&java_records, &truth_map, &target_records);
+        let rust_acc = evaluate_imputation(&rust_records, &truth_map, &target_records);
+
+        // Print results
+        println!("\n{:<25} {:>12} {:>12}", "Metric", "Java", "Rust");
+        println!("{:-<25} {:->12} {:->12}", "", "", "");
+        println!("{:<25} {:>11.2}% {:>11.2}%", "Concordance",
+                 java_acc.concordance() * 100.0, rust_acc.concordance() * 100.0);
+        println!("{:<25} {:>12.4} {:>12.4}", "Brier Score",
+                 java_acc.brier_score(), rust_acc.brier_score());
+
+        // STRICT assertions
+        assert!(
+            rust_acc.concordance() >= java_acc.concordance() - 0.001,
+            "{}: Rust concordance ({:.4}%) worse than Java ({:.4}%)",
+            scenario_name, rust_acc.concordance() * 100.0, java_acc.concordance() * 100.0
+        );
+
+        if !java_acc.brier_score().is_nan() && !rust_acc.brier_score().is_nan() {
+            assert!(
+                rust_acc.brier_score() <= java_acc.brier_score() + 0.001,
+                "{}: Rust Brier ({:.6}) worse than Java ({:.6})",
+                scenario_name, rust_acc.brier_score(), java_acc.brier_score()
+            );
+        }
+
+        println!("\n[{}] PASSED!", scenario_name);
+    }
+}
+
+#[test]
+fn test_multiple_seeds_consistency() {
+    // Verify that different seeds don't cause catastrophic failures
+    // and results remain consistent with Java
+    let source = &get_all_data_sources()[0];
+    let files = setup_test_files();
+
+    let seeds = [1, 42, 123, 999, 12345];
+    let mut rust_concordances = Vec::new();
+    let mut java_concordances = Vec::new();
+
+    println!("\n{}", "=".repeat(60));
+    println!("=== Multiple Seeds Consistency Test ===");
+    println!("{}", "=".repeat(60));
+
+    for &seed in &seeds {
+        let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+        // Copy files
+        let ref_path = work_dir.path().join("ref.vcf.gz");
+        fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+        let target_path = work_dir.path().join("target_sparse.vcf.gz");
+        fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+        // Create masked version with this seed
+        let masked_path = work_dir.path().join("masked.vcf");
+        let truth_map = create_masked_vcf(&target_path, &masked_path, 0.20, seed);
+
+        // Compress
+        let masked_gz = work_dir.path().join("masked.vcf.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .stdin(File::open(&masked_path).unwrap())
+            .stdout(File::create(&masked_gz).unwrap())
+            .status()
+            .expect("gzip failed");
+        assert!(status.success());
+
+        // Run Java
+        let java_out = work_dir.path().join("java_out");
+        let java_output = run_beagle(
+            &files.beagle_jar,
+            &[
+                ("ref", ref_path.to_str().unwrap()),
+                ("gt", masked_gz.to_str().unwrap()),
+                ("out", java_out.to_str().unwrap()),
+                ("seed", &seed.to_string()),
+                ("gp", "true"),
+            ],
+            work_dir.path(),
+        );
+        assert!(java_output.status.success(), "Java failed for seed {}", seed);
+
+        // Run Rust
+        let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+        let rust_out = work_dir.path().join("rust_out");
+        let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, seed as i64);
+        assert!(rust_result.is_ok(), "Rust failed for seed {}: {:?}", seed, rust_result.err());
+
+        // Evaluate
+        let (_, target_records) = parse_vcf(&target_path);
+        let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+        let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+
+        let java_acc = evaluate_imputation(&java_records, &truth_map, &target_records);
+        let rust_acc = evaluate_imputation(&rust_records, &truth_map, &target_records);
+
+        println!("Seed {}: Java {:.2}%, Rust {:.2}%",
+                 seed, java_acc.concordance() * 100.0, rust_acc.concordance() * 100.0);
+
+        java_concordances.push(java_acc.concordance());
+        rust_concordances.push(rust_acc.concordance());
+
+        // Per-seed check: Rust should be at least as good as Java
+        assert!(
+            rust_acc.concordance() >= java_acc.concordance() - 0.01,
+            "Seed {}: Rust ({:.4}%) worse than Java ({:.4}%)",
+            seed, rust_acc.concordance() * 100.0, java_acc.concordance() * 100.0
+        );
+    }
+
+    // Overall consistency: variance should be reasonable
+    let java_mean: f64 = java_concordances.iter().sum::<f64>() / java_concordances.len() as f64;
+    let rust_mean: f64 = rust_concordances.iter().sum::<f64>() / rust_concordances.len() as f64;
+    let java_std = (java_concordances.iter().map(|x| (x - java_mean).powi(2)).sum::<f64>() / java_concordances.len() as f64).sqrt();
+    let rust_std = (rust_concordances.iter().map(|x| (x - rust_mean).powi(2)).sum::<f64>() / rust_concordances.len() as f64).sqrt();
+
+    println!("\nSummary across {} seeds:", seeds.len());
+    println!("  Java: mean={:.4}%, std={:.4}%", java_mean * 100.0, java_std * 100.0);
+    println!("  Rust: mean={:.4}%, std={:.4}%", rust_mean * 100.0, rust_std * 100.0);
+
+    // Rust mean should be >= Java mean
+    assert!(
+        rust_mean >= java_mean - 0.001,
+        "Rust mean concordance ({:.4}%) worse than Java ({:.4}%)",
+        rust_mean * 100.0, java_mean * 100.0
+    );
+
+    println!("\nMultiple seeds consistency test PASSED!");
+}
+
