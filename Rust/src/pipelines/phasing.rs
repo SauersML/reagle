@@ -303,6 +303,8 @@ impl PhasingPipeline {
                 &stage1_p_recomb,
                 &ibs2,
                 &mut sample_phases,
+                &maf,
+                rare_threshold,
             );
             
             // Sync again after Stage 2
@@ -2225,6 +2227,8 @@ impl PhasingPipeline {
         stage1_p_recomb: &[f32],
         ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
+        maf: &[f32],
+        rare_threshold: f32,
     ) {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
@@ -2358,12 +2362,20 @@ impl PhasingPipeline {
                         return;
                     }
 
+                    // Determine if each allele is rare (low frequency)
+                    // Following Java Stage2Baum.unscaledAlProbs: isLowFreq(m, allele)
+                    // For biallelic markers: non-reference allele (a > 0) is rare when MAF < threshold
+                    // Reference allele (0) is typically not rare
+                    let marker_maf = maf[m];
+                    let is_a1_rare = a1 > 0 && marker_maf < rare_threshold;
+                    let is_a2_rare = a2 > 0 && marker_maf < rare_threshold;
+
                     // Compute interpolated allele probabilities for each haplotype
                     let al_probs1 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs1, &states, &get_allele, a1, a2,
+                        m, &probs1, &states, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
                     );
                     let al_probs2 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs2, &states, &get_allele, a1, a2,
+                        m, &probs2, &states, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
                     );
 
                     // p1 = P(hap1 has a1, hap2 has a2)
@@ -2561,6 +2573,12 @@ impl Stage2Phaser {
     /// Following Java Stage2Baum.unscaledAlProbs:
     /// - For each HMM state, interpolate probability from flanking Stage 1 markers
     /// - Accumulate allele probabilities based on reference haplotype alleles
+    /// - Only rare alleles trigger the match logic (Java's isLowFreq check)
+    /// - Use full probability (1.0), not the 0.55/0.45 heuristic (that's for imputation)
+    ///
+    /// # Arguments
+    /// * `is_a1_rare` - Whether target allele a1 is low frequency
+    /// * `is_a2_rare` - Whether target allele a2 is low frequency
     fn interpolated_allele_probs<F>(
         &self,
         marker: usize,
@@ -2569,6 +2587,8 @@ impl Stage2Phaser {
         get_allele: &F,           // Closure to get allele for any haplotype
         a1: u8,
         a2: u8,
+        is_a1_rare: bool,
+        is_a2_rare: bool,
     ) -> [f32; 2]
     where
         F: Fn(usize, usize) -> u8, // (marker, hap_index) -> allele
@@ -2611,24 +2631,22 @@ impl Stage2Phaser {
                 }
             } else {
                 // Heterozygous reference haplotype - use rare allele matching
-                // Following Java Stage2Baum logic for rare allele disambiguation
-                let match1 = a1 == b1 || a1 == b2;
-                let match2 = a2 == b1 || a2 == b2;
+                // Following Java Stage2Baum.unscaledAlProbs:
+                // - match1 is true ONLY if a1 is rare AND matches a reference allele
+                // - match2 is true ONLY if a2 is rare AND matches a reference allele
+                // - Use FULL probability (1.0), NOT the 0.55/0.45 heuristic (that's for imputation)
+                let match1 = is_a1_rare && (a1 == b1 || a1 == b2);
+                let match2 = is_a2_rare && (a2 == b1 || a2 == b2);
 
                 if match1 && !match2 {
-                    // Only a1 matches - favor a1 with heuristic weight
-                    al_probs[0] += 0.55 * prob;
-                    al_probs[1] += 0.45 * prob;
+                    // Only a1 matches (and is rare) - add full probability to a1
+                    al_probs[0] += prob;
                 } else if match2 && !match1 {
-                    // Only a2 matches - favor a2 with heuristic weight
-                    al_probs[0] += 0.45 * prob;
-                    al_probs[1] += 0.55 * prob;
-                } else {
-                    // Both match or neither match (ambiguous) - split 50/50
-                    // This preserves probabilistic information from the HMM
-                    al_probs[0] += 0.5 * prob;
-                    al_probs[1] += 0.5 * prob;
+                    // Only a2 matches (and is rare) - add full probability to a2
+                    al_probs[1] += prob;
                 }
+                // If both match or neither match (ambiguous), no contribution
+                // This is consistent with Java Stage2Baum.unscaledAlProbs behavior
             }
         }
 
