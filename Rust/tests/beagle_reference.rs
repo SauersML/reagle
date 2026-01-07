@@ -49,15 +49,14 @@ fn get_all_data_sources() -> Vec<TestDataSource> {
         target_sparse_vcf: beagle.target_sparse_vcf,
     });
 
-    // Include gnomAD if available
-    if let Some(gnomad) = setup_gnomad_files() {
-        sources.push(TestDataSource {
-            name: "gnomAD",
-            ref_vcf: gnomad.ref_vcf,
-            target_vcf: gnomad.target_vcf,
-            target_sparse_vcf: gnomad.target_sparse_vcf,
-        });
-    }
+    // Always include gnomAD (fixtures are pre-generated and committed)
+    let gnomad = setup_gnomad_files();
+    sources.push(TestDataSource {
+        name: "gnomAD",
+        ref_vcf: gnomad.ref_vcf,
+        target_vcf: gnomad.target_vcf,
+        target_sparse_vcf: gnomad.target_sparse_vcf,
+    });
 
     sources
 }

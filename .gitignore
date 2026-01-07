@@ -8,4 +8,5 @@ build.log
 Rust/.gitignore
 **/Cargo.lock
 Rust/target
-Rust/tests/fixtures/
+Rust/tests/fixtures/beagle_reference/
+!Rust/tests/fixtures/gnomad_hgdp/
