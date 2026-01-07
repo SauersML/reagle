@@ -301,22 +301,38 @@ impl StateProbs {
         let probs = &self.probs[sparse_idx];
 
         if n_alleles == 2 {
-            // Optimized biallelic path - just compute P(ALT)
+            // Biallelic path with proper handling of missing reference data
+            // When a reference haplotype has missing data (255) at this marker,
+            // we must renormalize so that P(REF) + P(ALT) = 1.0
             let mut p_alt = 0.0f32;
+            let mut p_ref = 0.0f32;
             for (j, &hap) in haps.iter().enumerate() {
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele == 1 {
                     p_alt += probs[j];
+                } else if allele == 0 {
+                    p_ref += probs[j];
                 }
+                // allele == 255 (missing): don't add to either, will renormalize
             }
+            // Renormalize if there was any missing data
+            let total = p_ref + p_alt;
+            let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
             AllelePosteriors::Biallelic(p_alt)
         } else {
-            // Full multiallelic - compute PMF
+            // Full multiallelic - compute PMF with renormalization
             let mut al_probs = vec![0.0f32; n_alleles];
             for (j, &hap) in haps.iter().enumerate() {
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele != 255 && (allele as usize) < n_alleles {
                     al_probs[allele as usize] += probs[j];
+                }
+            }
+            // Renormalize so probabilities sum to 1
+            let total: f32 = al_probs.iter().sum();
+            if total > 1e-10 {
+                for p in &mut al_probs {
+                    *p /= total;
                 }
             }
             AllelePosteriors::Multiallelic(al_probs)
@@ -384,22 +400,35 @@ impl StateProbs {
 
         if n_alleles == 2 {
             // Compute P(ALT at ref_marker) using left marker's states
+            // Handle missing data by tracking both REF and ALT
             let mut p_alt_left = 0.0f32;
+            let mut p_ref_left = 0.0f32;
             for (j, &hap) in haps_left.iter().enumerate() {
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele == 1 {
                     p_alt_left += probs_left[j];
+                } else if allele == 0 {
+                    p_ref_left += probs_left[j];
                 }
             }
+            // Renormalize left
+            let total_left = p_ref_left + p_alt_left;
+            let p_alt_left = if total_left > 1e-10 { p_alt_left / total_left } else { 0.0 };
 
             // Compute P(ALT at ref_marker) using right marker's states
             let mut p_alt_right = 0.0f32;
+            let mut p_ref_right = 0.0f32;
             for (j, &hap) in haps_right.iter().enumerate() {
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele == 1 {
                     p_alt_right += probs_right[j];
+                } else if allele == 0 {
+                    p_ref_right += probs_right[j];
                 }
             }
+            // Renormalize right
+            let total_right = p_ref_right + p_alt_right;
+            let p_alt_right = if total_right > 1e-10 { p_alt_right / total_right } else { 0.0 };
 
             // Interpolate the allele posteriors (not state probabilities!)
             let p_alt = weight_left * p_alt_left + weight_right * p_alt_right;
@@ -413,6 +442,13 @@ impl StateProbs {
                     al_probs_left[allele as usize] += probs_left[j];
                 }
             }
+            // Renormalize left
+            let total_left: f32 = al_probs_left.iter().sum();
+            if total_left > 1e-10 {
+                for p in &mut al_probs_left {
+                    *p /= total_left;
+                }
+            }
 
             // Compute allele posteriors from right marker's states
             let mut al_probs_right = vec![0.0f32; n_alleles];
@@ -420,6 +456,13 @@ impl StateProbs {
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele != 255 && (allele as usize) < n_alleles {
                     al_probs_right[allele as usize] += probs_right[j];
+                }
+            }
+            // Renormalize right
+            let total_right: f32 = al_probs_right.iter().sum();
+            if total_right > 1e-10 {
+                for p in &mut al_probs_right {
+                    *p /= total_right;
                 }
             }
 
