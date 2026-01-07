@@ -197,10 +197,16 @@ impl MarkerAlignment {
 ///
 /// This provides ~100x speedup over running HMM on all reference markers.
 ///
-/// **Design Note**: We store allele posteriors (P(ALT)) at each genotyped marker,
-/// not state probabilities. This is because IBS state selection chooses DIFFERENT
-/// haplotypes at each genotyped marker, so state indices don't correspond across
-/// markers. Interpolating at the allele level avoids this mismatch.
+/// **Design Note**: We store state probabilities at genotyped markers, and for
+/// interpolation we store BOTH `probs[m]` and `probs_p1[m]` (probability at next
+/// marker) to match Java Beagle's approach. The haplotype from marker m is used
+/// for allele lookup at all interpolated positions, while the state probability
+/// is interpolated between prob[m] and probs_p1[m].
+///
+/// This matches Java `imp/StateProbsFactory.java` which stores:
+/// - hapIndices[m][j] = haplotype for state j at marker m
+/// - probs[m][j] = P(state j) at marker m
+/// - probsP1[m][j] = P(state j) at marker m+1
 #[derive(Clone, Debug)]
 pub struct StateProbs {
     /// Indices of genotyped markers in reference space
@@ -210,6 +216,9 @@ pub struct StateProbs {
     hap_indices: Vec<Vec<u32>>,
     /// State probabilities at each genotyped marker
     probs: Vec<Vec<f32>>,
+    /// State probabilities at the NEXT genotyped marker (for interpolation)
+    /// At the last marker, this equals probs (no next marker)
+    probs_p1: Vec<Vec<f32>>,
     /// Genetic positions of ALL reference markers (for interpolation)
     /// Uses Arc to share across all haplotypes (avoids cloning ~8MB per haplotype)
     gen_positions: std::sync::Arc<Vec<f64>>,
@@ -226,11 +235,11 @@ impl StateProbs {
     /// * `gen_positions` - Genetic positions of ALL reference markers
     ///
     /// # Design
-    /// Stores state probabilities at each genotyped marker. For interpolation at
-    /// ungenotyped markers, we compute allele posteriors from BOTH adjacent genotyped
-    /// markers (using their respective haplotype sets) and interpolate by position.
-    /// This avoids the bug of mixing state indices across markers where IBS selection
-    /// chooses different haplotypes.
+    /// Stores state probabilities at each genotyped marker PLUS probabilities at the
+    /// next marker (probs_p1) for interpolation. This matches Java Beagle's approach
+    /// where interpolation uses:
+    /// - Haplotype from marker m for allele lookup
+    /// - Interpolated probability: w * prob[m] + (1-w) * prob[m+1]
     pub fn new(
         genotyped_markers: std::sync::Arc<Vec<usize>>,
         n_states: usize,
@@ -242,28 +251,38 @@ impl StateProbs {
 
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
+        let mut filtered_probs_p1 = Vec::with_capacity(n_genotyped);
 
         // Keep ALL states - no filtering to avoid probability mass loss
         for sparse_m in 0..n_genotyped {
             let row_offset = sparse_m * n_states;
+            // For probs_p1, use the next marker if available, else same marker
+            let m_p1 = if sparse_m + 1 < n_genotyped { sparse_m + 1 } else { sparse_m };
+            let row_offset_p1 = m_p1 * n_states;
 
             let mut haps = Vec::new();
             let mut probs = Vec::new();
+            let mut probs_p1 = Vec::new();
 
             for j in 0..n_states.min(hap_indices.get(sparse_m).map(|v| v.len()).unwrap_or(0)) {
                 let prob = state_probs.get(row_offset + j).copied().unwrap_or(0.0);
+                // Get prob at next marker for same state index j
+                let prob_p1 = state_probs.get(row_offset_p1 + j).copied().unwrap_or(0.0);
                 haps.push(hap_indices[sparse_m][j]);
                 probs.push(prob);
+                probs_p1.push(prob_p1);
             }
 
             filtered_haps.push(haps);
             filtered_probs.push(probs);
+            filtered_probs_p1.push(probs_p1);
         }
 
         Self {
             genotyped_markers,
             hap_indices: filtered_haps,
             probs: filtered_probs,
+            probs_p1: filtered_probs_p1,
             gen_positions,
         }
     }
@@ -341,9 +360,13 @@ impl StateProbs {
 
     /// Per-allele probabilities at an ungenotyped marker via interpolation
     ///
-    /// Computes allele posteriors at the ungenotyped marker using BOTH adjacent
-    /// genotyped markers' state sets, then interpolates the allele posteriors.
-    /// This avoids the bug of mixing state indices across markers.
+    /// Matches Java Beagle's `ImputedVcfWriter.setAlProbs()` approach:
+    /// - Uses haplotypes from LEFT marker for allele lookup
+    /// - Interpolates state probabilities: w * prob[m] + (1-w) * probs_p1[m]
+    /// - Adds interpolated prob to the allele that haplotype carries at ref_marker
+    ///
+    /// This differs from the previous approach which used different haplotype sets
+    /// for left and right markers and interpolated allele posteriors.
     #[inline]
     fn posteriors_interpolated<F>(
         &self,
@@ -372,107 +395,77 @@ impl StateProbs {
             return self.posteriors_at_genotyped(n_genotyped - 1, ref_marker, n_alleles, get_ref_allele);
         }
 
-        // Get adjacent genotyped marker indices
+        // Get the LEFT genotyped marker (we use its haplotypes for allele lookup)
         let left_sparse = insert_pos - 1;
-        let right_sparse = insert_pos;
         let left_ref = self.genotyped_markers[left_sparse];
-        let right_ref = self.genotyped_markers[right_sparse];
+        let right_ref = self.genotyped_markers[insert_pos];
 
         let pos_left = self.gen_positions[left_ref];
         let pos_right = self.gen_positions[right_ref];
         let pos_marker = self.gen_positions[ref_marker];
 
+        // Weight for LEFT marker's probability (matches Java's wts formula)
         let total_dist = pos_right - pos_left;
         let weight_left = if total_dist > 1e-10 {
             ((pos_right - pos_marker) / total_dist) as f32
         } else {
             0.5
         };
-        let weight_right = 1.0 - weight_left;
 
-        // Compute allele posteriors from LEFT marker's states at the interpolated position
-        let haps_left = &self.hap_indices[left_sparse];
-        let probs_left = &self.probs[left_sparse];
-
-        // Compute allele posteriors from RIGHT marker's states at the interpolated position
-        let haps_right = &self.hap_indices[right_sparse];
-        let probs_right = &self.probs[right_sparse];
+        // Get haplotypes and probabilities from LEFT marker
+        let haps = &self.hap_indices[left_sparse];
+        let probs = &self.probs[left_sparse];
+        let probs_p1 = &self.probs_p1[left_sparse];
 
         if n_alleles == 2 {
-            // Compute P(ALT at ref_marker) using left marker's states
-            // Handle missing data by tracking both REF and ALT
-            let mut p_alt_left = 0.0f32;
-            let mut p_ref_left = 0.0f32;
-            for (j, &hap) in haps_left.iter().enumerate() {
+            // Java-style interpolation for biallelic sites:
+            // For each state j, interpolate prob: w * prob[j] + (1-w) * probs_p1[j]
+            // Then add to allele posterior based on haplotype's allele at ref_marker
+            let mut p_alt = 0.0f32;
+            let mut p_ref = 0.0f32;
+            for (j, &hap) in haps.iter().enumerate() {
+                // Interpolate state probability
+                let prob = probs.get(j).copied().unwrap_or(0.0);
+                let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                let interpolated_prob = weight_left * prob + (1.0 - weight_left) * prob_p1;
+
+                // Look up allele at the interpolated marker
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele == 1 {
-                    p_alt_left += probs_left[j];
+                    p_alt += interpolated_prob;
                 } else if allele == 0 {
-                    p_ref_left += probs_left[j];
+                    p_ref += interpolated_prob;
                 }
+                // allele == 255 (missing): don't add to either, will renormalize
             }
-            // Renormalize left
-            let total_left = p_ref_left + p_alt_left;
-            let p_alt_left = if total_left > 1e-10 { p_alt_left / total_left } else { 0.0 };
 
-            // Compute P(ALT at ref_marker) using right marker's states
-            let mut p_alt_right = 0.0f32;
-            let mut p_ref_right = 0.0f32;
-            for (j, &hap) in haps_right.iter().enumerate() {
-                let allele = get_ref_allele(ref_marker, hap);
-                if allele == 1 {
-                    p_alt_right += probs_right[j];
-                } else if allele == 0 {
-                    p_ref_right += probs_right[j];
-                }
-            }
-            // Renormalize right
-            let total_right = p_ref_right + p_alt_right;
-            let p_alt_right = if total_right > 1e-10 { p_alt_right / total_right } else { 0.0 };
-
-            // Interpolate the allele posteriors (not state probabilities!)
-            let p_alt = weight_left * p_alt_left + weight_right * p_alt_right;
+            // Renormalize if there was any missing data
+            let total = p_ref + p_alt;
+            let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
             AllelePosteriors::Biallelic(p_alt)
         } else {
-            // Compute allele posteriors from left marker's states
-            let mut al_probs_left = vec![0.0f32; n_alleles];
-            for (j, &hap) in haps_left.iter().enumerate() {
+            // Java-style interpolation for multiallelic sites
+            let mut al_probs = vec![0.0f32; n_alleles];
+            for (j, &hap) in haps.iter().enumerate() {
+                // Interpolate state probability
+                let prob = probs.get(j).copied().unwrap_or(0.0);
+                let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                let interpolated_prob = weight_left * prob + (1.0 - weight_left) * prob_p1;
+
+                // Look up allele at the interpolated marker
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele != 255 && (allele as usize) < n_alleles {
-                    al_probs_left[allele as usize] += probs_left[j];
-                }
-            }
-            // Renormalize left
-            let total_left: f32 = al_probs_left.iter().sum();
-            if total_left > 1e-10 {
-                for p in &mut al_probs_left {
-                    *p /= total_left;
+                    al_probs[allele as usize] += interpolated_prob;
                 }
             }
 
-            // Compute allele posteriors from right marker's states
-            let mut al_probs_right = vec![0.0f32; n_alleles];
-            for (j, &hap) in haps_right.iter().enumerate() {
-                let allele = get_ref_allele(ref_marker, hap);
-                if allele != 255 && (allele as usize) < n_alleles {
-                    al_probs_right[allele as usize] += probs_right[j];
+            // Renormalize so probabilities sum to 1
+            let total: f32 = al_probs.iter().sum();
+            if total > 1e-10 {
+                for p in &mut al_probs {
+                    *p /= total;
                 }
             }
-            // Renormalize right
-            let total_right: f32 = al_probs_right.iter().sum();
-            if total_right > 1e-10 {
-                for p in &mut al_probs_right {
-                    *p /= total_right;
-                }
-            }
-
-            // Interpolate the allele posteriors
-            let al_probs: Vec<f32> = al_probs_left
-                .iter()
-                .zip(al_probs_right.iter())
-                .map(|(&l, &r)| weight_left * l + weight_right * r)
-                .collect();
-
             AllelePosteriors::Multiallelic(al_probs)
         }
     }
@@ -996,6 +989,7 @@ fn run_hmm_forward_backward(
     }
 
     // Backward pass using workspace.bwd buffer
+    // Match Java exactly: initialize bwd to 1/n_states
     let bwd = &mut workspace.bwd;
     bwd.resize(n_states, 0.0);
     bwd.fill(1.0 / n_states as f32);
@@ -1003,16 +997,21 @@ fn run_hmm_forward_backward(
 
     for m in (0..n_markers).rev() {
         let row_offset = m * n_states;
-        
-        // Apply transition for backward (except at last marker)
-        if m < n_markers - 1 {
-            let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
-            let shift = p_rec / n_states as f32;
-            let scale = (1.0 - p_rec) / bwd_sum;
 
-            for k in 0..n_states {
-                bwd[k] = scale * bwd[k] + shift;
-            }
+        // Apply transition for backward at ALL markers (matching Java)
+        // Java: pRecomb = (mP1 < nMarkers) ? impData.pRecomb(mP1) : 0.0f
+        // At last marker: pRecomb = 0, so scale = 1/lastSum, shift = 0
+        // This normalizes bwd by bwd_sum even at last marker
+        let p_rec = if m < n_markers - 1 {
+            p_recomb.get(m + 1).copied().unwrap_or(0.0)
+        } else {
+            0.0  // At last marker, no recombination to "next" marker
+        };
+        let shift = p_rec / n_states as f32;
+        let scale = (1.0 - p_rec) / bwd_sum;
+
+        for k in 0..n_states {
+            bwd[k] = scale * bwd[k] + shift;
         }
 
         // Compute posterior: fwd * bwd
