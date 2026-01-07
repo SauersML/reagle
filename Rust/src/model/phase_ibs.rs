@@ -13,6 +13,13 @@ pub const DEFAULT_PBWT_BACKOFF_CM: f64 = 0.3;
 /// Stores both forward and backward PBWT arrays at each marker to enable
 /// selecting haplotypes that match well both upstream and downstream.
 /// This is critical for phasing accuracy around recombination hotspots.
+///
+/// ## Subset Support
+///
+/// When built for a marker subset (e.g., high-frequency markers in Stage 1),
+/// the PBWT operates in subset index space (0..n_subset), but IBS2 segments
+/// use global marker indices. The `subset_to_global` mapping handles this
+/// coordinate space conversion automatically in `find_neighbors`.
 pub struct BidirectionalPhaseIbs {
     /// Forward divergence at each marker: fwd_div[m] = divergence array after processing markers 0..=m
     fwd_div: Vec<Vec<i32>>,
@@ -28,6 +35,10 @@ pub struct BidirectionalPhaseIbs {
     fwd_backoff_limit: Vec<i32>,
     /// Pre-computed backward backoff limits: bwd_backoff_limit[m] = latest marker within backoff distance
     bwd_backoff_limit: Vec<i32>,
+    /// Optional mapping from subset marker index to global marker index.
+    /// When Some, IBS2 lookups use the mapped global index.
+    /// When None (full chromosome), marker indices are used directly.
+    subset_to_global: Option<Vec<usize>>,
 }
 
 impl BidirectionalPhaseIbs {
@@ -82,7 +93,32 @@ impl BidirectionalPhaseIbs {
             n_markers,
             fwd_backoff_limit,
             bwd_backoff_limit,
+            subset_to_global: None,
         }
+    }
+
+    /// Build bidirectional PBWT for a marker subset with global index mapping
+    ///
+    /// This variant stores the subset-to-global marker mapping so that IBS2
+    /// lookups (which use global indices) work correctly when the PBWT is
+    /// built on a marker subset (e.g., high-frequency markers in Stage 1).
+    ///
+    /// # Arguments
+    /// * `alleles` - Allele data per subset marker
+    /// * `n_haps` - Number of haplotypes
+    /// * `n_markers` - Number of markers in subset
+    /// * `gen_positions` - Optional genetic positions (cM) for computing backoff limits
+    /// * `subset_to_global` - Mapping from subset index to global marker index
+    pub fn build_for_subset(
+        alleles: &[Vec<u8>],
+        n_haps: usize,
+        n_markers: usize,
+        gen_positions: Option<&[f64]>,
+        subset_to_global: &[usize],
+    ) -> Self {
+        let mut result = Self::build(alleles, n_haps, n_markers, gen_positions);
+        result.subset_to_global = Some(subset_to_global.to_vec());
+        result
     }
 
     /// Compute backoff limits for each marker based on genetic distance
@@ -140,6 +176,9 @@ impl BidirectionalPhaseIbs {
     }
 
     /// Find neighbors at a marker using both forward and backward PBWT
+    ///
+    /// When built with `build_for_subset`, automatically converts the subset
+    /// marker index to global space for IBS2 segment lookups.
     pub fn find_neighbors(
         &self,
         hap_idx: u32,
@@ -150,8 +189,17 @@ impl BidirectionalPhaseIbs {
         let mut neighbors = Vec::with_capacity(n_candidates * 2 + 10);
         let sample = SampleIdx::new(hap_idx / 2);
 
+        // Convert marker index to global space for IBS2 lookup
+        // IBS2 segments use global marker indices, but when built for a subset,
+        // marker_idx is in subset space. The mapping handles this conversion.
+        let ibs2_marker_idx = self
+            .subset_to_global
+            .as_ref()
+            .and_then(|mapping| mapping.get(marker_idx).copied())
+            .unwrap_or(marker_idx);
+
         for seg in ibs2.segments(sample) {
-            if seg.contains(marker_idx) {
+            if seg.contains(ibs2_marker_idx) {
                 let other_s = seg.other_sample;
                 if other_s != sample {
                     neighbors.push(other_s.hap1().0);

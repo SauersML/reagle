@@ -157,6 +157,7 @@ impl CodedStep {
     /// Always returns a pattern (never None)
     ///
     /// Uses a closure to look up reference alleles on-demand.
+    /// Optimized with early termination when perfect match is found.
     ///
     /// # Arguments
     /// * `alleles` - Target allele sequence for this step
@@ -173,18 +174,33 @@ impl CodedStep {
         let mut best_distance = usize::MAX;
 
         for (idx, &rep_hap) in self.pattern_rep_hap.iter().enumerate() {
-            let distance = (self.start..self.end)
-                .enumerate()
-                .filter(|(i, m)| {
-                    let ref_allele = get_allele(*m, rep_hap);
-                    let target_allele = alleles[*i];
-                    ref_allele != target_allele && ref_allele != 255 && target_allele != 255
-                })
-                .count();
+            // Early termination with bounded counting
+            let mut distance = 0usize;
+            let mut early_exit = false;
 
-            if distance < best_distance {
+            for (i, m) in (self.start..self.end).enumerate() {
+                let ref_allele = get_allele(m, rep_hap);
+                let target_allele = alleles[i];
+
+                // Skip missing data comparisons
+                if ref_allele != target_allele && ref_allele != 255 && target_allele != 255 {
+                    distance += 1;
+                    // Early exit if we can't beat current best
+                    if distance >= best_distance {
+                        early_exit = true;
+                        break;
+                    }
+                }
+            }
+
+            if !early_exit && distance < best_distance {
                 best_distance = distance;
                 best_pattern = idx as u16;
+
+                // Perfect match - return immediately
+                if distance == 0 {
+                    return best_pattern;
+                }
             }
         }
 

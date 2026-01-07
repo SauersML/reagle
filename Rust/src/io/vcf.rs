@@ -638,16 +638,7 @@ impl VcfWriter {
 
     /// Write VCF header for phased output
     pub fn write_header(&mut self, markers: &Markers) -> Result<()> {
-        self.write_header_impl(markers, false)
-    }
-
-    /// Write VCF header for imputed output (includes DR2, AF, IMP fields)
-    pub fn write_header_imputed(&mut self, markers: &Markers) -> Result<()> {
-        self.write_header_impl(markers, true)
-    }
-
-    fn write_header_impl(&mut self, markers: &Markers, imputed: bool) -> Result<()> {
-        self.write_header_extended(markers, imputed, false, false)
+        self.write_header_extended(markers, false, false, false)
     }
 
     /// Write VCF header with optional GP/AP fields

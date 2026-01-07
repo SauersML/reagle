@@ -921,13 +921,20 @@ impl PhasingPipeline {
     /// Build bidirectional PBWT for a subset of markers (e.g., high-frequency only)
     ///
     /// This ensures state selection is consistent with the HMM marker space
-    /// when phasing Stage 1 (high-frequency) markers.
+    /// when phasing Stage 1 (high-frequency) markers. The subset-to-global marker
+    /// mapping is stored so that IBS2 lookups (which use global indices) work correctly.
+    ///
+    /// # Arguments
+    /// * `geno` - Genotype data (uses global marker indices internally)
+    /// * `marker_indices` - Global indices of markers in the subset (subset-to-global mapping)
+    /// * `n_haps` - Number of haplotypes
+    /// * `subset_gen_positions` - Genetic positions already in subset space (length = n_subset)
     fn build_bidirectional_pbwt_subset(
         &self,
         geno: &MutableGenotypes,
         marker_indices: &[usize],
         n_haps: usize,
-        gen_positions: Option<&[f64]>,
+        subset_gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs {
         let n_subset = marker_indices.len();
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
@@ -940,16 +947,14 @@ impl PhasingPipeline {
             alleles_by_marker.push(alleles);
         }
 
-        // Extract genetic positions for the subset markers
-        let subset_gen_positions: Option<Vec<f64>> = gen_positions.map(|gp| {
-            marker_indices.iter().map(|&m| gp[m]).collect()
-        });
-
-        BidirectionalPhaseIbs::build(
+        // Use build_for_subset to store the marker mapping for IBS2 coordinate conversion
+        // Note: gen_positions are already in subset space, no extraction needed
+        BidirectionalPhaseIbs::build_for_subset(
             &alleles_by_marker,
             n_haps,
             n_subset,
-            subset_gen_positions.as_deref(),
+            subset_gen_positions,
+            marker_indices,
         )
     }
 
@@ -981,13 +986,20 @@ impl PhasingPipeline {
     /// Build bidirectional PBWT for combined haplotype space on a marker subset
     ///
     /// Used for Stage 1 phasing with reference panel - indexes both target and
-    /// reference haplotypes but only on high-frequency markers.
+    /// reference haplotypes but only on high-frequency markers. The subset-to-global
+    /// marker mapping is stored so that IBS2 lookups work correctly.
+    ///
+    /// # Arguments
+    /// * `get_allele` - Closure to get allele at (global_marker_idx, hap_idx)
+    /// * `marker_indices` - Global indices of markers in the subset (subset-to-global mapping)
+    /// * `n_total_haps` - Number of haplotypes (target + reference)
+    /// * `subset_gen_positions` - Genetic positions already in subset space (length = n_subset)
     fn build_bidirectional_pbwt_combined_subset<F>(
         &self,
         get_allele: F,
         marker_indices: &[usize],
         n_total_haps: usize,
-        gen_positions: Option<&[f64]>,
+        subset_gen_positions: Option<&[f64]>,
     ) -> BidirectionalPhaseIbs
     where
         F: Fn(usize, usize) -> u8,  // (orig_marker_idx, hap_idx) -> allele
@@ -1003,16 +1015,14 @@ impl PhasingPipeline {
             alleles_by_marker.push(alleles);
         }
 
-        // Extract genetic positions for the subset markers
-        let subset_gen_positions: Option<Vec<f64>> = gen_positions.map(|gp| {
-            marker_indices.iter().map(|&m| gp[m]).collect()
-        });
-
-        BidirectionalPhaseIbs::build(
+        // Use build_for_subset to store the marker mapping for IBS2 coordinate conversion
+        // Note: gen_positions are already in subset space, no extraction needed
+        BidirectionalPhaseIbs::build_for_subset(
             &alleles_by_marker,
             n_total_haps,
             n_subset,
-            subset_gen_positions.as_deref(),
+            subset_gen_positions,
+            marker_indices,
         )
     }
 
@@ -2372,6 +2382,9 @@ impl PhasingPipeline {
             }
         };
 
+        // Extract subset genetic positions for PBWT backoff computation
+        let subset_gen_positions: Vec<f64> = hi_freq_markers.iter().map(|&m| gen_positions[m]).collect();
+
         // Build bidirectional PBWT on hi-freq markers for consistent state selection
         // When reference is available, include reference haplotypes
         let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
@@ -2392,10 +2405,10 @@ impl PhasingPipeline {
                 },
                 hi_freq_markers,
                 n_total_haps,
-                Some(gen_positions),
+                Some(&subset_gen_positions),
             )
         } else {
-            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps, Some(gen_positions))
+            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps, Some(&subset_gen_positions))
         };
 
         // Process samples in parallel - collect results: (marker, should_swap)
