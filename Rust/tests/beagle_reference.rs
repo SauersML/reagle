@@ -20,9 +20,43 @@ use rand::SeedableRng;
 // Import Rust implementation for comparison tests
 use reagle::{Config, ImputationPipeline, PhasingPipeline};
 
-// Import gnomAD data source
-mod gnomad_reference;
-use gnomad_reference::setup_gnomad_files;
+// =============================================================================
+// gnomAD Test Data Source
+// =============================================================================
+
+/// gnomAD test files (same structure as BEAGLE test files)
+struct GnomadTestFiles {
+    ref_vcf: PathBuf,
+    target_vcf: PathBuf,
+    target_sparse_vcf: PathBuf,
+}
+
+/// Get gnomAD fixtures directory
+fn gnomad_fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gnomad_hgdp")
+}
+
+/// Setup gnomAD test files (pre-generated fixtures)
+fn setup_gnomad_files() -> GnomadTestFiles {
+    let fixtures = gnomad_fixtures_dir();
+    let ref_vcf = fixtures.join("ref.vcf.gz");
+    let target_vcf = fixtures.join("target.vcf.gz");
+    let target_sparse_vcf = fixtures.join("target_sparse.vcf.gz");
+
+    // Verify fixtures exist
+    assert!(ref_vcf.exists(), "gnomAD ref.vcf.gz fixture missing: {}", ref_vcf.display());
+    assert!(target_vcf.exists(), "gnomAD target.vcf.gz fixture missing: {}", target_vcf.display());
+    assert!(target_sparse_vcf.exists(), "gnomAD target_sparse.vcf.gz fixture missing: {}", target_sparse_vcf.display());
+
+    GnomadTestFiles {
+        ref_vcf,
+        target_vcf,
+        target_sparse_vcf,
+    }
+}
 
 // =============================================================================
 // Common Data Source Abstraction
