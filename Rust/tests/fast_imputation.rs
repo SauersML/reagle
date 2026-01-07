@@ -177,6 +177,40 @@ fn inspect_dosages(path: &std::path::Path, _: usize) -> Vec<Vec<f32>> {
     all_dosages
 }
 
+/// Compute R² between estimated dosages and true dosages
+/// R² = 1 - (SS_res / SS_tot) = Var(estimated) / Var(true) when means match
+fn compute_r_squared(estimated: &[f32], truth: &[f32]) -> f64 {
+    if estimated.len() != truth.len() || estimated.is_empty() {
+        return 0.0;
+    }
+    let n = estimated.len() as f64;
+
+    // Compute means
+    let mean_est: f64 = estimated.iter().map(|&x| x as f64).sum::<f64>() / n;
+    let mean_true: f64 = truth.iter().map(|&x| x as f64).sum::<f64>() / n;
+
+    // Compute variances and covariance
+    let mut var_est = 0.0;
+    let mut var_true = 0.0;
+    let mut covar = 0.0;
+
+    for (&e, &t) in estimated.iter().zip(truth.iter()) {
+        let e_diff = e as f64 - mean_est;
+        let t_diff = t as f64 - mean_true;
+        var_est += e_diff * e_diff;
+        var_true += t_diff * t_diff;
+        covar += e_diff * t_diff;
+    }
+
+    // R² = correlation² = (covariance / (sd_est * sd_true))²
+    if var_est < 1e-10 || var_true < 1e-10 {
+        return 0.0;
+    }
+
+    let r = covar / (var_est.sqrt() * var_true.sqrt());
+    r * r
+}
+
 fn inspect_gt_phasing(path: &std::path::Path) -> Vec<Vec<String>> {
     let file = File::open(path).expect("Open output VCF");
     let decoder = bgzf_io::Reader::new(file);
@@ -990,5 +1024,213 @@ fn test_adversarial_no_match() {
     assert!(extreme_pct < 0.8,
         "Algorithm is overconfident on adversarial data: {:.1}% extreme predictions",
         extreme_pct * 100.0);
+}
+
+/// Microarray-style target (sparse ~1% of markers) vs WGS-style reference (dense)
+/// This is the realistic imputation scenario - compute R² to measure accuracy
+#[test]
+fn test_microarray_vs_wgs_imputation() {
+    // Dense WGS reference panel: 500 markers, 50 samples (100 haplotypes)
+    let n_ref_markers = 500;
+    let n_ref_samples = 50;
+    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 1000 + 1).collect();
+
+    // Create structured haplotype patterns with LD blocks
+    // Each 50-marker block has correlated alleles
+    let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
+        .positions(positions.clone())
+        .allele_generator(|m, h| {
+            let block = m / 50;
+            let hap_group = h / 20; // 5 haplotype groups
+            // Within-block correlation: same allele throughout block with some variation
+            let base_allele = ((block + hap_group) % 2) as u8;
+            // Add some noise based on position within block
+            if (m % 10 == 3 || m % 10 == 7) && h % 3 == 0 {
+                1 - base_allele // Flip allele for diversity
+            } else {
+                base_allele
+            }
+        })
+        .build();
+
+    // Create masked target (microarray-style - only every 10th marker)
+    let masked_target_file = SyntheticVcfBuilder::new(n_ref_markers, 5)
+        .positions(positions.clone())
+        .allele_generator(|m, h| {
+            if m % 10 == 0 {
+                // Genotyped marker - same pattern as full target
+                let block = m / 50;
+                let hap_group = h / 2;
+                let base_allele = ((block + hap_group) % 2) as u8;
+                if (m % 10 == 3 || m % 10 == 7) && h % 3 == 0 {
+                    1 - base_allele
+                } else {
+                    base_allele
+                }
+            } else {
+                255 // Missing - to be imputed
+            }
+        })
+        .build();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("output_microarray");
+
+    let mut config = default_test_config();
+    config.gt = masked_target_file.path().to_path_buf();
+    config.r#ref = Some(ref_file.path().to_path_buf());
+    config.out = out_prefix.clone();
+    config.imp_states = 100;
+    config.nthreads = Some(1);
+
+    let mut pipeline = ImputationPipeline::new(config);
+    pipeline.run().expect("Pipeline run success");
+
+    let out_vcf = temp_dir.path().join("output_microarray.vcf.gz");
+    let imputed_dosages = inspect_dosages(&out_vcf, 5);
+
+    // Get true dosages from full target file
+    let true_dosages: Vec<Vec<f32>> = (0..n_ref_markers)
+        .map(|m| {
+            (0..5)
+                .map(|s| {
+                    let h0 = s * 2;
+                    let h1 = s * 2 + 1;
+                    let block = m / 50;
+                    let allele0 = {
+                        let hap_group = h0 / 2;
+                        let base = ((block + hap_group) % 2) as f32;
+                        if (m % 10 == 3 || m % 10 == 7) && h0 % 3 == 0 { 1.0 - base } else { base }
+                    };
+                    let allele1 = {
+                        let hap_group = h1 / 2;
+                        let base = ((block + hap_group) % 2) as f32;
+                        if (m % 10 == 3 || m % 10 == 7) && h1 % 3 == 0 { 1.0 - base } else { base }
+                    };
+                    allele0 + allele1
+                })
+                .collect()
+        })
+        .collect();
+
+    // Compute R² for imputed markers only (not genotyped)
+    let mut imputed_est: Vec<f32> = Vec::new();
+    let mut imputed_true: Vec<f32> = Vec::new();
+
+    for m in 0..n_ref_markers {
+        if m % 10 != 0 {
+            // This is an imputed marker
+            for s in 0..5 {
+                imputed_est.push(imputed_dosages[m][s]);
+                imputed_true.push(true_dosages[m][s]);
+            }
+        }
+    }
+
+    let r_squared = compute_r_squared(&imputed_est, &imputed_true);
+    println!("Microarray vs WGS R²: {:.4}", r_squared);
+
+    // Compute concordance
+    let mut correct = 0;
+    let mut total = 0;
+    for (&est, &truth) in imputed_est.iter().zip(imputed_true.iter()) {
+        let est_geno = if est < 0.5 { 0 } else if est < 1.5 { 1 } else { 2 };
+        let true_geno = truth.round() as i32;
+        if est_geno == true_geno {
+            correct += 1;
+        }
+        total += 1;
+    }
+    let concordance = correct as f64 / total as f64;
+    println!("Microarray vs WGS Concordance: {:.2}%", concordance * 100.0);
+
+    // R² should be reasonably high for well-imputed data
+    assert!(r_squared > 0.5, "R² too low for microarray imputation: {:.4}", r_squared);
+    assert!(concordance > 0.7, "Concordance too low: {:.2}%", concordance * 100.0);
+}
+
+/// Test with lower-density genotyping array
+/// Simulate ~20% genotyped markers (every 5th)
+#[test]
+fn test_high_density_array_imputation() {
+    // Dense reference: 100 markers, 20 samples
+    let n_ref_markers = 100;
+    let n_ref_samples = 20;
+    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 1000 + 1).collect();
+
+    // Create reference with diverse haplotypes - simple MAF variation
+    let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
+        .positions(positions.clone())
+        .allele_generator(|m, h| {
+            // Alternate alleles based on marker and haplotype
+            // Creates MAF ~0.3-0.7 at most sites
+            let val = (m * 7 + h * 13) % 10;
+            if val < 4 { 1 } else { 0 }
+        })
+        .build();
+
+    // Target: every 5th marker genotyped (20% density)
+    let target_file = SyntheticVcfBuilder::new(n_ref_markers, 3)
+        .positions(positions.clone())
+        .allele_generator(|m, h| {
+            let val = (m * 7 + h * 13) % 10;
+            let true_allele = if val < 4 { 1u8 } else { 0 };
+            if m % 5 == 0 {
+                true_allele
+            } else {
+                255
+            }
+        })
+        .build();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("output_highdens");
+
+    let mut config = default_test_config();
+    config.gt = target_file.path().to_path_buf();
+    config.r#ref = Some(ref_file.path().to_path_buf());
+    config.out = out_prefix.clone();
+    config.imp_states = 40;
+    config.nthreads = Some(1);
+
+    let mut pipeline = ImputationPipeline::new(config);
+    pipeline.run().expect("Pipeline run success");
+
+    let out_vcf = temp_dir.path().join("output_highdens.vcf.gz");
+    let imputed_dosages = inspect_dosages(&out_vcf, 3);
+
+    // Compute expected dosages using same formula
+    let expected: Vec<Vec<f32>> = (0..n_ref_markers)
+        .map(|m| {
+            (0..3)
+                .map(|s| {
+                    let h0 = s * 2;
+                    let h1 = s * 2 + 1;
+                    let a0 = if (m * 7 + h0 * 13) % 10 < 4 { 1.0f32 } else { 0.0 };
+                    let a1 = if (m * 7 + h1 * 13) % 10 < 4 { 1.0f32 } else { 0.0 };
+                    a0 + a1
+                })
+                .collect()
+        })
+        .collect();
+
+    // R² on imputed markers
+    let mut est_vec: Vec<f32> = Vec::new();
+    let mut true_vec: Vec<f32> = Vec::new();
+    for m in 0..n_ref_markers {
+        if m % 5 != 0 {
+            for s in 0..3 {
+                est_vec.push(imputed_dosages[m][s]);
+                true_vec.push(expected[m][s]);
+            }
+        }
+    }
+
+    let r_squared = compute_r_squared(&est_vec, &true_vec);
+    println!("High-density array R²: {:.4}", r_squared);
+
+    // This test checks imputation works with moderate density
+    // R² > 0 means there's some correlation
+    assert!(r_squared > 0.1, "R² too low for array imputation: {:.4}", r_squared);
 }
 
