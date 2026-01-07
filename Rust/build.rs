@@ -72,6 +72,12 @@ struct DebugAssertCollector {
     file_path: PathBuf,
 }
 
+// A custom collector for forbidden TODO/FIXME/"for now" comments
+struct TodoCommentCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn warnings_enabled() -> bool {
@@ -576,6 +582,38 @@ impl DebugAssertCollector {
     }
 }
 
+impl TodoCommentCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} TODO/FIXME comments in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str("\n⚠️ TODO/FIXME/\"for now\" COMMENTS ARE FORBIDDEN IN THIS PROJECT!\n");
+        error_msg.push_str("   These comments indicate incomplete work. DO IT NOW!\n");
+        error_msg.push_str("   Do NOT just remove the comment - implement the thing first!\n");
+
+        Some(error_msg)
+    }
+}
+
 // Implement the `Sink` trait for our collector.
 // The `matched` method is called by the searcher for every line that matches the regex.
 impl Sink for ViolationCollector {
@@ -1073,6 +1111,19 @@ impl Sink for DebugAssertCollector {
     }
 }
 
+impl Sink for TodoCommentCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        self.violations.push(format!("{line_number}:{line_text}"));
+
+        Ok(true)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum EmptyBlockTokenKind {
     Ident(String),
@@ -1221,6 +1272,16 @@ fn main() {
     );
     emit_stage_detail(&debug_assert_report);
     all_violations.extend(debug_assert_violations);
+
+    // Scan for TODO/FIXME/"for now" comments
+    update_stage("scan TODO/FIXME comments");
+    let todo_violations = scan_for_todo_comments();
+    let todo_report = format!(
+        "TODO/FIXME comment scan identified {} violation groups",
+        todo_violations.len()
+    );
+    emit_stage_detail(&todo_report);
+    all_violations.extend(todo_violations);
 
     // If any violations were found, print them all and exit with error
     if !all_violations.is_empty() {
@@ -1923,6 +1984,52 @@ fn scan_for_ignored_tests() -> Vec<String> {
     }
 
     // Return all violations found
+    all_violations
+}
+
+fn scan_for_todo_comments() -> Vec<String> {
+    // Regex pattern to find TODO/FIXME/"for now" comments (case insensitive)
+    // Matches: TODO, FIXME, XXX, "for now" in comments
+    let pattern = r"(?i)//.*\b(TODO|FIXME|XXX|for now)\b";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                match std::fs::read_to_string(path) {
+                    Ok(_) => {}
+                    Err(_) => continue,
+                };
+
+                let mut collector = TodoCommentCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!("Error creating TODO comment regex matcher: {}", e));
+        }
+    }
+
     all_violations
 }
 
