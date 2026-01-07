@@ -5,6 +5,7 @@
 
 use bitvec::prelude::*;
 
+use crate::data::marker::bits_per_allele;
 use crate::data::HapIdx;
 
 /// Dense bit-packed storage for genotype data
@@ -69,13 +70,9 @@ impl DenseColumn {
         }
     }
 
-    /// Calculate bits needed per allele
+    /// Calculate bits needed per allele (minimum 1 for storage)
     fn calculate_bits_per_allele(n_alleles: usize) -> u8 {
-        if n_alleles <= 1 {
-            1
-        } else {
-            (usize::BITS - (n_alleles.max(1) - 1).leading_zeros()) as u8
-        }
+        bits_per_allele(n_alleles).max(1)
     }
 
     /// Get allele for haplotype

@@ -8,6 +8,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::ChromIdx;
 
+/// Calculate bits needed to represent n alleles
+/// - 0-1 alleles: 0 bits (nothing to distinguish)
+/// - 2 alleles: 1 bit
+/// - 3-4 alleles: 2 bits
+/// - 5-8 alleles: 3 bits
+///
+/// Formula: ceil(log2(n)) = floor(log2(n-1)) + 1 for n >= 2
+pub fn bits_per_allele(n_alleles: usize) -> u8 {
+    if n_alleles <= 1 {
+        0
+    } else {
+        (n_alleles - 1).ilog2() as u8 + 1
+    }
+}
+
 /// Zero-cost newtype for marker indices
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct MarkerIdx(pub u32);
@@ -494,4 +509,25 @@ mod tests {
         assert!(marker.is_biallelic());
     }
 
+    #[test]
+    fn test_bits_per_allele() {
+        // 0-1 alleles: 0 bits (edge case)
+        assert_eq!(bits_per_allele(0), 0);
+        assert_eq!(bits_per_allele(1), 0);
+
+        // 2 alleles: 1 bit
+        assert_eq!(bits_per_allele(2), 1);
+
+        // 3-4 alleles: 2 bits
+        assert_eq!(bits_per_allele(3), 2);
+        assert_eq!(bits_per_allele(4), 2);
+
+        // 5-8 alleles: 3 bits
+        assert_eq!(bits_per_allele(5), 3);
+        assert_eq!(bits_per_allele(8), 3);
+
+        // 9-16 alleles: 4 bits
+        assert_eq!(bits_per_allele(9), 4);
+        assert_eq!(bits_per_allele(16), 4);
+    }
 }
