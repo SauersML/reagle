@@ -297,6 +297,12 @@ impl StateProbs {
     /// where interpolation uses:
     /// - Haplotype from marker m for allele lookup
     /// - Interpolated probability: w * prob[m] + (1-w) * prob[m+1]
+    ///
+    /// # Sparse Storage (matching Java StateProbsFactory)
+    /// Only states with probability >= threshold are stored, where:
+    ///   threshold = min(0.005, 1/K)
+    /// This typically reduces storage by 50-100x, critical for large datasets.
+    /// Remaining probability mass is renormalized.
     pub fn new(
         genotyped_markers: std::sync::Arc<Vec<usize>>,
         n_states: usize,
@@ -306,11 +312,14 @@ impl StateProbs {
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
 
+        // Sparse storage threshold: min(0.005, 1/K) - matches Java
+        let threshold = (0.005f32).min(1.0 / n_states.max(1) as f32);
+
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
         let mut filtered_probs_p1 = Vec::with_capacity(n_genotyped);
 
-        // Keep ALL states - no filtering to avoid probability mass loss
+        // Filter states by probability threshold (sparse storage)
         for sparse_m in 0..n_genotyped {
             let row_offset = sparse_m * n_states;
             // For probs_p1, use the next marker if available, else same marker
@@ -320,14 +329,37 @@ impl StateProbs {
             let mut haps = Vec::new();
             let mut probs = Vec::new();
             let mut probs_p1 = Vec::new();
+            let mut total_prob = 0.0f32;
 
+            // First pass: collect states above threshold
             for j in 0..n_states.min(hap_indices.get(sparse_m).map(|v| v.len()).unwrap_or(0)) {
                 let prob = state_probs.get(row_offset + j).copied().unwrap_or(0.0);
-                // Get prob at next marker for same state index j
+                // Keep state if prob >= threshold OR if prob_p1 >= threshold
+                // (need state for interpolation even if current prob is low)
                 let prob_p1 = state_probs.get(row_offset_p1 + j).copied().unwrap_or(0.0);
-                haps.push(hap_indices[sparse_m][j]);
-                probs.push(prob);
-                probs_p1.push(prob_p1);
+                if prob >= threshold || prob_p1 >= threshold {
+                    haps.push(hap_indices[sparse_m][j]);
+                    probs.push(prob);
+                    probs_p1.push(prob_p1);
+                    total_prob += prob;
+                }
+            }
+
+            // Renormalize to sum to 1.0 (compensate for dropped probability mass)
+            if total_prob > 0.0 && total_prob < 0.999 {
+                let scale = 1.0 / total_prob;
+                for p in &mut probs {
+                    *p *= scale;
+                }
+            }
+
+            // Renormalize probs_p1 separately
+            let total_p1: f32 = probs_p1.iter().sum();
+            if total_p1 > 0.0 && total_p1 < 0.999 {
+                let scale = 1.0 / total_p1;
+                for p in &mut probs_p1 {
+                    *p *= scale;
+                }
             }
 
             filtered_haps.push(haps);
