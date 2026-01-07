@@ -10,3 +10,4 @@ Rust/.gitignore
 Rust/target
 .claude/
 *.csi
+Rust/clippy_output.txt
