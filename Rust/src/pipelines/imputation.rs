@@ -435,7 +435,9 @@ impl ImputationPipeline {
         );
 
         // Initialize parameters with CLI config
-        self.params = ModelParams::for_imputation(n_ref_haps, self.config.ne, self.config.err);
+        // Java uses nHaps = nRefHaps + nTargHaps for recombIntensity calculation
+        let n_total_haps = n_ref_haps + n_target_haps;
+        self.params = ModelParams::for_imputation(n_total_haps, self.config.ne, self.config.err);
         self.params
             .set_n_states(self.config.imp_states.min(n_ref_haps));
 
@@ -801,13 +803,15 @@ fn run_hmm_forward_backward(
             } else {
                 emit_probs[1]
             };
-            
+
+            // Match Java exactly: m==0 uses just emission, not divided by n_states
+            // Java: fwdVal[m][j] = m==0 ? em : em*(scale*fwdVal[m-1][j] + shift);
             let val = if m == 0 {
-                emit / n_states as f32
+                emit
             } else {
                 emit * (scale * fwd[prev_row_offset + k] + shift)
             };
-            
+
             fwd[row_offset + k] = val;
             new_sum += val;
         }

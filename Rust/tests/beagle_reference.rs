@@ -547,9 +547,18 @@ fn run_imputation_comparison(source: &TestDataSource) {
 
     if !dosage_diffs.is_empty() {
         let mean_diff: f64 = dosage_diffs.iter().sum::<f64>() / dosage_diffs.len() as f64;
-        println!("[{}] Dosage comparison: {} values, mean diff={:.4}",
-                 source.name, dosage_diffs.len(), mean_diff);
-        assert!(mean_diff < 0.1, "{}: Mean dosage too high: {:.4}", source.name, mean_diff);
+        let max_diff: f64 = dosage_diffs.iter().cloned().fold(0.0, f64::max);
+        let within_05: usize = dosage_diffs.iter().filter(|&&d| d < 0.05).count();
+        let pct_within_05 = 100.0 * within_05 as f64 / dosage_diffs.len() as f64;
+
+        println!("[{}] Dosage comparison: {} values, mean diff={:.4}, max diff={:.4}",
+                 source.name, dosage_diffs.len(), mean_diff, max_diff);
+        println!("[{}] Dosages within 0.05 tolerance: {:.1}%", source.name, pct_within_05);
+
+        // Strict tolerance: mean dosage difference should be small
+        assert!(mean_diff < 0.05, "{}: Mean dosage diff too high: {:.4}", source.name, mean_diff);
+        // At least 95% of dosages should be within 0.05 of Java
+        assert!(pct_within_05 >= 95.0, "{}: Only {:.1}% of dosages within 0.05 tolerance", source.name, pct_within_05);
     }
 }
 
@@ -665,8 +674,18 @@ fn test_imputation_bref3_ref_rust_vs_java() {
 
     if !dosage_diffs.is_empty() {
         let mean_diff: f64 = dosage_diffs.iter().sum::<f64>() / dosage_diffs.len() as f64;
-        println!("Dosage comparison: {} values, mean diff={:.4}", dosage_diffs.len(), mean_diff);
-        assert!(mean_diff < 0.1, "Mean dosage difference too high: {:.4}", mean_diff);
+        let max_diff: f64 = dosage_diffs.iter().cloned().fold(0.0, f64::max);
+        let within_05: usize = dosage_diffs.iter().filter(|&&d| d < 0.05).count();
+        let pct_within_05 = 100.0 * within_05 as f64 / dosage_diffs.len() as f64;
+
+        println!("Dosage comparison: {} values, mean diff={:.4}, max diff={:.4}",
+                 dosage_diffs.len(), mean_diff, max_diff);
+        println!("Dosages within 0.05 tolerance: {:.1}%", pct_within_05);
+
+        // Strict tolerance: mean dosage difference should be small
+        assert!(mean_diff < 0.05, "Mean dosage diff too high: {:.4}", mean_diff);
+        // At least 95% of dosages should be within 0.05 of Java
+        assert!(pct_within_05 >= 95.0, "Only {:.1}% of dosages within 0.05 tolerance", pct_within_05);
     }
 
     println!("bref3 imputation: Rust matches Java!");
@@ -1422,14 +1441,42 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     assert!(java_acc.concordance() > 0.80, "{}: Java concordance too low", source.name);
     assert!(rust_acc.concordance() > 0.80, "{}: Rust concordance too low", source.name);
 
-    // Compare Rust to Java (Rust should be within 10% of Java)
-    let concordance_diff = (java_acc.concordance() - rust_acc.concordance()).abs();
+    // Additional metrics: Rust must NOT be worse than Java
+    let brier_tolerance = 0.02; // Allow 2% worse Brier score at most
+    if !java_acc.brier_score().is_nan() && !rust_acc.brier_score().is_nan() {
+        assert!(
+            rust_acc.brier_score() <= java_acc.brier_score() + brier_tolerance,
+            "{}: Rust Brier score ({:.4}) must be <= Java ({:.4}) + {:.2}",
+            source.name,
+            rust_acc.brier_score(),
+            java_acc.brier_score(),
+            brier_tolerance
+        );
+    }
+
+    // Rare variant F1 should also be competitive
+    let rare_f1_tolerance = 0.05;
+    if rust_acc.rare_total > 0 && java_acc.rare_total > 0 {
+        assert!(
+            rust_acc.rare_f1() >= java_acc.rare_f1() - rare_f1_tolerance,
+            "{}: Rust rare F1 ({:.3}) must be >= Java ({:.3}) - {:.2}",
+            source.name,
+            rust_acc.rare_f1(),
+            java_acc.rare_f1(),
+            rare_f1_tolerance
+        );
+    }
+
+    // Compare Rust to Java - Rust must NOT be worse than Java
+    // Using 0.5% tolerance for floating-point and minor algorithmic differences
+    let tolerance = 0.005; // 0.5 percentage points
     assert!(
-        concordance_diff < 0.10,
-        "{}: Rust concordance differs too much from Java: {:.2}% vs {:.2}%",
+        rust_acc.concordance() >= java_acc.concordance() - tolerance,
+        "{}: Rust concordance ({:.2}%) must be >= Java ({:.2}%) - {:.1}%",
         source.name,
         rust_acc.concordance() * 100.0,
-        java_acc.concordance() * 100.0
+        java_acc.concordance() * 100.0,
+        tolerance * 100.0
     );
 
     println!("\n[{}] Mask-and-recover comparison passed!", source.name);

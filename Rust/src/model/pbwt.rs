@@ -109,51 +109,40 @@ impl PbwtDivUpdater {
 
         self.ensure_capacity(n_alleles);
 
-        // 1. Initialize p array (propagation)
-        let init_value = (marker + 1) as i32;
-        self.p[..n_alleles].fill(init_value);
-
-        // 2. Count frequencies of each allele (Counting Sort Phase 1)
+        // 1. Count frequencies of each allele (Counting Sort Phase 1)
+        // Note: We do NOT update p here - that happens in the scatter pass only
         self.counts[..n_alleles].fill(0);
-        
-        // We iterate in current prefix order to compute p and counts
+
         for i in 0..self.n_haps {
             let hap = prefix[i];
-            let div = divergence[i];
             let allele = alleles[hap as usize] as usize;
-            
             // Check bounds (shouldn't happen with valid data)
             let allele = if allele >= n_alleles { 0 } else { allele };
-
-            // Update p (Max Divergence Propagation) for ALL alleles
-            for j in 0..n_alleles {
-                if div > self.p[j] {
-                    self.p[j] = div;
-                }
-            }
-            
             self.counts[allele] += 1;
         }
 
-        // 3. Compute Offsets (Counting Sort Phase 2)
+        // 2. Compute Offsets (Counting Sort Phase 2)
         let mut running = 0;
         for i in 0..n_alleles {
             self.offsets[i] = running;
             running += self.counts[i];
         }
-        
-        // 4. Scatter to scratch buffers (Counting Sort Phase 3)
-        // Reset counts and p for the SCATTER pass
+
+        // 3. Initialize p array and reset counts for scatter pass
+        let init_value = (marker + 1) as i32;
         self.counts[..n_alleles].fill(0);
         self.p[..n_alleles].fill(init_value);
 
+        // 4. Scatter to scratch buffers with p propagation (Counting Sort Phase 3)
+        // This single pass matches Java's loop exactly:
+        //   propagate p -> store -> reset p[allele]
         for i in 0..self.n_haps {
             let hap = prefix[i];
             let div = divergence[i];
             let allele = alleles[hap as usize] as usize;
             let allele = if allele >= n_alleles { 0 } else { allele };
 
-            // Update p for all alleles
+            // Update p (Max Divergence Propagation) for ALL alleles
             for j in 0..n_alleles {
                 if div > self.p[j] {
                     self.p[j] = div;
@@ -167,9 +156,9 @@ impl PbwtDivUpdater {
             self.scratch_a[pos] = hap;
             self.scratch_d[pos] = self.p[allele];
 
-            // Reset p for next item in this allele bucket
-            self.p[allele] = i32::MIN; // Use MIN for 'reset'
-            
+            // Reset p for this allele after output
+            self.p[allele] = i32::MIN;
+
             self.counts[allele] += 1;
         }
 
