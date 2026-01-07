@@ -183,7 +183,7 @@ impl<'a> ImpStates<'a> {
         // Store backward IBS haps for each step (to use during forward pass)
         let mut bwd_ibs_per_step: Vec<Vec<u32>> = vec![Vec::new(); n_steps];
 
-        // STEP 1: Backward PBWT pass
+        // STEP 1: Backward PBWT pass with Virtual Insertion tracking
         {
             let mut pbwt_bwd = CodedPbwtView::new_backward(
                 &mut workspace.pbwt_prefix_bwd[..n_ref_haps],
@@ -191,61 +191,29 @@ impl<'a> ImpStates<'a> {
                 n_steps,
             );
 
+            // Virtual position for stateful PBWT tracking (LF-mapping)
+            let mut bwd_virtual_pos = n_ref_haps / 2;
+
             for step_idx in (0..n_steps).rev() {
                 let coded_step = self.ref_panel.step(step_idx);
                 let step_start = coded_step.start;
                 let step_end = coded_step.end;
 
-                pbwt_bwd.update_backward(coded_step, n_steps);
-
-                // Skip IBS matching if this step has no informative target data
-                if !step_has_data[step_idx] {
-                    continue;
-                }
-
-                // Extract target sequence for this step using reference marker indices
+                // Extract target sequence for this step
                 let target_seq: Vec<u8> = (step_start..step_end)
                     .map(|m| target_alleles.get(m).copied().unwrap_or(255))
                     .collect();
 
-                let bwd_ibs: Vec<u32> =
-                    if let Some(target_pattern) = coded_step.match_sequence_with(&target_seq, &get_ref_allele) {
-                        pbwt_bwd
-                            .find_ibs(target_pattern, coded_step, n_ibs_haps)
-                            .into_iter()
-                            .map(|h| h.0)
-                            .collect()
-                    } else {
-                        let closest_pattern = coded_step.closest_pattern_with(&target_seq, &get_ref_allele);
-                        pbwt_bwd
-                            .find_ibs(closest_pattern, coded_step, n_ibs_haps)
-                            .into_iter()
-                            .map(|h| h.0)
-                            .collect()
-                    };
+                // Get target pattern BEFORE sort update (needed for LF-mapping)
+                let target_pattern = coded_step
+                    .match_sequence_with(&target_seq, &get_ref_allele)
+                    .unwrap_or_else(|| coded_step.closest_pattern_with(&target_seq, &get_ref_allele));
 
-                bwd_ibs_per_step[step_idx] = bwd_ibs;
-            }
-        }
-
-        // STEP 2: Forward PBWT pass + composite haplotype building
-        {
-            let mut pbwt_fwd = CodedPbwtView::new(
-                &mut workspace.pbwt_prefix[..n_ref_haps],
-                &mut workspace.pbwt_divergence[..n_ref_haps + 1],
-            );
-
-            for step_idx in 0..n_steps {
-                let coded_step = self.ref_panel.step(step_idx);
-                let step_start = coded_step.start;
-                let step_end = coded_step.end;
-
-                pbwt_fwd.update_counting_sort(
+                // Update PBWT, computing new virtual position DURING the sort (before prefix mutation)
+                pbwt_bwd.update_backward(
                     coded_step,
-                    &mut workspace.sort_counts,
-                    &mut workspace.sort_offsets,
-                    &mut workspace.sort_prefix_scratch,
-                    &mut workspace.sort_div_scratch,
+                    n_steps,
+                    Some((&mut bwd_virtual_pos, target_pattern)),
                 );
 
                 // Skip IBS matching if this step has no informative target data
@@ -253,26 +221,63 @@ impl<'a> ImpStates<'a> {
                     continue;
                 }
 
-                // Extract target sequence for this step using reference marker indices
+                // Use stateful virtual position for neighbor selection
+                let bwd_ibs: Vec<u32> = pbwt_bwd
+                    .select_neighbors(bwd_virtual_pos, n_ibs_haps)
+                    .into_iter()
+                    .map(|h| h.0)
+                    .collect();
+
+                bwd_ibs_per_step[step_idx] = bwd_ibs;
+            }
+        }
+
+        // STEP 2: Forward PBWT pass with Virtual Insertion + composite haplotype building
+        {
+            let mut pbwt_fwd = CodedPbwtView::new(
+                &mut workspace.pbwt_prefix[..n_ref_haps],
+                &mut workspace.pbwt_divergence[..n_ref_haps + 1],
+            );
+
+            // Virtual position for stateful PBWT tracking (LF-mapping)
+            let mut fwd_virtual_pos = n_ref_haps / 2;
+
+            for step_idx in 0..n_steps {
+                let coded_step = self.ref_panel.step(step_idx);
+                let step_start = coded_step.start;
+                let step_end = coded_step.end;
+
+                // Extract target sequence for this step
                 let target_seq: Vec<u8> = (step_start..step_end)
                     .map(|m| target_alleles.get(m).copied().unwrap_or(255))
                     .collect();
 
-                let fwd_ibs: Vec<u32> =
-                    if let Some(target_pattern) = coded_step.match_sequence_with(&target_seq, &get_ref_allele) {
-                        pbwt_fwd
-                            .find_ibs(target_pattern, coded_step, n_ibs_haps)
-                            .into_iter()
-                            .map(|h| h.0)
-                            .collect()
-                    } else {
-                        let closest_pattern = coded_step.closest_pattern_with(&target_seq, &get_ref_allele);
-                        pbwt_fwd
-                            .find_ibs(closest_pattern, coded_step, n_ibs_haps)
-                            .into_iter()
-                            .map(|h| h.0)
-                            .collect()
-                    };
+                // Get target pattern BEFORE sort update (needed for LF-mapping)
+                let target_pattern = coded_step
+                    .match_sequence_with(&target_seq, &get_ref_allele)
+                    .unwrap_or_else(|| coded_step.closest_pattern_with(&target_seq, &get_ref_allele));
+
+                // Update PBWT, computing new virtual position DURING the sort (before prefix mutation)
+                pbwt_fwd.update_counting_sort(
+                    coded_step,
+                    &mut workspace.sort_counts,
+                    &mut workspace.sort_offsets,
+                    &mut workspace.sort_prefix_scratch,
+                    &mut workspace.sort_div_scratch,
+                    Some((&mut fwd_virtual_pos, target_pattern)),
+                );
+
+                // Skip IBS matching if this step has no informative target data
+                if !step_has_data[step_idx] {
+                    continue;
+                }
+
+                // Use stateful virtual position for neighbor selection
+                let fwd_ibs: Vec<u32> = pbwt_fwd
+                    .select_neighbors(fwd_virtual_pos, n_ibs_haps)
+                    .into_iter()
+                    .map(|h| h.0)
+                    .collect();
 
                 // Update composite haplotypes with IBS matches from BOTH directions
                 // Use the step_idx for state recency tracking (matches Java behavior)

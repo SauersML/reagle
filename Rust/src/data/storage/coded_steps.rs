@@ -326,6 +326,13 @@ impl<'a> CodedPbwtView<'a> {
     ///
     /// This optimized version avoids allocating Vec<Vec<>> per step by using
     /// flat counting sort with workspace scratch buffers.
+    ///
+    /// # Virtual Insertion (Optional)
+    /// If `virtual_pos` is provided as `Some((pos, target_pattern))`, this method
+    /// computes where a target with `target_pattern` would be placed in the new
+    /// sort order using LF-mapping: `new_pos = Offset[c] + Rank(Prefix[0..pos], c)`.
+    ///
+    /// Important: The rank is computed on the PRE-SORT prefix array, before mutation.
     pub fn update_counting_sort(
         &mut self,
         step: &CodedStep,
@@ -333,6 +340,7 @@ impl<'a> CodedPbwtView<'a> {
         offsets: &mut Vec<usize>,
         prefix_scratch: &mut [u32],
         div_scratch: &mut [i32],
+        virtual_pos: Option<(&mut usize, u16)>,
     ) {
         let n_haps = self.prefix.len();
         let n_patterns = step.n_patterns();
@@ -361,6 +369,21 @@ impl<'a> CodedPbwtView<'a> {
             running += count;
         }
         offsets[n_patterns] = running;
+
+        // Step 2.5: Calculate new virtual position BEFORE prefix mutation (LF-mapping)
+        // u_{k+1} = Offset[c] + Rank(Prefix_k[0..u_k], c)
+        if let Some((vpos, target_pattern)) = virtual_pos {
+            let pattern_idx = target_pattern as usize;
+            if pattern_idx < offsets.len() {
+                // Count haps with target_pattern in prefix[0..current_vpos]
+                let current_vpos = (*vpos).min(n_haps);
+                let rank = self.prefix[..current_vpos]
+                    .iter()
+                    .filter(|&&hap| step.pattern(HapIdx::new(hap)) == target_pattern)
+                    .count();
+                *vpos = offsets[pattern_idx] + rank;
+            }
+        }
 
         // Step 3: Distribute haplotypes to their sorted positions
         // We need to track current write position for each pattern
@@ -397,7 +420,16 @@ impl<'a> CodedPbwtView<'a> {
     ///
     /// For backward PBWT, divergence represents where the match ENDS (not starts).
     /// We use min aggregation instead of max, and initialize with end-of-chromosome.
-    pub fn update_backward(&mut self, step: &CodedStep, n_steps: usize) {
+    ///
+    /// # Virtual Insertion (Optional)
+    /// If `virtual_pos` is provided, computes the target's new position using LF-mapping
+    /// on the PRE-SORT prefix array, before mutation.
+    pub fn update_backward(
+        &mut self,
+        step: &CodedStep,
+        n_steps: usize,
+        virtual_pos: Option<(&mut usize, u16)>,
+    ) {
         let n_haps = self.prefix.len();
         let n_patterns = step.n_patterns();
 
@@ -412,6 +444,26 @@ impl<'a> CodedPbwtView<'a> {
             }
         }
 
+        // Calculate new virtual position BEFORE modifying prefix (LF-mapping)
+        if let Some((vpos, target_pattern)) = virtual_pos {
+            let pattern_idx = target_pattern as usize;
+            if pattern_idx < buckets.len() {
+                // Compute offset for target pattern (sum of bucket sizes before it)
+                let mut pattern_offset = 0;
+                for bucket in buckets.iter().take(pattern_idx) {
+                    pattern_offset += bucket.len();
+                }
+                // Rank = count of target_pattern haps before current vpos in OLD prefix
+                let current_vpos = (*vpos).min(n_haps);
+                let rank = self.prefix[..current_vpos]
+                    .iter()
+                    .filter(|&&hap| step.pattern(HapIdx::new(hap)) == target_pattern)
+                    .count();
+                *vpos = pattern_offset + rank;
+            }
+        }
+
+        // Now scatter to prefix
         let mut idx = 0;
         let step_end = n_steps as i32;
 
@@ -429,31 +481,36 @@ impl<'a> CodedPbwtView<'a> {
         }
     }
 
-    /// Find IBS haplotypes for a target pattern at current step
-    pub fn find_ibs(&self, target_pattern: u16, step: &CodedStep, n_matches: usize) -> Vec<HapIdx> {
-        let mut target_pos = None;
-        for (i, &hap) in self.prefix.iter().enumerate() {
-            if step.pattern(HapIdx::new(hap)) == target_pattern {
-                target_pos = Some(i);
-                break;
-            }
+    /// Select neighbors around a virtual position in the sorted prefix array
+    ///
+    /// This is the core of the "Virtual Insertion" algorithm from Naseri et al.
+    /// The target's virtual position represents where it would be inserted in
+    /// the PBWT sort order, preserving its history. Neighbors adjacent to this
+    /// position share the longest common history with the target.
+    ///
+    /// # Arguments
+    /// * `virtual_pos` - The target's position in the sort order (tracked via update_counting_sort)
+    /// * `n_matches` - Number of neighbors to return
+    pub fn select_neighbors(&self, virtual_pos: usize, n_matches: usize) -> Vec<HapIdx> {
+        let n_haps = self.prefix.len();
+        if n_haps == 0 {
+            return Vec::new();
         }
 
-        let target_pos = match target_pos {
-            Some(p) => p,
-            None => self.prefix.len() / 2,
-        };
+        // Clamp virtual_pos to valid range
+        let center = virtual_pos.min(n_haps.saturating_sub(1));
 
         let mut result = Vec::with_capacity(n_matches);
-        let mut left = target_pos;
-        let mut right = target_pos + 1;
+        let mut left = center;
+        let mut right = center + 1;
 
-        while result.len() < n_matches && (left > 0 || right < self.prefix.len()) {
+        // Expand outward from center, alternating left and right
+        while result.len() < n_matches && (left > 0 || right < n_haps) {
             if left > 0 {
                 left -= 1;
                 result.push(HapIdx::new(self.prefix[left]));
             }
-            if right < self.prefix.len() && result.len() < n_matches {
+            if right < n_haps && result.len() < n_matches {
                 result.push(HapIdx::new(self.prefix[right]));
                 right += 1;
             }
@@ -461,6 +518,7 @@ impl<'a> CodedPbwtView<'a> {
 
         result
     }
+
 }
 
 #[cfg(test)]
