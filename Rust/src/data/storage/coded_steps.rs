@@ -424,11 +424,16 @@ impl<'a> CodedPbwtView<'a> {
     /// # Virtual Insertion (Optional)
     /// If `virtual_pos` is provided, computes the target's new position using LF-mapping
     /// on the PRE-SORT prefix array, before mutation.
+    ///
+    /// # Offsets (Optional)
+    /// If `offsets` is provided, stores the bucket offsets after sorting.
+    /// offsets[i] = start position of pattern i in the sorted array.
     pub fn update_backward(
         &mut self,
         step: &CodedStep,
         n_steps: usize,
         virtual_pos: Option<(&mut usize, u16)>,
+        offsets: Option<&mut Vec<usize>>,
     ) {
         let n_haps = self.prefix.len();
         let n_patterns = step.n_patterns();
@@ -461,6 +466,18 @@ impl<'a> CodedPbwtView<'a> {
                     .count();
                 *vpos = pattern_offset + rank;
             }
+        }
+
+        // Compute and store offsets if requested
+        if let Some(offs) = offsets {
+            offs.clear();
+            offs.reserve(n_patterns + 1);
+            let mut running = 0;
+            for bucket in &buckets {
+                offs.push(running);
+                running += bucket.len();
+            }
+            offs.push(running); // Final offset = n_haps
         }
 
         // Now scatter to prefix
@@ -531,18 +548,6 @@ impl<'a> CodedPbwtView<'a> {
         result
     }
 
-    /// Select neighbors around a virtual position in the sorted prefix array
-    ///
-    /// This is the original unconstrained version that can cross bucket boundaries.
-    /// Use `select_neighbors_in_bucket` for pattern-aware selection.
-    ///
-    /// # Arguments
-    /// * `virtual_pos` - The target's position in the sort order (tracked via update_counting_sort)
-    /// * `n_matches` - Number of neighbors to return
-    pub fn select_neighbors(&self, virtual_pos: usize, n_matches: usize) -> Vec<HapIdx> {
-        let n_haps = self.prefix.len();
-        self.select_neighbors_in_bucket(virtual_pos, n_matches, 0, n_haps)
-    }
 
 }
 

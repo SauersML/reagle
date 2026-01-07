@@ -184,6 +184,8 @@ impl<'a> ImpStates<'a> {
         let mut bwd_ibs_per_step: Vec<Vec<u32>> = vec![Vec::new(); n_steps];
 
         // STEP 1: Backward PBWT pass with Virtual Insertion tracking
+        // NOTE: Backward pass does NOT use bucket constraints - experiments showed
+        // that unconstrained neighbor selection performs better for backward direction
         {
             let mut pbwt_bwd = CodedPbwtView::new_backward(
                 &mut workspace.pbwt_prefix_bwd[..n_ref_haps],
@@ -209,11 +211,12 @@ impl<'a> ImpStates<'a> {
                     .match_sequence_with(&target_seq, &get_ref_allele)
                     .unwrap_or_else(|| coded_step.closest_pattern_with(&target_seq, &get_ref_allele));
 
-                // Update PBWT, computing new virtual position DURING the sort (before prefix mutation)
+                // Update PBWT, computing new virtual position (no offsets needed)
                 pbwt_bwd.update_backward(
                     coded_step,
                     n_steps,
                     Some((&mut bwd_virtual_pos, target_pattern)),
+                    None,
                 );
 
                 // Skip IBS matching if this step has no informative target data
@@ -221,9 +224,9 @@ impl<'a> ImpStates<'a> {
                     continue;
                 }
 
-                // Use stateful virtual position for neighbor selection
+                // Select neighbors without bucket constraint (allows diverse selection)
                 let bwd_ibs: Vec<u32> = pbwt_bwd
-                    .select_neighbors(bwd_virtual_pos, n_ibs_haps)
+                    .select_neighbors_in_bucket(bwd_virtual_pos, n_ibs_haps, 0, n_ref_haps)
                     .into_iter()
                     .map(|h| h.0)
                     .collect();
