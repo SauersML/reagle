@@ -830,16 +830,51 @@ impl ImputationPipeline {
         // Genotyped markers for interpolation (still needed for StateProbs)
         let genotyped_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(genotyped_markers_vec.clone());
 
-        // Compute recombination probabilities for EACH genotyped marker
-        // Each marker i > 0 gets p_recomb based on genetic distance from marker i-1
-        let sparse_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain((1..n_genotyped).map(|i| {
-                let ref_m_prev = genotyped_markers[i - 1];
-                let ref_m = genotyped_markers[i];
-                let gen_dist = gen_positions[ref_m] - gen_positions[ref_m_prev];
-                self.params.p_recomb(gen_dist)
-            }))
-            .collect();
+        // Compute recombination probabilities for each genotyped marker.
+        // Within a cluster: p_recomb = 0 (markers are treated as a unit)
+        // At cluster boundaries: p_recomb based on genetic distance between cluster midpoints
+        //
+        // This matches Java ImpData.pRecomb() which returns 0 within clusters and
+        // computes recombination between cluster midpoints.
+        let sparse_p_recomb: Vec<f32> = {
+            // Build marker-to-cluster mapping
+            let mut marker_cluster: Vec<usize> = vec![0; n_genotyped];
+            for (cluster_idx, cluster) in clusters.iter().enumerate() {
+                for m in cluster.start..cluster.end {
+                    marker_cluster[m] = cluster_idx;
+                }
+            }
+
+            // Compute cluster midpoints in genetic position
+            let cluster_midpoints: Vec<f64> = clusters
+                .iter()
+                .map(|c| {
+                    if c.end > c.start {
+                        (gen_positions[genotyped_markers[c.start]]
+                            + gen_positions[genotyped_markers[c.end - 1]])
+                            / 2.0
+                    } else {
+                        gen_positions[genotyped_markers[c.start]]
+                    }
+                })
+                .collect();
+
+            // For each marker, compute recombination from previous marker
+            std::iter::once(0.0f32)
+                .chain((1..n_genotyped).map(|i| {
+                    let prev_cluster = marker_cluster[i - 1];
+                    let curr_cluster = marker_cluster[i];
+                    if curr_cluster == prev_cluster {
+                        // Same cluster: no recombination
+                        0.0
+                    } else {
+                        // Different clusters: recombination between cluster midpoints
+                        let gen_dist = cluster_midpoints[curr_cluster] - cluster_midpoints[prev_cluster];
+                        self.params.p_recomb(gen_dist)
+                    }
+                }))
+                .collect()
+        };
 
         // Run imputation for each target haplotype with per-thread workspaces
         let state_probs: Vec<StateProbs> = (0..n_target_haps)

@@ -299,11 +299,11 @@ impl<'a> ImpStates<'a> {
             }
         }
 
-        // If queue is empty, fill with random haplotypes
-        // Use hash of target alleles as target_hap seed for reproducibility
-        if self.queue.is_empty() {
+        // Fill remaining slots with random haplotypes if we didn't find enough
+        // Use hash of target alleles as seed for reproducibility
+        if self.queue.len() < self.max_states {
             let target_hap = target_alleles.iter().fold(0u32, |acc, &a| acc.wrapping_mul(31).wrapping_add(a as u32));
-            self.fill_with_random_haps(target_hap);
+            self.fill_remaining_with_random(target_hap);
         }
 
         // Build output arrays for GENOTYPED markers only (memory optimization)
@@ -381,7 +381,7 @@ impl<'a> ImpStates<'a> {
         }
     }
 
-    fn fill_with_random_haps(&mut self, target_hap_hash: u32) {
+    fn fill_remaining_with_random(&mut self, target_hap_hash: u32) {
         use rand::rngs::StdRng;
         use rand::Rng;
         use rand::SeedableRng;
@@ -389,22 +389,31 @@ impl<'a> ImpStates<'a> {
         // Use only reference haplotypes (exclude appended target haplotypes)
         let n_ref_haps = self.n_ref_haps;
         let n_states = self.max_states.min(n_ref_haps);
+        let current_states = self.queue.len();
+
+        if current_states >= n_states {
+            return;
+        }
 
         // Match Java: seed with target haplotype index for reproducibility
         // In imputation, target haps are separate from reference, so no exclusion needed
         let mut rng = StdRng::seed_from_u64(target_hap_hash as u64);
 
         let ibs_step = 0;
-        let mut states_added = 0;
-        while states_added < n_states {
+        let mut attempts = 0;
+        while self.queue.len() < n_states && attempts < n_ref_haps * 2 {
             let h = rng.random_range(0..n_ref_haps as u32);
-            let comp_hap_idx = self.threaded_haps.push_new(h);
-            self.queue.push(CompHapEntry {
-                comp_hap_idx,
-                hap: h,
-                last_ibs_step: ibs_step,
-            });
-            states_added += 1;
+            // Only add if this haplotype isn't already tracked
+            if !self.hap_to_last_ibs.contains_key(&h) {
+                let comp_hap_idx = self.threaded_haps.push_new(h);
+                self.queue.push(CompHapEntry {
+                    comp_hap_idx,
+                    hap: h,
+                    last_ibs_step: ibs_step,
+                });
+                self.hap_to_last_ibs.insert(h, ibs_step);
+            }
+            attempts += 1;
         }
     }
 
