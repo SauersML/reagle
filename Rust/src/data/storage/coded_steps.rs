@@ -19,6 +19,11 @@ use crate::data::storage::matrix::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
 
 /// A single coded step containing dictionary-compressed haplotypes
+///
+/// Memory-efficient design: stores representative haplotype indices instead of
+/// materialized allele sequences. Alleles are looked up on-demand from the
+/// genotype matrix when needed. This matches Java Beagle's approach and
+/// dramatically reduces memory usage for large reference panels.
 #[derive(Clone, Debug)]
 pub struct CodedStep {
     /// Start marker (inclusive)
@@ -29,16 +34,16 @@ pub struct CodedStep {
     n_patterns: usize,
     /// Mapping from haplotype to pattern index
     hap_to_pattern: Vec<u16>,
-    /// Allele sequences for each pattern: patterns[pattern_idx][marker_offset] = allele
-    patterns: Vec<Vec<u8>>,
+    /// Representative haplotype index for each pattern (for on-demand allele lookup)
+    /// This replaces Vec<Vec<u8>> to save ~3GB for large reference panels
+    pattern_rep_hap: Vec<u32>,
 }
 
 impl CodedStep {
     /// Create a new coded step from genotype data
     ///
-    /// OPTIMIZATION: Uses a reusable scratch buffer to avoid allocating a new Vec<u8>
-    /// for every haplotype. Only unique patterns are allocated and stored.
-    /// This reduces heap allocations from O(n_haps * n_steps) to O(n_unique_patterns).
+    /// Memory-efficient: stores only representative haplotype indices, not allele sequences.
+    /// Alleles are looked up on-demand when needed, saving ~3GB for large reference panels.
     pub fn new<S: PhaseState>(gt: &GenotypeMatrix<S>, start: usize, end: usize) -> Self {
         let n_haps = gt.n_haplotypes();
         let n_markers = end - start;
@@ -49,38 +54,38 @@ impl CodedStep {
                 end,
                 n_patterns: 0,
                 hap_to_pattern: vec![0; n_haps],
-                patterns: Vec::new(),
+                pattern_rep_hap: Vec::new(),
             };
         }
 
-        // Pre-allocate scratch buffer - reused for each haplotype (avoids O(n_haps) allocations)
-        let mut scratch = vec![0u8; n_markers];
-
-        // Store unique patterns and their indices
-        let mut patterns: Vec<Vec<u8>> = Vec::new();
+        // Use HashMap for pattern deduplication during construction
+        // Key: allele sequence, Value: (pattern_index, representative_hap)
+        use std::collections::HashMap;
+        let mut pattern_map: HashMap<Vec<u8>, (u16, u32)> = HashMap::new();
         let mut hap_to_pattern = Vec::with_capacity(n_haps);
+        let mut pattern_rep_hap: Vec<u32> = Vec::new();
+
+        // Pre-allocate scratch buffer - reused for each haplotype
+        let mut scratch = vec![0u8; n_markers];
 
         for h in 0..n_haps {
             let hap = HapIdx::new(h as u32);
 
-            // Fill scratch buffer in-place (NO allocation)
+            // Fill scratch buffer in-place
             for (i, m) in (start..end).enumerate() {
                 scratch[i] = gt.allele(MarkerIdx::new(m as u32), hap);
             }
 
-            // Look up pattern using linear search for small pattern counts
-            // This is typically faster than HashMap for <100 patterns due to cache locality,
-            // and reference panels typically have high compression ratios (many haps per pattern)
-            let pattern_idx = patterns
-                .iter()
-                .position(|p| p.as_slice() == scratch.as_slice())
-                .map(|i| i as u16)
-                .unwrap_or_else(|| {
-                    // Only allocate when we discover a unique pattern
-                    let idx = patterns.len() as u16;
-                    patterns.push(scratch.clone()); // Only allocation per unique pattern
-                    idx
-                });
+            // Look up or insert pattern
+            let pattern_idx = if let Some(&(idx, _)) = pattern_map.get(&scratch) {
+                idx
+            } else {
+                // New unique pattern - store representative haplotype index
+                let idx = pattern_rep_hap.len() as u16;
+                pattern_rep_hap.push(h as u32);
+                pattern_map.insert(scratch.clone(), (idx, h as u32));
+                idx
+            };
 
             hap_to_pattern.push(pattern_idx);
         }
@@ -88,9 +93,9 @@ impl CodedStep {
         Self {
             start,
             end,
-            n_patterns: patterns.len(),
+            n_patterns: pattern_rep_hap.len(),
             hap_to_pattern,
-            patterns,
+            pattern_rep_hap,
         }
     }
 
@@ -120,34 +125,61 @@ impl CodedStep {
 
     /// Match a target allele sequence to a pattern index
     /// Returns None if the sequence doesn't exist in the reference
-    pub fn match_sequence(&self, alleles: &[u8]) -> Option<u16> {
+    ///
+    /// Uses a closure to look up reference alleles on-demand, saving ~3GB
+    /// vs storing all pattern allele sequences in memory.
+    ///
+    /// # Arguments
+    /// * `alleles` - Target allele sequence for this step
+    /// * `get_allele` - Closure: (marker_idx, hap_idx) -> allele
+    pub fn match_sequence_with<F>(&self, alleles: &[u8], get_allele: F) -> Option<u16>
+    where
+        F: Fn(usize, u32) -> u8,
+    {
         if alleles.len() != self.n_markers() {
             return None;
         }
 
-        // Look for exact match in patterns
-        self.patterns
-            .iter()
-            .position(|p| p == alleles)
-            .map(|idx| idx as u16)
+        // Look for exact match by comparing against representative haplotypes
+        for (idx, &rep_hap) in self.pattern_rep_hap.iter().enumerate() {
+            let matches = (self.start..self.end).enumerate().all(|(i, m)| {
+                let ref_allele = get_allele(m, rep_hap);
+                alleles[i] == ref_allele || alleles[i] == 255 || ref_allele == 255
+            });
+            if matches {
+                return Some(idx as u16);
+            }
+        }
+        None
     }
 
     /// Find closest pattern to target sequence (by Hamming distance)
     /// Always returns a pattern (never None)
-    pub fn closest_pattern(&self, alleles: &[u8]) -> u16 {
-        if alleles.len() != self.n_markers() {
-            // Return most common pattern (usually index 0)
+    ///
+    /// Uses a closure to look up reference alleles on-demand.
+    ///
+    /// # Arguments
+    /// * `alleles` - Target allele sequence for this step
+    /// * `get_allele` - Closure: (marker_idx, hap_idx) -> allele
+    pub fn closest_pattern_with<F>(&self, alleles: &[u8], get_allele: F) -> u16
+    where
+        F: Fn(usize, u32) -> u8,
+    {
+        if alleles.len() != self.n_markers() || self.n_patterns == 0 {
             return 0;
         }
 
         let mut best_pattern = 0u16;
         let mut best_distance = usize::MAX;
 
-        for (idx, pattern) in self.patterns.iter().enumerate() {
-            let distance = pattern
-                .iter()
-                .zip(alleles.iter())
-                .filter(|(p, a)| **p != **a && **p != 255 && **a != 255)
+        for (idx, &rep_hap) in self.pattern_rep_hap.iter().enumerate() {
+            let distance = (self.start..self.end)
+                .enumerate()
+                .filter(|(i, m)| {
+                    let ref_allele = get_allele(*m, rep_hap);
+                    let target_allele = alleles[*i];
+                    ref_allele != target_allele && ref_allele != 255 && target_allele != 255
+                })
                 .count();
 
             if distance < best_distance {

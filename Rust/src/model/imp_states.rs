@@ -208,14 +208,14 @@ impl<'a> ImpStates<'a> {
                     .collect();
 
                 let bwd_ibs: Vec<u32> =
-                    if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                    if let Some(target_pattern) = coded_step.match_sequence_with(&target_seq, &get_ref_allele) {
                         pbwt_bwd
                             .find_ibs(target_pattern, coded_step, n_ibs_haps)
                             .into_iter()
                             .map(|h| h.0)
                             .collect()
                     } else {
-                        let closest_pattern = coded_step.closest_pattern(&target_seq);
+                        let closest_pattern = coded_step.closest_pattern_with(&target_seq, &get_ref_allele);
                         pbwt_bwd
                             .find_ibs(closest_pattern, coded_step, n_ibs_haps)
                             .into_iter()
@@ -258,14 +258,14 @@ impl<'a> ImpStates<'a> {
                     .collect();
 
                 let fwd_ibs: Vec<u32> =
-                    if let Some(target_pattern) = coded_step.match_sequence(&target_seq) {
+                    if let Some(target_pattern) = coded_step.match_sequence_with(&target_seq, &get_ref_allele) {
                         pbwt_fwd
                             .find_ibs(target_pattern, coded_step, n_ibs_haps)
                             .into_iter()
                             .map(|h| h.0)
                             .collect()
                     } else {
-                        let closest_pattern = coded_step.closest_pattern(&target_seq);
+                        let closest_pattern = coded_step.closest_pattern_with(&target_seq, &get_ref_allele);
                         pbwt_fwd
                             .find_ibs(closest_pattern, coded_step, n_ibs_haps)
                             .into_iter()

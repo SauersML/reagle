@@ -12,6 +12,8 @@
 //!
 //! This implements Beagle's two-stage phasing algorithm for handling rare variants.
 
+use std::sync::Arc;
+
 use bitvec::prelude::*;
 use rayon::prelude::*;
 
@@ -38,7 +40,8 @@ pub struct PhasingPipeline {
     config: Config,
     params: ModelParams,
     /// Reference panel for reference-guided phasing (optional)
-    reference_gt: Option<GenotypeMatrix<Phased>>,
+    /// Uses Arc for shared ownership to avoid cloning the large reference panel
+    reference_gt: Option<Arc<GenotypeMatrix<Phased>>>,
     /// Marker alignment between target and reference
     alignment: Option<MarkerAlignment>,
 }
@@ -53,6 +56,18 @@ impl PhasingPipeline {
             reference_gt: None,
             alignment: None,
         }
+    }
+
+    /// Set reference panel for reference-guided phasing
+    ///
+    /// When a reference panel is provided, the phasing algorithm uses it to:
+    /// 1. Improve state selection (PBWT neighbors from reference)
+    /// 2. Guide phase decisions with reference haplotypes
+    ///
+    /// Uses Arc for shared ownership to avoid cloning the large reference panel.
+    pub fn set_reference(&mut self, reference: Arc<GenotypeMatrix<Phased>>, alignment: MarkerAlignment) {
+        self.reference_gt = Some(reference);
+        self.alignment = Some(alignment);
     }
 
     /// Run the phasing pipeline
@@ -117,7 +132,7 @@ impl PhasingPipeline {
 
             // Store in pipeline struct for use during phasing iterations
             self.alignment = Some(alignment);
-            self.reference_gt = Some(ref_gt);
+            self.reference_gt = Some(Arc::new(ref_gt));
         }
 
         // Compute combined haplotype count
@@ -829,29 +844,37 @@ impl PhasingPipeline {
         iteration: usize,
     ) -> Vec<HapIdx> {
         use rand::seq::SliceRandom;
-        use rand::SeedableRng;
+        use rand::{Rng, SeedableRng};
+
+        // Create RNG early so it can be used for random state filling
+        let combined_seed = (seed as u64)
+            .wrapping_add(iteration as u64)
+            .wrapping_add(hap_idx.0 as u64);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(combined_seed);
 
         let n_candidates = (n_states_wanted * 2).min(n_total_haps);
         let neighbors = phase_ibs.find_neighbors(hap_idx.0, marker_idx, ibs2, n_candidates);
 
         let mut states: Vec<HapIdx> = neighbors.into_iter().map(HapIdx::new).collect();
 
-        if states.len() < n_states_wanted {
-            let sample = SampleIdx::new(hap_idx.0 / 2);
-            let mut i = 0;
-            while states.len() < n_states_wanted && i < n_total_haps {
-                let h = HapIdx::new(i as u32);
-                if h != sample.hap1() && h != sample.hap2() && !states.contains(&h) {
+        // Fill remaining slots with RANDOM haplotypes (not sequential)
+        // This matches Java Beagle's fillQWithRandomHaps behavior
+        let sample = SampleIdx::new(hap_idx.0 / 2);
+        // Cap states to available haplotypes (excluding self) to prevent infinite loop
+        let max_available = n_total_haps.saturating_sub(2); // exclude both haps of current sample
+        let target_states = n_states_wanted.min(max_available);
+
+        if states.len() < target_states {
+            // Use HashSet for O(1) duplicate checking
+            let mut seen: std::collections::HashSet<u32> = states.iter().map(|h| h.0).collect();
+            while states.len() < target_states {
+                let h = HapIdx::new(rng.random_range(0..n_total_haps as u32));
+                // Exclude self and duplicates
+                if h.sample() != sample && seen.insert(h.0) {
                     states.push(h);
                 }
-                i += 1;
             }
         }
-
-        let combined_seed = (seed as u64)
-            .wrapping_add(iteration as u64)
-            .wrapping_add(hap_idx.0 as u64);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(combined_seed);
 
         states.shuffle(&mut rng);
         states.truncate(n_states_wanted);
@@ -1914,7 +1937,7 @@ impl PhasingPipeline {
 
         // Collect phase decisions per sample using correct per-het algorithm
         // Returns: Vec of (hi_freq_idx, should_swap) for each sample
-        let phase_decisions: Vec<Vec<(usize, bool)>> = sample_phases
+        let phase_decisions: Vec<Vec<(usize, bool, f32)>> = sample_phases
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
@@ -2156,7 +2179,13 @@ impl PhasingPipeline {
                         let l_swap = p12 * p21;
 
                         let should_swap = l_swap > l_keep;
-                        decisions.push((i, should_swap));
+                        // Compute likelihood ratio for threshold check
+                        let lr = if l_swap > l_keep {
+                            (l_swap / l_keep.max(1e-300)) as f32
+                        } else {
+                            (l_keep / l_swap.max(1e-300)) as f32
+                        };
+                        decisions.push((i, should_swap, lr));
 
                         if should_swap {
                             // SWAP: exchange alleles from this position forward
@@ -2226,10 +2255,14 @@ impl PhasingPipeline {
         let mut total_switches = 0;
         let mut total_phased = 0;
 
+        // Determine if we're in burn-in (don't mark as phased during burn-in)
+        let is_burnin = iteration < self.config.burnin;
+        let lr_threshold = self.params.lr_threshold;
+
         for (s, decisions) in phase_decisions.into_iter().enumerate() {
             let sp = &mut sample_phases[s];
 
-            for (hi_freq_idx, should_swap) in decisions {
+            for (hi_freq_idx, should_swap, lr) in decisions {
                 let m = hi_freq_to_orig[hi_freq_idx];
 
                 // Apply swap if needed
@@ -2238,9 +2271,14 @@ impl PhasingPipeline {
                     total_switches += 1;
                 }
 
-                // Mark as phased (we made a decision)
-                sp.mark_phased(m);
-                total_phased += 1;
+                // Only mark as phased if:
+                // 1. Not in burn-in, AND
+                // 2. Likelihood ratio exceeds threshold
+                // This matches Java Beagle's PhaseBaum2.phaseHet behavior
+                if !is_burnin && lr >= lr_threshold {
+                    sp.mark_phased(m);
+                    total_phased += 1;
+                }
             }
         }
 
@@ -2362,7 +2400,7 @@ impl PhasingPipeline {
 
         // Process samples in parallel - collect results: (marker, should_swap)
         // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
-        let phase_changes: Vec<Vec<(usize, bool)>> = sample_phases
+        let phase_changes: Vec<Vec<(usize, bool, f32)>> = sample_phases
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
@@ -2461,12 +2499,18 @@ impl PhasingPipeline {
                     let p1 = al_probs1[a1 as usize] * al_probs2[a2 as usize];
                     let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
 
-                    // Record decision: (marker, should_swap)
+                    // Record decision: (marker, should_swap, likelihood_ratio)
                     // When probabilities are equal (ambiguous phase), use random tie-breaking
                     // to prevent systematic bias. This matches Java Beagle behavior:
                     // switchAlleles = (p1<p2 || (p1==p2 && rand.nextBoolean()))
                     let should_swap = p2 > p1 || (p1 == p2 && rng.random_bool(0.5));
-                    phase_decisions.push((m, should_swap));
+                    // Compute likelihood ratio for threshold check
+                    let lr = if p2 > p1 {
+                        (p2 / p1.max(1e-30)) as f32
+                    } else {
+                        (p1 / p2.max(1e-30)) as f32
+                    };
+                    phase_decisions.push((m, should_swap, lr));
                 };
 
                 // Process markers before first Stage 1 marker
@@ -2499,10 +2543,14 @@ impl PhasingPipeline {
         let mut total_switches = 0;
         let mut total_phased = 0;
 
+        // Stage 2 runs after all iterations, so lr_threshold is typically 1.0
+        // (all decisions pass). We still check for consistency with Stage 1.
+        let lr_threshold = self.params.lr_threshold;
+
         for (s, decisions) in phase_changes.into_iter().enumerate() {
             let sp = &mut sample_phases[s];
 
-            for (m, should_swap) in decisions {
+            for (m, should_swap, lr) in decisions {
                 // Double-check still unphased (should always be true)
                 if !sp.is_unphased(m) {
                     continue;
@@ -2513,9 +2561,12 @@ impl PhasingPipeline {
                     total_switches += 1;
                 }
 
-                // Mark as phased after Stage 2 processing
-                sp.mark_phased(m);
-                total_phased += 1;
+                // Only mark as phased if likelihood ratio exceeds threshold
+                // (Stage 2 runs after iterations, so threshold is typically 1.0)
+                if lr >= lr_threshold {
+                    sp.mark_phased(m);
+                    total_phased += 1;
+                }
             }
         }
 

@@ -13,6 +13,7 @@
 
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
@@ -285,7 +286,8 @@ impl ImputationPipeline {
         })?;
 
         // Detect file format by extension and load accordingly
-        let ref_gt: GenotypeMatrix<Phased> = if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
+        // Wrap in Arc for shared ownership (avoids cloning when passing to phasing pipeline)
+        let ref_gt: Arc<GenotypeMatrix<Phased>> = Arc::new(if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
             eprintln!("  Detected BREF3 format");
             let reader = Bref3Reader::open(ref_path)?;
             reader.read_all()?
@@ -293,7 +295,7 @@ impl ImputationPipeline {
             eprintln!("  Detected VCF format");
             let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
             ref_reader.read_all(ref_file)?.into_phased()
-        };
+        });
 
         if target_gt.n_markers() == 0 || ref_gt.n_markers() == 0 {
             return Ok(());
@@ -303,8 +305,26 @@ impl ImputationPipeline {
         // With type states, VcfReader returns GenotypeMatrix<Unphased>, so we always phase
         eprintln!("Phasing target data before imputation...");
 
+        // Create marker alignment (reused for both phasing and imputation)
+        // This can be done before phasing since markers don't change during phasing
+        eprintln!("Aligning markers...");
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+
+        let n_ref_haps = ref_gt.n_haplotypes();
+        let n_ref_markers = ref_gt.n_markers();
+        let n_genotyped = alignment.ref_to_target.iter().filter(|&&x| x >= 0).count();
+        eprintln!(
+            "  {} of {} reference markers are genotyped in target",
+            n_genotyped, n_ref_markers
+        );
+
         // Create phasing pipeline with current config
         let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
+
+        // Set reference panel for reference-guided phasing
+        // Uses Arc::clone for cheap reference count increment instead of deep cloning
+        phasing.set_reference(Arc::clone(&ref_gt), alignment.clone());
+        eprintln!("Using reference panel ({} haplotypes) for phasing", n_ref_haps);
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
@@ -321,8 +341,6 @@ impl ImputationPipeline {
 
         let target_gt = phasing.phase_in_memory(&target_gt, &gen_maps)?;
 
-        let n_ref_haps = ref_gt.n_haplotypes();
-        let n_ref_markers = ref_gt.n_markers();
         let n_target_markers = target_gt.n_markers();
         let n_target_samples = target_gt.n_samples();
         let n_target_haps = target_gt.n_haplotypes();
@@ -330,15 +348,6 @@ impl ImputationPipeline {
         eprintln!(
             "Target: {} markers, {} samples; Reference: {} markers, {} haplotypes",
             n_target_markers, n_target_samples, n_ref_markers, n_ref_haps
-        );
-
-        // Create marker alignment
-        eprintln!("Aligning markers...");
-        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
-        let n_genotyped = alignment.ref_to_target.iter().filter(|&&x| x >= 0).count();
-        eprintln!(
-            "  {} of {} reference markers are genotyped in target",
-            n_genotyped, n_ref_markers
         );
 
         // Initialize parameters with CLI config
