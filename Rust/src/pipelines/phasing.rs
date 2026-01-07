@@ -868,7 +868,7 @@ impl PhasingPipeline {
             // Use HashSet for O(1) duplicate checking
             let mut seen: std::collections::HashSet<u32> = states.iter().map(|h| h.0).collect();
             while states.len() < target_states {
-                let h = HapIdx::new(rng.gen_range(0..n_total_haps as u32));
+                let h = HapIdx::new(rng.random_range(0..n_total_haps as u32));
                 // Exclude self and duplicates
                 if h.sample() != sample && seen.insert(h.0) {
                     states.push(h);
