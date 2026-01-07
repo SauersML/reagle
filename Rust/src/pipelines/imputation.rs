@@ -196,6 +196,10 @@ impl MarkerAlignment {
 /// are computed via linear interpolation in genetic distance space.
 ///
 /// This provides ~100x speedup over running HMM on all reference markers.
+///
+/// **Important**: This structure stores `probs_p1` (probabilities at the next marker)
+/// to enable proper interpolation matching Java Beagle's approach. This ensures
+/// the **same** haplotype is used with smoothly transitioning probability weights.
 #[derive(Clone, Debug)]
 pub struct StateProbs {
     /// Indices of genotyped markers in reference space
@@ -204,6 +208,9 @@ pub struct StateProbs {
     hap_indices: Vec<Vec<u32>>,
     /// State probabilities at each genotyped marker
     probs: Vec<Vec<f32>>,
+    /// State probabilities at the **next** genotyped marker (for interpolation)
+    /// At the last marker, this equals probs (no next marker)
+    probs_p1: Vec<Vec<f32>>,
     /// Genetic positions of ALL reference markers (for interpolation)
     gen_positions: Vec<f64>,
 }
@@ -217,6 +224,11 @@ impl StateProbs {
     /// * `hap_indices` - Reference haplotype indices at each genotyped marker
     /// * `state_probs` - Flattened state probabilities from HMM (genotyped markers only)
     /// * `gen_positions` - Genetic positions of ALL reference markers
+    ///
+    /// # Java Compatibility
+    /// Stores `probs_p1` (probability at next marker) to match Java Beagle's
+    /// `StateProbsFactory.stateProbs()` which stores both `probs[m]` and `probsP1[m]`
+    /// for proper interpolation of ungenotyped markers.
     pub fn new(
         genotyped_markers: Vec<usize>,
         n_states: usize,
@@ -226,36 +238,44 @@ impl StateProbs {
     ) -> Self {
         let threshold = 0.005f32.min(0.9999 / n_states as f32);
         let n_genotyped = genotyped_markers.len();
+        let n_genotyped_m1 = n_genotyped.saturating_sub(1);
 
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
+        let mut filtered_probs_p1 = Vec::with_capacity(n_genotyped);
 
         for sparse_m in 0..n_genotyped {
             let row_offset = sparse_m * n_states;
+            // For probs_p1, use next marker's probs, or same marker if at end
+            let sparse_m_p1 = if sparse_m < n_genotyped_m1 { sparse_m + 1 } else { sparse_m };
+            let row_offset_p1 = sparse_m_p1 * n_states;
 
             let mut haps = Vec::new();
             let mut probs = Vec::new();
+            let mut probs_p1 = Vec::new();
 
+            // Match Java: include state if prob at m OR prob at m+1 exceeds threshold
             for j in 0..n_states.min(hap_indices.get(sparse_m).map(|v| v.len()).unwrap_or(0)) {
-                let prob = state_probs
-                    .get(row_offset + j)
-                    .copied()
-                    .unwrap_or(0.0);
+                let prob = state_probs.get(row_offset + j).copied().unwrap_or(0.0);
+                let prob_p1 = state_probs.get(row_offset_p1 + j).copied().unwrap_or(0.0);
 
-                if prob > threshold {
+                if prob > threshold || prob_p1 > threshold {
                     haps.push(hap_indices[sparse_m][j]);
                     probs.push(prob);
+                    probs_p1.push(prob_p1);
                 }
             }
 
             filtered_haps.push(haps);
             filtered_probs.push(probs);
+            filtered_probs_p1.push(probs_p1);
         }
 
         Self {
             genotyped_markers,
             hap_indices: filtered_haps,
             probs: filtered_probs,
+            probs_p1: filtered_probs_p1,
             gen_positions,
         }
     }
@@ -303,6 +323,15 @@ impl StateProbs {
     }
 
     /// Compute dosage at an ungenotyped marker via interpolation
+    ///
+    /// # Java Compatibility
+    /// Matches Java Beagle's `ImputedVcfWriter.setAlProbs()`:
+    /// - Uses the **same** haplotypes from the left flanking marker
+    /// - Interpolates **probability weights** using `probs` and `probs_p1`
+    /// - Formula: `allele * (wt * prob + (1-wt) * probP1)`
+    ///
+    /// This ensures smooth probability transitions across marker boundaries,
+    /// maintaining calibration and avoiding discontinuities from switching haplotype sets.
     #[inline]
     fn dosage_interpolated<F>(&self, ref_marker: usize, insert_pos: usize, get_ref_allele: &F) -> f32
     where
@@ -323,30 +352,43 @@ impl StateProbs {
             return self.dosage_at_genotyped(n_genotyped - 1, ref_marker, get_ref_allele);
         }
 
-        // Interpolate between markers at insert_pos-1 and insert_pos
+        // Use left marker's haplotypes with interpolated probabilities
+        // This matches Java's approach of using the same haplotype set
+        // with smoothly transitioning probability weights
         let left_sparse = insert_pos - 1;
-        let right_sparse = insert_pos;
         let left_ref = self.genotyped_markers[left_sparse];
-        let right_ref = self.genotyped_markers[right_sparse];
+        let right_ref = self.genotyped_markers[insert_pos];
 
         // Compute interpolation weight based on genetic distance
+        // Java: wt = (cumPos[nextStart] - cumPos[m]) / (cumPos[nextStart] - cumPos[end-1])
+        // This gives wt=1.0 at left marker (use probs), wt=0.0 at right marker (use probs_p1)
         let pos_left = self.gen_positions[left_ref];
         let pos_right = self.gen_positions[right_ref];
         let pos_marker = self.gen_positions[ref_marker];
 
         let total_dist = pos_right - pos_left;
-        let weight_right = if total_dist > 1e-10 {
-            ((pos_marker - pos_left) / total_dist) as f32
+        let weight_left = if total_dist > 1e-10 {
+            ((pos_right - pos_marker) / total_dist) as f32
         } else {
             0.5 // Equal weight if markers are at same position
         };
-        let weight_left = 1.0 - weight_right;
 
-        // Compute dosage at each flanking marker and interpolate
-        let dosage_left = self.dosage_at_genotyped(left_sparse, ref_marker, get_ref_allele);
-        let dosage_right = self.dosage_at_genotyped(right_sparse, ref_marker, get_ref_allele);
+        // Compute dosage using the SAME haplotypes from left marker
+        // with interpolated probability weights
+        let haps = &self.hap_indices[left_sparse];
+        let probs = &self.probs[left_sparse];
+        let probs_p1 = &self.probs_p1[left_sparse];
 
-        weight_left * dosage_left + weight_right * dosage_right
+        let mut dosage = 0.0f32;
+        for (j, &hap) in haps.iter().enumerate() {
+            let allele = get_ref_allele(ref_marker, hap);
+            if allele != 255 {
+                // Interpolate probability: wt*prob + (1-wt)*probP1
+                let interpolated_prob = weight_left * probs[j] + (1.0 - weight_left) * probs_p1[j];
+                dosage += interpolated_prob * allele as f32;
+            }
+        }
+        dosage
     }
 }
 
@@ -459,7 +501,10 @@ impl ImputationPipeline {
         // Note: gen_positions and steps_config removed - ImpStates now uses ref_panel step boundaries directly
 
         // Number of IBS haplotypes to find per step
-        let n_ibs_haps = self.config.imp_nsteps;
+        // Java: nHapsPerStep = imp_states / (imp_segment / imp_step)
+        //     = 1600 / (6.0 / 0.1) = 1600 / 60 ≈ 26
+        let n_steps_per_segment = (self.config.imp_segment / self.config.imp_step).round() as usize;
+        let n_ibs_haps = (self.config.imp_states / n_steps_per_segment.max(1)).max(1);
 
         // Compute genetic positions at ALL reference markers (for RefPanelCoded)
         let ref_gen_positions: Vec<f64> = (0..n_ref_markers)

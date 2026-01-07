@@ -413,7 +413,10 @@ impl<'a> ImpStates<'a> {
                     hap_indices[m][j] = hap;
 
                     let ref_allele = get_ref_allele(m, hap);
-                    allele_match[m][j] = target_allele == 255 || ref_allele == target_allele;
+                    // For missing target alleles (255), treat as mismatch (matches Java behavior)
+                    // In Java, targAllele=-1 won't match refAllele=0 or 1
+                    // For present target alleles, check exact match
+                    allele_match[m][j] = target_allele != 255 && ref_allele == target_allele;
                 }
             }
         }
