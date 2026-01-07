@@ -251,11 +251,6 @@ impl RefPanelCoded {
         &self.steps[idx]
     }
 
-    /// Total number of patterns across all steps
-    pub fn total_patterns(&self) -> usize {
-        self.steps.iter().map(|s| s.n_patterns()).sum()
-    }
-
     /// Average compression ratio
     pub fn avg_compression_ratio(&self) -> f32 {
         if self.steps.is_empty() {

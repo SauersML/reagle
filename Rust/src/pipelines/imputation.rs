@@ -212,7 +212,8 @@ pub struct StateProbs {
     /// At the last marker, this equals probs (no next marker)
     probs_p1: Vec<Vec<f32>>,
     /// Genetic positions of ALL reference markers (for interpolation)
-    gen_positions: Vec<f64>,
+    /// Uses Arc to share across all haplotypes (avoids cloning ~8MB per haplotype)
+    gen_positions: std::sync::Arc<Vec<f64>>,
 }
 
 impl StateProbs {
@@ -234,7 +235,7 @@ impl StateProbs {
         n_states: usize,
         hap_indices: Vec<Vec<u32>>,
         state_probs: Vec<f32>,
-        gen_positions: Vec<f64>,
+        gen_positions: std::sync::Arc<Vec<f64>>,
     ) -> Self {
         let threshold = 0.005f32.min(0.9999 / n_states as f32);
         let n_genotyped = genotyped_markers.len();
@@ -555,10 +556,9 @@ impl ImputationPipeline {
             self.config.imp_step as f64,
         );
         eprintln!(
-            "  {} steps, {} total patterns, avg compression ratio: {:.1}x",
+            "  {} steps ({} haps share each pattern on avg)",
             ref_panel_coded.n_steps(),
-            ref_panel_coded.total_patterns(),
-            ref_panel_coded.avg_compression_ratio()
+            ref_panel_coded.avg_compression_ratio() as usize
         );
 
         eprintln!("Running imputation with dynamic state selection...");
@@ -570,15 +570,16 @@ impl ImputationPipeline {
             .filter(|&m| alignment.is_genotyped(m))
             .collect();
         let n_genotyped = genotyped_markers.len();
+        let n_to_impute = n_ref_markers - n_genotyped;
         eprintln!(
-            "  HMM will run on {} genotyped markers (of {} total) - {:.1}x speedup",
+            "  HMM on {} genotyped markers, interpolating {} ungenotyped",
             n_genotyped,
-            n_ref_markers,
-            n_ref_markers as f64 / n_genotyped.max(1) as f64
+            n_to_impute
         );
 
         // Compute cumulative genetic positions for ALL reference markers (for interpolation)
-        let gen_positions: Vec<f64> = {
+        // Wrapped in Arc to share across all haplotypes without cloning
+        let gen_positions: std::sync::Arc<Vec<f64>> = {
             let mut positions = Vec::with_capacity(n_ref_markers);
             let mut cumulative = 0.0f64;
             positions.push(0.0);
@@ -588,7 +589,7 @@ impl ImputationPipeline {
                 cumulative += gen_maps.gen_dist(chrom, pos1, pos2);
                 positions.push(cumulative);
             }
-            positions
+            std::sync::Arc::new(positions)
         };
 
         // Compute sparse recombination probabilities (between consecutive GENOTYPED markers)
