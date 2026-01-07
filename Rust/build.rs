@@ -1869,8 +1869,13 @@ fn scan_for_allow_dead_code() -> Vec<String> {
 }
 
 fn scan_for_ignored_tests() -> Vec<String> {
-    // Regex pattern to find #[ignore] test attributes
-    let pattern = r"#\s*\[\s*ignore\s*\]";
+    // Regex pattern to find #[ignore] test attributes in all forms:
+    // - #[ignore]
+    // - #[ignore = "reason"]
+    // - #[ignore("reason")]
+    // - #[cfg_attr(..., ignore)]
+    // - #[cfg_attr(..., ignore = "reason")]
+    let pattern = r"#\s*\[.*\bignore\b";
     let mut all_violations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
