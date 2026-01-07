@@ -923,23 +923,17 @@ impl ImputationPipeline {
         let need_allele_probs = self.config.ap || self.config.gp;
 
         // Compute dosages per sample (parallel, no locks)
-        // Each sample returns: (dosages, allele_posteriors, quality_contributions)
-        // Uses optimized AllelePosteriors enum (compact for biallelic, full for multiallelic)
-        type QualityContrib = (usize, [f32; 2], [f32; 2]); // (marker, probs1, probs2)
+        // Each sample returns: (dosages, allele_posteriors)
+        // AllelePosteriors are always needed for both GP output AND DR2 calculation
         type HapPosteriors = Vec<(AllelePosteriors, AllelePosteriors)>; // [marker] -> (hap1, hap2)
-        let sample_results: Vec<(Vec<f32>, Option<HapPosteriors>, Vec<QualityContrib>)> = (0..n_target_samples)
+        let sample_results: Vec<(Vec<f32>, HapPosteriors)> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
                 let hap1_probs = &state_probs[s * 2];
                 let hap2_probs = &state_probs[s * 2 + 1];
 
                 let mut dosages: Vec<f32> = Vec::with_capacity(n_ref_markers);
-                let mut posteriors: Option<HapPosteriors> = if need_allele_probs {
-                    Some(Vec::with_capacity(n_ref_markers))
-                } else {
-                    None
-                };
-                let mut quality_contribs: Vec<QualityContrib> = Vec::new();
+                let mut posteriors: HapPosteriors = Vec::with_capacity(n_ref_markers);
 
                 for m in 0..n_ref_markers {
                     let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
@@ -948,7 +942,7 @@ impl ImputationPipeline {
 
                     let n_alleles = n_alleles_per_marker[m];
 
-                    // Compute per-allele posteriors (optimized enum)
+                    // Compute per-allele posteriors (handles multiallelic correctly)
                     let post1 = hap1_probs.allele_posteriors(m, n_alleles, &get_ref_allele);
                     let post2 = hap2_probs.allele_posteriors(m, n_alleles, &get_ref_allele);
 
@@ -957,26 +951,23 @@ impl ImputationPipeline {
                     let d2 = post2.dosage();
                     dosages.push(d1 + d2);
 
-                    // Record contributions for DR2 calculation (all sites)
-                    quality_contribs.push((m,
-                        [post1.prob(0), post1.prob(1)],
-                        [post2.prob(0), post2.prob(1)]
-                    ));
-
-                    // Store posteriors if needed for output
-                    if let Some(ref mut p) = posteriors {
-                        p.push((post1, post2));
-                    }
+                    // Store posteriors for DR2 calculation and GP output
+                    posteriors.push((post1, post2));
                 }
 
-                (dosages, posteriors, quality_contribs)
+                (dosages, posteriors)
             })
             .collect();
 
-        // Serial reduction: accumulate all quality contributions (fast, no contention)
-        for (_, _, quality_contribs) in &sample_results {
-            for &(m, probs1, probs2) in quality_contribs {
+        // Serial reduction: accumulate DR2 contributions from all samples
+        // Uses AllelePosteriors which handles multiallelic sites correctly
+        for (_, posteriors) in &sample_results {
+            for (m, (post1, post2)) in posteriors.iter().enumerate() {
                 if let Some(stats) = quality.get_mut(m) {
+                    let n_alleles = n_alleles_per_marker[m];
+                    // Build probability arrays for all alleles (multiallelic-safe)
+                    let probs1: Vec<f32> = (0..n_alleles).map(|a| post1.prob(a)).collect();
+                    let probs2: Vec<f32> = (0..n_alleles).map(|a| post2.prob(a)).collect();
                     stats.add_sample(&probs1, &probs2);
                 }
             }
@@ -996,14 +987,12 @@ impl ImputationPipeline {
         };
 
         // Streaming closure: get posteriors (clones one at a time during write)
+        // Posteriors are always available now (used for both GP output and DR2 calculation)
         let get_posteriors: Option<Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>> =
             if need_allele_probs {
                 Some(Box::new(|m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
-                    if let Some(ref posts) = sample_results[s].1 {
-                        (posts[m].0.clone(), posts[m].1.clone())
-                    } else {
-                        (AllelePosteriors::Biallelic(0.0), AllelePosteriors::Biallelic(0.0))
-                    }
+                    let posts = &sample_results[s].1;
+                    (posts[m].0.clone(), posts[m].1.clone())
                 }))
             } else {
                 None
