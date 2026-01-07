@@ -750,9 +750,21 @@ impl ImputationPipeline {
         eprintln!("Running imputation with dynamic state selection...");
         let n_states = self.params.n_states;
 
-        // Build genotyped markers list (reference markers that have target data)
+        // Build genotyped markers list (reference markers with NON-MISSING target data)
+        // A marker is only considered "genotyped" if at least one target haplotype has data
         let genotyped_markers_vec: Vec<usize> = (0..n_ref_markers)
-            .filter(|&m| alignment.is_genotyped(m))
+            .filter(|&ref_m| {
+                if let Some(target_m) = alignment.target_marker(ref_m) {
+                    // Check if any haplotype has non-missing data at this marker
+                    let marker_idx = MarkerIdx::new(target_m as u32);
+                    (0..n_target_haps).any(|hap| {
+                        let hap_idx = HapIdx::new(hap as u32);
+                        target_gt.allele(marker_idx, hap_idx) != 255
+                    })
+                } else {
+                    false
+                }
+            })
             .collect();
         let n_genotyped = genotyped_markers_vec.len();
         let n_to_impute = n_ref_markers - n_genotyped;

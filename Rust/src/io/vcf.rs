@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use noodles::bgzf;
+use noodles::bgzf::io as bgzf_io;
 use noodles::vcf::Header;
 
 use crate::data::haplotype::Samples;
@@ -161,7 +161,7 @@ impl VcfReader {
             .unwrap_or(false);
 
         let reader: Box<dyn BufRead + Send> = if is_gzipped {
-            Box::new(BufReader::new(bgzf::Reader::new(file)))
+            Box::new(BufReader::new(bgzf_io::Reader::new(file)))
         } else {
             Box::new(BufReader::new(file))
         };
@@ -628,7 +628,7 @@ impl VcfWriter {
             .unwrap_or(false);
 
         let writer: Box<dyn Write + Send> = if is_gzipped {
-            Box::new(BufWriter::new(bgzf::Writer::new(file)))
+            Box::new(BufWriter::new(bgzf_io::Writer::new(file)))
         } else {
             Box::new(BufWriter::new(file))
         };

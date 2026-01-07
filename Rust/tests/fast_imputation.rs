@@ -5,7 +5,7 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 use std::path::PathBuf;
 use std::fs::File;
-use ::noodles::bgzf;
+use ::noodles::bgzf::io as bgzf_io;
 use ::noodles::vcf as noodles_vcf;
 use noodles_vcf::Record;
 use noodles_vcf::variant::record::samples::Series;
@@ -101,7 +101,7 @@ impl SyntheticVcfBuilder {
 // Helper to inspect output dosages robustly using noodles
 fn inspect_dosages(path: &std::path::Path, _: usize) -> Vec<Vec<f32>> {
     let file = File::open(path).expect("Open output VCF");
-    let decoder = bgzf::Reader::new(file);
+    let decoder = bgzf_io::Reader::new(file);
     let mut reader = noodles_vcf::io::Reader::new(decoder);
     
     let header = reader.read_header().expect("Read header");
@@ -179,7 +179,7 @@ fn inspect_dosages(path: &std::path::Path, _: usize) -> Vec<Vec<f32>> {
 
 fn inspect_gt_phasing(path: &std::path::Path) -> Vec<Vec<String>> {
     let file = File::open(path).expect("Open output VCF");
-    let decoder = bgzf::Reader::new(file);
+    let decoder = bgzf_io::Reader::new(file);
     let mut reader = noodles_vcf::io::Reader::new(decoder);
     let header = reader.read_header().expect("Read header");
     
@@ -692,7 +692,7 @@ fn test_dr2_validation() {
 
     // Verify output file exists and can be read
     let file = File::open(&out_vcf).unwrap();
-    let mut reader = noodles_vcf::io::Reader::new(bgzf::Reader::new(file));
+    let mut reader = noodles_vcf::io::Reader::new(bgzf_io::Reader::new(file));
     reader.read_header().unwrap();
 
     // For now, pass if pipeline runs successfully
@@ -879,12 +879,12 @@ fn test_ultra_dense_markers() {
         })
         .build();
 
-    // Target with every 10th marker genotyped
+    // Target with every 10th marker genotyped - ALL haplotypes match ref group 0
     let target_file = SyntheticVcfBuilder::new(n_ref_markers, 2)
         .positions(positions)
-        .allele_generator(|m, h| {
+        .allele_generator(|m, _| {
             if m % 10 == 0 {
-                if h < 2 { 0 } else { 1 } // Match first group
+                0 // All target haplotypes get allele 0, matching ref haps 0-9
             } else {
                 255
             }

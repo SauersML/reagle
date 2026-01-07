@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
 
-use noodles::bgzf;
+use noodles::bgzf::io as bgzf_io;
 
 use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
@@ -159,7 +159,7 @@ impl StreamingVcfReader {
             .unwrap_or(false);
 
         let reader: Box<dyn BufRead + Send> = if is_gzipped {
-            Box::new(BufReader::new(bgzf::Reader::new(file)))
+            Box::new(BufReader::new(bgzf_io::Reader::new(file)))
         } else {
             Box::new(BufReader::new(file))
         };
