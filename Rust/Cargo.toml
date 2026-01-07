@@ -25,7 +25,7 @@ log = "0.4.22"
 env_logger = "0.11.6"
 
 # VCF parsing (genomics)
-noodles = { version = "0.91.0", features = ["vcf", "bgzf", "csi", "tabix"] }
+noodles = { version = "0.104.0", features = ["vcf", "bgzf", "csi", "tabix"] }
 
 # Random number generation (for sampling)
 rand = "0.9.0"
@@ -36,12 +36,12 @@ serde = { version = "1.0.228", features = ["derive", "rc", "std"] }
 serde_json = "1.0.148"
 
 [dev-dependencies]
-criterion = "0.5.1"
+criterion = "0.8.1"
 tempfile = "3.24.0"
 flate2 = "1.0"
 
 [build-dependencies]
-grep = "0.3"
+grep = "0.4"
 walkdir = "2.5"
 
 [profile.release]
