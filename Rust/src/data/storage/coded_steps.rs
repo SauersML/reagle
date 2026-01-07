@@ -481,42 +481,67 @@ impl<'a> CodedPbwtView<'a> {
         }
     }
 
-    /// Select neighbors around a virtual position in the sorted prefix array
+    /// Select neighbors around a virtual position, constrained to a pattern bucket
     ///
     /// This is the core of the "Virtual Insertion" algorithm from Naseri et al.
     /// The target's virtual position represents where it would be inserted in
     /// the PBWT sort order, preserving its history. Neighbors adjacent to this
     /// position share the longest common history with the target.
     ///
+    /// IMPORTANT: Neighbors are constrained to the bucket [bucket_start, bucket_end)
+    /// to ensure they have the SAME allele pattern as the target. This matches
+    /// Java's ImpIbs behavior which only returns haplotypes from the same partition.
+    ///
     /// # Arguments
-    /// * `virtual_pos` - The target's position in the sort order (tracked via update_counting_sort)
+    /// * `virtual_pos` - The target's position in the sort order
     /// * `n_matches` - Number of neighbors to return
-    pub fn select_neighbors(&self, virtual_pos: usize, n_matches: usize) -> Vec<HapIdx> {
+    /// * `bucket_start` - Start of the target's pattern bucket (inclusive)
+    /// * `bucket_end` - End of the target's pattern bucket (exclusive)
+    pub fn select_neighbors_in_bucket(
+        &self,
+        virtual_pos: usize,
+        n_matches: usize,
+        bucket_start: usize,
+        bucket_end: usize,
+    ) -> Vec<HapIdx> {
         let n_haps = self.prefix.len();
-        if n_haps == 0 {
+        if n_haps == 0 || bucket_start >= bucket_end {
             return Vec::new();
         }
 
-        // Clamp virtual_pos to valid range
-        let center = virtual_pos.min(n_haps.saturating_sub(1));
+        // Clamp virtual_pos to bucket range
+        let center = virtual_pos.clamp(bucket_start, bucket_end.saturating_sub(1));
 
         let mut result = Vec::with_capacity(n_matches);
         let mut left = center;
         let mut right = center + 1;
 
-        // Expand outward from center, alternating left and right
-        while result.len() < n_matches && (left > 0 || right < n_haps) {
-            if left > 0 {
+        // Expand outward from center, staying within bucket
+        while result.len() < n_matches && (left > bucket_start || right < bucket_end) {
+            if left > bucket_start {
                 left -= 1;
                 result.push(HapIdx::new(self.prefix[left]));
             }
-            if right < n_haps && result.len() < n_matches {
+            if right < bucket_end && result.len() < n_matches {
                 result.push(HapIdx::new(self.prefix[right]));
                 right += 1;
             }
         }
 
         result
+    }
+
+    /// Select neighbors around a virtual position in the sorted prefix array
+    ///
+    /// This is the original unconstrained version that can cross bucket boundaries.
+    /// Use `select_neighbors_in_bucket` for pattern-aware selection.
+    ///
+    /// # Arguments
+    /// * `virtual_pos` - The target's position in the sort order (tracked via update_counting_sort)
+    /// * `n_matches` - Number of neighbors to return
+    pub fn select_neighbors(&self, virtual_pos: usize, n_matches: usize) -> Vec<HapIdx> {
+        let n_haps = self.prefix.len();
+        self.select_neighbors_in_bucket(virtual_pos, n_matches, 0, n_haps)
     }
 
 }

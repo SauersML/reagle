@@ -272,9 +272,15 @@ impl<'a> ImpStates<'a> {
                     continue;
                 }
 
-                // Use stateful virtual position for neighbor selection
+                // Get bucket boundaries for target's pattern (after counting sort)
+                // Neighbors should be from the SAME pattern bucket to match Java's behavior
+                let pattern_idx = target_pattern as usize;
+                let bucket_start = workspace.sort_offsets.get(pattern_idx).copied().unwrap_or(0);
+                let bucket_end = workspace.sort_offsets.get(pattern_idx + 1).copied().unwrap_or(n_ref_haps);
+
+                // Use stateful virtual position for neighbor selection, constrained to same-pattern bucket
                 let fwd_ibs: Vec<u32> = pbwt_fwd
-                    .select_neighbors(fwd_virtual_pos, n_ibs_haps)
+                    .select_neighbors_in_bucket(fwd_virtual_pos, n_ibs_haps, bucket_start, bucket_end)
                     .into_iter()
                     .map(|h| h.0)
                     .collect();
