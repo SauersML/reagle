@@ -1015,7 +1015,7 @@ impl ImputationPipeline {
         // Run imputation for each target haplotype with per-thread workspaces
         // Optimization: ImpStates is now created once per thread (not per haplotype)
         // to avoid allocator contention from HashMap/BinaryHeap allocation
-        let state_probs: Vec<StateProbs> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
+        let state_probs: Vec<Arc<StateProbs>> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
             (0..n_target_haps)
             .into_par_iter()
             .map_init(
@@ -1129,13 +1129,13 @@ impl ImputationPipeline {
                     // NOTE: probs_p1 uses "next marker" which correctly produces:
                     // - Constant values within clusters (since same-cluster markers have equal probs)
                     // - Smooth transitions between clusters
-                    StateProbs::new(
+                    Arc::new(StateProbs::new(
                         std::sync::Arc::clone(&genotyped_markers),
                         actual_n_states,
                         sparse_hap_indices,
                         hmm_state_probs,
                         std::sync::Arc::clone(&gen_positions),
-                    )
+                    ))
                 },
             )
             .collect()
