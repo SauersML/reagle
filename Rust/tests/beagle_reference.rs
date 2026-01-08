@@ -2138,3 +2138,186 @@ fn test_multiple_seeds_consistency() {
     println!("\nMultiple seeds consistency test PASSED!");
 }
 
+/// Test per-sample imputation accuracy to isolate sample-specific issues.
+/// This test breaks down accuracy by sample to help identify if failures
+/// are concentrated in specific samples or uniform across all samples.
+#[test]
+fn test_per_sample_imputation_accuracy() {
+    let source = &get_all_data_sources()[0];
+    let files = setup_test_files();
+
+    println!("\n{}", "=".repeat(60));
+    println!("=== Per-Sample Imputation Accuracy Test ===");
+    println!("{}", "=".repeat(60));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy files
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    // Create masked version
+    let masked_path = work_dir.path().join("masked.vcf");
+    let truth_map = create_masked_vcf(&target_path, &masked_path, 0.25, 42);
+    println!("Masked {} genotypes (25%)", truth_map.len());
+
+    // Compress
+    let masked_gz = work_dir.path().join("masked.vcf.gz");
+    let status = Command::new("gzip")
+        .args(["-c"])
+        .stdin(File::open(&masked_path).unwrap())
+        .stdout(File::create(&masked_gz).unwrap())
+        .status()
+        .expect("gzip failed");
+    assert!(status.success());
+
+    // Run Java
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", masked_gz.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    // Run Rust
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_out");
+    let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, 42);
+    assert!(rust_result.is_ok(), "Rust imputation failed: {:?}", rust_result.err());
+
+    // Parse outputs
+    let (sample_names, target_records) = parse_vcf(&target_path);
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+
+    let n_samples = sample_names.len();
+    println!("\nAnalyzing {} samples...\n", n_samples);
+
+    // Per-sample accuracy tracking
+    let mut java_sample_correct: Vec<usize> = vec![0; n_samples];
+    let mut rust_sample_correct: Vec<usize> = vec![0; n_samples];
+    let mut sample_total: Vec<usize> = vec![0; n_samples];
+    let mut samples_with_rust_worse = 0;
+    let mut max_accuracy_gap = 0.0f64;
+    let mut worst_sample_idx = 0usize;
+
+    // Evaluate per-sample
+    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+        // Find corresponding truth record
+        let truth_pos = format!("{}:{}", j_rec.chrom, j_rec.pos);
+        
+        // Find matching target record
+        let target_rec = target_records.iter().find(|t| format!("{}:{}", t.chrom, t.pos) == truth_pos);
+        let target_rec = match target_rec {
+            Some(r) => r,
+            None => continue,
+        };
+
+        for sample_idx in 0..n_samples {
+            let key = (j_rec.chrom.clone(), j_rec.pos, sample_idx);
+            
+            // Only evaluate masked positions
+            if !truth_map.contains_key(&key) {
+                continue;
+            }
+
+            let truth_gt = &target_rec.genotypes[sample_idx].gt;
+            let java_gt = &j_rec.genotypes[sample_idx].gt;
+            let rust_gt = &r_rec.genotypes[sample_idx].gt;
+
+            sample_total[sample_idx] += 1;
+
+            if normalize_gt_unphased(java_gt) == normalize_gt_unphased(truth_gt) {
+                java_sample_correct[sample_idx] += 1;
+            }
+            if normalize_gt_unphased(rust_gt) == normalize_gt_unphased(truth_gt) {
+                rust_sample_correct[sample_idx] += 1;
+            }
+        }
+    }
+
+    // Print per-sample results
+    println!("{:<20} {:>12} {:>12} {:>10}", "Sample", "Java Acc", "Rust Acc", "Diff");
+    println!("{:-<20} {:-<12} {:-<12} {:-<10}", "", "", "", "");
+
+    for i in 0..n_samples {
+        if sample_total[i] == 0 {
+            continue;
+        }
+        let java_acc = java_sample_correct[i] as f64 / sample_total[i] as f64;
+        let rust_acc = rust_sample_correct[i] as f64 / sample_total[i] as f64;
+        let diff = rust_acc - java_acc;
+
+        let status = if diff < -0.01 { "WORSE" } else if diff > 0.01 { "BETTER" } else { "" };
+        println!(
+            "{:<20} {:>11.2}% {:>11.2}% {:>+9.2}% {}",
+            &sample_names[i][..sample_names[i].len().min(20)],
+            java_acc * 100.0,
+            rust_acc * 100.0,
+            diff * 100.0,
+            status
+        );
+
+        if diff < -0.001 {
+            samples_with_rust_worse += 1;
+            if diff.abs() > max_accuracy_gap {
+                max_accuracy_gap = diff.abs();
+                worst_sample_idx = i;
+            }
+        }
+    }
+
+    // Summary
+    let total_java_correct: usize = java_sample_correct.iter().sum();
+    let total_rust_correct: usize = rust_sample_correct.iter().sum();
+    let total_evaluated: usize = sample_total.iter().sum();
+    
+    let java_overall = total_java_correct as f64 / total_evaluated as f64;
+    let rust_overall = total_rust_correct as f64 / total_evaluated as f64;
+
+    println!("\n{}", "=".repeat(60));
+    println!("Summary:");
+    println!("  Total evaluated: {} genotypes", total_evaluated);
+    println!("  Java overall accuracy: {:.2}%", java_overall * 100.0);
+    println!("  Rust overall accuracy: {:.2}%", rust_overall * 100.0);
+    println!("  Samples where Rust is worse: {}/{}", samples_with_rust_worse, n_samples);
+    if samples_with_rust_worse > 0 {
+        println!("  Worst sample: {} (gap: {:.2}%)", sample_names[worst_sample_idx], max_accuracy_gap * 100.0);
+    }
+
+    // STRICT: Rust should not be significantly worse on any sample
+    assert!(
+        max_accuracy_gap < 0.05,
+        "Per-sample accuracy gap too large: {:.2}% on sample {}",
+        max_accuracy_gap * 100.0,
+        sample_names[worst_sample_idx]
+    );
+
+    // STRICT: Less than 50% of samples should show Rust worse
+    let pct_worse = samples_with_rust_worse as f64 / n_samples as f64;
+    assert!(
+        pct_worse < 0.5,
+        "Too many samples ({:.0}%) show Rust worse than Java",
+        pct_worse * 100.0
+    );
+
+    // STRICT: Overall Rust accuracy must be >= Java - 1%
+    assert!(
+        rust_overall >= java_overall - 0.01,
+        "Rust overall accuracy ({:.2}%) worse than Java ({:.2}%) by more than 1%",
+        rust_overall * 100.0,
+        java_overall * 100.0
+    );
+
+    println!("\nPer-sample imputation accuracy test PASSED!");
+}
+
