@@ -201,6 +201,15 @@ impl<'a> ImpStates<'a> {
                 let step_start = coded_step.start;
                 let step_end = coded_step.end;
 
+                // Skip BOTH PBWT update and IBS matching if this step has no informative target data
+                // This prevents the virtual position from being corrupted by all-missing data
+                // being routed to pattern 0
+                if !step_has_data[step_idx] {
+                    // Still need to update PBWT structure but WITHOUT changing virtual position
+                    pbwt_bwd.update_backward(coded_step, n_steps, None, None);
+                    continue;
+                }
+
                 // Extract target sequence for this step
                 let target_seq: Vec<u8> = (step_start..step_end)
                     .map(|m| target_alleles.get(m).copied().unwrap_or(255))
@@ -211,18 +220,13 @@ impl<'a> ImpStates<'a> {
                     .match_sequence_with(&target_seq, &get_ref_allele)
                     .unwrap_or_else(|| coded_step.closest_pattern_with(&target_seq, &get_ref_allele));
 
-                // Update PBWT, computing new virtual position (no offsets needed)
+                // Update PBWT, computing new virtual position
                 pbwt_bwd.update_backward(
                     coded_step,
                     n_steps,
                     Some((&mut bwd_virtual_pos, target_pattern)),
                     None,
                 );
-
-                // Skip IBS matching if this step has no informative target data
-                if !step_has_data[step_idx] {
-                    continue;
-                }
 
                 // Select neighbors without bucket constraint (allows diverse selection)
                 let bwd_ibs: Vec<u32> = pbwt_bwd
@@ -250,6 +254,22 @@ impl<'a> ImpStates<'a> {
                 let step_start = coded_step.start;
                 let step_end = coded_step.end;
 
+                // Skip BOTH PBWT update and IBS matching if this step has no informative target data
+                // This prevents the virtual position from being corrupted by all-missing data
+                // being routed to pattern 0
+                if !step_has_data[step_idx] {
+                    // Still need to update PBWT structure but WITHOUT changing virtual position
+                    pbwt_fwd.update_counting_sort(
+                        coded_step,
+                        &mut workspace.sort_counts,
+                        &mut workspace.sort_offsets,
+                        &mut workspace.sort_prefix_scratch,
+                        &mut workspace.sort_div_scratch,
+                        None,
+                    );
+                    continue;
+                }
+
                 // Extract target sequence for this step
                 let target_seq: Vec<u8> = (step_start..step_end)
                     .map(|m| target_alleles.get(m).copied().unwrap_or(255))
@@ -269,11 +289,6 @@ impl<'a> ImpStates<'a> {
                     &mut workspace.sort_div_scratch,
                     Some((&mut fwd_virtual_pos, target_pattern)),
                 );
-
-                // Skip IBS matching if this step has no informative target data
-                if !step_has_data[step_idx] {
-                    continue;
-                }
 
                 // Get bucket boundaries for target's pattern (after counting sort)
                 // Neighbors should be from the SAME pattern bucket to match Java's behavior
