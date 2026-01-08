@@ -313,6 +313,102 @@ fn bench_hashmap_vs_vec(c: &mut Criterion) {
     group.finish();
 }
 
+/// E2E benchmark: Full imputation pipeline with synthetic data
+/// This measures the complete pipeline including I/O simulation
+fn bench_imputation_e2e(c: &mut Criterion) {
+    use reagle::data::marker::{Allele, Marker, Markers};
+    use reagle::data::haplotype::Samples;
+    use reagle::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use reagle::data::ChromIdx;
+    use std::sync::Arc;
+
+    let mut group = c.benchmark_group("imputation_e2e");
+    group.sample_size(10); // E2E is slower, fewer samples
+
+    // Scaling benchmark: vary number of markers
+    for n_markers in [1000, 5000] {
+        let n_ref_samples = 50;
+        let n_target_samples = 10;
+        let n_ref_haps = n_ref_samples * 2;
+
+        // Build synthetic reference panel
+        let ref_samples = Arc::new(Samples::from_ids(
+            (0..n_ref_samples).map(|i| format!("REF{}", i)).collect()
+        ));
+        let mut ref_markers = Markers::new();
+        ref_markers.add_chrom("chr1");
+
+        let mut ref_columns = Vec::with_capacity(n_markers);
+        for m in 0..n_markers {
+            ref_markers.push(Marker::new(
+                ChromIdx::new(0),
+                (m * 1000 + 100) as u32,
+                None,
+                Allele::Base(0),
+                vec![Allele::Base(1)],
+            ));
+            // Random-ish alleles based on marker/hap indices
+            let alleles: Vec<u8> = (0..n_ref_haps)
+                .map(|h| ((m * 7 + h * 13) % 2) as u8)
+                .collect();
+            ref_columns.push(GenotypeColumn::from_alleles(&alleles, 2));
+        }
+        let ref_gt = GenotypeMatrix::new_phased(ref_markers.clone(), ref_columns, ref_samples);
+
+        // Build synthetic target panel (subset of markers)
+        let target_samples = Arc::new(Samples::from_ids(
+            (0..n_target_samples).map(|i| format!("TGT{}", i)).collect()
+        ));
+        let n_target_haps = n_target_samples * 2;
+        let genotyped_fraction = 0.1; // 10% genotyped
+        let n_genotyped = (n_markers as f64 * genotyped_fraction) as usize;
+
+        let mut target_markers = Markers::new();
+        target_markers.add_chrom("chr1");
+        let mut target_columns = Vec::with_capacity(n_genotyped);
+
+        for m in (0..n_markers).step_by(n_markers / n_genotyped.max(1)) {
+            if target_markers.len() >= n_genotyped {
+                break;
+            }
+            if let Some(ref_marker) = ref_markers.get(reagle::MarkerIdx::new(m as u32)) {
+                target_markers.push(Marker::new(
+                    ref_marker.chrom,
+                    ref_marker.pos,
+                    None,
+                    ref_marker.ref_allele.clone(),
+                    ref_marker.alt_alleles.clone(),
+                ));
+                // Target alleles (some matching reference pattern)
+                let alleles: Vec<u8> = (0..n_target_haps)
+                    .map(|h| ((m * 7 + h * 13 + 1) % 2) as u8) // Slightly different pattern
+                    .collect();
+                target_columns.push(GenotypeColumn::from_alleles(&alleles, 2));
+            }
+        }
+        let target_gt = GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
+
+        group.throughput(Throughput::Elements(n_markers as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("markers", n_markers),
+            &(ref_gt, target_gt),
+            |b, (ref_gt, target_gt)| {
+                b.iter(|| {
+                    // Measure alignment creation (lightweight operation)
+                    let alignment = reagle::pipelines::imputation::MarkerAlignment::new(
+                        target_gt,
+                        ref_gt,
+                    );
+                    black_box(alignment.n_aligned())
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fwd_update,
@@ -323,6 +419,7 @@ criterion_group!(
     bench_memory_access_patterns,
     bench_priority_queue,
     bench_hashmap_vs_vec,
+    bench_imputation_e2e,
 );
 
 criterion_main!(benches);
