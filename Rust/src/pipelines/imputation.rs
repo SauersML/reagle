@@ -387,10 +387,10 @@ impl StateProbs {
     {
         match self.genotyped_markers.binary_search(&ref_marker) {
             Ok(sparse_idx) => {
-                self.posteriors_at_genotyped(sparse_idx, ref_marker, n_alleles, get_ref_allele)
+                self.posteriors_at_genotyped(sparse_idx, ref_marker, n_alleles, &get_ref_allele)
             }
             Err(insert_pos) => {
-                self.posteriors_interpolated(ref_marker, insert_pos, n_alleles, get_ref_allele)
+                self.posteriors_interpolated(ref_marker, insert_pos, n_alleles, &get_ref_allele)
             }
         }
     }
