@@ -948,18 +948,19 @@ impl ImputationPipeline {
                     // Expand cluster-level state probs to marker-level
                     // All markers in a cluster get the same state probabilities
                     let n_genotyped_local = genotyped_markers.len();
-                    let hmm_state_probs: Vec<f32> = (0..n_genotyped_local)
-                        .flat_map(|m| {
-                            let cluster_idx = marker_to_cluster[m];
-                            let cluster_offset = cluster_idx * actual_n_states;
-                            (0..actual_n_states).map(move |k| {
-                                cluster_state_probs
-                                    .get(cluster_offset + k)
-                                    .copied()
-                                    .unwrap_or(1.0 / actual_n_states as f32)
-                            })
-                        })
-                        .collect();
+                    let mut hmm_state_probs: Vec<f32> = Vec::with_capacity(n_genotyped_local * actual_n_states);
+                    let default_prob = 1.0 / actual_n_states as f32;
+                    for m in 0..n_genotyped_local {
+                        let cluster_idx = marker_to_cluster[m];
+                        let cluster_offset = cluster_idx * actual_n_states;
+                        for k in 0..actual_n_states {
+                            let prob = cluster_state_probs
+                                .get(cluster_offset + k)
+                                .copied()
+                                .unwrap_or(default_prob);
+                            hmm_state_probs.push(prob);
+                        }
+                    }
 
                     // Create StateProbs with interpolation support
                     StateProbs::new(
@@ -1084,131 +1085,6 @@ impl ImputationPipeline {
         eprintln!("Imputation complete!");
         Ok(())
     }
-}
-
-/// Run forward-backward HMM on IBS-selected states
-///
-/// # Arguments
-/// * `target_alleles` - Target haplotype alleles at each marker
-/// * `allele_match` - Whether each state matches target at each marker
-/// * `p_recomb` - Per-marker recombination probabilities
-/// * `p_mismatch` - Per-marker mismatch probabilities (scaled by cluster size)
-/// * `n_states` - Number of HMM states
-/// * `workspace` - Reusable workspace for temporary storage
-fn run_hmm_forward_backward(
-    target_alleles: &[u8],
-    allele_match: &[Vec<bool>],
-    p_recomb: &[f32],
-    p_mismatch: &[f32],  // Changed from scalar to per-marker
-    n_states: usize,
-    workspace: &mut ImpWorkspace,
-) -> Vec<f32> {
-    let n_markers = target_alleles.len();
-    if n_markers == 0 || n_states == 0 {
-        return Vec::new();
-    }
-
-    // Ensure workspace is sized correctly
-    workspace.resize(n_states, n_markers);
-
-    // Default error probability if p_mismatch is empty or too short
-    let default_err = if p_mismatch.is_empty() { 0.001 } else { p_mismatch[0] };
-
-    // Use pre-allocated forward storage (flat)
-    let total_size = n_markers * n_states;
-    let mut fwd: Vec<f32> = vec![0.0; total_size];
-    let mut fwd_sum = 1.0f32;
-
-    // Forward pass using workspace.tmp for temporary calculations
-    for m in 0..n_markers {
-        let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
-        let shift = p_rec / n_states as f32;
-        let scale = (1.0 - p_rec) / fwd_sum;
-
-        // Get per-marker error probability (scaled by cluster size)
-        let p_err = p_mismatch.get(m).copied().unwrap_or(default_err);
-        let p_match = 1.0 - p_err;
-
-        let mut new_sum = 0.0f32;
-        let matches = &allele_match[m];
-        let row_offset = m * n_states;
-        let prev_row_offset = if m > 0 { (m - 1) * n_states } else { 0 };
-
-        for k in 0..n_states.min(matches.len()) {
-            let emit = if matches[k] { p_match } else { p_err };
-
-            // Match Java exactly: m==0 uses just emission, not divided by n_states
-            // Java: fwdVal[m][j] = m==0 ? em : em*(scale*fwdVal[m-1][j] + shift);
-            let val = if m == 0 {
-                emit
-            } else {
-                emit * (scale * fwd[prev_row_offset + k] + shift)
-            };
-
-            fwd[row_offset + k] = val;
-            new_sum += val;
-        }
-        fwd_sum = new_sum;
-    }
-
-    // Backward pass using workspace.bwd buffer
-    // Match Java exactly: initialize bwd to 1/n_states
-    let bwd = &mut workspace.bwd;
-    bwd.resize(n_states, 0.0);
-    bwd.fill(1.0 / n_states as f32);
-    let mut bwd_sum = 1.0f32;
-
-    for m in (0..n_markers).rev() {
-        let row_offset = m * n_states;
-
-        // Apply transition for backward at ALL markers (matching Java)
-        // Java: pRecomb = (mP1 < nMarkers) ? impData.pRecomb(mP1) : 0.0f
-        // At last marker: pRecomb = 0, so scale = 1/lastSum, shift = 0
-        // This normalizes bwd by bwd_sum even at last marker
-        let p_rec = if m < n_markers - 1 {
-            p_recomb.get(m + 1).copied().unwrap_or(0.0)
-        } else {
-            0.0  // At last marker, no recombination to "next" marker
-        };
-        let shift = p_rec / n_states as f32;
-        let scale = (1.0 - p_rec) / bwd_sum;
-
-        for k in 0..n_states {
-            bwd[k] = scale * bwd[k] + shift;
-        }
-
-        // Compute posterior: fwd * bwd
-        let mut state_sum = 0.0f32;
-        for k in 0..n_states {
-            let idx = row_offset + k;
-            fwd[idx] *= bwd[k];
-            state_sum += fwd[idx];
-        }
-
-        // Normalize
-        if state_sum > 0.0 {
-            let inv_sum = 1.0 / state_sum;
-            for k in 0..n_states {
-                fwd[row_offset + k] *= inv_sum;
-            }
-        }
-
-        // Apply emission for next backward iteration
-        if m > 0 {
-            let matches = &allele_match[m];
-            // Get per-marker error probability (scaled by cluster size)
-            let p_err = p_mismatch.get(m).copied().unwrap_or(default_err);
-            let p_match = 1.0 - p_err;
-            bwd_sum = 0.0;
-            for k in 0..n_states.min(matches.len()) {
-                let emit = if matches[k] { p_match } else { p_err };
-                bwd[k] *= emit;
-                bwd_sum += bwd[k];
-            }
-        }
-    }
-
-    fwd
 }
 
 /// Run forward-backward HMM on CLUSTERS (matches Java ImpLSBaum exactly)
