@@ -27,6 +27,7 @@ import sys
 import subprocess
 import random
 import gzip
+import json
 from pathlib import Path
 from collections import defaultdict
 import math
@@ -457,6 +458,16 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             var_t = sum((t - mean_t) ** 2 for t in truth_dosages)
             var_i = sum((i - mean_i) ** 2 for i in imputed_dosages)
 
+            # Store sufficient statistics for exact global aggregation
+            metrics["r2_stats"] = {
+                "sum_t": sum(truth_dosages),
+                "sum_i": sum(imputed_dosages),
+                "sum_ti": sum(t * i for t, i in zip(truth_dosages, imputed_dosages)),
+                "sum_tt": sum(t * t for t in truth_dosages),
+                "sum_ii": sum(i * i for i in imputed_dosages),
+                "count": len(truth_dosages)
+            }
+
             if var_t > 0 and var_i > 0:
                 r = cov / math.sqrt(var_t * var_i)
                 metrics["r_squared"] = r ** 2
@@ -543,10 +554,15 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         if sample_switch_rates:
             metrics["sample_switch_error_mean"] = sum(sample_switch_rates) / len(sample_switch_rates)
             metrics["sample_switch_error_max"] = max(sample_switch_rates)
+            metrics["sample_switch_error_max"] = max(sample_switch_rates)
             metrics["sample_switch_error_min"] = min(sample_switch_rates)
 
     elapsed = time.time() - start_time
     metrics["calculation_time_sec"] = elapsed
+
+    # Save metrics to JSON for exact aggregation
+    with open(output_prefix + "_metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
 
     # Print results
     print("\n" + "=" * 60)
@@ -1403,27 +1419,182 @@ def stage_metrics_chr(chrom):
 
 
 def stage_summary():
-    """Aggregate metrics across all chromosomes."""
+    """Aggregate metrics across all chromosomes and generate comprehensive report."""
     print("\n" + "=" * 60)
     print("STAGE: GENOME-WIDE SUMMARY")
     print("=" * 60)
     
     script_dir = Path(__file__).parent
     tools = ["beagle", "reagle", "impute5", "minimac", "glimpse"]
+    display_names = {
+        "beagle": "Beagle 5.4",
+        "reagle": "Reagle (Rust)",
+        "impute5": "IMPUTE5",
+        "minimac": "Minimac4",
+        "glimpse": "GLIMPSE2"
+    }
+
+    final_metrics = []
     
     for tool in tools:
-        print(f"\n=== {tool.upper()} ===")
+        print(f"\nProcessing {tool.upper()}...")
+        
+        # Aggregators
+        total_sites_compared = 0
+        total_time_sec = 0.0
+        
+        # Exact counts for rates
+        agg_concordant = 0
+        agg_genotypes = 0
+        agg_nonref_concordant = 0
+        agg_nonref_total = 0
+        agg_switch_errors = 0
+        agg_switch_opps = 0
+        
+        # R2 sufficient stats
+        r2_sum_t = 0.0
+        r2_sum_i = 0.0
+        r2_sum_ti = 0.0
+        r2_sum_tt = 0.0
+        r2_sum_ii = 0.0
+        r2_n = 0
+        
+        chromosomes_found = 0
+        
         for chrom in range(1, 23):
-            metrics_file = script_dir / f"data_chr{chrom}" / f"{tool}_metrics.txt"
-            if metrics_file.exists():
-                with open(metrics_file) as f:
-                    content = f.read()
-                    # Extract key metrics
-                    for line in content.split('\n'):
-                        if 'Unphased concordance:' in line or 'Overall R²:' in line:
-                            print(f"  chr{chrom}: {line.strip()}")
+            # Prefer JSON for exact stats
+            json_file = script_dir / f"data_chr{chrom}" / f"{tool}_metrics.json"
+            
+            if json_file.exists():
+                chromosomes_found += 1
+                try:
+                    with open(json_file) as f:
+                        data = json.load(f)
+                        
+                    total_sites_compared += data.get("sites_compared", 0)
+                    total_time_sec += data.get("calculation_time_sec", 0.0)
+                    
+                    # Concordance counts
+                    n_genotypes = data.get("total_genotypes", 0)
+                    conc_rate = data.get("unphased_concordance", 0)
+                    agg_genotypes += n_genotypes
+                    agg_concordant += int(conc_rate * n_genotypes) # Reconstruct count
+                    
+                    # Non-ref
+                    nr_rate = data.get("nonref_concordance", 0)
+                    nr_total = data.get("nonref_total", 0)
+                    agg_nonref_total += nr_total
+                    agg_nonref_concordant += int(nr_rate * nr_total)
+                    
+                    # Switch Error
+                    agg_switch_errors += data.get("switch_errors", 0)
+                    agg_switch_opps += data.get("switch_opportunities", 0)
+                    
+                    # R2 stats
+                    stats = data.get("r2_stats")
+                    if stats:
+                        r2_sum_t += stats["sum_t"]
+                        r2_sum_i += stats["sum_i"]
+                        r2_sum_ti += stats["sum_ti"]
+                        r2_sum_tt += stats["sum_tt"]
+                        r2_sum_ii += stats["sum_ii"]
+                        r2_n += stats["count"]
+                except Exception as e:
+                    print(f"  Error reading chr{chrom} JSON: {e}")
             else:
-                print(f"  chr{chrom}: MISSING")
+                pass 
+                # print(f"  chr{chrom}: MISSING")
+
+        if chromosomes_found == 0:
+            continue
+
+        # Calculate exact global metrics
+        global_conc = agg_concordant / agg_genotypes if agg_genotypes > 0 else 0.0
+        global_nonref = agg_nonref_concordant / agg_nonref_total if agg_nonref_total > 0 else 0.0
+        global_ser = agg_switch_errors / agg_switch_opps if agg_switch_opps > 0 else 0.0
+        
+        # Calculate exact GLOBAL dosage R2
+        global_r2 = 0.0
+        if r2_n > 0:
+            mean_t = r2_sum_t / r2_n
+            mean_i = r2_sum_i / r2_n
+            
+            # Covariance * N
+            cov_n = r2_sum_ti - (r2_sum_t * r2_sum_i / r2_n)
+            # Variance * N
+            var_t_n = r2_sum_tt - (r2_sum_t * r2_sum_t / r2_n)
+            var_i_n = r2_sum_ii - (r2_sum_i * r2_sum_i / r2_n)
+            
+            if var_t_n > 0 and var_i_n > 0:
+                r = cov_n / math.sqrt(var_t_n * var_i_n)
+                global_r2 = r ** 2
+
+        final_metrics.append({
+            'id': tool,
+            'name': display_names[tool],
+            'time': total_time_sec,
+            'conc': global_conc,
+            'nonref': global_nonref,
+            'r2': global_r2,
+            'ser': global_ser,
+            'chromosomes': chromosomes_found
+        })
+    
+    if not final_metrics:
+        print("No metrics found.")
+        return
+
+    # -- Sort by R2 (descending) --
+    final_metrics.sort(key=lambda x: x['r2'], reverse=True)
+    
+    # -- Generate Markdown Report --
+    md_lines = []
+    md_lines.append("# 🧬 Imputation Benchmark Results")
+    md_lines.append(f"**Genome-wide comparison (All 22 autosomes)**")
+    md_lines.append(f"*Metrics aggregated exactly across all sites (Dosage R²).*")
+    
+    # Winner badges
+    best_r2 = max(final_metrics, key=lambda x: x['r2'])
+    best_time = min(final_metrics, key=lambda x: x['time'])
+    final_metrics_with_ser = [m for m in final_metrics if m['ser'] > 0]
+    best_ser = min(final_metrics_with_ser, key=lambda x: x['ser']) if final_metrics_with_ser else None
+
+    md_lines.append(f"\n### 🏆 Highlights")
+    md_lines.append(f"- **Most Accurate (R²):** {best_r2['name']} ({best_r2['r2']:.4f})")
+    md_lines.append(f"- **Fastest:** {best_time['name']} ({best_time['time']:.1f}s)")
+    if best_ser and best_ser['ser'] < 1.0:
+        md_lines.append(f"- **Best Phasing (SER):** {best_ser['name']} ({best_ser['ser']:.4f})")
+    
+    md_lines.append(f"\n### 📊 Comprehensive Comparison")
+    md_lines.append("| Tool | R² | Concordance | Non-Ref Conc. | Switch Error | Runtime (s) | Chrs |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
+    
+    for m in final_metrics:
+        # Comparison vs Reagle (if present)
+        r2_diff = ""
+        reagle_stats = next((x for x in final_metrics if x['id'] == 'reagle'), None)
+        if reagle_stats and m['id'] != 'reagle':
+            diff = m['r2'] - reagle_stats['r2']
+            icon = "🔻" if diff < 0 else "🔺"
+            r2_diff = f" ({icon}{abs(diff):.4f})"
+            
+        md_lines.append(f"| **{m['name']}** | {m['r2']:.4f}{r2_diff} | {m['conc']:.5f} | {m['nonref']:.4f} | {m['ser']:.4f} | {m['time']:.1f} | {m['chromosomes']} |")
+
+    # Write to Summary file
+    summary_file = script_dir / "genome_wide_summary.md"
+    with open(summary_file, 'w') as f:
+        f.write('\n'.join(md_lines))
+        
+    print(f"\nSummary written to: {summary_file}")
+    
+    # Print to console
+    print('\n'.join(md_lines))
+    
+    # If running in GHA, append to job summary
+    gha_summary = os.getenv('GITHUB_STEP_SUMMARY')
+    if gha_summary:
+        with open(gha_summary, 'a') as f:
+            f.write('\n'.join(md_lines))
 
 
 if __name__ == "__main__":
