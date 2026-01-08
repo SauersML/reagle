@@ -1054,11 +1054,11 @@ impl PhasingPipeline {
             // This is needed because ThreadedHaps uses cursor-based traversal
             let state_haps: Vec<Vec<u32>> = {
                 let mut threaded_haps_mut = threaded_haps.clone();
+                let mut buffer = vec![0u32; n_states];
                 (0..n_markers)
                     .map(|m| {
-                        (0..n_states)
-                            .map(|k| threaded_haps_mut.hap_at_raw(k, m))
-                            .collect()
+                        threaded_haps_mut.materialize_haps(m, &mut buffer);
+                        buffer.clone()
                     })
                     .collect()
             };
@@ -1487,11 +1487,11 @@ impl PhasingPipeline {
                 // Pre-compute state->hap mapping for all (marker, state) pairs
                 let state_haps: Vec<Vec<u32>> = {
                     let mut threaded_haps_mut = threaded_haps.clone();
+                    let mut buffer = vec![0u32; n_states];
                     (0..n_markers)
                         .map(|m| {
-                            (0..n_states)
-                                .map(|k| threaded_haps_mut.hap_at_raw(k, m))
-                                .collect()
+                            threaded_haps_mut.materialize_haps(m, &mut buffer);
+                            buffer.clone()
                         })
                         .collect()
                 };
@@ -1912,11 +1912,11 @@ impl PhasingPipeline {
                 // Pre-compute state->hap mapping for all (hi_freq_idx, state) pairs
                 let state_haps: Vec<Vec<u32>> = {
                     let mut threaded_haps_mut = threaded_haps.clone();
+                    let mut buffer = vec![0u32; n_states];
                     (0..n_hi_freq)
                         .map(|m| {
-                            (0..n_states)
-                                .map(|k| threaded_haps_mut.hap_at_raw(k, m))
-                                .collect()
+                            threaded_haps_mut.materialize_haps(m, &mut buffer);
+                            buffer.clone()
                         })
                         .collect()
                 };
@@ -2397,11 +2397,11 @@ impl PhasingPipeline {
                 // This is needed because ThreadedHaps uses cursor-based traversal
                 let state_haps_stage1: Vec<Vec<u32>> = {
                     let mut threaded_haps_mut = threaded_haps.clone();
+                    let mut buffer = vec![0u32; n_states];
                     (0..n_stage1)
                         .map(|m| {
-                            (0..n_states)
-                                .map(|k| threaded_haps_mut.hap_at_raw(k, m))
-                                .collect()
+                            threaded_haps_mut.materialize_haps(m, &mut buffer);
+                            buffer.clone()
                         })
                         .collect()
                 };

@@ -95,20 +95,68 @@ impl ThreadedHaps {
     }
 
     /// Get haplotype at marker for a state (advances cursor)
+    ///
+    /// Optimized with fast path: most calls don't cross segment boundaries,
+    /// so we check the common case first before entering the advancement loop.
     #[inline]
     pub fn hap_at_raw(&mut self, state_idx: usize, marker: usize) -> u32 {
-        let mut cur = self.state_cursors[state_idx] as usize;
+        let cur = self.state_cursors[state_idx] as usize;
 
-        while marker >= self.segments_end[cur] as usize {
+        // Fast path: marker is within current segment (common case ~90%+)
+        // This avoids the loop overhead when no advancement is needed
+        if marker < self.segments_end[cur] as usize {
+            return self.segments_hap[cur];
+        }
+
+        // Slow path: need to advance through segments
+        self.advance_cursor_slow(state_idx, cur, marker)
+    }
+
+    /// Slow path for cursor advancement (called when segment boundary crossed)
+    #[cold]
+    #[inline(never)]
+    fn advance_cursor_slow(&mut self, state_idx: usize, mut cur: usize, marker: usize) -> u32 {
+        loop {
             let next = self.segments_next[cur];
             if next == Self::NIL {
                 break;
             }
             cur = next as usize;
+            if marker < self.segments_end[cur] as usize {
+                break;
+            }
         }
 
         self.state_cursors[state_idx] = cur as u32;
         self.segments_hap[cur]
+    }
+
+    /// Batch materialize haplotypes for all states at a given marker.
+    ///
+    /// This is more efficient than calling `hap_at_raw()` for each state because:
+    /// 1. Single marker bounds check amortized across all states
+    /// 2. Better cache locality - processes all states together
+    /// 3. Output buffer can be used directly by SIMD kernels
+    ///
+    /// # Arguments
+    /// * `marker` - The marker index to query
+    /// * `out` - Output buffer to fill with haplotype indices (must be len >= n_states)
+    #[inline]
+    pub fn materialize_haps(&mut self, marker: usize, out: &mut [u32]) {
+        let n_states = self.state_heads.len();
+        assert!(out.len() >= n_states);
+
+        for state_idx in 0..n_states {
+            let cur = self.state_cursors[state_idx] as usize;
+
+            // Fast path: within current segment
+            if marker < self.segments_end[cur] as usize {
+                out[state_idx] = self.segments_hap[cur];
+            } else {
+                // Slow path: advance and store
+                out[state_idx] = self.advance_cursor_slow(state_idx, cur, marker);
+            }
+        }
     }
 
     /// Reset cursors for all states (for new iteration pass)
@@ -418,5 +466,48 @@ mod tests {
         assert_eq!(cursor.active_haps()[0], 10);
         assert_eq!(cursor.active_haps()[1], 30);
         assert_eq!(history.len(), 0); // All events popped
+    }
+
+    #[test]
+    fn test_materialize_haps() {
+        let mut th = ThreadedHaps::new(3, 8, 100);
+
+        // State 0: hap 10 for [0, 50), hap 15 for [50, 100)
+        th.push_new(10);
+        th.add_segment(0, 15, 50);
+
+        // State 1: hap 20 for all markers
+        th.push_new(20);
+
+        // State 2: hap 30 for [0, 25), hap 35 for [25, 100)
+        th.push_new(30);
+        th.add_segment(2, 35, 25);
+
+        let mut buffer = vec![0u32; 3];
+
+        // Test at marker 10 - before any segment transitions
+        th.materialize_haps(10, &mut buffer);
+        assert_eq!(buffer[0], 10);
+        assert_eq!(buffer[1], 20);
+        assert_eq!(buffer[2], 30);
+
+        // Test at marker 30 - after state 2's transition
+        th.materialize_haps(30, &mut buffer);
+        assert_eq!(buffer[0], 10);
+        assert_eq!(buffer[1], 20);
+        assert_eq!(buffer[2], 35);
+
+        // Test at marker 60 - after state 0's transition
+        th.materialize_haps(60, &mut buffer);
+        assert_eq!(buffer[0], 15);
+        assert_eq!(buffer[1], 20);
+        assert_eq!(buffer[2], 35);
+
+        // Reset and test again to verify cursor handling
+        th.reset_cursors();
+        th.materialize_haps(5, &mut buffer);
+        assert_eq!(buffer[0], 10);
+        assert_eq!(buffer[1], 20);
+        assert_eq!(buffer[2], 30);
     }
 }

@@ -149,13 +149,30 @@ fn bench_threaded_haps_traversal(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements((n_markers * n_states) as u64));
 
-    group.bench_function("full_traversal", |b| {
+    // Original per-state traversal
+    group.bench_function("per_state", |b| {
         b.iter(|| {
             th.reset_cursors();
             let mut sum = 0u32;
             for m in 0..n_markers {
                 for state in 0..n_states {
                     sum = sum.wrapping_add(th.hap_at_raw(state, m));
+                }
+            }
+            black_box(sum)
+        })
+    });
+
+    // Batch materialization (new optimized path)
+    let mut hap_buffer = vec![0u32; n_states];
+    group.bench_function("batch_materialize", |b| {
+        b.iter(|| {
+            th.reset_cursors();
+            let mut sum = 0u32;
+            for m in 0..n_markers {
+                th.materialize_haps(m, &mut hap_buffer);
+                for &hap in &hap_buffer {
+                    sum = sum.wrapping_add(hap);
                 }
             }
             black_box(sum)
