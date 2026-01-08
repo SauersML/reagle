@@ -937,13 +937,20 @@ impl ImputationPipeline {
         let marker_to_cluster = std::sync::Arc::new(marker_to_cluster);
 
         // Run imputation for each target haplotype with per-thread workspaces
+        // Optimization: ImpStates is now created once per thread (not per haplotype)
+        // to avoid allocator contention from HashMap/BinaryHeap allocation
         let state_probs: Vec<StateProbs> = (0..n_target_haps)
             .into_par_iter()
             .map_init(
-                // Initialize workspace for each thread
-                || ImpWorkspace::with_ref_size(n_states, n_ref_markers, n_ref_haps),
-                // Process each haplotype with its thread's workspace
-                |workspace, h| {
+                // Initialize workspace AND ImpStates for each thread (reduces allocations)
+                // ImpStates::ibs_states() calls initialize() internally, so reuse is safe
+                || {
+                    let workspace = ImpWorkspace::with_ref_size(n_states, n_ref_markers, n_ref_haps);
+                    let imp_states = ImpStates::new(&ref_panel_coded, n_ref_haps, n_states, n_ibs_haps);
+                    (workspace, imp_states)
+                },
+                // Process each haplotype with its thread's workspace and ImpStates
+                |(workspace, imp_states), h| {
                     let hap_idx = HapIdx::new(h as u32);
 
                     // Build target alleles in REFERENCE marker space (full)
@@ -958,10 +965,6 @@ impl ImputationPipeline {
                             }
                         })
                         .collect();
-
-                    // Create ImpStates for dynamic state selection with RefPanelCoded
-                    let mut imp_states =
-                        ImpStates::new(&ref_panel_coded, n_ref_haps, n_states, n_ibs_haps);
 
                     // Get reference allele closure
                     let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
@@ -1509,8 +1512,7 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
         let p_err = vec![0.01f32; n_markers];
-        let posteriors = run_hmm_forward_backward(
-            &target_alleles,
+        let posteriors = run_hmm_forward_backward_clusters(
             &allele_match,
             &p_recomb,
             &p_err,
@@ -1576,8 +1578,7 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
         let p_err = vec![0.01f32; n_markers];
-        let posteriors = run_hmm_forward_backward(
-            &target_alleles,
+        let posteriors = run_hmm_forward_backward_clusters(
             &allele_match,
             &p_recomb,
             &p_err,
@@ -1718,8 +1719,7 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 10);
         let p_err_vec = vec![p_err; n_markers];
-        let posteriors = run_hmm_forward_backward(
-            &target_alleles,
+        let posteriors = run_hmm_forward_backward_clusters(
             &allele_match,
             &p_recomb,
             &p_err_vec,
@@ -1773,8 +1773,7 @@ mod tests {
 
             let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
             let p_err = vec![0.01f32; n_markers];
-            let posteriors = run_hmm_forward_backward(
-                &target_alleles,
+            let posteriors = run_hmm_forward_backward_clusters(
                 &allele_match,
                 &p_recomb,
                 &p_err,
@@ -1818,8 +1817,7 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
         let p_err = vec![0.01f32; n_markers];  // small mismatch prob
-        let posteriors = run_hmm_forward_backward(
-            &target_alleles,
+        let posteriors = run_hmm_forward_backward_clusters(
             &allele_match,
             &p_recomb,
             &p_err,
