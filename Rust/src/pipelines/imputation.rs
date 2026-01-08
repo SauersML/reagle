@@ -680,16 +680,16 @@ impl AllelePosteriors {
 /// For 818 samples × 2 haps × 1.1M markers = 1.8 billion marker lookups:
 /// - Binary search: 1.8B × 20 comparisons = 36 billion comparisons
 /// - Cursor: 1.8B × ~1 comparison = ~1.8 billion comparisons (20x faster)
-pub struct StateProbsCursor<'a> {
-    state_probs: &'a StateProbs,
+pub struct StateProbsCursor {
+    state_probs: Arc<StateProbs>,
     /// Current position in genotyped_markers (the sparse index)
     sparse_idx: usize,
 }
 
-impl<'a> StateProbsCursor<'a> {
+impl StateProbsCursor {
     /// Create a new cursor starting at position 0
     #[inline]
-    pub fn new(state_probs: &'a StateProbs) -> Self {
+    pub fn new(state_probs: Arc<StateProbs>) -> Self {
         Self {
             state_probs,
             sparse_idx: 0,
