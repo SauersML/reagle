@@ -387,10 +387,10 @@ impl StateProbs {
     {
         match self.genotyped_markers.binary_search(&ref_marker) {
             Ok(sparse_idx) => {
-                self.posteriors_at_genotyped(sparse_idx, ref_marker, n_alleles, &get_ref_allele)
+                self.posteriors_at_genotyped(sparse_idx, ref_marker, n_alleles, get_ref_allele)
             }
             Err(insert_pos) => {
-                self.posteriors_interpolated(ref_marker, insert_pos, n_alleles, &get_ref_allele)
+                self.posteriors_interpolated(ref_marker, insert_pos, n_alleles, get_ref_allele)
             }
         }
     }
@@ -695,7 +695,7 @@ impl<'a> StateProbsCursor<'a> {
     /// IMPORTANT: Markers MUST be queried in ascending order (0, 1, 2, ...).
     /// The cursor advances automatically and cannot go backwards.
     #[inline]
-    pub fn allele_posteriors<F>(&mut self, ref_marker: usize, n_alleles: usize, get_ref_allele: &F) -> AllelePosteriors
+    pub fn allele_posteriors<F>(&mut self, ref_marker: usize, n_alleles: usize, get_ref_allele: F) -> AllelePosteriors
     where
         F: Fn(usize, u32) -> u8,
     {
@@ -710,11 +710,11 @@ impl<'a> StateProbsCursor<'a> {
 
         // Check if ref_marker is exactly a genotyped marker
         if self.sparse_idx < n_genotyped && genotyped_markers[self.sparse_idx] == ref_marker {
-            self.state_probs.posteriors_at_genotyped(self.sparse_idx, ref_marker, n_alleles, get_ref_allele)
+            self.state_probs.posteriors_at_genotyped(self.sparse_idx, ref_marker, n_alleles, &get_ref_allele)
         } else {
             // ref_marker is between sparse_idx-1 and sparse_idx (or before first/after last)
             // insert_pos = sparse_idx gives the correct interpolation interval
-            self.state_probs.posteriors_interpolated(ref_marker, self.sparse_idx, n_alleles, get_ref_allele)
+            self.state_probs.posteriors_interpolated(ref_marker, self.sparse_idx, n_alleles, &get_ref_allele)
         }
     }
 }
@@ -2109,7 +2109,7 @@ mod tests {
         // Test interpolation at various positions
         // At marker 0: weight_left = 1.0, prob = 1.0 * 1.0 + 0.0 * 0.0 = 1.0 for state 0
         //   P(ALT) = prob_state1 = 0.0
-        let post_0 = sp.allele_posteriors(0, 2, &get_ref_allele);
+        let post_0 = sp.allele_posteriors(0, 2, get_ref_allele);
         match post_0 {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 0.0).abs() < 0.05, "At marker 0: expected P(ALT)~0.0, got {}", p_alt);
@@ -2121,7 +2121,7 @@ mod tests {
         //   prob_state0 = 0.5 * 1.0 + 0.5 * 0.0 = 0.5
         //   prob_state1 = 0.5 * 0.0 + 0.5 * 1.0 = 0.5
         //   P(ALT) = prob_state1 = 0.5
-        let post_5 = sp.allele_posteriors(5, 2, &get_ref_allele);
+        let post_5 = sp.allele_posteriors(5, 2, get_ref_allele);
         match post_5 {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 0.5).abs() < 0.1, "At marker 5: expected P(ALT)~0.5, got {}", p_alt);
@@ -2131,7 +2131,7 @@ mod tests {
 
         // At marker 10: should use exact value (not interpolated)
         //   P(ALT) = prob_state1 = 1.0
-        let post_10 = sp.allele_posteriors(10, 2, &get_ref_allele);
+        let post_10 = sp.allele_posteriors(10, 2, get_ref_allele);
         match post_10 {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 1.0).abs() < 0.05, "At marker 10: expected P(ALT)~1.0, got {}", p_alt);
@@ -2142,7 +2142,7 @@ mod tests {
         // Test precise interpolation at marker 2 (position 0.2)
         // weight_left = (1.0 - 0.2) / (1.0 - 0.0) = 0.8
         // prob_state1 = 0.8 * 0.0 + 0.2 * 1.0 = 0.2
-        let post_2 = sp.allele_posteriors(2, 2, &get_ref_allele);
+        let post_2 = sp.allele_posteriors(2, 2, get_ref_allele);
         match post_2 {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 0.2).abs() < 0.1, "At marker 2: expected P(ALT)~0.2, got {}", p_alt);
@@ -2153,7 +2153,7 @@ mod tests {
         // Test precise interpolation at marker 8 (position 0.8)
         // weight_left = (1.0 - 0.8) / (1.0 - 0.0) = 0.2
         // prob_state1 = 0.2 * 0.0 + 0.8 * 1.0 = 0.8
-        let post_8 = sp.allele_posteriors(8, 2, &get_ref_allele);
+        let post_8 = sp.allele_posteriors(8, 2, get_ref_allele);
         match post_8 {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 0.8).abs() < 0.1, "At marker 8: expected P(ALT)~0.8, got {}", p_alt);
@@ -2192,7 +2192,7 @@ mod tests {
 
         // Marker 0 is before first genotyped marker (5)
         // Should return marker 5's value: P(ALT) = 0.3
-        let post_before = sp.allele_posteriors(0, 2, &get_ref_allele);
+        let post_before = sp.allele_posteriors(0, 2, get_ref_allele);
         match post_before {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 0.3).abs() < 0.1, "Before first: expected ~0.3, got {}", p_alt);
@@ -2234,7 +2234,7 @@ mod tests {
         };
 
         // At marker 0: P(REF) = 0.4+0.3 = 0.7, P(ALT) = 0.2+0.1 = 0.3
-        let post_0 = sp.allele_posteriors(0, 2, &get_ref_allele);
+        let post_0 = sp.allele_posteriors(0, 2, get_ref_allele);
         match post_0 {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 0.3).abs() < 0.05, "Marker 0: expected P(ALT)=0.3, got {}", p_alt);
@@ -2243,7 +2243,7 @@ mod tests {
         }
 
         // At marker 10: P(REF) = 0.1+0.2 = 0.3, P(ALT) = 0.3+0.4 = 0.7
-        let post_10 = sp.allele_posteriors(10, 2, &get_ref_allele);
+        let post_10 = sp.allele_posteriors(10, 2, get_ref_allele);
         match post_10 {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 0.7).abs() < 0.05, "Marker 10: expected P(ALT)=0.7, got {}", p_alt);
@@ -2253,7 +2253,7 @@ mod tests {
 
         // At marker 5 (midpoint): should interpolate
         // Expected P(ALT) = 0.5 * 0.3 + 0.5 * 0.7 = 0.5
-        let post_5 = sp.allele_posteriors(5, 2, &get_ref_allele);
+        let post_5 = sp.allele_posteriors(5, 2, get_ref_allele);
         match post_5 {
             AllelePosteriors::Biallelic(p_alt) => {
                 assert!((p_alt - 0.5).abs() < 0.1, "Marker 5: expected P(ALT)~0.5, got {}", p_alt);
@@ -2321,7 +2321,7 @@ mod tests {
             let cursor_result = cursor.allele_posteriors(m, 2, &get_ref_allele);
 
             // Get result from binary search (O(log N))
-            let bs_result = sp.allele_posteriors(m, 2, &get_ref_allele);
+            let bs_result = sp.allele_posteriors(m, 2, get_ref_allele);
 
             // They must match exactly
             match (&cursor_result, &bs_result) {
@@ -2438,18 +2438,15 @@ mod tests {
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
             std::hint::black_box(marker);
-            if hap % 2 == 0 { 0 } else { 1 }
+            if hap.is_multiple_of(2) { 0 } else { 1 }
         };
 
         // With all states filtered out, what should happen?
         // The posteriors should return 0 or handle gracefully
-        let post = sp.allele_posteriors(5, 2, &get_ref_allele);
-        match post {
-            AllelePosteriors::Biallelic(p_alt) => {
-                // With no stored states, result is undefined but should be valid
-                assert!(p_alt >= 0.0 && p_alt <= 1.0, "P(ALT) should be in [0,1], got {}", p_alt);
-            }
-            _ => {} // Multiallelic is also acceptable
+        let post = sp.allele_posteriors(5, 2, get_ref_allele);
+        if let AllelePosteriors::Biallelic(p_alt) = post {
+            // With no stored states, result is undefined but should be valid
+            assert!((0.0..=1.0).contains(&p_alt), "P(ALT) should be in [0,1], got {}", p_alt);
         }
     }
 
@@ -2480,7 +2477,7 @@ mod tests {
 
         // Any marker should use the single genotyped marker's values
         for m in [0, 25, 50, 75, 99] {
-            let post = sp.allele_posteriors(m, 2, &get_ref_allele);
+            let post = sp.allele_posteriors(m, 2, get_ref_allele);
             match post {
                 AllelePosteriors::Biallelic(p_alt) => {
                     // Should be approximately 0.7 (state 1 carries ALT)
@@ -2528,16 +2525,13 @@ mod tests {
         // Wait, position 50 has gen_pos = 0.0 (only pos 100 is non-zero)
         // So weight_left = (1000 - 0) / (1000 - 0) = 1.0
         // interpolated = 1.0 * 0.0 + 0.0 * 1.0 = 0.0
-        let post = sp.allele_posteriors(50, 2, &get_ref_allele);
-        match post {
-            AllelePosteriors::Biallelic(p_alt) => {
-                // Should be 0 because we're very close to marker 0 in genetic distance
-                assert!(
-                    p_alt >= 0.0 && p_alt <= 1.0,
-                    "P(ALT) should be in [0,1], got {}", p_alt
-                );
-            }
-            _ => panic!("Expected Biallelic"),
+        let post = sp.allele_posteriors(50, 2, get_ref_allele);
+        if let AllelePosteriors::Biallelic(p_alt) = post {
+            // Should be 0 because we're very close to marker 0 in genetic distance
+            assert!(
+                (0.0..=1.0).contains(&p_alt),
+                "P(ALT) should be in [0,1], got {}", p_alt
+            );
         }
     }
 
