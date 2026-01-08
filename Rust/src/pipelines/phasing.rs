@@ -930,6 +930,7 @@ impl PhasingPipeline {
     /// This uses the full Forward-Backward algorithm to compute posterior probabilities
     /// of the phase, ensuring that phasing decisions are informed by both upstream
     /// and downstream data.
+    #[instrument(skip_all, fields(n_samples, n_markers))]
     fn run_phase_baum_iteration(
         &mut self,
         target_gt: &GenotypeMatrix,
@@ -944,11 +945,14 @@ impl PhasingPipeline {
         let n_haps = geno.n_haps();
         let markers = target_gt.markers();
 
+        tracing::Span::current().record("n_samples", n_samples);
+        tracing::Span::current().record("n_markers", n_markers);
+
         // Compute total haplotype count (target + reference)
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
 
-        let ref_geno = geno.clone();
+        let ref_geno = tracing::info_span!("clone_geno").in_scope(|| geno.clone());
 
         // Use Composite view when reference panel is available
         let ref_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
@@ -963,8 +967,9 @@ impl PhasingPipeline {
         };
 
         // Build PBWT over combined haplotype space when reference is available
-        let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            self.build_bidirectional_pbwt_combined(
+        let phase_ibs = tracing::info_span!("build_pbwt").in_scope(|| {
+            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                self.build_bidirectional_pbwt_combined(
                 |m, h| {
                     if h < n_haps {
                         ref_geno.get(m, HapIdx::new(h as u32))
@@ -982,13 +987,14 @@ impl PhasingPipeline {
                 n_markers,
                 n_total_haps,
             )
-        } else {
-            self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps)
-        };
+            } else {
+                self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps)
+            }
+        });
 
         let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
 
-        swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
+        tracing::info_span!("hmm_samples").in_scope(|| swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
             let sample_idx = SampleIdx::new(s as u32);
             let hap1 = sample_idx.hap1();
             let hap2 = sample_idx.hap2();
@@ -1387,7 +1393,7 @@ impl PhasingPipeline {
                     mask.set(m, true);
                 }
             }
-        });
+        }));
 
         // Apply Swaps
         let mut total_switches = 0;

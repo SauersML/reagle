@@ -305,17 +305,23 @@ impl StateProbs {
     /// This typically reduces storage by 50-100x, critical for large datasets.
     /// Remaining probability mass is renormalized.
     ///
-    /// # Arguments
-    /// * `marker_to_cluster` - Optional cluster assignment for each marker. When provided,
-    ///   `probs_p1` will reference the next CLUSTER, not the next marker. This is important
-    ///   because markers in the same cluster have identical probabilities (HMM runs on clusters).
+    /// # Why probs_p1 uses "next marker" (not "next cluster"):
+    ///
+    /// The HMM runs on CLUSTERS, so markers in the same cluster have IDENTICAL probabilities.
+    /// When interpolating between markers M and M+1:
+    /// - If same cluster: probs[M] == probs[M+1], so probs_p1[M] = probs[M+1] = probs[M]
+    ///   → Interpolation yields CONSTANT (correct for within-cluster region)
+    /// - If different clusters: probs[M] != probs[M+1]
+    ///   → Interpolation yields smooth transition (correct for between-cluster region)
+    ///
+    /// Using "next marker" naturally produces correct behavior without special-casing.
+    /// Using "next cluster" would INCORRECTLY force gradients INSIDE clusters.
     pub fn new(
         genotyped_markers: std::sync::Arc<Vec<usize>>,
         n_states: usize,
         hap_indices: Vec<Vec<u32>>,
         state_probs: Vec<f32>,
         gen_positions: std::sync::Arc<Vec<f64>>,
-        marker_to_cluster: Option<&[usize]>,
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
 
@@ -331,27 +337,8 @@ impl StateProbs {
         // Java does NOT renormalize after filtering - it stores raw probabilities
         for sparse_m in 0..n_genotyped {
             let row_offset = sparse_m * n_states;
-
-            // For probs_p1, find the first marker in the NEXT cluster
-            // Markers in the same cluster have identical probabilities, so we need
-            // to look ahead to the next cluster for meaningful interpolation
-            let m_p1 = if let Some(clusters) = marker_to_cluster {
-                let current_cluster = clusters.get(sparse_m).copied().unwrap_or(0);
-                // Find first marker in next cluster
-                let mut next_m = sparse_m + 1;
-                while next_m < n_genotyped {
-                    let next_cluster = clusters.get(next_m).copied().unwrap_or(current_cluster);
-                    if next_cluster != current_cluster {
-                        break;
-                    }
-                    next_m += 1;
-                }
-                // If no next cluster found, use last marker
-                if next_m >= n_genotyped { n_genotyped - 1 } else { next_m }
-            } else {
-                // No cluster info: fall back to next marker
-                if sparse_m + 1 < n_genotyped { sparse_m + 1 } else { sparse_m }
-            };
+            // probs_p1 uses next marker (see comment above for why this is correct)
+            let m_p1 = if sparse_m + 1 < n_genotyped { sparse_m + 1 } else { sparse_m };
             let row_offset_p1 = m_p1 * n_states;
 
             let mut haps = Vec::new();
@@ -1088,15 +1075,16 @@ impl ImputationPipeline {
                         }
                     }
 
-                    // Create StateProbs with cluster info for proper interpolation
-                    // probs_p1 must reference NEXT CLUSTER, not just next marker
+                    // Create StateProbs with interpolation support
+                    // NOTE: probs_p1 uses "next marker" which correctly produces:
+                    // - Constant values within clusters (since same-cluster markers have equal probs)
+                    // - Smooth transitions between clusters
                     StateProbs::new(
                         std::sync::Arc::clone(&genotyped_markers),
                         actual_n_states,
                         sparse_hap_indices,
                         hmm_state_probs,
                         std::sync::Arc::clone(&gen_positions),
-                        Some(&marker_to_cluster),
                     )
                 },
             )
