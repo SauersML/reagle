@@ -89,14 +89,19 @@ impl ModelParams {
     /// Create parameters for imputation
     ///
     /// # Arguments
-    /// * `n_total_haps` - Total number of haplotypes (reference + target)
-    ///                    Java uses nHaps = nRefHaps + nTargHaps for recombIntensity
+    /// * `n_ref_haps` - Number of reference haplotypes (used for recomb intensity)
+    /// * `n_total_haps` - Total haplotypes (ref + target, used for error rate)
     /// * `ne` - Effective population size (from CLI or default)
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
-    pub fn for_imputation(n_total_haps: usize, ne: f32, err: Option<f32>) -> Self {
-        // Java ImpData: double c = -(0.04*ne/nHaps) where nHaps = nRefHaps + nTargHaps
+    ///
+    /// Java ImpData uses different counts for different parameters:
+    /// - errProb: uses nHaps = nRefHaps + nTargHaps
+    /// - pRecomb: uses refGT.nHaps() (ref only)
+    pub fn for_imputation(n_ref_haps: usize, n_total_haps: usize, ne: f32, err: Option<f32>) -> Self {
+        // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
-        let recomb_intensity = 0.04 * ne / n_total_haps as f32;
+        // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
+        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 
         Self {
             p_mismatch,

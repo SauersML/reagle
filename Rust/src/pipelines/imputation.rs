@@ -771,9 +771,11 @@ impl ImputationPipeline {
         );
 
         // Initialize parameters with CLI config
-        // Java uses nHaps = nRefHaps + nTargHaps for recombIntensity calculation
+        // Java uses different hap counts for different parameters:
+        // - errProb: uses nHaps = nRefHaps + nTargHaps (total)
+        // - pRecomb: uses refGT.nHaps() (ref only)
         let n_total_haps = n_ref_haps + n_target_haps;
-        self.params = ModelParams::for_imputation(n_total_haps, self.config.ne, self.config.err);
+        self.params = ModelParams::for_imputation(n_ref_haps, n_total_haps, self.config.ne, self.config.err);
         self.params
             .set_n_states(self.config.imp_states.min(n_ref_haps));
 
