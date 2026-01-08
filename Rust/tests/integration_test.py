@@ -650,6 +650,23 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     bin_metrics["switch_error_rate"] = data["switch_errors"] / data["switch_opportunities"]
                     bin_metrics["switch_errors"] = data["switch_errors"]
                     bin_metrics["switch_opportunities"] = data["switch_opportunities"]
+
+                # Sufficient stats for genome-wide MAF bin aggregation
+                bin_metrics["agg_stats"] = {
+                    "sum_t": sum(data["truth"]),
+                    "sum_i": sum(data["imputed"]),
+                    "sum_ti": sum(t * i for t, i in zip(data["truth"], data["imputed"])),
+                    "sum_tt": sum(t * t for t in data["truth"]),
+                    "sum_ii": sum(i * i for i in data["imputed"]),
+                    "count": len(data["truth"]),
+                    "concordant": data["unphased_concordant"],
+                    "nonref_concordant": data["nonref_concordant"],
+                    "nonref_total": data["nonref_total"],
+                    "switch_err": data["switch_errors"],
+                    "switch_opp": data["switch_opportunities"],
+                    "tp": b_tp, "fp": b_fp, "fn": b_fn
+                }
+
                 metrics["by_maf"][maf_bin] = bin_metrics
         
         # Per-sample switch error summary
@@ -1702,6 +1719,61 @@ def stage_summary():
                 r = cov_n / math.sqrt(var_t_n * var_i_n)
                 global_rare_r2 = r ** 2
 
+        # Aggregate MAF bin stats genome-wide
+        maf_bin_agg = {}
+        bin_order = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)",
+                     "low-freq (1-5%)", "medium (5-20%)", "common (>20%)"]
+
+        for chrom in range(1, 23):
+            json_file = script_dir / f"{tool}_chr{chrom}_metrics.json"
+            if json_file.exists():
+                try:
+                    with open(json_file) as f:
+                        data = json.load(f)
+                    for maf_bin, bin_data in data.get("by_maf", {}).items():
+                        agg = bin_data.get("agg_stats")
+                        if agg:
+                            if maf_bin not in maf_bin_agg:
+                                maf_bin_agg[maf_bin] = {
+                                    "sum_t": 0, "sum_i": 0, "sum_ti": 0,
+                                    "sum_tt": 0, "sum_ii": 0, "count": 0,
+                                    "concordant": 0, "nonref_concordant": 0,
+                                    "nonref_total": 0, "switch_err": 0,
+                                    "switch_opp": 0, "tp": 0, "fp": 0, "fn": 0
+                                }
+                            for k in maf_bin_agg[maf_bin]:
+                                maf_bin_agg[maf_bin][k] += agg.get(k, 0)
+                except:
+                    pass
+
+        # Calculate per-bin metrics
+        maf_metrics = {}
+        for maf_bin in bin_order:
+            if maf_bin in maf_bin_agg:
+                agg = maf_bin_agg[maf_bin]
+                n = agg["count"]
+                if n > 0:
+                    conc = agg["concordant"] / n
+                    # R²
+                    mean_t = agg["sum_t"] / n
+                    mean_i = agg["sum_i"] / n
+                    cov_n = agg["sum_ti"] - (agg["sum_t"] * agg["sum_i"] / n)
+                    var_t_n = agg["sum_tt"] - (agg["sum_t"] ** 2 / n)
+                    var_i_n = agg["sum_ii"] - (agg["sum_i"] ** 2 / n)
+                    r2 = 0.0
+                    if var_t_n > 0 and var_i_n > 0:
+                        r = cov_n / math.sqrt(var_t_n * var_i_n)
+                        r2 = r ** 2
+                    # F1
+                    tp, fp, fn = agg["tp"], agg["fp"], agg["fn"]
+                    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+                    # SER
+                    ser = agg["switch_err"] / agg["switch_opp"] if agg["switch_opp"] > 0 else 0.0
+
+                    maf_metrics[maf_bin] = {"r2": r2, "conc": conc, "f1": f1, "ser": ser, "n": n}
+
         final_metrics.append({
             'id': tool,
             'name': display_names[tool],
@@ -1715,7 +1787,8 @@ def stage_summary():
             'prec': global_prec,
             'rec': global_rec,
             'n50': global_n50,
-            'chromosomes': chromosomes_found
+            'chromosomes': chromosomes_found,
+            'maf_metrics': maf_metrics
         })
     
     if not final_metrics:
@@ -1765,6 +1838,47 @@ def stage_summary():
             r2_diff = f" ({icon}{abs(diff):.4f})"
             
         md_lines.append(f"| **{m['name']}** | {m['r2']:.4f}{r2_diff} | {m['rare_r2']:.4f} | {m['f1']:.4f} | {m['nonref']:.4f} | {m['ser']:.4f} | {m['n50']:.0f} | {m['time']:.1f} | {m['chromosomes']} |")
+
+    # MAF-stratified performance comparison table
+    bin_order = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)",
+                 "low-freq (1-5%)", "medium (5-20%)", "common (>20%)"]
+    bin_labels = {"ultra-rare (<0.1%)": "Ultra-rare (<0.1%)",
+                  "very-rare (0.1-0.5%)": "Very-rare (0.1-0.5%)",
+                  "rare (0.5-1%)": "Rare (0.5-1%)",
+                  "low-freq (1-5%)": "Low-freq (1-5%)",
+                  "medium (5-20%)": "Medium (5-20%)",
+                  "common (>20%)": "Common (>20%)"}
+
+    md_lines.append(f"\n### 📈 MAF-Stratified Performance (R²)")
+    md_lines.append("*Dosage R² by Minor Allele Frequency bin - key metric for rare variant imputation quality*\n")
+
+    # Header row
+    header = "| MAF Bin |"
+    sep = "| :--- |"
+    for m in final_metrics:
+        header += f" {m['name']} |"
+        sep += " :---: |"
+    md_lines.append(header)
+    md_lines.append(sep)
+
+    # Data rows
+    for maf_bin in bin_order:
+        row = f"| {bin_labels.get(maf_bin, maf_bin)} |"
+        for m in final_metrics:
+            maf_m = m.get('maf_metrics', {}).get(maf_bin)
+            if maf_m:
+                r2_val = maf_m['r2']
+                row += f" {r2_val:.4f} |"
+            else:
+                row += " - |"
+        md_lines.append(row)
+
+    # Add N counts row
+    row = "| **N genotypes** |"
+    for m in final_metrics:
+        total_n = sum(bm.get('n', 0) for bm in m.get('maf_metrics', {}).values())
+        row += f" {total_n:,} |"
+    md_lines.append(row)
 
     # Write to Summary file
     summary_file = script_dir / "genome_wide_summary.md"
