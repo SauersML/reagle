@@ -238,9 +238,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 if gt is not None:
                     truth_gts[key][truth_samples[i]] = (gt, calculate_dosage(gt), is_phased)
 
-    # Load imputed genotypes - store both genotype tuple and dosage
+    # Load imputed genotypes - store both genotype tuple, dosage, and GP (if available)
     imputed_gts = {}
-    result = run(f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}", capture=True)
+    # Try to get GP field for Hellinger score (Beagle outputs GP)
+    result = run(f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%GP]\\n' {imputed_vcf} 2>/dev/null || bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:.]\\n' {imputed_vcf}", capture=True)
     samples_result = run(f"bcftools query -l {imputed_vcf}", capture=True)
     imputed_samples = samples_result.stdout.strip().split('\n')
 
@@ -252,15 +253,25 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             continue
         chrom, pos = parts[0], parts[1]
         key = (chrom, int(pos))
-        gts = parts[4:]
+        sample_data = parts[4:]
         imputed_gts[key] = {}
-        for i, gt_str in enumerate(gts):
+        for i, data_str in enumerate(sample_data):
             if i < len(imputed_samples):
-                gt_field = gt_str.split(':')[0]
+                fields = data_str.split(':')
+                gt_field = fields[0]
                 gt = parse_genotype(gt_field)
                 is_phased = '|' in gt_field
+                # Parse GP if available (format: P(0/0),P(0/1),P(1/1))
+                gp = None
+                if len(fields) > 1 and fields[1] != '.':
+                    try:
+                        gp_parts = fields[1].split(',')
+                        if len(gp_parts) == 3:
+                            gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
+                    except:
+                        pass
                 if gt is not None:
-                    imputed_gts[key][imputed_samples[i]] = (gt, calculate_dosage(gt), is_phased)
+                    imputed_gts[key][imputed_samples[i]] = (gt, calculate_dosage(gt), is_phased, gp)
 
     # Calculate metrics
     unphased_concordant = 0  # Genotype match ignoring phase (0|1 == 1|0)
@@ -285,7 +296,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
 
     # For IQS calculation: track per-site concordance and expected concordance
     site_iqs_values = []
-    
+
+    # For Hellinger score (requires GP field)
+    hellinger_values = []
+
     # For switch error rate
     switch_errors = 0
     switch_opportunities = 0
@@ -349,9 +363,21 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         for sample in truth_site:
             if sample in imputed_site:
                 t_gt, t_dos, t_phased = truth_site[sample]
-                i_gt, i_dos, i_phased = imputed_site[sample]
+                imp_data = imputed_site[sample]
+                i_gt, i_dos, i_phased = imp_data[0], imp_data[1], imp_data[2]
+                i_gp = imp_data[3] if len(imp_data) > 3 else None
 
                 if t_dos is not None and i_dos is not None:
+                    # Hellinger score calculation (if GP available)
+                    if i_gp is not None:
+                        # Truth GP is deterministic: [1,0,0] for 0/0, [0,1,0] for 0/1, [0,0,1] for 1/1
+                        t_gp = (1.0, 0.0, 0.0) if t_dos == 0 else ((0.0, 1.0, 0.0) if t_dos == 1 else (0.0, 0.0, 1.0))
+                        # Hellinger distance: H(P,Q) = sqrt(1 - BC) where BC = sum(sqrt(p_i * q_i))
+                        bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
+                        hellinger_dist = math.sqrt(max(0, 1 - bc))
+                        # Hellinger score = 1 - distance (higher is better)
+                        hellinger_score = 1 - hellinger_dist
+                        hellinger_values.append(hellinger_score)
                     total_compared += 1
                     site_total += 1
                     truth_dosages.append(t_dos)
@@ -549,6 +575,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         else:
             metrics["r_squared"] = None
 
+        # Hellinger Score (if GP field was available)
+        if hellinger_values:
+            metrics["hellinger_score"] = sum(hellinger_values) / len(hellinger_values)
+            metrics["hellinger_n"] = len(hellinger_values)
+
         # Calculate Rare Variant R² stats (MAF < 1%)
         rare_stats = {
             "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0,
@@ -705,6 +736,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         print(f"   Precision / Recall:   {metrics.get('precision', 0):.4f} / {metrics.get('recall', 0):.4f}")
         print(f"   Overall R²:           {metrics.get('r_squared'):.4f}" if metrics.get('r_squared') else "   Overall R²:           N/A")
         print(f"   Overall IQS:          {metrics.get('iqs'):.4f}" if metrics.get('iqs') else "   Overall IQS:          N/A")
+        print(f"   Hellinger Score:      {metrics.get('hellinger_score'):.4f}" if metrics.get('hellinger_score') else "   Hellinger Score:      N/A (no GP)")
         print(f"   INFO score (approx):  {metrics.get('info_score_approx'):.4f}" if metrics.get('info_score_approx') else "   INFO score (approx):  N/A")
         
         if metrics.get('switch_error_rate') is not None:
@@ -777,6 +809,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 f.write(f"Overall IQS: {metrics['iqs']:.6f}\n")
             if metrics.get('info_score_approx'):
                 f.write(f"INFO score (approx): {metrics['info_score_approx']:.6f}\n")
+            if metrics.get('hellinger_score'):
+                f.write(f"Hellinger Score: {metrics['hellinger_score']:.6f}\n")
             if metrics.get('switch_error_rate') is not None:
                 f.write(f"Switch error rate: {metrics['switch_error_rate']:.6f}\n")
                 f.write(f"N50 Phase Block: {metrics.get('n50_phase_block'):.0f} bp\n")
@@ -1815,19 +1849,31 @@ def stage_summary():
     final_metrics_with_n50 = [m for m in final_metrics if m['n50'] > 0]
     best_n50 = max(final_metrics_with_n50, key=lambda x: x['n50']) if final_metrics_with_n50 else None
 
+    # Best rare variant (key differentiator)
+    best_rare = max(final_metrics, key=lambda x: x['rare_r2'])
+
+    # Speedup calculation (vs Beagle as baseline)
+    beagle_stats = next((x for x in final_metrics if x['id'] == 'beagle'), None)
+
     md_lines.append(f"\n### 🏆 Highlights")
     md_lines.append(f"- **Most Accurate (R²):** {best_r2['name']} ({best_r2['r2']:.4f})")
+    md_lines.append(f"- **Best Rare Variants (R² <1%):** {best_rare['name']} ({best_rare['rare_r2']:.4f})")
     md_lines.append(f"- **Best F1 Score:** {best_f1['name']} ({best_f1['f1']:.4f})")
     md_lines.append(f"- **Fastest:** {best_time['name']} ({best_time['time']:.1f}s)")
+    if beagle_stats:
+        reagle_stats = next((x for x in final_metrics if x['id'] == 'reagle'), None)
+        if reagle_stats and beagle_stats['time'] > 0:
+            speedup = beagle_stats['time'] / reagle_stats['time']
+            md_lines.append(f"- **Reagle Speedup:** {speedup:.1f}x faster than Beagle")
     if best_ser and best_ser['ser'] < 1.0:
         md_lines.append(f"- **Best Phasing (SER):** {best_ser['name']} ({best_ser['ser']:.4f})")
     if best_n50:
         md_lines.append(f"- **Longest Phase Blocks (N50):** {best_n50['name']} ({best_n50['n50']:.0f} bp)")
     
     md_lines.append(f"\n### 📊 Comprehensive Comparison")
-    md_lines.append("| Tool | R² | Rare R² (<1%) | F1 Score | Non-Ref Conc. | Switch Error | N50 Block (bp) | Runtime (s) | Chrs |")
+    md_lines.append("| Tool | R² | Rare R² (<1%) | F1 Score | Non-Ref Conc. | Switch Error | N50 (bp) | Time (s) | Speedup |")
     md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
-    
+
     for m in final_metrics:
         # Comparison vs Reagle (if present)
         r2_diff = ""
@@ -1836,8 +1882,17 @@ def stage_summary():
             diff = m['r2'] - reagle_stats['r2']
             icon = "🔻" if diff < 0 else "🔺"
             r2_diff = f" ({icon}{abs(diff):.4f})"
-            
-        md_lines.append(f"| **{m['name']}** | {m['r2']:.4f}{r2_diff} | {m['rare_r2']:.4f} | {m['f1']:.4f} | {m['nonref']:.4f} | {m['ser']:.4f} | {m['n50']:.0f} | {m['time']:.1f} | {m['chromosomes']} |")
+
+        # Speedup vs Beagle
+        speedup_str = "-"
+        if beagle_stats and beagle_stats['time'] > 0:
+            if m['id'] == 'beagle':
+                speedup_str = "1.0x"
+            else:
+                speedup = beagle_stats['time'] / m['time'] if m['time'] > 0 else 0
+                speedup_str = f"{speedup:.1f}x"
+
+        md_lines.append(f"| **{m['name']}** | {m['r2']:.4f}{r2_diff} | {m['rare_r2']:.4f} | {m['f1']:.4f} | {m['nonref']:.4f} | {m['ser']:.4f} | {m['n50']:.0f} | {m['time']:.1f} | {speedup_str} |")
 
     # MAF-stratified performance comparison table
     bin_order = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)",
