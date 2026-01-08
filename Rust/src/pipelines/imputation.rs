@@ -1259,7 +1259,7 @@ impl ImputationPipeline {
         });
 
         // PASS 2: Write output with on-the-fly computation (streaming)
-        info_span!("write_output").in_scope(|| {
+        info_span!("write_output").in_scope(move || {
             let output_path = self.config.out.with_extension("vcf.gz");
             eprintln!("Writing output to {:?} (streaming)...", output_path);
             let mut writer = VcfWriter::create(&output_path, target_samples)?;
