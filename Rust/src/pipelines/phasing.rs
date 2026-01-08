@@ -553,7 +553,7 @@ impl PhasingPipeline {
             };
 
             self.run_phase_baum_iteration(
-                &target_gt,
+                target_gt,
                 &mut geno,
                 &p_recomb,
                 &gen_dists,
@@ -671,7 +671,7 @@ impl PhasingPipeline {
             };
 
             self.run_phase_baum_iteration_with_overlap(
-                &target_gt,
+                target_gt,
                 &mut geno,
                 &p_recomb,
                 &gen_dists,
@@ -1027,7 +1027,7 @@ impl PhasingPipeline {
             //
             // This ensures forward probabilities after a het correctly reflect the phase decision
             // by using the decided alleles for emission probabilities.
-            let hmm = BeagleHmm::new(ref_view.clone(), &self.params, n_states, p_recomb.to_vec());
+            let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
 
             // Collect EM statistics if requested (using original sequences)
             if let Some(atomic) = atomic_estimates {
@@ -1064,8 +1064,8 @@ impl PhasingPipeline {
             let state_haps: Vec<Vec<u32>> = {
                 let mut threaded_haps_mut = threaded_haps.clone();
                 let mut state_haps = vec![vec![0u32; n_states]; n_markers];
-                for m in 0..n_markers {
-                    threaded_haps_mut.materialize_haps(m, &mut state_haps[m]);
+                for (m, item) in state_haps.iter_mut().enumerate().take(n_markers) {
+                    threaded_haps_mut.materialize_haps(m, item);
                 }
                 state_haps
             };
@@ -1170,7 +1170,7 @@ impl PhasingPipeline {
                         let mut bwd1_sum = 0.0f32;
                         let mut bwd2_sum = 0.0f32;
 
-                        for k in 0..n_states {
+                        for (k, item) in bwd0.iter_mut().enumerate().take(n_states) {
                             let ref_al = get_ref_allele(m, k);
 
                             // Track 0: Combined emission (match-any at hets)
@@ -1203,11 +1203,11 @@ impl PhasingPipeline {
                                 p_err
                             };
 
-                            bwd0[k] *= emit0;
+                            *item *= emit0;
                             bwd1[k] *= emit1;
                             bwd2[k] *= emit2;
 
-                            bwd0_sum += bwd0[k];
+                            bwd0_sum += *item;
                             bwd1_sum += bwd1[k];
                             bwd2_sum += bwd2[k];
                         }
@@ -1217,8 +1217,8 @@ impl PhasingPipeline {
                         let scale1 = stay / bwd1_sum.max(1e-30);
                         let scale2 = stay / bwd2_sum.max(1e-30);
 
-                        for k in 0..n_states {
-                            bwd0[k] = scale0 * bwd0[k] + shift;
+                        for (k, item) in bwd0.iter_mut().enumerate().take(n_states) {
+                            *item = scale0 * *item + shift;
                             bwd1[k] = scale1 * bwd1[k] + shift;
                             bwd2[k] = scale2 * bwd2[k] + shift;
                         }
@@ -1258,8 +1258,8 @@ impl PhasingPipeline {
                 let is_het = het_idx < n_hets && het_positions[het_idx] == m;
 
                 // Cache reference alleles for this marker
-                for k in 0..n_states {
-                    ref_alleles[k] = get_ref_allele(m, k);
+                for (k, item) in ref_alleles.iter_mut().enumerate().take(n_states) {
+                    *item = get_ref_allele(m, k);
                 }
 
                 // Compute PRIOR for all three tracks (transition only, no emission)
@@ -1271,14 +1271,14 @@ impl PhasingPipeline {
                     let scale1 = (1.0 - p_recomb_m) / fwd1_sum;
                     let scale2 = (1.0 - p_recomb_m) / fwd2_sum;
 
-                    for k in 0..n_states {
-                        fwd0_prior[k] = scale0 * fwd0[k] + shift;
+                    for (k, item) in fwd0_prior.iter_mut().enumerate().take(n_states) {
+                        *item = scale0 * fwd0[k] + shift;
                         fwd1_prior[k] = scale1 * fwd1[k] + shift;
                         fwd2_prior[k] = scale2 * fwd2[k] + shift;
                     }
                 } else {
-                    for k in 0..n_states {
-                        fwd0_prior[k] = init_val;
+                    for (k, item) in fwd0_prior.iter_mut().enumerate().take(n_states) {
+                        *item = init_val;
                         fwd1_prior[k] = init_val;
                         fwd2_prior[k] = init_val;
                     }
@@ -1298,8 +1298,8 @@ impl PhasingPipeline {
                     let mut p21 = 0.0f64;
                     let mut p22 = 0.0f64;
 
-                    for k in 0..n_states {
-                        let ref_al = ref_alleles[k];
+                    for (k, ref_al_item) in ref_alleles.iter().enumerate().take(n_states) {
+                        let ref_al = *ref_al_item;
                         let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
                             p_no_err
                         } else {
@@ -1330,25 +1330,25 @@ impl PhasingPipeline {
                     if l_swap > l_keep {
                         // SWAP: exchange alleles from this position forward
                         for m_swap in m..n_markers {
-                            std::mem::swap(&mut seq1_working[m_swap], &mut seq2_working[m_swap]);
+                            seq1_working.swap(m_swap, m_swap);
                         }
                         // Swap backward caches for future het decisions
                         for h in het_idx..n_hets {
-                            std::mem::swap(&mut bwd1_cache[h], &mut bwd2_cache[h]);
+                            bwd1_cache.swap(h, h);
                         }
                     }
 
                     // Apply combined emission to fwd0 (match-any at hets)
                     fwd0_sum = 0.0;
-                    for k in 0..n_states {
+                    for (k, item) in fwd0.iter_mut().enumerate().take(n_states) {
                         let ref_al = ref_alleles[k];
                         let emit = if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
                             p_no_err
                         } else {
                             p_err
                         };
-                        fwd0[k] = fwd0_prior[k] * emit;
-                        fwd0_sum += fwd0[k];
+                        *item = fwd0_prior[k] * emit;
+                        fwd0_sum += *item;
                     }
                     fwd0_sum = fwd0_sum.max(1e-30);
 
@@ -1367,17 +1367,17 @@ impl PhasingPipeline {
                     fwd1_sum = 0.0;
                     fwd2_sum = 0.0;
 
-                    for k in 0..n_states {
+                    for (k, item) in fwd0.iter_mut().enumerate().take(n_states) {
                         let ref_al = ref_alleles[k];
                         let emit = if ref_al == observed || ref_al == 255 || observed == 255 {
                             p_no_err
                         } else {
                             p_err
                         };
-                        fwd0[k] = fwd0_prior[k] * emit;
+                        *item = fwd0_prior[k] * emit;
                         fwd1[k] = fwd1_prior[k] * emit;
                         fwd2[k] = fwd2_prior[k] * emit;
-                        fwd0_sum += fwd0[k];
+                        fwd0_sum += *item;
                         fwd1_sum += fwd1[k];
                         fwd2_sum += fwd2[k];
                     }
@@ -1388,17 +1388,16 @@ impl PhasingPipeline {
             }
 
             // Determine which markers were swapped by comparing final working sequences to originals
-            for m in 0..n_markers {
+            for (m, mask_bit) in mask.iter_mut().enumerate().take(n_markers) {
                 if seq1_working[m] != seq1[m] {
-                    mask.set(m, true);
+                    mask_bit.set(true);
                 }
             }
         }));
 
         // Apply Swaps
         let mut total_switches = 0;
-        for s in 0..n_samples {
-            let mask = &swap_masks[s];
+        for (s, mask) in swap_masks.iter().enumerate().take(n_samples) {
             if mask.any() {
                 let hap1 = HapIdx::new((s * 2) as u32);
                 let hap2 = HapIdx::new((s * 2 + 1) as u32);
@@ -1468,7 +1467,7 @@ impl PhasingPipeline {
 
                 // Collect EM statistics if requested
                 if let Some(atomic) = atomic_estimates {
-                    let hmm = BeagleHmm::new(ref_view.clone(), &self.params, n_states, p_recomb.to_vec());
+                    let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
                     let mut local_est = crate::model::parameters::ParamEstimates::new();
                     hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
                     hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
@@ -2265,7 +2264,7 @@ impl PhasingPipeline {
         let columns: Vec<GenotypeColumn> = (0..n_markers)
             .map(|m| {
                 let alleles = geno.marker_alleles(m);
-                let bytes: Vec<u8> = alleles.iter().map(|b| *b as u8).collect();
+                let bytes: Vec<u8> = alleles.iter().copied().collect();
                 GenotypeColumn::from_alleles(&bytes, 2)
             })
             .collect();
