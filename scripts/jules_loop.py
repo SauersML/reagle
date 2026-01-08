@@ -399,18 +399,55 @@ def main():
         print("Jules' changes will be committed even if build still fails.")
         verify_rust_build()
 
-    print("\n--- Committing and Pushing ---")
+    print("\n--- Committing and Creating PR ---")
     print(f"Commit message: {msg}")
 
+    # Create a unique branch name
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    branch_name = f"jules/{timestamp}"
+
+    run_command(f"git checkout -b {branch_name}", check=True)
     run_command(['git', 'commit', '-m', msg], check=True)
 
-    print("Pulling latest changes to avoid non-fast-forward...")
-    run_command("git pull --rebase origin main", check=True)
+    print(f"Pushing changes to branch {branch_name}...")
+    run_command(f"git push origin {branch_name}", check=True)
 
-    print("Pushing changes...")
-    run_command("git push origin main", check=True)
+    # Create PR via GitHub API
+    print("\n--- Creating Pull Request ---")
+    github_token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
 
-    print("Push complete. Waiting for next CRON schedule.")
+    if github_token and repo:
+        pr_payload = {
+            "title": msg[:200] if len(msg) > 200 else msg,
+            "head": branch_name,
+            "base": "main",
+            "body": f"Automated improvement by Jules.\n\n**Summary:**\n{msg}"
+        }
+
+        try:
+            pr_resp = requests.post(
+                f"https://api.github.com/repos/{repo}/pulls",
+                headers={
+                    "Authorization": f"token {github_token}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                json=pr_payload,
+                timeout=30
+            )
+
+            if pr_resp.status_code == 201:
+                pr_url = pr_resp.json().get("html_url")
+                print(f"PR created successfully: {pr_url}")
+            else:
+                print(f"Failed to create PR: {pr_resp.status_code} - {pr_resp.text}")
+        except requests.exceptions.RequestException as e:
+            print(f"Error creating PR: {e}")
+    else:
+        print("GITHUB_TOKEN or GITHUB_REPOSITORY not set, skipping PR creation.")
+
+    print("Done. PR created for review.")
 
 
 if __name__ == "__main__":
