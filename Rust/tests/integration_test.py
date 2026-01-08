@@ -1348,9 +1348,14 @@ def stage_minimac():
     minimac_bin = data_dir / "minimac4"
     if not minimac_bin.exists():
         print("Downloading Minimac4...")
-        run(f"curl -L -o {data_dir}/minimac4.tar.gz 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.tar.gz'")
-        run(f"cd {data_dir} && tar -xzf minimac4.tar.gz && mv minimac4-4.1.6-Linux-x86_64/bin/minimac4 . && chmod +x minimac4")
-    
+        run(f"curl -L -o {data_dir}/minimac4.sh 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.sh'")
+        run(f"chmod +x {data_dir}/minimac4.sh")
+        run(f"cd {data_dir} && ./minimac4.sh --prefix=. --skip-license --exclude-subdir")
+        # The installer extracts to bin/minimac4
+        if (data_dir / "bin" / "minimac4").exists():
+             run(f"mv {data_dir}/bin/minimac4 {data_dir}/minimac4")
+             run(f"rm -rf {data_dir}/bin {data_dir}/share {data_dir}/minimac4.sh")
+
     minimac_out = data_dir / "minimac_imputed.vcf.gz"
     if not minimac_out.exists():
         print("Running Minimac4...")
@@ -1572,8 +1577,12 @@ def run_minimac_chr(chrom, paths):
         minimac_bin = data_dir / "minimac4"
         if not minimac_bin.exists():
             print(f"Downloading Minimac4 for chr{chrom}...")
-            run(f"curl -L -o {data_dir}/minimac4.tar.gz 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.tar.gz'")
-            run(f"cd {data_dir} && tar -xzf minimac4.tar.gz && mv minimac4-4.1.6-Linux-x86_64/bin/minimac4 . && chmod +x minimac4")
+            run(f"curl -L -o {data_dir}/minimac4.sh 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.sh'")
+            run(f"chmod +x {data_dir}/minimac4.sh")
+            run(f"cd {data_dir} && ./minimac4.sh --prefix=. --skip-license --exclude-subdir")
+            if (data_dir / "bin" / "minimac4").exists():
+                 run(f"mv {data_dir}/bin/minimac4 {data_dir}/minimac4")
+                 run(f"rm -rf {data_dir}/bin {data_dir}/share {data_dir}/minimac4.sh")
 
     out = data_dir / "minimac_imputed.vcf.gz"
     if not out.exists():
