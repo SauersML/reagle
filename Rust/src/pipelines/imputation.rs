@@ -1225,21 +1225,21 @@ impl ImputationPipeline {
                             if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
                                 probs1[a1_mapped as usize] = 1.0;
                             } else {
-                                let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+                                let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
                                 for a in 0..n_alleles { probs1[a] = post1.prob(a); }
                             }
 
                             if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
                                 probs2[a2_mapped as usize] = 1.0;
                             } else {
-                                let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+                                let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
                                 for a in 0..n_alleles { probs2[a] = post2.prob(a); }
                             }
                         }
                     } else {
                         // For imputed markers: use HMM posteriors
-                        let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
-                        let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+                        let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+                        let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
 
                         for a in 0..n_alleles {
                             probs1[a] = post1.prob(a);
@@ -1378,7 +1378,7 @@ fn run_hmm_forward_backward_clusters(
     let mut fwd: Vec<f32> = vec![0.0; total_size];
     let mut fwd_sum = 1.0f32;
 
-    for c in 0..n_clusters {
+    for (c, matches) in cluster_allele_match.iter().enumerate().take(n_clusters) {
         let p_rec = p_recomb.get(c).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / fwd_sum;
@@ -1387,7 +1387,6 @@ fn run_hmm_forward_backward_clusters(
         let p_match = 1.0 - cluster_err;
 
         let mut new_sum = 0.0f32;
-        let matches = &cluster_allele_match[c];
         let row_offset = c * n_states;
         let prev_row_offset = if c > 0 { (c - 1) * n_states } else { 0 };
 
@@ -1423,15 +1422,15 @@ fn run_hmm_forward_backward_clusters(
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / bwd_sum;
 
-        for k in 0..n_states {
-            bwd[k] = scale * bwd[k] + shift;
+        for val in bwd.iter_mut().take(n_states) {
+            *val = scale * *val + shift;
         }
 
         // Compute posterior: fwd * bwd
         let mut state_sum = 0.0f32;
-        for k in 0..n_states {
+        for (k, val) in bwd.iter().enumerate().take(n_states) {
             let idx = row_offset + k;
-            fwd[idx] *= bwd[k];
+            fwd[idx] *= val;
             state_sum += fwd[idx];
         }
 
