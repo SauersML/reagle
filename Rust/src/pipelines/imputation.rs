@@ -322,8 +322,6 @@ impl StateProbs {
         hap_indices: Vec<Vec<u32>>,
         state_probs: Vec<f32>,
         gen_positions: std::sync::Arc<Vec<f64>>,
-        marker_to_cluster: std::sync::Arc<Vec<usize>>,
-        cluster_end_ref_markers: std::sync::Arc<Vec<usize>>,
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
 
@@ -371,8 +369,6 @@ impl StateProbs {
             probs: filtered_probs,
             probs_p1: filtered_probs_p1,
             gen_positions,
-            marker_to_cluster,
-            cluster_end_ref_markers,
         }
     }
 
@@ -1004,21 +1000,6 @@ impl ImputationPipeline {
         };
         let marker_to_cluster = std::sync::Arc::new(marker_to_cluster);
 
-        // For each cluster, find the reference marker index of its last marker
-        let cluster_end_ref_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(
-            clusters
-                .iter()
-                .map(|c| {
-                    if c.end > c.start {
-                        // Exclusive end, so use last marker in cluster
-                        genotyped_markers[c.end - 1]
-                    } else {
-                        // Empty cluster? Use start marker
-                        genotyped_markers[c.start]
-                    }
-                })
-                .collect(),
-        );
 
         // Run imputation for each target haplotype with per-thread workspaces
         // Optimization: ImpStates is now created once per thread (not per haplotype)
@@ -1142,8 +1123,6 @@ impl ImputationPipeline {
                         sparse_hap_indices,
                         hmm_state_probs,
                         std::sync::Arc::clone(&gen_positions),
-                        std::sync::Arc::clone(&marker_to_cluster),
-                        std::sync::Arc::clone(&cluster_end_ref_markers),
                     )
                 },
             )
