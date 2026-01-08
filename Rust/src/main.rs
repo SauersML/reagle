@@ -46,6 +46,8 @@ fn init_profiling() {
                 .with_targets(false)
                 .with_bracketed_fields(false)
                 .with_timer(tracing_tree::time::Uptime::default())
+                .with_verbose_exit(true)
+                .with_verbose_entry(true)
         )
         .init();
 }

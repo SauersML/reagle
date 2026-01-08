@@ -1054,15 +1054,14 @@ impl PhasingPipeline {
 
             // Pre-compute state->hap mapping for all (marker, state) pairs
             // This is needed because ThreadedHaps uses cursor-based traversal
+            // Pre-allocate all memory upfront to avoid clone() overhead in hot loop
             let state_haps: Vec<Vec<u32>> = {
                 let mut threaded_haps_mut = threaded_haps.clone();
-                let mut buffer = vec![0u32; n_states];
-                (0..n_markers)
-                    .map(|m| {
-                        threaded_haps_mut.materialize_haps(m, &mut buffer);
-                        buffer.clone()
-                    })
-                    .collect()
+                let mut state_haps = vec![vec![0u32; n_states]; n_markers];
+                for m in 0..n_markers {
+                    threaded_haps_mut.materialize_haps(m, &mut state_haps[m]);
+                }
+                state_haps
             };
 
             // Helper to get reference allele at (marker, state)
@@ -1487,15 +1486,14 @@ impl PhasingPipeline {
                 let p_no_err = 1.0 - p_err;
 
                 // Pre-compute state->hap mapping for all (marker, state) pairs
+                // Pre-allocate all memory upfront to avoid clone() overhead in hot loop
                 let state_haps: Vec<Vec<u32>> = {
                     let mut threaded_haps_mut = threaded_haps.clone();
-                    let mut buffer = vec![0u32; n_states];
-                    (0..n_markers)
-                        .map(|m| {
-                            threaded_haps_mut.materialize_haps(m, &mut buffer);
-                            buffer.clone()
-                        })
-                        .collect()
+                    let mut state_haps = vec![vec![0u32; n_states]; n_markers];
+                    for m in 0..n_markers {
+                        threaded_haps_mut.materialize_haps(m, &mut state_haps[m]);
+                    }
+                    state_haps
                 };
 
                 // Helper to get reference allele at (marker, state)
@@ -1912,15 +1910,14 @@ impl PhasingPipeline {
                 let p_no_err = 1.0 - p_err;
 
                 // Pre-compute state->hap mapping for all (hi_freq_idx, state) pairs
+                // Pre-allocate all memory upfront to avoid clone() overhead in hot loop
                 let state_haps: Vec<Vec<u32>> = {
                     let mut threaded_haps_mut = threaded_haps.clone();
-                    let mut buffer = vec![0u32; n_states];
-                    (0..n_hi_freq)
-                        .map(|m| {
-                            threaded_haps_mut.materialize_haps(m, &mut buffer);
-                            buffer.clone()
-                        })
-                        .collect()
+                    let mut state_haps = vec![vec![0u32; n_states]; n_hi_freq];
+                    for m in 0..n_hi_freq {
+                        threaded_haps_mut.materialize_haps(m, &mut state_haps[m]);
+                    }
+                    state_haps
                 };
 
                 // Helper to get reference allele at (hi_freq_idx, state)
@@ -2397,15 +2394,14 @@ impl PhasingPipeline {
 
                 // Pre-compute state->hap mapping for all Stage 1 markers
                 // This is needed because ThreadedHaps uses cursor-based traversal
+                // Pre-allocate all memory upfront to avoid clone() overhead in hot loop
                 let state_haps_stage1: Vec<Vec<u32>> = {
                     let mut threaded_haps_mut = threaded_haps.clone();
-                    let mut buffer = vec![0u32; n_states];
-                    (0..n_stage1)
-                        .map(|m| {
-                            threaded_haps_mut.materialize_haps(m, &mut buffer);
-                            buffer.clone()
-                        })
-                        .collect()
+                    let mut state_haps = vec![vec![0u32; n_states]; n_stage1];
+                    for m in 0..n_stage1 {
+                        threaded_haps_mut.materialize_haps(m, &mut state_haps[m]);
+                    }
+                    state_haps
                 };
 
                 // Closure to get allele for any haplotype (target or reference)

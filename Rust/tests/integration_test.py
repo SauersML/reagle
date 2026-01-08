@@ -290,6 +290,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     switch_errors = 0
     switch_opportunities = 0
 
+    # For N50 Phasing Block Length
+    # sample -> list of block lengths (in bp)
+    phase_blocks = defaultdict(list)
+    # sample -> start position of current block
+    current_block_start = {} 
+
     # MAF bins for stratified analysis - FINER BINS for rare variants
     def get_maf_bin(maf):
         if maf < 0.001:
@@ -385,16 +391,28 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     
                     # Switch error detection (for hets only, when both are phased)
                     if t_dos == 1 and i_dos == 1 and t_phased and i_phased:
+                        pos = site[1]
+                        if sample not in current_block_start:
+                            current_block_start[sample] = pos
+
                         if sample in prev_het:
                             prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample]
                             # Determine if there's a switch by comparing phase relationships
                             # If truth maintains same phase but imputed flips, it's a switch
                             t_same_phase = (t_gt[0] == prev_t_gt[0])  # First allele same as prev first
                             i_same_phase = (i_gt[0] == prev_i_gt[0])
+                            
                             if t_same_phase != i_same_phase:
+                                # Switch error! End current block
+                                block_len = pos - current_block_start[sample]
+                                phase_blocks[sample].append(block_len)
+                                # Start new block at current position
+                                current_block_start[sample] = pos
+                                
                                 switch_errors += 1
                                 sample_metrics[sample]["switch_errors"] += 1
                                 maf_bins[maf_bin]["switch_errors"] += 1
+                            
                             switch_opportunities += 1
                             sample_metrics[sample]["switch_opportunities"] += 1
                             maf_bins[maf_bin]["switch_opportunities"] += 1
@@ -419,9 +437,57 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 iqs = (observed_conc - expected_conc) / (1.0 - expected_conc)
                 site_iqs_values.append(iqs)
                 maf_bins[maf_bin]["iqs_values"].append(iqs)
+    
+    # Close final phase blocks
+    last_pos = sorted_sites[-1][1] if sorted_sites else 0
+    for sample, start_pos in current_block_start.items():
+        block_len = last_pos - start_pos
+        phase_blocks[sample].append(block_len)
 
     # Calculate overall metrics
     metrics = {}
+    
+    # Calculate N50 Phase Block Length
+    all_lengths = []
+    for lengths in phase_blocks.values():
+        all_lengths.extend(lengths)
+    
+    if all_lengths:
+        all_lengths.sort(reverse=True)
+        total_len = sum(all_lengths)
+        target = total_len / 2
+        running_sum = 0
+        n50 = 0
+        for l in all_lengths:
+            running_sum += l
+            if running_sum >= target:
+                n50 = l
+                break
+        metrics["n50_phase_block"] = n50
+    else:
+        metrics["n50_phase_block"] = 0.0
+
+    # Precision/Recall/F1 (Binary classification: Ref vs Non-Ref)
+    # TP: Truth=Alt, Imputed=Alt
+    # FP: Truth=Ref, Imputed=Alt
+    # FN: Truth=Alt, Imputed=Ref
+    # TN: Truth=Ref, Imputed=Ref
+    
+    tp = confusion[1][1] + confusion[1][2] + confusion[2][1] + confusion[2][2]
+    fp = confusion[0][1] + confusion[0][2]
+    fn = confusion[1][0] + confusion[2][0]
+    
+    metrics["tp"] = tp
+    metrics["fp"] = fp
+    metrics["fn"] = fn
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    metrics["precision"] = precision
+    metrics["recall"] = recall
+    metrics["f1_score"] = f1
 
     if total_compared > 0:
         metrics["unphased_concordance"] = unphased_concordant / total_compared
@@ -483,6 +549,32 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         else:
             metrics["r_squared"] = None
 
+        # Calculate Rare Variant R² stats (MAF < 1%)
+        rare_stats = {
+            "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0,
+            "sum_tt": 0.0, "sum_ii": 0.0, "count": 0
+        }
+        
+        # We need to iterate again or collect during the main loop?
+        # The main loop collected `truth_dosages` and `imputed_dosages` but mixed all MAFs.
+        # However, we have `maf_bins`.
+        # "ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)" are the ones we want.
+        target_bins = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)"]
+        
+        for bin_name in target_bins:
+            if bin_name in maf_bins:
+                b_data = maf_bins[bin_name]
+                if "truth" in b_data:
+                    for t, i in zip(b_data["truth"], b_data["imputed"]):
+                        rare_stats["sum_t"] += t
+                        rare_stats["sum_i"] += i
+                        rare_stats["sum_ti"] += t * i
+                        rare_stats["sum_tt"] += t * t
+                        rare_stats["sum_ii"] += i * i
+                        rare_stats["count"] += 1
+                        
+        metrics["rare_r2_stats"] = rare_stats
+
         # Calculate overall IQS (mean across sites)
         if site_iqs_values:
             metrics["iqs"] = sum(site_iqs_values) / len(site_iqs_values)
@@ -525,6 +617,20 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 # Non-ref concordance per bin
                 if data["nonref_total"] > 0:
                     bin_metrics["nonref_concordance"] = data["nonref_concordant"] / data["nonref_total"]
+                
+                # F1/Precision/Recall per bin
+                b_conf = data["confusion"]
+                b_tp = b_conf[1][1] + b_conf[1][2] + b_conf[2][1] + b_conf[2][2]
+                b_fp = b_conf[0][1] + b_conf[0][2]
+                b_fn = b_conf[1][0] + b_conf[2][0]
+                
+                b_prec = b_tp / (b_tp + b_fp) if (b_tp + b_fp) > 0 else 0.0
+                b_rec = b_tp / (b_tp + b_fn) if (b_tp + b_fn) > 0 else 0.0
+                b_f1 = 2 * b_prec * b_rec / (b_prec + b_rec) if (b_prec + b_rec) > 0 else 0.0
+                
+                bin_metrics["f1_score"] = b_f1
+                bin_metrics["recall"] = b_rec
+                
                 # R² per bin
                 if len(data["truth"]) > 1:
                     mean_t = sum(data["truth"]) / len(data["truth"])
@@ -578,6 +684,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         print(f"\n🎯 ACCURACY METRICS")
         print(f"   Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")
         print(f"   Non-ref concordance:  {metrics.get('nonref_concordance', 0):.4f}" if metrics.get('nonref_concordance') else "   Non-ref concordance:  N/A")
+        print(f"   F1 Score (Non-Ref):   {metrics.get('f1_score', 0):.4f}")
+        print(f"   Precision / Recall:   {metrics.get('precision', 0):.4f} / {metrics.get('recall', 0):.4f}")
         print(f"   Overall R²:           {metrics.get('r_squared'):.4f}" if metrics.get('r_squared') else "   Overall R²:           N/A")
         print(f"   Overall IQS:          {metrics.get('iqs'):.4f}" if metrics.get('iqs') else "   Overall IQS:          N/A")
         print(f"   INFO score (approx):  {metrics.get('info_score_approx'):.4f}" if metrics.get('info_score_approx') else "   INFO score (approx):  N/A")
@@ -585,6 +693,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         if metrics.get('switch_error_rate') is not None:
             print(f"\n🔀 PHASING QUALITY")
             print(f"   Switch error rate:    {metrics.get('switch_error_rate'):.4f} ({metrics.get('switch_errors')}/{metrics.get('switch_opportunities')})")
+            print(f"   N50 Phase Block:      {metrics.get('n50_phase_block'):.0f} bp")
         
         print(f"\n📋 CONFUSION MATRIX (Truth vs Imputed)")
         print(f"   {'':12} {'HomRef':>10} {'Het':>10} {'HomAlt':>10}")
@@ -610,7 +719,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
 
         if "by_maf" in metrics:
             print(f"\n📈 BY MAF BIN (sorted by frequency)")
-            print(f"   {'MAF Bin':<20} {'Conc':>8} {'NonRef':>8} {'R²':>8} {'SwitchErr':>10} {'N':>10}")
+            print(f"   {'MAF Bin':<20} {'F1':>8} {'Conc':>8} {'R²':>8} {'SwitchErr':>10} {'N':>10}")
             print(f"   {'-'*20} {'-'*8} {'-'*8} {'-'*8} {'-'*10} {'-'*10}")
             # Sort by actual frequency order
             bin_order = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)", 
@@ -618,11 +727,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             for maf_bin in bin_order:
                 if maf_bin in metrics["by_maf"]:
                     bin_metrics = metrics["by_maf"][maf_bin]
+                    f1_str = f"{bin_metrics.get('f1_score', 0):.4f}"
                     conc = f"{bin_metrics['unphased_concordance']:.4f}"
-                    nonref = f"{bin_metrics.get('nonref_concordance', 0):.4f}" if bin_metrics.get('nonref_concordance') else "N/A"
                     r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
                     switch_str = f"{bin_metrics.get('switch_error_rate'):.4f}" if bin_metrics.get('switch_error_rate') is not None else "N/A"
-                    print(f"   {maf_bin:<20} {conc:>8} {nonref:>8} {r2_str:>8} {switch_str:>10} {bin_metrics['n_genotypes']:>10,}")
+                    print(f"   {maf_bin:<20} {f1_str:>8} {conc:>8} {r2_str:>8} {switch_str:>10} {bin_metrics['n_genotypes']:>10,}")
 
     # Save detailed metrics to file
     metrics_file = f"{output_prefix}_metrics.txt"
@@ -639,6 +748,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             
             f.write("ACCURACY METRICS\n")
             f.write("-" * 40 + "\n")
+            f.write(f"F1 Score (Non-Ref): {metrics.get('f1_score', 0):.6f}\n")
+            f.write(f"Precision: {metrics.get('precision', 0):.6f}\n")
+            f.write(f"Recall: {metrics.get('recall', 0):.6f}\n")
             f.write(f"Unphased concordance: {metrics.get('unphased_concordance', 0):.6f}\n")
             if metrics.get('nonref_concordance'):
                 f.write(f"Non-ref concordance: {metrics['nonref_concordance']:.6f}\n")
@@ -650,6 +762,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 f.write(f"INFO score (approx): {metrics['info_score_approx']:.6f}\n")
             if metrics.get('switch_error_rate') is not None:
                 f.write(f"Switch error rate: {metrics['switch_error_rate']:.6f}\n")
+                f.write(f"N50 Phase Block: {metrics.get('n50_phase_block'):.0f} bp\n")
             
             f.write("\nCONFUSION MATRIX\n")
             f.write("-" * 40 + "\n")
@@ -662,6 +775,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             f.write("-" * 40 + "\n")
             for maf_bin, bin_metrics in metrics.get("by_maf", {}).items():
                 f.write(f"\n{maf_bin}:\n")
+                f.write(f"  F1 Score: {bin_metrics.get('f1_score', 0):.6f}\n")
+                f.write(f"  Recall: {bin_metrics.get('recall', 0):.6f}\n")
                 f.write(f"  Concordance: {bin_metrics['unphased_concordance']:.6f}\n")
                 if bin_metrics.get('nonref_concordance'):
                     f.write(f"  Non-ref concordance: {bin_metrics['nonref_concordance']:.6f}\n")
@@ -1451,6 +1566,13 @@ def stage_summary():
         agg_switch_errors = 0
         agg_switch_opps = 0
         
+        agg_tp = 0
+        agg_fp = 0
+        agg_fn = 0
+        
+        agg_n50_sum = 0.0
+        agg_n50_count = 0
+        
         # R2 sufficient stats
         r2_sum_t = 0.0
         r2_sum_i = 0.0
@@ -1458,6 +1580,14 @@ def stage_summary():
         r2_sum_tt = 0.0
         r2_sum_ii = 0.0
         r2_n = 0
+        
+        # Rare R2 sufficient stats
+        rare_sum_t = 0.0
+        rare_sum_i = 0.0
+        rare_sum_ti = 0.0
+        rare_sum_tt = 0.0
+        rare_sum_ii = 0.0
+        rare_n = 0
         
         chromosomes_found = 0
         
@@ -1486,6 +1616,16 @@ def stage_summary():
                     agg_nonref_total += nr_total
                     agg_nonref_concordant += int(nr_rate * nr_total)
                     
+                    # F1/Prec/Recall
+                    agg_tp += data.get("tp", 0)
+                    agg_fp += data.get("fp", 0)
+                    agg_fn += data.get("fn", 0)
+                    
+                    # N50
+                    if "n50_phase_block" in data:
+                        agg_n50_sum += data["n50_phase_block"]
+                        agg_n50_count += 1
+                    
                     # Switch Error
                     agg_switch_errors += data.get("switch_errors", 0)
                     agg_switch_opps += data.get("switch_opportunities", 0)
@@ -1499,6 +1639,17 @@ def stage_summary():
                         r2_sum_tt += stats["sum_tt"]
                         r2_sum_ii += stats["sum_ii"]
                         r2_n += stats["count"]
+                        
+                    # Rare R2 stats
+                    rstats = data.get("rare_r2_stats")
+                    if rstats:
+                        rare_sum_t += rstats["sum_t"]
+                        rare_sum_i += rstats["sum_i"]
+                        rare_sum_ti += rstats["sum_ti"]
+                        rare_sum_tt += rstats["sum_tt"]
+                        rare_sum_ii += rstats["sum_ii"]
+                        rare_n += rstats["count"]
+                        
                 except Exception as e:
                     print(f"  Error reading chr{chrom} JSON: {e}")
             else:
@@ -1512,6 +1663,14 @@ def stage_summary():
         global_conc = agg_concordant / agg_genotypes if agg_genotypes > 0 else 0.0
         global_nonref = agg_nonref_concordant / agg_nonref_total if agg_nonref_total > 0 else 0.0
         global_ser = agg_switch_errors / agg_switch_opps if agg_switch_opps > 0 else 0.0
+        
+        # Global F1/Prec/Recall
+        global_prec = agg_tp / (agg_tp + agg_fp) if (agg_tp + agg_fp) > 0 else 0.0
+        global_rec = agg_tp / (agg_tp + agg_fn) if (agg_tp + agg_fn) > 0 else 0.0
+        global_f1 = 2 * global_prec * global_rec / (global_prec + global_rec) if (global_prec + global_rec) > 0 else 0.0
+        
+        # Mean N50 across chromosomes (simple average for summary)
+        global_n50 = agg_n50_sum / agg_n50_count if agg_n50_count > 0 else 0.0
         
         # Calculate exact GLOBAL dosage R2
         global_r2 = 0.0
@@ -1528,6 +1687,20 @@ def stage_summary():
             if var_t_n > 0 and var_i_n > 0:
                 r = cov_n / math.sqrt(var_t_n * var_i_n)
                 global_r2 = r ** 2
+                
+        # Calculate exact GLOBAL Rare R2
+        global_rare_r2 = 0.0
+        if rare_n > 0:
+            mean_t = rare_sum_t / rare_n
+            mean_i = rare_sum_i / rare_n
+            
+            cov_n = rare_sum_ti - (rare_sum_t * rare_sum_i / rare_n)
+            var_t_n = rare_sum_tt - (rare_sum_t * rare_sum_t / rare_n)
+            var_i_n = rare_sum_ii - (rare_sum_i * rare_sum_i / rare_n)
+            
+            if var_t_n > 0 and var_i_n > 0:
+                r = cov_n / math.sqrt(var_t_n * var_i_n)
+                global_rare_r2 = r ** 2
 
         final_metrics.append({
             'id': tool,
@@ -1536,7 +1709,12 @@ def stage_summary():
             'conc': global_conc,
             'nonref': global_nonref,
             'r2': global_r2,
+            'rare_r2': global_rare_r2,
             'ser': global_ser,
+            'f1': global_f1,
+            'prec': global_prec,
+            'rec': global_rec,
+            'n50': global_n50,
             'chromosomes': chromosomes_found
         })
     
@@ -1556,18 +1734,26 @@ def stage_summary():
     # Winner badges
     best_r2 = max(final_metrics, key=lambda x: x['r2'])
     best_time = min(final_metrics, key=lambda x: x['time'])
+    best_f1 = max(final_metrics, key=lambda x: x['f1'])
+    
     final_metrics_with_ser = [m for m in final_metrics if m['ser'] > 0]
     best_ser = min(final_metrics_with_ser, key=lambda x: x['ser']) if final_metrics_with_ser else None
+    
+    final_metrics_with_n50 = [m for m in final_metrics if m['n50'] > 0]
+    best_n50 = max(final_metrics_with_n50, key=lambda x: x['n50']) if final_metrics_with_n50 else None
 
     md_lines.append(f"\n### 🏆 Highlights")
     md_lines.append(f"- **Most Accurate (R²):** {best_r2['name']} ({best_r2['r2']:.4f})")
+    md_lines.append(f"- **Best F1 Score:** {best_f1['name']} ({best_f1['f1']:.4f})")
     md_lines.append(f"- **Fastest:** {best_time['name']} ({best_time['time']:.1f}s)")
     if best_ser and best_ser['ser'] < 1.0:
         md_lines.append(f"- **Best Phasing (SER):** {best_ser['name']} ({best_ser['ser']:.4f})")
+    if best_n50:
+        md_lines.append(f"- **Longest Phase Blocks (N50):** {best_n50['name']} ({best_n50['n50']:.0f} bp)")
     
     md_lines.append(f"\n### 📊 Comprehensive Comparison")
-    md_lines.append("| Tool | R² | Concordance | Non-Ref Conc. | Switch Error | Runtime (s) | Chrs |")
-    md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
+    md_lines.append("| Tool | R² | Rare R² (<1%) | F1 Score | Non-Ref Conc. | Switch Error | N50 Block (bp) | Runtime (s) | Chrs |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     
     for m in final_metrics:
         # Comparison vs Reagle (if present)
@@ -1578,7 +1764,7 @@ def stage_summary():
             icon = "🔻" if diff < 0 else "🔺"
             r2_diff = f" ({icon}{abs(diff):.4f})"
             
-        md_lines.append(f"| **{m['name']}** | {m['r2']:.4f}{r2_diff} | {m['conc']:.5f} | {m['nonref']:.4f} | {m['ser']:.4f} | {m['time']:.1f} | {m['chromosomes']} |")
+        md_lines.append(f"| **{m['name']}** | {m['r2']:.4f}{r2_diff} | {m['rare_r2']:.4f} | {m['f1']:.4f} | {m['nonref']:.4f} | {m['ser']:.4f} | {m['n50']:.0f} | {m['time']:.1f} | {m['chromosomes']} |")
 
     # Write to Summary file
     summary_file = script_dir / "genome_wide_summary.md"
