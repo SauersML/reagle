@@ -1,0 +1,332 @@
+name: Full Genome Nightly Test
+
+# Runs full genome imputation benchmark (all chromosomes)
+# Triggered: Nightly at 4 AM EST (9:00 UTC) or manual dispatch
+
+on:
+  schedule:
+    # 4 AM EST = 9:00 UTC (EST is UTC-5)
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      chromosomes:
+        description: 'Chromosomes to test (comma-separated, e.g. "1,2,22" or "all")'
+        required: false
+        default: 'all'
+
+env:
+  # All chromosomes to test
+  ALL_CHROMOSOMES: "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22"
+
+jobs:
+  # Job 1: Build Reagle binary
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            Rust/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Reagle
+        working-directory: Rust
+        run: cargo build --release
+
+      - name: Upload Reagle binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: reagle-binary
+          path: Rust/target/release/reagle
+          retention-days: 7
+
+  # Job 2: Prepare test data for all chromosomes
+  prepare-data:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chromosome: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bcftools tabix curl
+
+      - name: Cache chromosome data
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+          key: test-data-hgdp1kg-chr${{ matrix.chromosome }}-v3
+
+      - name: Download and prepare chromosome ${{ matrix.chromosome }}
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        working-directory: Rust
+        run: |
+          # Create chromosome-specific data directory
+          mkdir -p tests/data_chr${{ matrix.chromosome }}
+          cd tests/data_chr${{ matrix.chromosome }}
+          
+          # Download HGDP+1kG data for this chromosome
+          CHROM=${{ matrix.chromosome }}
+          BCF_URL="https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr${CHROM}.filtered.SNV_INDEL.phased.shapeit5.bcf"
+          CSI_URL="${BCF_URL}.csi"
+          
+          echo "Downloading chr${CHROM}..."
+          curl -L -o hgdp1kg_chr${CHROM}.bcf "$BCF_URL"
+          curl -L -o hgdp1kg_chr${CHROM}.bcf.csi "$CSI_URL"
+          
+          # Convert to VCF.gz
+          bcftools view hgdp1kg_chr${CHROM}.bcf -O z -o hgdp1kg_chr${CHROM}.vcf.gz
+          bcftools index -f hgdp1kg_chr${CHROM}.vcf.gz
+          
+          # Get samples and split
+          bcftools query -l hgdp1kg_chr${CHROM}.vcf.gz > all_samples.txt
+          TOTAL=$(wc -l < all_samples.txt)
+          N_TEST=$((TOTAL / 5))  # 20%
+          
+          # Shuffle with seed for reproducibility
+          shuf --random-source=<(yes 42) all_samples.txt > shuffled.txt
+          head -n $N_TEST shuffled.txt > test_samples.txt
+          tail -n +$((N_TEST + 1)) shuffled.txt > train_samples.txt
+          
+          # Create reference panel (80%)
+          bcftools view -S train_samples.txt hgdp1kg_chr${CHROM}.vcf.gz -O z -o ref.vcf.gz
+          bcftools index -f ref.vcf.gz
+          
+          # Create truth (20%, full density)
+          bcftools view -S test_samples.txt hgdp1kg_chr${CHROM}.vcf.gz -O z -o truth.vcf.gz
+          bcftools index -f truth.vcf.gz
+          
+          # Download GSA sites
+          curl -L -o GSAv2_hg38.tsv "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv"
+          
+          # Extract GSA sites for this chromosome
+          grep -E "^(CHROM|chr${CHROM}\t|${CHROM}\t)" GSAv2_hg38.tsv | awk -F'\t' '{print "chr"$1"\t"$2}' | grep -v "^chrCHROM" > gsa_chr${CHROM}.regions
+          
+          # Downsample to GSA sites
+          bcftools view -R gsa_chr${CHROM}.regions truth.vcf.gz -O z -o input_phased.vcf.gz
+          
+          # Unphase the input for true phasing accuracy measurement
+          bcftools +setGT input_phased.vcf.gz -O z -o input.vcf.gz -- -t a -n u
+          bcftools index -f input.vcf.gz
+          
+          # Cleanup intermediate files
+          rm -f hgdp1kg_chr${CHROM}.bcf* input_phased.vcf.gz all_samples.txt shuffled.txt
+          
+          echo "Prepared chr${CHROM}: $(bcftools view -H ref.vcf.gz | wc -l) ref variants, $(bcftools view -H input.vcf.gz | wc -l) GSA variants"
+
+      - name: Upload chromosome data
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-chr${{ matrix.chromosome }}
+          path: |
+            Rust/tests/data_chr${{ matrix.chromosome }}/ref.vcf.gz*
+            Rust/tests/data_chr${{ matrix.chromosome }}/truth.vcf.gz*
+            Rust/tests/data_chr${{ matrix.chromosome }}/input.vcf.gz*
+            Rust/tests/data_chr${{ matrix.chromosome }}/train_samples.txt
+            Rust/tests/data_chr${{ matrix.chromosome }}/test_samples.txt
+          retention-days: 7
+
+  # Job 3: Run imputation on each chromosome (Beagle + Reagle in parallel)
+  impute:
+    runs-on: ubuntu-latest
+    needs: [build, prepare-data]
+    strategy:
+      fail-fast: false
+      matrix:
+        chromosome: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bcftools tabix openjdk-17-jre
+
+      - name: Download Reagle binary
+        uses: actions/download-artifact@v4
+        with:
+          name: reagle-binary
+          path: Rust/target/release/
+
+      - name: Make Reagle executable
+        run: chmod +x Rust/target/release/reagle
+
+      - name: Download chromosome data
+        uses: actions/download-artifact@v4
+        with:
+          name: data-chr${{ matrix.chromosome }}
+          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+
+      - name: Download Beagle JAR
+        run: |
+          curl -L -o Rust/tests/data_chr${{ matrix.chromosome }}/beagle.jar \
+            "https://faculty.washington.edu/browning/beagle/beagle.22Jul22.46e.jar"
+
+      - name: Run Beagle imputation
+        working-directory: Rust/tests/data_chr${{ matrix.chromosome }}
+        run: |
+          java -Xmx8g -jar beagle.jar \
+            ref=ref.vcf.gz \
+            gt=input.vcf.gz \
+            out=beagle_imputed \
+            nthreads=4
+          bcftools index -f beagle_imputed.vcf.gz
+
+      - name: Run Reagle imputation
+        working-directory: Rust
+        run: |
+          ./target/release/reagle \
+            --ref tests/data_chr${{ matrix.chromosome }}/ref.vcf.gz \
+            --gt tests/data_chr${{ matrix.chromosome }}/input.vcf.gz \
+            --out tests/data_chr${{ matrix.chromosome }}/reagle_imputed
+          bcftools index -f tests/data_chr${{ matrix.chromosome }}/reagle_imputed.vcf.gz
+
+      - name: Upload imputation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: imputed-chr${{ matrix.chromosome }}
+          path: |
+            Rust/tests/data_chr${{ matrix.chromosome }}/beagle_imputed.vcf.gz*
+            Rust/tests/data_chr${{ matrix.chromosome }}/reagle_imputed.vcf.gz*
+          retention-days: 7
+
+  # Job 4: Calculate metrics for each chromosome
+  analyze:
+    runs-on: ubuntu-latest
+    needs: impute
+    strategy:
+      fail-fast: false
+      matrix:
+        chromosome: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bcftools
+
+      - name: Download chromosome data
+        uses: actions/download-artifact@v4
+        with:
+          name: data-chr${{ matrix.chromosome }}
+          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+
+      - name: Download imputation results
+        uses: actions/download-artifact@v4
+        with:
+          name: imputed-chr${{ matrix.chromosome }}
+          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+
+      - name: Calculate metrics for chr${{ matrix.chromosome }}
+        working-directory: Rust
+        run: |
+          # Use the same metrics calculation logic from integration_test.py
+          python3 << 'EOF'
+          import sys
+          sys.path.insert(0, 'tests')
+          from integration_test import calculate_metrics
+          
+          data_dir = f"tests/data_chr${{ matrix.chromosome }}"
+          truth_vcf = f"{data_dir}/truth.vcf.gz"
+          
+          print("=" * 60)
+          print(f"CHROMOSOME ${{ matrix.chromosome }} - BEAGLE")
+          print("=" * 60)
+          calculate_metrics(truth_vcf, f"{data_dir}/beagle_imputed.vcf.gz", f"{data_dir}/beagle")
+          
+          print("\n" + "=" * 60)
+          print(f"CHROMOSOME ${{ matrix.chromosome }} - REAGLE")
+          print("=" * 60)
+          calculate_metrics(truth_vcf, f"{data_dir}/reagle_imputed.vcf.gz", f"{data_dir}/reagle")
+          EOF
+
+      - name: Upload metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-chr${{ matrix.chromosome }}
+          path: Rust/tests/data_chr${{ matrix.chromosome }}/*_metrics.txt
+          retention-days: 30
+
+  # Job 5: Aggregate all chromosome metrics into summary report
+  summary:
+    runs-on: ubuntu-latest
+    needs: analyze
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all metrics
+        uses: actions/download-artifact@v4
+        with:
+          pattern: metrics-chr*
+          path: metrics/
+          merge-multiple: true
+
+      - name: Generate genome-wide summary
+        run: |
+          echo "=================================================="
+          echo "FULL GENOME IMPUTATION BENCHMARK - SUMMARY"
+          echo "=================================================="
+          echo ""
+          echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          
+          # Aggregate metrics from all chromosomes
+          for TOOL in beagle reagle; do
+            echo ""
+            echo "=== ${TOOL^^} RESULTS ==="
+            echo ""
+            
+            # Collect concordance values
+            for CHR in {1..22}; do
+              if [ -f "metrics/data_chr${CHR}/${TOOL}_metrics.txt" ]; then
+                CONC=$(grep "Unphased concordance:" "metrics/data_chr${CHR}/${TOOL}_metrics.txt" | awk '{print $NF}')
+                R2=$(grep "Overall R²:" "metrics/data_chr${CHR}/${TOOL}_metrics.txt" | awk '{print $NF}')
+                echo "chr${CHR}: concordance=${CONC:-N/A}, R²=${R2:-N/A}"
+              else
+                echo "chr${CHR}: MISSING"
+              fi
+            done
+          done
+          
+          # Save summary
+          cat > metrics/genome_summary.txt << 'SUMMARY'
+          FULL GENOME IMPUTATION BENCHMARK
+          =================================
+          
+          This report summarizes imputation accuracy across all 22 autosomes.
+          
+          Reference: HGDP+1kG phased haplotypes (Shapeit5)
+          Target: 20% of samples, downsampled to GSA v2 sites, UNPHASED
+          
+          Metrics:
+          - Concordance: Unphased genotype match (0|1 == 1|0)
+          - R²: Squared correlation between true and imputed dosages
+          - Switch Error: Phase switch rate vs truth
+          
+          See individual chromosome metrics in metrics-chr* artifacts.
+          SUMMARY
+
+      - name: Upload genome summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: genome-wide-summary
+          path: metrics/genome_summary.txt
+          retention-days: 30
