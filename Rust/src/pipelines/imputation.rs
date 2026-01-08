@@ -2328,14 +2328,15 @@ mod tests {
         };
 
         // Use cursor to iterate through ALL markers sequentially
-        let mut cursor = StateProbsCursor::new(Arc::new(sp.clone()));
+        let sp_arc = Arc::new(sp);
+        let mut cursor = sp_arc.clone().cursor();
 
         for m in 0..n_ref_markers {
             // Get result from cursor (O(1) amortized)
             let cursor_result = cursor.allele_posteriors(m, 2, &get_ref_allele);
 
             // Get result from binary search (O(log N))
-            let bs_result = sp.allele_posteriors(m, 2, get_ref_allele);
+            let bs_result = sp_arc.allele_posteriors(m, 2, get_ref_allele);
 
             // They must match exactly
             match (&cursor_result, &bs_result) {
@@ -2383,7 +2384,7 @@ mod tests {
 
         // Access markers in random order
         // Cursor should handle this by advancing (but can't go backwards)
-        let mut cursor = StateProbsCursor::new(Arc::new(sp));
+        let mut cursor = Arc::new(sp).cursor();
 
         // First access at m=25 (cursor advances to sparse_idx=1)
         let p1 = cursor.allele_posteriors(25, 2, &get_ref_allele);
