@@ -518,17 +518,26 @@ impl StateProbs {
         let probs = &self.probs[left_sparse];
         let probs_p1 = &self.probs_p1[left_sparse];
 
+        // Java Beagle uses constant probability for markers within a cluster and
+        // interpolates only for markers BETWEEN clusters. We detect "within-cluster"
+        // by checking if the probability vectors for the left marker and the next
+        // marker are identical. HMM expansion ensures this is true for markers
+        // belonging to the same cluster.
+        let is_between_clusters = probs != probs_p1;
+
         if n_alleles == 2 {
-            // Java-style interpolation for biallelic sites:
-            // For each state j, interpolate prob: w * prob[j] + (1-w) * probs_p1[j]
-            // Then add to allele posterior based on haplotype's allele at ref_marker
+            // Java-style interpolation for biallelic sites
             let mut p_alt = 0.0f32;
             let mut p_ref = 0.0f32;
             for (j, &hap) in haps.iter().enumerate() {
-                // Interpolate state probability
+                // Interpolate state probability only when between different clusters
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                let interpolated_prob = weight_left * prob + (1.0 - weight_left) * prob_p1;
+                let interpolated_prob = if is_between_clusters {
+                    let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                    weight_left * prob + (1.0 - weight_left) * prob_p1
+                } else {
+                    prob
+                };
 
                 // Look up allele at the interpolated marker
                 let allele = get_ref_allele(ref_marker, hap);
@@ -548,10 +557,14 @@ impl StateProbs {
             // Java-style interpolation for multiallelic sites
             let mut al_probs = vec![0.0f32; n_alleles];
             for (j, &hap) in haps.iter().enumerate() {
-                // Interpolate state probability
+                // Interpolate state probability only when between different clusters
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                let interpolated_prob = weight_left * prob + (1.0 - weight_left) * prob_p1;
+                let interpolated_prob = if is_between_clusters {
+                    let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                    weight_left * prob + (1.0 - weight_left) * prob_p1
+                } else {
+                    prob
+                };
 
                 // Look up allele at the interpolated marker
                 let allele = get_ref_allele(ref_marker, hap);
