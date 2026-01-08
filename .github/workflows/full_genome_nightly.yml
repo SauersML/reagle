@@ -16,7 +16,7 @@ on:
       tools:
         description: 'Tools to run (comma-separated)'
         required: false
-        default: 'beagle,reagle'
+        default: 'beagle,reagle,impute5,minimac,glimpse'
 
 jobs:
   # Job 1: Build Reagle binary
@@ -94,7 +94,7 @@ jobs:
         working-directory: Rust
         run: |
           python3 tests/integration_test.py impute-chr ${{ matrix.chromosome }} \
-            --tools ${{ inputs.tools || 'beagle,reagle' }}
+            --tools ${{ inputs.tools || 'beagle,reagle,impute5,minimac,glimpse' }}
 
       - name: Upload chromosome data
         uses: actions/upload-artifact@v4
