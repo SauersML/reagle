@@ -1000,22 +1000,6 @@ impl ImputationPipeline {
         };
         let marker_to_cluster = std::sync::Arc::new(marker_to_cluster);
 
-        // For each cluster, find the reference marker index of its last marker
-        let cluster_end_ref_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(
-            clusters
-                .iter()
-                .map(|c| {
-                    if c.end > c.start {
-                        // Exclusive end, so use last marker in cluster
-                        genotyped_markers[c.end - 1]
-                    } else {
-                        // Empty cluster? Use start marker
-                        genotyped_markers[c.start]
-                    }
-                })
-                .collect(),
-        );
-
         // Run imputation for each target haplotype with per-thread workspaces
         // Optimization: ImpStates is now created once per thread (not per haplotype)
         // to avoid allocator contention from HashMap/BinaryHeap allocation
