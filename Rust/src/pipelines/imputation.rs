@@ -31,6 +31,9 @@ use crate::utils::workspace::ImpWorkspace;
 use crate::model::imp_states::ImpStates;
 use crate::model::parameters::ModelParams;
 
+/// Minimum genetic distance between markers (matches Java Beagle)
+const MIN_CM_DIST: f64 = 1e-7;
+
 /// Imputation pipeline
 pub struct ImputationPipeline {
     config: Config,
@@ -927,7 +930,8 @@ impl ImputationPipeline {
             for m in 1..n_ref_markers {
                 let pos1 = ref_gt.marker(MarkerIdx::new((m - 1) as u32)).pos;
                 let pos2 = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
-                cumulative += gen_maps.gen_dist(chrom, pos1, pos2);
+                let gen_dist = gen_maps.gen_dist(chrom, pos1, pos2);
+                cumulative += gen_dist.max(MIN_CM_DIST);
                 positions.push(cumulative);
             }
             std::sync::Arc::new(positions)
