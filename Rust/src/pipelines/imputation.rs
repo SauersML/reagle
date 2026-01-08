@@ -871,13 +871,38 @@ impl ImputationPipeline {
         let n_genotyped = genotyped_markers_vec.len();
         let n_to_impute = n_ref_markers - n_genotyped;
 
+        // Compute cumulative genetic positions for ALL reference markers
+        // MATCHES JAVA: ImpData.cumPos()
+        // - Enforces minimal genetic distance between markers (1e-7 cM) to prevent zero-length intervals
+        // - This is critical for numerical stability in interpolation and HMM
+        let gen_positions: std::sync::Arc<Vec<f64>> = {
+            let mut positions = Vec::with_capacity(n_ref_markers);
+            let mut cumulative = 0.0f64;
+            // Java starts with 0.0 (relative to first marker)
+            positions.push(0.0);
+
+            let mut last_gen_pos = gen_maps.gen_pos(chrom, ref_gt.marker(MarkerIdx::new(0)).pos);
+            const MIN_CM_DIST: f64 = 1e-7;
+
+            for m in 1..n_ref_markers {
+                let pos = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
+                let curr_gen_pos = gen_maps.gen_pos(chrom, pos);
+
+                // Java: Math.max(Math.abs(genPos - lastGenPos), MIN_CM_DIST)
+                let dist = (curr_gen_pos - last_gen_pos).abs().max(MIN_CM_DIST);
+
+                cumulative += dist;
+                positions.push(cumulative);
+                last_gen_pos = curr_gen_pos;
+            }
+            std::sync::Arc::new(positions)
+        };
+
         // Compute genetic positions at genotyped markers only (for projected PBWT)
+        // derived from the cumulative positions to ensure consistency
         let projected_gen_positions: Vec<f64> = genotyped_markers_vec
             .iter()
-            .map(|&ref_m| {
-                let pos = ref_gt.marker(MarkerIdx::new(ref_m as u32)).pos;
-                gen_maps.gen_pos(chrom, pos)
-            })
+            .map(|&ref_m| gen_positions[ref_m])
             .collect();
 
         // Build coded reference panel in PROJECTED space (genotyped markers only)
@@ -917,21 +942,6 @@ impl ImputationPipeline {
 
         eprintln!("Running imputation with dynamic state selection...");
         let n_states = self.params.n_states;
-
-        // Compute cumulative genetic positions for ALL reference markers
-        // Wrapped in Arc to share across all haplotypes without cloning
-        let gen_positions: std::sync::Arc<Vec<f64>> = {
-            let mut positions = Vec::with_capacity(n_ref_markers);
-            let mut cumulative = 0.0f64;
-            positions.push(0.0);
-            for m in 1..n_ref_markers {
-                let pos1 = ref_gt.marker(MarkerIdx::new((m - 1) as u32)).pos;
-                let pos2 = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
-                cumulative += gen_maps.gen_dist(chrom, pos1, pos2);
-                positions.push(cumulative);
-            }
-            std::sync::Arc::new(positions)
-        };
 
         // Compute marker clusters based on genetic distance (matching Java ImpData)
         // Markers within cluster_dist cM are grouped together
