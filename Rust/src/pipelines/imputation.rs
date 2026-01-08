@@ -811,65 +811,60 @@ impl ImputationPipeline {
             n_clusters, n_genotyped, n_to_impute
         );
 
-        // Error rate for each marker: use BASE rate, not scaled by cluster size.
-        //
-        // Java applies cluster-scaled error (errRate * clusterSize) ONCE per cluster.
-        // When Rust runs HMM on individual markers with p_recomb=0 within clusters,
-        // emissions naturally multiply: P(emit cluster | state) = Π P(emit marker | state).
-        //
-        // Using base error rate: P(match cluster) = (1 - ε)^N ≈ 1 - N*ε
-        // This matches Java's single cluster emission of 1 - N*ε.
-        let base_err_rate = self.params.p_mismatch;
-        let per_marker_err: Vec<f32> = vec![base_err_rate; n_genotyped];
-
         // Genotyped markers for interpolation (still needed for StateProbs)
         let genotyped_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(genotyped_markers_vec.clone());
 
-        // Compute recombination probabilities for each genotyped marker.
-        // Within a cluster: p_recomb = 0 (markers are treated as a unit)
-        // At cluster boundaries: p_recomb based on genetic distance between cluster midpoints
+        // Cluster-aggregated HMM: run on C clusters, not M markers.
+        // This matches Java's ImpLSBaum which operates on nClusters, not nMarkers.
         //
-        // This matches Java ImpData.pRecomb() which returns 0 within clusters and
-        // computes recombination between cluster midpoints.
-        let sparse_p_recomb: Vec<f32> = {
-            // Build marker-to-cluster mapping
-            let mut marker_cluster: Vec<usize> = vec![0; n_genotyped];
+        // Benefits:
+        // 1. Faster: C iterations instead of M (typically 10-50x fewer)
+        // 2. Correct math: cluster-scaled error applied ONCE per cluster
+        // 3. Matches Java exactly
+        let base_err_rate = self.params.p_mismatch;
+
+        // Compute cluster midpoints for recombination
+        let cluster_midpoints: Vec<f64> = clusters
+            .iter()
+            .map(|c| {
+                if c.end > c.start {
+                    (gen_positions[genotyped_markers[c.start]]
+                        + gen_positions[genotyped_markers[c.end - 1]])
+                        / 2.0
+                } else {
+                    gen_positions[genotyped_markers[c.start]]
+                }
+            })
+            .collect();
+
+        // Cluster-level recombination probabilities
+        let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain((1..n_clusters).map(|c| {
+                let gen_dist = cluster_midpoints[c] - cluster_midpoints[c - 1];
+                self.params.p_recomb(gen_dist)
+            }))
+            .collect();
+
+        // Cluster-level error probabilities (scaled by cluster size, applied ONCE)
+        let cluster_err: Vec<f32> = clusters
+            .iter()
+            .map(|c| {
+                let size = (c.end - c.start) as f32;
+                (base_err_rate * size).min(0.5)
+            })
+            .collect();
+
+        // Build marker-to-cluster mapping for expanding results
+        let marker_to_cluster: Vec<usize> = {
+            let mut mapping = vec![0usize; n_genotyped];
             for (cluster_idx, cluster) in clusters.iter().enumerate() {
                 for m in cluster.start..cluster.end {
-                    marker_cluster[m] = cluster_idx;
+                    mapping[m] = cluster_idx;
                 }
             }
-
-            // Compute cluster midpoints in genetic position
-            let cluster_midpoints: Vec<f64> = clusters
-                .iter()
-                .map(|c| {
-                    if c.end > c.start {
-                        (gen_positions[genotyped_markers[c.start]]
-                            + gen_positions[genotyped_markers[c.end - 1]])
-                            / 2.0
-                    } else {
-                        gen_positions[genotyped_markers[c.start]]
-                    }
-                })
-                .collect();
-
-            // For each marker, compute recombination from previous marker
-            std::iter::once(0.0f32)
-                .chain((1..n_genotyped).map(|i| {
-                    let prev_cluster = marker_cluster[i - 1];
-                    let curr_cluster = marker_cluster[i];
-                    if curr_cluster == prev_cluster {
-                        // Same cluster: no recombination
-                        0.0
-                    } else {
-                        // Different clusters: recombination between cluster midpoints
-                        let gen_dist = cluster_midpoints[curr_cluster] - cluster_midpoints[prev_cluster];
-                        self.params.p_recomb(gen_dist)
-                    }
-                }))
-                .collect()
+            mapping
         };
+        let marker_to_cluster = std::sync::Arc::new(marker_to_cluster);
 
         // Run imputation for each target haplotype with per-thread workspaces
         let state_probs: Vec<StateProbs> = (0..n_target_haps)
@@ -917,22 +912,54 @@ impl ImputationPipeline {
                         &mut sparse_allele_match,
                     );
 
-                    // Extract sparse target alleles for HMM
-                    let sparse_target_alleles: Vec<u8> = genotyped_markers
+                    // Aggregate marker-level matches into cluster-level matches.
+                    // A state matches a cluster IFF it matches ALL non-missing markers in that cluster.
+                    // This matches Java's pattern-based matching at the cluster level.
+                    let cluster_allele_match: Vec<Vec<bool>> = clusters
                         .iter()
-                        .map(|&m| target_alleles[m])
+                        .map(|cluster| {
+                            (0..actual_n_states)
+                                .map(|k| {
+                                    // Check if state k matches all markers in this cluster
+                                    (cluster.start..cluster.end).all(|m| {
+                                        // Missing target alleles (255) are treated as matching
+                                        let target_allele = genotyped_markers
+                                            .get(m)
+                                            .and_then(|&ref_m| target_alleles.get(ref_m))
+                                            .copied()
+                                            .unwrap_or(255);
+                                        target_allele == 255 || sparse_allele_match[m][k]
+                                    })
+                                })
+                                .collect()
+                        })
                         .collect();
 
-                    // Run forward-backward HMM on GENOTYPED markers only (~100x faster)
-                    // Uses per-marker error probabilities (scaled by cluster size)
-                    let hmm_state_probs = run_hmm_forward_backward(
-                        &sparse_target_alleles,
-                        &sparse_allele_match,
-                        &sparse_p_recomb,
-                        &per_marker_err,
+                    // Run forward-backward HMM on CLUSTERS (matches Java ImpLSBaum)
+                    // This is faster (C iterations vs M) and uses correct math
+                    let cluster_state_probs = run_hmm_forward_backward_clusters(
+                        &cluster_allele_match,
+                        &cluster_p_recomb,
+                        &cluster_err,
                         actual_n_states,
                         workspace,
                     );
+
+                    // Expand cluster-level state probs to marker-level
+                    // All markers in a cluster get the same state probabilities
+                    let n_genotyped_local = genotyped_markers.len();
+                    let hmm_state_probs: Vec<f32> = (0..n_genotyped_local)
+                        .flat_map(|m| {
+                            let cluster_idx = marker_to_cluster[m];
+                            let cluster_offset = cluster_idx * actual_n_states;
+                            (0..actual_n_states).map(move |k| {
+                                cluster_state_probs
+                                    .get(cluster_offset + k)
+                                    .copied()
+                                    .unwrap_or(1.0 / actual_n_states as f32)
+                            })
+                        })
+                        .collect();
 
                     // Create StateProbs with interpolation support
                     StateProbs::new(
@@ -1175,6 +1202,126 @@ fn run_hmm_forward_backward(
             bwd_sum = 0.0;
             for k in 0..n_states.min(matches.len()) {
                 let emit = if matches[k] { p_match } else { p_err };
+                bwd[k] *= emit;
+                bwd_sum += bwd[k];
+            }
+        }
+    }
+
+    fwd
+}
+
+/// Run forward-backward HMM on CLUSTERS (matches Java ImpLSBaum exactly)
+///
+/// This is the cluster-aggregated version that:
+/// 1. Operates on C clusters instead of M markers (10-50x faster)
+/// 2. Uses cluster-scaled error probability ONCE per cluster
+/// 3. Matches Java's exact mathematical model
+///
+/// # Arguments
+/// * `cluster_allele_match` - For each cluster, whether each state matches (all markers must match)
+/// * `p_recomb` - Per-cluster recombination probabilities
+/// * `p_err` - Per-cluster error probabilities (base_err * cluster_size)
+/// * `n_states` - Number of HMM states
+/// * `workspace` - Reusable workspace for temporary storage
+///
+/// # Returns
+/// Flat array of state probabilities: cluster_state_probs[c * n_states + k] = P(state k | cluster c)
+fn run_hmm_forward_backward_clusters(
+    cluster_allele_match: &[Vec<bool>],
+    p_recomb: &[f32],
+    p_err: &[f32],
+    n_states: usize,
+    workspace: &mut ImpWorkspace,
+) -> Vec<f32> {
+    let n_clusters = cluster_allele_match.len();
+    if n_clusters == 0 || n_states == 0 {
+        return Vec::new();
+    }
+
+    // Ensure workspace is sized correctly
+    workspace.resize(n_states, n_clusters);
+
+    let default_err = if p_err.is_empty() { 0.001 } else { p_err[0] };
+
+    // Forward pass
+    let total_size = n_clusters * n_states;
+    let mut fwd: Vec<f32> = vec![0.0; total_size];
+    let mut fwd_sum = 1.0f32;
+
+    for c in 0..n_clusters {
+        let p_rec = p_recomb.get(c).copied().unwrap_or(0.0);
+        let shift = p_rec / n_states as f32;
+        let scale = (1.0 - p_rec) / fwd_sum;
+
+        let cluster_err = p_err.get(c).copied().unwrap_or(default_err);
+        let p_match = 1.0 - cluster_err;
+
+        let mut new_sum = 0.0f32;
+        let matches = &cluster_allele_match[c];
+        let row_offset = c * n_states;
+        let prev_row_offset = if c > 0 { (c - 1) * n_states } else { 0 };
+
+        for k in 0..n_states.min(matches.len()) {
+            let emit = if matches[k] { p_match } else { cluster_err };
+
+            let val = if c == 0 {
+                emit
+            } else {
+                emit * (scale * fwd[prev_row_offset + k] + shift)
+            };
+
+            fwd[row_offset + k] = val;
+            new_sum += val;
+        }
+        fwd_sum = new_sum;
+    }
+
+    // Backward pass
+    let bwd = &mut workspace.bwd;
+    bwd.resize(n_states, 0.0);
+    bwd.fill(1.0 / n_states as f32);
+    let mut bwd_sum = 1.0f32;
+
+    for c in (0..n_clusters).rev() {
+        let row_offset = c * n_states;
+
+        let p_rec = if c < n_clusters - 1 {
+            p_recomb.get(c + 1).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let shift = p_rec / n_states as f32;
+        let scale = (1.0 - p_rec) / bwd_sum;
+
+        for k in 0..n_states {
+            bwd[k] = scale * bwd[k] + shift;
+        }
+
+        // Compute posterior: fwd * bwd
+        let mut state_sum = 0.0f32;
+        for k in 0..n_states {
+            let idx = row_offset + k;
+            fwd[idx] *= bwd[k];
+            state_sum += fwd[idx];
+        }
+
+        // Normalize
+        if state_sum > 0.0 {
+            let inv_sum = 1.0 / state_sum;
+            for k in 0..n_states {
+                fwd[row_offset + k] *= inv_sum;
+            }
+        }
+
+        // Apply emission for next backward iteration
+        if c > 0 {
+            let matches = &cluster_allele_match[c];
+            let cluster_err = p_err.get(c).copied().unwrap_or(default_err);
+            let p_match = 1.0 - cluster_err;
+            bwd_sum = 0.0;
+            for k in 0..n_states.min(matches.len()) {
+                let emit = if matches[k] { p_match } else { cluster_err };
                 bwd[k] *= emit;
                 bwd_sum += bwd[k];
             }
