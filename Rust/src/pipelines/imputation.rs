@@ -1292,14 +1292,15 @@ impl ImputationPipeline {
             let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                 ref_gt_for_dosage.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
             };
-            let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
-            let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+            let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+            let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
             post1.dosage() + post2.dosage()
         };
 
         // Streaming closure: compute posteriors on-the-fly
         // Note: Uses separate cursor set since called after get_dosage for same (m, s)
-        let get_posteriors: Option<Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>> =
+        type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
+        let get_posteriors: Option<GetPosteriorsFn> =
             if need_allele_probs {
                 let cursors_post: RefCell<Vec<StateProbsCursor>> = RefCell::new(
                     state_probs.iter().map(|sp| sp.cursor()).collect()
@@ -1317,8 +1318,8 @@ impl ImputationPipeline {
                     let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                         ref_gt_for_post.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
-                    let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
-                    let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+                    let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+                    let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
                     (post1, post2)
                 }))
             } else {
