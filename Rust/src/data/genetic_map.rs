@@ -34,28 +34,6 @@ pub struct GeneticMap {
 }
 
 impl GeneticMap {
-    /// Create a new genetic map (test-only)
-    #[cfg(test)]
-    pub fn new(chrom: ChromIdx, positions: Vec<u32>, gen_positions: Vec<f64>) -> Self {
-        assert_eq!(positions.len(), gen_positions.len());
-        assert!(positions.windows(2).all(|w| w[0] <= w[1]));
-        Self {
-            chrom,
-            positions,
-            gen_positions,
-        }
-    }
-
-    /// Create an empty genetic map (uses default rate, test-only)
-    #[cfg(test)]
-    pub fn empty(chrom: ChromIdx) -> Self {
-        Self {
-            chrom,
-            positions: Vec::new(),
-            gen_positions: Vec::new(),
-        }
-    }
-
     /// Load from PLINK format map file
     ///
     /// Format: chrom position_bp rate_cM_per_Mb position_cM
@@ -374,6 +352,14 @@ mod tests {
     use super::*;
     use crate::data::marker::{Allele, Marker};
 
+    /// Get the path to the PLINK genetic map fixture
+    fn fixture_map_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("test_genetic_map.map")
+    }
+
     fn make_test_markers() -> Markers {
         let mut markers = Markers::new();
         markers.add_chrom("chr1");
@@ -394,13 +380,11 @@ mod tests {
 
     #[test]
     fn test_interpolation() {
-        let map = GeneticMap::new(
-            ChromIdx::new(0),
-            vec![1_000_000, 2_000_000, 3_000_000],
-            vec![0.0, 1.0, 2.5],
-        );
+        // Use production from_plink_file() to load the map
+        let map = GeneticMap::from_plink_file(fixture_map_path().as_path(), "chr1")
+            .expect("Failed to load PLINK map fixture");
 
-        // Exact positions
+        // Exact positions (from fixture: 1Mb=0.0, 2Mb=1.0, 3Mb=2.5)
         assert!((map.gen_pos(1_000_000) - 0.0).abs() < 0.001);
         assert!((map.gen_pos(2_000_000) - 1.0).abs() < 0.001);
         assert!((map.gen_pos(3_000_000) - 2.5).abs() < 0.001);
@@ -412,29 +396,37 @@ mod tests {
 
     #[test]
     fn test_extrapolation() {
-        let map = GeneticMap::new(ChromIdx::new(0), vec![1_000_000, 2_000_000], vec![1.0, 2.0]);
+        let map = GeneticMap::from_plink_file(fixture_map_path().as_path(), "chr1")
+            .expect("Failed to load PLINK map fixture");
 
-        // Before first position
+        // Before first position (should extrapolate)
         let before = map.gen_pos(500_000);
-        assert!(before < 1.0);
+        assert!(before < 0.0, "Position before first marker should extrapolate to < 0");
 
-        // After last position
-        let after = map.gen_pos(2_500_000);
-        assert!(after > 2.0);
+        // After last position (should extrapolate)
+        let after = map.gen_pos(3_500_000);
+        assert!(after > 2.5, "Position after last marker should extrapolate to > 2.5");
     }
 
     #[test]
-    fn test_empty_map() {
-        let map = GeneticMap::empty(ChromIdx::new(0));
-        // Should use default rate of 1 cM per Mb
+    fn test_empty_map_for_missing_chrom() {
+        // Load map for a chromosome that doesn't exist - should return empty map
+        let map = GeneticMap::from_plink_file(fixture_map_path().as_path(), "chr99")
+            .expect("Loading map for missing chrom should succeed with empty positions");
+        
+        // Empty map should use default rate of 1 cM per Mb
         assert!((map.gen_pos(1_000_000) - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn test_gen_dist() {
-        let map = GeneticMap::new(ChromIdx::new(0), vec![1_000_000, 2_000_000], vec![0.0, 1.0]);
+        let map = GeneticMap::from_plink_file(fixture_map_path().as_path(), "chr1")
+            .expect("Failed to load PLINK map fixture");
 
+        // Distance from 1Mb (0.0 cM) to 2Mb (1.0 cM) = 1.0 cM
         assert!((map.gen_dist(1_000_000, 2_000_000) - 1.0).abs() < 0.001);
+        
+        // Distance from 1Mb to 1.5Mb (interpolated to 0.5 cM) = 0.5 cM
         assert!((map.gen_dist(1_000_000, 1_500_000) - 0.5).abs() < 0.001);
     }
 
@@ -462,5 +454,20 @@ mod tests {
 
         assert!((pm.gen_pos(1_000_000) - 1.0).abs() < 0.001);
         assert!((pm.gen_pos(2_000_000) - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_genetic_maps_collection() {
+        // Test the GeneticMaps collection with from_plink_file
+        let chrom_names = ["chr1"];
+        let maps = GeneticMaps::from_plink_file(fixture_map_path().as_path(), &chrom_names)
+            .expect("Failed to load maps");
+
+        // Should have loaded chr1
+        assert!(maps.get(ChromIdx::new(0)).is_some());
+        
+        // Test gen_pos through collection
+        let pos = maps.gen_pos(ChromIdx::new(0), 1_500_000);
+        assert!((pos - 0.5).abs() < 0.001);
     }
 }
