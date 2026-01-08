@@ -1422,8 +1422,8 @@ fn run_hmm_forward_backward_clusters(
     // Backward pass
     let bwd = &mut workspace.bwd;
     bwd.resize(n_states, 0.0);
-    bwd.fill(1.0 / n_states as f32);
-    let mut bwd_sum = 1.0f32;
+    bwd.fill(1.0);
+    let mut bwd_sum = n_states as f32;
 
     for c in (0..n_clusters).rev() {
         let row_offset = c * n_states;
