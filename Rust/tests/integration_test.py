@@ -277,7 +277,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     confusion = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
     
     # Per-sample tracking
-    sample_metrics = defaultdict(lambda: {"concordant": 0, "total": 0, "truth_dos": [], "imp_dos": []})
+    sample_metrics = defaultdict(lambda: {
+        "concordant": 0, "total": 0, "truth_dos": [], "imp_dos": [],
+        "switch_errors": 0, "switch_opportunities": 0
+    })
 
     # For IQS calculation: track per-site concordance and expected concordance
     site_iqs_values = []
@@ -286,11 +289,26 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     switch_errors = 0
     switch_opportunities = 0
 
-    # MAF bins for stratified analysis
+    # MAF bins for stratified analysis - FINER BINS for rare variants
+    def get_maf_bin(maf):
+        if maf < 0.001:
+            return "ultra-rare (<0.1%)"
+        elif maf < 0.005:
+            return "very-rare (0.1-0.5%)"
+        elif maf < 0.01:
+            return "rare (0.5-1%)"
+        elif maf < 0.05:
+            return "low-freq (1-5%)"
+        elif maf < 0.2:
+            return "medium (5-20%)"
+        else:
+            return "common (>20%)"
+    
     maf_bins = defaultdict(lambda: {
         "unphased_concordant": 0, "total": 0, "truth": [], "imputed": [],
         "iqs_values": [], "nonref_concordant": 0, "nonref_total": 0,
-        "confusion": [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+        "confusion": [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        "switch_errors": 0, "switch_opportunities": 0
     })
 
     common_sites = set(truth_gts.keys()) & set(imputed_gts.keys())
@@ -300,7 +318,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     sorted_sites = sorted(common_sites, key=lambda x: (x[0], x[1]))
     
     # Track previous het for switch error calculation per sample
-    prev_het = {}  # sample -> (site, truth_gt, imputed_gt)
+    prev_het = {}  # sample -> (site, truth_gt, imputed_gt, maf_bin)
 
     for site in sorted_sites:
         truth_site = truth_gts[site]
@@ -314,15 +332,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         else:
             maf = 0
 
-        # Determine MAF bin
-        if maf < 0.01:
-            maf_bin = "rare (<1%)"
-        elif maf < 0.05:
-            maf_bin = "low (1-5%)"
-        elif maf < 0.2:
-            maf_bin = "medium (5-20%)"
-        else:
-            maf_bin = "common (>20%)"
+        # Determine MAF bin using finer categories
+        maf_bin = get_maf_bin(maf)
 
         # Track per-site concordance for IQS
         site_concordant = 0
@@ -374,15 +385,19 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     # Switch error detection (for hets only, when both are phased)
                     if t_dos == 1 and i_dos == 1 and t_phased and i_phased:
                         if sample in prev_het:
-                            prev_site, prev_t_gt, prev_i_gt = prev_het[sample]
+                            prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample]
                             # Determine if there's a switch by comparing phase relationships
                             # If truth maintains same phase but imputed flips, it's a switch
                             t_same_phase = (t_gt[0] == prev_t_gt[0])  # First allele same as prev first
                             i_same_phase = (i_gt[0] == prev_i_gt[0])
                             if t_same_phase != i_same_phase:
                                 switch_errors += 1
+                                sample_metrics[sample]["switch_errors"] += 1
+                                maf_bins[maf_bin]["switch_errors"] += 1
                             switch_opportunities += 1
-                        prev_het[sample] = (site, t_gt, i_gt)
+                            sample_metrics[sample]["switch_opportunities"] += 1
+                            maf_bins[maf_bin]["switch_opportunities"] += 1
+                        prev_het[sample] = (site, t_gt, i_gt, maf_bin)
 
         # Calculate IQS for this site
         # IQS = (observed - expected) / (1 - expected)
@@ -513,7 +528,22 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 # IQS per bin
                 if data["iqs_values"]:
                     bin_metrics["iqs"] = sum(data["iqs_values"]) / len(data["iqs_values"])
+                # Switch error rate per bin
+                if data["switch_opportunities"] > 0:
+                    bin_metrics["switch_error_rate"] = data["switch_errors"] / data["switch_opportunities"]
+                    bin_metrics["switch_errors"] = data["switch_errors"]
+                    bin_metrics["switch_opportunities"] = data["switch_opportunities"]
                 metrics["by_maf"][maf_bin] = bin_metrics
+        
+        # Per-sample switch error summary
+        sample_switch_rates = []
+        for sample, data in sample_metrics.items():
+            if data["switch_opportunities"] > 0:
+                sample_switch_rates.append(data["switch_errors"] / data["switch_opportunities"])
+        if sample_switch_rates:
+            metrics["sample_switch_error_mean"] = sum(sample_switch_rates) / len(sample_switch_rates)
+            metrics["sample_switch_error_max"] = max(sample_switch_rates)
+            metrics["sample_switch_error_min"] = min(sample_switch_rates)
 
     elapsed = time.time() - start_time
     metrics["calculation_time_sec"] = elapsed
@@ -559,17 +589,24 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             print(f"   Concordance: mean={metrics['sample_concordance_mean']:.4f}, min={metrics['sample_concordance_min']:.4f}, max={metrics['sample_concordance_max']:.4f}")
         if metrics.get('sample_r2_mean'):
             print(f"   R²:          mean={metrics['sample_r2_mean']:.4f}, min={metrics['sample_r2_min']:.4f}")
+        if metrics.get('sample_switch_error_mean') is not None:
+            print(f"   Switch Err:  mean={metrics['sample_switch_error_mean']:.4f}, min={metrics['sample_switch_error_min']:.4f}, max={metrics['sample_switch_error_max']:.4f}")
 
         if "by_maf" in metrics:
-            print(f"\n📈 BY MAF BIN")
-            print(f"   {'MAF Bin':<15} {'Conc':>8} {'NonRef':>8} {'R²':>8} {'IQS':>8} {'N':>10}")
-            print(f"   {'-'*15} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*10}")
-            for maf_bin, bin_metrics in metrics["by_maf"].items():
-                conc = f"{bin_metrics['unphased_concordance']:.4f}"
-                nonref = f"{bin_metrics.get('nonref_concordance', 0):.4f}" if bin_metrics.get('nonref_concordance') else "N/A"
-                r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
-                iqs_str = f"{bin_metrics.get('iqs'):.4f}" if bin_metrics.get('iqs') else "N/A"
-                print(f"   {maf_bin:<15} {conc:>8} {nonref:>8} {r2_str:>8} {iqs_str:>8} {bin_metrics['n_genotypes']:>10,}")
+            print(f"\n📈 BY MAF BIN (sorted by frequency)")
+            print(f"   {'MAF Bin':<20} {'Conc':>8} {'NonRef':>8} {'R²':>8} {'SwitchErr':>10} {'N':>10}")
+            print(f"   {'-'*20} {'-'*8} {'-'*8} {'-'*8} {'-'*10} {'-'*10}")
+            # Sort by actual frequency order
+            bin_order = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)", 
+                        "low-freq (1-5%)", "medium (5-20%)", "common (>20%)"]
+            for maf_bin in bin_order:
+                if maf_bin in metrics["by_maf"]:
+                    bin_metrics = metrics["by_maf"][maf_bin]
+                    conc = f"{bin_metrics['unphased_concordance']:.4f}"
+                    nonref = f"{bin_metrics.get('nonref_concordance', 0):.4f}" if bin_metrics.get('nonref_concordance') else "N/A"
+                    r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
+                    switch_str = f"{bin_metrics.get('switch_error_rate'):.4f}" if bin_metrics.get('switch_error_rate') is not None else "N/A"
+                    print(f"   {maf_bin:<20} {conc:>8} {nonref:>8} {r2_str:>8} {switch_str:>10} {bin_metrics['n_genotypes']:>10,}")
 
     # Save detailed metrics to file
     metrics_file = f"{output_prefix}_metrics.txt"
