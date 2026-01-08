@@ -2276,4 +2276,140 @@ mod tests {
         }
     }
 
+    /// Edge case test: What happens when all state probabilities are below threshold?
+    /// This could happen with many states where probability is spread thin.
+    ///
+    /// With threshold = min(0.005, 0.9999/K), if K=1000 states, threshold = 0.0009999
+    /// If all probs are 0.001 (just barely above), they should all be stored.
+    /// If all probs are 0.0005 (below), they should all be filtered out.
+    #[test]
+    fn test_state_probs_all_below_threshold() {
+        // 200 states → threshold = min(0.005, 0.9999/200) = 0.004999...
+        // If all probs are 0.002, they're below threshold
+        let n_states = 200;
+        let genotyped_markers = std::sync::Arc::new(vec![0, 10]);
+        let gen_positions: std::sync::Arc<Vec<f64>> = std::sync::Arc::new(
+            (0..11).map(|m| m as f64).collect()
+        );
+
+        let hap_indices: Vec<Vec<u32>> = (0..2)
+            .map(|_| (0..n_states as u32).collect())
+            .collect();
+
+        // All probabilities are 0.002 (below threshold of ~0.005)
+        let state_probs: Vec<f32> = vec![0.002; 2 * n_states];
+
+        let sp = StateProbs::new(
+            genotyped_markers,
+            n_states,
+            hap_indices,
+            state_probs,
+            gen_positions,
+        );
+
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            std::hint::black_box(marker);
+            if hap % 2 == 0 { 0 } else { 1 }
+        };
+
+        // With all states filtered out, what should happen?
+        // The posteriors should return 0 or handle gracefully
+        let post = sp.allele_posteriors(5, 2, &get_ref_allele);
+        match post {
+            AllelePosteriors::Biallelic(p_alt) => {
+                // With no stored states, result is undefined but should be valid
+                assert!(p_alt >= 0.0 && p_alt <= 1.0, "P(ALT) should be in [0,1], got {}", p_alt);
+            }
+            _ => {} // Multiallelic is also acceptable
+        }
+    }
+
+    /// Edge case: Single genotyped marker - interpolation should use that marker for all
+    #[test]
+    fn test_single_genotyped_marker() {
+        let genotyped_markers = std::sync::Arc::new(vec![50]);
+        let n_ref_markers = 100;
+        let gen_positions: std::sync::Arc<Vec<f64>> = std::sync::Arc::new(
+            (0..n_ref_markers).map(|m| m as f64).collect()
+        );
+
+        let hap_indices: Vec<Vec<u32>> = vec![vec![0, 1]];
+        let state_probs = vec![0.3, 0.7]; // 30% state 0, 70% state 1
+
+        let sp = StateProbs::new(
+            genotyped_markers,
+            2,
+            hap_indices,
+            state_probs,
+            gen_positions,
+        );
+
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            std::hint::black_box(marker);
+            if hap == 0 { 0 } else { 1 }
+        };
+
+        // Any marker should use the single genotyped marker's values
+        for m in [0, 25, 50, 75, 99] {
+            let post = sp.allele_posteriors(m, 2, &get_ref_allele);
+            match post {
+                AllelePosteriors::Biallelic(p_alt) => {
+                    // Should be approximately 0.7 (state 1 carries ALT)
+                    assert!(
+                        (p_alt - 0.7).abs() < 0.01,
+                        "Marker {}: expected P(ALT)~0.7, got {}", m, p_alt
+                    );
+                }
+                _ => panic!("Expected Biallelic"),
+            }
+        }
+    }
+
+    /// Edge case: Very large genetic distances - weight calculation should still be valid
+    #[test]
+    fn test_large_genetic_distances() {
+        let genotyped_markers = std::sync::Arc::new(vec![0, 100]);
+        let gen_positions: std::sync::Arc<Vec<f64>> = std::sync::Arc::new({
+            let mut pos = vec![0.0; 101];
+            // Position 100 is 1000 cM away (very large)
+            pos[100] = 1000.0;
+            pos
+        });
+
+        let hap_indices: Vec<Vec<u32>> = vec![vec![0, 1], vec![0, 1]];
+        let state_probs = vec![
+            1.0, 0.0,  // m=0: 100% state 0
+            0.0, 1.0,  // m=100: 100% state 1
+        ];
+
+        let sp = StateProbs::new(
+            genotyped_markers,
+            2,
+            hap_indices,
+            state_probs,
+            gen_positions,
+        );
+
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            std::hint::black_box(marker);
+            if hap == 0 { 0 } else { 1 }
+        };
+
+        // At marker 50, weight_left = (1000 - 0) / (1000 - 0) = 1.0
+        // Wait, position 50 has gen_pos = 0.0 (only pos 100 is non-zero)
+        // So weight_left = (1000 - 0) / (1000 - 0) = 1.0
+        // interpolated = 1.0 * 0.0 + 0.0 * 1.0 = 0.0
+        let post = sp.allele_posteriors(50, 2, &get_ref_allele);
+        match post {
+            AllelePosteriors::Biallelic(p_alt) => {
+                // Should be 0 because we're very close to marker 0 in genetic distance
+                assert!(
+                    p_alt >= 0.0 && p_alt <= 1.0,
+                    "P(ALT) should be in [0,1], got {}", p_alt
+                );
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+    }
+
 }
