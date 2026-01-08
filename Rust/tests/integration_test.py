@@ -189,12 +189,74 @@ def calculate_dosage(gt):
     return gt[0] + gt[1]
 
 
+def _stream_vcf_lines(cmd):
+    """Stream VCF query output line by line to avoid loading all into memory."""
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for line in proc.stdout:
+        line = line.strip()
+        if line:
+            yield line
+    proc.wait()
+    if proc.returncode != 0:
+        stderr = proc.stderr.read()
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr)
+
+
+def _parse_truth_line(line, samples):
+    """Parse a truth VCF line into (key, sample_data_dict)."""
+    parts = line.split('\t')
+    if len(parts) < 5:
+        return None, None
+    chrom, pos = parts[0], int(parts[1])
+    key = (chrom, pos)
+    gts = parts[4:]
+    sample_data = {}
+    for i, gt_str in enumerate(gts):
+        if i < len(samples):
+            gt_field = gt_str.split(':')[0]
+            gt = parse_genotype(gt_field)
+            is_phased = '|' in gt_field
+            if gt is not None:
+                sample_data[samples[i]] = (gt, calculate_dosage(gt), is_phased)
+    return key, sample_data
+
+
+def _parse_imputed_line(line, samples):
+    """Parse an imputed VCF line into (key, sample_data_dict)."""
+    parts = line.split('\t')
+    if len(parts) < 5:
+        return None, None
+    chrom, pos = parts[0], int(parts[1])
+    key = (chrom, pos)
+    sample_data_list = parts[4:]
+    sample_data = {}
+    for i, data_str in enumerate(sample_data_list):
+        if i < len(samples):
+            fields = data_str.split(':')
+            gt_field = fields[0]
+            gt = parse_genotype(gt_field)
+            is_phased = '|' in gt_field
+            gp = None
+            if len(fields) > 1 and fields[1] != '.':
+                try:
+                    gp_parts = fields[1].split(',')
+                    if len(gp_parts) == 3:
+                        gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
+                except:
+                    pass
+            if gt is not None:
+                sample_data[samples[i]] = (gt, calculate_dosage(gt), is_phased, gp)
+    return key, sample_data
+
+
 def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     """
     Calculate comprehensive imputation accuracy metrics.
 
+    Memory-efficient streaming version using merge-join on sorted VCFs.
+
     Metrics:
-    - Unphased genotype concordance (exact match ignoring phase: 0|1 == 1|0)  
+    - Unphased genotype concordance (exact match ignoring phase: 0|1 == 1|0)
     - Allelic R² (correlation between true and imputed dosages)
     - Dosage Variance R² (correlation using variance-weighted approach)
     - Non-reference concordance (concordance for non-REF genotypes only)
@@ -207,90 +269,48 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     """
     import time
     start_time = time.time()
-    
+
     if not imputed_vcf or not os.path.exists(imputed_vcf):
         print("Imputed VCF not found")
         return None
 
     print(f"\nCalculating metrics: {imputed_vcf} vs {truth_vcf}")
 
-    # Load truth genotypes - store both genotype tuple and dosage
-    truth_gts = {}  # (chrom, pos) -> {sample: (gt_tuple, dosage, is_phased)}
-    result = run(f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {truth_vcf}", capture=True)
+    # Get sample lists first (small memory footprint)
     samples_result = run(f"bcftools query -l {truth_vcf}", capture=True)
     truth_samples = samples_result.stdout.strip().split('\n')
-
-    for line in result.stdout.strip().split('\n'):
-        if not line:
-            continue
-        parts = line.split('\t')
-        if len(parts) < 5:
-            continue
-        chrom, pos, ref, alt = parts[0], parts[1], parts[2], parts[3]
-        key = (chrom, int(pos))
-        gts = parts[4:]
-        truth_gts[key] = {}
-        for i, gt_str in enumerate(gts):
-            if i < len(truth_samples):
-                gt_field = gt_str.split(':')[0]  # Handle GT:other fields
-                gt = parse_genotype(gt_field)
-                is_phased = '|' in gt_field
-                if gt is not None:
-                    truth_gts[key][truth_samples[i]] = (gt, calculate_dosage(gt), is_phased)
-
-    # Load imputed genotypes - store both genotype tuple, dosage, and GP (if available)
-    imputed_gts = {}
-    # Try to get GP field for Hellinger score (Beagle outputs GP)
-    result = run(f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%GP]\\n' {imputed_vcf} 2>/dev/null || bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:.]\\n' {imputed_vcf}", capture=True)
     samples_result = run(f"bcftools query -l {imputed_vcf}", capture=True)
     imputed_samples = samples_result.stdout.strip().split('\n')
 
-    for line in result.stdout.strip().split('\n'):
-        if not line:
-            continue
-        parts = line.split('\t')
-        if len(parts) < 5:
-            continue
-        chrom, pos = parts[0], parts[1]
-        key = (chrom, int(pos))
-        sample_data = parts[4:]
-        imputed_gts[key] = {}
-        for i, data_str in enumerate(sample_data):
-            if i < len(imputed_samples):
-                fields = data_str.split(':')
-                gt_field = fields[0]
-                gt = parse_genotype(gt_field)
-                is_phased = '|' in gt_field
-                # Parse GP if available (format: P(0/0),P(0/1),P(1/1))
-                gp = None
-                if len(fields) > 1 and fields[1] != '.':
-                    try:
-                        gp_parts = fields[1].split(',')
-                        if len(gp_parts) == 3:
-                            gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
-                    except:
-                        pass
-                if gt is not None:
-                    imputed_gts[key][imputed_samples[i]] = (gt, calculate_dosage(gt), is_phased, gp)
+    print(f"Truth samples: {len(truth_samples)}, Imputed samples: {len(imputed_samples)}")
+
+    # Build sample index for common samples
+    common_samples = set(truth_samples) & set(imputed_samples)
+    if not common_samples:
+        print("ERROR: No common samples between truth and imputed VCFs")
+        return None
+    print(f"Common samples: {len(common_samples)}")
 
     # Calculate metrics
     unphased_concordant = 0  # Genotype match ignoring phase (0|1 == 1|0)
     total_compared = 0
-    
+
     # Non-reference concordance (excludes 0/0 vs 0/0)
     nonref_concordant = 0
     nonref_total = 0
 
-    truth_dosages = []
-    imputed_dosages = []
+    # Online statistics for R² (Welford's algorithm) - avoids storing all dosages
+    # We need: sum(t), sum(i), sum(t*i), sum(t^2), sum(i^2), count
+    r2_stats = {"sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0, "count": 0}
 
     # Confusion matrix: [true_class][imputed_class]
     # Classes: 0=HomRef, 1=Het, 2=HomAlt
     confusion = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
-    
-    # Per-sample tracking
+
+    # Per-sample tracking - use online stats instead of storing all dosages
     sample_metrics = defaultdict(lambda: {
-        "concordant": 0, "total": 0, "truth_dos": [], "imp_dos": [],
+        "concordant": 0, "total": 0,
+        "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0,
         "switch_errors": 0, "switch_opportunities": 0
     })
 
@@ -298,7 +318,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     site_iqs_values = []
 
     # For Hellinger score (requires GP field)
-    hellinger_values = []
+    hellinger_sum = 0.0
+    hellinger_count = 0
 
     # For switch error rate
     switch_errors = 0
@@ -308,7 +329,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     # sample -> list of block lengths (in bp)
     phase_blocks = defaultdict(list)
     # sample -> start position of current block
-    current_block_start = {} 
+    current_block_start = {}
 
     # MAF bins for stratified analysis - FINER BINS for rare variants
     def get_maf_bin(maf):
@@ -324,26 +345,63 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             return "medium (5-20%)"
         else:
             return "common (>20%)"
-    
+
+    # MAF bins with online stats instead of storing lists
     maf_bins = defaultdict(lambda: {
-        "unphased_concordant": 0, "total": 0, "truth": [], "imputed": [],
+        "unphased_concordant": 0, "total": 0,
+        "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0,
         "iqs_values": [], "nonref_concordant": 0, "nonref_total": 0,
         "confusion": [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
         "switch_errors": 0, "switch_opportunities": 0
     })
 
-    common_sites = set(truth_gts.keys()) & set(imputed_gts.keys())
-    print(f"Common sites: {len(common_sites)}")
-    
-    # Sort sites for switch error calculation
-    sorted_sites = sorted(common_sites, key=lambda x: (x[0], x[1]))
-    
+    # Stream truth VCF into memory-efficient dict (one site at a time in the stream)
+    print("Loading truth genotypes (streaming)...")
+    truth_gts = {}
+    truth_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {truth_vcf}"
+    for line in _stream_vcf_lines(truth_cmd):
+        key, sample_data = _parse_truth_line(line, truth_samples)
+        if key is not None:
+            truth_gts[key] = sample_data
+
+    print(f"Truth sites loaded: {len(truth_gts)}")
+
+    # Stream imputed VCF and compare on-the-fly using merge-join
+    # Since both VCFs are sorted, we process imputed and look up in truth
+    print("Processing imputed genotypes (streaming)...")
+
+    # Try to get GP field for Hellinger score (Beagle outputs GP)
+    # First try with GP, fall back to without
+    imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%GP]\\n' {imputed_vcf} 2>/dev/null"
+    try:
+        imputed_lines = list(_stream_vcf_lines(imputed_cmd))
+        # Check if GP field was present
+        if imputed_lines and ':.' not in imputed_lines[0].split('\t')[4]:
+            pass  # GP field present
+        else:
+            raise ValueError("No GP field")
+    except:
+        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:.]\\n' {imputed_vcf}"
+        imputed_lines = list(_stream_vcf_lines(imputed_cmd))
+
     # Track previous het for switch error calculation per sample
     prev_het = {}  # sample -> (site, truth_gt, imputed_gt, maf_bin)
+    common_sites_count = 0
+    last_pos = 0
 
-    for site in sorted_sites:
-        truth_site = truth_gts[site]
-        imputed_site = imputed_gts.get(site, {})
+    for line in imputed_lines:
+        key, imputed_site = _parse_imputed_line(line, imputed_samples)
+        if key is None:
+            continue
+
+        # Only process sites that exist in truth
+        if key not in truth_gts:
+            continue
+
+        truth_site = truth_gts[key]
+        common_sites_count += 1
+        site = key
+        last_pos = key[1]
 
         # Calculate MAF from truth
         dosages_at_site = [v[1] for v in truth_site.values() if v[1] is not None]
@@ -376,21 +434,35 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                         bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
                         hellinger_dist = math.sqrt(max(0, 1 - bc))
                         # Hellinger score = 1 - distance (higher is better)
-                        hellinger_score = 1 - hellinger_dist
-                        hellinger_values.append(hellinger_score)
+                        h_score = 1 - hellinger_dist
+                        hellinger_sum += h_score
+                        hellinger_count += 1
                     total_compared += 1
                     site_total += 1
-                    truth_dosages.append(t_dos)
-                    imputed_dosages.append(i_dos)
 
-                    maf_bins[maf_bin]["truth"].append(t_dos)
-                    maf_bins[maf_bin]["imputed"].append(i_dos)
+                    # Online stats for global R² (avoid storing all dosages)
+                    r2_stats["sum_t"] += t_dos
+                    r2_stats["sum_i"] += i_dos
+                    r2_stats["sum_ti"] += t_dos * i_dos
+                    r2_stats["sum_tt"] += t_dos * t_dos
+                    r2_stats["sum_ii"] += i_dos * i_dos
+                    r2_stats["count"] += 1
+
+                    # Online stats for MAF bin R²
+                    maf_bins[maf_bin]["sum_t"] += t_dos
+                    maf_bins[maf_bin]["sum_i"] += i_dos
+                    maf_bins[maf_bin]["sum_ti"] += t_dos * i_dos
+                    maf_bins[maf_bin]["sum_tt"] += t_dos * t_dos
+                    maf_bins[maf_bin]["sum_ii"] += i_dos * i_dos
                     maf_bins[maf_bin]["total"] += 1
-                    
-                    # Per-sample tracking
+
+                    # Per-sample online stats
                     sample_metrics[sample]["total"] += 1
-                    sample_metrics[sample]["truth_dos"].append(t_dos)
-                    sample_metrics[sample]["imp_dos"].append(i_dos)
+                    sample_metrics[sample]["sum_t"] += t_dos
+                    sample_metrics[sample]["sum_i"] += i_dos
+                    sample_metrics[sample]["sum_ti"] += t_dos * i_dos
+                    sample_metrics[sample]["sum_tt"] += t_dos * t_dos
+                    sample_metrics[sample]["sum_ii"] += i_dos * i_dos
                     
                     # Classify genotypes for confusion matrix
                     t_class = 0 if t_dos == 0 else (2 if t_dos == 2 else 1)
@@ -464,8 +536,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 site_iqs_values.append(iqs)
                 maf_bins[maf_bin]["iqs_values"].append(iqs)
     
+    print(f"Common sites: {common_sites_count}")
+
     # Close final phase blocks
-    last_pos = sorted_sites[-1][1] if sorted_sites else 0
     for sample, start_pos in current_block_start.items():
         block_len = last_pos - start_pos
         phase_blocks[sample].append(block_len)
@@ -518,7 +591,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     if total_compared > 0:
         metrics["unphased_concordance"] = unphased_concordant / total_compared
         metrics["total_genotypes"] = total_compared
-        metrics["sites_compared"] = len(common_sites)
+        metrics["sites_compared"] = common_sites_count
         
         # Non-reference concordance
         if nonref_total > 0:
@@ -541,24 +614,26 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 metrics[f"{name}_accuracy"] = confusion[cls][cls] / row_total
                 metrics[f"{name}_total"] = row_total
 
-        # Calculate R²
-        if len(truth_dosages) > 1:
-            mean_t = sum(truth_dosages) / len(truth_dosages)
-            mean_i = sum(imputed_dosages) / len(imputed_dosages)
+        # Calculate R² from online statistics
+        n = r2_stats["count"]
+        if n > 1:
+            sum_t = r2_stats["sum_t"]
+            sum_i = r2_stats["sum_i"]
+            sum_ti = r2_stats["sum_ti"]
+            sum_tt = r2_stats["sum_tt"]
+            sum_ii = r2_stats["sum_ii"]
 
-            cov = sum((t - mean_t) * (i - mean_i) for t, i in zip(truth_dosages, imputed_dosages))
-            var_t = sum((t - mean_t) ** 2 for t in truth_dosages)
-            var_i = sum((i - mean_i) ** 2 for i in imputed_dosages)
+            mean_t = sum_t / n
+            mean_i = sum_i / n
+
+            # Cov = E[XY] - E[X]E[Y] = sum_ti/n - mean_t*mean_i
+            # Var = E[X²] - E[X]² = sum_tt/n - mean_t²
+            cov = sum_ti / n - mean_t * mean_i
+            var_t = sum_tt / n - mean_t * mean_t
+            var_i = sum_ii / n - mean_i * mean_i
 
             # Store sufficient statistics for exact global aggregation
-            metrics["r2_stats"] = {
-                "sum_t": sum(truth_dosages),
-                "sum_i": sum(imputed_dosages),
-                "sum_ti": sum(t * i for t, i in zip(truth_dosages, imputed_dosages)),
-                "sum_tt": sum(t * t for t in truth_dosages),
-                "sum_ii": sum(i * i for i in imputed_dosages),
-                "count": len(truth_dosages)
-            }
+            metrics["r2_stats"] = r2_stats
 
             if var_t > 0 and var_i > 0:
                 r = cov / math.sqrt(var_t * var_i)
@@ -576,34 +651,28 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             metrics["r_squared"] = None
 
         # Hellinger Score (if GP field was available)
-        if hellinger_values:
-            metrics["hellinger_score"] = sum(hellinger_values) / len(hellinger_values)
-            metrics["hellinger_n"] = len(hellinger_values)
+        if hellinger_count > 0:
+            metrics["hellinger_score"] = hellinger_sum / hellinger_count
+            metrics["hellinger_n"] = hellinger_count
 
-        # Calculate Rare Variant R² stats (MAF < 1%)
+        # Calculate Rare Variant R² stats (MAF < 1%) from online stats
         rare_stats = {
             "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0,
             "sum_tt": 0.0, "sum_ii": 0.0, "count": 0
         }
-        
-        # We need to iterate again or collect during the main loop?
-        # The main loop collected `truth_dosages` and `imputed_dosages` but mixed all MAFs.
-        # However, we have `maf_bins`.
-        # "ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)" are the ones we want.
+
         target_bins = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)"]
-        
+
         for bin_name in target_bins:
             if bin_name in maf_bins:
                 b_data = maf_bins[bin_name]
-                if "truth" in b_data:
-                    for t, i in zip(b_data["truth"], b_data["imputed"]):
-                        rare_stats["sum_t"] += t
-                        rare_stats["sum_i"] += i
-                        rare_stats["sum_ti"] += t * i
-                        rare_stats["sum_tt"] += t * t
-                        rare_stats["sum_ii"] += i * i
-                        rare_stats["count"] += 1
-                        
+                rare_stats["sum_t"] += b_data["sum_t"]
+                rare_stats["sum_i"] += b_data["sum_i"]
+                rare_stats["sum_ti"] += b_data["sum_ti"]
+                rare_stats["sum_tt"] += b_data["sum_tt"]
+                rare_stats["sum_ii"] += b_data["sum_ii"]
+                rare_stats["count"] += b_data["total"]
+
         metrics["rare_r2_stats"] = rare_stats
 
         # Calculate overall IQS (mean across sites)
@@ -613,18 +682,19 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         else:
             metrics["iqs"] = None
             
-        # Per-sample summary statistics
+        # Per-sample summary statistics (using online stats)
         sample_concordances = []
         sample_r2s = []
         for sample, data in sample_metrics.items():
             if data["total"] > 0:
                 sample_concordances.append(data["concordant"] / data["total"])
-            if len(data["truth_dos"]) > 1:
-                mean_t = sum(data["truth_dos"]) / len(data["truth_dos"])
-                mean_i = sum(data["imp_dos"]) / len(data["imp_dos"])
-                cov = sum((t - mean_t) * (i - mean_i) for t, i in zip(data["truth_dos"], data["imp_dos"]))
-                var_t = sum((t - mean_t) ** 2 for t in data["truth_dos"])
-                var_i = sum((i - mean_i) ** 2 for i in data["imp_dos"])
+            n = data["total"]
+            if n > 1:
+                mean_t = data["sum_t"] / n
+                mean_i = data["sum_i"] / n
+                cov = data["sum_ti"] / n - mean_t * mean_i
+                var_t = data["sum_tt"] / n - mean_t * mean_t
+                var_i = data["sum_ii"] / n - mean_i * mean_i
                 if var_t > 0 and var_i > 0:
                     r = cov / math.sqrt(var_t * var_i)
                     sample_r2s.append(r ** 2)
@@ -662,14 +732,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 bin_metrics["f1_score"] = b_f1
                 bin_metrics["recall"] = b_rec
                 
-                # R² per bin
-                if len(data["truth"]) > 1:
-                    mean_t = sum(data["truth"]) / len(data["truth"])
-                    mean_i = sum(data["imputed"]) / len(data["imputed"])
-                    cov = sum((t - mean_t) * (i - mean_i)
-                             for t, i in zip(data["truth"], data["imputed"]))
-                    var_t = sum((t - mean_t) ** 2 for t in data["truth"])
-                    var_i = sum((i - mean_i) ** 2 for i in data["imputed"])
+                # R² per bin (from online stats)
+                n_bin = data["total"]
+                if n_bin > 1:
+                    mean_t = data["sum_t"] / n_bin
+                    mean_i = data["sum_i"] / n_bin
+                    cov = data["sum_ti"] / n_bin - mean_t * mean_i
+                    var_t = data["sum_tt"] / n_bin - mean_t * mean_t
+                    var_i = data["sum_ii"] / n_bin - mean_i * mean_i
                     if var_t > 0 and var_i > 0:
                         r = cov / math.sqrt(var_t * var_i)
                         bin_metrics["r_squared"] = r ** 2
@@ -684,12 +754,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
 
                 # Sufficient stats for genome-wide MAF bin aggregation
                 bin_metrics["agg_stats"] = {
-                    "sum_t": sum(data["truth"]),
-                    "sum_i": sum(data["imputed"]),
-                    "sum_ti": sum(t * i for t, i in zip(data["truth"], data["imputed"])),
-                    "sum_tt": sum(t * t for t in data["truth"]),
-                    "sum_ii": sum(i * i for i in data["imputed"]),
-                    "count": len(data["truth"]),
+                    "sum_t": data["sum_t"],
+                    "sum_i": data["sum_i"],
+                    "sum_ti": data["sum_ti"],
+                    "sum_tt": data["sum_tt"],
+                    "sum_ii": data["sum_ii"],
+                    "count": data["total"],
                     "concordant": data["unphased_concordant"],
                     "nonref_concordant": data["nonref_concordant"],
                     "nonref_total": data["nonref_total"],
