@@ -523,7 +523,7 @@ impl StateProbs {
         // by checking if the probability vectors for the left marker and the next
         // marker are identical. HMM expansion ensures this is true for markers
         // belonging to the same cluster.
-        let is_between_clusters = probs != probs_p1;
+        // let is_between_clusters = probs != probs_p1;
 
         if n_alleles == 2 {
             // Java-style interpolation for biallelic sites
@@ -1150,10 +1150,19 @@ impl ImputationPipeline {
                 let n_alleles = n_alleles_per_marker[m];
                 let is_genotyped = alignment.is_genotyped(m);
 
+                // Use an iterator over chunks to access cursors mutably for each sample
+                // This avoids splitting the slice inside the loop
+                let mut cursors_iter = cursors.chunks_exact_mut(2);
+
                 for s in 0..n_target_samples {
                     let hap1_idx = HapIdx::new((s * 2) as u32);
                     let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
                     
+                    let cursors_pair = cursors_iter.next().unwrap();
+                    let (left, right) = cursors_pair.split_at_mut(1);
+                    let cursor1 = &mut left[0];
+                    let cursor2 = &mut right[0];
+
                     // Clear probability buffers
                     for a in 0..n_alleles {
                         probs1[a] = 0.0;
@@ -1173,21 +1182,23 @@ impl ImputationPipeline {
                             let a2_mapped = alignment.map_allele(target_m, a2);
                             
                             // Set probability 1.0 for observed allele (if not missing)
+                            // If missing, fall back to HMM posteriors
                             if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
                                 probs1[a1_mapped as usize] = 1.0;
+                            } else {
+                                let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+                                for a in 0..n_alleles { probs1[a] = post1.prob(a); }
                             }
+
                             if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
                                 probs2[a2_mapped as usize] = 1.0;
+                            } else {
+                                let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+                                for a in 0..n_alleles { probs2[a] = post2.prob(a); }
                             }
                         }
                     } else {
                         // For imputed markers: use HMM posteriors
-                        let (cursor1, cursor2) = {
-                            let mid = s * 2 + 1;
-                            let (left, right) = cursors.split_at_mut(mid);
-                            (&mut left[s * 2], &mut right[0])
-                        };
-
                         let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
                         let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
 
