@@ -1319,8 +1319,8 @@ def stage_impute5():
     impute5_bin = data_dir / "impute5"
     if not impute5_bin.exists():
         print("Downloading IMPUTE5...")
-        run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/s/raw/mwmgzjx5vvmbuaz/impute5_v1.2.0_static.zip'")
-        run(f"cd {data_dir} && unzip -q impute5.zip && mv impute5_v1.2.0_static/impute5_1.2.0_static impute5 && chmod +x impute5")
+        run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/sh/mwnceyhir8yze2j/AADbzP6QuAFPrj0Z9_I1RSmla?dl=1'")
+        run(f"cd {data_dir} && unzip -q -o impute5.zip impute5_v1.2.0.zip && unzip -q -o impute5_v1.2.0.zip && mv impute5_v1.2.0/impute5_v1.2.0_static impute5 && chmod +x impute5")
     
     impute5_out = data_dir / "impute5_imputed.vcf.gz"
     if not impute5_out.exists():
@@ -1348,9 +1348,14 @@ def stage_minimac():
     minimac_bin = data_dir / "minimac4"
     if not minimac_bin.exists():
         print("Downloading Minimac4...")
-        run(f"curl -L -o {data_dir}/minimac4.tar.gz 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.tar.gz'")
-        run(f"cd {data_dir} && tar -xzf minimac4.tar.gz && mv minimac4-4.1.6-Linux-x86_64/bin/minimac4 . && chmod +x minimac4")
-    
+        run(f"curl -L -o {data_dir}/minimac4.sh 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.sh'")
+        run(f"chmod +x {data_dir}/minimac4.sh")
+        run(f"cd {data_dir} && ./minimac4.sh --prefix=. --skip-license --exclude-subdir")
+        # The installer extracts to bin/minimac4
+        if (data_dir / "bin" / "minimac4").exists():
+             run(f"mv {data_dir}/bin/minimac4 {data_dir}/minimac4")
+             run(f"rm -rf {data_dir}/bin {data_dir}/share {data_dir}/minimac4.sh")
+
     minimac_out = data_dir / "minimac_imputed.vcf.gz"
     if not minimac_out.exists():
         print("Running Minimac4...")
@@ -1387,7 +1392,7 @@ def stage_glimpse():
     if not glimpse_out.exists():
         print("Running GLIMPSE...")
         try:
-            run(f"{glimpse_bin} --input {paths['input_vcf']} --reference {paths['ref_vcf']} --output {data_dir}/glimpse_imputed.bcf --threads 4")
+            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --output {data_dir}/glimpse_imputed.bcf --threads 4")
             run(f"bcftools view {data_dir}/glimpse_imputed.bcf -O z -o {glimpse_out}")
             run(f"bcftools index -f {glimpse_out}")
         except Exception as e:
@@ -1543,8 +1548,8 @@ def run_impute5_chr(chrom, paths):
         impute5_bin = data_dir / "impute5"
         if not impute5_bin.exists():
             print(f"Downloading IMPUTE5 for chr{chrom}...")
-            run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/s/raw/mwmgzjx5vvmbuaz/impute5_v1.2.0_static.zip'")
-            run(f"cd {data_dir} && unzip -q impute5.zip && mv impute5_v1.2.0_static/impute5_1.2.0_static impute5 && chmod +x impute5")
+            run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/sh/mwnceyhir8yze2j/AADbzP6QuAFPrj0Z9_I1RSmla?dl=1'")
+            run(f"cd {data_dir} && unzip -q -o impute5.zip impute5_v1.2.0.zip && unzip -q -o impute5_v1.2.0.zip && mv impute5_v1.2.0/impute5_v1.2.0_static impute5 && chmod +x impute5")
 
     out = data_dir / "impute5_imputed.vcf.gz"
     if not out.exists():
@@ -1572,8 +1577,12 @@ def run_minimac_chr(chrom, paths):
         minimac_bin = data_dir / "minimac4"
         if not minimac_bin.exists():
             print(f"Downloading Minimac4 for chr{chrom}...")
-            run(f"curl -L -o {data_dir}/minimac4.tar.gz 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.tar.gz'")
-            run(f"cd {data_dir} && tar -xzf minimac4.tar.gz && mv minimac4-4.1.6-Linux-x86_64/bin/minimac4 . && chmod +x minimac4")
+            run(f"curl -L -o {data_dir}/minimac4.sh 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.sh'")
+            run(f"chmod +x {data_dir}/minimac4.sh")
+            run(f"cd {data_dir} && ./minimac4.sh --prefix=. --skip-license --exclude-subdir")
+            if (data_dir / "bin" / "minimac4").exists():
+                 run(f"mv {data_dir}/bin/minimac4 {data_dir}/minimac4")
+                 run(f"rm -rf {data_dir}/bin {data_dir}/share {data_dir}/minimac4.sh")
 
     out = data_dir / "minimac_imputed.vcf.gz"
     if not out.exists():

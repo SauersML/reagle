@@ -31,6 +31,9 @@ use crate::utils::workspace::ImpWorkspace;
 use crate::model::imp_states::ImpStates;
 use crate::model::parameters::ModelParams;
 
+/// Minimum genetic distance between markers (matches Java Beagle)
+const MIN_CM_DIST: f64 = 1e-7;
+
 /// Imputation pipeline
 pub struct ImputationPipeline {
     config: Config,
@@ -400,10 +403,6 @@ impl StateProbs {
     /// When processing markers in order (0, 1, 2, ..., N-1), this provides O(1)
     /// amortized lookup instead of O(log N) binary search per marker.
     /// This is ~900 million binary search operations saved for typical datasets.
-    #[inline]
-    pub fn cursor(&self) -> StateProbsCursor<'_> {
-        StateProbsCursor::new(self)
-    }
 
     /// Per-allele probabilities at a genotyped marker
     #[inline]
@@ -677,17 +676,20 @@ impl AllelePosteriors {
 /// For 818 samples × 2 haps × 1.1M markers = 1.8 billion marker lookups:
 /// - Binary search: 1.8B × 20 comparisons = 36 billion comparisons
 /// - Cursor: 1.8B × ~1 comparison = ~1.8 billion comparisons (20x faster)
-pub struct StateProbsCursor<'a> {
-    state_probs: &'a StateProbs,
+pub struct StateProbsCursor {
+    state_probs: Arc<StateProbs>,
     /// Current position in genotyped_markers (the sparse index)
     sparse_idx: usize,
 }
 
-impl<'a> StateProbsCursor<'a> {
+impl StateProbsCursor {
     /// Create a new cursor starting at position 0
     #[inline]
-    pub fn new(state_probs: &'a StateProbs) -> Self {
-        Self { state_probs, sparse_idx: 0 }
+    pub fn new(state_probs: Arc<StateProbs>) -> Self {
+        Self {
+            state_probs,
+            sparse_idx: 0,
+        }
     }
 
     /// Compute allele posteriors at ref_marker using cursor for O(1) lookup.
@@ -695,7 +697,12 @@ impl<'a> StateProbsCursor<'a> {
     /// IMPORTANT: Markers MUST be queried in ascending order (0, 1, 2, ...).
     /// The cursor advances automatically and cannot go backwards.
     #[inline]
-    pub fn allele_posteriors<F>(&mut self, ref_marker: usize, n_alleles: usize, get_ref_allele: F) -> AllelePosteriors
+    pub fn allele_posteriors<F>(
+        &mut self,
+        ref_marker: usize,
+        n_alleles: usize,
+        get_ref_allele: F,
+    ) -> AllelePosteriors
     where
         F: Fn(usize, u32) -> u8,
     {
@@ -927,7 +934,8 @@ impl ImputationPipeline {
             for m in 1..n_ref_markers {
                 let pos1 = ref_gt.marker(MarkerIdx::new((m - 1) as u32)).pos;
                 let pos2 = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
-                cumulative += gen_maps.gen_dist(chrom, pos1, pos2);
+                let gen_dist = gen_maps.gen_dist(chrom, pos1, pos2);
+                cumulative += gen_dist.max(MIN_CM_DIST);
                 positions.push(cumulative);
             }
             std::sync::Arc::new(positions)
@@ -1004,7 +1012,7 @@ impl ImputationPipeline {
         // Run imputation for each target haplotype with per-thread workspaces
         // Optimization: ImpStates is now created once per thread (not per haplotype)
         // to avoid allocator contention from HashMap/BinaryHeap allocation
-        let state_probs: Vec<StateProbs> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
+        let state_probs: Vec<Arc<StateProbs>> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
             (0..n_target_haps)
             .into_par_iter()
             .map_init(
@@ -1015,11 +1023,12 @@ impl ImputationPipeline {
                     // Use PROJECTED ImpStates - RefPanelCoded is in projected space
                     let imp_states = ImpStates::new_projected(
                         &ref_panel_coded,
-                        &genotyped_markers_vec,
                         n_ref_markers,
                         n_ref_haps,
                         n_states,
                         n_ibs_haps,
+                        &projected_gen_positions,
+                        &gen_positions,
                     );
                     (workspace, imp_states)
                 },
@@ -1117,13 +1126,13 @@ impl ImputationPipeline {
                     // NOTE: probs_p1 uses "next marker" which correctly produces:
                     // - Constant values within clusters (since same-cluster markers have equal probs)
                     // - Smooth transitions between clusters
-                    StateProbs::new(
+                    Arc::new(StateProbs::new(
                         std::sync::Arc::clone(&genotyped_markers),
                         actual_n_states,
                         sparse_hap_indices,
                         hmm_state_probs,
                         std::sync::Arc::clone(&gen_positions),
-                    )
+                    ))
                 },
             )
             .collect()
@@ -1172,7 +1181,8 @@ impl ImputationPipeline {
         info_span!("compute_dr2").in_scope(|| {
             eprintln!("Computing DR2 quality metrics (streaming)...");
             // Create cursors for each haplotype (2 per sample)
-            let mut cursors: Vec<StateProbsCursor> = state_probs.iter().map(|sp| sp.cursor()).collect();
+            let mut cursors: Vec<StateProbsCursor> =
+                state_probs.iter().map(|sp| StateProbsCursor::new(Arc::clone(sp))).collect();
 
             // Closure for ref allele lookup
             let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
@@ -1225,21 +1235,21 @@ impl ImputationPipeline {
                             if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
                                 probs1[a1_mapped as usize] = 1.0;
                             } else {
-                                let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+                                let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
                                 for a in 0..n_alleles { probs1[a] = post1.prob(a); }
                             }
 
                             if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
                                 probs2[a2_mapped as usize] = 1.0;
                             } else {
-                                let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+                                let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
                                 for a in 0..n_alleles { probs2[a] = post2.prob(a); }
                             }
                         }
                     } else {
                         // For imputed markers: use HMM posteriors
-                        let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
-                        let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+                        let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+                        let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
 
                         for a in 0..n_alleles {
                             probs1[a] = post1.prob(a);
@@ -1255,7 +1265,7 @@ impl ImputationPipeline {
         });
 
         // PASS 2: Write output with on-the-fly computation (streaming)
-        info_span!("write_output").in_scope(|| {
+        info_span!("write_output").in_scope(move || {
             let output_path = self.config.out.with_extension("vcf.gz");
             eprintln!("Writing output to {:?} (streaming)...", output_path);
             let mut writer = VcfWriter::create(&output_path, target_samples)?;
@@ -1266,7 +1276,7 @@ impl ImputationPipeline {
         use std::rc::Rc;
 
         let cursors: Rc<RefCell<Vec<StateProbsCursor>>> = Rc::new(RefCell::new(
-            state_probs.iter().map(|sp| sp.cursor()).collect()
+            state_probs.iter().map(|sp| StateProbsCursor::new(Arc::clone(sp))).collect()
         ));
 
         // Share n_alleles_per_marker between closures via Rc
@@ -1288,17 +1298,18 @@ impl ImputationPipeline {
             let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                 ref_gt_for_dosage.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
             };
-            let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
-            let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+            let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+            let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
             post1.dosage() + post2.dosage()
         };
 
         // Streaming closure: compute posteriors on-the-fly
         // Note: Uses separate cursor set since called after get_dosage for same (m, s)
-        let get_posteriors: Option<Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>> =
+        type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
+        let get_posteriors: Option<GetPosteriorsFn> =
             if need_allele_probs {
                 let cursors_post: RefCell<Vec<StateProbsCursor>> = RefCell::new(
-                    state_probs.iter().map(|sp| sp.cursor()).collect()
+                    state_probs.iter().map(|sp| StateProbsCursor::new(Arc::clone(sp))).collect()
                 );
                 let n_alleles_per_marker = n_alleles_shared.as_ref().clone();
                 let ref_gt_for_post = Arc::clone(&ref_gt);
@@ -1313,8 +1324,8 @@ impl ImputationPipeline {
                     let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                         ref_gt_for_post.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
-                    let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
-                    let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+                    let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+                    let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
                     (post1, post2)
                 }))
             } else {
@@ -1378,7 +1389,7 @@ fn run_hmm_forward_backward_clusters(
     let mut fwd: Vec<f32> = vec![0.0; total_size];
     let mut fwd_sum = 1.0f32;
 
-    for c in 0..n_clusters {
+    for (c, matches) in cluster_allele_match.iter().enumerate().take(n_clusters) {
         let p_rec = p_recomb.get(c).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / fwd_sum;
@@ -1387,7 +1398,6 @@ fn run_hmm_forward_backward_clusters(
         let p_match = 1.0 - cluster_err;
 
         let mut new_sum = 0.0f32;
-        let matches = &cluster_allele_match[c];
         let row_offset = c * n_states;
         let prev_row_offset = if c > 0 { (c - 1) * n_states } else { 0 };
 
@@ -1423,15 +1433,15 @@ fn run_hmm_forward_backward_clusters(
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / bwd_sum;
 
-        for k in 0..n_states {
-            bwd[k] = scale * bwd[k] + shift;
+        for val in bwd.iter_mut().take(n_states) {
+            *val = scale * *val + shift;
         }
 
         // Compute posterior: fwd * bwd
         let mut state_sum = 0.0f32;
-        for k in 0..n_states {
+        for (k, val) in bwd.iter().enumerate().take(n_states) {
             let idx = row_offset + k;
-            fwd[idx] *= bwd[k];
+            fwd[idx] *= val;
             state_sum += fwd[idx];
         }
 
@@ -2315,7 +2325,7 @@ mod tests {
         };
 
         // Use cursor to iterate through ALL markers sequentially
-        let mut cursor = sp.cursor();
+        let mut cursor = StateProbsCursor::new(Arc::new(sp.clone()));
 
         for m in 0..n_ref_markers {
             // Get result from cursor (O(1) amortized)
@@ -2370,7 +2380,7 @@ mod tests {
 
         // Access markers in random order
         // Cursor should handle this by advancing (but can't go backwards)
-        let mut cursor = sp.cursor();
+        let mut cursor = StateProbsCursor::new(Arc::new(sp));
 
         // First access at m=25 (cursor advances to sparse_idx=1)
         let p1 = cursor.allele_posteriors(25, 2, &get_ref_allele);
