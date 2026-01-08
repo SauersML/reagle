@@ -811,21 +811,16 @@ impl ImputationPipeline {
             n_clusters, n_genotyped, n_to_impute
         );
 
-        // Compute per-marker error probabilities (matching Java ImpData.err())
-        // Error rate for each marker depends on the size of its cluster
+        // Error rate for each marker: use BASE rate, not scaled by cluster size.
+        //
+        // Java applies cluster-scaled error (errRate * clusterSize) ONCE per cluster.
+        // When Rust runs HMM on individual markers with p_recomb=0 within clusters,
+        // emissions naturally multiply: P(emit cluster | state) = Π P(emit marker | state).
+        //
+        // Using base error rate: P(match cluster) = (1 - ε)^N ≈ 1 - N*ε
+        // This matches Java's single cluster emission of 1 - N*ε.
         let base_err_rate = self.params.p_mismatch;
-        let per_marker_err: Vec<f32> = {
-            let mut errs = Vec::with_capacity(n_genotyped);
-            for cluster in &clusters {
-                let cluster_size = cluster.end - cluster.start;
-                let cluster_err = (base_err_rate * cluster_size as f32).min(0.5);
-                // All markers in this cluster get the same error probability
-                for _ in cluster.start..cluster.end {
-                    errs.push(cluster_err);
-                }
-            }
-            errs
-        };
+        let per_marker_err: Vec<f32> = vec![base_err_rate; n_genotyped];
 
         // Genotyped markers for interpolation (still needed for StateProbs)
         let genotyped_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(genotyped_markers_vec.clone());
