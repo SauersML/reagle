@@ -403,6 +403,9 @@ impl StateProbs {
     /// When processing markers in order (0, 1, 2, ..., N-1), this provides O(1)
     /// amortized lookup instead of O(log N) binary search per marker.
     /// This is ~900 million binary search operations saved for typical datasets.
+    pub fn cursor(self: Arc<Self>) -> StateProbsCursor {
+        StateProbsCursor::new(self)
+    }
 
     /// Per-allele probabilities at a genotyped marker
     #[inline]
@@ -685,7 +688,7 @@ pub struct StateProbsCursor {
 impl StateProbsCursor {
     /// Create a new cursor starting at position 0
     #[inline]
-    pub fn new(state_probs: Arc<StateProbs>) -> Self {
+    pub(crate) fn new(state_probs: Arc<StateProbs>) -> Self {
         Self {
             state_probs,
             sparse_idx: 0,
@@ -1182,7 +1185,7 @@ impl ImputationPipeline {
             eprintln!("Computing DR2 quality metrics (streaming)...");
             // Create cursors for each haplotype (2 per sample)
             let mut cursors: Vec<StateProbsCursor> =
-                state_probs.iter().map(|sp| StateProbsCursor::new(Arc::clone(sp))).collect();
+                state_probs.iter().map(|sp| sp.clone().cursor()).collect();
 
             // Closure for ref allele lookup
             let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
@@ -1276,7 +1279,7 @@ impl ImputationPipeline {
         use std::rc::Rc;
 
         let cursors: Rc<RefCell<Vec<StateProbsCursor>>> = Rc::new(RefCell::new(
-            state_probs.iter().map(|sp| StateProbsCursor::new(Arc::clone(sp))).collect()
+            state_probs.iter().map(|sp| sp.clone().cursor()).collect()
         ));
 
         // Share n_alleles_per_marker between closures via Rc
@@ -1309,7 +1312,7 @@ impl ImputationPipeline {
         let get_posteriors: Option<GetPosteriorsFn> =
             if need_allele_probs {
                 let cursors_post: RefCell<Vec<StateProbsCursor>> = RefCell::new(
-                    state_probs.iter().map(|sp| StateProbsCursor::new(Arc::clone(sp))).collect()
+                    state_probs.iter().map(|sp| sp.clone().cursor()).collect()
                 );
                 let n_alleles_per_marker = n_alleles_shared.as_ref().clone();
                 let ref_gt_for_post = Arc::clone(&ref_gt);
