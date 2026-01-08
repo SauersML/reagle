@@ -1387,7 +1387,7 @@ def stage_glimpse():
     if not glimpse_out.exists():
         print("Running GLIMPSE...")
         try:
-            run(f"{glimpse_bin} --input {paths['input_vcf']} --reference {paths['ref_vcf']} --output {data_dir}/glimpse_imputed.bcf --threads 4")
+            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --output {data_dir}/glimpse_imputed.bcf --threads 4")
             run(f"bcftools view {data_dir}/glimpse_imputed.bcf -O z -o {glimpse_out}")
             run(f"bcftools index -f {glimpse_out}")
         except Exception as e:
