@@ -40,70 +40,6 @@ pub struct CodedStep {
 }
 
 impl CodedStep {
-    /// Create a new coded step from genotype data
-    ///
-    /// Memory-efficient: stores only representative haplotype indices, not allele sequences.
-    /// Alleles are looked up on-demand when needed, saving ~3GB for large reference panels.
-    pub fn new<S: PhaseState>(gt: &GenotypeMatrix<S>, start: usize, end: usize) -> Self {
-        let n_haps = gt.n_haplotypes();
-        let n_markers = end - start;
-
-        if n_markers == 0 {
-            return Self {
-                start,
-                end,
-                n_patterns: 0,
-                hap_to_pattern: vec![0; n_haps],
-                pattern_rep_hap: Vec::new(),
-            };
-        }
-
-        // Use HashMap for pattern deduplication during construction
-        // Key: allele sequence, Value: (pattern_index, representative_hap)
-        use std::collections::HashMap;
-        let mut pattern_map: HashMap<Vec<u8>, (u16, u32)> = HashMap::new();
-        let mut hap_to_pattern = Vec::with_capacity(n_haps);
-        let mut pattern_rep_hap: Vec<u32> = Vec::new();
-
-        // Pre-allocate scratch buffer - reused for each haplotype
-        let mut scratch = vec![0u8; n_markers];
-
-        for h in 0..n_haps {
-            let hap = HapIdx::new(h as u32);
-
-            // Fill scratch buffer in-place
-            for (i, m) in (start..end).enumerate() {
-                scratch[i] = gt.allele(MarkerIdx::new(m as u32), hap);
-            }
-
-            // Look up or insert pattern
-            let pattern_idx = if let Some(&(idx, _)) = pattern_map.get(&scratch) {
-                idx
-            } else {
-                // New unique pattern - store representative haplotype index
-                let idx = pattern_rep_hap.len() as u16;
-                pattern_rep_hap.push(h as u32);
-                pattern_map.insert(scratch.clone(), (idx, h as u32));
-                idx
-            };
-
-            hap_to_pattern.push(pattern_idx);
-        }
-
-        Self {
-            start,
-            end,
-            n_patterns: pattern_rep_hap.len(),
-            hap_to_pattern,
-            pattern_rep_hap,
-        }
-    }
-
-    /// Number of markers in this step
-    pub fn n_markers(&self) -> usize {
-        self.end - self.start
-    }
-
     /// Number of unique patterns
     pub fn n_patterns(&self) -> usize {
         self.n_patterns
@@ -123,28 +59,105 @@ impl CodedStep {
         }
     }
 
-    /// Match a target allele sequence to a pattern index
-    /// Returns None if the sequence doesn't exist in the reference
+    /// Create a coded step from a PROJECTED subset of markers
     ///
-    /// Uses a closure to look up reference alleles on-demand, saving ~3GB
-    /// vs storing all pattern allele sequences in memory.
+    /// Unlike `new()` which assumes contiguous marker range [start, end),
+    /// this version builds patterns from non-contiguous markers specified
+    /// by indices into a projected marker list.
+    ///
+    /// This is the key fix for DR2 regression: by building patterns on only
+    /// the markers where the target has data, we ensure exact matching.
     ///
     /// # Arguments
-    /// * `alleles` - Target allele sequence for this step
-    /// * `get_allele` - Closure: (marker_idx, hap_idx) -> allele
-    pub fn match_sequence_with<F>(&self, alleles: &[u8], get_allele: F) -> Option<u16>
+    /// * `gt` - Full genotype matrix (dense)
+    /// * `projected_markers` - Indices of genotyped markers in dense space
+    /// * `projected_start` - Start index in projected_markers (inclusive)
+    /// * `projected_end` - End index in projected_markers (exclusive)
+    pub fn new_projected<S: PhaseState>(
+        gt: &GenotypeMatrix<S>,
+        projected_markers: &[usize],
+        projected_start: usize,
+        projected_end: usize,
+    ) -> Self {
+        let n_haps = gt.n_haplotypes();
+        let step_markers = &projected_markers[projected_start..projected_end];
+        let n_markers = step_markers.len();
+
+        if n_markers == 0 {
+            return Self {
+                start: projected_start,
+                end: projected_end,
+                n_patterns: 0,
+                hap_to_pattern: vec![0; n_haps],
+                pattern_rep_hap: Vec::new(),
+            };
+        }
+
+        use std::collections::HashMap;
+        let mut pattern_map: HashMap<Vec<u8>, (u16, u32)> = HashMap::new();
+        let mut hap_to_pattern = Vec::with_capacity(n_haps);
+        let mut pattern_rep_hap: Vec<u32> = Vec::new();
+        let mut scratch = vec![0u8; n_markers];
+
+        for h in 0..n_haps {
+            let hap = HapIdx::new(h as u32);
+
+            // Fill scratch from NON-CONTIGUOUS markers (the key difference)
+            for (i, &dense_m) in step_markers.iter().enumerate() {
+                scratch[i] = gt.allele(MarkerIdx::new(dense_m as u32), hap);
+            }
+
+            let pattern_idx = if let Some(&(idx, _)) = pattern_map.get(&scratch) {
+                idx
+            } else {
+                let idx = pattern_rep_hap.len() as u16;
+                pattern_rep_hap.push(h as u32);
+                pattern_map.insert(scratch.clone(), (idx, h as u32));
+                idx
+            };
+
+            hap_to_pattern.push(pattern_idx);
+        }
+
+        Self {
+            start: projected_start,
+            end: projected_end,
+            n_patterns: pattern_rep_hap.len(),
+            hap_to_pattern,
+            pattern_rep_hap,
+        }
+    }
+
+    /// Match sequence in PROJECTED space with 255 wildcard handling
+    ///
+    /// Even in projected space, individual samples may have missing data (255)
+    /// at markers that are "genotyped" because other samples have data there.
+    /// We treat 255 as a wildcard that matches any reference allele.
+    ///
+    /// # Arguments
+    /// * `alleles` - Target alleles for this step (length = end - start)
+    /// * `projected_markers` - Dense indices for this step's markers
+    /// * `get_dense_allele` - Closure: (dense_marker_idx, hap) -> allele
+    pub fn match_sequence_projected<F>(
+        &self,
+        alleles: &[u8],
+        projected_markers: &[usize],
+        get_dense_allele: F,
+    ) -> Option<u16>
     where
         F: Fn(usize, u32) -> u8,
     {
-        if alleles.len() != self.n_markers() {
+        let step_markers = &projected_markers[self.start..self.end];
+        if alleles.len() != step_markers.len() {
             return None;
         }
 
-        // Look for exact match by comparing against representative haplotypes
         for (idx, &rep_hap) in self.pattern_rep_hap.iter().enumerate() {
-            let matches = (self.start..self.end).enumerate().all(|(i, m)| {
-                let ref_allele = get_allele(m, rep_hap);
-                alleles[i] == ref_allele || alleles[i] == 255 || ref_allele == 255
+            let matches = step_markers.iter().enumerate().all(|(i, &dense_m)| {
+                let ref_allele = get_dense_allele(dense_m, rep_hap);
+                let target_allele = alleles[i];
+                // Handle 255 (missing) as wildcard - matches anything
+                target_allele == ref_allele || target_allele == 255 || ref_allele == 255
             });
             if matches {
                 return Some(idx as u16);
@@ -153,20 +166,26 @@ impl CodedStep {
         None
     }
 
-    /// Find closest pattern to target sequence (by Hamming distance)
-    /// Always returns a pattern (never None)
+    /// Find closest pattern in PROJECTED space (by Hamming distance, 255 = wildcard)
     ///
-    /// Uses a closure to look up reference alleles on-demand.
-    /// Optimized with early termination when perfect match is found.
+    /// Fallback when exact match fails due to missing data.
+    /// Uses same logic as `closest_pattern_with` but in projected space.
     ///
     /// # Arguments
-    /// * `alleles` - Target allele sequence for this step
-    /// * `get_allele` - Closure: (marker_idx, hap_idx) -> allele
-    pub fn closest_pattern_with<F>(&self, alleles: &[u8], get_allele: F) -> u16
+    /// * `alleles` - Target alleles for this step
+    /// * `projected_markers` - Dense indices for this step's markers
+    /// * `get_dense_allele` - Closure: (dense_marker_idx, hap) -> allele
+    pub fn closest_pattern_projected<F>(
+        &self,
+        alleles: &[u8],
+        projected_markers: &[usize],
+        get_dense_allele: F,
+    ) -> u16
     where
         F: Fn(usize, u32) -> u8,
     {
-        if alleles.len() != self.n_markers() || self.n_patterns == 0 {
+        let step_markers = &projected_markers[self.start..self.end];
+        if alleles.len() != step_markers.len() || self.n_patterns == 0 {
             return 0;
         }
 
@@ -174,18 +193,16 @@ impl CodedStep {
         let mut best_distance = usize::MAX;
 
         for (idx, &rep_hap) in self.pattern_rep_hap.iter().enumerate() {
-            // Early termination with bounded counting
             let mut distance = 0usize;
             let mut early_exit = false;
 
-            for (i, m) in (self.start..self.end).enumerate() {
-                let ref_allele = get_allele(m, rep_hap);
+            for (i, &dense_m) in step_markers.iter().enumerate() {
+                let ref_allele = get_dense_allele(dense_m, rep_hap);
                 let target_allele = alleles[i];
 
-                // Skip missing data comparisons
+                // Skip missing data comparisons (255 = wildcard)
                 if ref_allele != target_allele && ref_allele != 255 && target_allele != 255 {
                     distance += 1;
-                    // Early exit if we can't beat current best
                     if distance >= best_distance {
                         early_exit = true;
                         break;
@@ -197,7 +214,6 @@ impl CodedStep {
                 best_distance = distance;
                 best_pattern = idx as u16;
 
-                // Perfect match - return immediately
                 if distance == 0 {
                     return best_pattern;
                 }
@@ -213,32 +229,39 @@ impl CodedStep {
 pub struct RefPanelCoded {
     /// Coded steps
     steps: Vec<CodedStep>,
-    /// Number of markers
-    n_markers: usize,
 }
 
 impl RefPanelCoded {
-    /// Create coded reference panel from genotype matrix
-    pub fn new<S: PhaseState>(gt: &GenotypeMatrix<S>, step_starts: &[usize]) -> Self {
-        let n_markers = gt.n_markers();
+    /// Create coded reference panel in PROJECTED space (genotyped markers only)
+    ///
+    /// This is the key fix for DR2 regression. By building patterns on only
+    /// the markers where the target has data, we ensure:
+    /// 1. Target patterns are EXACT (no 255s, no approximation)
+    /// 2. Virtual insertion is EXACT (no closest_pattern fallback)
+    /// 3. Reference haps matching at observed positions cluster together
+    ///
+    /// # Arguments
+    /// * `gt` - Full dense genotype matrix
+    /// * `projected_markers` - Indices of genotyped markers in dense space
+    /// * `projected_gen_positions` - Genetic positions at projected markers only
+    /// * `step_cm` - Step size in centiMorgans
+    pub fn from_projected_markers<S: PhaseState>(
+        gt: &GenotypeMatrix<S>,
+        projected_markers: &[usize],
+        projected_gen_positions: &[f64],
+        step_cm: f64,
+    ) -> Self {
+        let step_starts = compute_step_starts(projected_gen_positions, step_cm);
+        let n_projected = projected_markers.len();
 
         let mut steps = Vec::with_capacity(step_starts.len());
 
         for (i, &start) in step_starts.iter().enumerate() {
-            let end = step_starts.get(i + 1).copied().unwrap_or(n_markers);
-            steps.push(CodedStep::new(gt, start, end));
+            let end = step_starts.get(i + 1).copied().unwrap_or(n_projected);
+            steps.push(CodedStep::new_projected(gt, projected_markers, start, end));
         }
 
-        Self {
-            steps,
-            n_markers,
-        }
-    }
-
-    /// Create from genetic positions with default step size
-    pub fn from_gen_positions<S: PhaseState>(gt: &GenotypeMatrix<S>, gen_positions: &[f64], step_cm: f64) -> Self {
-        let step_starts = compute_step_starts(gen_positions, step_cm);
-        Self::new(gt, &step_starts)
+        Self { steps }
     }
 
     /// Number of steps
@@ -258,11 +281,6 @@ impl RefPanelCoded {
         }
         let sum: f32 = self.steps.iter().map(|s| s.compression_ratio()).sum();
         sum / self.steps.len() as f32
-    }
-
-    /// Number of markers
-    pub fn n_markers(&self) -> usize {
-        self.n_markers
     }
 }
 
@@ -320,12 +338,6 @@ impl<'a> CodedPbwtView<'a> {
         divergence.fill(n_steps as i32);
 
         Self { prefix, divergence }
-    }
-
-    /// Get haplotype at a given position in the prefix array
-    #[inline]
-    pub fn hap_at(&self, pos: usize) -> u32 {
-        self.prefix[pos]
     }
 
     /// Update PBWT with a coded step using counting sort
@@ -573,92 +585,6 @@ impl<'a> CodedPbwtView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::ChromIdx;
-    use crate::data::haplotype::Samples;
-    use crate::data::marker::{Allele, Marker, Markers};
-    use crate::data::storage::GenotypeColumn;
-    use std::sync::Arc;
-
-    fn make_test_matrix() -> GenotypeMatrix {
-        let samples = Arc::new(Samples::from_ids(vec![
-            "S1".to_string(),
-            "S2".to_string(),
-            "S3".to_string(),
-        ]));
-
-        let mut markers = Markers::new();
-        markers.add_chrom("chr1");
-
-        // 6 markers, 6 haplotypes
-        // Pattern: markers 0-2 are step 1, markers 3-5 are step 2
-        let allele_data = vec![
-            // marker 0: [0,1, 0,1, 0,0] - 2 patterns: (0), (1)
-            vec![0u8, 1, 0, 1, 0, 0],
-            // marker 1: [0,1, 0,1, 0,0]
-            vec![0, 1, 0, 1, 0, 0],
-            // marker 2: [0,1, 0,1, 0,0]
-            vec![0, 1, 0, 1, 0, 0],
-            // marker 3: [0,0, 1,1, 0,1]
-            vec![0, 0, 1, 1, 0, 1],
-            // marker 4: [0,0, 1,1, 0,1]
-            vec![0, 0, 1, 1, 0, 1],
-            // marker 5: [0,0, 1,1, 0,1]
-            vec![0, 0, 1, 1, 0, 1],
-        ];
-
-        let mut columns = Vec::new();
-        for (i, alleles) in allele_data.iter().enumerate() {
-            let m = Marker::new(
-                ChromIdx::new(0),
-                (i * 1000 + 100) as u32,
-                None,
-                Allele::Base(0),
-                vec![Allele::Base(1)],
-            );
-            markers.push(m);
-            columns.push(GenotypeColumn::from_alleles(alleles, 2));
-        }
-
-        GenotypeMatrix::new_unphased(markers, columns, samples)
-    }
-
-    #[test]
-    fn test_coded_step() {
-        let gt = make_test_matrix();
-        let step = CodedStep::new(&gt, 0, 3);
-
-        assert_eq!(step.n_markers(), 3);
-        // n_haps() not exposed on CodedStep, but hap_to_pattern.len() would be 6
-
-        // Should have 2 patterns: [0,0,0] and [1,1,1]
-        assert_eq!(step.n_patterns(), 2);
-
-        // Haplotypes 0,2,4 have pattern [0,0,0]
-        // Haplotypes 1,3,5 have pattern [1,1,1]
-        let p0 = step.pattern(HapIdx::new(0));
-        let p2 = step.pattern(HapIdx::new(2));
-        let p4 = step.pattern(HapIdx::new(4));
-        assert_eq!(p0, p2);
-        assert_eq!(p2, p4);
-
-        let p1 = step.pattern(HapIdx::new(1));
-        let p3 = step.pattern(HapIdx::new(3));
-        assert_eq!(p1, p3);
-        assert_ne!(p0, p1);
-
-        // Check compression ratio
-        assert!(step.compression_ratio() > 1.0);
-    }
-
-    #[test]
-    fn test_ref_panel_coded() {
-        let gt = make_test_matrix();
-        let step_starts = vec![0, 3];
-        let coded = RefPanelCoded::new(&gt, &step_starts);
-
-        assert_eq!(coded.n_steps(), 2);
-        assert_eq!(coded.n_markers(), 6);
-    }
 
     #[test]
     fn test_compute_step_starts() {

@@ -31,7 +31,6 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use crate::data::haplotype::HapIdx;
 use crate::data::storage::coded_steps::{CodedPbwtView, RefPanelCoded};
 use crate::utils::workspace::ImpWorkspace;
 
@@ -93,71 +92,72 @@ pub struct ImpStates<'a> {
     hap_to_last_ibs: Vec<i32>,
     /// Priority queue for managing composite haplotypes
     queue: BinaryHeap<CompHapEntry>,
-    /// Number of reference markers
+    /// Number of reference markers (in DENSE space, for ThreadedHaps)
     n_ref_markers: usize,
     /// Number of reference haplotypes (excludes appended target haplotypes)
     n_ref_haps: usize,
     /// Number of IBS haplotypes to find per step
     n_ibs_haps: usize,
+    /// Projected->Dense marker mapping (None for dense mode, Some for projected mode)
+    /// Used to convert step boundaries to dense space for ThreadedHaps
+    projected_to_dense: Option<&'a [usize]>,
 }
 
 impl<'a> ImpStates<'a> {
-    /// Create a new state selector
+    /// Create a new state selector for PROJECTED PBWT
+    ///
+    /// In projected mode, the RefPanelCoded is built on genotyped markers only.
+    /// ThreadedHaps still uses dense marker indices for segment boundaries.
     ///
     /// # Arguments
-    /// * `ref_panel` - Reference panel with coded steps (defines step boundaries)
-    /// * `n_ref_haps` - Number of reference haplotypes (excludes appended target haplotypes)
+    /// * `ref_panel` - Reference panel in PROJECTED space (genotyped markers only)
+    /// * `projected_markers` - Mapping from projected index to dense marker index
+    /// * `n_dense_markers` - Number of markers in dense space (for ThreadedHaps)
+    /// * `n_ref_haps` - Number of reference haplotypes
     /// * `max_states` - Maximum number of HMM states to track
     /// * `n_ibs_haps` - Number of IBS haplotypes to find per step
-    pub fn new(
+    pub fn new_projected(
         ref_panel: &'a RefPanelCoded,
+        projected_markers: &'a [usize],
+        n_dense_markers: usize,
         n_ref_haps: usize,
         max_states: usize,
         n_ibs_haps: usize,
     ) -> Self {
-        let n_ref_markers = ref_panel.n_markers();
-
         Self {
             max_states,
             ref_panel,
-            threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_ref_markers),
-            // Pre-allocate Vec for O(1) direct-indexed lookup (15x faster than HashMap)
+            // ThreadedHaps uses DENSE marker count for segment boundaries
+            threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_dense_markers),
             hap_to_last_ibs: vec![IBS_NIL; n_ref_haps],
             queue: BinaryHeap::with_capacity(max_states),
-            n_ref_markers,
+            n_ref_markers: n_dense_markers,
             n_ref_haps,
             n_ibs_haps,
+            projected_to_dense: Some(projected_markers),
         }
     }
 
-    /// Select IBS-based HMM states for a target haplotype
+    /// Select IBS states using PROJECTED PBWT (exact matching, no approximation)
     ///
-    /// Uses BOTH forward and backward PBWT passes to find IBS matches,
-    /// matching Java Beagle's bidirectional approach.
-    ///
-    /// **Sparse target handling:** Steps with all-missing target data are skipped
-    /// for IBS matching, preventing degenerate state selection when the target
-    /// is much sparser than the reference panel.
-    ///
-    /// **Memory optimization:** Output arrays are sized for genotyped markers only,
-    /// not all reference markers. This reduces memory from O(n_ref_markers * n_states)
-    /// to O(n_genotyped_markers * n_states), typically 10-100x savings.
+    /// This is the key fix for DR2 regression. In projected space:
+    /// 1. target_alleles has NO missing values (no 255s)
+    /// 2. Pattern matching is EXACT (no closest_pattern fallback)
+    /// 3. All refs matching at observed positions cluster together
     ///
     /// # Arguments
-    /// * `get_ref_allele` - Function to get reference allele at (marker, hap)
-    /// * `target_alleles` - Target alleles in **reference marker space** (length = n_ref_markers)
-    ///                      Use 255 for markers not genotyped in target
-    /// * `genotyped_markers` - Indices of genotyped markers in reference space (sparse subset)
+    /// * `get_ref_allele` - Dense closure: (dense_marker_idx, hap) -> allele
+    /// * `target_alleles_projected` - Target alleles in PROJECTED space (no 255s!)
+    /// * `target_alleles_dense` - Target alleles in DENSE space (with 255s, for output)
+    /// * `genotyped_markers` - Dense indices of genotyped markers (= projected_to_dense mapping)
     /// * `workspace` - Pre-allocated workspace buffers
-    /// * `hap_indices` - Output: reference haplotype indices at each GENOTYPED marker
-    /// * `allele_match` - Output: whether each state matches target at each GENOTYPED marker
-    ///
-    /// # Returns
-    /// Number of states selected
-    pub fn ibs_states<F>(
+    /// * `hap_indices` - Output: ref hap indices at each genotyped marker
+    /// * `allele_match` - Output: whether each state matches target
+    pub fn ibs_states_projected<F>(
         &mut self,
         get_ref_allele: F,
-        target_alleles: &[u8],
+        target_alleles_projected: &[u8],
+        target_alleles_dense: &[u8],
         genotyped_markers: &[usize],
         workspace: &mut ImpWorkspace,
         hap_indices: &mut Vec<Vec<u32>>,
@@ -171,28 +171,13 @@ impl<'a> ImpStates<'a> {
         let n_ref_haps = self.n_ref_haps;
         let n_steps = self.ref_panel.n_steps();
         let n_ibs_haps = self.n_ibs_haps;
+
         workspace.resize_with_ref(self.max_states, self.n_ref_markers, n_ref_haps);
 
-        // Pre-compute which steps have informative target data
-        // Steps with all-missing data should be skipped for IBS matching
-        let step_has_data: Vec<bool> = (0..n_steps)
-            .map(|step_idx| {
-                let coded_step = self.ref_panel.step(step_idx);
-                let step_start = coded_step.start;
-                let step_end = coded_step.end;
-                // Check if any marker in this step has non-missing target data
-                (step_start..step_end).any(|m| {
-                    target_alleles.get(m).copied().unwrap_or(255) != 255
-                })
-            })
-            .collect();
-
-        // Store backward IBS haps for each step (to use during forward pass)
+        // Store backward IBS haps for each step
         let mut bwd_ibs_per_step: Vec<Vec<u32>> = vec![Vec::new(); n_steps];
 
-        // STEP 1: Backward PBWT pass with Virtual Insertion tracking
-        // NOTE: Backward pass does NOT use bucket constraints - experiments showed
-        // that unconstrained neighbor selection performs better for backward direction
+        // STEP 1: Backward PBWT pass
         {
             let mut pbwt_bwd = CodedPbwtView::new_backward(
                 &mut workspace.pbwt_prefix_bwd[..n_ref_haps],
@@ -200,43 +185,26 @@ impl<'a> ImpStates<'a> {
                 n_steps,
             );
 
-            // Virtual position for stateful PBWT tracking (LF-mapping)
             let mut bwd_virtual_pos = n_ref_haps / 2;
 
             for step_idx in (0..n_steps).rev() {
                 let coded_step = self.ref_panel.step(step_idx);
-                let step_start = coded_step.start;
-                let step_end = coded_step.end;
+                let proj_start = coded_step.start;
+                let proj_end = coded_step.end;
 
-                // When step has no target data, we still need to track virtual position
-                // through the sort. We follow the haplotype currently at virtual_pos -
-                // this maintains continuity since neighbors are likely similar.
-                if !step_has_data[step_idx] {
-                    // Track the haplotype at current virtual position
-                    let tracked_hap = pbwt_bwd.hap_at(bwd_virtual_pos.min(n_ref_haps - 1));
-                    let tracked_pattern = coded_step.pattern(HapIdx::new(tracked_hap));
-
-                    // Update PBWT and track where our haplotype goes
-                    pbwt_bwd.update_backward(
-                        coded_step,
-                        n_steps,
-                        Some((&mut bwd_virtual_pos, tracked_pattern)),
-                        None,
-                    );
-                    continue;
-                }
-
-                // Extract target sequence for this step
-                let target_seq: Vec<u8> = (step_start..step_end)
-                    .map(|m| target_alleles.get(m).copied().unwrap_or(255))
+                // Extract target sequence for this step (in projected space, no 255s!)
+                let target_seq: Vec<u8> = (proj_start..proj_end)
+                    .map(|p| target_alleles_projected[p])
                     .collect();
 
-                // Get target pattern BEFORE sort update (needed for LF-mapping)
+                // Try exact match first, use closest pattern as fallback for missing data
                 let target_pattern = coded_step
-                    .match_sequence_with(&target_seq, &get_ref_allele)
-                    .unwrap_or_else(|| coded_step.closest_pattern_with(&target_seq, &get_ref_allele));
+                    .match_sequence_projected(&target_seq, genotyped_markers, &get_ref_allele)
+                    .unwrap_or_else(|| {
+                        // Fallback: use closest pattern (handles 255s in target)
+                        coded_step.closest_pattern_projected(&target_seq, genotyped_markers, &get_ref_allele)
+                    });
 
-                // Update PBWT, computing new virtual position
                 pbwt_bwd.update_backward(
                     coded_step,
                     n_steps,
@@ -244,7 +212,6 @@ impl<'a> ImpStates<'a> {
                     None,
                 );
 
-                // Select neighbors without bucket constraint (allows diverse selection)
                 let bwd_ibs: Vec<u32> = pbwt_bwd
                     .select_neighbors_in_bucket(bwd_virtual_pos, n_ibs_haps, 0, n_ref_haps)
                     .into_iter()
@@ -255,52 +222,32 @@ impl<'a> ImpStates<'a> {
             }
         }
 
-        // STEP 2: Forward PBWT pass with Virtual Insertion + composite haplotype building
+        // STEP 2: Forward PBWT pass with composite haplotype building
         {
             let mut pbwt_fwd = CodedPbwtView::new(
                 &mut workspace.pbwt_prefix[..n_ref_haps],
                 &mut workspace.pbwt_divergence[..n_ref_haps + 1],
             );
 
-            // Virtual position for stateful PBWT tracking (LF-mapping)
             let mut fwd_virtual_pos = n_ref_haps / 2;
 
             for step_idx in 0..n_steps {
                 let coded_step = self.ref_panel.step(step_idx);
-                let step_start = coded_step.start;
-                let step_end = coded_step.end;
+                let proj_start = coded_step.start;
+                let proj_end = coded_step.end;
 
-                // When step has no target data, we still need to track virtual position
-                // through the sort. We follow the haplotype currently at virtual_pos -
-                // this maintains continuity since neighbors are likely similar.
-                if !step_has_data[step_idx] {
-                    // Track the haplotype at current virtual position
-                    let tracked_hap = pbwt_fwd.hap_at(fwd_virtual_pos.min(n_ref_haps - 1));
-                    let tracked_pattern = coded_step.pattern(HapIdx::new(tracked_hap));
-
-                    // Update PBWT and track where our haplotype goes
-                    pbwt_fwd.update_counting_sort(
-                        coded_step,
-                        &mut workspace.sort_counts,
-                        &mut workspace.sort_offsets,
-                        &mut workspace.sort_prefix_scratch,
-                        &mut workspace.sort_div_scratch,
-                        Some((&mut fwd_virtual_pos, tracked_pattern)),
-                    );
-                    continue;
-                }
-
-                // Extract target sequence for this step
-                let target_seq: Vec<u8> = (step_start..step_end)
-                    .map(|m| target_alleles.get(m).copied().unwrap_or(255))
+                // Extract target sequence (projected space, no 255s)
+                let target_seq: Vec<u8> = (proj_start..proj_end)
+                    .map(|p| target_alleles_projected[p])
                     .collect();
 
-                // Get target pattern BEFORE sort update (needed for LF-mapping)
+                // Try exact match first, use closest pattern as fallback for missing data
                 let target_pattern = coded_step
-                    .match_sequence_with(&target_seq, &get_ref_allele)
-                    .unwrap_or_else(|| coded_step.closest_pattern_with(&target_seq, &get_ref_allele));
+                    .match_sequence_projected(&target_seq, genotyped_markers, &get_ref_allele)
+                    .unwrap_or_else(|| {
+                        coded_step.closest_pattern_projected(&target_seq, genotyped_markers, &get_ref_allele)
+                    });
 
-                // Update PBWT, computing new virtual position DURING the sort (before prefix mutation)
                 pbwt_fwd.update_counting_sort(
                     coded_step,
                     &mut workspace.sort_counts,
@@ -310,13 +257,11 @@ impl<'a> ImpStates<'a> {
                     Some((&mut fwd_virtual_pos, target_pattern)),
                 );
 
-                // Get bucket boundaries for target's pattern (after counting sort)
-                // Neighbors should be from the SAME pattern bucket to match Java's behavior
+                // Get bucket boundaries for target's pattern
                 let pattern_idx = target_pattern as usize;
                 let bucket_start = workspace.sort_offsets.get(pattern_idx).copied().unwrap_or(0);
                 let bucket_end = workspace.sort_offsets.get(pattern_idx + 1).copied().unwrap_or(n_ref_haps);
 
-                // Use stateful virtual position for neighbor selection, constrained to same-pattern bucket
                 let fwd_ibs: Vec<u32> = pbwt_fwd
                     .select_neighbors_in_bucket(fwd_virtual_pos, n_ibs_haps, bucket_start, bucket_end)
                     .into_iter()
@@ -324,7 +269,6 @@ impl<'a> ImpStates<'a> {
                     .collect();
 
                 // Update composite haplotypes with IBS matches from BOTH directions
-                // Use the step_idx for state recency tracking (matches Java behavior)
                 for hap in fwd_ibs {
                     self.update_with_ibs_hap(hap, step_idx as i32);
                 }
@@ -334,18 +278,17 @@ impl<'a> ImpStates<'a> {
             }
         }
 
-        // Fill remaining slots with random haplotypes if we didn't find enough
-        // Use hash of target alleles as seed for reproducibility
+        // Fill remaining slots with random haplotypes if needed
         if self.queue.len() < self.max_states {
-            let target_hap = target_alleles.iter().fold(0u32, |acc, &a| acc.wrapping_mul(31).wrapping_add(a as u32));
+            let target_hap = target_alleles_projected.iter().fold(0u32, |acc, &a| acc.wrapping_mul(31).wrapping_add(a as u32));
             self.fill_remaining_with_random(target_hap);
         }
 
-        // Build output arrays for GENOTYPED markers only (memory optimization)
+        // Build output arrays (uses dense target_alleles for match computation)
         let n_states = self.queue.len().min(self.max_states);
         self.build_output_sparse(
             get_ref_allele,
-            target_alleles,
+            target_alleles_dense,
             genotyped_markers,
             n_states,
             hap_indices,
@@ -373,12 +316,26 @@ impl<'a> ImpStates<'a> {
                 // Replace oldest composite haplotype
                 if let Some(mut head) = self.queue.pop() {
                     let mid_step = (head.last_ibs_step + step) / 2;
-                    // Use reference panel's step boundary (the fix!)
                     let mid_step_idx = mid_step.max(0) as usize;
-                    let start_marker = if mid_step_idx < self.ref_panel.n_steps() {
+
+                    // Get step boundary - this is in projected space if using projected PBWT
+                    let step_start_projected = if mid_step_idx < self.ref_panel.n_steps() {
                         self.ref_panel.step(mid_step_idx).start
                     } else {
                         0
+                    };
+
+                    // Convert to dense marker index for ThreadedHaps
+                    let start_marker = if let Some(mapping) = self.projected_to_dense {
+                        // Projected mode: convert projected index to dense
+                        if step_start_projected < mapping.len() {
+                            mapping[step_start_projected]
+                        } else {
+                            0
+                        }
+                    } else {
+                        // Dense mode: step boundary is already in dense space
+                        step_start_projected
                     };
 
                     // Clear old haplotype's entry

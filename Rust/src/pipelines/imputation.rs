@@ -807,62 +807,7 @@ impl ImputationPipeline {
         let min_ibs = (self.config.imp_states as f64).sqrt() as usize;
         let n_ibs_haps = computed.max(min_ibs).max(1);
 
-        // Compute genetic positions at ALL reference markers (for RefPanelCoded)
-        let ref_gen_positions: Vec<f64> = (0..n_ref_markers)
-            .map(|m| {
-                let pos = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
-                gen_maps.gen_pos(chrom, pos)
-            })
-            .collect();
-
-        // Build coded reference panel for efficient PBWT operations
-        //
-        // We build the dictionary using ONLY reference haplotypes.
-        // Do not append target haplotypes to this panel.
-        //
-        // Mathematical basis for this design:
-        // ─────────────────────────────────────────────────────────────────────
-        // Let M_ref be the set of reference markers, M_targ ⊂ M_ref be target markers.
-        // Let C: H → ℕ be the pattern coding function mapping allele sequences to indices.
-        //
-        // If we append target haplotypes with "missing" (255) at M_ref \ M_targ:
-        //   - Reference patterns: ∀m ∈ step, A(h_ref, m) ∈ {0, 1}
-        //   - Target patterns: ∃m ∈ step where A(h_targ, m) = 255
-        //   - Since 255 ≠ 0 and 255 ≠ 1: C(h_ref) ≠ C(h_targ) for any ref/targ pair
-        //   - The pattern sets are DISJOINT: {C(h_ref)} ∩ {C(h_targ)} = ∅
-        //
-        // This causes IBS matching to fail catastrophically:
-        //   1. match_sequence(target_seq) finds the target's own pattern (with 255s)
-        //   2. find_ibs() searches PBWT for ref haps with that pattern
-        //   3. No ref hap has patterns containing 255 → zero matches
-        //   4. Falls back to random selection → imputation accuracy destroyed
-        //
-        // Solution: Keep only reference patterns in the dictionary.
-        // The ImpStates::ibs_states() method uses:
-        //   - PBWT built on reference haplotypes only (n_ref_haps)
-        //   - closest_pattern() which correctly ignores 255s in distance calculation:
-        //       distance = Σ 𝟙[p_i ≠ a_i ∧ p_i ≠ 255 ∧ a_i ≠ 255]
-        //   - This finds the reference pattern that best matches at genotyped positions
-        // ─────────────────────────────────────────────────────────────────────
-        let ref_panel_coded = info_span!("build_coded_panel").in_scope(|| {
-            eprintln!("Building coded reference panel...");
-            let panel = RefPanelCoded::from_gen_positions(
-                &ref_gt,
-                &ref_gen_positions,
-                self.config.imp_step as f64,
-            );
-            eprintln!(
-                "  {} steps ({} haps share each pattern on avg)",
-                panel.n_steps(),
-                panel.avg_compression_ratio() as usize
-            );
-            panel
-        });
-
-        eprintln!("Running imputation with dynamic state selection...");
-        let n_states = self.params.n_states;
-
-        // Build genotyped markers list (reference markers with NON-MISSING target data)
+        // Build genotyped markers list FIRST (needed for projected PBWT)
         // A marker is only considered "genotyped" if at least one target haplotype has data
         let genotyped_markers_vec: Vec<usize> = (0..n_ref_markers)
             .filter(|&ref_m| {
@@ -880,6 +825,53 @@ impl ImputationPipeline {
             .collect();
         let n_genotyped = genotyped_markers_vec.len();
         let n_to_impute = n_ref_markers - n_genotyped;
+
+        // Compute genetic positions at genotyped markers only (for projected PBWT)
+        let projected_gen_positions: Vec<f64> = genotyped_markers_vec
+            .iter()
+            .map(|&ref_m| {
+                let pos = ref_gt.marker(MarkerIdx::new(ref_m as u32)).pos;
+                gen_maps.gen_pos(chrom, pos)
+            })
+            .collect();
+
+        // Build coded reference panel in PROJECTED space (genotyped markers only)
+        //
+        // This is the key fix for DR2 regression:
+        // ─────────────────────────────────────────────────────────────────────
+        // PROBLEM with Dense PBWT:
+        //   - RefPanelCoded built on ALL markers (1356)
+        //   - Target has 255s at unobserved positions
+        //   - closest_pattern() is APPROXIMATE - picks "closest" but not exact
+        //   - This causes FRAGMENTATION: valid candidates get scattered in PBWT
+        //     based on their alleles at unobserved positions
+        //
+        // SOLUTION with Projected PBWT:
+        //   - RefPanelCoded built on GENOTYPED markers only (e.g., 135)
+        //   - Target has NO missing values in projected space
+        //   - Pattern matching is EXACT (no closest_pattern needed)
+        //   - All refs matching at observed positions cluster together in PBWT
+        //   - Virtual insertion finds EXACTLY the right bucket
+        // ─────────────────────────────────────────────────────────────────────
+        let ref_panel_coded = info_span!("build_coded_panel").in_scope(|| {
+            eprintln!("Building coded reference panel (projected space)...");
+            let panel = RefPanelCoded::from_projected_markers(
+                &ref_gt,
+                &genotyped_markers_vec,
+                &projected_gen_positions,
+                self.config.imp_step as f64,
+            );
+            eprintln!(
+                "  {} steps ({} haps share each pattern on avg), {} projected markers",
+                panel.n_steps(),
+                panel.avg_compression_ratio() as usize,
+                n_genotyped
+            );
+            panel
+        });
+
+        eprintln!("Running imputation with dynamic state selection...");
+        let n_states = self.params.n_states;
 
         // Compute cumulative genetic positions for ALL reference markers
         // Wrapped in Arc to share across all haplotypes without cloning
@@ -971,20 +963,27 @@ impl ImputationPipeline {
             .into_par_iter()
             .map_init(
                 // Initialize workspace AND ImpStates for each thread (reduces allocations)
-                // ImpStates::ibs_states() calls initialize() internally, so reuse is safe
+                // ImpStates::ibs_states_projected() calls initialize() internally, so reuse is safe
                 || {
                     let workspace = ImpWorkspace::with_ref_size(n_states, n_ref_markers, n_ref_haps);
-                    let imp_states = ImpStates::new(&ref_panel_coded, n_ref_haps, n_states, n_ibs_haps);
+                    // Use PROJECTED ImpStates - RefPanelCoded is in projected space
+                    let imp_states = ImpStates::new_projected(
+                        &ref_panel_coded,
+                        &genotyped_markers_vec,
+                        n_ref_markers,
+                        n_ref_haps,
+                        n_states,
+                        n_ibs_haps,
+                    );
                     (workspace, imp_states)
                 },
                 // Process each haplotype with its thread's workspace and ImpStates
                 |(workspace, imp_states), h| {
                     let hap_idx = HapIdx::new(h as u32);
 
-                    // Build target alleles in REFERENCE marker space (full)
-                    // Needed for IBS state selection which runs on all markers
-                    // Note: Small allocation (~n_ref_markers bytes) - not worth workspace complexity
-                    let target_alleles: Vec<u8> = (0..n_ref_markers)
+                    // Build target alleles in DENSE space (with 255s for ungenotyped markers)
+                    // Needed for HMM output computation
+                    let target_alleles_dense: Vec<u8> = (0..n_ref_markers)
                         .map(|ref_m| {
                             if let Some(target_m) = alignment.target_marker(ref_m) {
                                 let raw_allele = target_gt.allele(MarkerIdx::new(target_m as u32), hap_idx);
@@ -995,19 +994,26 @@ impl ImputationPipeline {
                         })
                         .collect();
 
-                    // Get reference allele closure
+                    // Build target alleles in PROJECTED space (indexed by genotyped marker position)
+                    // May still have 255s if this specific sample has missing data at a "genotyped" marker
+                    let target_alleles_projected: Vec<u8> = genotyped_markers_vec
+                        .iter()
+                        .map(|&ref_m| target_alleles_dense[ref_m])
+                        .collect();
+
+                    // Get reference allele closure (dense space)
                     let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                         ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
 
-                    // Get IBS-based states with SPARSE output (genotyped markers only)
-                    // Memory optimization: allocates O(n_genotyped * n_states) instead of
-                    // O(n_ref_markers * n_states), typically 10-100x memory savings
+                    // Get IBS-based states using PROJECTED PBWT (exact matching)
+                    // This is the key fix for DR2 regression - PBWT runs on genotyped markers only
                     let mut sparse_hap_indices: Vec<Vec<u32>> = Vec::new();
                     let mut sparse_allele_match: Vec<Vec<bool>> = Vec::new();
-                    let actual_n_states = imp_states.ibs_states(
+                    let actual_n_states = imp_states.ibs_states_projected(
                         get_ref_allele,
-                        &target_alleles,
+                        &target_alleles_projected,
+                        &target_alleles_dense,
                         &genotyped_markers,
                         workspace,
                         &mut sparse_hap_indices,
@@ -1025,11 +1031,8 @@ impl ImputationPipeline {
                                     // Check if state k matches all markers in this cluster
                                     (cluster.start..cluster.end).all(|m| {
                                         // Missing target alleles (255) are treated as matching
-                                        let target_allele = genotyped_markers
-                                            .get(m)
-                                            .and_then(|&ref_m| target_alleles.get(ref_m))
-                                            .copied()
-                                            .unwrap_or(255);
+                                        // Note: m is index into genotyped_markers (projected space)
+                                        let target_allele = target_alleles_projected.get(m).copied().unwrap_or(255);
                                         target_allele == 255 || sparse_allele_match[m][k]
                                     })
                                 })
