@@ -1141,22 +1141,53 @@ impl ImputationPipeline {
             // Process marker-by-marker (streaming, O(n_markers × n_samples) total)
             for m in 0..n_ref_markers {
                 let n_alleles = n_alleles_per_marker[m];
+                let is_genotyped = alignment.is_genotyped(m);
 
                 for s in 0..n_target_samples {
-                    let (cursor1, cursor2) = {
-                        let mid = s * 2 + 1;
-                        let (left, right) = cursors.split_at_mut(mid);
-                        (&mut left[s * 2], &mut right[0])
-                    };
-
-                    // O(1) cursor lookup instead of O(log N) binary search
-                    let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
-                    let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
-
-                    // Build probability arrays for DR2
+                    let hap1_idx = HapIdx::new((s * 2) as u32);
+                    let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
+                    
+                    // Clear probability buffers
                     for a in 0..n_alleles {
-                        probs1[a] = post1.prob(a);
-                        probs2[a] = post2.prob(a);
+                        probs1[a] = 0.0;
+                        probs2[a] = 0.0;
+                    }
+
+                    if is_genotyped {
+                        // For genotyped markers: use OBSERVED alleles with probability 1.0
+                        // This matches Java's setToObsAlleles() behavior
+                        if let Some(target_m) = alignment.target_marker(m) {
+                            let target_marker_idx = MarkerIdx::new(target_m as u32);
+                            let a1 = target_gt.allele(target_marker_idx, hap1_idx);
+                            let a2 = target_gt.allele(target_marker_idx, hap2_idx);
+                            
+                            // Map target alleles to reference allele space
+                            let a1_mapped = alignment.map_allele(target_m, a1);
+                            let a2_mapped = alignment.map_allele(target_m, a2);
+                            
+                            // Set probability 1.0 for observed allele (if not missing)
+                            if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
+                                probs1[a1_mapped as usize] = 1.0;
+                            }
+                            if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
+                                probs2[a2_mapped as usize] = 1.0;
+                            }
+                        }
+                    } else {
+                        // For imputed markers: use HMM posteriors
+                        let (cursor1, cursor2) = {
+                            let mid = s * 2 + 1;
+                            let (left, right) = cursors.split_at_mut(mid);
+                            (&mut left[s * 2], &mut right[0])
+                        };
+
+                        let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+                        let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+
+                        for a in 0..n_alleles {
+                            probs1[a] = post1.prob(a);
+                            probs2[a] = post2.prob(a);
+                        }
                     }
 
                     if let Some(stats) = quality.get_mut(m) {

@@ -1768,6 +1768,57 @@ fn compare_dr2_values(java_records: &[ParsedRecord], rust_records: &[ParsedRecor
         return;
     }
 
+    // Separate genotyped (IMP flag absent) vs imputed (IMP flag present) markers
+    let java_genotyped_dr2: Vec<f64> = java_records
+        .iter()
+        .filter_map(|r| {
+            let is_imputed = r.info.contains_key("IMP");
+            if !is_imputed {
+                r.info.get("DR2").and_then(|v| v.parse().ok())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let java_imputed_dr2: Vec<f64> = java_records
+        .iter()
+        .filter_map(|r| {
+            let is_imputed = r.info.contains_key("IMP");
+            if is_imputed {
+                r.info.get("DR2").and_then(|v| v.parse().ok())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let rust_genotyped_dr2: Vec<f64> = rust_records
+        .iter()
+        .filter_map(|r| {
+            let is_imputed = r.info.contains_key("IMP");
+            if !is_imputed {
+                r.info.get("DR2").and_then(|v| v.parse().ok())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let rust_imputed_dr2: Vec<f64> = rust_records
+        .iter()
+        .filter_map(|r| {
+            let is_imputed = r.info.contains_key("IMP");
+            if is_imputed {
+                r.info.get("DR2").and_then(|v| v.parse().ok())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let java_genotyped_mean = if java_genotyped_dr2.is_empty() { 0.0 } else { java_genotyped_dr2.iter().sum::<f64>() / java_genotyped_dr2.len() as f64 };
+    let java_imputed_mean = if java_imputed_dr2.is_empty() { 0.0 } else { java_imputed_dr2.iter().sum::<f64>() / java_imputed_dr2.len() as f64 };
+    let rust_genotyped_mean = if rust_genotyped_dr2.is_empty() { 0.0 } else { rust_genotyped_dr2.iter().sum::<f64>() / rust_genotyped_dr2.len() as f64 };
+    let rust_imputed_mean = if rust_imputed_dr2.is_empty() { 0.0 } else { rust_imputed_dr2.iter().sum::<f64>() / rust_imputed_dr2.len() as f64 };
+
     let java_mean: f64 = java_dr2.iter().sum::<f64>() / java_dr2.len() as f64;
     let rust_mean: f64 = rust_dr2.iter().sum::<f64>() / rust_dr2.len() as f64;
 
@@ -1780,8 +1831,10 @@ fn compare_dr2_values(java_records: &[ParsedRecord], rust_records: &[ParsedRecor
     };
 
     println!("[{}] DR2 Comparison:", name);
-    println!("  Java mean DR2: {:.4}", java_mean);
-    println!("  Rust mean DR2: {:.4}", rust_mean);
+    println!("  Java mean DR2: {:.4} (genotyped: {:.4} [n={}], imputed: {:.4} [n={}])", 
+             java_mean, java_genotyped_mean, java_genotyped_dr2.len(), java_imputed_mean, java_imputed_dr2.len());
+    println!("  Rust mean DR2: {:.4} (genotyped: {:.4} [n={}], imputed: {:.4} [n={}])", 
+             rust_mean, rust_genotyped_mean, rust_genotyped_dr2.len(), rust_imputed_mean, rust_imputed_dr2.len());
     println!("  DR2 correlation: {:.4}", dr2_correlation);
 
     // STRICT: Rust mean DR2 should be >= Java (higher DR2 = better quality)
