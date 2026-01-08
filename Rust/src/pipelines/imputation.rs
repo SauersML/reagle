@@ -948,7 +948,7 @@ impl ImputationPipeline {
         // Cluster-level recombination probabilities
         let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
             .chain((1..n_clusters).map(|c| {
-                let gen_dist = cluster_midpoints[c] - cluster_midpoints[c - 1];
+                let gen_dist = (cluster_midpoints[c] - cluster_midpoints[c - 1]).abs();
                 self.params.p_recomb(gen_dist)
             }))
             .collect();
