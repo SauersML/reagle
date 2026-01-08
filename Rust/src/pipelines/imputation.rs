@@ -359,11 +359,14 @@ impl StateProbs {
         }
     }
 
-    /// Compute per-allele probabilities at a reference marker.
+    /// Compute per-allele probabilities at a reference marker (random access).
     /// Returns optimized representation: Biallelic for 2-allele sites, Multiallelic for others.
     ///
     /// NOTE: For sequential marker access (0, 1, 2, ...), use `cursor()` instead
     /// which provides O(1) lookup via linear scanning instead of O(log N) binary search.
+    ///
+    /// This method is primarily used in tests for random-access interpolation verification.
+    #[cfg(test)]
     #[inline]
     pub fn allele_posteriors<F>(&self, ref_marker: usize, n_alleles: usize, get_ref_allele: F) -> AllelePosteriors
     where
@@ -627,12 +630,6 @@ impl<'a> StateProbsCursor<'a> {
     #[inline]
     pub fn new(state_probs: &'a StateProbs) -> Self {
         Self { state_probs, sparse_idx: 0 }
-    }
-
-    /// Reset cursor to beginning (for reuse across multiple passes)
-    #[inline]
-    pub fn reset(&mut self) {
-        self.sparse_idx = 0;
     }
 
     /// Compute allele posteriors at ref_marker using cursor for O(1) lookup.
@@ -1107,8 +1104,11 @@ impl ImputationPipeline {
                 let n_alleles = n_alleles_per_marker[m];
 
                 for s in 0..n_target_samples {
-                    let cursor1 = &mut cursors[s * 2];
-                    let cursor2 = &mut cursors[s * 2 + 1];
+                    let (cursor1, cursor2) = {
+                        let mid = s * 2 + 1;
+                        let (left, right) = cursors.split_at_mut(mid);
+                        (&mut left[s * 2], &mut right[0])
+                    };
 
                     // O(1) cursor lookup instead of O(log N) binary search
                     let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
@@ -1135,22 +1135,31 @@ impl ImputationPipeline {
 
         // Use RefCell for interior mutability - allows mutable cursor access from Fn closures
         use std::cell::RefCell;
-        let cursors: RefCell<Vec<StateProbsCursor>> = RefCell::new(
-            state_probs.iter().map(|sp| sp.cursor()).collect()
-        );
+        use std::rc::Rc;
 
-        // Closure for ref allele lookup
-        let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
-            ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
-        };
+        let cursors: Rc<RefCell<Vec<StateProbsCursor>>> = Rc::new(RefCell::new(
+            state_probs.iter().map(|sp| sp.cursor()).collect()
+        ));
+
+        // Share n_alleles_per_marker between closures via Rc
+        let n_alleles_shared: Rc<Vec<usize>> = Rc::new(n_alleles_per_marker);
 
         // Streaming closure: compute dosage on-the-fly using cursor
         // write_imputed_streaming processes markers sequentially, so cursors advance monotonically
-        let get_dosage = |m: usize, s: usize| -> f32 {
-            let n_alleles = n_alleles_per_marker[m];
-            let mut cursors = cursors.borrow_mut();
-            let cursor1 = &mut cursors[s * 2];
-            let cursor2 = &mut cursors[s * 2 + 1];
+        let n_alleles_for_dosage = Rc::clone(&n_alleles_shared);
+        let cursors_for_dosage = Rc::clone(&cursors);
+        let ref_gt_for_dosage = Arc::clone(&ref_gt);
+        let get_dosage = move |m: usize, s: usize| -> f32 {
+            let n_alleles = n_alleles_for_dosage[m];
+            let mut cursors = cursors_for_dosage.borrow_mut();
+            let (cursor1, cursor2) = {
+                let mid = s * 2 + 1;
+                let (left, right) = cursors.split_at_mut(mid);
+                (&mut left[s * 2], &mut right[0])
+            };
+            let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
+                ref_gt_for_dosage.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
+            };
             let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
             let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
             post1.dosage() + post2.dosage()
@@ -1163,11 +1172,19 @@ impl ImputationPipeline {
                 let cursors_post: RefCell<Vec<StateProbsCursor>> = RefCell::new(
                     state_probs.iter().map(|sp| sp.cursor()).collect()
                 );
+                let n_alleles_per_marker = n_alleles_shared.as_ref().clone();
+                let ref_gt_for_post = Arc::clone(&ref_gt);
                 Some(Box::new(move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
                     let n_alleles = n_alleles_per_marker[m];
                     let mut cursors = cursors_post.borrow_mut();
-                    let cursor1 = &mut cursors[s * 2];
-                    let cursor2 = &mut cursors[s * 2 + 1];
+                    let (cursor1, cursor2) = {
+                        let mid = s * 2 + 1;
+                        let (left, right) = cursors.split_at_mut(mid);
+                        (&mut left[s * 2], &mut right[0])
+                    };
+                    let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
+                        ref_gt_for_post.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
+                    };
                     let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
                     let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
                     (post1, post2)
@@ -1467,7 +1484,6 @@ mod tests {
         // Test with various configurations
         for n_markers in [2, 5, 10, 20] {
             for n_states in [2, 4, 8] {
-                let target_alleles = vec![0u8; n_markers];
                 let allele_match: Vec<Vec<bool>> = (0..n_markers)
                     .map(|m| (0..n_states).map(|k| (m + k) % 2 == 0).collect())
                     .collect();
@@ -1504,7 +1520,6 @@ mod tests {
 
         let n_markers = 10;
         let n_states = 4;
-        let target_alleles = vec![0u8; n_markers];
         let allele_match: Vec<Vec<bool>> = (0..n_markers)
             .map(|m| (0..n_states).map(|k| k == m % n_states).collect())
             .collect();
@@ -1532,7 +1547,6 @@ mod tests {
 
         let n_markers = 20;
         let n_states = 4;
-        let target_alleles = vec![0u8; n_markers];
 
         // State 0 always matches, others never match
         let allele_match: Vec<Vec<bool>> = (0..n_markers)
@@ -1567,7 +1581,6 @@ mod tests {
         // Pattern: state 0 matches first half, state 1 matches second half
         let n_markers = 20;
         let n_states = 2;
-        let target_alleles = vec![0u8; n_markers];
 
         let allele_match: Vec<Vec<bool>> = (0..n_markers)
             .map(|m| {
@@ -1605,7 +1618,6 @@ mod tests {
 
         let n_markers = 10;
         let n_states = 2;
-        let target_alleles = vec![0u8; n_markers];
 
         // Run 1: state 0 matches at even markers
         let match1: Vec<Vec<bool>> = (0..n_markers)
@@ -1714,7 +1726,6 @@ mod tests {
         let expected_gamma1_1 = gamma1_1_raw / gamma1_sum;
 
         // Run the actual HMM
-        let target_alleles = vec![0u8; n_markers];
         let p_recomb = vec![0.0, rho];  // First marker has 0 recomb
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 10);
@@ -1761,7 +1772,6 @@ mod tests {
 
         for n_states in [2, 4, 8, 16] {
             let n_markers = 10;
-            let target_alleles = vec![0u8; n_markers];
 
             // All states match at all markers
             let allele_match: Vec<Vec<bool>> = (0..n_markers)
@@ -1805,7 +1815,6 @@ mod tests {
 
         let n_states = 4;
         let n_markers = 10;
-        let target_alleles = vec![0u8; n_markers];
 
         // State 0 always matches
         let allele_match: Vec<Vec<bool>> = (0..n_markers)
