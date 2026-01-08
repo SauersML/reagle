@@ -1330,11 +1330,11 @@ impl PhasingPipeline {
                     if l_swap > l_keep {
                         // SWAP: exchange alleles from this position forward
                         for m_swap in m..n_markers {
-                            seq1_working.swap(m_swap, m_swap);
+                            std::mem::swap(&mut seq1_working[m_swap], &mut seq2_working[m_swap]);
                         }
                         // Swap backward caches for future het decisions
                         for h in het_idx..n_hets {
-                            bwd1_cache.swap(h, h);
+                            std::mem::swap(&mut bwd1_cache[h], &mut bwd2_cache[h]);
                         }
                     }
 
