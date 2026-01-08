@@ -935,7 +935,7 @@ impl ImputationPipeline {
                 let pos1 = ref_gt.marker(MarkerIdx::new((m - 1) as u32)).pos;
                 let pos2 = ref_gt.marker(MarkerIdx::new(m as u32)).pos;
                 let gen_dist = gen_maps.gen_dist(chrom, pos1, pos2);
-                cumulative += gen_dist.max(MIN_CM_DIST);
+                cumulative += gen_dist.abs().max(MIN_CM_DIST);
                 positions.push(cumulative);
             }
             std::sync::Arc::new(positions)
