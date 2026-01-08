@@ -523,7 +523,6 @@ impl StateProbs {
         // by checking if the probability vectors for the left marker and the next
         // marker are identical. HMM expansion ensures this is true for markers
         // belonging to the same cluster.
-        let _is_between_clusters = probs != probs_p1;
 
         if n_alleles == 2 {
             // Java-style interpolation for biallelic sites
