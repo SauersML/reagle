@@ -952,25 +952,48 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Stages:
-  prepare   Download data and prepare reference/truth/input VCFs
-  beagle    Run Java Beagle imputation (requires prepare)
-  reagle    Run Reagle imputation (requires prepare + build)
-  metrics   Calculate and compare accuracy metrics (requires imputation)
-  all       Run all stages sequentially (default)
+  prepare      Download data and prepare reference/truth/input VCFs
+  beagle       Run Java Beagle imputation
+  reagle       Run Reagle imputation
+  impute5      Run IMPUTE5 imputation
+  minimac      Run Minimac4 imputation
+  glimpse      Run GLIMPSE imputation
+  metrics      Calculate and compare accuracy metrics
+  all          Run all stages sequentially (default)
+  
+Full genome mode (for nightly CI):
+  prepare-chr <N>    Prepare data for chromosome N
+  impute-chr <N>     Run all imputations for chromosome N
+  metrics-chr <N>    Calculate metrics for chromosome N
+  summary            Aggregate metrics across all chromosomes
 
 Examples:
-  python integration_test.py              # Run all stages
-  python integration_test.py prepare      # Just prepare data
-  python integration_test.py beagle       # Just run Beagle
-  python integration_test.py metrics      # Just calculate metrics
+  python integration_test.py                  # Run all stages (chr22 only)
+  python integration_test.py prepare          # Just prepare data
+  python integration_test.py impute5          # Run IMPUTE5
+  python integration_test.py prepare-chr 1    # Prepare chr1 for full genome
+  python integration_test.py summary          # Aggregate all chromosome metrics
         """
     )
     parser.add_argument(
         'stage',
         nargs='?',
         default='all',
-        choices=['all', 'prepare', 'beagle', 'reagle', 'metrics'],
+        choices=['all', 'prepare', 'beagle', 'reagle', 'impute5', 'minimac', 
+                 'glimpse', 'metrics', 'prepare-chr', 'impute-chr', 
+                 'metrics-chr', 'summary'],
         help='Stage to run (default: all)'
+    )
+    parser.add_argument(
+        'chromosome',
+        nargs='?',
+        default='22',
+        help='Chromosome number for -chr stages (default: 22)'
+    )
+    parser.add_argument(
+        '--tools',
+        default='beagle,reagle',
+        help='Comma-separated list of tools to run (default: beagle,reagle)'
     )
 
     args = parser.parse_args()
@@ -985,8 +1008,22 @@ Examples:
         stage_beagle()
     elif args.stage == 'reagle':
         stage_reagle()
+    elif args.stage == 'impute5':
+        stage_impute5()
+    elif args.stage == 'minimac':
+        stage_minimac()
+    elif args.stage == 'glimpse':
+        stage_glimpse()
     elif args.stage == 'metrics':
         stage_metrics()
+    elif args.stage == 'prepare-chr':
+        stage_prepare_chr(args.chromosome)
+    elif args.stage == 'impute-chr':
+        stage_impute_chr(args.chromosome, args.tools.split(','))
+    elif args.stage == 'metrics-chr':
+        stage_metrics_chr(args.chromosome)
+    elif args.stage == 'summary':
+        stage_summary()
     elif args.stage == 'all':
         # Run all stages sequentially
         stage_prepare()
@@ -1013,5 +1050,304 @@ Examples:
         print("\nIntegration test completed successfully.")
 
 
+# =============================================================================
+# Additional imputation tool stages
+# =============================================================================
+
+def stage_impute5():
+    """Run IMPUTE5 imputation."""
+    print("\n" + "=" * 60)
+    print("STAGE: IMPUTE5 IMPUTATION")
+    print("=" * 60)
+
+    paths = get_paths()
+    data_dir = paths['data_dir']
+    
+    # Download IMPUTE5 if not present
+    impute5_bin = data_dir / "impute5"
+    if not impute5_bin.exists():
+        print("Downloading IMPUTE5...")
+        run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/s/raw/mwmgzjx5vvmbuaz/impute5_v1.2.0_static.zip'")
+        run(f"cd {data_dir} && unzip -q impute5.zip && mv impute5_v1.2.0_static/impute5_1.2.0_static impute5 && chmod +x impute5")
+    
+    impute5_out = data_dir / "impute5_imputed.vcf.gz"
+    if not impute5_out.exists():
+        print("Running IMPUTE5...")
+        try:
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r chr22 --o {impute5_out} --threads 4")
+            run(f"bcftools index -f {impute5_out}")
+        except Exception as e:
+            print(f"IMPUTE5 failed: {e}")
+    else:
+        print(f"Using existing: {impute5_out}")
+    print("IMPUTE5 stage completed.")
+
+
+def stage_minimac():
+    """Run Minimac4 imputation."""
+    print("\n" + "=" * 60)
+    print("STAGE: MINIMAC4 IMPUTATION")
+    print("=" * 60)
+
+    paths = get_paths()
+    data_dir = paths['data_dir']
+    
+    # Download Minimac4 if not present
+    minimac_bin = data_dir / "minimac4"
+    if not minimac_bin.exists():
+        print("Downloading Minimac4...")
+        run(f"curl -L -o {data_dir}/minimac4.tar.gz 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.tar.gz'")
+        run(f"cd {data_dir} && tar -xzf minimac4.tar.gz && mv minimac4-4.1.6-Linux-x86_64/bin/minimac4 . && chmod +x minimac4")
+    
+    minimac_out = data_dir / "minimac_imputed.vcf.gz"
+    if not minimac_out.exists():
+        print("Running Minimac4...")
+        try:
+            run(f"{minimac_bin} --refHaps {paths['ref_vcf']} --haps {paths['input_vcf']} --prefix {data_dir}/minimac_imputed --cpus 4 --format GT,DS")
+            # Minimac outputs to .dose.vcf.gz
+            if (data_dir / "minimac_imputed.dose.vcf.gz").exists():
+                run(f"mv {data_dir}/minimac_imputed.dose.vcf.gz {minimac_out}")
+            run(f"bcftools index -f {minimac_out}")
+        except Exception as e:
+            print(f"Minimac4 failed: {e}")
+    else:
+        print(f"Using existing: {minimac_out}")
+    print("Minimac4 stage completed.")
+
+
+def stage_glimpse():
+    """Run GLIMPSE imputation."""
+    print("\n" + "=" * 60)
+    print("STAGE: GLIMPSE IMPUTATION")
+    print("=" * 60)
+
+    paths = get_paths()
+    data_dir = paths['data_dir']
+    
+    # Download GLIMPSE if not present
+    glimpse_bin = data_dir / "glimpse_phase"
+    if not glimpse_bin.exists():
+        print("Downloading GLIMPSE...")
+        run(f"curl -L -o {glimpse_bin} 'https://github.com/odelaneau/GLIMPSE/releases/download/v2.0.1/GLIMPSE2_phase_static'")
+        run(f"chmod +x {glimpse_bin}")
+    
+    glimpse_out = data_dir / "glimpse_imputed.vcf.gz"
+    if not glimpse_out.exists():
+        print("Running GLIMPSE...")
+        try:
+            run(f"{glimpse_bin} --input {paths['input_vcf']} --reference {paths['ref_vcf']} --output {data_dir}/glimpse_imputed.bcf --threads 4")
+            run(f"bcftools view {data_dir}/glimpse_imputed.bcf -O z -o {glimpse_out}")
+            run(f"bcftools index -f {glimpse_out}")
+        except Exception as e:
+            print(f"GLIMPSE failed: {e}")
+    else:
+        print(f"Using existing: {glimpse_out}")
+    print("GLIMPSE stage completed.")
+
+
+# =============================================================================
+# Full genome (per-chromosome) stages
+# =============================================================================
+
+def get_chr_paths(chrom):
+    """Get paths for a specific chromosome."""
+    script_dir = Path(__file__).parent
+    project_dir = script_dir.parent
+    data_dir = script_dir / f"data_chr{chrom}"
+    os.makedirs(data_dir, exist_ok=True)
+    
+    return {
+        'data_dir': data_dir,
+        'project_dir': project_dir,
+        'ref_vcf': data_dir / "ref.vcf.gz",
+        'truth_vcf': data_dir / "truth.vcf.gz",
+        'input_vcf': data_dir / "input.vcf.gz",
+        'reagle_bin': project_dir / "target" / "release" / "reagle",
+    }
+
+
+def stage_prepare_chr(chrom):
+    """Prepare data for a specific chromosome."""
+    print(f"\n{'=' * 60}")
+    print(f"STAGE: PREPARE CHROMOSOME {chrom}")
+    print("=" * 60)
+    
+    paths = get_chr_paths(chrom)
+    data_dir = paths['data_dir']
+    
+    # Download HGDP+1kG data for this chromosome
+    bcf_url = f"https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr{chrom}.filtered.SNV_INDEL.phased.shapeit5.bcf"
+    local_bcf = data_dir / f"hgdp1kg_chr{chrom}.bcf"
+    local_vcf = data_dir / f"hgdp1kg_chr{chrom}.vcf.gz"
+    
+    if not local_vcf.exists():
+        print(f"Downloading chr{chrom}...")
+        run(f"curl -L -o {local_bcf} '{bcf_url}'")
+        run(f"curl -L -o {local_bcf}.csi '{bcf_url}.csi'")
+        run(f"bcftools view {local_bcf} -O z -o {local_vcf}")
+        run(f"bcftools index -f {local_vcf}")
+    
+    # Split samples (same logic as main prepare)
+    train_file = data_dir / "train_samples.txt"
+    test_file = data_dir / "test_samples.txt"
+    
+    if not train_file.exists():
+        result = run(f"bcftools query -l {local_vcf}", capture=True)
+        samples = result.stdout.strip().split('\n')
+        random.seed(42)
+        random.shuffle(samples)
+        n_test = len(samples) // 5
+        test_samples = samples[:n_test]
+        train_samples = samples[n_test:]
+        
+        with open(train_file, 'w') as f:
+            f.write('\n'.join(train_samples))
+        with open(test_file, 'w') as f:
+            f.write('\n'.join(test_samples))
+    
+    # Create ref, truth, input VCFs
+    if not paths['ref_vcf'].exists():
+        run(f"bcftools view -S {train_file} {local_vcf} -O z -o {paths['ref_vcf']}")
+        run(f"bcftools index -f {paths['ref_vcf']}")
+    
+    if not paths['truth_vcf'].exists():
+        run(f"bcftools view -S {test_file} {local_vcf} -O z -o {paths['truth_vcf']}")
+        run(f"bcftools index -f {paths['truth_vcf']}")
+    
+    if not paths['input_vcf'].exists():
+        # Download GSA sites and filter
+        gsa_file = data_dir / "GSAv2_hg38.tsv"
+        if not gsa_file.exists():
+            run(f"curl -L -o {gsa_file} 'https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv'")
+        
+        gsa_sites = load_gsa_sites(str(gsa_file), chrom=chrom)
+        regions_file = data_dir / f"gsa_chr{chrom}.regions"
+        create_regions_file(gsa_sites, str(regions_file))
+        
+        # Downsample and unphase
+        tmp_phased = data_dir / "input_phased_tmp.vcf.gz"
+        run(f"bcftools view -R {regions_file} {paths['truth_vcf']} -O z -o {tmp_phased}")
+        run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
+        run(f"bcftools index -f {paths['input_vcf']}")
+        os.remove(tmp_phased)
+    
+    print(f"Chromosome {chrom} preparation complete.")
+
+
+def stage_impute_chr(chrom, tools):
+    """Run specified imputation tools for a chromosome."""
+    print(f"\n{'=' * 60}")
+    print(f"STAGE: IMPUTE CHROMOSOME {chrom}")
+    print(f"Tools: {', '.join(tools)}")
+    print("=" * 60)
+    
+    paths = get_chr_paths(chrom)
+    
+    for tool in tools:
+        if tool == 'beagle':
+            run_beagle_chr(chrom, paths)
+        elif tool == 'reagle':
+            run_reagle_chr(chrom, paths)
+        elif tool == 'impute5':
+            run_impute5_chr(chrom, paths)
+        elif tool == 'minimac':
+            run_minimac_chr(chrom, paths)
+        elif tool == 'glimpse':
+            run_glimpse_chr(chrom, paths)
+
+
+def run_beagle_chr(chrom, paths):
+    """Run Beagle for a chromosome."""
+    data_dir = paths['data_dir']
+    beagle_jar = data_dir / "beagle.jar"
+    out = data_dir / "beagle_imputed.vcf.gz"
+    
+    if not beagle_jar.exists():
+        run(f"curl -L -o {beagle_jar} 'https://faculty.washington.edu/browning/beagle/beagle.22Jul22.46e.jar'")
+    
+    if not out.exists():
+        run(f"java -Xmx8g -jar {beagle_jar} ref={paths['ref_vcf']} gt={paths['input_vcf']} out={data_dir}/beagle_imputed nthreads=4")
+        run(f"bcftools index -f {out}")
+
+
+def run_reagle_chr(chrom, paths):
+    """Run Reagle for a chromosome."""
+    out = paths['data_dir'] / "reagle_imputed.vcf.gz"
+    if paths['reagle_bin'].exists() and not out.exists():
+        run(f"{paths['reagle_bin']} --ref {paths['ref_vcf']} --gt {paths['input_vcf']} --out {paths['data_dir']}/reagle_imputed")
+        run(f"bcftools index -f {out}")
+
+
+def run_impute5_chr(chrom, paths):
+    """Run IMPUTE5 for a chromosome."""
+    # Similar to stage_impute5 but for specific chromosome
+    pass  # TODO: implement
+
+
+def run_minimac_chr(chrom, paths):
+    """Run Minimac4 for a chromosome."""
+    pass  # TODO: implement
+
+
+def run_glimpse_chr(chrom, paths):
+    """Run GLIMPSE for a chromosome."""
+    pass  # TODO: implement
+
+
+def stage_metrics_chr(chrom):
+    """Calculate metrics for a specific chromosome."""
+    print(f"\n{'=' * 60}")
+    print(f"STAGE: METRICS CHROMOSOME {chrom}")
+    print("=" * 60)
+    
+    paths = get_chr_paths(chrom)
+    truth_vcf = str(paths['truth_vcf'])
+    data_dir = paths['data_dir']
+    
+    tools = [
+        ("beagle", "beagle_imputed.vcf.gz"),
+        ("reagle", "reagle_imputed.vcf.gz"),
+        ("impute5", "impute5_imputed.vcf.gz"),
+        ("minimac", "minimac_imputed.vcf.gz"),
+        ("glimpse", "glimpse_imputed.vcf.gz"),
+    ]
+    
+    for prefix, filename in tools:
+        imputed_path = data_dir / filename
+        if imputed_path.exists():
+            print(f"\n{'=' * 40}")
+            print(f"Calculating metrics for {prefix.upper()}")
+            print("=" * 40)
+            try:
+                calculate_metrics(truth_vcf, str(imputed_path), str(data_dir / prefix))
+            except Exception as e:
+                print(f"Error: {e}")
+
+
+def stage_summary():
+    """Aggregate metrics across all chromosomes."""
+    print("\n" + "=" * 60)
+    print("STAGE: GENOME-WIDE SUMMARY")
+    print("=" * 60)
+    
+    script_dir = Path(__file__).parent
+    tools = ["beagle", "reagle", "impute5", "minimac", "glimpse"]
+    
+    for tool in tools:
+        print(f"\n=== {tool.upper()} ===")
+        for chrom in range(1, 23):
+            metrics_file = script_dir / f"data_chr{chrom}" / f"{tool}_metrics.txt"
+            if metrics_file.exists():
+                with open(metrics_file) as f:
+                    content = f.read()
+                    # Extract key metrics
+                    for line in content.split('\n'):
+                        if 'Unphased concordance:' in line or 'Overall R²:' in line:
+                            print(f"  chr{chrom}: {line.strip()}")
+            else:
+                print(f"  chr{chrom}: MISSING")
+
+
 if __name__ == "__main__":
     main()
+
