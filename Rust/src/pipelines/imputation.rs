@@ -1008,6 +1008,7 @@ impl ImputationPipeline {
         };
         let marker_to_cluster = std::sync::Arc::new(marker_to_cluster);
 
+
         // Run imputation for each target haplotype with per-thread workspaces
         // Optimization: ImpStates is now created once per thread (not per haplotype)
         // to avoid allocator contention from HashMap/BinaryHeap allocation
