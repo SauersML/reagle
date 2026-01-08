@@ -269,6 +269,7 @@ fn default_test_config() -> Config {
         streaming: None,
         seed: -99999,
         nthreads: None,
+        profile: false,
     }
 }
 

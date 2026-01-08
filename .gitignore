@@ -11,3 +11,10 @@ Rust/target
 .claude/
 *.csi
 Rust/clippy_output.txt
+# Uncompressed VCF files (keep .vcf.gz compressed versions)
+*.vcf
+# Java jar files (Beagle binaries)
+*.jar
+# Python cache
+__pycache__/
+*.pyc

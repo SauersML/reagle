@@ -969,6 +969,7 @@ impl ImputationPipeline {
 
                     // Build target alleles in REFERENCE marker space (full)
                     // Needed for IBS state selection which runs on all markers
+                    // Note: Small allocation (~n_ref_markers bytes) - not worth workspace complexity
                     let target_alleles: Vec<u8> = (0..n_ref_markers)
                         .map(|ref_m| {
                             if let Some(target_m) = alignment.target_marker(ref_m) {

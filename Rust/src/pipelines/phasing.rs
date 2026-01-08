@@ -2873,6 +2873,7 @@ mod tests {
             streaming: None,
             seed: 12345,
             nthreads: None,
+            profile: false,
         };
 
         let pipeline = PhasingPipeline::new(config);
@@ -2959,10 +2960,11 @@ mod tests {
             streaming: None,
             seed: 12345,
             nthreads: Some(2),
+            profile: false,
         };
-        
+
         let mut pipeline = PhasingPipeline::new(config);
-        
+
         // Run phasing
         let result = pipeline.phase_in_memory(&gt, &gen_maps);
         
