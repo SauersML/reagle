@@ -147,6 +147,8 @@ pub struct VcfReader {
     /// Per-sample ploidy detected during reading (true = diploid, false = haploid)
     /// Initialized on first variant, used to update Samples after reading
     sample_ploidy: Option<Vec<bool>>,
+    /// Whether all genotypes read were phased (detected during read_all)
+    all_phased: bool,
 }
 
 impl VcfReader {
@@ -209,6 +211,7 @@ impl VcfReader {
             include_sample_indices: None,
             exclude_marker_ids: None,
             sample_ploidy: None,
+            all_phased: true,
         }, reader))
     }
 
@@ -286,8 +289,13 @@ impl VcfReader {
             }
 
             // Parse VCF record
-            let (marker, mut alleles, _) =
+            let (marker, mut alleles, is_phased) =
                 self.parse_record(line, &mut markers, line_num)?;
+
+            // Track if any marker is unphased
+            if !is_phased {
+                self.all_phased = false;
+            }
 
             // Check marker exclusion filter
             if let Some(ref exclude_ids) = self.exclude_marker_ids {
@@ -527,6 +535,15 @@ impl VcfReader {
                 .collect();
             self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
         }
+    }
+
+    /// Check if all genotypes read were phased
+    ///
+    /// Returns true if every genotype in the VCF used the "|" separator,
+    /// indicating the data is already phased and doesn't need re-phasing.
+    /// Must be called after read_all().
+    pub fn was_all_phased(&self) -> bool {
+        self.all_phased
     }
 }
 

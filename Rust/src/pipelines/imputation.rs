@@ -696,12 +696,7 @@ impl ImputationPipeline {
             return Ok(());
         }
 
-        // Phase target before imputation (imputation requires phased haplotypes)
-        // With type states, VcfReader returns GenotypeMatrix<Unphased>, so we always phase
-        eprintln!("Phasing target data before imputation...");
-
         // Create marker alignment (reused for both phasing and imputation)
-        // This can be done before phasing since markers don't change during phasing
         eprintln!("Aligning markers...");
         let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
 
@@ -713,28 +708,36 @@ impl ImputationPipeline {
             n_genotyped, n_ref_markers
         );
 
-        // Create phasing pipeline with current config
-        let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
-
-        // Set reference panel for reference-guided phasing
-        // Uses Arc::clone for cheap reference count increment instead of deep cloning
-        phasing.set_reference(Arc::clone(&ref_gt), alignment.clone());
-        eprintln!("Using reference panel ({} haplotypes) for phasing", n_ref_haps);
-
-        // Load genetic map if provided
-        let gen_maps = if let Some(ref map_path) = self.config.map {
-            let chrom_names: Vec<&str> = target_gt
-                .markers()
-                .chrom_names()
-                .iter()
-                .map(|s| s.as_ref())
-                .collect();
-            GeneticMaps::from_plink_file(map_path, &chrom_names)?
+        // Check if target data is already phased - skip phasing if so
+        let target_gt = if target_reader.was_all_phased() {
+            eprintln!("Target data is already phased, skipping phasing step");
+            target_gt.into_phased()
         } else {
-            GeneticMaps::new()
-        };
+            // Phase target before imputation (imputation requires phased haplotypes)
+            eprintln!("Phasing target data before imputation...");
 
-        let target_gt = phasing.phase_in_memory(&target_gt, &gen_maps)?;
+            // Create phasing pipeline with current config
+            let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
+
+            // Set reference panel for reference-guided phasing
+            phasing.set_reference(Arc::clone(&ref_gt), alignment.clone());
+            eprintln!("Using reference panel ({} haplotypes) for phasing", n_ref_haps);
+
+            // Load genetic map if provided
+            let gen_maps = if let Some(ref map_path) = self.config.map {
+                let chrom_names: Vec<&str> = target_gt
+                    .markers()
+                    .chrom_names()
+                    .iter()
+                    .map(|s| s.as_ref())
+                    .collect();
+                GeneticMaps::from_plink_file(map_path, &chrom_names)?
+            } else {
+                GeneticMaps::new()
+            };
+
+            phasing.phase_in_memory(&target_gt, &gen_maps)?
+        };
 
         let n_target_markers = target_gt.n_markers();
         let n_target_samples = target_gt.n_samples();
