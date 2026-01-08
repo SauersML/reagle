@@ -1319,8 +1319,8 @@ def stage_impute5():
     impute5_bin = data_dir / "impute5"
     if not impute5_bin.exists():
         print("Downloading IMPUTE5...")
-        run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/s/raw/mwmgzjx5vvmbuaz/impute5_v1.2.0_static.zip'")
-        run(f"cd {data_dir} && unzip -q impute5.zip && mv impute5_v1.2.0_static/impute5_1.2.0_static impute5 && chmod +x impute5")
+        run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/sh/mwnceyhir8yze2j/AADbzP6QuAFPrj0Z9_I1RSmla?dl=1'")
+        run(f"cd {data_dir} && unzip -q -o impute5.zip impute5_v1.2.0.zip && unzip -q -o impute5_v1.2.0.zip && mv impute5_v1.2.0/impute5_v1.2.0_static impute5 && chmod +x impute5")
     
     impute5_out = data_dir / "impute5_imputed.vcf.gz"
     if not impute5_out.exists():
@@ -1543,8 +1543,8 @@ def run_impute5_chr(chrom, paths):
         impute5_bin = data_dir / "impute5"
         if not impute5_bin.exists():
             print(f"Downloading IMPUTE5 for chr{chrom}...")
-            run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/s/raw/mwmgzjx5vvmbuaz/impute5_v1.2.0_static.zip'")
-            run(f"cd {data_dir} && unzip -q impute5.zip && mv impute5_v1.2.0_static/impute5_1.2.0_static impute5 && chmod +x impute5")
+            run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/sh/mwnceyhir8yze2j/AADbzP6QuAFPrj0Z9_I1RSmla?dl=1'")
+            run(f"cd {data_dir} && unzip -q -o impute5.zip impute5_v1.2.0.zip && unzip -q -o impute5_v1.2.0.zip && mv impute5_v1.2.0/impute5_v1.2.0_static impute5 && chmod +x impute5")
 
     out = data_dir / "impute5_imputed.vcf.gz"
     if not out.exists():
