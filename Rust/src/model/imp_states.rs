@@ -98,9 +98,10 @@ pub struct ImpStates<'a> {
     n_ref_haps: usize,
     /// Number of IBS haplotypes to find per step
     n_ibs_haps: usize,
-    /// Projected->Dense marker mapping (None for dense mode, Some for projected mode)
-    /// Used to convert step boundaries to dense space for ThreadedHaps
-    projected_to_dense: Option<&'a [usize]>,
+    /// Genetic positions of projected markers (used for precise midpoint calculation)
+    projected_gen_positions: Option<&'a [f64]>,
+    /// Genetic positions of all dense markers (used for precise midpoint calculation)
+    dense_gen_positions: Option<&'a [f64]>,
 }
 
 impl<'a> ImpStates<'a> {
@@ -111,18 +112,20 @@ impl<'a> ImpStates<'a> {
     ///
     /// # Arguments
     /// * `ref_panel` - Reference panel in PROJECTED space (genotyped markers only)
-    /// * `projected_markers` - Mapping from projected index to dense marker index
     /// * `n_dense_markers` - Number of markers in dense space (for ThreadedHaps)
     /// * `n_ref_haps` - Number of reference haplotypes
     /// * `max_states` - Maximum number of HMM states to track
     /// * `n_ibs_haps` - Number of IBS haplotypes to find per step
+    /// * `projected_gen_positions` - Genetic positions of genotyped markers
+    /// * `dense_gen_positions` - Genetic positions of all reference markers
     pub fn new_projected(
         ref_panel: &'a RefPanelCoded,
-        projected_markers: &'a [usize],
         n_dense_markers: usize,
         n_ref_haps: usize,
         max_states: usize,
         n_ibs_haps: usize,
+        projected_gen_positions: &'a [f64],
+        dense_gen_positions: &'a [f64],
     ) -> Self {
         Self {
             max_states,
@@ -134,7 +137,8 @@ impl<'a> ImpStates<'a> {
             n_ref_markers: n_dense_markers,
             n_ref_haps,
             n_ibs_haps,
-            projected_to_dense: Some(projected_markers),
+            projected_gen_positions: Some(projected_gen_positions),
+            dense_gen_positions: Some(dense_gen_positions),
         }
     }
 
@@ -149,7 +153,7 @@ impl<'a> ImpStates<'a> {
     /// * `get_ref_allele` - Dense closure: (dense_marker_idx, hap) -> allele
     /// * `target_alleles_projected` - Target alleles in PROJECTED space (no 255s!)
     /// * `target_alleles_dense` - Target alleles in DENSE space (with 255s, for output)
-    /// * `genotyped_markers` - Dense indices of genotyped markers (= projected_to_dense mapping)
+    /// * `genotyped_markers` - Dense indices of genotyped markers
     /// * `workspace` - Pre-allocated workspace buffers
     /// * `hap_indices` - Output: ref hap indices at each genotyped marker
     /// * `allele_match` - Output: whether each state matches target
@@ -315,27 +319,42 @@ impl<'a> ImpStates<'a> {
             if self.queue.len() == self.max_states {
                 // Replace oldest composite haplotype
                 if let Some(mut head) = self.queue.pop() {
-                    let mid_step = (head.last_ibs_step + step) / 2;
-                    let mid_step_idx = mid_step.max(0) as usize;
+                    let start_marker = if let (Some(proj_pos), Some(dense_pos)) = (self.projected_gen_positions, self.dense_gen_positions) {
+                        let last_step_idx = head.last_ibs_step.max(0) as usize;
+                        let curr_step_idx = step.max(0) as usize;
 
-                    // Get step boundary - this is in projected space if using projected PBWT
-                    let step_start_projected = if mid_step_idx < self.ref_panel.n_steps() {
-                        self.ref_panel.step(mid_step_idx).start
+                        // Get genetic positions of the steps (start of the step)
+                        // Be careful with bounds: step index can be up to n_steps
+                        // ref_panel.step(i).start is the projected marker index
+                        let get_pos = |step_idx: usize| -> f64 {
+                            if step_idx < self.ref_panel.n_steps() {
+                                let proj_idx = self.ref_panel.step(step_idx).start;
+                                proj_pos.get(proj_idx).copied().unwrap_or(0.0)
+                            } else {
+                                // After last step
+                                proj_pos.last().copied().unwrap_or(0.0)
+                            }
+                        };
+
+                        let pos_last = get_pos(last_step_idx);
+                        let pos_curr = get_pos(curr_step_idx);
+
+                        let mid_pos = (pos_last + pos_curr) / 2.0;
+
+                        // Find dense marker closest to mid_pos
+                        // partition_point returns first element >= mid_pos
+                        let idx = dense_pos.partition_point(|&p| p < mid_pos);
+                        idx.min(dense_pos.len().saturating_sub(1))
                     } else {
-                        0
-                    };
-
-                    // Convert to dense marker index for ThreadedHaps
-                    let start_marker = if let Some(mapping) = self.projected_to_dense {
-                        // Projected mode: convert projected index to dense
-                        if step_start_projected < mapping.len() {
-                            mapping[step_start_projected]
+                        // Fallback to old sparse logic (should not happen in projected mode)
+                        let mid_step = (head.last_ibs_step + step) / 2;
+                        let mid_step_idx = mid_step.max(0) as usize;
+                        if mid_step_idx < self.ref_panel.n_steps() {
+                             // Assuming standard mode where step start is dense index
+                             self.ref_panel.step(mid_step_idx).start
                         } else {
                             0
                         }
-                    } else {
-                        // Dense mode: step boundary is already in dense space
-                        step_start_projected
                     };
 
                     // Clear old haplotype's entry

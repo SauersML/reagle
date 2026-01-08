@@ -1014,11 +1014,12 @@ impl ImputationPipeline {
                     // Use PROJECTED ImpStates - RefPanelCoded is in projected space
                     let imp_states = ImpStates::new_projected(
                         &ref_panel_coded,
-                        &genotyped_markers_vec,
                         n_ref_markers,
                         n_ref_haps,
                         n_states,
                         n_ibs_haps,
+                        &projected_gen_positions,
+                        &gen_positions,
                     );
                     (workspace, imp_states)
                 },
