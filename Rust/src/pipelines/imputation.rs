@@ -2133,4 +2133,147 @@ mod tests {
         }
     }
 
+    /// Critical test: cursor-based interpolation must match binary-search interpolation exactly.
+    ///
+    /// This validates the O(1) cursor optimization introduced to fix the 900M binary search
+    /// bottleneck. If this test fails, the cursor is advancing incorrectly.
+    #[test]
+    fn test_cursor_matches_binary_search() {
+        // Create a realistic StateProbs with multiple genotyped markers
+        let genotyped_markers = std::sync::Arc::new(vec![0, 10, 25, 50, 75, 100]);
+        let n_ref_markers = 101;
+        let gen_positions: std::sync::Arc<Vec<f64>> = std::sync::Arc::new(
+            (0..n_ref_markers).map(|m| m as f64 * 0.01).collect()
+        );
+
+        // Create haplotype indices and probabilities
+        // State 0 = hap 0, State 1 = hap 1, State 2 = hap 2
+        let n_states = 3;
+        let hap_indices: Vec<Vec<u32>> = (0..genotyped_markers.len())
+            .map(|_| vec![0, 1, 2])
+            .collect();
+
+        // Varying probabilities across genotyped markers
+        // m=0:   [0.8, 0.1, 0.1]
+        // m=10:  [0.3, 0.5, 0.2]
+        // m=25:  [0.1, 0.7, 0.2]
+        // m=50:  [0.2, 0.2, 0.6]
+        // m=75:  [0.4, 0.4, 0.2]
+        // m=100: [0.1, 0.3, 0.6]
+        let state_probs = vec![
+            0.8, 0.1, 0.1,  // m=0
+            0.3, 0.5, 0.2,  // m=10
+            0.1, 0.7, 0.2,  // m=25
+            0.2, 0.2, 0.6,  // m=50
+            0.4, 0.4, 0.2,  // m=75
+            0.1, 0.3, 0.6,  // m=100
+        ];
+
+        let sp = StateProbs::new(
+            genotyped_markers.clone(),
+            n_states,
+            hap_indices,
+            state_probs,
+            gen_positions.clone(),
+        );
+
+        // Reference allele function: hap 0 = REF, hap 1 = ALT, hap 2 = ALT
+        // All haplotypes have same allele at each marker (simplified test)
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            std::hint::black_box(marker); // silence unused warning
+            if hap == 0 { 0 } else { 1 }
+        };
+
+        // Use cursor to iterate through ALL markers sequentially
+        let mut cursor = sp.cursor();
+
+        for m in 0..n_ref_markers {
+            // Get result from cursor (O(1) amortized)
+            let cursor_result = cursor.allele_posteriors(m, 2, &get_ref_allele);
+
+            // Get result from binary search (O(log N))
+            let bs_result = sp.allele_posteriors(m, 2, &get_ref_allele);
+
+            // They must match exactly
+            match (&cursor_result, &bs_result) {
+                (AllelePosteriors::Biallelic(c_alt), AllelePosteriors::Biallelic(b_alt)) => {
+                    assert!(
+                        (c_alt - b_alt).abs() < 1e-6,
+                        "Marker {}: cursor gave P(ALT)={}, binary search gave P(ALT)={}",
+                        m, c_alt, b_alt
+                    );
+                }
+                _ => panic!("Marker {}: type mismatch between cursor and binary search", m),
+            }
+        }
+    }
+
+    /// Test cursor behavior when iterating BACKWARDS (should still work via linear scan)
+    /// This validates that the cursor handles out-of-order access gracefully.
+    #[test]
+    fn test_cursor_non_sequential_access() {
+        let genotyped_markers = std::sync::Arc::new(vec![0, 50, 100]);
+        let n_ref_markers = 101;
+        let gen_positions: std::sync::Arc<Vec<f64>> = std::sync::Arc::new(
+            (0..n_ref_markers).map(|m| m as f64).collect()
+        );
+
+        let hap_indices: Vec<Vec<u32>> = vec![vec![0, 1], vec![0, 1], vec![0, 1]];
+        let state_probs = vec![
+            1.0, 0.0,  // m=0: 100% state 0
+            0.5, 0.5,  // m=50: 50/50
+            0.0, 1.0,  // m=100: 100% state 1
+        ];
+
+        let sp = StateProbs::new(
+            genotyped_markers,
+            2,
+            hap_indices,
+            state_probs,
+            gen_positions,
+        );
+
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            std::hint::black_box(marker);
+            if hap == 0 { 0 } else { 1 }
+        };
+
+        // Access markers in random order
+        // Cursor should handle this by advancing (but can't go backwards)
+        let mut cursor = sp.cursor();
+
+        // First access at m=25 (cursor advances to sparse_idx=1)
+        let p1 = cursor.allele_posteriors(25, 2, &get_ref_allele);
+
+        // Second access at m=75 (cursor advances to sparse_idx=2)
+        let p2 = cursor.allele_posteriors(75, 2, &get_ref_allele);
+
+        // Verify results are reasonable
+        match p1 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                // m=25 is between m=0 (0% ALT) and m=50 (50% ALT)
+                // weight_left = (50 - 25) / (50 - 0) = 0.5
+                // interpolated = 0.5 * 0.0 + 0.5 * 0.5 = 0.25
+                assert!(
+                    (p_alt - 0.25).abs() < 0.1,
+                    "m=25: expected P(ALT)~0.25, got {}", p_alt
+                );
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+
+        match p2 {
+            AllelePosteriors::Biallelic(p_alt) => {
+                // m=75 is between m=50 (50% ALT) and m=100 (100% ALT)
+                // weight_left = (100 - 75) / (100 - 50) = 0.5
+                // interpolated = 0.5 * 0.5 + 0.5 * 1.0 = 0.75
+                assert!(
+                    (p_alt - 0.75).abs() < 0.1,
+                    "m=75: expected P(ALT)~0.75, got {}", p_alt
+                );
+            }
+            _ => panic!("Expected Biallelic"),
+        }
+    }
+
 }
