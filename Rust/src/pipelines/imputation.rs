@@ -280,10 +280,6 @@ pub struct StateProbs {
     /// Genetic positions of ALL reference markers (for interpolation)
     /// Uses Arc to share across all haplotypes (avoids cloning ~8MB per haplotype)
     gen_positions: std::sync::Arc<Vec<f64>>,
-    /// For each genotyped marker (sparse index), gives the cluster index
-    marker_to_cluster: std::sync::Arc<Vec<usize>>,
-    /// For each cluster, gives the reference marker index of the cluster end (exclusive)
-    cluster_end_ref_markers: std::sync::Arc<Vec<usize>>,
 }
 
 impl StateProbs {
