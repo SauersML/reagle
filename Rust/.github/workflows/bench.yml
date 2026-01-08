@@ -31,14 +31,14 @@ jobs:
             ${{ runner.os }}-cargo-bench-
 
       - name: Run benchmarks
-        run: cargo bench --bench hmm_benchmark -- --noplot --save-baseline pr
+        run: cargo bench --bench benchmarks -- --noplot --save-baseline pr
 
       - name: Compare to baseline (on PRs)
         if: github.event_name == 'pull_request'
         run: |
           # Fetch main branch baseline if available
           git fetch origin main:main || true
-          if cargo bench --bench hmm_benchmark -- --noplot --load-baseline main --baseline pr 2>/dev/null; then
+          if cargo bench --bench benchmarks -- --noplot --load-baseline main --baseline pr 2>/dev/null; then
             echo "Baseline comparison complete"
           else
             echo "No baseline found on main branch - skipping comparison"
@@ -47,7 +47,7 @@ jobs:
       - name: Save baseline (on main)
         if: github.ref == 'refs/heads/main'
         run: |
-          cargo bench --bench hmm_benchmark -- --noplot --save-baseline main
+          cargo bench --bench benchmarks -- --noplot --save-baseline main
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
