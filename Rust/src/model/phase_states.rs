@@ -180,17 +180,22 @@ impl PhaseStates {
         // Hap is not in queue - try to add it
         self.update_head_of_queue();
 
-        let should_replace = if self.queue.len() == self.max_states {
-            true
+        // Only replace when queue is FULL - matches Java BasicPhaseStates behavior
+        // The staleness check determines WHICH entry to replace, not WHETHER to replace
+        if self.queue.len() < self.max_states {
+            // Queue has room - add new entry
+            let index = self.queue.len();
+            self.threaded_haps.push_new(ibs_hap);
+            self.queue.push(CompHapEntry {
+                comp_hap_idx: index,
+                hap: ibs_hap,
+                start_marker: 0,
+                last_ibs_marker: marker,
+            });
         } else if !self.queue.is_empty() {
+            // Queue is full - check if oldest entry is stale enough to replace
             let oldest = self.queue.peek().unwrap();
-            (marker - oldest.last_ibs_marker) >= self.min_segment_len as i32
-        } else {
-            false
-        };
-
-        if should_replace || self.queue.len() < self.max_states {
-            if should_replace && !self.queue.is_empty() {
+            if (marker - oldest.last_ibs_marker) >= self.min_segment_len as i32 {
                 // Replace the oldest entry
                 let head = self.queue.pop().unwrap();
                 let index = head.comp_hap_idx;
@@ -220,17 +225,8 @@ impl PhaseStates {
                     start_marker: next_start,
                     last_ibs_marker: marker,
                 });
-            } else {
-                // Add new entry
-                let index = self.queue.len();
-                self.threaded_haps.push_new(ibs_hap);
-                self.queue.push(CompHapEntry {
-                    comp_hap_idx: index,
-                    hap: ibs_hap,
-                    start_marker: 0,
-                    last_ibs_marker: marker,
-                });
             }
+            // If oldest entry is not stale enough, don't replace - just track the hap
         }
 
         self.hap_to_last_ibs.insert(ibs_hap, marker);
