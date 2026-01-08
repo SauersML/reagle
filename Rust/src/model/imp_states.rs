@@ -207,12 +207,21 @@ impl<'a> ImpStates<'a> {
                 let step_start = coded_step.start;
                 let step_end = coded_step.end;
 
-                // Skip BOTH PBWT update and IBS matching if this step has no informative target data
-                // This prevents the virtual position from being corrupted by all-missing data
-                // being routed to pattern 0
+                // When step has no target data, we still need to track virtual position
+                // through the sort. We follow the haplotype currently at virtual_pos -
+                // this maintains continuity since neighbors are likely similar.
                 if !step_has_data[step_idx] {
-                    // Still need to update PBWT structure but WITHOUT changing virtual position
-                    pbwt_bwd.update_backward(coded_step, n_steps, None, None);
+                    // Track the haplotype at current virtual position
+                    let tracked_hap = pbwt_bwd.hap_at(bwd_virtual_pos.min(n_ref_haps - 1));
+                    let tracked_pattern = coded_step.pattern(HapIdx::new(tracked_hap));
+
+                    // Update PBWT and track where our haplotype goes
+                    pbwt_bwd.update_backward(
+                        coded_step,
+                        n_steps,
+                        Some((&mut bwd_virtual_pos, tracked_pattern)),
+                        None,
+                    );
                     continue;
                 }
 

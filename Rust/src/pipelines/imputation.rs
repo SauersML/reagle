@@ -372,19 +372,6 @@ impl StateProbs {
         }
     }
 
-    /// Convenience constructor without cluster information.
-    /// Uses next-marker fallback for probs_p1 (suitable for tests).
-    #[cfg(test)]
-    pub fn new_simple(
-        genotyped_markers: std::sync::Arc<Vec<usize>>,
-        n_states: usize,
-        hap_indices: Vec<Vec<u32>>,
-        state_probs: Vec<f32>,
-        gen_positions: std::sync::Arc<Vec<f64>>,
-    ) -> Self {
-        Self::new(genotyped_markers, n_states, hap_indices, state_probs, gen_positions)
-    }
-
     /// Compute per-allele probabilities at a reference marker (random access).
     /// Returns optimized representation: Biallelic for 2-allele sites, Multiallelic for others.
     ///

@@ -322,6 +322,12 @@ impl<'a> CodedPbwtView<'a> {
         Self { prefix, divergence }
     }
 
+    /// Get haplotype at a given position in the prefix array
+    #[inline]
+    pub fn hap_at(&self, pos: usize) -> u32 {
+        self.prefix[pos]
+    }
+
     /// Update PBWT with a coded step using counting sort
     ///
     /// This optimized version avoids allocating Vec<Vec<>> per step by using
