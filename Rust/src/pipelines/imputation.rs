@@ -530,14 +530,12 @@ impl StateProbs {
             let mut p_alt = 0.0f32;
             let mut p_ref = 0.0f32;
             for (j, &hap) in haps.iter().enumerate() {
-                // Interpolate state probability only when between different clusters
+                // Interpolate state probability. For markers within the same cluster,
+                // probs and probs_p1 will be identical, resulting in a constant probability.
+                // For markers between clusters, this produces a linear interpolation.
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                let interpolated_prob = if is_between_clusters {
-                    let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    weight_left * prob + (1.0 - weight_left) * prob_p1
-                } else {
-                    prob
-                };
+                let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                let interpolated_prob = weight_left * prob + (1.0 - weight_left) * prob_p1;
 
                 // Look up allele at the interpolated marker
                 let allele = get_ref_allele(ref_marker, hap);
@@ -557,14 +555,10 @@ impl StateProbs {
             // Java-style interpolation for multiallelic sites
             let mut al_probs = vec![0.0f32; n_alleles];
             for (j, &hap) in haps.iter().enumerate() {
-                // Interpolate state probability only when between different clusters
+                // Interpolate state probability (see biallelic case for explanation)
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                let interpolated_prob = if is_between_clusters {
-                    let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    weight_left * prob + (1.0 - weight_left) * prob_p1
-                } else {
-                    prob
-                };
+                let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                let interpolated_prob = weight_left * prob + (1.0 - weight_left) * prob_p1;
 
                 // Look up allele at the interpolated marker
                 let allele = get_ref_allele(ref_marker, hap);
