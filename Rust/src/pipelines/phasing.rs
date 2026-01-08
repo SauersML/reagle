@@ -1867,7 +1867,8 @@ impl PhasingPipeline {
         //   - swap_mask[i] = true if hi_freq marker i should be swapped (derived by comparing
         //     final working sequences to originals, capturing cumulative effect of all swaps)
         //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
-        let phase_decisions: Vec<(Vec<bool>, Vec<(usize, f32)>)> = sample_phases
+        type PhaseDecision = (Vec<bool>, Vec<(usize, f32)>);
+        let phase_decisions: Vec<PhaseDecision> = sample_phases
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
