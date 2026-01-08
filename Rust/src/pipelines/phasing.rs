@@ -2352,9 +2352,9 @@ impl PhasingPipeline {
             self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps)
         };
 
-        // Process samples in parallel - collect results: (marker, should_swap)
+        // Process samples in parallel - collect results: Stage2Decision
         // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
-        let phase_changes: Vec<Vec<(usize, bool, f32)>> = sample_phases
+        let phase_changes: Vec<Vec<Stage2Decision>> = sample_phases
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
@@ -2406,9 +2406,6 @@ impl PhasingPipeline {
                         .collect()
                 };
 
-                // Collect phase decisions for this sample
-                let mut phase_decisions = Vec::new();
-
                 // Closure to get allele for any haplotype (target or reference)
                 let get_allele = |marker: usize, hap: usize| -> u8 {
                     if hap < n_haps {
@@ -2430,15 +2427,92 @@ impl PhasingPipeline {
                     }
                 };
 
+                let mut decisions: Vec<Stage2Decision> = Vec::new();
+
+                // Function to impute a single allele for a haplotype
+                // Matches Java Stage2Baum.imputeAllele()
+                let impute_allele = |m: usize, probs: &[Vec<f32>], state_haps: &[Vec<u32>]| -> u8 {
+                    // For biallelic sites (most common), use 2 alleles
+                    // For multiallelic, use a reasonable max
+                    let n_alleles = 4usize; // Conservative max for rare multiallelic sites
+                    let mut al_probs = vec![0.0f32; n_alleles];
+
+                    let mkr_a = stage2_phaser.prev_stage1_marker[m];
+                    let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
+                    let wt = stage2_phaser.prev_stage1_wt[m];
+
+                    for (j, &hap) in state_haps[mkr_a].iter().enumerate() {
+                        let prob_a = probs[mkr_a].get(j).copied().unwrap_or(0.0);
+                        let prob_b = probs[mkr_b].get(j).copied().unwrap_or(0.0);
+                        let prob = wt * prob_a + (1.0 - wt) * prob_b;
+
+                        let b1 = get_allele(m, hap as usize);
+                        let b2 = get_allele(m, (hap ^ 1) as usize);
+
+                        if b1 != 255 && b2 != 255 {
+                            if b1 == b2 || (hap as usize) >= n_haps {
+                                // Homozygous or reference haplotype
+                                if (b1 as usize) < n_alleles {
+                                    al_probs[b1 as usize] += prob;
+                                }
+                            } else {
+                                // Heterozygous target haplotype
+                                let is_rare1 = maf[m] < rare_threshold && b1 > 0;
+                                let is_rare2 = maf[m] < rare_threshold && b2 > 0;
+                                if is_rare1 != is_rare2 {
+                                    // One rare, one common: favor rare slightly
+                                    if is_rare1 && (b1 as usize) < n_alleles {
+                                        al_probs[b1 as usize] += 0.55 * prob;
+                                    }
+                                    if !is_rare1 && (b1 as usize) < n_alleles {
+                                        al_probs[b1 as usize] += 0.45 * prob;
+                                    }
+                                    if is_rare2 && (b2 as usize) < n_alleles {
+                                        al_probs[b2 as usize] += 0.55 * prob;
+                                    }
+                                    if !is_rare2 && (b2 as usize) < n_alleles {
+                                        al_probs[b2 as usize] += 0.45 * prob;
+                                    }
+                                } else {
+                                    // Both rare or both common: equal weight
+                                    if (b1 as usize) < n_alleles {
+                                        al_probs[b1 as usize] += 0.5 * prob;
+                                    }
+                                    if (b2 as usize) < n_alleles {
+                                        al_probs[b2 as usize] += 0.5 * prob;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Return allele with highest probability
+                    al_probs
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as u8)
+                        .unwrap_or(0)
+                };
+
                 let mut process_marker = |m: usize, rng: &mut rand::rngs::StdRng| {
+                    let a1 = sp.allele1(m);
+                    let a2 = sp.allele2(m);
+
+                    // Handle missing genotypes by imputation
+                    if sp.is_missing(m) || a1 == 255 || a2 == 255 {
+                        let imp_a1 = impute_allele(m, &probs1, &state_haps_stage1);
+                        let imp_a2 = impute_allele(m, &probs2, &state_haps_stage1);
+                        decisions.push(Stage2Decision::Impute { marker: m, a1: imp_a1, a2: imp_a2 });
+                        return;
+                    }
+
+                    // Skip if not unphased heterozygote
                     if !sp.is_unphased(m) {
                         return;
                     }
 
-                    let a1 = sp.allele1(m);
-                    let a2 = sp.allele2(m);
-
-                    // Only process heterozygotes
+                    // Skip homozygotes
                     if a1 == a2 {
                         return;
                     }
@@ -2476,7 +2550,7 @@ impl PhasingPipeline {
                     } else {
                         (p1 / p2.max(1e-30)) as f32
                     };
-                    phase_decisions.push((m, should_swap, lr));
+                    decisions.push(Stage2Decision::Phase { marker: m, should_swap, lr });
                 };
 
                 // Process markers before first Stage 1 marker
@@ -2501,13 +2575,14 @@ impl PhasingPipeline {
                     }
                 }
 
-                phase_decisions
+                decisions
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        // Apply phase changes to SamplePhase
+        // Apply phase changes and imputations to SamplePhase
         let mut total_switches = 0;
         let mut total_phased = 0;
+        let mut total_imputed = 0;
 
         // Stage 2 runs after all iterations, so lr_threshold is typically 1.0
         // (all decisions pass). We still check for consistency with Stage 1.
@@ -2516,29 +2591,38 @@ impl PhasingPipeline {
         for (s, decisions) in phase_changes.into_iter().enumerate() {
             let sp = &mut sample_phases[s];
 
-            for (m, should_swap, lr) in decisions {
-                // Double-check still unphased (should always be true)
-                if !sp.is_unphased(m) {
-                    continue;
-                }
+            for decision in decisions {
+                match decision {
+                    Stage2Decision::Phase { marker: m, should_swap, lr } => {
+                        // Double-check still unphased (should always be true)
+                        if !sp.is_unphased(m) {
+                            continue;
+                        }
 
-                if should_swap {
-                    sp.swap_haps(m, m + 1);
-                    total_switches += 1;
-                }
+                        if should_swap {
+                            sp.swap_haps(m, m + 1);
+                            total_switches += 1;
+                        }
 
-                // Only mark as phased if likelihood ratio exceeds threshold
-                // (Stage 2 runs after iterations, so threshold is typically 1.0)
-                if lr >= lr_threshold {
-                    sp.mark_phased(m);
-                    total_phased += 1;
+                        // Only mark as phased if likelihood ratio exceeds threshold
+                        // (Stage 2 runs after iterations, so threshold is typically 1.0)
+                        if lr >= lr_threshold {
+                            sp.mark_phased(m);
+                            total_phased += 1;
+                        }
+                    }
+                    Stage2Decision::Impute { marker: m, a1, a2 } => {
+                        // Set imputed alleles for missing marker
+                        sp.set_imputed(m, a1, a2);
+                        total_imputed += 1;
+                    }
                 }
             }
         }
 
         eprintln!(
-            "Stage 2: Applied {} phase switches, {} markers phased (HMM interpolation)",
-            total_switches, total_phased
+            "Stage 2: Applied {} phase switches, {} markers phased, {} markers imputed (HMM interpolation)",
+            total_switches, total_phased, total_imputed
         );
     }
 }
@@ -2570,6 +2654,15 @@ fn compute_state_posteriors(
     }
 
     probs
+}
+
+/// Decision type for Stage 2 marker processing
+#[derive(Debug, Clone)]
+enum Stage2Decision {
+    /// Phase an unphased heterozygote
+    Phase { marker: usize, should_swap: bool, lr: f32 },
+    /// Impute a missing genotype
+    Impute { marker: usize, a1: u8, a2: u8 },
 }
 
 /// Stage 2 phaser with HMM state probability interpolation

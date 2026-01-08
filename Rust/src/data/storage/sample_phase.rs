@@ -168,6 +168,26 @@ impl SamplePhase {
             self.status[marker] = ClusterStatus::Phased;
         }
     }
+
+    /// Returns true if the marker has missing genotype data.
+    #[inline]
+    pub fn is_missing(&self, marker: usize) -> bool {
+        self.status[marker] == ClusterStatus::Missing
+    }
+
+    /// Set imputed alleles for a missing marker.
+    ///
+    /// Sets the alleles and changes status from Missing to Phased.
+    /// Only has effect if the marker is currently Missing.
+    pub fn set_imputed(&mut self, marker: usize, a1: u8, a2: u8) {
+        if self.status[marker] == ClusterStatus::Missing {
+            self.hap1[marker] = a1;
+            self.hap2[marker] = a2;
+            self.status_counts[ClusterStatus::Missing as usize] -= 1;
+            self.status_counts[ClusterStatus::Phased as usize] += 1;
+            self.status[marker] = ClusterStatus::Phased;
+        }
+    }
 }
 
 #[cfg(test)]
