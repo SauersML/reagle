@@ -49,6 +49,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+[[bench]]
+name = "hmm_benchmark"
+harness = false
+
 [lints.rust]
 # Treat all warnings as errors
 warnings = "deny"

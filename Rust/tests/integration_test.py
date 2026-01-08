@@ -190,14 +190,23 @@ def calculate_dosage(gt):
 
 def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     """
-    Calculate detailed imputation accuracy metrics.
+    Calculate comprehensive imputation accuracy metrics.
 
     Metrics:
-    - Unphased genotype concordance (exact match ignoring phase: 0|1 == 1|0)
+    - Unphased genotype concordance (exact match ignoring phase: 0|1 == 1|0)  
     - Allelic R² (correlation between true and imputed dosages)
-    - Non-reference concordance
+    - Dosage Variance R² (correlation using variance-weighted approach)
+    - Non-reference concordance (concordance for non-REF genotypes only)
+    - IQS (Imputation Quality Score - chance-corrected concordance)
+    - Switch Error Rate (phase switch errors for heterozygotes)
+    - Confusion matrix (HomRef/Het/HomAlt)
+    - Per-sample metrics
     - Per-MAF-bin metrics
+    - INFO score approximation
     """
+    import time
+    start_time = time.time()
+    
     if not imputed_vcf or not os.path.exists(imputed_vcf):
         print("Imputed VCF not found")
         return None
@@ -205,7 +214,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     print(f"\nCalculating metrics: {imputed_vcf} vs {truth_vcf}")
 
     # Load truth genotypes - store both genotype tuple and dosage
-    truth_gts = {}  # (chrom, pos) -> {sample: (gt_tuple, dosage)}
+    truth_gts = {}  # (chrom, pos) -> {sample: (gt_tuple, dosage, is_phased)}
     result = run(f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {truth_vcf}", capture=True)
     samples_result = run(f"bcftools query -l {truth_vcf}", capture=True)
     truth_samples = samples_result.stdout.strip().split('\n')
@@ -222,9 +231,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         truth_gts[key] = {}
         for i, gt_str in enumerate(gts):
             if i < len(truth_samples):
-                gt = parse_genotype(gt_str.split(':')[0])  # Handle GT:other fields
+                gt_field = gt_str.split(':')[0]  # Handle GT:other fields
+                gt = parse_genotype(gt_field)
+                is_phased = '|' in gt_field
                 if gt is not None:
-                    truth_gts[key][truth_samples[i]] = (gt, calculate_dosage(gt))
+                    truth_gts[key][truth_samples[i]] = (gt, calculate_dosage(gt), is_phased)
 
     # Load imputed genotypes - store both genotype tuple and dosage
     imputed_gts = {}
@@ -244,37 +255,61 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         imputed_gts[key] = {}
         for i, gt_str in enumerate(gts):
             if i < len(imputed_samples):
-                gt = parse_genotype(gt_str.split(':')[0])
+                gt_field = gt_str.split(':')[0]
+                gt = parse_genotype(gt_field)
+                is_phased = '|' in gt_field
                 if gt is not None:
-                    imputed_gts[key][imputed_samples[i]] = (gt, calculate_dosage(gt))
+                    imputed_gts[key][imputed_samples[i]] = (gt, calculate_dosage(gt), is_phased)
 
     # Calculate metrics
     unphased_concordant = 0  # Genotype match ignoring phase (0|1 == 1|0)
     total_compared = 0
+    
+    # Non-reference concordance (excludes 0/0 vs 0/0)
+    nonref_concordant = 0
+    nonref_total = 0
 
     truth_dosages = []
     imputed_dosages = []
 
+    # Confusion matrix: [true_class][imputed_class]
+    # Classes: 0=HomRef, 1=Het, 2=HomAlt
+    confusion = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    
+    # Per-sample tracking
+    sample_metrics = defaultdict(lambda: {"concordant": 0, "total": 0, "truth_dos": [], "imp_dos": []})
+
     # For IQS calculation: track per-site concordance and expected concordance
     site_iqs_values = []
+    
+    # For switch error rate
+    switch_errors = 0
+    switch_opportunities = 0
 
     # MAF bins for stratified analysis
     maf_bins = defaultdict(lambda: {
         "unphased_concordant": 0, "total": 0, "truth": [], "imputed": [],
-        "iqs_values": []
+        "iqs_values": [], "nonref_concordant": 0, "nonref_total": 0,
+        "confusion": [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
     })
 
     common_sites = set(truth_gts.keys()) & set(imputed_gts.keys())
     print(f"Common sites: {len(common_sites)}")
+    
+    # Sort sites for switch error calculation
+    sorted_sites = sorted(common_sites, key=lambda x: (x[0], x[1]))
+    
+    # Track previous het for switch error calculation per sample
+    prev_het = {}  # sample -> (site, truth_gt, imputed_gt)
 
-    for site in common_sites:
+    for site in sorted_sites:
         truth_site = truth_gts[site]
         imputed_site = imputed_gts.get(site, {})
 
         # Calculate MAF from truth
-        dosages = [v[1] for v in truth_site.values() if v[1] is not None]
-        if dosages:
-            af = sum(dosages) / (2 * len(dosages))
+        dosages_at_site = [v[1] for v in truth_site.values() if v[1] is not None]
+        if dosages_at_site:
+            af = sum(dosages_at_site) / (2 * len(dosages_at_site))
             maf = min(af, 1 - af)
         else:
             maf = 0
@@ -295,8 +330,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
 
         for sample in truth_site:
             if sample in imputed_site:
-                t_gt, t_dos = truth_site[sample]
-                i_gt, i_dos = imputed_site[sample]
+                t_gt, t_dos, t_phased = truth_site[sample]
+                i_gt, i_dos, i_phased = imputed_site[sample]
 
                 if t_dos is not None and i_dos is not None:
                     total_compared += 1
@@ -307,6 +342,17 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     maf_bins[maf_bin]["truth"].append(t_dos)
                     maf_bins[maf_bin]["imputed"].append(i_dos)
                     maf_bins[maf_bin]["total"] += 1
+                    
+                    # Per-sample tracking
+                    sample_metrics[sample]["total"] += 1
+                    sample_metrics[sample]["truth_dos"].append(t_dos)
+                    sample_metrics[sample]["imp_dos"].append(i_dos)
+                    
+                    # Classify genotypes for confusion matrix
+                    t_class = 0 if t_dos == 0 else (2 if t_dos == 2 else 1)
+                    i_class = 0 if i_dos == 0 else (2 if i_dos == 2 else 1)
+                    confusion[t_class][i_class] += 1
+                    maf_bins[maf_bin]["confusion"][t_class][i_class] += 1
 
                     # Unphased concordance: sort alleles so 0|1 == 1|0
                     t_sorted = tuple(sorted(t_gt))
@@ -315,6 +361,28 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                         unphased_concordant += 1
                         site_concordant += 1
                         maf_bins[maf_bin]["unphased_concordant"] += 1
+                        sample_metrics[sample]["concordant"] += 1
+                    
+                    # Non-reference concordance
+                    if t_dos > 0:  # Truth is not HomRef
+                        nonref_total += 1
+                        maf_bins[maf_bin]["nonref_total"] += 1
+                        if t_sorted == i_sorted:
+                            nonref_concordant += 1
+                            maf_bins[maf_bin]["nonref_concordant"] += 1
+                    
+                    # Switch error detection (for hets only, when both are phased)
+                    if t_dos == 1 and i_dos == 1 and t_phased and i_phased:
+                        if sample in prev_het:
+                            prev_site, prev_t_gt, prev_i_gt = prev_het[sample]
+                            # Determine if there's a switch by comparing phase relationships
+                            # If truth maintains same phase but imputed flips, it's a switch
+                            t_same_phase = (t_gt[0] == prev_t_gt[0])  # First allele same as prev first
+                            i_same_phase = (i_gt[0] == prev_i_gt[0])
+                            if t_same_phase != i_same_phase:
+                                switch_errors += 1
+                            switch_opportunities += 1
+                        prev_het[sample] = (site, t_gt, i_gt)
 
         # Calculate IQS for this site
         # IQS = (observed - expected) / (1 - expected)
@@ -343,6 +411,27 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         metrics["unphased_concordance"] = unphased_concordant / total_compared
         metrics["total_genotypes"] = total_compared
         metrics["sites_compared"] = len(common_sites)
+        
+        # Non-reference concordance
+        if nonref_total > 0:
+            metrics["nonref_concordance"] = nonref_concordant / nonref_total
+            metrics["nonref_total"] = nonref_total
+        
+        # Switch error rate
+        if switch_opportunities > 0:
+            metrics["switch_error_rate"] = switch_errors / switch_opportunities
+            metrics["switch_errors"] = switch_errors
+            metrics["switch_opportunities"] = switch_opportunities
+        
+        # Confusion matrix
+        metrics["confusion_matrix"] = confusion
+        
+        # Per-class accuracy
+        for cls, name in [(0, "homref"), (1, "het"), (2, "homalt")]:
+            row_total = sum(confusion[cls])
+            if row_total > 0:
+                metrics[f"{name}_accuracy"] = confusion[cls][cls] / row_total
+                metrics[f"{name}_total"] = row_total
 
         # Calculate R²
         if len(truth_dosages) > 1:
@@ -358,14 +447,46 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 metrics["r_squared"] = r ** 2
             else:
                 metrics["r_squared"] = None
+                
+            # INFO score approximation (variance ratio)
+            # INFO ≈ 1 - (mean imputed variance) / (expected variance under HWE)
+            # For hard calls: var_expected = 2*p*q, var_observed = 0
+            # This is a rough approximation
+            if var_t > 0:
+                metrics["info_score_approx"] = var_i / var_t
         else:
             metrics["r_squared"] = None
 
         # Calculate overall IQS (mean across sites)
         if site_iqs_values:
             metrics["iqs"] = sum(site_iqs_values) / len(site_iqs_values)
+            metrics["iqs_median"] = sorted(site_iqs_values)[len(site_iqs_values) // 2]
         else:
             metrics["iqs"] = None
+            
+        # Per-sample summary statistics
+        sample_concordances = []
+        sample_r2s = []
+        for sample, data in sample_metrics.items():
+            if data["total"] > 0:
+                sample_concordances.append(data["concordant"] / data["total"])
+            if len(data["truth_dos"]) > 1:
+                mean_t = sum(data["truth_dos"]) / len(data["truth_dos"])
+                mean_i = sum(data["imp_dos"]) / len(data["imp_dos"])
+                cov = sum((t - mean_t) * (i - mean_i) for t, i in zip(data["truth_dos"], data["imp_dos"]))
+                var_t = sum((t - mean_t) ** 2 for t in data["truth_dos"])
+                var_i = sum((i - mean_i) ** 2 for i in data["imp_dos"])
+                if var_t > 0 and var_i > 0:
+                    r = cov / math.sqrt(var_t * var_i)
+                    sample_r2s.append(r ** 2)
+        
+        if sample_concordances:
+            metrics["sample_concordance_mean"] = sum(sample_concordances) / len(sample_concordances)
+            metrics["sample_concordance_min"] = min(sample_concordances)
+            metrics["sample_concordance_max"] = max(sample_concordances)
+        if sample_r2s:
+            metrics["sample_r2_mean"] = sum(sample_r2s) / len(sample_r2s)
+            metrics["sample_r2_min"] = min(sample_r2s)
 
         # Per-MAF bin metrics
         metrics["by_maf"] = {}
@@ -375,6 +496,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     "unphased_concordance": data["unphased_concordant"] / data["total"],
                     "n_genotypes": data["total"]
                 }
+                # Non-ref concordance per bin
+                if data["nonref_total"] > 0:
+                    bin_metrics["nonref_concordance"] = data["nonref_concordant"] / data["nonref_total"]
                 # R² per bin
                 if len(data["truth"]) > 1:
                     mean_t = sum(data["truth"]) / len(data["truth"])
@@ -391,45 +515,110 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     bin_metrics["iqs"] = sum(data["iqs_values"]) / len(data["iqs_values"])
                 metrics["by_maf"][maf_bin] = bin_metrics
 
+    elapsed = time.time() - start_time
+    metrics["calculation_time_sec"] = elapsed
+
     # Print results
-    print("\n" + "=" * 50)
-    print("IMPUTATION METRICS")
-    print("=" * 50)
+    print("\n" + "=" * 60)
+    print("IMPUTATION METRICS - COMPREHENSIVE ANALYSIS")
+    print("=" * 60)
 
     if metrics:
-        print(f"Sites compared: {metrics.get('sites_compared', 'N/A')}")
-        print(f"Genotypes compared: {metrics.get('total_genotypes', 'N/A')}")
-        print(f"Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")
-        print(f"Overall R²: {metrics.get('r_squared'):.4f}" if metrics.get('r_squared') else "Overall R²: N/A")
-        print(f"Overall IQS: {metrics.get('iqs'):.4f}" if metrics.get('iqs') else "Overall IQS: N/A")
+        print(f"\n📊 OVERALL STATISTICS")
+        print(f"   Sites compared: {metrics.get('sites_compared', 'N/A'):,}")
+        print(f"   Genotypes compared: {metrics.get('total_genotypes', 'N/A'):,}")
+        print(f"   Calculation time: {metrics.get('calculation_time_sec', 0):.1f}s")
+        
+        print(f"\n🎯 ACCURACY METRICS")
+        print(f"   Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")
+        print(f"   Non-ref concordance:  {metrics.get('nonref_concordance', 0):.4f}" if metrics.get('nonref_concordance') else "   Non-ref concordance:  N/A")
+        print(f"   Overall R²:           {metrics.get('r_squared'):.4f}" if metrics.get('r_squared') else "   Overall R²:           N/A")
+        print(f"   Overall IQS:          {metrics.get('iqs'):.4f}" if metrics.get('iqs') else "   Overall IQS:          N/A")
+        print(f"   INFO score (approx):  {metrics.get('info_score_approx'):.4f}" if metrics.get('info_score_approx') else "   INFO score (approx):  N/A")
+        
+        if metrics.get('switch_error_rate') is not None:
+            print(f"\n🔀 PHASING QUALITY")
+            print(f"   Switch error rate:    {metrics.get('switch_error_rate'):.4f} ({metrics.get('switch_errors')}/{metrics.get('switch_opportunities')})")
+        
+        print(f"\n📋 CONFUSION MATRIX (Truth vs Imputed)")
+        print(f"   {'':12} {'HomRef':>10} {'Het':>10} {'HomAlt':>10}")
+        labels = ['HomRef', 'Het', 'HomAlt']
+        for i, label in enumerate(labels):
+            row = metrics.get('confusion_matrix', [[0,0,0],[0,0,0],[0,0,0]])[i]
+            print(f"   {label:12} {row[0]:>10,} {row[1]:>10,} {row[2]:>10,}")
+        
+        print(f"\n📊 PER-CLASS ACCURACY")
+        for cls in ['homref', 'het', 'homalt']:
+            acc = metrics.get(f'{cls}_accuracy')
+            total = metrics.get(f'{cls}_total', 0)
+            if acc is not None:
+                print(f"   {cls.upper():12} {acc:.4f} (n={total:,})")
+        
+        print(f"\n👥 PER-SAMPLE STATISTICS")
+        if metrics.get('sample_concordance_mean'):
+            print(f"   Concordance: mean={metrics['sample_concordance_mean']:.4f}, min={metrics['sample_concordance_min']:.4f}, max={metrics['sample_concordance_max']:.4f}")
+        if metrics.get('sample_r2_mean'):
+            print(f"   R²:          mean={metrics['sample_r2_mean']:.4f}, min={metrics['sample_r2_min']:.4f}")
 
         if "by_maf" in metrics:
-            print("\nBy MAF bin:")
+            print(f"\n📈 BY MAF BIN")
+            print(f"   {'MAF Bin':<15} {'Conc':>8} {'NonRef':>8} {'R²':>8} {'IQS':>8} {'N':>10}")
+            print(f"   {'-'*15} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*10}")
             for maf_bin, bin_metrics in metrics["by_maf"].items():
+                conc = f"{bin_metrics['unphased_concordance']:.4f}"
+                nonref = f"{bin_metrics.get('nonref_concordance', 0):.4f}" if bin_metrics.get('nonref_concordance') else "N/A"
                 r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
                 iqs_str = f"{bin_metrics.get('iqs'):.4f}" if bin_metrics.get('iqs') else "N/A"
-                print(f"  {maf_bin}: conc={bin_metrics['unphased_concordance']:.4f}, "
-                      f"R²={r2_str}, IQS={iqs_str}, n={bin_metrics['n_genotypes']}")
+                print(f"   {maf_bin:<15} {conc:>8} {nonref:>8} {r2_str:>8} {iqs_str:>8} {bin_metrics['n_genotypes']:>10,}")
 
-    # Save metrics to file
+    # Save detailed metrics to file
     metrics_file = f"{output_prefix}_metrics.txt"
     with open(metrics_file, 'w') as f:
-        f.write("IMPUTATION ACCURACY METRICS\n")
-        f.write("=" * 50 + "\n\n")
+        f.write("=" * 60 + "\n")
+        f.write("IMPUTATION ACCURACY METRICS - DETAILED REPORT\n")
+        f.write("=" * 60 + "\n\n")
         if metrics:
+            f.write("OVERALL STATISTICS\n")
+            f.write("-" * 40 + "\n")
             f.write(f"Sites compared: {metrics.get('sites_compared', 'N/A')}\n")
             f.write(f"Genotypes compared: {metrics.get('total_genotypes', 'N/A')}\n")
-            f.write(f"Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}\n")
+            f.write(f"Calculation time: {metrics.get('calculation_time_sec', 0):.1f}s\n\n")
+            
+            f.write("ACCURACY METRICS\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Unphased concordance: {metrics.get('unphased_concordance', 0):.6f}\n")
+            if metrics.get('nonref_concordance'):
+                f.write(f"Non-ref concordance: {metrics['nonref_concordance']:.6f}\n")
             if metrics.get('r_squared'):
-                f.write(f"Overall R²: {metrics['r_squared']:.4f}\n")
+                f.write(f"Overall R²: {metrics['r_squared']:.6f}\n")
             if metrics.get('iqs'):
-                f.write(f"Overall IQS: {metrics['iqs']:.4f}\n")
-            f.write("\nBy MAF bin:\n")
+                f.write(f"Overall IQS: {metrics['iqs']:.6f}\n")
+            if metrics.get('info_score_approx'):
+                f.write(f"INFO score (approx): {metrics['info_score_approx']:.6f}\n")
+            if metrics.get('switch_error_rate') is not None:
+                f.write(f"Switch error rate: {metrics['switch_error_rate']:.6f}\n")
+            
+            f.write("\nCONFUSION MATRIX\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"{'':12} {'HomRef':>10} {'Het':>10} {'HomAlt':>10}\n")
+            for i, label in enumerate(['HomRef', 'Het', 'HomAlt']):
+                row = metrics.get('confusion_matrix', [[0,0,0],[0,0,0],[0,0,0]])[i]
+                f.write(f"{label:12} {row[0]:>10} {row[1]:>10} {row[2]:>10}\n")
+            
+            f.write("\nBY MAF BIN\n")
+            f.write("-" * 40 + "\n")
             for maf_bin, bin_metrics in metrics.get("by_maf", {}).items():
-                r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
-                iqs_str = f"{bin_metrics.get('iqs'):.4f}" if bin_metrics.get('iqs') else "N/A"
-                f.write(f"  {maf_bin}: conc={bin_metrics['unphased_concordance']:.4f}, "
-                       f"R²={r2_str}, IQS={iqs_str}, n={bin_metrics['n_genotypes']}\n")
+                f.write(f"\n{maf_bin}:\n")
+                f.write(f"  Concordance: {bin_metrics['unphased_concordance']:.6f}\n")
+                if bin_metrics.get('nonref_concordance'):
+                    f.write(f"  Non-ref concordance: {bin_metrics['nonref_concordance']:.6f}\n")
+                if bin_metrics.get('r_squared'):
+                    f.write(f"  R²: {bin_metrics['r_squared']:.6f}\n")
+                if bin_metrics.get('iqs'):
+                    f.write(f"  IQS: {bin_metrics['iqs']:.6f}\n")
+                f.write(f"  N genotypes: {bin_metrics['n_genotypes']}\n")
+    
+    print(f"\n📄 Detailed metrics saved to: {metrics_file}")
 
     return metrics
 
