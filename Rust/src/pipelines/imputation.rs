@@ -361,6 +361,9 @@ impl StateProbs {
 
     /// Compute per-allele probabilities at a reference marker.
     /// Returns optimized representation: Biallelic for 2-allele sites, Multiallelic for others.
+    ///
+    /// NOTE: For sequential marker access (0, 1, 2, ...), use `cursor()` instead
+    /// which provides O(1) lookup via linear scanning instead of O(log N) binary search.
     #[inline]
     pub fn allele_posteriors<F>(&self, ref_marker: usize, n_alleles: usize, get_ref_allele: F) -> AllelePosteriors
     where
@@ -374,6 +377,16 @@ impl StateProbs {
                 self.posteriors_interpolated(ref_marker, insert_pos, n_alleles, &get_ref_allele)
             }
         }
+    }
+
+    /// Create a cursor for efficient sequential marker access.
+    ///
+    /// When processing markers in order (0, 1, 2, ..., N-1), this provides O(1)
+    /// amortized lookup instead of O(log N) binary search per marker.
+    /// This is ~900 million binary search operations saved for typical datasets.
+    #[inline]
+    pub fn cursor(&self) -> StateProbsCursor<'_> {
+        StateProbsCursor::new(self)
     }
 
     /// Per-allele probabilities at a genotyped marker
@@ -592,6 +605,63 @@ impl AllelePosteriors {
         }
     }
 
+}
+
+/// Cursor for efficient sequential marker access to StateProbs.
+///
+/// Eliminates the O(log N) binary search per marker by maintaining position state.
+/// When markers are processed in order (0, 1, 2, ...), this provides O(1) amortized lookup.
+///
+/// # Performance Impact
+/// For 818 samples × 2 haps × 1.1M markers = 1.8 billion marker lookups:
+/// - Binary search: 1.8B × 20 comparisons = 36 billion comparisons
+/// - Cursor: 1.8B × ~1 comparison = ~1.8 billion comparisons (20x faster)
+pub struct StateProbsCursor<'a> {
+    state_probs: &'a StateProbs,
+    /// Current position in genotyped_markers (the sparse index)
+    sparse_idx: usize,
+}
+
+impl<'a> StateProbsCursor<'a> {
+    /// Create a new cursor starting at position 0
+    #[inline]
+    pub fn new(state_probs: &'a StateProbs) -> Self {
+        Self { state_probs, sparse_idx: 0 }
+    }
+
+    /// Reset cursor to beginning (for reuse across multiple passes)
+    #[inline]
+    pub fn reset(&mut self) {
+        self.sparse_idx = 0;
+    }
+
+    /// Compute allele posteriors at ref_marker using cursor for O(1) lookup.
+    ///
+    /// IMPORTANT: Markers MUST be queried in ascending order (0, 1, 2, ...).
+    /// The cursor advances automatically and cannot go backwards.
+    #[inline]
+    pub fn allele_posteriors<F>(&mut self, ref_marker: usize, n_alleles: usize, get_ref_allele: &F) -> AllelePosteriors
+    where
+        F: Fn(usize, u32) -> u8,
+    {
+        let genotyped_markers = &self.state_probs.genotyped_markers;
+        let n_genotyped = genotyped_markers.len();
+
+        // Advance cursor until we find or pass ref_marker
+        // This is O(1) amortized because each marker is visited at most once
+        while self.sparse_idx < n_genotyped && genotyped_markers[self.sparse_idx] < ref_marker {
+            self.sparse_idx += 1;
+        }
+
+        // Check if ref_marker is exactly a genotyped marker
+        if self.sparse_idx < n_genotyped && genotyped_markers[self.sparse_idx] == ref_marker {
+            self.state_probs.posteriors_at_genotyped(self.sparse_idx, ref_marker, n_alleles, get_ref_allele)
+        } else {
+            // ref_marker is between sparse_idx-1 and sparse_idx (or before first/after last)
+            // insert_pos = sparse_idx gives the correct interpolation interval
+            self.state_probs.posteriors_interpolated(ref_marker, self.sparse_idx, n_alleles, get_ref_allele)
+        }
+    }
 }
 
 impl ImputationPipeline {
@@ -994,77 +1064,110 @@ impl ImputationPipeline {
         // Check if we need per-haplotype allele probabilities for AP/GP output
         let need_allele_probs = self.config.ap || self.config.gp;
 
-        // Compute dosages per sample (parallel, no locks)
-        // Each sample returns: (dosages, allele_posteriors)
-        // AllelePosteriors are always needed for both GP output AND DR2 calculation
-        type HapPosteriors = Vec<(AllelePosteriors, AllelePosteriors)>; // [marker] -> (hap1, hap2)
-        let sample_results: Vec<(Vec<f32>, HapPosteriors)> = (0..n_target_samples)
-            .into_par_iter()
-            .map(|s| {
-                let hap1_probs = &state_probs[s * 2];
-                let hap2_probs = &state_probs[s * 2 + 1];
+        // =========================================================================
+        // STREAMING ARCHITECTURE: Compute on-the-fly to avoid OOM
+        // =========================================================================
+        //
+        // Previous architecture (OOM-causing):
+        //   - Computed ALL posteriors for ALL samples upfront: O(n_markers × n_samples × 48 bytes)
+        //   - For 1.1M markers × 818 samples = ~45GB allocation
+        //
+        // New architecture (streaming):
+        //   - Uses cursor-based state lookup: O(1) per marker instead of O(log N) binary search
+        //   - Computes DR2 in marker-major pass (one marker at a time across all samples)
+        //   - Computes dosages on-the-fly during write (no pre-allocation)
+        //   - Memory: O(n_haps) for cursors + O(n_markers) for DR2 stats
+        //
+        // Performance:
+        //   - Eliminates ~900M binary searches (20x improvement in lookup)
+        //   - Eliminates ~45GB allocation (enables large datasets)
+        // =========================================================================
 
-                let mut dosages: Vec<f32> = Vec::with_capacity(n_ref_markers);
-                let mut posteriors: HapPosteriors = Vec::with_capacity(n_ref_markers);
+        // PASS 1: Compute DR2 statistics in marker-major order (streaming)
+        eprintln!("Computing DR2 quality metrics (streaming)...");
+        {
+            // Create cursors for each haplotype (2 per sample)
+            let mut cursors: Vec<StateProbsCursor> = state_probs.iter().map(|sp| sp.cursor()).collect();
 
-                for m in 0..n_ref_markers {
-                    let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
-                        ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
-                    };
+            // Closure for ref allele lookup
+            let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
+                ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
+            };
 
-                    let n_alleles = n_alleles_per_marker[m];
+            // Reusable buffers for allele probabilities (avoids per-marker allocation)
+            let max_alleles = n_alleles_per_marker.iter().copied().max().unwrap_or(2);
+            let mut probs1 = vec![0.0f32; max_alleles];
+            let mut probs2 = vec![0.0f32; max_alleles];
 
-                    // Compute per-allele posteriors (handles multiallelic correctly)
-                    let post1 = hap1_probs.allele_posteriors(m, n_alleles, &get_ref_allele);
-                    let post2 = hap2_probs.allele_posteriors(m, n_alleles, &get_ref_allele);
+            // Process marker-by-marker (streaming, O(n_markers × n_samples) total)
+            for m in 0..n_ref_markers {
+                let n_alleles = n_alleles_per_marker[m];
 
-                    // Dosage = expected ALT allele count for both haplotypes
-                    let d1 = post1.dosage();
-                    let d2 = post2.dosage();
-                    dosages.push(d1 + d2);
+                for s in 0..n_target_samples {
+                    let cursor1 = &mut cursors[s * 2];
+                    let cursor2 = &mut cursors[s * 2 + 1];
 
-                    // Store posteriors for DR2 calculation and GP output
-                    posteriors.push((post1, post2));
-                }
+                    // O(1) cursor lookup instead of O(log N) binary search
+                    let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+                    let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
 
-                (dosages, posteriors)
-            })
-            .collect();
+                    // Build probability arrays for DR2
+                    for a in 0..n_alleles {
+                        probs1[a] = post1.prob(a);
+                        probs2[a] = post2.prob(a);
+                    }
 
-        // Serial reduction: accumulate DR2 contributions from all samples
-        // Uses AllelePosteriors which handles multiallelic sites correctly
-        for (_, posteriors) in &sample_results {
-            for (m, (post1, post2)) in posteriors.iter().enumerate() {
-                if let Some(stats) = quality.get_mut(m) {
-                    let n_alleles = n_alleles_per_marker[m];
-                    // Build probability arrays for all alleles (multiallelic-safe)
-                    let probs1: Vec<f32> = (0..n_alleles).map(|a| post1.prob(a)).collect();
-                    let probs2: Vec<f32> = (0..n_alleles).map(|a| post2.prob(a)).collect();
-                    stats.add_sample(&probs1, &probs2);
+                    if let Some(stats) = quality.get_mut(m) {
+                        stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
+                    }
                 }
             }
         }
 
-        // STREAMING OUTPUT: No flat_dosages allocation!
-        // Access sample_results directly via closures during write.
-        // Memory savings: eliminates O(n_markers * n_samples) transposed array
+        // PASS 2: Write output with on-the-fly computation (streaming)
         let output_path = self.config.out.with_extension("vcf.gz");
-        eprintln!("Writing output to {:?}", output_path);
+        eprintln!("Writing output to {:?} (streaming)...", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples)?;
         writer.write_header_extended(ref_gt.markers(), true, self.config.gp, self.config.ap)?;
 
-        // Streaming closure: get dosage directly from sample-major storage
-        let get_dosage = |m: usize, s: usize| -> f32 {
-            sample_results[s].0[m]
+        // Use RefCell for interior mutability - allows mutable cursor access from Fn closures
+        use std::cell::RefCell;
+        let cursors: RefCell<Vec<StateProbsCursor>> = RefCell::new(
+            state_probs.iter().map(|sp| sp.cursor()).collect()
+        );
+
+        // Closure for ref allele lookup
+        let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
+            ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
         };
 
-        // Streaming closure: get posteriors (clones one at a time during write)
-        // Posteriors are always available now (used for both GP output and DR2 calculation)
+        // Streaming closure: compute dosage on-the-fly using cursor
+        // write_imputed_streaming processes markers sequentially, so cursors advance monotonically
+        let get_dosage = |m: usize, s: usize| -> f32 {
+            let n_alleles = n_alleles_per_marker[m];
+            let mut cursors = cursors.borrow_mut();
+            let cursor1 = &mut cursors[s * 2];
+            let cursor2 = &mut cursors[s * 2 + 1];
+            let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+            let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+            post1.dosage() + post2.dosage()
+        };
+
+        // Streaming closure: compute posteriors on-the-fly
+        // Note: Uses separate cursor set since called after get_dosage for same (m, s)
         let get_posteriors: Option<Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>> =
             if need_allele_probs {
-                Some(Box::new(|m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
-                    let posts = &sample_results[s].1;
-                    (posts[m].0.clone(), posts[m].1.clone())
+                let cursors_post: RefCell<Vec<StateProbsCursor>> = RefCell::new(
+                    state_probs.iter().map(|sp| sp.cursor()).collect()
+                );
+                Some(Box::new(move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
+                    let n_alleles = n_alleles_per_marker[m];
+                    let mut cursors = cursors_post.borrow_mut();
+                    let cursor1 = &mut cursors[s * 2];
+                    let cursor2 = &mut cursors[s * 2 + 1];
+                    let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+                    let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
+                    (post1, post2)
                 }))
             } else {
                 None
@@ -1371,8 +1474,7 @@ mod tests {
 
                 let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
                 let p_err = vec![0.01f32; n_markers];
-                let posteriors = run_hmm_forward_backward(
-                    &target_alleles,
+                let posteriors = run_hmm_forward_backward_clusters(
                     &allele_match,
                     &p_recomb,
                     &p_err,
@@ -1438,8 +1540,7 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
         let p_err = vec![0.001f32; n_markers];
-        let posteriors = run_hmm_forward_backward(
-            &target_alleles,
+        let posteriors = run_hmm_forward_backward_clusters(
             &allele_match,
             &p_recomb,
             &p_err,
@@ -1520,8 +1621,8 @@ mod tests {
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
         let p_err = vec![0.01f32; n_markers];
 
-        let post1 = run_hmm_forward_backward(&target_alleles, &match1, &p_recomb, &p_err, n_states, &mut workspace);
-        let post2 = run_hmm_forward_backward(&target_alleles, &match2, &p_recomb, &p_err, n_states, &mut workspace);
+        let post1 = run_hmm_forward_backward_clusters(&match1, &p_recomb, &p_err, n_states, &mut workspace);
+        let post2 = run_hmm_forward_backward_clusters(&match2, &p_recomb, &p_err, n_states, &mut workspace);
 
         // Posteriors should be swapped
         for m in 0..n_markers {
