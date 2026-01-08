@@ -37,17 +37,15 @@ fn main() {
 
 /// Initialize tracing subscriber for hierarchical profiling output
 fn init_profiling() {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-    use tracing_tree::HierarchicalLayer;
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::fmt::format::FmtSpan;
 
     tracing_subscriber::registry()
         .with(
-            HierarchicalLayer::new(2)
-                .with_targets(false)
-                .with_bracketed_fields(false)
-                .with_timer(tracing_tree::time::Uptime::default())
-                .with_verbose_exit(true)
-                .with_verbose_entry(true)
+            fmt::layer()
+                .with_span_events(FmtSpan::CLOSE)
+                .with_target(false)
+                .with_timer(fmt::time::uptime())
         )
         .init();
 }
