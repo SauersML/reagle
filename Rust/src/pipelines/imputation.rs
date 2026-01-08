@@ -680,16 +680,16 @@ impl AllelePosteriors {
 /// For 818 samples × 2 haps × 1.1M markers = 1.8 billion marker lookups:
 /// - Binary search: 1.8B × 20 comparisons = 36 billion comparisons
 /// - Cursor: 1.8B × ~1 comparison = ~1.8 billion comparisons (20x faster)
-pub struct StateProbsCursor {
-    state_probs: Arc<StateProbs>,
+pub struct StateProbsCursor<'a> {
+    state_probs: &'a StateProbs,
     /// Current position in genotyped_markers (the sparse index)
     sparse_idx: usize,
 }
 
-impl StateProbsCursor {
+impl<'a> StateProbsCursor<'a> {
     /// Create a new cursor starting at position 0
     #[inline]
-    pub fn new(state_probs: Arc<StateProbs>) -> Self {
+    pub fn new(state_probs: &'a StateProbs) -> Self {
         Self {
             state_probs,
             sparse_idx: 0,
@@ -1184,7 +1184,7 @@ impl ImputationPipeline {
         info_span!("compute_dr2").in_scope(|| {
             eprintln!("Computing DR2 quality metrics (streaming)...");
             // Create cursors for each haplotype (2 per sample)
-            let mut cursors: Vec<StateProbsCursor> = state_probs.iter().map(|sp| sp.cursor()).collect();
+            let mut cursors: Vec<StateProbsCursor<'_>> = state_probs.iter().map(|sp| sp.cursor()).collect();
 
             // Closure for ref allele lookup
             let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
@@ -1277,7 +1277,7 @@ impl ImputationPipeline {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        let cursors: Rc<RefCell<Vec<StateProbsCursor>>> = Rc::new(RefCell::new(
+        let cursors: Rc<RefCell<Vec<StateProbsCursor<'_>>>> = Rc::new(RefCell::new(
             state_probs.iter().map(|sp| sp.cursor()).collect()
         ));
 
