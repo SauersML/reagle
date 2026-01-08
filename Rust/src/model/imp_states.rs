@@ -429,15 +429,15 @@ impl<'a> ImpStates<'a> {
         let mut attempts = 0;
         while self.queue.len() < n_states && attempts < n_ref_haps * 2 {
             let h = rng.random_range(0..n_ref_haps as u32);
-            // Only add if this haplotype isn't already tracked
-            if !self.hap_to_last_ibs.contains_key(&h) {
+            // Only add if this haplotype isn't already tracked (direct array check)
+            if self.hap_to_last_ibs[h as usize] == IBS_NIL {
                 let comp_hap_idx = self.threaded_haps.push_new(h);
                 self.queue.push(CompHapEntry {
                     comp_hap_idx,
                     hap: h,
                     last_ibs_step: ibs_step,
                 });
-                self.hap_to_last_ibs.insert(h, ibs_step);
+                self.hap_to_last_ibs[h as usize] = ibs_step;
             }
             attempts += 1;
         }

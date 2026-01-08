@@ -1,0 +1,57 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Run benchmarks
+        run: cargo bench --bench hmm_benchmark -- --noplot --save-baseline pr
+
+      - name: Compare to baseline (on PRs)
+        if: github.event_name == 'pull_request'
+        run: |
+          # Fetch main branch baseline if available
+          git fetch origin main:main || true
+          if cargo bench --bench hmm_benchmark -- --noplot --load-baseline main --baseline pr 2>/dev/null; then
+            echo "Baseline comparison complete"
+          else
+            echo "No baseline found on main branch - skipping comparison"
+          fi
+
+      - name: Save baseline (on main)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cargo bench --bench hmm_benchmark -- --noplot --save-baseline main
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: target/criterion
+          retention-days: 30
