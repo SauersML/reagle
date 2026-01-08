@@ -1280,18 +1280,96 @@ def run_reagle_chr(chrom, paths):
 
 def run_impute5_chr(chrom, paths):
     """Run IMPUTE5 for a chromosome."""
-    # Similar to stage_impute5 but for specific chromosome
-    pass  # TODO: implement
+    data_dir = paths['data_dir']
+    
+    # Check for binary in main data dir first, then chrom dir
+    main_data_dir = paths['project_dir'] / "tests" / "data"
+    impute5_bin = main_data_dir / "impute5"
+    
+    if not impute5_bin.exists():
+        # Try finding in chrom dir or download
+        impute5_bin = data_dir / "impute5"
+        if not impute5_bin.exists():
+            print(f"Downloading IMPUTE5 for chr{chrom}...")
+            run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/s/raw/mwmgzjx5vvmbuaz/impute5_v1.2.0_static.zip'")
+            run(f"cd {data_dir} && unzip -q impute5.zip && mv impute5_v1.2.0_static/impute5_1.2.0_static impute5 && chmod +x impute5")
+
+    out = data_dir / "impute5_imputed.vcf.gz"
+    if not out.exists():
+        print(f"Running IMPUTE5 on chr{chrom}...")
+        try:
+            # IMPUTE5 requires an indexed reference and map file usually, but minimal example:
+            # --h reference --g input --r region --o output
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r chr{chrom} --o {out} --threads 4")
+            run(f"bcftools index -f {out}")
+        except Exception as e:
+            print(f"IMPUTE5 failed on chr{chrom}: {e}")
+    else:
+        print(f"Using existing IMPUTE5 output for chr{chrom}")
 
 
 def run_minimac_chr(chrom, paths):
     """Run Minimac4 for a chromosome."""
-    pass  # TODO: implement
+    data_dir = paths['data_dir']
+    
+    # Check for binary
+    main_data_dir = paths['project_dir'] / "tests" / "data"
+    minimac_bin = main_data_dir / "minimac4"
+    
+    if not minimac_bin.exists():
+        minimac_bin = data_dir / "minimac4"
+        if not minimac_bin.exists():
+            print(f"Downloading Minimac4 for chr{chrom}...")
+            run(f"curl -L -o {data_dir}/minimac4.tar.gz 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.tar.gz'")
+            run(f"cd {data_dir} && tar -xzf minimac4.tar.gz && mv minimac4-4.1.6-Linux-x86_64/bin/minimac4 . && chmod +x minimac4")
+
+    out = data_dir / "minimac_imputed.vcf.gz"
+    if not out.exists():
+        print(f"Running Minimac4 on chr{chrom}...")
+        try:
+            prefix = data_dir / "minimac_imputed"
+            # Minimac4: --refHaps ref.vcf --haps input.vcf --prefix out
+            run(f"{minimac_bin} --refHaps {paths['ref_vcf']} --haps {paths['input_vcf']} --prefix {prefix} --cpus 4 --format GT,DS")
+            
+            # Helper to move output
+            dose_out = data_dir / "minimac_imputed.dose.vcf.gz"
+            if dose_out.exists():
+                run(f"mv {dose_out} {out}")
+            run(f"bcftools index -f {out}")
+        except Exception as e:
+            print(f"Minimac4 failed on chr{chrom}: {e}")
+    else:
+        print(f"Using existing Minimac4 output for chr{chrom}")
 
 
 def run_glimpse_chr(chrom, paths):
     """Run GLIMPSE for a chromosome."""
-    pass  # TODO: implement
+    data_dir = paths['data_dir']
+    
+    # Check for binary
+    main_data_dir = paths['project_dir'] / "tests" / "data"
+    glimpse_bin = main_data_dir / "glimpse_phase"
+    
+    if not glimpse_bin.exists():
+        glimpse_bin = data_dir / "glimpse_phase"
+        if not glimpse_bin.exists():
+            print(f"Downloading GLIMPSE for chr{chrom}...")
+            run(f"curl -L -o {glimpse_bin} 'https://github.com/odelaneau/GLIMPSE/releases/download/v2.0.1/GLIMPSE2_phase_static'")
+            run(f"chmod +x {glimpse_bin}")
+
+    out = data_dir / "glimpse_imputed.vcf.gz"
+    if not out.exists():
+        print(f"Running GLIMPSE on chr{chrom}...")
+        try:
+            # GLIMPSE2_phase: --input input.vcf --reference ref.vcf --output out.bcf
+            bcf_out = data_dir / "glimpse_imputed.bcf"
+            run(f"{glimpse_bin} --input {paths['input_vcf']} --reference {paths['ref_vcf']} --output {bcf_out} --threads 4")
+            run(f"bcftools view {bcf_out} -O z -o {out}")
+            run(f"bcftools index -f {out}")
+        except Exception as e:
+            print(f"GLIMPSE failed on chr{chrom}: {e}")
+    else:
+        print(f"Using existing GLIMPSE output for chr{chrom}")
 
 
 def stage_metrics_chr(chrom):
