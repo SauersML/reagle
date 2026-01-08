@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use bitvec::prelude::*;
 use rayon::prelude::*;
+use tracing::instrument;
 
 use crate::config::Config;
 use crate::data::genetic_map::{GeneticMaps, MarkerMap};
@@ -495,6 +496,7 @@ impl PhasingPipeline {
     }
 
     /// Phase a GenotypeMatrix in-memory and return the phased result
+    #[instrument(name = "phase_in_memory", skip(self, target_gt, gen_maps))]
     pub fn phase_in_memory(
         &mut self,
         target_gt: &GenotypeMatrix,

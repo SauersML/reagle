@@ -130,6 +130,10 @@ pub struct Config {
     /// Number of threads (default: all available cores)
     #[arg(long)]
     pub nthreads: Option<usize>,
+
+    /// Enable profiling output (hierarchical timing tree)
+    #[arg(long, default_value = "false")]
+    pub profile: bool,
 }
 
 impl Config {

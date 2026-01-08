@@ -14,6 +14,7 @@
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{info_span, instrument};
 
 use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
@@ -669,36 +670,43 @@ impl ImputationPipeline {
     }
 
     /// Run the imputation pipeline
+    #[instrument(name = "imputation", skip(self))]
     pub fn run(&mut self) -> Result<()> {
-        eprintln!("Loading target VCF...");
-        let (mut target_reader, target_file) = VcfReader::open(&self.config.gt)?;
-        let target_samples = target_reader.samples_arc();
-        let target_gt = target_reader.read_all(target_file)?;
-
-        eprintln!("Loading reference panel...");
-        let ref_path = self.config.r#ref.as_ref().ok_or_else(|| {
-            crate::error::ReagleError::config("Reference panel required for imputation")
+        let (target_reader, target_gt, target_samples) = info_span!("load_target").in_scope(|| {
+            eprintln!("Loading target VCF...");
+            let (mut target_reader, target_file) = VcfReader::open(&self.config.gt)?;
+            let target_samples = target_reader.samples_arc();
+            let target_gt = target_reader.read_all(target_file)?;
+            Ok::<_, crate::error::ReagleError>((target_reader, target_gt, target_samples))
         })?;
 
-        // Detect file format by extension and load accordingly
-        // Wrap in Arc for shared ownership (avoids cloning when passing to phasing pipeline)
-        let ref_gt: Arc<GenotypeMatrix<Phased>> = Arc::new(if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
-            eprintln!("  Detected BREF3 format");
-            let reader = Bref3Reader::open(ref_path)?;
-            reader.read_all()?
-        } else {
-            eprintln!("  Detected VCF format");
-            let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
-            ref_reader.read_all(ref_file)?.into_phased()
-        });
+        let ref_gt: Arc<GenotypeMatrix<Phased>> = info_span!("load_reference").in_scope(|| {
+            eprintln!("Loading reference panel...");
+            let ref_path = self.config.r#ref.as_ref().ok_or_else(|| {
+                crate::error::ReagleError::config("Reference panel required for imputation")
+            })?;
+
+            // Detect file format by extension and load accordingly
+            Ok::<_, crate::error::ReagleError>(Arc::new(if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
+                eprintln!("  Detected BREF3 format");
+                let reader = Bref3Reader::open(ref_path)?;
+                reader.read_all()?
+            } else {
+                eprintln!("  Detected VCF format");
+                let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
+                ref_reader.read_all(ref_file)?.into_phased()
+            }))
+        })?;
 
         if target_gt.n_markers() == 0 || ref_gt.n_markers() == 0 {
             return Ok(());
         }
 
         // Create marker alignment (reused for both phasing and imputation)
-        eprintln!("Aligning markers...");
-        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let alignment = info_span!("align_markers").in_scope(|| {
+            eprintln!("Aligning markers...");
+            MarkerAlignment::new(&target_gt, &ref_gt)
+        });
 
         let n_ref_haps = ref_gt.n_haplotypes();
         let n_ref_markers = ref_gt.n_markers();
@@ -713,30 +721,32 @@ impl ImputationPipeline {
             eprintln!("Target data is already phased, skipping phasing step");
             target_gt.into_phased()
         } else {
-            // Phase target before imputation (imputation requires phased haplotypes)
-            eprintln!("Phasing target data before imputation...");
+            info_span!("phasing").in_scope(|| {
+                // Phase target before imputation (imputation requires phased haplotypes)
+                eprintln!("Phasing target data before imputation...");
 
-            // Create phasing pipeline with current config
-            let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
+                // Create phasing pipeline with current config
+                let mut phasing = super::phasing::PhasingPipeline::new(self.config.clone());
 
-            // Set reference panel for reference-guided phasing
-            phasing.set_reference(Arc::clone(&ref_gt), alignment.clone());
-            eprintln!("Using reference panel ({} haplotypes) for phasing", n_ref_haps);
+                // Set reference panel for reference-guided phasing
+                phasing.set_reference(Arc::clone(&ref_gt), alignment.clone());
+                eprintln!("Using reference panel ({} haplotypes) for phasing", n_ref_haps);
 
-            // Load genetic map if provided
-            let gen_maps = if let Some(ref map_path) = self.config.map {
-                let chrom_names: Vec<&str> = target_gt
-                    .markers()
-                    .chrom_names()
-                    .iter()
-                    .map(|s| s.as_ref())
-                    .collect();
-                GeneticMaps::from_plink_file(map_path, &chrom_names)?
-            } else {
-                GeneticMaps::new()
-            };
+                // Load genetic map if provided
+                let gen_maps = if let Some(ref map_path) = self.config.map {
+                    let chrom_names: Vec<&str> = target_gt
+                        .markers()
+                        .chrom_names()
+                        .iter()
+                        .map(|s| s.as_ref())
+                        .collect();
+                    GeneticMaps::from_plink_file(map_path, &chrom_names)?
+                } else {
+                    GeneticMaps::new()
+                };
 
-            phasing.phase_in_memory(&target_gt, &gen_maps)?
+                phasing.phase_in_memory(&target_gt, &gen_maps)
+            })?
         };
 
         let n_target_markers = target_gt.n_markers();
@@ -820,17 +830,20 @@ impl ImputationPipeline {
         //       distance = Σ 𝟙[p_i ≠ a_i ∧ p_i ≠ 255 ∧ a_i ≠ 255]
         //   - This finds the reference pattern that best matches at genotyped positions
         // ─────────────────────────────────────────────────────────────────────
-        eprintln!("Building coded reference panel...");
-        let ref_panel_coded = RefPanelCoded::from_gen_positions(
-            &ref_gt,
-            &ref_gen_positions,
-            self.config.imp_step as f64,
-        );
-        eprintln!(
-            "  {} steps ({} haps share each pattern on avg)",
-            ref_panel_coded.n_steps(),
-            ref_panel_coded.avg_compression_ratio() as usize
-        );
+        let ref_panel_coded = info_span!("build_coded_panel").in_scope(|| {
+            eprintln!("Building coded reference panel...");
+            let panel = RefPanelCoded::from_gen_positions(
+                &ref_gt,
+                &ref_gen_positions,
+                self.config.imp_step as f64,
+            );
+            eprintln!(
+                "  {} steps ({} haps share each pattern on avg)",
+                panel.n_steps(),
+                panel.avg_compression_ratio() as usize
+            );
+            panel
+        });
 
         eprintln!("Running imputation with dynamic state selection...");
         let n_states = self.params.n_states;
@@ -939,7 +952,8 @@ impl ImputationPipeline {
         // Run imputation for each target haplotype with per-thread workspaces
         // Optimization: ImpStates is now created once per thread (not per haplotype)
         // to avoid allocator contention from HashMap/BinaryHeap allocation
-        let state_probs: Vec<StateProbs> = (0..n_target_haps)
+        let state_probs: Vec<StateProbs> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
+            (0..n_target_haps)
             .into_par_iter()
             .map_init(
                 // Initialize workspace AND ImpStates for each thread (reduces allocations)
@@ -1045,7 +1059,8 @@ impl ImputationPipeline {
                     )
                 },
             )
-            .collect();
+            .collect()
+        });
 
         eprintln!("Computing dosages with interpolation and quality metrics...");
 
@@ -1087,8 +1102,8 @@ impl ImputationPipeline {
         // =========================================================================
 
         // PASS 1: Compute DR2 statistics in marker-major order (streaming)
-        eprintln!("Computing DR2 quality metrics (streaming)...");
-        {
+        info_span!("compute_dr2").in_scope(|| {
+            eprintln!("Computing DR2 quality metrics (streaming)...");
             // Create cursors for each haplotype (2 per sample)
             let mut cursors: Vec<StateProbsCursor> = state_probs.iter().map(|sp| sp.cursor()).collect();
 
@@ -1128,12 +1143,13 @@ impl ImputationPipeline {
                     }
                 }
             }
-        }
+        });
 
         // PASS 2: Write output with on-the-fly computation (streaming)
-        let output_path = self.config.out.with_extension("vcf.gz");
-        eprintln!("Writing output to {:?} (streaming)...", output_path);
-        let mut writer = VcfWriter::create(&output_path, target_samples)?;
+        info_span!("write_output").in_scope(|| {
+            let output_path = self.config.out.with_extension("vcf.gz");
+            eprintln!("Writing output to {:?} (streaming)...", output_path);
+            let mut writer = VcfWriter::create(&output_path, target_samples)?;
         writer.write_header_extended(ref_gt.markers(), true, self.config.gp, self.config.ap)?;
 
         // Use RefCell for interior mutability - allows mutable cursor access from Fn closures
@@ -1206,7 +1222,9 @@ impl ImputationPipeline {
             self.config.gp,
             self.config.ap,
         )?;
-        writer.flush()?;
+            writer.flush()?;
+            Ok::<_, crate::error::ReagleError>(())
+        })?;
 
         eprintln!("Imputation complete!");
         Ok(())

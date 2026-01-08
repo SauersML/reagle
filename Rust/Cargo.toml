@@ -7,33 +7,38 @@ repository = "https://github.com/SauersML/reagle"
 
 [dependencies]
 # CLI parsing
-clap = { version = "4.5.23", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 
 # Parallelism
-rayon = "1.10.0"
-thread_local = "1.1.8"
+rayon = "1.10"
+thread_local = "1.1"
 
 # Bit manipulation for dense genotype storage
-bitvec = "1.0.1"
+bitvec = "1.0"
 
 # Error handling
-thiserror = "2.0.9"
-anyhow = "1.0.95"
+thiserror = "2.0"
+anyhow = "1.0"
 
 # Logging
-log = "0.4.22"
-env_logger = "0.11.6"
+log = "0.4"
+env_logger = "0.11"
+
+# Profiling (hierarchical timing output with --profile flag)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-tree = "0.4"
 
 # VCF parsing (genomics)
-noodles = { version = "0.104.0", features = ["vcf", "bgzf", "csi", "tabix"] }
+noodles = { version = "0.104", features = ["vcf", "bgzf", "csi", "tabix"] }
 
 # Random number generation (for sampling)
-rand = "0.9.0"
-memmap2 = "0.9.9"
-bytemuck = "1.24.0"
-wide = "1.1.1"
-serde = { version = "1.0.228", features = ["derive", "rc", "std"] }
-serde_json = "1.0.148"
+rand = "0.9"
+memmap2 = "0.9"
+bytemuck = "1.24"
+wide = "1.1"
+serde = { version = "1.0", features = ["derive", "rc", "std"] }
+serde_json = "1.0"
 
 [dev-dependencies]
 criterion = "0.8.1"

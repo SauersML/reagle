@@ -9,6 +9,9 @@
 //!
 //! # Imputation with reference panel
 //! reagle --gt input.vcf.gz --ref reference.vcf.gz --out imputed
+//!
+//! # With profiling output
+//! reagle --gt input.vcf.gz --ref reference.vcf.gz --out imputed --profile
 //! ```
 
 use std::time::Instant;
@@ -32,11 +35,32 @@ fn main() {
     }
 }
 
+/// Initialize tracing subscriber for hierarchical profiling output
+fn init_profiling() {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_tree::HierarchicalLayer;
+
+    tracing_subscriber::registry()
+        .with(
+            HierarchicalLayer::new(2)
+                .with_targets(false)
+                .with_bracketed_fields(false)
+                .with_timer(tracing_tree::time::Uptime::default())
+        )
+        .init();
+}
+
 fn run() -> Result<()> {
     let start = Instant::now();
 
     // Parse and validate configuration
     let config = Config::parse_and_validate()?;
+
+    // Initialize profiling if requested
+    if config.profile {
+        init_profiling();
+        eprintln!("=== Profiling enabled ===\n");
+    }
 
     // Configure thread pool
     let n_threads = config.nthreads();
