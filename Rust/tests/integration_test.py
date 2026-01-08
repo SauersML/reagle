@@ -721,12 +721,20 @@ def stage_prepare():
         run(f"bcftools view -S {test_file} {paths['chr22_vcf']} -O z -o {paths['truth_vcf']}")
         run(f"bcftools index -f {paths['truth_vcf']}")
 
-    # Create input (test samples, downsampled to GSA sites)
+    # Create input (test samples, downsampled to GSA sites, UNPHASED)
+    # We unphase the input so switch error rate measures TRUE phasing accuracy
     if not paths['input_vcf'].exists():
-        print("Downsampling to GSA sites...")
+        print("Downsampling to GSA sites and unphasing...")
         create_regions_file(gsa_sites, str(paths['gsa_regions']))
-        run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {paths['input_vcf']}")
+        # Two-step process: downsample, then unphase
+        tmp_phased = str(paths['data_dir'] / "input_phased_tmp.vcf.gz")
+        run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
+        # Unphase: convert 0|1 to 0/1 using bcftools +setGT
+        # The plugin sets genotypes to unphased while preserving allele values
+        run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
         run(f"bcftools index -f {paths['input_vcf']}")
+        # Clean up temp file
+        os.remove(tmp_phased)
 
     # Count variants
     n_truth = run(f"bcftools view -H {paths['truth_vcf']} | wc -l", capture=True).stdout.strip()

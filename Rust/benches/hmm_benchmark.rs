@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use reagle::model::hmm::HmmUpdater;
+use std::hint::black_box;
 
 /// Benchmark HMM forward update with different state counts
 fn bench_fwd_update(c: &mut Criterion) {
