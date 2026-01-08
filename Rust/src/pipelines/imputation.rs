@@ -382,7 +382,7 @@ impl StateProbs {
         state_probs: Vec<f32>,
         gen_positions: std::sync::Arc<Vec<f64>>,
     ) -> Self {
-        Self::new(genotyped_markers, n_states, hap_indices, state_probs, gen_positions, None)
+        Self::new(genotyped_markers, n_states, hap_indices, state_probs, gen_positions)
     }
 
     /// Compute per-allele probabilities at a reference marker (random access).
