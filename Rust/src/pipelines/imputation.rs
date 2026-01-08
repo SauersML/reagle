@@ -525,6 +525,44 @@ impl StateProbs {
         // belonging to the same cluster.
         // let is_between_clusters = probs != probs_p1;
 
+        // Corrected Java-style interpolation:
+        // - CONSTANT probability for markers within a cluster (probs == probs_p1)
+        // - INTERPOLATED probability for markers between clusters (probs != probs_p1)
+        // This explicit check avoids subtle floating point issues and matches Java's
+        // behavior more closely, which is critical for DR2 accuracy.
+        let is_between_clusters = probs != probs_p1;
+        if !is_between_clusters {
+            // Use constant probability from the start of the cluster
+            if n_alleles == 2 {
+                let mut p_alt = 0.0f32;
+                let mut p_ref = 0.0f32;
+                for (j, &hap) in haps.iter().enumerate() {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele == 1 {
+                        p_alt += probs.get(j).copied().unwrap_or(0.0);
+                    } else if allele == 0 {
+                        p_ref += probs.get(j).copied().unwrap_or(0.0);
+                    }
+                }
+                let total = p_ref + p_alt;
+                let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
+                return AllelePosteriors::Biallelic(p_alt);
+            } else {
+                let mut al_probs = vec![0.0f32; n_alleles];
+                for (j, &hap) in haps.iter().enumerate() {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs[allele as usize] += probs.get(j).copied().unwrap_or(0.0);
+                    }
+                }
+                let total: f32 = al_probs.iter().sum();
+                if total > 1e-10 {
+                    for p in &mut al_probs { *p /= total; }
+                }
+                return AllelePosteriors::Multiallelic(al_probs);
+            }
+        }
+
         if n_alleles == 2 {
             // Java-style interpolation for biallelic sites
             let mut p_alt = 0.0f32;
