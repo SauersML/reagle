@@ -1889,7 +1889,7 @@ impl PhasingPipeline {
 
                 // Collect EM statistics if requested
                 if let Some(atomic) = atomic_estimates {
-                    let hmm = BeagleHmm::new(subset_view.clone(), &self.params, n_states, stage1_p_recomb.to_vec());
+                    let hmm = BeagleHmm::new(subset_view, &self.params, n_states, stage1_p_recomb.to_vec());
                     let mut local_est = crate::model::parameters::ParamEstimates::new();
                     hmm.collect_stats(&seq1, &threaded_haps, stage1_gen_dists, &mut local_est);
                     hmm.collect_stats(&seq2, &threaded_haps, stage1_gen_dists, &mut local_est);
@@ -2264,7 +2264,7 @@ impl PhasingPipeline {
         let columns: Vec<GenotypeColumn> = (0..n_markers)
             .map(|m| {
                 let alleles = geno.marker_alleles(m);
-                let bytes: Vec<u8> = alleles.iter().copied().collect();
+                let bytes: Vec<u8> = alleles.to_vec();
                 GenotypeColumn::from_alleles(&bytes, 2)
             })
             .collect();
