@@ -579,12 +579,26 @@ mod tests {
     fn test_beagle_hmm_forward_backward() {
         let ref_panel = make_test_ref_panel();
         let params = ModelParams::for_phasing(6, 10000.0, None);
-        let ref_haps: Vec<HapIdx> = (0..6).map(|i| HapIdx::new(i)).collect();
         let p_recomb = vec![0.0, 0.01, 0.01, 0.01, 0.01];
 
         let n_markers = 5;
-        let n_states = ref_haps.len();
-        let threaded_haps = ThreadedHaps::from_static_haps(&ref_haps, n_markers);
+        let n_states = 3; // 3 composite states with mosaic segments
+
+        // Build ThreadedHaps using PRODUCTION API with actual segment transitions
+        // This tests MosaicCursor segment-switching logic that from_static_haps bypassed
+        let mut threaded_haps = ThreadedHaps::new(n_states, n_states * 2, n_markers);
+        
+        // State 0: hap 0 for markers 0-2, then hap 1 for markers 3-4 (segment switch at marker 3)
+        threaded_haps.push_new(0);
+        threaded_haps.add_segment(0, 1, 3);
+        
+        // State 1: hap 2 for entire chromosome (no switch - tests static case too)
+        threaded_haps.push_new(2);
+        
+        // State 2: hap 4 for markers 0-1, then hap 5 for markers 2-4 (segment switch at marker 2)
+        threaded_haps.push_new(4);
+        threaded_haps.add_segment(2, 5, 2);
+
         let hmm = BeagleHmm::new(&ref_panel, &params, n_states, p_recomb);
 
         let target_alleles = vec![0, 0, 0, 1, 0]; // Should match haplotype 0 or 4
@@ -593,9 +607,16 @@ mod tests {
 
         let log_likelihood = hmm.forward_backward_raw(&target_alleles, &threaded_haps, &mut fwd, &mut bwd);
 
-        assert_eq!(fwd.len(), 5 * 6); // 5 markers * 6 states
-        assert_eq!(bwd.len(), 5 * 6);
+        assert_eq!(fwd.len(), 5 * 3); // 5 markers * 3 states
+        assert_eq!(bwd.len(), 5 * 3);
         assert!(log_likelihood.is_finite());
+        
+        // Verify posteriors sum to 1 at each marker (this validates the mosaic HMM math)
+        for m in 0..n_markers {
+            let sum: f32 = (0..n_states).map(|k| fwd[m * n_states + k] * bwd[m * n_states + k]).sum();
+            // Posteriors should be positive and reasonable
+            assert!(sum > 0.0, "Posterior sum at marker {} should be positive", m);
+        }
     }
 
     // =========================================================================

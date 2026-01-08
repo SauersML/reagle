@@ -1,0 +1,5 @@
+# PLINK genetic map format for unit tests
+# chrom  position_bp  rate_cM_per_Mb  position_cM
+chr1	1000000	1.0	0.0
+chr1	2000000	1.0	1.0
+chr1	3000000	1.5	2.5
