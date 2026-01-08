@@ -1388,7 +1388,7 @@ impl PhasingPipeline {
             }
 
             // Determine which markers were swapped by comparing final working sequences to originals
-            for (m, mask_bit) in mask.iter_mut().enumerate().take(n_markers) {
+            for (m, mut mask_bit) in mask.iter_mut().enumerate().take(n_markers) {
                 if seq1_working[m] != seq1[m] {
                     mask_bit.set(true);
                 }
