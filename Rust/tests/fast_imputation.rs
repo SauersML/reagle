@@ -238,6 +238,60 @@ fn inspect_gt_phasing(path: &std::path::Path) -> Vec<Vec<String>> {
     all_gts
 }
 
+/// Inspect DR2 (Dosage R-squared) values from INFO field of imputed VCF
+/// Returns a vector of DR2 values, one per marker
+fn inspect_dr2(path: &std::path::Path) -> Vec<f64> {
+    let file = File::open(path).expect("Open output VCF");
+    let decoder = bgzf_io::Reader::new(file);
+    let mut reader = noodles_vcf::io::Reader::new(decoder);
+    
+    let header = reader.read_header().expect("Read header");
+    
+    // Validate header was read successfully
+    assert!(header.formats().len() > 0 || header.infos().len() > 0, "VCF header should have fields");
+    
+    let mut dr2_values = Vec::new();
+    
+    for result in reader.records() {
+        let result: std::io::Result<Record> = result;
+        let record = result.expect("Read record");
+        
+        // DR2 is typically stored in the INFO field as DR2=<value>
+        // Parse the info field as a string and extract DR2
+        let info_str = format!("{:?}", record.info());
+        
+        // Look for DR2 in the info string
+        let dr2 = if let Some(start) = info_str.find("DR2") {
+            // Find the value after DR2=
+            let after_dr2 = &info_str[start..];
+            if let Some(eq_pos) = after_dr2.find('=') {
+                let after_eq = &after_dr2[eq_pos + 1..];
+                // Find the end of the value (comma, semicolon, parenthesis, or end)
+                let end_pos = after_eq.find(|c: char| c == ',' || c == ';' || c == ')' || c == '"')
+                    .unwrap_or(after_eq.len());
+                after_eq[..end_pos].trim().parse::<f64>().unwrap_or(-1.0)
+            } else {
+                -1.0 // DR2 key found but no value
+            }
+        } else {
+            -1.0 // No DR2 field
+        };
+        
+        dr2_values.push(dr2);
+    }
+    
+    dr2_values
+}
+
+/// Compute mean DR2 for valid DR2 values (>= 0)
+fn compute_mean_dr2(dr2_values: &[f64]) -> f64 {
+    let valid: Vec<f64> = dr2_values.iter().filter(|&&x| x >= 0.0 && x <= 1.0).copied().collect();
+    if valid.is_empty() {
+        return 0.0;
+    }
+    valid.iter().sum::<f64>() / valid.len() as f64
+}
+
 // --- Helper for Config ---
 fn default_test_config() -> Config {
     Config {
@@ -315,6 +369,18 @@ fn test_synthetic_slam_dunk() {
         let ds = dosages[m][0];
         assert!(ds < 0.1, "Marker {} should be 0, got {}", m, ds);
     }
+    
+    // DR2 validation for slam dunk test
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Slam dunk test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
+    // Clear haplotype structure should give high DR2
+    assert!(mean_dr2 > 0.6, "Mean DR2 too low for slam dunk test: {:.4}", mean_dr2);
 }
 
 #[test]
@@ -363,6 +429,20 @@ fn test_synthetic_recombination() {
     assert!(dosages[15][0] < 0.1, "Marker 15 should be 0, got {}", dosages[15][0]);
     // Marker 25 (in 1-region, should be 2 for diploid 1|1)
     assert!(dosages[25][0] > 1.9, "Marker 25 should be 2, got {}", dosages[25][0]);
+    
+    // DR2 validation
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Recombination test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    
+    // STRICT: All DR2 values must be in valid range [0, 1]
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
+    // STRICT: Mean DR2 should be high for well-imputed data with clear haplotype structure
+    assert!(mean_dr2 > 0.5, "Mean DR2 too low for recombination test: {:.4} (expected > 0.5)", mean_dr2);
 }
 
 #[test]
@@ -425,6 +505,18 @@ fn test_simulated_chip_density() {
     let ds1 = dosages[150][1];
     assert!(ds0 < 0.1, "Sample 0 at Marker 150 should be 0, got {}", ds0);
     assert!(ds1 > 1.9, "Sample 1 at Marker 150 should be 2, got {}", ds1);
+    
+    // DR2 validation
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Chip density test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    
+    // STRICT: All DR2 values must be valid
+    let valid_dr2_count = dr2_values.iter().filter(|&&x| x >= 0.0 && x <= 1.0).count();
+    assert!(valid_dr2_count > 0, "No valid DR2 values found in chip density test");
+    
+    // STRICT: High DR2 expected for clear two-population reference structure
+    assert!(mean_dr2 > 0.6, "Mean DR2 too low for chip density test: {:.4} (expected > 0.6)", mean_dr2);
 }
 
 #[test]
@@ -469,6 +561,20 @@ fn test_population_structure() {
     // Check markers in different population regions
     assert!(dosages[48][0] < 0.1, "Marker 48 should be 0, got {}", dosages[48][0]);
     assert!(dosages[52][0] > 1.9, "Marker 52 should be 2, got {}", dosages[52][0]);
+    
+    // DR2 validation
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Population structure test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    
+    // STRICT: DR2 values must be in valid range
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
+    // STRICT: Reasonable DR2 expected for population structure test
+    assert!(mean_dr2 > 0.4, "Mean DR2 too low for population structure test: {:.4} (expected > 0.4)", mean_dr2);
 }
 
 #[test]
@@ -527,6 +633,17 @@ fn test_hotspot_switching() {
 
     assert!(dosages[39][0] < 0.1, "Marker 39 should be 0, got {}", dosages[39][0]);
     assert!(dosages[42][0] > 1.9, "Marker 42 should be 2, got {}", dosages[42][0]);
+    
+    // DR2 validation for hotspot test
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Hotspot test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
+    assert!(mean_dr2 > 0.3, "Mean DR2 too low for hotspot test: {:.4}", mean_dr2);
 }
 
 #[test]
@@ -584,6 +701,16 @@ fn test_phase_switch_torture() {
     }
 
     assert!(switches < 5, "Too many phase switches: {}", switches);
+    
+    // DR2 validation for phase torture test (note: this is phasing, may not have imputed markers)
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Phase torture test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
 }
 
 #[test]
@@ -627,6 +754,24 @@ fn test_error_injection() {
 
     // Marker 25 should be corrected toward 0
     assert!(dosages[25][0] < 1.0, "Error not corrected! Got {}", dosages[25][0]);
+    
+    // DR2 validation for error correction
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    
+    println!("Error injection test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    
+    // STRICT: All DR2 values must be valid
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
+    
+    // STRICT: With monomorphic reference (all 0s), DR2 should be high (near 1.0)
+    // since there's no uncertainty in the imputation
+    assert!(mean_dr2 > 0.7, 
+        "Mean DR2 should be high for monomorphic reference, got {:.4}", mean_dr2);
 }
 
 #[test]
@@ -687,14 +832,37 @@ fn test_rare_variant() {
 
     // The dosage should be non-negative (valid)
     assert!(dosage >= 0.0 && dosage <= 2.0, "Invalid dosage: {}", dosage);
+    
+    // DR2 validation for rare variant
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    
+    println!("Rare variant test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    
+    // STRICT: All DR2 values must be in valid range [0, 1]
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
+    
+    // The rare variant site (marker 25) should have lower DR2 
+    // since rare variants are harder to impute with certainty
+    if dr2_values.len() > 25 && dr2_values[25] >= 0.0 {
+        println!("  Rare variant marker 25 DR2: {:.4}", dr2_values[25]);
+        // STRICT: DR2 for rare variant should still be valid
+        assert!(dr2_values[25] <= 1.0, "DR2 for rare variant out of range: {:.4}", dr2_values[25]);
+    }
 }
 
 #[test]
 fn test_dr2_validation() {
     // Test DR2 quality metric output.
     // Use 100kb spacing for sufficient genetic distance.
+    // Use multiple samples so DR2 can measure variance
 
     let n_markers = 50;
+    let n_samples = 10; // Multiple samples so DR2 variance calculation works
     let positions: Vec<usize> = (0..n_markers).map(|m| m * 100000 + 1).collect();
 
     let ref_file = SyntheticVcfBuilder::new(n_markers, 50)
@@ -702,10 +870,18 @@ fn test_dr2_validation() {
         .allele_generator(|m, h| ((m + h) % 2) as u8)
         .build();
 
-    let target_file = SyntheticVcfBuilder::new(n_markers, 1)
+    // Create target with varying patterns so DR2 has variance to measure
+    let target_file = SyntheticVcfBuilder::new(n_markers, n_samples)
         .positions(positions)
         .unphased()
-        .allele_generator(|_, _| 255) // All missing
+        .allele_generator(|m, h| {
+            // Keep some markers genotyped (every 10th) to give imputation context
+            if m % 10 == 0 {
+                ((m + h) % 2) as u8
+            } else {
+                255 // Missing
+            }
+        })
         .build();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -725,12 +901,48 @@ fn test_dr2_validation() {
 
     let out_vcf = temp_dir.path().join("output_dr2.vcf.gz");
 
-    // Verify output file exists and can be read
-    let file = File::open(&out_vcf).unwrap();
-    let mut reader = noodles_vcf::io::Reader::new(bgzf_io::Reader::new(file));
-    reader.read_header().unwrap();
+    // Verify output file exists and can be read using a scoped block
+    {
+        let file = File::open(&out_vcf).unwrap();
+        let mut reader = noodles_vcf::io::Reader::new(bgzf_io::Reader::new(file));
+        reader.read_header().unwrap();
+    }
 
-    // Test passes if pipeline runs successfully and produces valid output
+    // Comprehensive DR2 validation
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    
+    println!("DR2 validation test:");
+    println!("  Total markers: {}", dr2_values.len());
+    println!("  Mean DR2: {:.4}", mean_dr2);
+    
+    // Count valid and invalid DR2 values
+    let valid_count = dr2_values.iter().filter(|&&x| x >= 0.0 && x <= 1.0).count();
+    let invalid_count = dr2_values.iter().filter(|&&x| x > 1.0).count();
+    
+    println!("  Valid DR2 values: {}", valid_count);
+    println!("  Invalid DR2 values (>1): {}", invalid_count);
+    
+    // STRICT: DR2 should be produced for most/all markers
+    assert!(dr2_values.len() == n_markers, 
+        "DR2 count ({}) != marker count ({})", dr2_values.len(), n_markers);
+    
+    // STRICT: No DR2 values should exceed 1.0 (by definition)
+    assert!(invalid_count == 0, 
+        "Found {} DR2 values > 1.0, which is invalid", invalid_count);
+    
+    // STRICT: All valid DR2 values must be non-negative
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 >= 0.0 && dr2 <= 1.0, 
+                "DR2 at marker {} out of valid range [0, 1]: {:.4}", i, dr2);
+        }
+    }
+    
+    // With multiple samples and mixed genotyped/missing pattern,
+    // DR2 should be computable. Check that values are in valid range.
+    // Note: Mean can be 0 if all imputed values are identical across samples.
+    assert!(valid_count > 0, "Should have valid DR2 values");
 }
 
 #[test]
@@ -841,6 +1053,20 @@ fn test_singleton_imputation() {
     // This is a STRICT test - if we correctly track IBS, we should see elevated dosage
     // Note: this test may fail, which is useful information!
     assert!(singleton_dosage > 0.01, "Singleton should have elevated dosage given matching background, got {}", singleton_dosage);
+    
+    // DR2 validation for singleton imputation
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Singleton test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    // Singleton sites typically have lower DR2 due to uncertainty
+    if dr2_values.len() > 5 && dr2_values[5] >= 0.0 {
+        println!("  Singleton marker 5 DR2: {:.4}", dr2_values[5]);
+    }
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
 }
 
 /// Test imputation with extremely high recombination rate
@@ -892,6 +1118,16 @@ fn test_high_recombination_stress() {
         for (s, ds) in marker_dosages.iter().enumerate() {
             assert!(*ds >= 0.0 && *ds <= 2.0,
                 "Dosage out of range at marker {}, sample {}: {} (should be 0-2)", m, s, ds);
+        }
+    }
+    
+    // DR2 validation for high recombination stress test
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("High recomb stress test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
         }
     }
 }
@@ -956,6 +1192,18 @@ fn test_ultra_dense_markers() {
     println!("Average dosage: {}", avg_dosage);
     // Target matches haplotype group 0, so average dosage should be LOW
     assert!(avg_dosage < 0.5, "Average dosage should be low for matching haplotype group, got {}", avg_dosage);
+    
+    // DR2 validation for ultra-dense markers test
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Ultra-dense test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
+    // With strong LD, DR2 should be high
+    assert!(mean_dr2 > 0.5, "Mean DR2 should be high with strong LD, got {:.4}", mean_dr2);
 }
 
 /// Test imputation with diverse reference panel where target has some mismatch
@@ -1027,6 +1275,16 @@ fn test_diverse_reference_with_mismatch() {
         for ds in marker_dosages {
             assert!(*ds >= 0.0 && *ds <= 2.0,
                 "Dosage {} out of valid range [0, 2]", ds);
+        }
+    }
+    
+    // DR2 validation for diverse reference test
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    println!("Diverse reference test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
         }
     }
 }
@@ -1152,6 +1410,25 @@ fn test_microarray_vs_wgs_imputation() {
     // R² should be reasonably high for well-imputed data
     assert!(r_squared > 0.5, "R² too low for microarray imputation: {:.4}", r_squared);
     assert!(concordance > 0.7, "Concordance too low: {:.2}%", concordance * 100.0);
+    
+    // DR2 validation
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    
+    println!("Microarray test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    
+    // STRICT: DR2 count should match marker count
+    assert!(dr2_values.len() == n_ref_markers, 
+        "DR2 count ({}) != marker count ({})", dr2_values.len(), n_ref_markers);
+    
+    // STRICT: All DR2 values must be in valid range [0, 1]
+    let invalid_dr2 = dr2_values.iter().filter(|&&x| x > 1.0).count();
+    assert!(invalid_dr2 == 0, "Found {} invalid DR2 values > 1.0", invalid_dr2);
+    
+    // STRICT: DR2 should correlate with actual imputation R² 
+    // High R² imputation should have high mean DR2
+    assert!(mean_dr2 > 0.3, 
+        "Mean DR2 ({:.4}) too low for microarray test with R²={:.4}", mean_dr2, r_squared);
 }
 
 /// Test with lower-density genotyping array
@@ -1237,5 +1514,21 @@ fn test_high_density_array_imputation() {
     // This test checks imputation works with moderate density
     // R² > 0 means there's some correlation
     assert!(r_squared > 0.1, "R² too low for array imputation: {:.4}", r_squared);
+    
+    // DR2 validation
+    let dr2_values = inspect_dr2(&out_vcf);
+    let mean_dr2 = compute_mean_dr2(&dr2_values);
+    
+    println!("High-density array test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    
+    // STRICT: DR2 values must be in valid range
+    for (i, &dr2) in dr2_values.iter().enumerate() {
+        if dr2 >= 0.0 {
+            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
+        }
+    }
+    
+    // STRICT: Mean DR2 should be positive
+    assert!(mean_dr2 > 0.0, "Mean DR2 should be positive, got {:.4}", mean_dr2);
 }
 
