@@ -208,6 +208,7 @@ fn build_marker_cluster_index(
 
 fn compute_targ_block_end(
     ref_gt: &GenotypeMatrix<Phased>,
+    alignment: &MarkerAlignment,
     genotyped_markers: &[usize],
 ) -> Vec<usize> {
     let n_ref_haps = ref_gt.n_haplotypes();
@@ -219,9 +220,13 @@ fn compute_targ_block_end(
     let mut last_hash: u64 = 0;
     let mut initialized = false;
     for (idx, &ref_m) in genotyped_markers.iter().enumerate() {
+        let Some(target_m) = alignment.target_marker(ref_m) else {
+            continue;
+        };
         let mut hash = 0xcbf29ce484222325u64;
         for h in 0..n_ref_haps {
-            let allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32));
+            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32));
+            let allele = alignment.reverse_map_allele(target_m, ref_allele);
             hash ^= allele as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
@@ -1293,7 +1298,7 @@ impl ImputationPipeline {
         // Compute marker clusters based on genetic distance (matching Java ImpData)
         // Respect block boundaries induced by reference allele-coding changes.
         let cluster_dist = self.config.cluster as f64;
-        let targ_block_end = compute_targ_block_end(&ref_gt, &genotyped_markers_vec);
+        let targ_block_end = compute_targ_block_end(&ref_gt, &alignment, &genotyped_markers_vec);
         let clusters = compute_marker_clusters_with_blocks(
             &genotyped_markers_vec,
             &gen_positions,
