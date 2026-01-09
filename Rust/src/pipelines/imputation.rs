@@ -283,6 +283,8 @@ pub struct StateProbs {
     /// Genetic positions of ALL reference markers (for interpolation)
     /// Uses Arc to share across all haplotypes (avoids cloning ~8MB per haplotype)
     gen_positions: std::sync::Arc<Vec<f64>>,
+    /// Maps genotyped marker index to cluster index
+    marker_to_cluster: std::sync::Arc<Vec<usize>>,
 }
 
 impl StateProbs {
@@ -325,6 +327,7 @@ impl StateProbs {
         hap_indices: Vec<Vec<u32>>,
         state_probs: Vec<f32>,
         gen_positions: std::sync::Arc<Vec<f64>>,
+        marker_to_cluster: std::sync::Arc<Vec<usize>>,
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
 
@@ -372,6 +375,7 @@ impl StateProbs {
             probs: filtered_probs,
             probs_p1: filtered_probs_p1,
             gen_positions,
+            marker_to_cluster,
         }
     }
 
@@ -521,11 +525,12 @@ impl StateProbs {
         let probs_p1 = &self.probs_p1[left_sparse];
 
         // Java Beagle uses constant probability for markers within a cluster and
-        // interpolates only for markers BETWEEN clusters. We detect "within-cluster"
-        // by checking if the probability vectors for the left marker and the next
-        // marker are identical. HMM expansion ensures this is true for markers
-        // belonging to the same cluster.
-        // let is_between_clusters = probs != probs_p1;
+        // interpolates only for markers BETWEEN clusters.
+        // We use a robust, integer-based check on cluster indices instead of
+        // an unreliable floating point vector comparison (`probs != probs_p1`).
+        let right_sparse = insert_pos;
+        let is_between_clusters = self.marker_to_cluster[left_sparse]
+            != self.marker_to_cluster[right_sparse];
 
 
         if n_alleles == 2 {
@@ -533,12 +538,15 @@ impl StateProbs {
             let mut p_alt = 0.0f32;
             let mut p_ref = 0.0f32;
             for (j, &hap) in haps.iter().enumerate() {
-                // Interpolate state probability. For markers within the same cluster,
-                // probs and probs_p1 will be identical, resulting in a constant probability.
-                // For markers between clusters, this produces a linear interpolation.
+                // Interpolate state probability ONLY if between clusters.
+                // Otherwise, probability is constant within the cluster.
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                let interpolated_prob = weight_left * prob + (1.0 - weight_left) * prob_p1;
+                let interpolated_prob = if is_between_clusters {
+                    let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                    weight_left * prob + (1.0 - weight_left) * prob_p1
+                } else {
+                    prob
+                };
 
                 // Look up allele at the interpolated marker
                 let allele = get_ref_allele(ref_marker, hap);
@@ -558,10 +566,14 @@ impl StateProbs {
             // Java-style interpolation for multiallelic sites
             let mut al_probs = vec![0.0f32; n_alleles];
             for (j, &hap) in haps.iter().enumerate() {
-                // Interpolate state probability (see biallelic case for explanation)
+                // Interpolate state probability ONLY if between clusters.
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                let interpolated_prob = weight_left * prob + (1.0 - weight_left) * prob_p1;
+                let interpolated_prob = if is_between_clusters {
+                    let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                    weight_left * prob + (1.0 - weight_left) * prob_p1
+                } else {
+                    prob
+                };
 
                 // Look up allele at the interpolated marker
                 let allele = get_ref_allele(ref_marker, hap);
@@ -1098,6 +1110,7 @@ impl ImputationPipeline {
                         sparse_hap_indices,
                         hmm_state_probs,
                         std::sync::Arc::clone(&gen_positions),
+                        std::sync::Arc::clone(&marker_to_cluster),
                     ))
                 },
             )
@@ -2069,12 +2082,14 @@ mod tests {
         // At marker 10: 0% state 0, 100% state 1
         let state_probs = vec![1.0, 0.0, 0.0, 1.0];
 
+        let marker_to_cluster = std::sync::Arc::new(vec![0, 1]);
         let sp = StateProbs::new(
             genotyped_markers,
             2,
             hap_indices,
             state_probs,
             gen_positions,
+            marker_to_cluster,
         );
 
         // Hap 0 = REF (0), Hap 1 = ALT (1)
@@ -2154,12 +2169,14 @@ mod tests {
         // At marker 10: 20% state 0, 80% state 1
         let state_probs = vec![0.7, 0.3, 0.2, 0.8];
 
+        let marker_to_cluster = std::sync::Arc::new(vec![0, 1]);
         let sp = StateProbs::new(
             genotyped_markers,
             2,
             hap_indices,
             state_probs,
             gen_positions,
+            marker_to_cluster,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
@@ -2196,12 +2213,14 @@ mod tests {
         // Marker 10: [0.1, 0.2, 0.3, 0.4]
         let state_probs = vec![0.4, 0.3, 0.2, 0.1, 0.1, 0.2, 0.3, 0.4];
 
+        let marker_to_cluster = std::sync::Arc::new(vec![0, 1]);
         let sp = StateProbs::new(
             genotyped_markers,
             4,
             hap_indices,
             state_probs,
             gen_positions,
+            marker_to_cluster,
         );
 
         // Allele mapping: hap 0,1 = REF (0), hap 2,3 = ALT (1)
@@ -2275,12 +2294,14 @@ mod tests {
             0.1, 0.3, 0.6,  // m=100
         ];
 
+        let marker_to_cluster = std::sync::Arc::new((0..genotyped_markers.len()).collect());
         let sp = StateProbs::new(
             genotyped_markers.clone(),
             n_states,
             hap_indices,
             state_probs,
             gen_positions.clone(),
+            marker_to_cluster,
         );
 
         // Reference allele function: hap 0 = REF, hap 1 = ALT, hap 2 = ALT
@@ -2332,12 +2353,14 @@ mod tests {
             0.0, 1.0,  // m=100: 100% state 1
         ];
 
+        let marker_to_cluster = std::sync::Arc::new(vec![0, 1, 2]);
         let sp = StateProbs::new(
             genotyped_markers,
             2,
             hap_indices,
             state_probs,
             gen_positions,
+            marker_to_cluster,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
@@ -2406,12 +2429,14 @@ mod tests {
         // All probabilities are 0.002 (below threshold of ~0.005)
         let state_probs: Vec<f32> = vec![0.002; 2 * n_states];
 
+        let marker_to_cluster = std::sync::Arc::new((0..genotyped_markers.len()).collect());
         let sp = StateProbs::new(
             genotyped_markers,
             n_states,
             hap_indices,
             state_probs,
             gen_positions,
+            marker_to_cluster,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
@@ -2440,12 +2465,14 @@ mod tests {
         let hap_indices: Vec<Vec<u32>> = vec![vec![0, 1]];
         let state_probs = vec![0.3, 0.7]; // 30% state 0, 70% state 1
 
+        let marker_to_cluster = std::sync::Arc::new(vec![0]);
         let sp = StateProbs::new(
             genotyped_markers,
             2,
             hap_indices,
             state_probs,
             gen_positions,
+            marker_to_cluster,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
@@ -2486,12 +2513,14 @@ mod tests {
             0.0, 1.0,  // m=100: 100% state 1
         ];
 
+        let marker_to_cluster = std::sync::Arc::new(vec![0, 1]);
         let sp = StateProbs::new(
             genotyped_markers,
             2,
             hap_indices,
             state_probs,
             gen_positions,
+            marker_to_cluster,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
