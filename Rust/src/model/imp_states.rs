@@ -469,10 +469,13 @@ impl<'a> ImpStates<'a> {
         self.threaded_haps.reset_cursors();
 
         // Process only genotyped markers
+        let mut entries: Vec<CompHapEntry> = self.queue.iter().cloned().take(n_states).collect();
+        entries.sort_by_key(|e| e.comp_hap_idx);
+
         for (sparse_idx, &ref_m) in genotyped_markers.iter().enumerate() {
             let target_allele = target_alleles.get(ref_m).copied().unwrap_or(255);
 
-            for (j, entry) in self.queue.iter().take(n_states).enumerate() {
+            for (j, entry) in entries.iter().enumerate() {
                 if entry.comp_hap_idx < self.threaded_haps.n_states() {
                     let hap = self.threaded_haps.hap_at_raw(entry.comp_hap_idx, ref_m);
                     hap_indices[sparse_idx][j] = hap;
