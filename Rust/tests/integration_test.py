@@ -372,187 +372,196 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         "switch_errors": 0, "switch_opportunities": 0
     })
 
-    # Stream truth VCF into memory-efficient dict (one site at a time in the stream)
-    print("Loading truth genotypes (streaming)...")
-    truth_gts = {}
+    # === STREAMING SETUP ===
+    print("Initializing streams...")
+    
+    # 1. Truth Stream
     truth_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {truth_vcf}"
-    for line in _stream_vcf_lines(truth_cmd):
-        key, sample_data = _parse_truth_line(line, truth_samples)
-        if key is not None:
-            truth_gts[key] = sample_data
+    truth_iter = _stream_vcf_lines(truth_cmd)
 
-    print(f"Truth sites loaded: {len(truth_gts)}")
+    # 2. Imputed Stream
+    # Request GT:DS:GP. If failing, bcftools usually outputs '.' or we handle it in parser.
+    # We use a broad request and rely on parser robustness.
+    imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf}"
+    imputed_iter = _stream_vcf_lines(imputed_cmd)
 
-    # Stream imputed VCF and compare on-the-fly using merge-join
-    # Since both VCFs are sorted, we process imputed and look up in truth
-    print("Processing imputed genotypes (streaming)...")
+    # Helper to get next parsed line
+    def get_next_truth():
+        try:
+            line = next(truth_iter)
+            return _parse_truth_line(line, truth_samples)
+        except StopIteration:
+            return None, None
 
-    # Try to get GP field for Hellinger score (Beagle outputs GP)
-    # First try with GP, fall back to without
-    # Request GT:DS:GP to capture Estimated Dosage
-    imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf} 2>/dev/null"
-    try:
-        imputed_lines = list(_stream_vcf_lines(imputed_cmd))
-        # Check if query succeeded (some tools might not support DS/GP)
-        if not imputed_lines:
-            raise ValueError("Empty output")
-    except:
-        # Fallback to GT only (implies DS=GT)
-        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:.:.]\\n' {imputed_vcf}"
-        imputed_lines = list(_stream_vcf_lines(imputed_cmd))
+    def get_next_imputed():
+        try:
+            line = next(imputed_iter)
+            return _parse_imputed_line(line, imputed_samples)
+        except StopIteration:
+            return None, None
+
+    # Initial fetch
+    truth_key, truth_data = get_next_truth()
+    imp_key, imp_data = get_next_imputed()
 
     # Track previous het for switch error calculation per sample
     prev_het = {}  # sample -> (site, truth_gt, imputed_gt, maf_bin)
     common_sites_count = 0
     last_pos = 0
 
-    for line in imputed_lines:
-        key, imputed_site = _parse_imputed_line(line, imputed_samples)
-        if key is None:
-            continue
-
-        # Only process sites that exist in truth
-        if key not in truth_gts:
-            continue
-
-        truth_site = truth_gts[key]
-        common_sites_count += 1
-        site = key
-        last_pos = key[1]
-
-        # Calculate MAF from truth
-        dosages_at_site = [v[1] for v in truth_site.values() if v[1] is not None]
-        if dosages_at_site:
-            af = sum(dosages_at_site) / (2 * len(dosages_at_site))
-            maf = min(af, 1 - af)
-        else:
-            maf = 0
-
-        # Determine MAF bin using finer categories
-        maf_bin = get_maf_bin(maf)
-
-        # Track per-site concordance for IQS
-        site_concordant = 0
-        site_total = 0
-
-        for sample in truth_site:
-            if sample in imputed_site:
-                t_gt, t_dos, t_phased = truth_site[sample]
-                imp_data = imputed_site[sample]
-                i_gt, i_dos, i_phased = imp_data[0], imp_data[1], imp_data[2]
-                i_gp = imp_data[3] if len(imp_data) > 3 else None
-
-                if t_dos is not None and i_dos is not None:
-                    # Hellinger score calculation (if GP available)
-                    if i_gp is not None:
-                        # Truth GP is deterministic: [1,0,0] for 0/0, [0,1,0] for 0/1, [0,0,1] for 1/1
-                        t_gp = (1.0, 0.0, 0.0) if t_dos == 0 else ((0.0, 1.0, 0.0) if t_dos == 1 else (0.0, 0.0, 1.0))
-                        # Hellinger distance: H(P,Q) = sqrt(1 - BC) where BC = sum(sqrt(p_i * q_i))
-                        bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
-                        hellinger_dist = math.sqrt(max(0, 1 - bc))
-                        # Hellinger score = 1 - distance (higher is better)
-                        h_score = 1 - hellinger_dist
-                        hellinger_sum += h_score
-                        hellinger_count += 1
-                    total_compared += 1
-                    site_total += 1
-
-                    # Online stats for global R² (avoid storing all dosages)
-                    r2_stats["sum_t"] += t_dos
-                    r2_stats["sum_i"] += i_dos
-                    r2_stats["sum_ti"] += t_dos * i_dos
-                    r2_stats["sum_tt"] += t_dos * t_dos
-                    r2_stats["sum_ii"] += i_dos * i_dos
-                    r2_stats["count"] += 1
-
-                    # Online stats for MAF bin R²
-                    maf_bins[maf_bin]["sum_t"] += t_dos
-                    maf_bins[maf_bin]["sum_i"] += i_dos
-                    maf_bins[maf_bin]["sum_ti"] += t_dos * i_dos
-                    maf_bins[maf_bin]["sum_tt"] += t_dos * t_dos
-                    maf_bins[maf_bin]["sum_ii"] += i_dos * i_dos
-                    maf_bins[maf_bin]["total"] += 1
-
-                    # Per-sample online stats
-                    sample_metrics[sample]["total"] += 1
-                    sample_metrics[sample]["sum_t"] += t_dos
-                    sample_metrics[sample]["sum_i"] += i_dos
-                    sample_metrics[sample]["sum_ti"] += t_dos * i_dos
-                    sample_metrics[sample]["sum_tt"] += t_dos * t_dos
-                    sample_metrics[sample]["sum_ii"] += i_dos * i_dos
-                    
-                    # Classify genotypes for confusion matrix
-                    t_class = 0 if t_dos == 0 else (2 if t_dos == 2 else 1)
-                    i_class = 0 if i_dos == 0 else (2 if i_dos == 2 else 1)
-                    confusion[t_class][i_class] += 1
-                    maf_bins[maf_bin]["confusion"][t_class][i_class] += 1
-
-                    # Unphased concordance: sort alleles so 0|1 == 1|0
-                    t_sorted = tuple(sorted(t_gt))
-                    i_sorted = tuple(sorted(i_gt))
-                    if t_sorted == i_sorted:
-                        unphased_concordant += 1
-                        site_concordant += 1
-                        maf_bins[maf_bin]["unphased_concordant"] += 1
-                        sample_metrics[sample]["concordant"] += 1
-                    
-                    # Non-reference concordance
-                    if t_dos > 0:  # Truth is not HomRef
-                        nonref_total += 1
-                        maf_bins[maf_bin]["nonref_total"] += 1
-                        if t_sorted == i_sorted:
-                            nonref_concordant += 1
-                            maf_bins[maf_bin]["nonref_concordant"] += 1
-                    
-                    # Switch error detection (for hets only, when both are phased)
-                    if t_dos == 1 and i_dos == 1 and t_phased and i_phased:
-                        pos = site[1]
-                        if sample not in current_block_start:
-                            current_block_start[sample] = pos
-
-                        if sample in prev_het:
-                            prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample]
-                            # Determine if there's a switch by comparing phase relationships
-                            # If truth maintains same phase but imputed flips, it's a switch
-                            t_same_phase = (t_gt[0] == prev_t_gt[0])  # First allele same as prev first
-                            i_same_phase = (i_gt[0] == prev_i_gt[0])
-                            
-                            if t_same_phase != i_same_phase:
-                                # Switch error! End current block
-                                block_len = pos - current_block_start[sample]
-                                phase_blocks[sample].append(block_len)
-                                # Start new block at current position
-                                current_block_start[sample] = pos
-                                
-                                switch_errors += 1
-                                sample_metrics[sample]["switch_errors"] += 1
-                                maf_bins[maf_bin]["switch_errors"] += 1
-                            
-                            switch_opportunities += 1
-                            sample_metrics[sample]["switch_opportunities"] += 1
-                            maf_bins[maf_bin]["switch_opportunities"] += 1
-                        prev_het[sample] = (site, t_gt, i_gt, maf_bin)
-
-        # Calculate IQS for this site
-        # IQS = (observed - expected) / (1 - expected)
-        # Expected concordance under HWE: P(0/0)^2 + P(0/1)^2 + P(1/1)^2
-        # With p = alt allele freq: (1-p)^4 + 4p^2(1-p)^2 + p^4
-        if site_total > 0 and maf > 0 and maf < 1:
-            p = af  # Use AF not MAF for expected calculation
-            q = 1 - p
-            # HWE genotype frequencies
-            p_00 = q * q
-            p_01 = 2 * p * q
-            p_11 = p * p
-            # Expected concordance by chance
-            expected_conc = p_00 * p_00 + p_01 * p_01 + p_11 * p_11
-            observed_conc = site_concordant / site_total
-
-            if expected_conc < 1.0:  # Avoid division by zero
-                iqs = (observed_conc - expected_conc) / (1.0 - expected_conc)
-                site_iqs_values.append(iqs)
-                maf_bins[maf_bin]["iqs_values"].append(iqs)
+    print("Streaming and comparing...")
     
+    # Merge-join loop
+    while truth_key is not None and imp_key is not None:
+        t_chrom, t_pos = truth_key
+        i_chrom, i_pos = imp_key
+
+        # Compare positions (Chrom then Pos)
+        # Handle string chromosome comparison carefully if needed, 
+        # but typical numeric/lexicographic sort holds for same reference.
+        
+        if t_chrom == i_chrom:
+            if t_pos == i_pos:
+                # MATCH! Process site
+                common_sites_count += 1
+                site = truth_key
+                last_pos = site[1]
+                truth_site = truth_data
+                imputed_site = imp_data
+
+                # --- METRICS CALCULATION LOGIC (same as before) ---
+                
+                # Calculate MAF from truth
+                dosages_at_site = [v[1] for v in truth_site.values() if v[1] is not None]
+                if dosages_at_site:
+                    af = sum(dosages_at_site) / (2 * len(dosages_at_site))
+                    maf = min(af, 1 - af)
+                else:
+                    maf = 0
+
+                maf_bin = get_maf_bin(maf)
+                site_concordant = 0
+                site_total = 0
+
+                for sample in truth_site:
+                    if sample in imputed_site:
+                        t_gt, t_dos, t_phased = truth_site[sample]
+                        imp_values = imputed_site[sample]
+                        i_gt, i_dos, i_phased = imp_values[0], imp_values[1], imp_values[2]
+                        i_gp = imp_values[3] if len(imp_values) > 3 else None
+
+                        if t_dos is not None and i_dos is not None:
+                            # Hellinger score
+                            if i_gp is not None:
+                                t_gp = (1.0, 0.0, 0.0) if t_dos == 0 else ((0.0, 1.0, 0.0) if t_dos == 1 else (0.0, 0.0, 1.0))
+                                bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
+                                hellinger_dist = math.sqrt(max(0, 1 - bc))
+                                h_score = 1 - hellinger_dist
+                                hellinger_sum += h_score
+                                hellinger_count += 1
+                            
+                            total_compared += 1
+                            site_total += 1
+
+                            # Online R² stats
+                            r2_stats["sum_t"] += t_dos
+                            r2_stats["sum_i"] += i_dos
+                            r2_stats["sum_ti"] += t_dos * i_dos
+                            r2_stats["sum_tt"] += t_dos * t_dos
+                            r2_stats["sum_ii"] += i_dos * i_dos
+                            r2_stats["count"] += 1
+
+                            # MAF bin stats
+                            maf_bins[maf_bin]["sum_t"] += t_dos
+                            maf_bins[maf_bin]["sum_i"] += i_dos
+                            maf_bins[maf_bin]["sum_ti"] += t_dos * i_dos
+                            maf_bins[maf_bin]["sum_tt"] += t_dos * t_dos
+                            maf_bins[maf_bin]["sum_ii"] += i_dos * i_dos
+                            maf_bins[maf_bin]["total"] += 1
+
+                            # Sample stats
+                            sample_metrics[sample]["total"] += 1
+                            sample_metrics[sample]["sum_t"] += t_dos
+                            sample_metrics[sample]["sum_i"] += i_dos
+                            sample_metrics[sample]["sum_ti"] += t_dos * i_dos
+                            sample_metrics[sample]["sum_tt"] += t_dos * t_dos
+                            sample_metrics[sample]["sum_ii"] += i_dos * i_dos
+                            
+                            # Confusion matrix
+                            t_class = 0 if t_dos == 0 else (2 if t_dos == 2 else 1)
+                            i_class = 0 if i_dos == 0 else (2 if i_dos == 2 else 1)
+                            confusion[t_class][i_class] += 1
+                            maf_bins[maf_bin]["confusion"][t_class][i_class] += 1
+
+                            # Concordance
+                            t_sorted = tuple(sorted(t_gt))
+                            i_sorted = tuple(sorted(i_gt))
+                            if t_sorted == i_sorted:
+                                unphased_concordant += 1
+                                site_concordant += 1
+                                maf_bins[maf_bin]["unphased_concordant"] += 1
+                                sample_metrics[sample]["concordant"] += 1
+                            
+                            # Non-ref concordance
+                            if t_dos > 0:
+                                nonref_total += 1
+                                maf_bins[maf_bin]["nonref_total"] += 1
+                                if t_sorted == i_sorted:
+                                    nonref_concordant += 1
+                                    maf_bins[maf_bin]["nonref_concordant"] += 1
+                            
+                            # Switch errors
+                            if t_dos == 1 and i_dos == 1 and t_phased and i_phased:
+                                pos = site[1]
+                                if sample not in current_block_start:
+                                    current_block_start[sample] = pos
+
+                                if sample in prev_het:
+                                    prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample]
+                                    t_same_phase = (t_gt[0] == prev_t_gt[0])
+                                    i_same_phase = (i_gt[0] == prev_i_gt[0])
+                                    
+                                    if t_same_phase != i_same_phase:
+                                        block_len = pos - current_block_start[sample]
+                                        phase_blocks[sample].append(block_len)
+                                        current_block_start[sample] = pos
+                                        
+                                        switch_errors += 1
+                                        sample_metrics[sample]["switch_errors"] += 1
+                                        maf_bins[maf_bin]["switch_errors"] += 1
+                                    
+                                    switch_opportunities += 1
+                                    sample_metrics[sample]["switch_opportunities"] += 1
+                                    maf_bins[maf_bin]["switch_opportunities"] += 1
+                                prev_het[sample] = (site, t_gt, i_gt, maf_bin)
+
+                # IQS Calculation
+                if site_total > 0 and maf > 0 and maf < 1:
+                    p = af
+                    q = 1 - p
+                    expected_conc = (q*q)**2 + (2*p*q)**2 + (p*p)**2
+                    observed_conc = site_concordant / site_total
+                    if expected_conc < 1.0:
+                        iqs = (observed_conc - expected_conc) / (1.0 - expected_conc)
+                        site_iqs_values.append(iqs)
+                        maf_bins[maf_bin]["iqs_values"].append(iqs)
+
+                # Advance both
+                truth_key, truth_data = get_next_truth()
+                imp_key, imp_data = get_next_imputed()
+            
+            elif t_pos < i_pos:
+                # Truth is behind, means site missing in imputation (or extra site in Truth)
+                truth_key, truth_data = get_next_truth()
+            else:
+                # Imputed is behind, means extra site in Imputation
+                imp_key, imp_data = get_next_imputed()
+        
+        elif t_chrom < i_chrom:
+             truth_key, truth_data = get_next_truth()
+        else:
+             imp_key, imp_data = get_next_imputed()
+
     print(f"Common sites: {common_sites_count}")
 
     # Close final phase blocks
@@ -659,9 +668,6 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                 metrics["r_squared"] = None
                 
             # INFO score approximation (variance ratio)
-            # INFO ≈ 1 - (mean imputed variance) / (expected variance under HWE)
-            # For hard calls: var_expected = 2*p*q, var_observed = 0
-            # This is a rough approximation
             if var_t > 0:
                 metrics["info_score_approx"] = var_i / var_t
         else:
