@@ -18,22 +18,19 @@ use crate::error::{ReagleError, Result};
 
 /// Imputation quality statistics for a single marker
 ///
-/// Used to calculate DR2 (dosage R-squared) following the Beagle formula:
-/// DR2 = Var(d) / Var(X)
+/// Used to calculate DR2 (dosage R-squared) following Java Beagle's formula:
+/// DR2 = (sum2 - sum^2/n) / (sum - sum^2/n)
 ///
 /// Where:
-/// - d = estimated dosage (y1 + 2*y2) = p1 + p2
-/// - X = true count (0, 1, or 2)
-/// - Var(X) is estimated as Mean(m) - Mean(d)^2
-/// - m = second moment = y1 + 4*y2 = p1 + p2 + 2*p1*p2
+/// - sum = sum of dosages (p1 + p2)
+/// - sum2 = sum of squared allele probabilities (p1^2 + p2^2)
+/// - n = number of target haplotypes (2 * n_samples)
 #[derive(Clone, Debug, Default)]
 pub struct MarkerImputationStats {
     /// Sum of dosages (p1 + p2) for each ALT allele
     pub sum_dosages: Vec<f32>,
-    /// Sum of squared dosages (p1 + p2)^2 for each ALT allele
+    /// Sum of squared allele probabilities (p1^2 + p2^2) for each ALT allele
     pub sum_dosages_sq: Vec<f32>,
-    /// Sum of expected true variance second moments (p1 + p2 + 2*p1*p2)
-    pub sum_expected_truth: Vec<f32>,
     /// Number of SAMPLES processed (not haplotypes)
     pub n_samples: usize,
     /// Whether this marker was imputed (not in target genotypes)
@@ -46,7 +43,6 @@ impl MarkerImputationStats {
         Self {
             sum_dosages: vec![0.0; n_alleles],
             sum_dosages_sq: vec![0.0; n_alleles],
-            sum_expected_truth: vec![0.0; n_alleles],
             n_samples: 0,
             is_imputed: false,
         }
@@ -64,63 +60,32 @@ impl MarkerImputationStats {
             let p2 = probs2.get(a).copied().unwrap_or(0.0);
             
             let dose = p1 + p2;
-            let dose_sq = dose * dose;
-            
-            // m = second moment = p1 + p2 + 2*p1*p2
-            // logic:
-            // P(X=0) = (1-p1)(1-p2)
-            // P(X=1) = p1(1-p2) + p2(1-p1) = p1 + p2 - 2p1p2
-            // P(X=2) = p1p2
-            // E[X^2] = 0*P(0) + 1*P(1) + 4*P(2)
-            //        = p1 + p2 - 2p1p2 + 4p1p2
-            //        = p1 + p2 + 2p1p2
-            let m = p1 + p2 + 2.0 * p1 * p2;
+            let dose_sq = p1 * p1 + p2 * p2;
 
             self.sum_dosages[a] += dose;
             self.sum_dosages_sq[a] += dose_sq;
-            self.sum_expected_truth[a] += m;
         }
     }
 
     /// Calculate DR2 (dosage R-squared) for the specified ALT allele
     ///
-    /// DR2 = Var(d) / Var(X)
+    /// Matches Java Beagle ImputedRecBuilder.r2.
     pub fn dr2(&self, allele: usize) -> f32 {
         if allele == 0 || allele >= self.sum_dosages.len() || self.n_samples == 0 {
             return 0.0;
         }
 
-        let n = self.n_samples as f32;
-        let sum_d = self.sum_dosages[allele];
-        // let mean_d = sum_d / n;
+        let n = (self.n_samples as f32) * 2.0;
+        let sum = self.sum_dosages[allele];
+        let sum2 = self.sum_dosages_sq[allele];
+        let mean_term = sum * sum / n;
+        let num = sum2 - mean_term;
+        let den = sum - mean_term;
 
-        // Var(d) = Mean(d^2) - Mean(d)^2
-        //        = (sum_d_sq / n) - (sum_d / n)^2
-        //        = (sum_d_sq - sum_d^2/n) / n
-        let sum_d_sq = self.sum_dosages_sq[allele];
-        let var_d_num = sum_d_sq - (sum_d * sum_d / n);
-        
-        if var_d_num <= 0.0 {
-            return 0.0;
-        }
-        let var_d = var_d_num / n;
-
-        // Var(X) = Mean(m) - Mean(d)^2
-        //        = (sum_m / n) - (sum_d / n)^2
-        //        = (sum_m - sum_d^2/n) / n
-        let sum_m = self.sum_expected_truth[allele];
-        let var_x_num = sum_m - (sum_d * sum_d / n);
-
-        if var_x_num <= 0.0 {
-            return 0.0;
-        }
-        let var_x = var_x_num / n;
-
-        if var_x <= 1e-9 {
-            // No variance in truth (monomorphic site) -> undefined correlation
+        if num <= 0.0 || den <= 0.0 {
             0.0
         } else {
-            (var_d / var_x).clamp(0.0, 1.0)
+            (num / den).clamp(0.0, 1.0)
         }
     }
 
@@ -982,7 +947,6 @@ mod tests {
         let stats = MarkerImputationStats::new(3);
         assert_eq!(stats.sum_dosages.len(), 3);
         assert_eq!(stats.sum_dosages_sq.len(), 3);
-        assert_eq!(stats.sum_expected_truth.len(), 3);
         assert_eq!(stats.n_samples, 0);
         assert!(!stats.is_imputed);
     }
