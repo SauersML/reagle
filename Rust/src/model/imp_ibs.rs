@@ -47,13 +47,13 @@ pub struct ImpIbs {
 /// observed in targets.
 pub fn build_cluster_hap_sequences(
     ref_gt: &GenotypeMatrix<Phased>,
-    target_gt: &GenotypeMatrix<Phased>,
+    targ_gt: &GenotypeMatrix<Phased>,
     alignment: &MarkerAlignment,
     genotyped_markers: &[usize],
     cluster_bounds: &[(usize, usize)],
 ) -> ClusterHapSequences {
     let n_ref_haps = ref_gt.n_haplotypes();
-    let n_targ_haps = target_gt.n_haplotypes();
+    let n_targ_haps = targ_gt.n_haplotypes();
     let n_haps = n_ref_haps + n_targ_haps;
 
     let mut hap_to_seq = Vec::with_capacity(cluster_bounds.len());
@@ -65,25 +65,20 @@ pub fn build_cluster_hap_sequences(
         let mut seq_cnt = 2u32; // 0 reserved, 1 is base
 
         for &ref_m in &genotyped_markers[start..end] {
-            let Some(target_m) = alignment.target_marker(ref_m) else {
+            let Some(targ_m) = alignment.target_marker(ref_m) else {
                 continue;
             };
-            let target_marker_idx = MarkerIdx::new(target_m as u32);
-            let n_alleles = 1 + target_gt.marker(target_marker_idx).alt_alleles.len();
-            if n_alleles == 0 {
-                continue;
-            }
+            let targ_marker_idx = MarkerIdx::new(targ_m as u32);
+            let n_alleles = 1 + targ_gt.marker(targ_marker_idx).alt_alleles.len();
 
-            let mut seq_map = vec![0u32; (seq_cnt as usize) * n_alleles];
+            let mut seq_map = vec![0u32; (seq_cnt as usize) * n_alleles.max(1)];
             seq_cnt = 1;
 
-            // Update target hap sequences first.
+            // Update target hap sequences first to define the sequence IDs
             for h in 0..n_targ_haps {
                 let hap_idx = HapIdx::new(h as u32);
-                let mut allele = target_gt.allele(target_marker_idx, hap_idx) as usize;
-                if allele >= n_alleles {
-                    allele = 0;
-                }
+                let allele = targ_gt.allele(targ_marker_idx, hap_idx) as usize;
+                let allele = if allele >= n_alleles { 0 } else { allele };
                 let index = (targ_seq[h] as usize) * n_alleles + allele;
                 if seq_map[index] == 0 {
                     seq_map[index] = seq_cnt;
@@ -99,10 +94,8 @@ pub fn build_cluster_hap_sequences(
                 }
                 let hap_idx = HapIdx::new(h as u32);
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), hap_idx);
-                let mut allele = alignment.reverse_map_allele(target_m, ref_allele) as usize;
-                if allele >= n_alleles {
-                    allele = 0;
-                }
+                let allele = alignment.reverse_map_allele(targ_m, ref_allele) as usize;
+                let allele = if allele >= n_alleles { 0 } else { allele };
                 let index = (ref_seq[h] as usize) * n_alleles + allele;
                 ref_seq[h] = seq_map.get(index).copied().unwrap_or(0);
             }
