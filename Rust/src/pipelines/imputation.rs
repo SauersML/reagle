@@ -185,11 +185,6 @@ impl MarkerAlignment {
         }
     }
 
-    /// Check if a reference marker is genotyped in target
-    pub fn is_genotyped(&self, ref_marker: usize) -> bool {
-        self.ref_to_target.get(ref_marker).copied().unwrap_or(-1) >= 0
-    }
-
     /// Get target marker index for a reference marker (returns None if not genotyped)
     pub fn target_marker(&self, ref_marker: usize) -> Option<usize> {
         let idx = self.ref_to_target.get(ref_marker).copied().unwrap_or(-1);
@@ -970,6 +965,13 @@ impl ImputationPipeline {
             .collect();
         let n_genotyped = genotyped_markers_vec.len();
         let n_to_impute = n_ref_markers - n_genotyped;
+        let has_observed: std::sync::Arc<Vec<bool>> = {
+            let mut flags = vec![false; n_ref_markers];
+            for &m in &genotyped_markers_vec {
+                flags[m] = true;
+            }
+            std::sync::Arc::new(flags)
+        };
 
         // Number of IBS haplotypes to find per step
         // Java: nHapsPerStep = imp_states / (imp_segment / imp_step)
@@ -1284,7 +1286,7 @@ impl ImputationPipeline {
 
         // Mark imputed markers (those not in target)
         for m in 0..n_ref_markers {
-            let is_imputed = !alignment.is_genotyped(m);
+            let is_imputed = !has_observed[m];
             quality.set_imputed(m, is_imputed);
         }
 
@@ -1330,7 +1332,7 @@ impl ImputationPipeline {
             // Process marker-by-marker (streaming, O(n_markers × n_samples) total)
             for m in 0..n_ref_markers {
                 let n_alleles = n_alleles_per_marker[m];
-                let is_genotyped = alignment.is_genotyped(m);
+                let is_genotyped = has_observed[m];
 
                 // Use an iterator over chunks to access cursors mutably for each sample
                 // This avoids splitting the slice inside the loop
@@ -1433,23 +1435,27 @@ impl ImputationPipeline {
         let cursors_for_dosage = Rc::clone(&cursors);
         let ref_gt_for_dosage = Arc::clone(&ref_gt);
         let alignment_for_dosage = alignment.clone();
+        let has_observed_for_dosage = std::sync::Arc::clone(&has_observed);
         let target_gt_for_dosage = Arc::clone(&target_gt);
         let get_dosage = move |m: usize, s: usize| -> f32 {
-            if let Some(target_m) = alignment_for_dosage.target_marker(m) {
-                let hap1_idx = HapIdx::new((s * 2) as u32);
-                let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-                let a1 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap1_idx);
-                let a2 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap2_idx);
-                let a1_mapped = alignment_for_dosage.map_allele(target_m, a1);
-                let a2_mapped = alignment_for_dosage.map_allele(target_m, a2);
-                if a1_mapped != 255 && a2_mapped != 255 {
-                    return a1_mapped as f32 + a2_mapped as f32;
+            if has_observed_for_dosage[m] {
+                if let Some(target_m) = alignment_for_dosage.target_marker(m) {
+                    let hap1_idx = HapIdx::new((s * 2) as u32);
+                    let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
+                    let a1 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap1_idx);
+                    let a2 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap2_idx);
+                    let a1_mapped = alignment_for_dosage.map_allele(target_m, a1);
+                    let a2_mapped = alignment_for_dosage.map_allele(target_m, a2);
+                    if a1_mapped != 255 && a2_mapped != 255 {
+                        return a1_mapped as f32 + a2_mapped as f32;
+                    }
                 }
             }
+
             let n_alleles = n_alleles_for_dosage[m];
 
             // Check if genotyped in target
-            if alignment_for_dosage.is_genotyped(m) {
+            if has_observed_for_dosage[m] {
                 if let Some(target_m) = alignment_for_dosage.target_marker(m) {
                     let target_marker_idx = MarkerIdx::new(target_m as u32);
                     let hap1_idx = HapIdx::new((s * 2) as u32);
