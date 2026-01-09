@@ -747,9 +747,9 @@ impl ImputationPipeline {
         );
 
         // Check if target data is already phased - skip phasing if so
-        let target_gt = if target_reader.was_all_phased() {
+        let phased_target_gt_res: Result<GenotypeMatrix<Phased>> = if target_reader.was_all_phased() {
             eprintln!("Target data is already phased, skipping phasing step");
-            target_gt.into_phased()
+            Ok(target_gt.into_phased())
         } else {
             info_span!("phasing").in_scope(|| {
                 // Phase target before imputation (imputation requires phased haplotypes)
@@ -776,8 +776,9 @@ impl ImputationPipeline {
                 };
 
                 phasing.phase_in_memory(&target_gt, &gen_maps)
-            })?
+            })
         };
+        let target_gt = Arc::new(phased_target_gt_res?);
 
         let n_target_markers = target_gt.n_markers();
         let n_target_samples = target_gt.n_samples();
@@ -1248,55 +1249,93 @@ impl ImputationPipeline {
         // Share n_alleles_per_marker between closures via Rc
         let n_alleles_shared: Rc<Vec<usize>> = Rc::new(n_alleles_per_marker);
 
+        // Helper to create one-hot allele posteriors from a hard-called allele
+        let one_hot_posterior = |allele: u8, n_alleles: usize| -> AllelePosteriors {
+            if n_alleles == 2 {
+                AllelePosteriors::Biallelic(allele as f32)
+            } else {
+                let mut probs = vec![0.0f32; n_alleles];
+                if (allele as usize) < n_alleles {
+                    probs[allele as usize] = 1.0;
+                }
+                AllelePosteriors::Multiallelic(probs)
+            }
+        };
+
         // Streaming closure: compute dosage on-the-fly using cursor
-        // write_imputed_streaming processes markers sequentially, so cursors advance monotonically
         let n_alleles_for_dosage = Rc::clone(&n_alleles_shared);
         let cursors_for_dosage = Rc::clone(&cursors);
         let ref_gt_for_dosage = Arc::clone(&ref_gt);
+        let alignment_for_dosage = alignment.clone();
+        let target_gt_for_dosage = Arc::clone(&target_gt);
         let get_dosage = move |m: usize, s: usize| -> f32 {
+            if let Some(target_m) = alignment_for_dosage.target_marker(m) {
+                let hap1_idx = HapIdx::new((s * 2) as u32);
+                let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
+                let a1 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap1_idx);
+                let a2 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap2_idx);
+                let a1_mapped = alignment_for_dosage.map_allele(target_m, a1);
+                let a2_mapped = alignment_for_dosage.map_allele(target_m, a2);
+                if a1_mapped != 255 && a2_mapped != 255 {
+                    return a1_mapped as f32 + a2_mapped as f32;
+                }
+            }
             let n_alleles = n_alleles_for_dosage[m];
             let mut cursors = cursors_for_dosage.borrow_mut();
-            let (cursor1, cursor2) = {
-                let mid = s * 2 + 1;
-                let (left, right) = cursors.split_at_mut(mid);
-                (&mut left[s * 2], &mut right[0])
-            };
             let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                 ref_gt_for_dosage.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
             };
-            let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-            let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
+            let post1 = cursors[s * 2].allele_posteriors(m, n_alleles, &get_ref_allele);
+            let post2 = cursors[s * 2 + 1].allele_posteriors(m, n_alleles, &get_ref_allele);
             post1.dosage() + post2.dosage()
         };
 
         // Streaming closure: compute posteriors on-the-fly
-        // Note: Uses separate cursor set since called after get_dosage for same (m, s)
         type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
-        let get_posteriors: Option<GetPosteriorsFn> =
-            if need_allele_probs {
-                let cursors_post: RefCell<Vec<StateProbsCursor>> = RefCell::new(
-                    state_probs.iter().map(|sp| sp.clone().cursor()).collect()
-                );
-                let n_alleles_per_marker = n_alleles_shared.as_ref().clone();
-                let ref_gt_for_post = Arc::clone(&ref_gt);
-                Some(Box::new(move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
+        let get_posteriors: Option<GetPosteriorsFn> = if need_allele_probs {
+            let cursors_post: RefCell<Vec<StateProbsCursor>> = RefCell::new(state_probs.iter().map(|sp| sp.clone().cursor()).collect());
+            let n_alleles_per_marker = n_alleles_shared.as_ref().clone();
+            let ref_gt_for_post = Arc::clone(&ref_gt);
+            let alignment_for_post = alignment.clone();
+            let target_gt_for_post = Arc::clone(&target_gt);
+            Some(Box::new(
+                move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
                     let n_alleles = n_alleles_per_marker[m];
-                    let mut cursors = cursors_post.borrow_mut();
-                    let (cursor1, cursor2) = {
-                        let mid = s * 2 + 1;
-                        let (left, right) = cursors.split_at_mut(mid);
-                        (&mut left[s * 2], &mut right[0])
-                    };
                     let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                         ref_gt_for_post.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
-                    let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                    let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
+
+                    if let Some(target_m) = alignment_for_post.target_marker(m) {
+                        let hap1_idx = HapIdx::new((s * 2) as u32);
+                        let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
+                        let a1 = target_gt_for_post.allele(MarkerIdx::new(target_m as u32), hap1_idx);
+                        let a2 = target_gt_for_post.allele(MarkerIdx::new(target_m as u32), hap2_idx);
+                        let a1_mapped = alignment_for_post.map_allele(target_m, a1);
+                        let a2_mapped = alignment_for_post.map_allele(target_m, a2);
+
+                        let mut cursors = cursors_post.borrow_mut();
+                        let post1 = if a1_mapped != 255 {
+                            one_hot_posterior(a1_mapped, n_alleles)
+                        } else {
+                            cursors[s * 2].allele_posteriors(m, n_alleles, &get_ref_allele)
+                        };
+                        let post2 = if a2_mapped != 255 {
+                            one_hot_posterior(a2_mapped, n_alleles)
+                        } else {
+                            cursors[s * 2 + 1].allele_posteriors(m, n_alleles, &get_ref_allele)
+                        };
+                        return (post1, post2);
+                    }
+
+                    let mut cursors = cursors_post.borrow_mut();
+                    let post1 = cursors[s * 2].allele_posteriors(m, n_alleles, &get_ref_allele);
+                    let post2 = cursors[s * 2 + 1].allele_posteriors(m, n_alleles, &get_ref_allele);
                     (post1, post2)
-                }))
-            } else {
-                None
-            };
+                },
+            ))
+        } else {
+            None
+        };
 
         writer.write_imputed_streaming(
             &ref_gt,
