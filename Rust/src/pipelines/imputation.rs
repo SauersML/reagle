@@ -18,7 +18,7 @@ use tracing::{info_span, instrument};
 
 use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
-use crate::data::haplotype::HapIdx;
+use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::{PhaseState, Phased};
@@ -1510,6 +1510,7 @@ impl ImputationPipeline {
         // =========================================================================
 
         // PASS 1: Compute DR2 statistics in marker-major order (streaming)
+        let target_samples_for_dr2 = Arc::clone(&target_samples);
         info_span!("compute_dr2").in_scope(|| {
             eprintln!("Computing DR2 quality metrics (streaming)...");
             // Create cursors for each haplotype (2 per sample)
@@ -1536,6 +1537,7 @@ impl ImputationPipeline {
                 let mut cursors_iter = cursors.chunks_exact_mut(2);
 
                 for s in 0..n_target_samples {
+                    let is_diploid = target_samples_for_dr2.is_diploid(SampleIdx::new(s as u32));
                     let hap1_idx = HapIdx::new((s * 2) as u32);
                     let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
                     
@@ -1594,7 +1596,11 @@ impl ImputationPipeline {
 
                     if let Some(stats) = quality.get_mut(m) {
                         if !(is_genotyped && skip_sample) {
-                            stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
+                            if is_diploid {
+                                stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
+                            } else {
+                                stats.add_haploid(&probs1[..n_alleles]);
+                            }
                         }
                     }
                 }

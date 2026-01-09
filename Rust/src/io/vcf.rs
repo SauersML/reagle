@@ -31,8 +31,8 @@ pub struct MarkerImputationStats {
     pub sum_dosages: Vec<f32>,
     /// Sum of squared allele probabilities (p1^2 + p2^2) for each ALT allele
     pub sum_dosages_sq: Vec<f32>,
-    /// Number of SAMPLES processed (not haplotypes)
-    pub n_samples: usize,
+    /// Number of input haplotypes processed (accounts for ploidy)
+    pub n_haps: usize,
     /// Whether this marker was imputed (not in target genotypes)
     pub is_imputed: bool,
 }
@@ -43,7 +43,7 @@ impl MarkerImputationStats {
         Self {
             sum_dosages: vec![0.0; n_alleles],
             sum_dosages_sq: vec![0.0; n_alleles],
-            n_samples: 0,
+            n_haps: 0,
             is_imputed: false,
         }
     }
@@ -54,7 +54,7 @@ impl MarkerImputationStats {
     /// * `probs1` - Allele probabilities for haplotype 1 (length = n_alleles)
     /// * `probs2` - Allele probabilities for haplotype 2 (length = n_alleles)
     pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
-        self.n_samples += 1;
+        self.n_haps += 2;
         for a in 1..self.sum_dosages.len() {
             let p1 = probs1.get(a).copied().unwrap_or(0.0);
             let p2 = probs2.get(a).copied().unwrap_or(0.0);
@@ -67,15 +67,25 @@ impl MarkerImputationStats {
         }
     }
 
+    /// Add dosage contribution from a haploid sample
+    pub fn add_haploid(&mut self, probs: &[f32]) {
+        self.n_haps += 1;
+        for a in 1..self.sum_dosages.len() {
+            let p1 = probs.get(a).copied().unwrap_or(0.0);
+            self.sum_dosages[a] += p1;
+            self.sum_dosages_sq[a] += p1 * p1;
+        }
+    }
+
     /// Calculate DR2 (dosage R-squared) for the specified ALT allele
     ///
     /// Matches Java Beagle ImputedRecBuilder.r2.
     pub fn dr2(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_dosages.len() || self.n_samples == 0 {
+        if allele == 0 || allele >= self.sum_dosages.len() || self.n_haps == 0 {
             return 0.0;
         }
 
-        let n = (self.n_samples as f32) * 2.0;
+        let n = self.n_haps as f32;
         let sum = self.sum_dosages[allele];
         let sum2 = self.sum_dosages_sq[allele];
         let mean_term = sum * sum / n;
@@ -91,11 +101,11 @@ impl MarkerImputationStats {
 
     /// Calculate estimated allele frequency for the specified ALT allele
     pub fn allele_freq(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_dosages.len() || self.n_samples == 0 {
+        if allele == 0 || allele >= self.sum_dosages.len() || self.n_haps == 0 {
             return 0.0;
         }
-        // AF = Mean dosage / 2
-        (self.sum_dosages[allele] / self.n_samples as f32) / 2.0
+        // AF = Mean dosage per haplotype
+        self.sum_dosages[allele] / self.n_haps as f32
     }
 }
 
@@ -949,7 +959,7 @@ mod tests {
         let stats = MarkerImputationStats::new(3);
         assert_eq!(stats.sum_dosages.len(), 3);
         assert_eq!(stats.sum_dosages_sq.len(), 3);
-        assert_eq!(stats.n_samples, 0);
+        assert_eq!(stats.n_haps, 0);
         assert!(!stats.is_imputed);
     }
 
@@ -1042,7 +1052,7 @@ mod tests {
         }
 
         assert!(quality.get(2).unwrap().is_imputed);
-        assert_eq!(quality.get(2).unwrap().n_samples, 1);
+        assert_eq!(quality.get(2).unwrap().n_haps, 2);
     }
 }
 #[test]
