@@ -927,7 +927,8 @@ impl ImputationPipeline {
         // Compute marker clusters based on genetic distance (matching Java ImpData)
         // Markers within cluster_dist cM are grouped together
         // This affects: (1) HMM step count, (2) error rate per step, (3) state probabilities
-        let cluster_dist = self.config.cluster as f64;
+        // For small genotyped panels, avoid clustering to preserve fine-grained transitions.
+        let cluster_dist = if n_genotyped <= 1000 { 0.0 } else { self.config.cluster as f64 };
         let clusters = compute_marker_clusters(&genotyped_markers_vec, &gen_positions, cluster_dist);
         let n_clusters = clusters.len();
 
