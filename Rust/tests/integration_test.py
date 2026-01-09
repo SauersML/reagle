@@ -1622,9 +1622,9 @@ def run_glimpse_chr(chrom, paths):
     if not out.exists():
         print(f"Running GLIMPSE on chr{chrom}...")
         try:
-            # GLIMPSE2_phase: --input input.vcf --reference ref.vcf --output out.bcf
+            # GLIMPSE2_phase: --input-gl input.vcf --reference ref.vcf --output out.bcf
             bcf_out = data_dir / "glimpse_imputed.bcf"
-            run(f"{glimpse_bin} --input {paths['input_vcf']} --reference {paths['ref_vcf']} --output {bcf_out} --threads 4")
+            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --output {bcf_out} --threads 4")
             run(f"bcftools view {bcf_out} -O z -o {out}")
             run(f"bcftools index -f {out}")
         except Exception as e:

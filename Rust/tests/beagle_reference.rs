@@ -2321,3 +2321,451 @@ fn test_per_sample_imputation_accuracy() {
     println!("\nPer-sample imputation accuracy test PASSED!");
 }
 
+/// Test 1: Focus on DR2 for GENOTYPED vs IMPUTED markers separately.
+/// For genotyped markers, DR2 should be 1.0 (we know the truth, so estimated=actual).
+/// For imputed markers, Rust DR2 should match Java DR2.
+#[test]
+fn test_dr2_genotyped_vs_imputed() {
+    let source = &get_all_data_sources()[0];
+    let files = setup_test_files();
+
+    println!("\n{}", "=".repeat(70));
+    println!("=== DR2: Genotyped vs Imputed (Separate Analysis) ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy files
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    // Run Java
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", target_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    // Run Rust
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_out");
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    assert!(rust_result.is_ok(), "Rust imputation failed: {:?}", rust_result.err());
+
+    // Parse outputs
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+
+    // Separate genotyped and imputed markers
+    let mut genotyped_java_dr2: Vec<(u64, f64)> = Vec::new();
+    let mut genotyped_rust_dr2: Vec<(u64, f64)> = Vec::new();
+    let mut imputed_java_dr2: Vec<(u64, f64)> = Vec::new();
+    let mut imputed_rust_dr2: Vec<(u64, f64)> = Vec::new();
+    
+    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+        let java_dr2: Option<f64> = j_rec.info.get("DR2").and_then(|v| v.parse().ok());
+        let rust_dr2: Option<f64> = r_rec.info.get("DR2").and_then(|v| v.parse().ok());
+        
+        let is_imputed = j_rec.info.contains_key("IMP");
+        
+        if let Some(j) = java_dr2 {
+            if is_imputed {
+                imputed_java_dr2.push((j_rec.pos, j));
+            } else {
+                genotyped_java_dr2.push((j_rec.pos, j));
+            }
+        }
+        if let Some(r) = rust_dr2 {
+            if is_imputed {
+                imputed_rust_dr2.push((r_rec.pos, r));
+            } else {
+                genotyped_rust_dr2.push((r_rec.pos, r));
+            }
+        }
+    }
+
+    // Analyze genotyped markers
+    println!("\n=== GENOTYPED Markers (n={}) ===", genotyped_java_dr2.len());
+    
+    let java_geno_mean: f64 = genotyped_java_dr2.iter().map(|(_, d)| d).sum::<f64>() 
+        / genotyped_java_dr2.len().max(1) as f64;
+    let rust_geno_mean: f64 = genotyped_rust_dr2.iter().map(|(_, d)| d).sum::<f64>() 
+        / genotyped_rust_dr2.len().max(1) as f64;
+    
+    println!("  Java mean DR2: {:.4}", java_geno_mean);
+    println!("  Rust mean DR2: {:.4}", rust_geno_mean);
+    
+    // Find genotyped markers where DR2 != 1.0
+    let java_geno_not_1: Vec<_> = genotyped_java_dr2.iter()
+        .filter(|(_, d)| (*d - 1.0).abs() > 0.01)
+        .take(10)
+        .collect();
+    let rust_geno_not_1: Vec<_> = genotyped_rust_dr2.iter()
+        .filter(|(_, d)| (*d - 1.0).abs() > 0.01)
+        .take(10)
+        .collect();
+    
+    if !java_geno_not_1.is_empty() {
+        println!("\n  Java genotyped markers with DR2 != 1.0:");
+        for (pos, dr2) in java_geno_not_1 {
+            println!("    pos={}: DR2={:.4}", pos, dr2);
+        }
+    }
+    if !rust_geno_not_1.is_empty() {
+        println!("\n  Rust genotyped markers with DR2 != 1.0:");
+        for (pos, dr2) in rust_geno_not_1 {
+            println!("    pos={}: DR2={:.4}", pos, dr2);
+        }
+    }
+
+    // Analyze imputed markers
+    println!("\n=== IMPUTED Markers (n={}) ===", imputed_java_dr2.len());
+    
+    let java_imp_mean: f64 = imputed_java_dr2.iter().map(|(_, d)| d).sum::<f64>() 
+        / imputed_java_dr2.len().max(1) as f64;
+    let rust_imp_mean: f64 = imputed_rust_dr2.iter().map(|(_, d)| d).sum::<f64>() 
+        / imputed_rust_dr2.len().max(1) as f64;
+    
+    println!("  Java mean DR2: {:.4}", java_imp_mean);
+    println!("  Rust mean DR2: {:.4}", rust_imp_mean);
+    println!("  Gap: {:.4}", rust_imp_mean - java_imp_mean);
+    
+    // Find worst imputed markers (Rust << Java)
+    let mut imputed_gaps: Vec<(u64, f64, f64)> = Vec::new();
+    for ((j_pos, j_dr2), (_, r_dr2)) in imputed_java_dr2.iter().zip(imputed_rust_dr2.iter()) {
+        imputed_gaps.push((*j_pos, *j_dr2, *r_dr2));
+    }
+    imputed_gaps.sort_by(|a, b| (a.2 - a.1).partial_cmp(&(b.2 - b.1)).unwrap());
+    
+    println!("\n  Top 20 imputed markers where Rust DR2 is WORSE:");
+    println!("  {:>12} {:>10} {:>10} {:>10}", "Position", "Java DR2", "Rust DR2", "Gap");
+    println!("  {:-<12} {:-<10} {:-<10} {:-<10}", "", "", "", "");
+    for (pos, java_dr2, rust_dr2) in imputed_gaps.iter().take(20) {
+        let gap = rust_dr2 - java_dr2;
+        println!("  {:>12} {:>10.4} {:>10.4} {:>+10.4}", pos, java_dr2, rust_dr2, gap);
+    }
+
+    // Assertions for DR2 quality
+    println!("\n{}", "=".repeat(70));
+    println!("ASSERTIONS:");
+    
+    // 1. Genotyped markers should have DR2 close to 1.0 (we know the truth)
+    // Note: In practice, DR2 might not be exactly 1.0 due to how it's computed
+    // but it should be very high for genotyped markers
+    let rust_geno_low_count = genotyped_rust_dr2.iter()
+        .filter(|(_, d)| *d < 0.9)
+        .count();
+    println!("  Rust genotyped markers with DR2 < 0.9: {}/{}", 
+             rust_geno_low_count, genotyped_rust_dr2.len());
+    
+    // 2. Imputed markers: Rust should not be significantly worse than Java
+    let worse_imp_count = imputed_gaps.iter()
+        .filter(|(_, j, r)| *r < *j - 0.01)
+        .count();
+    println!("  Imputed markers where Rust DR2 significantly worse: {}/{}", 
+             worse_imp_count, imputed_gaps.len());
+
+    // STRICT: Rust genotyped DR2 should be >= 0.9 on average (known values)
+    assert!(
+        rust_geno_mean >= 0.9,
+        "GENOTYPED DR2 FAIL: Rust genotyped DR2 ({:.4}) should be >= 0.9 since we know the true values",
+        rust_geno_mean
+    );
+    
+    // STRICT: Rust imputed DR2 should not be much worse than Java
+    assert!(
+        rust_imp_mean >= java_imp_mean - 0.02,
+        "IMPUTED DR2 FAIL: Rust ({:.4}) worse than Java ({:.4}) by more than 0.02",
+        rust_imp_mean, java_imp_mean
+    );
+}
+
+/// Test 2: Check if dosage accuracy degrades with distance from genotyped markers.
+/// If interpolation is broken, farther markers should be worse.
+/// Also compares genotyped markers (distance=0) vs imputed.
+#[test]
+fn test_dosage_by_distance_from_genotyped() {
+    let source = &get_all_data_sources()[0];
+    let files = setup_test_files();
+
+    println!("\n{}", "=".repeat(70));
+    println!("=== Dosage by Distance from Genotyped Markers ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy files
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    // Run Java
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", target_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    // Run Rust
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_out");
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    assert!(rust_result.is_ok(), "Rust imputation failed: {:?}", rust_result.err());
+
+    // Parse outputs
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+
+    // Find genotyped marker positions
+    let genotyped_positions: Vec<u64> = java_records
+        .iter()
+        .filter(|r| !r.info.contains_key("IMP"))
+        .map(|r| r.pos)
+        .collect();
+
+    println!("Found {} genotyped markers, {} total markers", 
+             genotyped_positions.len(), java_records.len());
+
+    // Collect data for ALL markers (genotyped and imputed)
+    // pos, distance, mean_abs_diff per marker
+    let mut distance_data: Vec<(u64, u64, f64)> = Vec::new();
+
+    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+        let is_imputed = j_rec.info.contains_key("IMP");
+        
+        let distance = if is_imputed {
+            genotyped_positions
+                .iter()
+                .map(|&gp| if j_rec.pos > gp { j_rec.pos - gp } else { gp - j_rec.pos })
+                .min()
+                .unwrap_or(u64::MAX)
+        } else {
+            0 // Genotyped marker
+        };
+
+        let java_ds: Vec<f64> = j_rec.genotypes.iter().filter_map(|g| g.ds).collect();
+        let rust_ds: Vec<f64> = r_rec.genotypes.iter().filter_map(|g| g.ds).collect();
+
+        if java_ds.len() == rust_ds.len() && !java_ds.is_empty() {
+            let mean_diff: f64 = java_ds.iter().zip(&rust_ds)
+                .map(|(j, r)| (j - r).abs())
+                .sum::<f64>() / java_ds.len() as f64;
+            distance_data.push((j_rec.pos, distance, mean_diff));
+        }
+    }
+
+    // Bucket by distance - distance=0 is genotyped markers
+    let buckets: [(u64, u64, &str); 6] = [
+        (0, 1, "Genotyped"),
+        (1, 100, "1-100bp"),
+        (100, 500, "100-500bp"),
+        (500, 1000, "500-1000bp"),
+        (1000, 5000, "1-5kb"),
+        (5000, u64::MAX, "5kb+"),
+    ];
+    
+    println!("\nDosage MAD by distance from genotyped markers:\n");
+    println!("{:>12} {:>8} {:>10} {:>10} {:>12}", "Distance", "Count", "Mean MAD", "Max MAD", "Worst Pos");
+    println!("{:-<12} {:-<8} {:-<10} {:-<10} {:-<12}", "", "", "", "", "");
+
+    let mut any_bucket_failed = false;
+    let mut genotyped_mad = 0.0f64;
+    let mut imputed_mad = 0.0f64;
+    let mut imputed_count = 0usize;
+
+    for (lo, hi, label) in buckets {
+        let bucket: Vec<&(u64, u64, f64)> = distance_data
+            .iter()
+            .filter(|(_, d, _)| *d >= lo && *d < hi)
+            .collect();
+
+        if bucket.is_empty() {
+            continue;
+        }
+
+        let mean_mad: f64 = bucket.iter().map(|(_, _, m)| m).sum::<f64>() / bucket.len() as f64;
+        let (worst_pos, _, max_mad) = bucket.iter()
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+            .unwrap();
+
+        // Track genotyped vs imputed
+        if lo == 0 {
+            genotyped_mad = mean_mad;
+        } else {
+            imputed_mad += mean_mad * bucket.len() as f64;
+            imputed_count += bucket.len();
+        }
+
+        let status = if mean_mad > 0.05 { " FAIL" } else { "" };
+        if mean_mad > 0.05 {
+            any_bucket_failed = true;
+        }
+
+        println!("{:>12} {:>8} {:>10.4} {:>10.4} {:>12}{}", 
+                 label, bucket.len(), mean_mad, max_mad, worst_pos, status);
+    }
+
+    if imputed_count > 0 {
+        imputed_mad /= imputed_count as f64;
+    }
+
+    println!("\nSummary:");
+    println!("  Genotyped markers MAD: {:.4}", genotyped_mad);
+    println!("  Imputed markers MAD:   {:.4}", imputed_mad);
+    println!("  Difference:            {:.4}", imputed_mad - genotyped_mad);
+
+    // STRICT: No bucket should have mean MAD > 0.05
+    assert!(
+        !any_bucket_failed,
+        "DISTANCE TEST FAIL: At least one distance bucket has mean MAD > 0.05"
+    );
+}
+
+/// Test 3: Compare posterior probabilities (GP) directly.
+/// If probabilities are miscalibrated, this will show it.
+#[test]
+fn test_posterior_probability_calibration() {
+    let source = &get_all_data_sources()[0];
+    let files = setup_test_files();
+
+    println!("\n{}", "=".repeat(70));
+    println!("=== Posterior Probability (GP) Calibration Test ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy files
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    // Run Java
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", target_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    // Run Rust
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_out");
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    assert!(rust_result.is_ok(), "Rust imputation failed: {:?}", rust_result.err());
+
+    // Parse outputs
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+
+    // Collect GP values for imputed markers only
+    let mut java_gp0: Vec<f64> = Vec::new();
+    let mut java_gp1: Vec<f64> = Vec::new();
+    let mut java_gp2: Vec<f64> = Vec::new();
+    let mut rust_gp0: Vec<f64> = Vec::new();
+    let mut rust_gp1: Vec<f64> = Vec::new();
+    let mut rust_gp2: Vec<f64> = Vec::new();
+
+    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+        if !j_rec.info.contains_key("IMP") {
+            continue;
+        }
+
+        for (j_gt, r_gt) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()) {
+            if let (Some(j_gp), Some(r_gp)) = (&j_gt.gp, &r_gt.gp) {
+                java_gp0.push(j_gp[0]);
+                java_gp1.push(j_gp[1]);
+                java_gp2.push(j_gp[2]);
+                rust_gp0.push(r_gp[0]);
+                rust_gp1.push(r_gp[1]);
+                rust_gp2.push(r_gp[2]);
+            }
+        }
+    }
+
+    println!("Comparing {} GP values from imputed markers\n", java_gp0.len());
+
+    // Correlation for each GP component
+    let corr_gp0 = dosage_correlation(&java_gp0, &rust_gp0);
+    let corr_gp1 = dosage_correlation(&java_gp1, &rust_gp1);
+    let corr_gp2 = dosage_correlation(&java_gp2, &rust_gp2);
+
+    // Mean absolute difference for each component
+    let mad_gp0: f64 = java_gp0.iter().zip(&rust_gp0).map(|(j, r)| (j - r).abs()).sum::<f64>() / java_gp0.len() as f64;
+    let mad_gp1: f64 = java_gp1.iter().zip(&rust_gp1).map(|(j, r)| (j - r).abs()).sum::<f64>() / java_gp1.len() as f64;
+    let mad_gp2: f64 = java_gp2.iter().zip(&rust_gp2).map(|(j, r)| (j - r).abs()).sum::<f64>() / java_gp2.len() as f64;
+
+    // Mean values
+    let java_mean_gp0: f64 = java_gp0.iter().sum::<f64>() / java_gp0.len() as f64;
+    let java_mean_gp1: f64 = java_gp1.iter().sum::<f64>() / java_gp1.len() as f64;
+    let java_mean_gp2: f64 = java_gp2.iter().sum::<f64>() / java_gp2.len() as f64;
+    let rust_mean_gp0: f64 = rust_gp0.iter().sum::<f64>() / rust_gp0.len() as f64;
+    let rust_mean_gp1: f64 = rust_gp1.iter().sum::<f64>() / rust_gp1.len() as f64;
+    let rust_mean_gp2: f64 = rust_gp2.iter().sum::<f64>() / rust_gp2.len() as f64;
+
+    println!("{:>8} {:>12} {:>12} {:>10} {:>10}", "GP Comp", "Java Mean", "Rust Mean", "Corr", "MAD");
+    println!("{:-<8} {:-<12} {:-<12} {:-<10} {:-<10}", "", "", "", "", "");
+    println!("{:>8} {:>12.4} {:>12.4} {:>10.4} {:>10.4}", "GP[0]", java_mean_gp0, rust_mean_gp0, corr_gp0, mad_gp0);
+    println!("{:>8} {:>12.4} {:>12.4} {:>10.4} {:>10.4}", "GP[1]", java_mean_gp1, rust_mean_gp1, corr_gp1, mad_gp1);
+    println!("{:>8} {:>12.4} {:>12.4} {:>10.4} {:>10.4}", "GP[2]", java_mean_gp2, rust_mean_gp2, corr_gp2, mad_gp2);
+
+    // Check confidence distribution: how often is max(GP) > 0.9?
+    let java_high_conf = java_gp0.iter().zip(&java_gp1).zip(&java_gp2)
+        .filter(|((g0, g1), g2)| **g0 > 0.9 || **g1 > 0.9 || **g2 > 0.9)
+        .count();
+    let rust_high_conf = rust_gp0.iter().zip(&rust_gp1).zip(&rust_gp2)
+        .filter(|((g0, g1), g2)| **g0 > 0.9 || **g1 > 0.9 || **g2 > 0.9)
+        .count();
+
+    println!("\nHigh-confidence calls (max GP > 0.9):");
+    println!("  Java: {} ({:.1}%)", java_high_conf, 100.0 * java_high_conf as f64 / java_gp0.len() as f64);
+    println!("  Rust: {} ({:.1}%)", rust_high_conf, 100.0 * rust_high_conf as f64 / rust_gp0.len() as f64);
+
+    // STRICT: GP correlation should be high
+    let min_corr = corr_gp0.min(corr_gp1).min(corr_gp2);
+    assert!(
+        min_corr > 0.90,
+        "GP CALIBRATION FAIL: Min GP correlation ({:.4}) < 0.90",
+        min_corr
+    );
+
+    // STRICT: Mean GP values should be close
+    let max_mean_diff = (java_mean_gp0 - rust_mean_gp0).abs()
+        .max((java_mean_gp1 - rust_mean_gp1).abs())
+        .max((java_mean_gp2 - rust_mean_gp2).abs());
+    assert!(
+        max_mean_diff < 0.02,
+        "GP CALIBRATION FAIL: Max mean GP difference ({:.4}) >= 0.02",
+        max_mean_diff
+    );
+}
+
