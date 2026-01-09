@@ -835,17 +835,6 @@ impl ImputationPipeline {
 
         // Note: gen_positions and steps_config removed - ImpStates now uses ref_panel step boundaries directly
 
-        // Number of IBS haplotypes to find per step
-        // Java: nHapsPerStep = imp_states / (imp_segment / imp_step)
-        //     = 1600 / (6.0 / 0.1) = 1600 / 60 ≈ 26
-        // We add a minimum of sqrt(imp_states) to handle low imp_states values.
-        // Without this floor, imp_states=50 with 60 steps/segment gives 50/60=0,
-        // causing IBS matching to fail completely.
-        let n_steps_per_segment = (self.config.imp_segment / self.config.imp_step).round() as usize;
-        let computed = self.config.imp_states / n_steps_per_segment.max(1);
-        let min_ibs = (self.config.imp_states as f64).sqrt() as usize;
-        let n_ibs_haps = computed.max(min_ibs).max(1);
-
         // Build genotyped markers list FIRST (needed for projected PBWT)
         // A marker is only considered "genotyped" if at least one target haplotype has data
         let genotyped_markers_vec: Vec<usize> = (0..n_ref_markers)
@@ -864,6 +853,22 @@ impl ImputationPipeline {
             .collect();
         let n_genotyped = genotyped_markers_vec.len();
         let n_to_impute = n_ref_markers - n_genotyped;
+
+        // Number of IBS haplotypes to find per step
+        // Java: nHapsPerStep = imp_states / (imp_segment / imp_step)
+        //     = 1600 / (6.0 / 0.1) = 1600 / 60 ≈ 26
+        // We add a minimum of sqrt(imp_states) to handle low imp_states values.
+        // Without this floor, imp_states=50 with 60 steps/segment gives 50/60=0,
+        // causing IBS matching to fail completely.
+        let n_steps_per_segment = (self.config.imp_segment / self.config.imp_step).round() as usize;
+        let computed = self.config.imp_states / n_steps_per_segment.max(1);
+        let base_min_ibs = (self.config.imp_states as f64).sqrt() as usize;
+        let min_ibs = if n_genotyped <= 1000 {
+            base_min_ibs.saturating_mul(2)
+        } else {
+            base_min_ibs
+        };
+        let n_ibs_haps = computed.max(min_ibs).max(1).min(n_ref_haps);
 
         // Compute genetic positions at genotyped markers only (for projected PBWT)
         let projected_gen_positions: Vec<f64> = genotyped_markers_vec
