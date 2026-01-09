@@ -815,11 +815,9 @@ impl VcfWriter {
             let info_field = if let Some(stats) = stats {
                 let mut info_parts = Vec::new();
                 if n_alleles > 1 {
-                    let dr2_values: Vec<String> = if stats.is_imputed {
-                        (1..n_alleles).map(|a| format!("{:.4}", stats.dr2(a))).collect()
-                    } else {
-                        (1..n_alleles).map(|_| "1.0000".to_string()).collect()
-                    };
+                    let dr2_values: Vec<String> = (1..n_alleles)
+                        .map(|a| format!("{:.4}", stats.dr2(a)))
+                        .collect();
                     info_parts.push(format!("DR2={}", dr2_values.join(",")));
                     let af_values: Vec<String> = (1..n_alleles).map(|a| format!("{:.4}", stats.allele_freq(a))).collect();
                     info_parts.push(format!("AF={}", af_values.join(",")));
