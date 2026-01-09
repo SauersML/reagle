@@ -1415,17 +1415,6 @@ impl ImputationPipeline {
             self.config.seed as u64,
         ));
 
-        let cluster_err_prob: Vec<f32> = clusters
-            .iter()
-            .map(|c| {
-                let size = (c.end - c.start) as f32;
-                let mut p = base_err_rate * size;
-                if p > 0.5 { p = 0.5; }
-                p
-            })
-            .collect();
-
-
         // Run imputation for each target haplotype with per-thread workspaces
         let state_probs: Vec<Arc<ClusterStateProbs>> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
             (0..n_target_haps)
@@ -1463,7 +1452,7 @@ impl ImputationPipeline {
                         &cluster_mismatches,
                         &cluster_non_missing,
                         &cluster_p_recomb,
-                        &cluster_err_prob,
+                        base_err_rate,
                         actual_n_states,
                         workspace,
                     );
@@ -1934,7 +1923,7 @@ fn run_hmm_forward_backward_clusters_counts(
     cluster_mismatches: &[Vec<u16>],
     cluster_non_missing: &[u16],
     p_recomb: &[f32],
-    err_prob: &[f32],
+    base_err_rate: f32,
     n_states: usize,
     workspace: &mut ImpWorkspace,
 ) -> Vec<f32> {
@@ -1946,12 +1935,16 @@ fn run_hmm_forward_backward_clusters_counts(
     let mut ratio_pows: Vec<f32> = Vec::new();
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
-        let p_err = err_prob.get(m).copied().unwrap_or(0.0).clamp(1e-8, 0.5);
+        let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
+        let mut p_err = base_err_rate * (n_obs as f32);
+        if p_err > 0.5 {
+            p_err = 0.5;
+        }
+        p_err = p_err.clamp(1e-8, 0.5);
         let p_no_err = 1.0 - p_err;
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
 
-        let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
         let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
         let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
         ratio_pows.resize(n_obs.saturating_add(1), 1.0);
@@ -1984,12 +1977,16 @@ fn run_hmm_forward_backward_clusters_counts(
     for m in (0..n_clusters).rev() {
         let m_p1 = m + 1;
         let p_rec = p_recomb.get(m_p1).copied().unwrap_or(0.0);
-        let p_err = err_prob.get(m).copied().unwrap_or(0.0).clamp(1e-8, 0.5);
+        let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
+        let mut p_err = base_err_rate * (n_obs as f32);
+        if p_err > 0.5 {
+            p_err = 0.5;
+        }
+        p_err = p_err.clamp(1e-8, 0.5);
         let p_no_err = 1.0 - p_err;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
         let shift = p_rec / n_states as f32;
 
-        let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
         let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
         let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
         ratio_pows.resize(n_obs.saturating_add(1), 1.0);
