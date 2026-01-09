@@ -1548,8 +1548,30 @@ def run_impute5_chr(chrom, paths):
         impute5_bin = data_dir / "impute5"
         if not impute5_bin.exists():
             print(f"Downloading IMPUTE5 for chr{chrom}...")
-            run(f"curl -L -o {data_dir}/impute5.zip 'https://www.dropbox.com/sh/mwnceyhir8yze2j/AADbzP6QuAFPrj0Z9_I1RSmla?dl=1'")
+            zip_path = data_dir / "impute5.zip"
+            run(f"curl -L -o {zip_path} 'https://www.dropbox.com/sh/mwnceyhir8yze2j/AADbzP6QuAFPrj0Z9_I1RSmla?dl=1'")
+            
+            # Diagnostic: Check downloaded file type and size
+            result = run(f"file {zip_path}", capture=True)
+            print(f"IMPUTE5 download file type: {result.stdout.strip()}")
+            result = run(f"ls -la {zip_path}", capture=True)
+            print(f"IMPUTE5 download file size: {result.stdout.strip()}")
+            
+            if "Zip archive" not in run(f"file {zip_path}", capture=True).stdout:
+                print("ERROR: Downloaded file is not a valid zip archive!")
+                print("This may be a Dropbox redirect issue. Showing first 500 bytes:")
+                run(f"head -c 500 {zip_path}", capture=True)
+                raise RuntimeError("IMPUTE5 download failed - not a valid zip file")
+            
             run(f"cd {data_dir} && unzip -q -o impute5.zip impute5_v1.2.0.zip && unzip -q -o impute5_v1.2.0.zip && mv impute5_v1.2.0/impute5_v1.2.0_static impute5 && chmod +x impute5")
+            
+            # Verify binary works
+            print("Verifying IMPUTE5 binary...")
+            try:
+                result = run(f"{impute5_bin} --help 2>&1 | head -5", capture=True)
+                print(f"IMPUTE5 --help output: {result.stdout[:200]}")
+            except Exception as e:
+                print(f"Warning: IMPUTE5 --help check failed: {e}")
 
     out = data_dir / "impute5_imputed.vcf.gz"
     if not out.exists():
@@ -1577,12 +1599,33 @@ def run_minimac_chr(chrom, paths):
         minimac_bin = data_dir / "minimac4"
         if not minimac_bin.exists():
             print(f"Downloading Minimac4 for chr{chrom}...")
-            run(f"curl -L -o {data_dir}/minimac4.sh 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.sh'")
-            run(f"chmod +x {data_dir}/minimac4.sh")
+            sh_path = data_dir / "minimac4.sh"
+            run(f"curl -L -o {sh_path} 'https://github.com/statgen/Minimac4/releases/download/v4.1.6/minimac4-4.1.6-Linux-x86_64.sh'")
+            
+            # Diagnostic: Check downloaded file type and size
+            result = run(f"file {sh_path}", capture=True)
+            print(f"Minimac4 download file type: {result.stdout.strip()}")
+            result = run(f"ls -la {sh_path}", capture=True)
+            print(f"Minimac4 download file size: {result.stdout.strip()}")
+            
+            # Verify it's a shell script (should contain "#!/bin/sh" or similar)
+            result = run(f"head -c 100 {sh_path}", capture=True)
+            if "#!/" not in result.stdout and "ELF" not in result.stdout:
+                print(f"WARNING: Minimac4 installer may not be valid. First 100 bytes: {result.stdout}")
+            
+            run(f"chmod +x {sh_path}")
             run(f"cd {data_dir} && ./minimac4.sh --prefix=. --skip-license --exclude-subdir")
             if (data_dir / "bin" / "minimac4").exists():
                  run(f"mv {data_dir}/bin/minimac4 {data_dir}/minimac4")
                  run(f"rm -rf {data_dir}/bin {data_dir}/share {data_dir}/minimac4.sh")
+            
+            # Verify binary works
+            print("Verifying Minimac4 binary...")
+            try:
+                result = run(f"{minimac_bin} --help 2>&1 | head -5", capture=True)
+                print(f"Minimac4 --help output: {result.stdout[:200]}")
+            except Exception as e:
+                print(f"Warning: Minimac4 --help check failed: {e}")
 
     out = data_dir / "minimac_imputed.vcf.gz"
     if not out.exists():

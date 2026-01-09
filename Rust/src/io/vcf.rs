@@ -18,16 +18,24 @@ use crate::error::{ReagleError, Result};
 
 /// Imputation quality statistics for a single marker
 ///
-/// Used to calculate DR2 (dosage R-squared) following the Beagle formula.
-/// This matches Java ImputedRecBuilder's approach.
+/// Used to calculate DR2 (dosage R-squared) following the Beagle formula:
+/// DR2 = Var(d) / Var(X)
+///
+/// Where:
+/// - d = estimated dosage (y1 + 2*y2) = p1 + p2
+/// - X = true count (0, 1, or 2)
+/// - Var(X) is estimated as Mean(m) - Mean(d)^2
+/// - m = second moment = y1 + 4*y2 = p1 + p2 + 2*p1*p2
 #[derive(Clone, Debug, Default)]
 pub struct MarkerImputationStats {
-    /// Sum of allele probabilities (dosages) for each ALT allele
-    pub sum_al_probs: Vec<f32>,
-    /// Sum of squared allele probabilities for each ALT allele
-    pub sum_al_probs2: Vec<f32>,
-    /// Number of haplotypes processed
-    pub n_haps: usize,
+    /// Sum of dosages (p1 + p2) for each ALT allele
+    pub sum_dosages: Vec<f32>,
+    /// Sum of squared dosages (p1 + p2)^2 for each ALT allele
+    pub sum_dosages_sq: Vec<f32>,
+    /// Sum of expected true variance second moments (p1 + p2 + 2*p1*p2)
+    pub sum_expected_truth: Vec<f32>,
+    /// Number of SAMPLES processed (not haplotypes)
+    pub n_samples: usize,
     /// Whether this marker was imputed (not in target genotypes)
     pub is_imputed: bool,
 }
@@ -36,9 +44,10 @@ impl MarkerImputationStats {
     /// Create new stats for a marker with the given number of alleles
     pub fn new(n_alleles: usize) -> Self {
         Self {
-            sum_al_probs: vec![0.0; n_alleles],
-            sum_al_probs2: vec![0.0; n_alleles],
-            n_haps: 0,
+            sum_dosages: vec![0.0; n_alleles],
+            sum_dosages_sq: vec![0.0; n_alleles],
+            sum_expected_truth: vec![0.0; n_alleles],
+            n_samples: 0,
             is_imputed: false,
         }
     }
@@ -49,55 +58,79 @@ impl MarkerImputationStats {
     /// * `probs1` - Allele probabilities for haplotype 1 (length = n_alleles)
     /// * `probs2` - Allele probabilities for haplotype 2 (length = n_alleles)
     pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
-        self.n_haps += 2;
-        for a in 1..self.sum_al_probs.len() {
-            let dose =
-                probs1.get(a).copied().unwrap_or(0.0) + probs2.get(a).copied().unwrap_or(0.0);
-            let dose2 = probs1.get(a).copied().unwrap_or(0.0).powi(2)
-                + probs2.get(a).copied().unwrap_or(0.0).powi(2);
-            self.sum_al_probs[a] += dose;
-            self.sum_al_probs2[a] += dose2;
+        self.n_samples += 1;
+        for a in 1..self.sum_dosages.len() {
+            let p1 = probs1.get(a).copied().unwrap_or(0.0);
+            let p2 = probs2.get(a).copied().unwrap_or(0.0);
+            
+            let dose = p1 + p2;
+            let dose_sq = dose * dose;
+            
+            // m = second moment = p1 + p2 + 2*p1*p2
+            // logic:
+            // P(X=0) = (1-p1)(1-p2)
+            // P(X=1) = p1(1-p2) + p2(1-p1) = p1 + p2 - 2p1p2
+            // P(X=2) = p1p2
+            // E[X^2] = 0*P(0) + 1*P(1) + 4*P(2)
+            //        = p1 + p2 - 2p1p2 + 4p1p2
+            //        = p1 + p2 + 2p1p2
+            let m = p1 + p2 + 2.0 * p1 * p2;
+
+            self.sum_dosages[a] += dose;
+            self.sum_dosages_sq[a] += dose_sq;
+            self.sum_expected_truth[a] += m;
         }
     }
 
     /// Calculate DR2 (dosage R-squared) for the specified ALT allele
     ///
-    /// DR2 estimates the squared correlation between estimated and true dosages.
-    /// Formula follows Java ImputedRecBuilder.r2():
-    /// ```text
-    /// meanTerm = sum^2 / n_haps
-    /// num = sum2 - meanTerm
-    /// den = sum - meanTerm
-    /// r2 = num / den (clamped to [0, 1])
-    /// ```
+    /// DR2 = Var(d) / Var(X)
     pub fn dr2(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_al_probs.len() || self.n_haps == 0 {
+        if allele == 0 || allele >= self.sum_dosages.len() || self.n_samples == 0 {
             return 0.0;
         }
 
-        let sum = self.sum_al_probs[allele];
-        if sum == 0.0 {
+        let n = self.n_samples as f32;
+        let sum_d = self.sum_dosages[allele];
+        // let mean_d = sum_d / n;
+
+        // Var(d) = Mean(d^2) - Mean(d)^2
+        //        = (sum_d_sq / n) - (sum_d / n)^2
+        //        = (sum_d_sq - sum_d^2/n) / n
+        let sum_d_sq = self.sum_dosages_sq[allele];
+        let var_d_num = sum_d_sq - (sum_d * sum_d / n);
+        
+        if var_d_num <= 0.0 {
             return 0.0;
         }
+        let var_d = var_d_num / n;
 
-        let sum2 = self.sum_al_probs2[allele];
-        let mean_term = sum * sum / self.n_haps as f32;
-        let num = sum2 - mean_term;
-        let den = sum - mean_term;
+        // Var(X) = Mean(m) - Mean(d)^2
+        //        = (sum_m / n) - (sum_d / n)^2
+        //        = (sum_m - sum_d^2/n) / n
+        let sum_m = self.sum_expected_truth[allele];
+        let var_x_num = sum_m - (sum_d * sum_d / n);
 
-        if num <= 0.0 || den <= 0.0 {
+        if var_x_num <= 0.0 {
+            return 0.0;
+        }
+        let var_x = var_x_num / n;
+
+        if var_x <= 1e-9 {
+            // No variance in truth (monomorphic site) -> undefined correlation
             0.0
         } else {
-            (num / den).clamp(0.0, 1.0)
+            (var_d / var_x).clamp(0.0, 1.0)
         }
     }
 
     /// Calculate estimated allele frequency for the specified ALT allele
     pub fn allele_freq(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_al_probs.len() || self.n_haps == 0 {
+        if allele == 0 || allele >= self.sum_dosages.len() || self.n_samples == 0 {
             return 0.0;
         }
-        self.sum_al_probs[allele] / self.n_haps as f32
+        // AF = Mean dosage / 2
+        (self.sum_dosages[allele] / self.n_samples as f32) / 2.0
     }
 }
 
@@ -943,9 +976,10 @@ mod tests {
     #[test]
     fn test_marker_imputation_stats_new() {
         let stats = MarkerImputationStats::new(3);
-        assert_eq!(stats.sum_al_probs.len(), 3);
-        assert_eq!(stats.sum_al_probs2.len(), 3);
-        assert_eq!(stats.n_haps, 0);
+        assert_eq!(stats.sum_dosages.len(), 3);
+        assert_eq!(stats.sum_dosages_sq.len(), 3);
+        assert_eq!(stats.sum_expected_truth.len(), 3);
+        assert_eq!(stats.n_samples, 0);
         assert!(!stats.is_imputed);
     }
 
@@ -984,10 +1018,11 @@ mod tests {
         }
 
         // DR2 should be low for uncertain calls
+        // Here Var(d) = 0 because everyone has same dosage, so DR2=0
         let dr2 = stats.dr2(1);
         assert!(
-            dr2 < 0.5,
-            "DR2 should be low for uncertain calls, got {}",
+            dr2 < 0.1,
+            "DR2 should be low (0) for uncertain calls with no dosage variance, got {}",
             dr2
         );
     }
@@ -998,13 +1033,13 @@ mod tests {
         let mut stats = MarkerImputationStats::new(2);
 
         // Some certain, some uncertain
-        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]); // Certain alt/alt
-        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]); // Certain ref/ref
-        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]); // Uncertain
+        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]); // Certain alt/alt (dose=2)
+        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]); // Certain ref/ref (dose=0)
+        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]); // Uncertain (dose=1)
 
         let dr2 = stats.dr2(1);
         assert!(
-            dr2 > 0.0 && dr2 < 1.0,
+            dr2 > 0.0 && dr2 <= 1.0,
             "DR2 should be between 0 and 1, got {}",
             dr2
         );
@@ -1037,7 +1072,7 @@ mod tests {
         }
 
         assert!(quality.get(2).unwrap().is_imputed);
-        assert_eq!(quality.get(2).unwrap().n_haps, 2);
+        assert_eq!(quality.get(2).unwrap().n_samples, 1);
     }
 }
 #[test]

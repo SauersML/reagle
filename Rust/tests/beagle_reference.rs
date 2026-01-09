@@ -2902,10 +2902,10 @@ fn test_genotyped_dosage_matches_hard_call() {
         println!("  Rust has MORE mismatches than Java - this is a bug!");
     }
 
-    // STRICT: Rust should not have more mismatches than Java
+    // STRICT: For genotyped markers, DS MUST equal GT. Java has 0 mismatches.
     assert!(
-        rust_mismatches <= java_mismatches + 10,
-        "DOSAGE MISMATCH: Rust has {} mismatches vs Java {}", 
+        rust_mismatches == 0,
+        "GENOTYPED DOSAGE BUG: Rust has {} mismatches (DS != GT), Java has {}", 
         rust_mismatches, java_mismatches
     );
 }
