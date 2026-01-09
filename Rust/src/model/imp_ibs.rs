@@ -5,8 +5,9 @@
 //! - Build coded steps over clusters (step-based sequence IDs)
 //! - Partition haplotypes by coded sequences to produce IBS sets
 
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+const JAVA_RNG_MULT: u64 = 0x5DEECE66D;
+const JAVA_RNG_ADD: u64 = 0xB;
+const JAVA_RNG_MASK: u64 = (1u64 << 48) - 1;
 
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
@@ -38,6 +39,39 @@ pub struct ImpIbs {
     pub coded_steps: ClusterCodedSteps,
     /// ibs_haps[step][targ_hap] = Vec<ref_hap>
     pub ibs_haps: Vec<Vec<Vec<u32>>>,
+}
+
+#[derive(Clone, Debug)]
+struct JavaRng {
+    seed: u64,
+}
+
+impl JavaRng {
+    fn new(seed: u64) -> Self {
+        let seed = (seed ^ JAVA_RNG_MULT) & JAVA_RNG_MASK;
+        Self { seed }
+    }
+
+    fn next_bits(&mut self, bits: u32) -> u32 {
+        self.seed = (self.seed.wrapping_mul(JAVA_RNG_MULT).wrapping_add(JAVA_RNG_ADD)) & JAVA_RNG_MASK;
+        (self.seed >> (48 - bits)) as u32
+    }
+
+    fn next_int(&mut self, bound: usize) -> usize {
+        if bound <= 1 {
+            return 0;
+        }
+        if bound.is_power_of_two() {
+            return (((bound as u64) * (self.next_bits(31) as u64)) >> 31) as usize;
+        }
+        loop {
+            let bits = self.next_bits(31) as i64;
+            let val = (bits % bound as i64) as i64;
+            if bits - val + (bound as i64 - 1) >= 0 {
+                return val as usize;
+            }
+        }
+    }
 }
 
 /// Build per-cluster haplotype sequences (HaplotypeCoder equivalent).
@@ -447,7 +481,7 @@ fn final_update_results(
         let n_ref = ins_pt(parent, n_ref_haps);
         let mut ibs_list = parent[..n_ref].to_vec();
         if n_haps_per_step < ibs_list.len() {
-            let mut rng = StdRng::seed_from_u64(seed + parent[0] as u64);
+            let mut rng = JavaRng::new(seed + parent[0] as u64);
             shuffle_prefix(&mut ibs_list, n_haps_per_step, &mut rng);
             ibs_list.truncate(n_haps_per_step);
             ibs_list.sort_unstable();
@@ -471,7 +505,7 @@ fn ibs_haps(
     }
 
     let uniq = uniq_to_parent(parent, child, n_child_ref, n_ref_haps);
-    let mut rng = StdRng::seed_from_u64(seed + parent[0] as u64);
+    let mut rng = JavaRng::new(seed + parent[0] as u64);
     let subset = random_subset(&uniq, need, &mut rng);
     combined.extend_from_slice(&subset);
     combined.sort_unstable();
@@ -503,25 +537,25 @@ fn uniq_to_parent(parent: &[u32], child: &[u32], n_child_ref: usize, n_ref_haps:
     uniq
 }
 
-fn random_subset(list: &[u32], size: usize, rng: &mut StdRng) -> Vec<u32> {
+fn random_subset(list: &[u32], size: usize, rng: &mut JavaRng) -> Vec<u32> {
     if list.is_empty() || size == 0 {
         return Vec::new();
     }
     let mut buf = list.to_vec();
     let take = size.min(buf.len());
     for i in 0..take {
-        let j = i + rng.random_range(0..(buf.len() - i));
+        let j = i + rng.next_int(buf.len() - i);
         buf.swap(i, j);
     }
     buf.truncate(take);
     buf
 }
 
-fn shuffle_prefix(list: &mut [u32], k: usize, rng: &mut StdRng) {
+fn shuffle_prefix(list: &mut [u32], k: usize, rng: &mut JavaRng) {
     let mut i = 0;
     let n = list.len().min(k);
     while i < n {
-        let j = i + rng.random_range(0..(list.len() - i));
+        let j = i + rng.next_int(list.len() - i);
         list.swap(i, j);
         i += 1;
     }
