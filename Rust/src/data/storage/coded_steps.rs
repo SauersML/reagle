@@ -50,15 +50,6 @@ impl CodedStep {
         self.hap_to_pattern[hap.0 as usize]
     }
 
-    /// Compression ratio (n_haps / n_patterns)
-    pub fn compression_ratio(&self) -> f32 {
-        if self.n_patterns == 0 {
-            1.0
-        } else {
-            self.hap_to_pattern.len() as f32 / self.n_patterns as f32
-        }
-    }
-
     /// Create a coded step from a PROJECTED subset of markers
     ///
     /// Unlike `new()` which assumes contiguous marker range [start, end),
@@ -274,14 +265,6 @@ impl RefPanelCoded {
         &self.steps[idx]
     }
 
-    /// Average compression ratio
-    pub fn avg_compression_ratio(&self) -> f32 {
-        if self.steps.is_empty() {
-            return 1.0;
-        }
-        let sum: f32 = self.steps.iter().map(|s| s.compression_ratio()).sum();
-        sum / self.steps.len() as f32
-    }
 }
 
 /// Compute step start indices from genetic positions

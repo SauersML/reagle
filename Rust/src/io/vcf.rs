@@ -28,14 +28,16 @@ use crate::error::{ReagleError, Result};
 /// - m = second moment = y1 + 4*y2 = p1 + p2 + 2*p1*p2
 #[derive(Clone, Debug, Default)]
 pub struct MarkerImputationStats {
-    /// Sum of dosages (p1 + p2) for each ALT allele
-    pub sum_dosages: Vec<f32>,
-    /// Sum of squared dosages (p1 + p2)^2 for each ALT allele
-    pub sum_dosages_sq: Vec<f32>,
-    /// Sum of expected true variance second moments (p1 + p2 + 2*p1*p2)
-    pub sum_expected_truth: Vec<f32>,
+    /// Sum of ESTIMATED dosages (from HMM posteriors), for Var(d)
+    sum_d_est: Vec<f32>,
+    /// Sum of squared ESTIMATED dosages, for Var(d)
+    sum_d_sq_est: Vec<f32>,
+    /// Sum of TRUE allele counts (from hard calls or posterior expectations), for Var(X)
+    sum_x_true: Vec<f32>,
+    /// Sum of E[X^2] (from hard calls or posterior expectations), for Var(X)
+    sum_x_sq_true: Vec<f32>,
     /// Number of SAMPLES processed (not haplotypes)
-    pub n_samples: usize,
+    n_samples: usize,
     /// Whether this marker was imputed (not in target genotypes)
     pub is_imputed: bool,
 }
@@ -44,41 +46,46 @@ impl MarkerImputationStats {
     /// Create new stats for a marker with the given number of alleles
     pub fn new(n_alleles: usize) -> Self {
         Self {
-            sum_dosages: vec![0.0; n_alleles],
-            sum_dosages_sq: vec![0.0; n_alleles],
-            sum_expected_truth: vec![0.0; n_alleles],
+            sum_d_est: vec![0.0; n_alleles],
+            sum_d_sq_est: vec![0.0; n_alleles],
+            sum_x_true: vec![0.0; n_alleles],
+            sum_x_sq_true: vec![0.0; n_alleles],
             n_samples: 0,
             is_imputed: false,
         }
     }
 
-    /// Add dosage contribution from a diploid sample
+    /// Add sample contribution to DR2 calculation
     ///
     /// # Arguments
-    /// * `probs1` - Allele probabilities for haplotype 1 (length = n_alleles)
-    /// * `probs2` - Allele probabilities for haplotype 2 (length = n_alleles)
-    pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
+    /// * `est_probs1`, `est_probs2`: HMM posterior probabilities for Var(d)
+    /// * `true_probs1`, `true_probs2`: Ground truth probabilities for Var(X).
+    ///   For genotyped markers, this should be a one-hot vector based on hard calls.
+    ///   For imputed markers, this should be the same as `est_probs`.
+    pub fn add_sample(
+        &mut self,
+        est_probs1: &[f32],
+        est_probs2: &[f32],
+        true_probs1: &[f32],
+        true_probs2: &[f32],
+    ) {
         self.n_samples += 1;
-        for a in 1..self.sum_dosages.len() {
-            let p1 = probs1.get(a).copied().unwrap_or(0.0);
-            let p2 = probs2.get(a).copied().unwrap_or(0.0);
-            
-            let dose = p1 + p2;
-            let dose_sq = dose * dose;
-            
-            // m = second moment = p1 + p2 + 2*p1*p2
-            // logic:
-            // P(X=0) = (1-p1)(1-p2)
-            // P(X=1) = p1(1-p2) + p2(1-p1) = p1 + p2 - 2p1p2
-            // P(X=2) = p1p2
-            // E[X^2] = 0*P(0) + 1*P(1) + 4*P(2)
-            //        = p1 + p2 - 2p1p2 + 4p1p2
-            //        = p1 + p2 + 2p1p2
-            let m = p1 + p2 + 2.0 * p1 * p2;
+        for a in 1..self.sum_d_est.len() {
+            // --- Var(d) calculation from estimated posteriors ---
+            let p1_est = est_probs1.get(a).copied().unwrap_or(0.0);
+            let p2_est = est_probs2.get(a).copied().unwrap_or(0.0);
+            let dose_est = p1_est + p2_est;
+            self.sum_d_est[a] += dose_est;
+            self.sum_d_sq_est[a] += dose_est * dose_est;
 
-            self.sum_dosages[a] += dose;
-            self.sum_dosages_sq[a] += dose_sq;
-            self.sum_expected_truth[a] += m;
+            // --- Var(X) calculation from true/best-guess posteriors ---
+            let p1_true = true_probs1.get(a).copied().unwrap_or(0.0);
+            let p2_true = true_probs2.get(a).copied().unwrap_or(0.0);
+            let dose_true = p1_true + p2_true;
+            // E[X^2] = p1 + p2 + 2*p1*p2 for binomial. For hard calls, this equals X^2.
+            let m_true = dose_true + 2.0 * p1_true * p2_true;
+            self.sum_x_true[a] += dose_true;
+            self.sum_x_sq_true[a] += m_true;
         }
     }
 
@@ -86,35 +93,25 @@ impl MarkerImputationStats {
     ///
     /// DR2 = Var(d) / Var(X)
     pub fn dr2(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_dosages.len() || self.n_samples == 0 {
+        if allele == 0 || allele >= self.sum_d_est.len() || self.n_samples == 0 {
             return 0.0;
         }
 
         let n = self.n_samples as f32;
-        let sum_d = self.sum_dosages[allele];
-        // let mean_d = sum_d / n;
 
-        // Var(d) = Mean(d^2) - Mean(d)^2
-        //        = (sum_d_sq / n) - (sum_d / n)^2
-        //        = (sum_d_sq - sum_d^2/n) / n
-        let sum_d_sq = self.sum_dosages_sq[allele];
-        let var_d_num = sum_d_sq - (sum_d * sum_d / n);
-        
-        if var_d_num <= 0.0 {
+        // Var(d) = E[d^2] - E[d]^2
+        let sum_d = self.sum_d_est[allele];
+        let sum_d_sq = self.sum_d_sq_est[allele];
+        let var_d = (sum_d_sq / n) - (sum_d / n).powi(2);
+
+        if var_d <= 0.0 {
             return 0.0;
-        }
-        let var_d = var_d_num / n;
+        };
 
-        // Var(X) = Mean(m) - Mean(d)^2
-        //        = (sum_m / n) - (sum_d / n)^2
-        //        = (sum_m - sum_d^2/n) / n
-        let sum_m = self.sum_expected_truth[allele];
-        let var_x_num = sum_m - (sum_d * sum_d / n);
-
-        if var_x_num <= 0.0 {
-            return 0.0;
-        }
-        let var_x = var_x_num / n;
+        // Var(X) = E[X^2] - E[X]^2
+        let sum_x = self.sum_x_true[allele];
+        let sum_x_sq_moment = self.sum_x_sq_true[allele]; // This is sum(E[X_i^2])
+        let var_x = (sum_x_sq_moment / n) - (sum_x / n).powi(2);
 
         if var_x <= 1e-9 {
             // No variance in truth (monomorphic site) -> undefined correlation
@@ -126,11 +123,12 @@ impl MarkerImputationStats {
 
     /// Calculate estimated allele frequency for the specified ALT allele
     pub fn allele_freq(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_dosages.len() || self.n_samples == 0 {
+        // AF should be based on the true/best-guess counts
+        if allele == 0 || allele >= self.sum_x_true.len() || self.n_samples == 0 {
             return 0.0;
         }
         // AF = Mean dosage / 2
-        (self.sum_dosages[allele] / self.n_samples as f32) / 2.0
+        (self.sum_x_true[allele] / self.n_samples as f32) / 2.0
     }
 }
 
