@@ -87,8 +87,9 @@ impl PhaseStates {
     /// * `max_states` - Maximum number of composite haplotypes (K in Li-Stephens model)
     /// * `n_markers` - Number of markers in the HMM
     pub fn new(max_states: usize, n_markers: usize) -> Self {
-        // Minimum segment length: at least 1% of chromosome or 50 markers
-        let min_segment_len = (n_markers / 100).max(50).min(n_markers / 4);
+        // Minimum segment length: scale with marker density to avoid over-smoothing
+        // Dense panels need shorter segments to preserve local haplotype structure.
+        let min_segment_len = (n_markers / 1000).max(5).min(n_markers / 4);
 
         Self {
             max_states,
