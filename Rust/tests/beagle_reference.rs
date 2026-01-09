@@ -2507,11 +2507,14 @@ fn test_dr2_genotyped_vs_imputed() {
     println!("  Imputed markers where Rust DR2 significantly worse: {}/{}", 
              worse_imp_count, imputed_gaps.len());
 
-    // STRICT: Rust genotyped DR2 should be >= 0.9 on average (known values)
+    // The DR2 for genotyped markers should be consistent between Java and Rust.
+    // The test previously assumed it should be ~1.0, but Beagle re-estimates dosages
+    // for genotyped markers, so their DR2 can be lower. The key is consistency.
     assert!(
-        rust_geno_mean >= 0.9,
-        "GENOTYPED DR2 FAIL: Rust genotyped DR2 ({:.4}) should be >= 0.9 since we know the true values",
-        rust_geno_mean
+        (rust_geno_mean - java_geno_mean).abs() < 0.01,
+        "GENOTYPED DR2 FAIL: Rust genotyped DR2 ({:.4}) differs from Java ({:.4}) by more than 0.01",
+        rust_geno_mean,
+        java_geno_mean
     );
     
     // STRICT: Rust imputed DR2 should not be much worse than Java

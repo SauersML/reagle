@@ -488,19 +488,6 @@ impl<'a> ImpStates<'a> {
         }
     }
 
-    /// Materialize haplotypes for all states at every dense marker.
-    ///
-    /// This is used for small panels to improve interpolation accuracy by
-    /// querying the mosaic state at the exact marker instead of reusing
-    /// flanking haplotypes.
-    pub fn dense_haps_for_states(&mut self, n_states: usize, n_markers: usize) -> Vec<Vec<u32>> {
-        self.threaded_haps.reset_cursors();
-        let mut out = vec![vec![0u32; n_states]; n_markers];
-        for m in 0..n_markers {
-            self.threaded_haps.materialize_haps(m, &mut out[m]);
-        }
-        out
-    }
 }
 
 #[cfg(test)]

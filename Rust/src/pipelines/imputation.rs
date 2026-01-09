@@ -11,7 +11,6 @@
 //!
 //! This matches Java `imp/ImpLS.java`, `imp/ImpLSBaum.java`, and related classes.
 
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info_span, instrument};
@@ -913,7 +912,6 @@ impl ImputationPipeline {
         let target_gt = Arc::new(phased_target_gt_res?);
 
         // Wrap large data structures in Arc for sharing with closures
-        let target_gt = Arc::new(target_gt);
         let alignment = Arc::new(alignment);
 
         let n_target_markers = target_gt.n_markers();
@@ -1013,7 +1011,7 @@ impl ImputationPipeline {
         //   - All refs matching at observed positions cluster together in PBWT
         //   - Virtual insertion finds EXACTLY the right bucket
         // ─────────────────────────────────────────────────────────────────────
-        let ref_panel_coded = info_span!("build_coded_panel").in_scope(|| {
+        info_span!("build_coded_panel").in_scope(|| {
             eprintln!("Building coded reference panel (projected space)...");
             let effective_step = if n_genotyped <= 1000 {
                 let last = projected_gen_positions.last().copied().unwrap_or(0.0);
@@ -1075,9 +1073,6 @@ impl ImputationPipeline {
             n_clusters, n_genotyped, n_to_impute
         );
 
-        // Genotyped markers for interpolation (still needed for StateProbs)
-        let genotyped_markers: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(genotyped_markers_vec.clone());
-
         // Cluster-aggregated HMM: run on C clusters, not M markers.
         // This matches Java's ImpLSBaum which operates on nClusters, not nMarkers.
         //
@@ -1088,124 +1083,114 @@ impl ImputationPipeline {
         let base_err_rate = self.params.p_mismatch;
 
         // Compute cluster midpoints for recombination
-        let cluster_midpoints: Vec<f64> = clusters
-            .iter()
-            .map(|c| {
-                if c.end > c.start {
-                    (gen_positions[genotyped_markers[c.start]]
-                        + gen_positions[genotyped_markers[c.end - 1]])
-                        / 2.0
-                } else {
-                    gen_positions[genotyped_markers[c.start]]
+        // Main loop over SAMPLES (must be sequential due to per-sample projection)
+
+
+        // Main loop over SAMPLES (must be sequential due to per-sample projection)
+        let state_probs: Vec<Arc<StateProbs>> = info_span!("run_hmm", n_samples = n_target_samples).in_scope(|| {
+            let mut all_state_probs = Vec::with_capacity(n_target_haps);
+
+            for s in 0..n_target_samples {
+                let sample_idx = crate::data::haplotype::SampleIdx::new(s as u32);
+                let hap1_idx = sample_idx.hap1();
+                let hap2_idx = sample_idx.hap2();
+
+                // === PER-SAMPLE Reference Panel Projection ===
+                // This is critical for accuracy: the set of "genotyped" markers used
+                // to build the HMM states must be based on this sample's non-missing data.
+                let genotyped_for_sample: Vec<usize> = (0..n_ref_markers)
+                    .filter(|&ref_m| {
+                        if let Some(target_m) = alignment.target_marker(ref_m) {
+                            let marker_idx = MarkerIdx::new(target_m as u32);
+                            let a1 = target_gt.allele(marker_idx, hap1_idx);
+                            let a2 = target_gt.allele(marker_idx, hap2_idx);
+                            a1 != 255 && a2 != 255
+                        } else {
+                            false
+                        }
+                    })
+                    .collect();
+
+                if s == 0 { // Print stats for first sample only
+                    eprintln!(
+                        "  Sample 0: {} of {} markers are non-missing",
+                        genotyped_for_sample.len(),
+                        n_genotyped
+                    );
                 }
-            })
-            .collect();
 
-        // Cluster-level recombination probabilities
-        let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain((1..n_clusters).map(|c| {
-                let gen_dist = (cluster_midpoints[c] - cluster_midpoints[c - 1]).abs();
-                self.params.p_recomb(gen_dist)
-            }))
-            .collect();
+                // Build the projected reference panel for this specific sample
+                let projected_gen_positions: Vec<f64> = genotyped_for_sample
+                    .iter()
+                    .map(|&ref_m| gen_positions[ref_m])
+                    .collect();
 
-        // Build marker-to-cluster mapping for expanding results
-        let marker_to_cluster: Vec<usize> = {
-            let mut mapping = vec![0usize; n_genotyped];
-            for (cluster_idx, cluster) in clusters.iter().enumerate() {
-                for m in cluster.start..cluster.end {
-                    mapping[m] = cluster_idx;
-                }
-            }
-            mapping
-        };
-        let marker_to_cluster = std::sync::Arc::new(marker_to_cluster);
+                let ref_panel_coded = RefPanelCoded::from_projected_markers(
+                    &ref_gt,
+                    &genotyped_for_sample,
+                    &projected_gen_positions,
+                    self.config.imp_step as f64,
+                );
 
-
-        // Run imputation for each target haplotype with per-thread workspaces
-        // Optimization: ImpStates is now created once per thread (not per haplotype)
-        // to avoid allocator contention from HashMap/BinaryHeap allocation
-        let state_probs: Vec<Arc<StateProbs>> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
-            (0..n_target_haps)
-            .into_par_iter()
-            .map_init(
-                // Initialize workspace AND ImpStates for each thread (reduces allocations)
-                // ImpStates::ibs_states_projected() calls initialize() internally, so reuse is safe
-                || {
-                    let workspace = ImpWorkspace::with_ref_size(n_states, n_ref_markers, n_ref_haps);
-                    // Use PROJECTED ImpStates - RefPanelCoded is in projected space
-                    let imp_states = ImpStates::new_projected(
+                // Run HMM for each haplotype of this sample
+                for hap_idx in [hap1_idx, hap2_idx] {
+                    // This block is largely similar to the original parallel version,
+                    // but now operates on the per-sample projected panel.
+                    let mut workspace = ImpWorkspace::with_ref_size(n_states, n_ref_markers, n_ref_haps);
+                    let mut imp_states = ImpStates::new_projected(
                         &ref_panel_coded,
                         n_ref_markers,
                         n_ref_haps,
                         n_states,
                         n_ibs_haps,
                         &projected_gen_positions,
-                        &genotyped_markers_vec,
+                        &genotyped_for_sample,
                         self.config.seed as u64,
                     );
-                    (workspace, imp_states)
-                },
-                // Process each haplotype with its thread's workspace and ImpStates
-                |(workspace, imp_states), h| {
-                    let hap_idx = HapIdx::new(h as u32);
 
-                    // Build target alleles in DENSE space (with 255s for ungenotyped markers)
-                    // Needed for HMM output computation
                     let target_alleles_dense: Vec<u8> = (0..n_ref_markers)
                         .map(|ref_m| {
                             if let Some(target_m) = alignment.target_marker(ref_m) {
                                 let raw_allele = target_gt.allele(MarkerIdx::new(target_m as u32), hap_idx);
                                 alignment.map_allele(target_m, raw_allele)
-                            } else {
-                                255 // Missing - marker not in target
-                            }
+                            } else { 255 }
                         })
                         .collect();
 
-                    // Build target alleles in PROJECTED space (indexed by genotyped marker position)
-                    // May still have 255s if this specific sample has missing data at a "genotyped" marker
-                    let target_alleles_projected: Vec<u8> = genotyped_markers_vec
+                    let target_alleles_projected: Vec<u8> = genotyped_for_sample
                         .iter()
                         .map(|&ref_m| target_alleles_dense[ref_m])
                         .collect();
 
-                    // Get reference allele closure (dense space)
                     let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                         ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
 
-                    // Get IBS-based states using PROJECTED PBWT (exact matching)
-                    // This is the key fix for DR2 regression - PBWT runs on genotyped markers only
-                    let mut sparse_hap_indices: Vec<Vec<u32>> = Vec::new();
-                    let mut sparse_allele_match: Vec<Vec<bool>> = Vec::new();
+                    let mut sparse_hap_indices = Vec::new();
+                    let mut sparse_allele_match = Vec::new();
                     let actual_n_states = imp_states.ibs_states_projected(
                         get_ref_allele,
                         &target_alleles_projected,
                         &target_alleles_dense,
-                        &genotyped_markers,
-                        workspace,
+                        &genotyped_for_sample,
+                        &mut workspace,
                         &mut sparse_hap_indices,
                         &mut sparse_allele_match,
                     );
 
-                    // Aggregate marker-level matches into per-cluster mismatch counts.
-                    // Emissions are computed from mismatch counts and total observed markers
-                    // instead of a coarse all-match boolean.
-                    let mut cluster_non_missing: Vec<u16> = Vec::with_capacity(clusters.len());
-                    let mut cluster_mismatches: Vec<Vec<u16>> = Vec::with_capacity(clusters.len());
-                    for cluster in clusters.iter() {
+                    let clusters = compute_marker_clusters(&genotyped_for_sample, &gen_positions, cluster_dist);
+                    let mut cluster_non_missing = Vec::with_capacity(clusters.len());
+                    let mut cluster_mismatches = Vec::with_capacity(clusters.len());
+                    for cluster in &clusters {
                         let mut mismatches = vec![0u16; actual_n_states];
                         let mut non_missing = 0u16;
                         for m in cluster.start..cluster.end {
-                            let target_allele = target_alleles_projected.get(m).copied().unwrap_or(255);
-                            if target_allele == 255 {
-                                continue;
-                            }
-                            non_missing = non_missing.saturating_add(1);
-                            for k in 0..actual_n_states {
-                                if !sparse_allele_match[m][k] {
-                                    mismatches[k] = mismatches[k].saturating_add(1);
+                            if target_alleles_projected.get(m).copied().unwrap_or(255) != 255 {
+                                non_missing += 1;
+                                for k in 0..actual_n_states {
+                                    if !sparse_allele_match[m][k] {
+                                        mismatches[k] += 1;
+                                    }
                                 }
                             }
                         }
@@ -1213,56 +1198,43 @@ impl ImputationPipeline {
                         cluster_mismatches.push(mismatches);
                     }
 
-                    // Run forward-backward HMM on CLUSTERS (matches Java ImpLSBaum)
-                    // This is faster (C iterations vs M) and uses correct math
+                    let cluster_midpoints: Vec<f64> = clusters.iter()
+                        .map(|c| (gen_positions[genotyped_for_sample[c.start]] + gen_positions[genotyped_for_sample[c.end-1]])/2.0)
+                        .collect();
+                    let cluster_p_recomb: Vec<f32> = std::iter::once(0.0).chain((1..clusters.len()).map(|c| self.params.p_recomb((cluster_midpoints[c] - cluster_midpoints[c-1]).abs()))).collect();
+
                     let cluster_state_probs = run_hmm_forward_backward_clusters(
-                        &cluster_mismatches,
-                        &cluster_non_missing,
-                        &cluster_p_recomb,
-                        base_err_rate,
-                        actual_n_states,
-                        workspace,
+                        &cluster_mismatches, &cluster_non_missing, &cluster_p_recomb, base_err_rate, actual_n_states, &mut workspace
                     );
 
-                    // Expand cluster-level state probs to marker-level
-                    // All markers in a cluster get the same state probabilities
-                    let n_genotyped_local = genotyped_markers.len();
-                    let mut hmm_state_probs: Vec<f32> = Vec::with_capacity(n_genotyped_local * actual_n_states);
-                    let default_prob = 1.0 / actual_n_states as f32;
-                    for m in 0..n_genotyped_local {
-                        let cluster_idx = marker_to_cluster[m];
-                        let cluster_offset = cluster_idx * actual_n_states;
+                    let mut hmm_state_probs = Vec::with_capacity(genotyped_for_sample.len() * actual_n_states);
+                    let marker_to_cluster: Vec<usize> = {
+                        let mut mapping = vec![0; genotyped_for_sample.len()];
+                        for (i, c) in clusters.iter().enumerate() {
+                            for m in c.start..c.end { mapping[m] = i; }
+                        }
+                        mapping
+                    };
+
+                    for m in 0..genotyped_for_sample.len() {
+                        let c_idx = marker_to_cluster[m];
                         for k in 0..actual_n_states {
-                            let prob = cluster_state_probs
-                                .get(cluster_offset + k)
-                                .copied()
-                                .unwrap_or(default_prob);
-                            hmm_state_probs.push(prob);
+                            hmm_state_probs.push(cluster_state_probs[c_idx * actual_n_states + k]);
                         }
                     }
 
-                    // Create StateProbs with interpolation support
-                    // NOTE: probs_p1 uses "next marker" which correctly produces:
-                    // - Constant values within clusters (since same-cluster markers have equal probs)
-                    // - Smooth transitions between clusters
-                    let dense_haps = if n_ref_markers <= 20_000 {
-                        Some(imp_states.dense_haps_for_states(actual_n_states, n_ref_markers))
-                    } else {
-                        None
-                    };
-
-                    Arc::new(StateProbs::new(
-                        std::sync::Arc::clone(&genotyped_markers),
+                    all_state_probs.push(Arc::new(StateProbs::new(
+                        Arc::new(genotyped_for_sample.clone()),
                         actual_n_states,
                         sparse_hap_indices,
                         hmm_state_probs,
-                        std::sync::Arc::clone(&gen_positions),
-                        std::sync::Arc::clone(&marker_to_cluster),
-                        dense_haps,
-                    ))
-                },
-            )
-            .collect()
+                        Arc::clone(&gen_positions),
+                        Arc::new(marker_to_cluster),
+                        None,
+                    )));
+                }
+            }
+            all_state_probs
         });
 
         eprintln!("Computing dosages with interpolation and quality metrics...");
