@@ -252,8 +252,9 @@ fn compute_cluster_mismatches(
     (mismatches, non_missing)
 }
 
-fn compute_targ_block_end(
+fn compute_targ_block_end<S: crate::data::storage::phase_state::PhaseState>(
     ref_gt: &GenotypeMatrix<Phased>,
+    target_gt: &GenotypeMatrix<S>,
     alignment: &MarkerAlignment,
     genotyped_markers: &[usize],
 ) -> Vec<usize> {
@@ -269,10 +270,16 @@ fn compute_targ_block_end(
         let Some(target_m) = alignment.target_marker(ref_m) else {
             continue;
         };
+        let target_marker_idx = MarkerIdx::new(target_m as u32);
+        let n_alleles = 1 + target_gt.marker(target_marker_idx).alt_alleles.len();
+        let missing_allele = n_alleles.saturating_sub(1) as u8;
         let mut hash = 0xcbf29ce484222325u64;
         for h in 0..n_ref_haps {
             let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32));
-            let allele = alignment.reverse_map_allele(target_m, ref_allele);
+            let mut allele = alignment.reverse_map_allele(target_m, ref_allele);
+            if allele == 255 {
+                allele = missing_allele;
+            }
             hash ^= allele as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
@@ -1377,7 +1384,7 @@ impl ImputationPipeline {
         // Compute marker clusters based on genetic distance (matching Java ImpData)
         // Respect block boundaries induced by reference allele-coding changes.
         let cluster_dist = self.config.cluster as f64;
-        let targ_block_end = compute_targ_block_end(&ref_gt, &alignment, &genotyped_markers_vec);
+        let targ_block_end = compute_targ_block_end(&ref_gt, &target_gt, &alignment, &genotyped_markers_vec);
         let clusters = compute_marker_clusters_with_blocks(
             &genotyped_markers_vec,
             &gen_positions,
