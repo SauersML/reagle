@@ -230,17 +230,22 @@ fn compute_cluster_mismatches(
                 continue;
             };
             let target_marker_idx = MarkerIdx::new(target_m as u32);
-            let targ_allele = target_gt.allele(target_marker_idx, targ_hap_idx);
+            let n_alleles = 1 + target_gt.marker(target_marker_idx).alt_alleles.len();
+            let missing_allele = n_alleles.saturating_sub(1) as u8;
+            let mut targ_allele = target_gt.allele(target_marker_idx, targ_hap_idx);
             if targ_allele == 255 {
                 continue;
+            }
+            if (targ_allele as usize) >= n_alleles {
+                targ_allele = missing_allele;
             }
             non_missing[c] = non_missing[c].saturating_add(1);
 
             for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap));
-                let mapped = alignment.reverse_map_allele(target_m, ref_allele);
+                let mut mapped = alignment.reverse_map_allele(target_m, ref_allele);
                 if mapped == 255 {
-                    continue;
+                    mapped = missing_allele;
                 }
                 if mapped != targ_allele {
                     mismatches[c][j] = mismatches[c][j].saturating_add(1);
