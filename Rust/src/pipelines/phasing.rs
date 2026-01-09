@@ -1439,11 +1439,44 @@ impl PhasingPipeline {
         let n_haps = geno.n_haps();
         let markers = target_gt.markers();
 
+        // Compute total haplotype count (target + reference)
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
+
         let ref_geno = geno.clone();
-        let ref_view = GenotypeView::from((&ref_geno, markers));
+        let ref_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            GenotypeView::Composite {
+                target: &ref_geno,
+                reference: ref_gt,
+                alignment,
+                n_target_haps: n_haps,
+            }
+        } else {
+            GenotypeView::from((&ref_geno, markers))
+        };
 
         // Build bidirectional PBWT for better state selection around recombination hotspots
-        let phase_ibs = self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps);
+        let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            self.build_bidirectional_pbwt_combined(
+                |m, h| {
+                    if h < n_haps {
+                        ref_geno.get(m, HapIdx::new(h as u32))
+                    } else {
+                        let ref_h = h - n_haps;
+                        if let Some(ref_m) = alignment.target_to_ref(m) {
+                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                            alignment.reverse_map_allele(m, ref_allele)
+                        } else {
+                            255
+                        }
+                    }
+                },
+                n_markers,
+                n_total_haps,
+            )
+        } else {
+            self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps)
+        };
 
         // Collect swap masks per sample
         let n_samples = n_haps / 2;
