@@ -280,6 +280,8 @@ pub struct StateProbs {
     /// State probabilities at the NEXT genotyped marker (for interpolation)
     /// At the last marker, this equals probs (no next marker)
     probs_p1: Vec<Vec<f32>>,
+    /// Dense haplotypes for all markers (small panels only)
+    dense_haps: Option<Vec<Vec<u32>>>,
     /// Reference haplotype indices at the NEXT genotyped marker (optional, accuracy boost)
     haps_p1: Option<Vec<Vec<u32>>>,
     /// Genetic positions of ALL reference markers (for interpolation)
@@ -330,6 +332,7 @@ impl StateProbs {
         state_probs: Vec<f32>,
         gen_positions: std::sync::Arc<Vec<f64>>,
         marker_to_cluster: std::sync::Arc<Vec<usize>>,
+        dense_haps: Option<Vec<Vec<u32>>>,
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
         let store_haps_p1 = n_genotyped <= 1000;
@@ -395,6 +398,7 @@ impl StateProbs {
             probs: filtered_probs,
             probs_p1: filtered_probs_p1,
             haps_p1: filtered_haps_p1,
+            dense_haps,
             gen_positions,
             marker_to_cluster,
         }
@@ -539,6 +543,63 @@ impl StateProbs {
         } else {
             0.5
         };
+
+        // Prefer dense haplotype lookup when available (small panels)
+        if let Some(ref dense_haps) = self.dense_haps {
+            if ref_marker < dense_haps.len() {
+                let haps = &dense_haps[ref_marker];
+                let probs = &self.probs[left_sparse];
+                let probs_p1 = &self.probs_p1[left_sparse];
+                let right_sparse = insert_pos;
+                let is_between_clusters = self.marker_to_cluster[left_sparse]
+                    != self.marker_to_cluster[right_sparse];
+
+                if n_alleles == 2 {
+                    let mut p_alt = 0.0f32;
+                    let mut p_ref = 0.0f32;
+                    for (j, &hap) in haps.iter().enumerate() {
+                        let prob = probs.get(j).copied().unwrap_or(0.0);
+                        let interpolated_prob = if is_between_clusters {
+                            let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                            weight_left * prob + (1.0 - weight_left) * prob_p1
+                        } else {
+                            prob
+                        };
+                        let allele = get_ref_allele(ref_marker, hap);
+                        if allele == 1 {
+                            p_alt += interpolated_prob;
+                        } else if allele == 0 {
+                            p_ref += interpolated_prob;
+                        }
+                    }
+                    let total = p_ref + p_alt;
+                    let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
+                    return AllelePosteriors::Biallelic(p_alt);
+                } else {
+                    let mut al_probs = vec![0.0f32; n_alleles];
+                    for (j, &hap) in haps.iter().enumerate() {
+                        let prob = probs.get(j).copied().unwrap_or(0.0);
+                        let interpolated_prob = if is_between_clusters {
+                            let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
+                            weight_left * prob + (1.0 - weight_left) * prob_p1
+                        } else {
+                            prob
+                        };
+                        let allele = get_ref_allele(ref_marker, hap);
+                        if allele != 255 && (allele as usize) < n_alleles {
+                            al_probs[allele as usize] += interpolated_prob;
+                        }
+                    }
+                    let total: f32 = al_probs.iter().sum();
+                    if total > 1e-10 {
+                        for p in &mut al_probs {
+                            *p /= total;
+                        }
+                    }
+                    return AllelePosteriors::Multiallelic(al_probs);
+                }
+            }
+        }
 
         // Get haplotypes and probabilities from LEFT marker
         let haps = &self.hap_indices[left_sparse];
@@ -1171,6 +1232,12 @@ impl ImputationPipeline {
                     // NOTE: probs_p1 uses "next marker" which correctly produces:
                     // - Constant values within clusters (since same-cluster markers have equal probs)
                     // - Smooth transitions between clusters
+                    let dense_haps = if n_ref_markers <= 20_000 {
+                        Some(imp_states.dense_haps_for_states(actual_n_states, n_ref_markers))
+                    } else {
+                        None
+                    };
+
                     Arc::new(StateProbs::new(
                         std::sync::Arc::clone(&genotyped_markers),
                         actual_n_states,
@@ -1178,6 +1245,7 @@ impl ImputationPipeline {
                         hmm_state_probs,
                         std::sync::Arc::clone(&gen_positions),
                         std::sync::Arc::clone(&marker_to_cluster),
+                        dense_haps,
                     ))
                 },
             )
