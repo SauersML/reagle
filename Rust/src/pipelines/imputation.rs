@@ -1159,21 +1159,9 @@ impl ImputationPipeline {
 
         // Note: gen_positions and steps_config removed - ImpStates now uses ref_panel step boundaries directly
 
-        // Build genotyped markers list FIRST (needed for projected PBWT)
-        // A marker is only considered "genotyped" if at least one target haplotype has data
+        // Build target-aligned marker list (Java uses all target markers, regardless of missingness).
         let genotyped_markers_vec: Vec<usize> = (0..n_ref_markers)
-            .filter(|&ref_m| {
-                if let Some(target_m) = alignment.target_marker(ref_m) {
-                    // Check if any haplotype has non-missing data at this marker
-                    let marker_idx = MarkerIdx::new(target_m as u32);
-                    (0..n_target_haps).any(|hap| {
-                        let hap_idx = HapIdx::new(hap as u32);
-                        target_gt.allele(marker_idx, hap_idx) != 255
-                    })
-                } else {
-                    false
-                }
-            })
+            .filter(|&ref_m| alignment.target_marker(ref_m).is_some())
             .collect();
         let n_genotyped = genotyped_markers_vec.len();
         let n_to_impute = n_ref_markers - n_genotyped;
