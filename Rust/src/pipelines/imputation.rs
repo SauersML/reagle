@@ -1262,9 +1262,10 @@ impl ImputationPipeline {
 
         // Number of IBS haplotypes to find per step (Java ImpIbs)
         // Java: nHapsPerStep = imp_states / (imp_segment / imp_step)
+        let imp_states = self.params.n_states;
         let n_steps_per_segment = (self.config.imp_segment / self.config.imp_step).round() as usize;
         let n_steps_per_segment = n_steps_per_segment.max(1);
-        let n_ibs_haps = (self.config.imp_states / n_steps_per_segment)
+        let n_ibs_haps = (imp_states / n_steps_per_segment)
             .max(1)
             .min(n_ref_haps);
 
