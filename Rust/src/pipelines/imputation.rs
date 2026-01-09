@@ -1068,7 +1068,6 @@ impl ImputationPipeline {
                         n_ibs_haps,
                         &projected_gen_positions,
                         &genotyped_markers_vec,
-                        &gen_positions,
                         self.config.seed as u64,
                     );
                     (workspace, imp_states)
