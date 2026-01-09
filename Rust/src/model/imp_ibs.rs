@@ -99,9 +99,15 @@ pub fn build_cluster_hap_sequences(
                 }
                 let hap_idx = HapIdx::new(h as u32);
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), hap_idx);
-                let mut allele = alignment.reverse_map_allele(target_m, ref_allele) as usize;
+                let mapped = alignment.reverse_map_allele(target_m, ref_allele);
+                if mapped == 255 {
+                    ref_seq[h] = 0;
+                    continue;
+                }
+                let allele = mapped as usize;
                 if allele >= n_alleles {
-                    allele = 0;
+                    ref_seq[h] = 0;
+                    continue;
                 }
                 let index = (ref_seq[h] as usize) * n_alleles + allele;
                 ref_seq[h] = seq_map.get(index).copied().unwrap_or(0);
