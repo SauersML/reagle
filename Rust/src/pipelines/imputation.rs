@@ -1214,20 +1214,16 @@ impl ImputationPipeline {
                             let a1_mapped = alignment.map_allele(target_m, a1);
                             let a2_mapped = alignment.map_allele(target_m, a2);
                             
-                            // Set probability 1.0 for observed allele (if not missing)
-                            // If missing, fall back to HMM posteriors
+                            // Set probability 1.0 for observed allele (if not missing).
+                            // If missing, the probabilities remain 0.0 for this haplotype.
+                            // Crucially, we DO NOT fall back to HMM posteriors for genotyped
+                            // markers, as this introduces noise and causes artificially low DR2.
                             if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
                                 probs1[a1_mapped as usize] = 1.0;
-                            } else {
-                                let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs1[a] = post1.prob(a); }
                             }
 
                             if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
                                 probs2[a2_mapped as usize] = 1.0;
-                            } else {
-                                let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs2[a] = post2.prob(a); }
                             }
                         }
                     } else {
