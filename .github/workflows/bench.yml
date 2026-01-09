@@ -13,6 +13,9 @@ jobs:
   benchmark:
     name: Performance Benchmarks
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Rust
     steps:
       - uses: actions/checkout@v4
 
@@ -25,7 +28,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
+            Rust/target
           key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-bench-
@@ -53,5 +56,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: target/criterion
+          path: Rust/target/criterion
           retention-days: 30
