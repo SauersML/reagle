@@ -97,6 +97,53 @@ fn compute_marker_clusters(
     clusters
 }
 
+fn compute_marker_clusters_with_blocks(
+    genotyped_markers: &[usize],
+    gen_positions: &[f64],
+    cluster_dist: f64,
+    block_end: &[usize],
+) -> Vec<MarkerCluster> {
+    if genotyped_markers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut clusters = Vec::new();
+    let mut block_start = 0usize;
+    let mut block_end_iter = block_end.iter().copied().filter(|&v| v > 0);
+
+    while let Some(block_end_idx) = block_end_iter.next() {
+        if block_end_idx <= block_start {
+            continue;
+        }
+        let mut cluster_start = block_start;
+        let mut start_pos = gen_positions[genotyped_markers[cluster_start]];
+
+        for m in (cluster_start + 1)..block_end_idx {
+            let pos = gen_positions[genotyped_markers[m]];
+            if pos - start_pos > cluster_dist {
+                clusters.push(MarkerCluster {
+                    start: cluster_start,
+                    end: m,
+                });
+                cluster_start = m;
+                start_pos = pos;
+            }
+        }
+
+        clusters.push(MarkerCluster {
+            start: cluster_start,
+            end: block_end_idx,
+        });
+        block_start = block_end_idx;
+    }
+
+    if clusters.is_empty() {
+        compute_marker_clusters(genotyped_markers, gen_positions, cluster_dist)
+    } else {
+        clusters
+    }
+}
+
 fn compute_ref_cluster_bounds(
     genotyped_markers: &[usize],
     clusters: &[MarkerCluster],
@@ -157,6 +204,35 @@ fn build_marker_cluster_index(
         marker_cluster[m] = c;
     }
     marker_cluster
+}
+
+fn compute_targ_block_end(
+    ref_gt: &GenotypeMatrix<Phased>,
+    genotyped_markers: &[usize],
+) -> Vec<usize> {
+    let n_ref_haps = ref_gt.n_haplotypes();
+    let mut block_end = Vec::new();
+    if genotyped_markers.is_empty() {
+        return block_end;
+    }
+
+    let mut last_hash: u64 = 0;
+    let mut initialized = false;
+    for (idx, &ref_m) in genotyped_markers.iter().enumerate() {
+        let mut hash = 0xcbf29ce484222325u64;
+        for h in 0..n_ref_haps {
+            let allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32));
+            hash ^= allele as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        if initialized && hash != last_hash {
+            block_end.push(idx);
+        }
+        last_hash = hash;
+        initialized = true;
+    }
+    block_end.push(genotyped_markers.len());
+    block_end
 }
 
 /// Marker alignment between target and reference panels
@@ -1214,10 +1290,15 @@ impl ImputationPipeline {
         };
 
         // Compute marker clusters based on genetic distance (matching Java ImpData)
-        // Markers within cluster_dist cM are grouped together
-        // This affects: (1) HMM step count, (2) error rate per step, (3) state probabilities
+        // Respect block boundaries induced by reference allele-coding changes.
         let cluster_dist = self.config.cluster as f64;
-        let clusters = compute_marker_clusters(&genotyped_markers_vec, &gen_positions, cluster_dist);
+        let targ_block_end = compute_targ_block_end(&ref_gt, &genotyped_markers_vec);
+        let clusters = compute_marker_clusters_with_blocks(
+            &genotyped_markers_vec,
+            &gen_positions,
+            cluster_dist,
+            &targ_block_end,
+        );
         let n_clusters = clusters.len();
 
         eprintln!(
