@@ -2817,6 +2817,38 @@ mod tests {
     }
 
     #[test]
+    fn test_cluster_state_probs_between_clusters_uses_left_and_right_haps() {
+        let marker_cluster = Arc::new(vec![0usize, 0usize, 1usize]);
+        let ref_cluster_end = Arc::new(vec![1usize, 3usize]);
+        let weight = Arc::new(vec![1.0f32, 0.25f32, 1.0f32]);
+
+        let hap_indices = vec![vec![0u32], vec![1u32]];
+        let cluster_probs = vec![0.8f32, 0.2f32];
+
+        let state_probs = ClusterStateProbs::new(
+            marker_cluster,
+            ref_cluster_end,
+            weight,
+            1,
+            hap_indices,
+            cluster_probs,
+        );
+
+        let get_ref_allele = |m: usize, hap: u32| -> u8 {
+            if m == 1 {
+                if hap == 0 { 0 } else { 1 }
+            } else {
+                0
+            }
+        };
+
+        let post = state_probs.allele_posteriors(1, 2, &get_ref_allele);
+        let p_alt = post.prob(1);
+        let expected = 0.15 / (0.2 + 0.15);
+        assert!((p_alt - expected).abs() < 1e-6, "p_alt={}, expected={}", p_alt, expected);
+    }
+
+    #[test]
     fn test_state_probs_edge_cases() {
         // Test edge case: marker before first genotyped marker
         // Should return the first marker's value
