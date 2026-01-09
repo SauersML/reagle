@@ -1185,26 +1185,13 @@ impl ImputationPipeline {
             std::sync::Arc::new(flags)
         };
 
-        // Number of IBS haplotypes to find per step
+        // Number of IBS haplotypes to find per step (Java ImpIbs)
         // Java: nHapsPerStep = imp_states / (imp_segment / imp_step)
-        //     = 1600 / (6.0 / 0.1) = 1600 / 60 ≈ 26
-        // We add a minimum of sqrt(imp_states) to handle low imp_states values.
-        // Without this floor, imp_states=50 with 60 steps/segment gives 50/60=0,
-        // causing IBS matching to fail completely.
         let n_steps_per_segment = (self.config.imp_segment / self.config.imp_step).round() as usize;
-        let computed = self.config.imp_states / n_steps_per_segment.max(1);
-        let base_min_ibs = (self.config.imp_states as f64).sqrt() as usize;
-        let min_ibs = if n_genotyped <= 1000 {
-            base_min_ibs.saturating_mul(2)
-        } else {
-            base_min_ibs
-        };
-        let n_ibs_haps = if n_genotyped <= 1000 {
-            // Small panels: keep all reference haplotypes to avoid random fill.
-            self.params.n_states.min(n_ref_haps)
-        } else {
-            computed.max(min_ibs).max(1).min(n_ref_haps)
-        };
+        let n_steps_per_segment = n_steps_per_segment.max(1);
+        let n_ibs_haps = (self.config.imp_states / n_steps_per_segment)
+            .max(1)
+            .min(n_ref_haps);
 
         // Cluster-coded haplotype sequences and recursive IBS matching (Java ImpIbs)
 
@@ -1230,8 +1217,7 @@ impl ImputationPipeline {
         // Compute marker clusters based on genetic distance (matching Java ImpData)
         // Markers within cluster_dist cM are grouped together
         // This affects: (1) HMM step count, (2) error rate per step, (3) state probabilities
-        // For small genotyped panels, avoid clustering to preserve fine-grained transitions.
-        let cluster_dist = if n_genotyped <= 1000 { 0.0 } else { self.config.cluster as f64 };
+        let cluster_dist = self.config.cluster as f64;
         let clusters = compute_marker_clusters(&genotyped_markers_vec, &gen_positions, cluster_dist);
         let n_clusters = clusters.len();
 
