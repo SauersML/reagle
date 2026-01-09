@@ -970,15 +970,6 @@ impl ImputationPipeline {
             }))
             .collect();
 
-        // Cluster-level error probabilities (scaled by cluster size, applied ONCE)
-        let cluster_err: Vec<f32> = clusters
-            .iter()
-            .map(|c| {
-                let size = (c.end - c.start) as f32;
-                (base_err_rate * size).min(0.5)
-            })
-            .collect();
-
         // Build marker-to-cluster mapping for expanding results
         let marker_to_cluster: Vec<usize> = {
             let mut mapping = vec![0usize; n_genotyped];
@@ -1058,32 +1049,37 @@ impl ImputationPipeline {
                         &mut sparse_allele_match,
                     );
 
-                    // Aggregate marker-level matches into cluster-level matches.
-                    // A state matches a cluster IFF it matches ALL non-missing markers in that cluster.
-                    // This matches Java's pattern-based matching at the cluster level.
-                    let cluster_allele_match: Vec<Vec<bool>> = clusters
-                        .iter()
-                        .map(|cluster| {
-                            (0..actual_n_states)
-                                .map(|k| {
-                                    // Check if state k matches all markers in this cluster
-                                    (cluster.start..cluster.end).all(|m| {
-                                        // Missing target alleles (255) are treated as matching
-                                        // Note: m is index into genotyped_markers (projected space)
-                                        let target_allele = target_alleles_projected.get(m).copied().unwrap_or(255);
-                                        target_allele == 255 || sparse_allele_match[m][k]
-                                    })
-                                })
-                                .collect()
-                        })
-                        .collect();
+                    // Aggregate marker-level matches into per-cluster mismatch counts.
+                    // Emissions are computed from mismatch counts and total observed markers
+                    // instead of a coarse all-match boolean.
+                    let mut cluster_non_missing: Vec<u16> = Vec::with_capacity(clusters.len());
+                    let mut cluster_mismatches: Vec<Vec<u16>> = Vec::with_capacity(clusters.len());
+                    for cluster in clusters.iter() {
+                        let mut mismatches = vec![0u16; actual_n_states];
+                        let mut non_missing = 0u16;
+                        for m in cluster.start..cluster.end {
+                            let target_allele = target_alleles_projected.get(m).copied().unwrap_or(255);
+                            if target_allele == 255 {
+                                continue;
+                            }
+                            non_missing = non_missing.saturating_add(1);
+                            for k in 0..actual_n_states {
+                                if !sparse_allele_match[m][k] {
+                                    mismatches[k] = mismatches[k].saturating_add(1);
+                                }
+                            }
+                        }
+                        cluster_non_missing.push(non_missing);
+                        cluster_mismatches.push(mismatches);
+                    }
 
                     // Run forward-backward HMM on CLUSTERS (matches Java ImpLSBaum)
                     // This is faster (C iterations vs M) and uses correct math
                     let cluster_state_probs = run_hmm_forward_backward_clusters(
-                        &cluster_allele_match,
+                        &cluster_mismatches,
+                        &cluster_non_missing,
                         &cluster_p_recomb,
-                        &cluster_err,
+                        base_err_rate,
                         actual_n_states,
                         workspace,
                     );
@@ -1418,26 +1414,28 @@ impl ImputationPipeline {
 ///
 /// This is the cluster-aggregated version that:
 /// 1. Operates on C clusters instead of M markers (10-50x faster)
-/// 2. Uses cluster-scaled error probability ONCE per cluster
+/// 2. Uses per-marker mismatch probability applied across all observed markers
 /// 3. Matches Java's exact mathematical model
 ///
 /// # Arguments
-/// * `cluster_allele_match` - For each cluster, whether each state matches (all markers must match)
+/// * `cluster_mismatches` - For each cluster, mismatch counts per state
+/// * `cluster_non_missing` - For each cluster, number of observed markers
 /// * `p_recomb` - Per-cluster recombination probabilities
-/// * `p_err` - Per-cluster error probabilities (base_err * cluster_size)
+/// * `p_err` - Per-marker mismatch probability
 /// * `n_states` - Number of HMM states
 /// * `workspace` - Reusable workspace for temporary storage
 ///
 /// # Returns
 /// Flat array of state probabilities: cluster_state_probs[c * n_states + k] = P(state k | cluster c)
 fn run_hmm_forward_backward_clusters(
-    cluster_allele_match: &[Vec<bool>],
+    cluster_mismatches: &[Vec<u16>],
+    cluster_non_missing: &[u16],
     p_recomb: &[f32],
-    p_err: &[f32],
+    p_err: f32,
     n_states: usize,
     workspace: &mut ImpWorkspace,
 ) -> Vec<f32> {
-    let n_clusters = cluster_allele_match.len();
+    let n_clusters = cluster_mismatches.len();
     if n_clusters == 0 || n_states == 0 {
         return Vec::new();
     }
@@ -1445,27 +1443,40 @@ fn run_hmm_forward_backward_clusters(
     // Ensure workspace is sized correctly
     workspace.resize(n_states, n_clusters);
 
-    let default_err = if p_err.is_empty() { 0.001 } else { p_err[0] };
+    let p_err = p_err.clamp(1e-8, 0.5);
+    let p_no_err = 1.0 - p_err;
+    let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
 
     // Forward pass
     let total_size = n_clusters * n_states;
     let mut fwd: Vec<f32> = vec![0.0; total_size];
     let mut fwd_sum = 1.0f32;
 
-    for (c, matches) in cluster_allele_match.iter().enumerate().take(n_clusters) {
+    let mut ratio_pows: Vec<f32> = Vec::new();
+    for (c, mismatches) in cluster_mismatches.iter().enumerate().take(n_clusters) {
         let p_rec = p_recomb.get(c).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / fwd_sum;
 
-        let cluster_err = p_err.get(c).copied().unwrap_or(default_err);
-        let p_match = 1.0 - cluster_err;
+        let n_obs = cluster_non_missing.get(c).copied().unwrap_or(0) as usize;
+        let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
+        ratio_pows.resize(n_obs.saturating_add(1), 1.0);
+        for i in 1..=n_obs {
+            ratio_pows[i] = ratio_pows[i - 1] * ratio;
+        }
 
         let mut new_sum = 0.0f32;
         let row_offset = c * n_states;
         let prev_row_offset = if c > 0 { (c - 1) * n_states } else { 0 };
 
-        for k in 0..n_states.min(matches.len()) {
-            let emit = if matches[k] { p_match } else { cluster_err };
+        for k in 0..n_states.min(mismatches.len()) {
+            let mismatch_count = mismatches[k] as usize;
+            let mismatch_count = mismatch_count.min(n_obs);
+            let emit = if n_obs == 0 {
+                1.0
+            } else {
+                base_emit * ratio_pows[mismatch_count]
+            };
 
             let val = if c == 0 {
                 emit
@@ -1518,12 +1529,22 @@ fn run_hmm_forward_backward_clusters(
 
         // Apply emission for next backward iteration
         if c > 0 {
-            let matches = &cluster_allele_match[c];
-            let cluster_err = p_err.get(c).copied().unwrap_or(default_err);
-            let p_match = 1.0 - cluster_err;
+            let mismatches = &cluster_mismatches[c];
+            let n_obs = cluster_non_missing.get(c).copied().unwrap_or(0) as usize;
+            let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
+            ratio_pows.resize(n_obs.saturating_add(1), 1.0);
+            for i in 1..=n_obs {
+                ratio_pows[i] = ratio_pows[i - 1] * ratio;
+            }
             bwd_sum = 0.0;
-            for k in 0..n_states.min(matches.len()) {
-                let emit = if matches[k] { p_match } else { cluster_err };
+            for k in 0..n_states.min(mismatches.len()) {
+                let mismatch_count = mismatches[k] as usize;
+                let mismatch_count = mismatch_count.min(n_obs);
+                let emit = if n_obs == 0 {
+                    1.0
+                } else {
+                    base_emit * ratio_pows[mismatch_count]
+                };
                 bwd[k] *= emit;
                 bwd_sum += bwd[k];
             }
@@ -1536,6 +1557,20 @@ fn run_hmm_forward_backward_clusters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matches_to_mismatches(allele_match: &[Vec<bool>]) -> (Vec<Vec<u16>>, Vec<u16>) {
+        let mut mismatches = Vec::with_capacity(allele_match.len());
+        let mut non_missing = Vec::with_capacity(allele_match.len());
+        for row in allele_match {
+            let mut row_mismatches = Vec::with_capacity(row.len());
+            for &is_match in row {
+                row_mismatches.push(if is_match { 0 } else { 1 });
+            }
+            mismatches.push(row_mismatches);
+            non_missing.push(1);
+        }
+        (mismatches, non_missing)
+    }
 
     // =========================================================================
     // AllelePosteriors Tests - RIGOROUS
@@ -1695,11 +1730,13 @@ mod tests {
                     .collect();
 
                 let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
-                let p_err = vec![0.01f32; n_markers];
+                let p_err = 0.01f32;
+                let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
                 let posteriors = run_hmm_forward_backward_clusters(
-                    &allele_match,
+                    &mismatches,
+                    &non_missing,
                     &p_recomb,
-                    &p_err,
+                    p_err,
                     n_states,
                     &mut workspace,
                 );
@@ -1729,11 +1766,13 @@ mod tests {
         let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.05 }).collect();
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
-        let p_err = vec![0.01f32; n_markers];
+        let p_err = 0.01f32;
+        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
-            &allele_match,
+            &mismatches,
+            &non_missing,
             &p_recomb,
-            &p_err,
+            p_err,
             n_states,
             &mut workspace,
         );
@@ -1758,11 +1797,13 @@ mod tests {
         let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.001 }).collect();
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
-        let p_err = vec![0.001f32; n_markers];
+        let p_err = 0.001f32;
+        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
-            &allele_match,
+            &mismatches,
+            &non_missing,
             &p_recomb,
-            &p_err,
+            p_err,
             n_states,
             &mut workspace,
         );
@@ -1793,11 +1834,13 @@ mod tests {
         let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.01 }).collect();
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
-        let p_err = vec![0.01f32; n_markers];
+        let p_err = 0.01f32;
+        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
-            &allele_match,
+            &mismatches,
+            &non_missing,
             &p_recomb,
-            &p_err,
+            p_err,
             n_states,
             &mut workspace,
         );
@@ -1835,10 +1878,26 @@ mod tests {
         let p_recomb: Vec<f32> = (0..n_markers).map(|m| if m == 0 { 0.0 } else { 0.05 }).collect();
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
-        let p_err = vec![0.01f32; n_markers];
+        let p_err = 0.01f32;
+        let (mismatches1, non_missing1) = matches_to_mismatches(&match1);
+        let (mismatches2, non_missing2) = matches_to_mismatches(&match2);
 
-        let post1 = run_hmm_forward_backward_clusters(&match1, &p_recomb, &p_err, n_states, &mut workspace);
-        let post2 = run_hmm_forward_backward_clusters(&match2, &p_recomb, &p_err, n_states, &mut workspace);
+        let post1 = run_hmm_forward_backward_clusters(
+            &mismatches1,
+            &non_missing1,
+            &p_recomb,
+            p_err,
+            n_states,
+            &mut workspace,
+        );
+        let post2 = run_hmm_forward_backward_clusters(
+            &mismatches2,
+            &non_missing2,
+            &p_recomb,
+            p_err,
+            n_states,
+            &mut workspace,
+        );
 
         // Posteriors should be swapped
         for m in 0..n_markers {
@@ -1932,11 +1991,12 @@ mod tests {
         let p_recomb = vec![0.0, rho];  // First marker has 0 recomb
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 10);
-        let p_err_vec = vec![p_err; n_markers];
+        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
-            &allele_match,
+            &mismatches,
+            &non_missing,
             &p_recomb,
-            &p_err_vec,
+            p_err,
             n_states,
             &mut workspace,
         );
@@ -1985,11 +2045,13 @@ mod tests {
                 .collect();
 
             let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
-            let p_err = vec![0.01f32; n_markers];
+            let p_err = 0.01f32;
+            let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
             let posteriors = run_hmm_forward_backward_clusters(
-                &allele_match,
+                &mismatches,
+                &non_missing,
                 &p_recomb,
-                &p_err,
+                p_err,
                 n_states,
                 &mut workspace,
             );
@@ -2028,11 +2090,13 @@ mod tests {
         let p_recomb = vec![0.0f32; n_markers];
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states, n_markers, 100);
-        let p_err = vec![0.01f32; n_markers];  // small mismatch prob
+        let p_err = 0.01f32;  // small mismatch prob
+        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
-            &allele_match,
+            &mismatches,
+            &non_missing,
             &p_recomb,
-            &p_err,
+            p_err,
             n_states,
             &mut workspace,
         );
