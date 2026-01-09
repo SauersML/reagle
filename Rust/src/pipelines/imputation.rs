@@ -1552,50 +1552,33 @@ impl ImputationPipeline {
                         probs2[a] = 0.0;
                     }
 
-                    let mut skip_sample = false;
+                    // For ALL markers (genotyped and imputed), use HMM posteriors.
+                    // This is the correct behavior for the BEAGLE algorithm, which
+                    // re-evaluates known genotypes to refine them.
+                    let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+                    let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
+
+                    for a in 0..n_alleles {
+                        probs1[a] = post1.prob(a);
+                        probs2[a] = post2.prob(a);
+                    }
+
+                    // For genotyped markers, if the true genotype is missing, we must
+                    // exclude it from the DR2 calculation.
+                    let mut skip_for_dr2 = false;
                     if is_genotyped {
-                        // For genotyped markers: use OBSERVED alleles with probability 1.0
-                        // This matches Java's setToObsAlleles() behavior
                         if let Some(target_m) = alignment.target_marker(m) {
                             let target_marker_idx = MarkerIdx::new(target_m as u32);
                             let a1 = target_gt.allele(target_marker_idx, hap1_idx);
                             let a2 = target_gt.allele(target_marker_idx, hap2_idx);
-                            
-                            // Map target alleles to reference allele space
-                            let a1_mapped = alignment.map_allele(target_m, a1);
-                            let a2_mapped = alignment.map_allele(target_m, a2);
-                            
-                            // Set probability 1.0 for observed allele (if not missing)
-                            // If missing, fall back to HMM posteriors
-                            if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
-                                probs1[a1_mapped as usize] = 1.0;
-                            } else {
-                                skip_sample = true;
-                                let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs1[a] = post1.prob(a); }
+                            if a1 == 255 || a2 == 255 {
+                                skip_for_dr2 = true;
                             }
-
-                            if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
-                                probs2[a2_mapped as usize] = 1.0;
-                            } else {
-                                skip_sample = true;
-                                let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs2[a] = post2.prob(a); }
-                            }
-                        }
-                    } else {
-                        // For imputed markers: use HMM posteriors
-                        let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                        let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-
-                        for a in 0..n_alleles {
-                            probs1[a] = post1.prob(a);
-                            probs2[a] = post2.prob(a);
                         }
                     }
 
                     if let Some(stats) = quality.get_mut(m) {
-                        if !(is_genotyped && skip_sample) {
+                        if !skip_for_dr2 {
                             if is_diploid {
                                 stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
                             } else {
