@@ -798,6 +798,10 @@ impl VcfWriter {
         G: Fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors),
     {
         let n_samples = self.samples.len();
+        let format_prob = |val: f32| -> String {
+            let rounded = (val * 100.0).round() / 100.0;
+            format!("{:.2}", rounded)
+        };
 
         for m in start..end {
             let marker_idx = MarkerIdx::new(m as u32);
@@ -841,7 +845,7 @@ impl VcfWriter {
                     (p1.max_allele(), p2.max_allele())
                 } else { gt_from_dosage(ds) };
 
-                write!(self.writer, "\t{}|{}:{:.4}", a1, a2, ds)?;
+                write!(self.writer, "\t{}|{}:{}", a1, a2, format_prob(ds))?;
 
                 if include_gp {
                     if let Some((ref p1, ref p2)) = posteriors {
@@ -853,26 +857,26 @@ impl VcfWriter {
                                 first = false;
                                 let prob = if i1 == i2 { p1.prob(i1) * p2.prob(i2) }
                                     else { p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1) };
-                                write!(self.writer, "{:.4}", prob)?;
+                                write!(self.writer, "{}", format_prob(prob))?;
                             }
                         }
                     } else {
-                        write!(self.writer, ":{}", vec!["0.0000"; n_alleles * (n_alleles + 1) / 2].join(","))?;
+                        write!(self.writer, ":{}", vec!["0.00"; n_alleles * (n_alleles + 1) / 2].join(","))?;
                     }
                 }
 
                 if include_ap {
                     if let Some((ref p1, ref p2)) = posteriors {
                         write!(self.writer, ":")?;
-                        let ap1: Vec<String> = (1..n_alleles).map(|a| format!("{:.4}", p1.prob(a))).collect();
+                        let ap1: Vec<String> = (1..n_alleles).map(|a| format_prob(p1.prob(a))).collect();
                         write!(self.writer, "{}", if ap1.is_empty() { "0.00".to_string() } else { ap1.join(",") })?;
                         write!(self.writer, ":")?;
-                        let ap2: Vec<String> = (1..n_alleles).map(|a| format!("{:.4}", p2.prob(a))).collect();
+                        let ap2: Vec<String> = (1..n_alleles).map(|a| format_prob(p2.prob(a))).collect();
                         write!(self.writer, "{}", if ap2.is_empty() { "0.00".to_string() } else { ap2.join(",") })?;
                     } else {
                         let n_ap = n_alleles.saturating_sub(1).max(1);
-                        write!(self.writer, ":{}", vec!["0.0000"; n_ap].join(","))?;
-                        write!(self.writer, ":{}", vec!["0.0000"; n_ap].join(","))?;
+                        write!(self.writer, ":{}", vec!["0.00"; n_ap].join(","))?;
+                        write!(self.writer, ":{}", vec!["0.00"; n_ap].join(","))?;
                     }
                 }
             }
