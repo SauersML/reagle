@@ -344,6 +344,7 @@ impl StateProbs {
         } else {
             (0.005f32).min(0.9999 / n_states.max(1) as f32)
         };
+        let include_all_states = threshold == 0.0;
 
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
@@ -372,7 +373,7 @@ impl StateProbs {
                 let prob = state_probs.get(row_offset + j).copied().unwrap_or(0.0);
                 let prob_p1 = state_probs.get(row_offset_p1 + j).copied().unwrap_or(0.0);
                 // Java: if (stateProbs[m][j] > threshold || stateProbs[mP1][j] > threshold)
-                if prob > threshold || prob_p1 > threshold {
+                if include_all_states || prob > threshold || prob_p1 > threshold {
                     haps.push(hap_indices[sparse_m][j]);
                     probs.push(prob);
                     probs_p1.push(prob_p1);
@@ -391,6 +392,12 @@ impl StateProbs {
                 all_haps_p1.push(haps_p1.unwrap_or_default());
             }
         }
+
+        let dense_haps = if include_all_states {
+            dense_haps
+        } else {
+            None
+        };
 
         Self {
             genotyped_markers,
