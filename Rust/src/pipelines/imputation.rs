@@ -239,6 +239,9 @@ fn compute_cluster_mismatches(
             for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap));
                 let mapped = alignment.reverse_map_allele(target_m, ref_allele);
+                if mapped == 255 {
+                    continue;
+                }
                 if mapped != targ_allele {
                     mismatches[c][j] = mismatches[c][j].saturating_add(1);
                 }
@@ -1017,6 +1020,7 @@ pub struct ClusterStateProbs {
     ref_cluster_end: std::sync::Arc<Vec<usize>>,
     weight: std::sync::Arc<Vec<f32>>,
     hap_indices: Vec<Vec<u32>>,
+    haps_p1: Vec<Vec<u32>>,
     probs: Vec<Vec<f32>>,
     probs_p1: Vec<Vec<f32>>,
 }
@@ -1033,6 +1037,7 @@ impl ClusterStateProbs {
         let n_clusters = hap_indices.len();
         let threshold = (0.9999f32 / n_states as f32).min(0.005f32);
         let mut filtered_haps = Vec::with_capacity(n_clusters);
+        let mut filtered_haps_p1 = Vec::with_capacity(n_clusters);
         let mut probs = Vec::with_capacity(n_clusters);
         let mut probs_p1 = Vec::with_capacity(n_clusters);
 
@@ -1042,6 +1047,7 @@ impl ClusterStateProbs {
             let next_offset = next * n_states;
 
             let mut haps_row = Vec::new();
+            let mut haps_p1_row = Vec::new();
             let mut prob_row = Vec::new();
             let mut prob_p1_row = Vec::new();
 
@@ -1050,12 +1056,14 @@ impl ClusterStateProbs {
                 let prob_p1 = cluster_probs.get(next_offset + k).copied().unwrap_or(0.0);
                 if prob > threshold || prob_p1 > threshold {
                     haps_row.push(hap_indices[c][k]);
+                    haps_p1_row.push(hap_indices[next][k]);
                     prob_row.push(prob);
                     prob_p1_row.push(prob_p1);
                 }
             }
 
             filtered_haps.push(haps_row);
+            filtered_haps_p1.push(haps_p1_row);
             probs.push(prob_row);
             probs_p1.push(prob_p1_row);
         }
@@ -1065,6 +1073,7 @@ impl ClusterStateProbs {
             ref_cluster_end,
             weight,
             hap_indices: filtered_haps,
+            haps_p1: filtered_haps_p1,
             probs,
             probs_p1,
         }
@@ -1093,6 +1102,7 @@ impl ClusterStateProbs {
         }
 
         let haps = &self.hap_indices[cluster];
+        let haps_p1 = &self.haps_p1[cluster];
         let probs = &self.probs[cluster];
         let probs_p1 = &self.probs_p1[cluster];
 
@@ -1102,16 +1112,31 @@ impl ClusterStateProbs {
             for (j, &hap) in haps.iter().enumerate() {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
                 let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                let interp = if in_cluster {
-                    prob
+                if in_cluster {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele == 1 {
+                        p_alt += prob;
+                    } else if allele == 0 {
+                        p_ref += prob;
+                    }
                 } else {
-                    weight * prob + (1.0 - weight) * prob_p1
-                };
-                let allele = get_ref_allele(ref_marker, hap);
-                if allele == 1 {
-                    p_alt += interp;
-                } else if allele == 0 {
-                    p_ref += interp;
+                    let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
+                    let prob_left = weight * prob;
+                    let prob_right = (1.0 - weight) * prob_p1;
+
+                    let allele_left = get_ref_allele(ref_marker, hap);
+                    if allele_left == 1 {
+                        p_alt += prob_left;
+                    } else if allele_left == 0 {
+                        p_ref += prob_left;
+                    }
+
+                    let allele_right = get_ref_allele(ref_marker, hap_right);
+                    if allele_right == 1 {
+                        p_alt += prob_right;
+                    } else if allele_right == 0 {
+                        p_ref += prob_right;
+                    }
                 }
             }
             let total = p_ref + p_alt;
@@ -1122,14 +1147,25 @@ impl ClusterStateProbs {
             for (j, &hap) in haps.iter().enumerate() {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
                 let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                let interp = if in_cluster {
-                    prob
+                if in_cluster {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs[allele as usize] += prob;
+                    }
                 } else {
-                    weight * prob + (1.0 - weight) * prob_p1
-                };
-                let allele = get_ref_allele(ref_marker, hap);
-                if allele != 255 && (allele as usize) < n_alleles {
-                    al_probs[allele as usize] += interp;
+                    let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
+                    let prob_left = weight * prob;
+                    let prob_right = (1.0 - weight) * prob_p1;
+
+                    let allele_left = get_ref_allele(ref_marker, hap);
+                    if allele_left != 255 && (allele_left as usize) < n_alleles {
+                        al_probs[allele_left as usize] += prob_left;
+                    }
+
+                    let allele_right = get_ref_allele(ref_marker, hap_right);
+                    if allele_right != 255 && (allele_right as usize) < n_alleles {
+                        al_probs[allele_right as usize] += prob_right;
+                    }
                 }
             }
             let total: f32 = al_probs.iter().sum();
