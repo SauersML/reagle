@@ -1201,43 +1201,55 @@ impl ImputationPipeline {
                         probs2[a] = 0.0;
                     }
 
-                    if is_genotyped {
-                        // For genotyped markers: use OBSERVED alleles with probability 1.0
-                        // This matches Java's setToObsAlleles() behavior
+                    // Determine correct posteriors (observed allele or HMM)
+                    let (post1, post2) = if is_genotyped {
                         if let Some(target_m) = alignment.target_marker(m) {
                             let target_marker_idx = MarkerIdx::new(target_m as u32);
                             let a1 = target_gt.allele(target_marker_idx, hap1_idx);
                             let a2 = target_gt.allele(target_marker_idx, hap2_idx);
-                            
-                            // Map target alleles to reference allele space
+
                             let a1_mapped = alignment.map_allele(target_m, a1);
                             let a2_mapped = alignment.map_allele(target_m, a2);
-                            
-                            // Set probability 1.0 for observed allele (if not missing)
-                            // If missing, fall back to HMM posteriors
-                            if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
-                                probs1[a1_mapped as usize] = 1.0;
-                            } else {
-                                let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs1[a] = post1.prob(a); }
-                            }
 
-                            if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
-                                probs2[a2_mapped as usize] = 1.0;
+                            // Use observed allele if present, else use HMM posterior
+                            let p1 = if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
+                                AllelePosteriors::Multiallelic({
+                                    let mut p = vec![0.0; n_alleles];
+                                    p[a1_mapped as usize] = 1.0;
+                                    p
+                                })
                             } else {
-                                let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs2[a] = post2.prob(a); }
-                            }
+                                cursor1.allele_posteriors(m, n_alleles, &get_ref_allele)
+                            };
+                            let p2 = if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
+                                AllelePosteriors::Multiallelic({
+                                    let mut p = vec![0.0; n_alleles];
+                                    p[a2_mapped as usize] = 1.0;
+                                    p
+                                })
+                            } else {
+                                cursor2.allele_posteriors(m, n_alleles, &get_ref_allele)
+                            };
+                            (p1, p2)
+                        } else {
+                            // Should not happen, but fallback to HMM
+                            (
+                                cursor1.allele_posteriors(m, n_alleles, &get_ref_allele),
+                                cursor2.allele_posteriors(m, n_alleles, &get_ref_allele),
+                            )
                         }
                     } else {
-                        // For imputed markers: use HMM posteriors
-                        let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                        let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
+                        // For imputed markers, use HMM posteriors
+                        (
+                            cursor1.allele_posteriors(m, n_alleles, &get_ref_allele),
+                            cursor2.allele_posteriors(m, n_alleles, &get_ref_allele),
+                        )
+                    };
 
-                        for a in 0..n_alleles {
-                            probs1[a] = post1.prob(a);
-                            probs2[a] = post2.prob(a);
-                        }
+                    // Populate probability buffers from posteriors
+                    for a in 0..n_alleles {
+                        probs1[a] = post1.prob(a);
+                        probs2[a] = post2.prob(a);
                     }
 
                     if let Some(stats) = quality.get_mut(m) {
