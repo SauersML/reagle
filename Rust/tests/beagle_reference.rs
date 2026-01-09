@@ -3050,6 +3050,7 @@ fn test_genotyped_dosage_matches_hard_call() {
 
 // =============================================================================
 // Hard Phasing Tests - Stress-test phasing correctness
+// STRICT: Rust must be AT LEAST AS GOOD as Java Beagle
 // =============================================================================
 
 /// Sanity check: verify phasing output is well-formed
@@ -3057,6 +3058,7 @@ fn test_genotyped_dosage_matches_hard_call() {
 /// - No missing alleles introduced
 /// - Allele values preserved (same unphased genotype)
 /// - Same number of markers and samples
+/// STRICT: Zero tolerance for corruption
 #[test]
 fn test_phasing_sanity_checks() {
     for source in get_all_data_sources() {
@@ -3086,13 +3088,13 @@ fn test_phasing_sanity_checks() {
         let rust_vcf = work_dir.path().join("rust_phased.vcf.gz");
         let (output_samples, output_records) = parse_vcf(&rust_vcf);
 
-        // CHECK 1: Same number of markers and samples
+        // CHECK 1: Same number of markers and samples - STRICT
         assert_eq!(input_n_markers, output_records.len(),
             "{}: Marker count changed ({} -> {})", source.name, input_n_markers, output_records.len());
         assert_eq!(input_n_samples, output_samples.len(),
             "{}: Sample count changed ({} -> {})", source.name, input_n_samples, output_samples.len());
 
-        // CHECK 2: All genotypes are phased and valid
+        // CHECK 2: All genotypes are phased and valid - STRICT
         let mut unphased_count = 0;
         let mut missing_introduced = 0;
         let mut allele_mismatch = 0;
@@ -3134,27 +3136,27 @@ fn test_phasing_sanity_checks() {
         println!("  Missing introduced: {}", missing_introduced);
         println!("  Allele mismatches: {}", allele_mismatch);
 
-        // STRICT assertions
+        // STRICT: ZERO TOLERANCE for data corruption
         assert!(missing_introduced == 0,
-            "{}: Phasing introduced {} missing genotypes!", source.name, missing_introduced);
+            "{}: PHASING CORRUPTED DATA: introduced {} missing genotypes!", source.name, missing_introduced);
         assert!(allele_mismatch == 0,
-            "{}: Phasing changed {} allele values!", source.name, allele_mismatch);
-        // Allow some unphased (homozygotes don't need phasing)
+            "{}: PHASING CORRUPTED DATA: changed {} allele values!", source.name, allele_mismatch);
+        // STRICT: Almost all genotypes must be phased (< 1% unphased for non-hom sites)
         let unphased_rate = unphased_count as f64 / (input_n_markers * input_n_samples) as f64;
-        assert!(unphased_rate < 0.5,
-            "{}: Too many unphased genotypes: {:.2}%", source.name, unphased_rate * 100.0);
+        assert!(unphased_rate < 0.01,
+            "{}: Too many unphased genotypes: {:.2}% (must be < 1%)", source.name, unphased_rate * 100.0);
 
         println!("\n[{}] Phasing sanity checks PASSED!", source.name);
     }
 }
 
-/// Compare phase switch error rate between Rust and Java
-/// Phase switch = adjacent heterozygotes have different phase orientation
+/// STRICT: Compare phase switch error rate between Rust and Java
+/// Rust must have switch error rate <= Java (not worse than reference implementation)
 #[test]
 fn test_phasing_switch_error_rate() {
     for source in get_all_data_sources() {
         println!("\n{}", "=".repeat(70));
-        println!("=== Phasing Switch Error Rate: {} ===", source.name);
+        println!("=== STRICT Phasing Switch Error Rate: {} ===", source.name);
         println!("{}", "=".repeat(70));
 
         let files = setup_test_files();
@@ -3189,61 +3191,110 @@ fn test_phasing_switch_error_rate() {
         let (_, java_records) = parse_vcf(&java_vcf);
         let (_, rust_records) = parse_vcf(&rust_vcf);
 
-        // Count phase switches relative to Java (treating Java as ground truth)
-        let mut total_het_pairs = 0;
-        let mut rust_switches = 0;
         let n_samples = java_records[0].genotypes.len();
+        let n_markers = java_records.len();
+
+        // Count phase switches for BOTH implementations, comparing to ground truth
+        // Ground truth = input phase (treating it as truth for switch counting)
+        // We compute internal consistency (switches within each implementation)
+        let mut java_total_switches = 0;
+        let mut rust_total_switches = 0;
+        let mut total_het_pairs = 0;
+        
+        // Also count disagreements between Java and Rust
+        let mut rust_vs_java_switches = 0;
+        let mut samples_rust_worse = 0;
+        let mut samples_rust_better = 0;
 
         for s in 0..n_samples {
             let mut prev_java_phase: Option<bool> = None;
             let mut prev_rust_phase: Option<bool> = None;
+            
+            let mut sample_java_switches = 0;
+            let mut sample_rust_switches = 0;
+            let mut sample_het_pairs = 0;
 
-            for m in 0..java_records.len() {
+            for m in 0..n_markers {
                 let j_gt = &java_records[m].genotypes[s].gt;
                 let r_gt = &rust_records[m].genotypes[s].gt;
 
-                // Only consider heterozygotes
-                let j_is_het = j_gt.contains('|') && 
-                    ((j_gt == "0|1") || (j_gt == "1|0"));
-                let r_is_het = r_gt.contains('|') && 
-                    ((r_gt == "0|1") || (r_gt == "1|0"));
+                // Only consider biallelic heterozygotes
+                let j_is_het = j_gt == "0|1" || j_gt == "1|0";
+                let r_is_het = r_gt == "0|1" || r_gt == "1|0";
 
                 if j_is_het && r_is_het {
-                    let j_phase = j_gt == "0|1"; // true = 0|1, false = 1|0
+                    let j_phase = j_gt == "0|1";
                     let r_phase = r_gt == "0|1";
 
                     if let (Some(pj), Some(pr)) = (prev_java_phase, prev_rust_phase) {
-                        total_het_pairs += 1;
-                        // Check if phase orientation changed differently
+                        sample_het_pairs += 1;
+                        
+                        // Count internal switches
+                        if pj != j_phase { sample_java_switches += 1; }
+                        if pr != r_phase { sample_rust_switches += 1; }
+                        
+                        // Count disagreements
                         let j_switched = pj != j_phase;
                         let r_switched = pr != r_phase;
                         if j_switched != r_switched {
-                            rust_switches += 1;
+                            rust_vs_java_switches += 1;
                         }
                     }
                     prev_java_phase = Some(j_phase);
                     prev_rust_phase = Some(r_phase);
                 }
             }
+
+            java_total_switches += sample_java_switches;
+            rust_total_switches += sample_rust_switches;
+            total_het_pairs += sample_het_pairs;
+
+            // Track per-sample performance
+            if sample_rust_switches > sample_java_switches {
+                samples_rust_worse += 1;
+            } else if sample_rust_switches < sample_java_switches {
+                samples_rust_better += 1;
+            }
         }
 
-        let switch_rate = if total_het_pairs > 0 {
-            rust_switches as f64 / total_het_pairs as f64
-        } else {
-            0.0
-        };
+        let java_switch_rate = if total_het_pairs > 0 {
+            java_total_switches as f64 / total_het_pairs as f64
+        } else { 0.0 };
+        
+        let rust_switch_rate = if total_het_pairs > 0 {
+            rust_total_switches as f64 / total_het_pairs as f64
+        } else { 0.0 };
+        
+        let disagreement_rate = if total_het_pairs > 0 {
+            rust_vs_java_switches as f64 / total_het_pairs as f64
+        } else { 0.0 };
 
         println!("[{}] Results:", source.name);
-        println!("  Total het pairs compared: {}", total_het_pairs);
-        println!("  Rust phase switches vs Java: {}", rust_switches);
-        println!("  Switch error rate: {:.4}%", switch_rate * 100.0);
+        println!("  Total het pairs: {}", total_het_pairs);
+        println!("  Java internal switches: {} ({:.4}%)", java_total_switches, java_switch_rate * 100.0);
+        println!("  Rust internal switches: {} ({:.4}%)", rust_total_switches, rust_switch_rate * 100.0);
+        println!("  Disagreement rate: {:.4}%", disagreement_rate * 100.0);
+        println!("  Per-sample: Rust worse={}, Rust better={}, Tied={}", 
+            samples_rust_worse, samples_rust_better, n_samples - samples_rust_worse - samples_rust_better);
 
-        // STRICT: Switch error rate should be low (< 10%)
-        // Note: This is relative to Java, not absolute ground truth
+        // Strict assertions
         if total_het_pairs > 100 {
-            assert!(switch_rate < 0.10,
-                "{}: Switch error rate too high: {:.2}% (expected < 10%)", 
-                source.name, switch_rate * 100.0);
+            // 1. Rust disagreement with Java should be reasonable (< 10%)
+            // Note: Disagreement != error. Different phasing can be equally valid.
+            assert!(disagreement_rate < 0.10,
+                "{}: PHASING DIVERGENCE: Rust disagrees with Java on {:.2}% of het pairs (must be < 10%)", 
+                source.name, disagreement_rate * 100.0);
+            
+            // 2. Rust should not have MORE switches than Java (internal consistency)
+            // Allow 1% tolerance for stochastic differences
+            assert!(rust_switch_rate <= java_switch_rate + 0.01,
+                "{}: RUST WORSE THAN JAVA: Rust switch rate ({:.4}%) > Java ({:.4}%)", 
+                source.name, rust_switch_rate * 100.0, java_switch_rate * 100.0);
+            
+            // 3. Rust should not be worse on majority of samples
+            assert!(samples_rust_worse <= n_samples / 2,
+                "{}: RUST WORSE ON MAJORITY: {} of {} samples have more switches in Rust",
+                source.name, samples_rust_worse, n_samples);
         }
 
         println!("\n[{}] Switch error rate test PASSED!", source.name);

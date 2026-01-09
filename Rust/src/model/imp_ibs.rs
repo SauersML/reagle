@@ -110,20 +110,17 @@ pub fn build_cluster_hap_sequences(
 
             let mut seq_map = vec![0u32; (seq_cnt as usize) * n_alleles];
             seq_cnt = 1;
+            let missing_allele = n_alleles.saturating_sub(1);
 
             // Update target hap sequences first.
             for h in 0..n_targ_haps {
                 let hap_idx = HapIdx::new(h as u32);
                 let allele_raw = target_gt.allele(target_marker_idx, hap_idx);
-                if allele_raw == 255 {
-                    targ_seq[h] = 0;
-                    continue;
-                }
-                let allele = allele_raw as usize;
-                if allele >= n_alleles {
-                    targ_seq[h] = 0;
-                    continue;
-                }
+                let allele = if allele_raw == 255 || (allele_raw as usize) >= n_alleles {
+                    missing_allele
+                } else {
+                    allele_raw as usize
+                };
                 let index = (targ_seq[h] as usize) * n_alleles + allele;
                 if seq_map[index] == 0 {
                     seq_map[index] = seq_cnt;
@@ -140,15 +137,11 @@ pub fn build_cluster_hap_sequences(
                 let hap_idx = HapIdx::new(h as u32);
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), hap_idx);
                 let mapped = alignment.reverse_map_allele(target_m, ref_allele);
-                if mapped == 255 {
-                    ref_seq[h] = 0;
-                    continue;
-                }
-                let allele = mapped as usize;
-                if allele >= n_alleles {
-                    ref_seq[h] = 0;
-                    continue;
-                }
+                let allele = if mapped == 255 || (mapped as usize) >= n_alleles {
+                    missing_allele
+                } else {
+                    mapped as usize
+                };
                 let index = (ref_seq[h] as usize) * n_alleles + allele;
                 ref_seq[h] = seq_map.get(index).copied().unwrap_or(0);
             }
