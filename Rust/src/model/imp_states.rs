@@ -100,6 +100,8 @@ pub struct ImpStates<'a> {
     n_ibs_haps: usize,
     /// Genetic positions of projected markers (used for precise midpoint calculation)
     projected_gen_positions: Option<&'a [f64]>,
+    /// Dense indices of projected (genotyped) markers
+    projected_markers: Option<&'a [usize]>,
     /// Genetic positions of all dense markers (used for precise midpoint calculation)
     dense_gen_positions: Option<&'a [f64]>,
 }
@@ -125,6 +127,7 @@ impl<'a> ImpStates<'a> {
         max_states: usize,
         n_ibs_haps: usize,
         projected_gen_positions: &'a [f64],
+        projected_markers: &'a [usize],
         dense_gen_positions: &'a [f64],
     ) -> Self {
         Self {
@@ -138,6 +141,7 @@ impl<'a> ImpStates<'a> {
             n_ref_haps,
             n_ibs_haps,
             projected_gen_positions: Some(projected_gen_positions),
+            projected_markers: Some(projected_markers),
             dense_gen_positions: Some(dense_gen_positions),
         }
     }
@@ -323,7 +327,7 @@ impl<'a> ImpStates<'a> {
             if self.queue.len() == self.max_states {
                 // Replace oldest composite haplotype
                 if let Some(mut head) = self.queue.pop() {
-                    let start_marker = if let (Some(proj_pos), Some(dense_pos)) = (self.projected_gen_positions, self.dense_gen_positions) {
+                    let start_marker = if let (Some(proj_pos), Some(proj_markers)) = (self.projected_gen_positions, self.projected_markers) {
                         let last_step_idx = head.last_ibs_step.max(0) as usize;
                         let curr_step_idx = step.max(0) as usize;
 
@@ -347,10 +351,10 @@ impl<'a> ImpStates<'a> {
 
                         let mid_pos = (pos_last + pos_curr) / 2.0;
 
-                        // Find dense marker closest to mid_pos
-                        // partition_point returns first element >= mid_pos
-                        let idx = dense_pos.partition_point(|&p| p < mid_pos);
-                        idx.min(dense_pos.len().saturating_sub(1))
+                        // Find projected marker closest to mid_pos, then map to dense index.
+                        let idx = proj_pos.partition_point(|&p| p < mid_pos);
+                        let proj_idx = idx.min(proj_pos.len().saturating_sub(1));
+                        proj_markers.get(proj_idx).copied().unwrap_or(0)
                     } else {
                         // Fallback to old sparse logic (should not happen in projected mode)
                         let mid_step = (head.last_ibs_step + step) / 2;

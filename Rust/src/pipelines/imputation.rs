@@ -1012,6 +1012,7 @@ impl ImputationPipeline {
                         n_states,
                         n_ibs_haps,
                         &projected_gen_positions,
+                        &genotyped_markers_vec,
                         &gen_positions,
                     );
                     (workspace, imp_states)
