@@ -333,7 +333,7 @@ impl StateProbs {
 
         // Sparse storage threshold: min(0.005, 0.9999/K) - matches Java exactly
         // Java: Math.min(0.005f, 0.9999f/nStates)
-        let threshold = (0.005f32).min(0.9999 / n_states.max(1) as f32);
+        let threshold = (0.005f32).min(0.9999f32 / n_states.max(1) as f32);
 
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
