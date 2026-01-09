@@ -624,25 +624,29 @@ impl StateProbs {
 
 
         if n_alleles == 2 {
-            // Java-style interpolation for biallelic sites
+            // Interpolate haplotype alleles with distance-weighted mixing.
             let mut p_alt = 0.0f32;
             let mut p_ref = 0.0f32;
             for (j, &hap) in haps.iter().enumerate() {
-                // Interpolate state probability ONLY if between clusters.
-                // Otherwise, probability is constant within the cluster.
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                if is_between_clusters {
+
+                let (prob_left, prob_right) = if is_between_clusters {
                     let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    let prob_left = weight_left * prob;
-                    let prob_right = (1.0 - weight_left) * prob_p1;
+                    (weight_left * prob, (1.0 - weight_left) * prob_p1)
+                } else if haps_p1.is_some() {
+                    (weight_left * prob, (1.0 - weight_left) * prob)
+                } else {
+                    (prob, 0.0)
+                };
 
-                    let allele_left = get_ref_allele(ref_marker, hap);
-                    if allele_left == 1 {
-                        p_alt += prob_left;
-                    } else if allele_left == 0 {
-                        p_ref += prob_left;
-                    }
+                let allele_left = get_ref_allele(ref_marker, hap);
+                if allele_left == 1 {
+                    p_alt += prob_left;
+                } else if allele_left == 0 {
+                    p_ref += prob_left;
+                }
 
+                if prob_right > 0.0 {
                     if let Some(haps_p1_row) = haps_p1 {
                         let hap_right = haps_p1_row.get(j).copied().unwrap_or(hap);
                         let allele_right = get_ref_allele(ref_marker, hap_right);
@@ -659,36 +663,32 @@ impl StateProbs {
                             p_ref += prob_right;
                         }
                     }
-                } else {
-                    let allele = get_ref_allele(ref_marker, hap);
-                    if allele == 1 {
-                        p_alt += prob;
-                    } else if allele == 0 {
-                        p_ref += prob;
-                    }
                 }
             }
 
-            // Renormalize if there was any missing data
             let total = p_ref + p_alt;
             let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
             AllelePosteriors::Biallelic(p_alt)
         } else {
-            // Java-style interpolation for multiallelic sites
             let mut al_probs = vec![0.0f32; n_alleles];
             for (j, &hap) in haps.iter().enumerate() {
-                // Interpolate state probability ONLY if between clusters.
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                if is_between_clusters {
+
+                let (prob_left, prob_right) = if is_between_clusters {
                     let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    let prob_left = weight_left * prob;
-                    let prob_right = (1.0 - weight_left) * prob_p1;
+                    (weight_left * prob, (1.0 - weight_left) * prob_p1)
+                } else if haps_p1.is_some() {
+                    (weight_left * prob, (1.0 - weight_left) * prob)
+                } else {
+                    (prob, 0.0)
+                };
 
-                    let allele_left = get_ref_allele(ref_marker, hap);
-                    if allele_left != 255 && (allele_left as usize) < n_alleles {
-                        al_probs[allele_left as usize] += prob_left;
-                    }
+                let allele_left = get_ref_allele(ref_marker, hap);
+                if allele_left != 255 && (allele_left as usize) < n_alleles {
+                    al_probs[allele_left as usize] += prob_left;
+                }
 
+                if prob_right > 0.0 {
                     if let Some(haps_p1_row) = haps_p1 {
                         let hap_right = haps_p1_row.get(j).copied().unwrap_or(hap);
                         let allele_right = get_ref_allele(ref_marker, hap_right);
@@ -701,15 +701,9 @@ impl StateProbs {
                             al_probs[allele_right as usize] += prob_right;
                         }
                     }
-                } else {
-                    let allele = get_ref_allele(ref_marker, hap);
-                    if allele != 255 && (allele as usize) < n_alleles {
-                        al_probs[allele as usize] += prob;
-                    }
                 }
             }
 
-            // Renormalize so probabilities sum to 1
             let total: f32 = al_probs.iter().sum();
             if total > 1e-10 {
                 for p in &mut al_probs {
