@@ -1203,6 +1203,7 @@ impl ImputationPipeline {
                             // Set probability 1.0 for observed allele (if not missing)
                             // If missing, fall back to HMM posteriors
                             if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
+                                probs1[..n_alleles].fill(0.0);
                                 probs1[a1_mapped as usize] = 1.0;
                             } else {
                                 let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
@@ -1210,13 +1211,14 @@ impl ImputationPipeline {
                             }
 
                             if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
+                                probs2[..n_alleles].fill(0.0);
                                 probs2[a2_mapped as usize] = 1.0;
                             } else {
                                 let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
                                 for a in 0..n_alleles { probs2[a] = post2.prob(a); }
                             }
                         }
-                    } else {
+                    } else { // Marker is not genotyped in target (imputed)
                         // For imputed markers: use HMM posteriors
                         let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
                         let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
