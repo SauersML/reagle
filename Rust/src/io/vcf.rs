@@ -52,32 +52,49 @@ impl MarkerImputationStats {
         }
     }
 
-    /// Add dosage contribution from a diploid sample
+    /// Add dosage contribution from a diploid sample where estimated = truth.
+    ///
+    /// For imputed markers, the estimated probabilities are the best guess for truth.
     ///
     /// # Arguments
     /// * `probs1` - Allele probabilities for haplotype 1 (length = n_alleles)
     /// * `probs2` - Allele probabilities for haplotype 2 (length = n_alleles)
     pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
+        self.add_sample_with_truth(probs1, probs2, probs1, probs2);
+    }
+
+    /// Add dosage contribution from a diploid sample with separate truth values.
+    ///
+    /// This is used for genotyped markers where the "truth" is the known
+    /// hard-call genotype, while the "estimated" is the HMM's posterior.
+    ///
+    /// # Arguments
+    /// * `est_probs1` - Estimated allele probabilities for haplotype 1
+    /// * `est_probs2` - Estimated allele probabilities for haplotype 2
+    /// * `true_probs1` - True allele probabilities for haplotype 1
+    /// * `true_probs2` - True allele probabilities for haplotype 2
+    pub fn add_sample_with_truth(
+        &mut self,
+        est_probs1: &[f32],
+        est_probs2: &[f32],
+        true_probs1: &[f32],
+        true_probs2: &[f32],
+    ) {
         self.n_samples += 1;
         for a in 1..self.sum_dosages.len() {
-            let p1 = probs1.get(a).copied().unwrap_or(0.0);
-            let p2 = probs2.get(a).copied().unwrap_or(0.0);
-            
-            let dose = p1 + p2;
+            // Estimated dosage calculations from HMM posteriors
+            let p1_est = est_probs1.get(a).copied().unwrap_or(0.0);
+            let p2_est = est_probs2.get(a).copied().unwrap_or(0.0);
+            let dose = p1_est + p2_est;
             let dose_sq = dose * dose;
-            
-            // m = second moment = p1 + p2 + 2*p1*p2
-            // logic:
-            // P(X=0) = (1-p1)(1-p2)
-            // P(X=1) = p1(1-p2) + p2(1-p1) = p1 + p2 - 2p1p2
-            // P(X=2) = p1p2
-            // E[X^2] = 0*P(0) + 1*P(1) + 4*P(2)
-            //        = p1 + p2 - 2p1p2 + 4p1p2
-            //        = p1 + p2 + 2p1p2
-            let m = p1 + p2 + 2.0 * p1 * p2;
-
             self.sum_dosages[a] += dose;
             self.sum_dosages_sq[a] += dose_sq;
+
+            // True variance calculation from hard-called genotypes
+            let p1_true = true_probs1.get(a).copied().unwrap_or(0.0);
+            let p2_true = true_probs2.get(a).copied().unwrap_or(0.0);
+            // m = second moment = E[X^2]
+            let m = p1_true + p2_true + 2.0 * p1_true * p2_true;
             self.sum_expected_truth[a] += m;
         }
     }
