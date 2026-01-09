@@ -1560,24 +1560,49 @@ fn run_hmm_forward_backward_clusters(
     let bwd = &mut workspace.bwd;
     bwd.resize(n_states, 0.0);
     bwd.fill(1.0 / n_states as f32);
-    let mut bwd_sum = 1.0f32;
 
     for c in (0..n_clusters).rev() {
-        let row_offset = c * n_states;
+        // Update bwd to correspond to cluster c using emissions at c+1 and transition
+        if c < n_clusters - 1 {
+            let p_rec = p_recomb.get(c + 1).copied().unwrap_or(0.0);
+            let shift = p_rec / n_states as f32;
 
-        let p_rec = if c < n_clusters - 1 {
-            p_recomb.get(c + 1).copied().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let shift = p_rec / n_states as f32;
-        let scale = (1.0 - p_rec) / bwd_sum;
+            let mismatches = &cluster_mismatches[c + 1];
+            let n_obs = cluster_non_missing.get(c + 1).copied().unwrap_or(0) as usize;
+            let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
+            ratio_pows.resize(n_obs.saturating_add(1), 1.0);
+            for i in 1..=n_obs {
+                ratio_pows[i] = ratio_pows[i - 1] * ratio;
+            }
 
-        for val in bwd.iter_mut().take(n_states) {
-            *val = scale * *val + shift;
+            let mut emitted_sum = 0.0f32;
+            for k in 0..n_states.min(mismatches.len()) {
+                let mismatch_count = mismatches[k] as usize;
+                let mismatch_count = mismatch_count.min(n_obs);
+                let emit = if n_obs == 0 {
+                    1.0
+                } else {
+                    base_emit * ratio_pows[mismatch_count]
+                };
+                bwd[k] *= emit;
+                emitted_sum += bwd[k];
+            }
+
+            if emitted_sum > 0.0 {
+                let scale = (1.0 - p_rec) / emitted_sum;
+                for k in 0..n_states {
+                    bwd[k] = scale * bwd[k] + shift;
+                }
+            } else {
+                let uniform = 1.0 / n_states as f32;
+                for k in 0..n_states {
+                    bwd[k] = uniform;
+                }
+            }
         }
 
-        // Compute posterior: fwd * bwd
+        // Compute posterior: fwd * bwd for cluster c
+        let row_offset = c * n_states;
         let mut state_sum = 0.0f32;
         for (k, val) in bwd.iter().enumerate().take(n_states) {
             let idx = row_offset + k;
@@ -1590,29 +1615,6 @@ fn run_hmm_forward_backward_clusters(
             let inv_sum = 1.0 / state_sum;
             for k in 0..n_states {
                 fwd[row_offset + k] *= inv_sum;
-            }
-        }
-
-        // Apply emission for next backward iteration
-        if c > 0 {
-            let mismatches = &cluster_mismatches[c];
-            let n_obs = cluster_non_missing.get(c).copied().unwrap_or(0) as usize;
-            let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
-            ratio_pows.resize(n_obs.saturating_add(1), 1.0);
-            for i in 1..=n_obs {
-                ratio_pows[i] = ratio_pows[i - 1] * ratio;
-            }
-            bwd_sum = 0.0;
-            for k in 0..n_states.min(mismatches.len()) {
-                let mismatch_count = mismatches[k] as usize;
-                let mismatch_count = mismatch_count.min(n_obs);
-                let emit = if n_obs == 0 {
-                    1.0
-                } else {
-                    base_emit * ratio_pows[mismatch_count]
-                };
-                bwd[k] *= emit;
-                bwd_sum += bwd[k];
             }
         }
     }
