@@ -181,7 +181,7 @@ impl<'a> ImpStates<'a> {
         // Store backward IBS haps for each step
         let mut bwd_ibs_per_step: Vec<Vec<u32>> = vec![Vec::new(); n_steps];
 
-        // STEP 1: Backward PBWT pass
+        // STEP 1: Backward PBWT pass (allocation-free using counting sort)
         {
             let mut pbwt_bwd = CodedPbwtView::new_backward(
                 &mut workspace.pbwt_prefix_bwd[..n_ref_haps],
@@ -209,11 +209,15 @@ impl<'a> ImpStates<'a> {
                         coded_step.closest_pattern_projected(&target_seq, genotyped_markers, &get_ref_allele)
                     });
 
-                pbwt_bwd.update_backward(
+                // Use allocation-free counting sort for backward pass
+                pbwt_bwd.update_backward_counting_sort(
                     coded_step,
                     n_steps,
+                    &mut workspace.sort_counts_bwd,
+                    &mut workspace.sort_offsets_bwd,
+                    &mut workspace.sort_prefix_scratch_bwd,
+                    &mut workspace.sort_div_scratch_bwd,
                     Some((&mut bwd_virtual_pos, target_pattern)),
-                    None,
                 );
 
                 let bwd_ibs: Vec<u32> = pbwt_bwd

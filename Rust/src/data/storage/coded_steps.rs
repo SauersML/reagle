@@ -442,10 +442,13 @@ impl<'a> CodedPbwtView<'a> {
         self.divergence[..n_haps].copy_from_slice(&div_scratch[..n_haps]);
     }
 
-    /// Backward update PBWT with a coded step
+    /// Backward update PBWT with a coded step using counting sort (allocation-free)
     ///
     /// For backward PBWT, divergence represents where the match ENDS (not starts).
     /// We use min aggregation instead of max, and initialize with end-of-chromosome.
+    ///
+    /// This version uses the same counting sort approach as the forward path to avoid
+    /// allocating `Vec<Vec<>>` on every call, which was a major memory pressure point.
     ///
     /// # Virtual Insertion (Optional)
     /// If `virtual_pos` is provided, computes the target's new position using LF-mapping
@@ -454,80 +457,93 @@ impl<'a> CodedPbwtView<'a> {
     /// # Offsets (Optional)
     /// If `offsets` is provided, stores the bucket offsets after sorting.
     /// offsets[i] = start position of pattern i in the sorted array.
-    pub fn update_backward(
+    pub fn update_backward_counting_sort(
         &mut self,
         step: &CodedStep,
         n_steps: usize,
+        counts: &mut Vec<usize>,
+        offsets: &mut Vec<usize>,
+        prefix_scratch: &mut [u32],
+        div_scratch: &mut [i32],
         virtual_pos: Option<(&mut usize, u16)>,
-        offsets: Option<&mut Vec<usize>>,
     ) {
         let n_haps = self.prefix.len();
         let n_patterns = step.n_patterns();
 
-        let mut buckets: Vec<Vec<(u32, i32)>> = vec![Vec::new(); n_patterns.max(1)];
+        if n_patterns == 0 || n_haps == 0 {
+            return;
+        }
 
-        // Extract virtual position info for fused rank computation
-        let (vpos_ref, target_pattern, current_vpos) = match &virtual_pos {
+        // Step 1: Count frequency of each pattern AND compute rank for virtual insertion
+        counts.clear();
+        counts.resize(n_patterns, 0);
+
+        let (has_vpos, target_pattern, current_vpos) = match &virtual_pos {
             Some((vpos, pattern)) => (true, *pattern as usize, (**vpos).min(n_haps)),
             None => (false, 0, 0),
         };
         let mut rank_at_vpos = 0usize;
 
-        // Build buckets AND compute rank in single pass (fused loop)
+        for i in 0..n_haps {
+            let hap = self.prefix[i];
+            let pattern = step.pattern(HapIdx::new(hap)) as usize;
+            if pattern < n_patterns {
+                if has_vpos && pattern == target_pattern && i < current_vpos {
+                    rank_at_vpos += 1;
+                }
+                counts[pattern] += 1;
+            }
+        }
+
+        // Step 2: Compute cumulative offsets
+        offsets.clear();
+        offsets.resize(n_patterns + 1, 0);
+        let mut running = 0usize;
+        for (i, &count) in counts.iter().enumerate() {
+            offsets[i] = running;
+            running += count;
+        }
+        offsets[n_patterns] = running;
+
+        // Step 2.5: Apply LF-mapping for virtual insertion
+        if let Some((vpos, _)) = virtual_pos {
+            if target_pattern < offsets.len() {
+                *vpos = offsets[target_pattern] + rank_at_vpos;
+            }
+        }
+
+        // Step 3: Distribute haplotypes to sorted positions
+        let mut write_pos: Vec<usize> = offsets[..n_patterns].to_vec();
+        let step_end = n_steps as i32;
+
         for i in 0..n_haps {
             let hap = self.prefix[i];
             let div = self.divergence[i];
             let pattern = step.pattern(HapIdx::new(hap)) as usize;
-            if pattern < buckets.len() {
-                // Track rank for virtual insertion (fused with bucket building)
-                if vpos_ref && pattern == target_pattern && i < current_vpos {
-                    rank_at_vpos += 1;
-                }
-                buckets[pattern].push((hap, div));
-            }
-        }
 
-        // Calculate new virtual position using pre-computed rank (LF-mapping)
-        if let Some((vpos, _)) = virtual_pos {
-            if target_pattern < buckets.len() {
-                // Compute offset for target pattern (sum of bucket sizes before it)
-                let mut pattern_offset = 0;
-                for bucket in buckets.iter().take(target_pattern) {
-                    pattern_offset += bucket.len();
-                }
-                *vpos = pattern_offset + rank_at_vpos;
-            }
-        }
+            if pattern < n_patterns {
+                let bucket_start = offsets[pattern];
+                let pos = write_pos[pattern];
 
-        // Compute and store offsets if requested
-        if let Some(offs) = offsets {
-            offs.clear();
-            offs.reserve(n_patterns + 1);
-            let mut running = 0;
-            for bucket in &buckets {
-                offs.push(running);
-                running += bucket.len();
-            }
-            offs.push(running); // Final offset = n_haps
-        }
-
-        // Now scatter to prefix
-        let mut idx = 0;
-        let step_end = n_steps as i32;
-
-        for bucket in &buckets {
-            let bucket_start = idx;
-            for &(hap, div) in bucket {
-                self.prefix[idx] = hap;
-                self.divergence[idx] = if idx == bucket_start {
+                prefix_scratch[pos] = hap;
+                // Backward divergence uses min (match ends)
+                div_scratch[pos] = if pos == bucket_start {
                     step_end.min(div)
                 } else {
                     div
                 };
-                idx += 1;
+
+                write_pos[pattern] += 1;
             }
         }
+
+        // Step 4: Copy results back
+        self.prefix[..n_haps].copy_from_slice(&prefix_scratch[..n_haps]);
+        self.divergence[..n_haps].copy_from_slice(&div_scratch[..n_haps]);
     }
+
+
+
 
     /// Select neighbors around a virtual position, constrained to a pattern bucket
     ///

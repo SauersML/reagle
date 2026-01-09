@@ -87,6 +87,12 @@ impl DenseColumn {
             return 255;
         }
 
+        // Fast path for biallelic sites (99% of cases): single bit lookup
+        if self.bits_per_allele == 1 {
+            return self.bits[idx] as u8;
+        }
+
+        // General multi-allelic path
         let start = idx * self.bits_per_allele as usize;
         let mut allele = 0u8;
         for b in 0..self.bits_per_allele as usize {

@@ -32,14 +32,22 @@ pub struct ImpWorkspace {
     pub pbwt_prefix_bwd: Vec<u32>,
     /// PBWT divergence array for backward direction
     pub pbwt_divergence_bwd: Vec<i32>,
-    /// Pattern counts for counting sort
+    /// Pattern counts for counting sort (forward)
     pub sort_counts: Vec<usize>,
-    /// Cumulative offsets for counting sort
+    /// Cumulative offsets for counting sort (forward)
     pub sort_offsets: Vec<usize>,
-    /// Scratch buffer for new prefix order
+    /// Scratch buffer for new prefix order (forward)
     pub sort_prefix_scratch: Vec<u32>,
-    /// Scratch buffer for new divergence values
+    /// Scratch buffer for new divergence values (forward)
     pub sort_div_scratch: Vec<i32>,
+    /// Pattern counts for counting sort (backward)
+    pub sort_counts_bwd: Vec<usize>,
+    /// Cumulative offsets for counting sort (backward)
+    pub sort_offsets_bwd: Vec<usize>,
+    /// Scratch buffer for new prefix order (backward)
+    pub sort_prefix_scratch_bwd: Vec<u32>,
+    /// Scratch buffer for new divergence values (backward)
+    pub sort_div_scratch_bwd: Vec<i32>,
 }
 
 impl ImpWorkspace {
@@ -64,6 +72,10 @@ impl ImpWorkspace {
             sort_offsets: Vec::new(),
             sort_prefix_scratch: vec![0; n_states],
             sort_div_scratch: vec![0; n_states + 1],
+            sort_counts_bwd: Vec::new(),
+            sort_offsets_bwd: Vec::new(),
+            sort_prefix_scratch_bwd: vec![0; n_states],
+            sort_div_scratch_bwd: vec![0; n_states + 1],
         }
     }
 
@@ -88,6 +100,10 @@ impl ImpWorkspace {
             sort_offsets: Vec::new(),
             sort_prefix_scratch: vec![0; n_ref_haps],
             sort_div_scratch: vec![0; n_ref_haps + 1],
+            sort_counts_bwd: Vec::new(),
+            sort_offsets_bwd: Vec::new(),
+            sort_prefix_scratch_bwd: vec![0; n_ref_haps],
+            sort_div_scratch_bwd: vec![0; n_ref_haps + 1],
         }
     }
 
@@ -127,6 +143,8 @@ impl ImpWorkspace {
         self.pbwt_divergence_bwd.fill(0);
         self.sort_prefix_scratch.resize(n_ref_haps, 0);
         self.sort_div_scratch.resize(n_ref_haps + 1, 0);
+        self.sort_prefix_scratch_bwd.resize(n_ref_haps, 0);
+        self.sort_div_scratch_bwd.resize(n_ref_haps + 1, 0);
     }
 }
 
