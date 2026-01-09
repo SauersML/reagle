@@ -1015,11 +1015,26 @@ impl ImputationPipeline {
         // ─────────────────────────────────────────────────────────────────────
         let ref_panel_coded = info_span!("build_coded_panel").in_scope(|| {
             eprintln!("Building coded reference panel (projected space)...");
+            let effective_step = if n_genotyped <= 1000 {
+                let span = projected_gen_positions
+                    .last()
+                    .copied()
+                    .unwrap_or(0.0)
+                    .saturating_sub(projected_gen_positions.first().copied().unwrap_or(0.0));
+                let avg = if n_genotyped > 1 {
+                    (span / n_genotyped as f64).max(1e-6)
+                } else {
+                    self.config.imp_step as f64
+                };
+                avg.min(self.config.imp_step as f64)
+            } else {
+                self.config.imp_step as f64
+            };
             let panel = RefPanelCoded::from_projected_markers(
                 &ref_gt,
                 &genotyped_markers_vec,
                 &projected_gen_positions,
-                self.config.imp_step as f64,
+                effective_step,
             );
             eprintln!(
                 "  {} steps ({} haps share each pattern on avg), {} projected markers",
