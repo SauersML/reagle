@@ -985,7 +985,12 @@ impl ImputationPipeline {
         } else {
             base_min_ibs
         };
-        let n_ibs_haps = computed.max(min_ibs).max(1).min(n_ref_haps);
+        let n_ibs_haps = if n_genotyped <= 1000 {
+            // Small panels: keep all reference haplotypes to avoid random fill.
+            self.params.n_states.min(n_ref_haps)
+        } else {
+            computed.max(min_ibs).max(1).min(n_ref_haps)
+        };
 
         // Compute genetic positions at genotyped markers only (for projected PBWT)
         let projected_gen_positions: Vec<f64> = genotyped_markers_vec
