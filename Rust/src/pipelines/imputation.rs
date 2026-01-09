@@ -907,33 +907,40 @@ impl ClusterStateProbs {
         cluster_probs: Vec<f32>,
     ) -> Self {
         let n_clusters = hap_indices.len();
+        let threshold = (0.9999f32 / n_states as f32).min(0.005f32);
+        let mut filtered_haps = Vec::with_capacity(n_clusters);
         let mut probs = Vec::with_capacity(n_clusters);
         let mut probs_p1 = Vec::with_capacity(n_clusters);
 
         for c in 0..n_clusters {
-            let row_offset = c * n_states;
-            let mut row = Vec::with_capacity(n_states);
-            for k in 0..n_states {
-                row.push(cluster_probs.get(row_offset + k).copied().unwrap_or(0.0));
-            }
-            probs.push(row);
-        }
-
-        for c in 0..n_clusters {
             let next = if c + 1 < n_clusters { c + 1 } else { c };
-            let row_offset = next * n_states;
-            let mut row = Vec::with_capacity(n_states);
+            let row_offset = c * n_states;
+            let next_offset = next * n_states;
+
+            let mut haps_row = Vec::new();
+            let mut prob_row = Vec::new();
+            let mut prob_p1_row = Vec::new();
+
             for k in 0..n_states {
-                row.push(cluster_probs.get(row_offset + k).copied().unwrap_or(0.0));
+                let prob = cluster_probs.get(row_offset + k).copied().unwrap_or(0.0);
+                let prob_p1 = cluster_probs.get(next_offset + k).copied().unwrap_or(0.0);
+                if prob > threshold || prob_p1 > threshold {
+                    haps_row.push(hap_indices[c][k]);
+                    prob_row.push(prob);
+                    prob_p1_row.push(prob_p1);
+                }
             }
-            probs_p1.push(row);
+
+            filtered_haps.push(haps_row);
+            probs.push(prob_row);
+            probs_p1.push(prob_p1_row);
         }
 
         Self {
             marker_cluster,
             ref_cluster_end,
             weight,
-            hap_indices,
+            hap_indices: filtered_haps,
             probs,
             probs_p1,
         }
