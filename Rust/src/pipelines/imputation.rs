@@ -2374,6 +2374,7 @@ mod tests {
             state_probs,
             gen_positions,
             marker_to_cluster,
+            None,
         );
 
         // Hap 0 = REF (0), Hap 1 = ALT (1)
@@ -2461,6 +2462,7 @@ mod tests {
             state_probs,
             gen_positions,
             marker_to_cluster,
+            None,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
@@ -2505,6 +2507,7 @@ mod tests {
             state_probs,
             gen_positions,
             marker_to_cluster,
+            None,
         );
 
         // Allele mapping: hap 0,1 = REF (0), hap 2,3 = ALT (1)
@@ -2586,6 +2589,7 @@ mod tests {
             state_probs,
             gen_positions.clone(),
             marker_to_cluster,
+            None,
         );
 
         // Reference allele function: hap 0 = REF, hap 1 = ALT, hap 2 = ALT
@@ -2645,6 +2649,7 @@ mod tests {
             state_probs,
             gen_positions,
             marker_to_cluster,
+            None,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
@@ -2721,6 +2726,7 @@ mod tests {
             state_probs,
             gen_positions,
             marker_to_cluster,
+            None,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
@@ -2757,6 +2763,7 @@ mod tests {
             state_probs,
             gen_positions,
             marker_to_cluster,
+            None,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
@@ -2805,6 +2812,7 @@ mod tests {
             state_probs,
             gen_positions,
             marker_to_cluster,
+            None,
         );
 
         let get_ref_allele = |marker: usize, hap: u32| -> u8 {
