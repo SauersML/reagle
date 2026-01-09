@@ -489,6 +489,13 @@ fn compare_imputation_results(
         let rust_r2 = dosage_correlation(&truth_dosages, &rust_dosages_r2);
         println!("[{}] Overall R^2 (Truth vs Java): {:.6}", name, java_r2);
         println!("[{}] Overall R^2 (Truth vs Rust): {:.6}", name, rust_r2);
+
+        // STRICT: Rust R² vs truth must be >= Java R² vs truth (zero tolerance)
+        assert!(
+            rust_r2 >= java_r2,
+            "[{}] STRICT: Rust R² ({:.6}) WORSE than Java R² ({:.6}) vs truth",
+            name, rust_r2, java_r2
+        );
     }
 
     if !dosage_diffs.is_empty() {
@@ -1862,10 +1869,9 @@ fn compare_dr2_values(java_records: &[ParsedRecord], rust_records: &[ParsedRecor
              rust_mean, rust_genotyped_mean, rust_genotyped_dr2.len(), rust_imputed_mean, rust_imputed_dr2.len());
     println!("  DR2 correlation: {:.4}", dr2_correlation);
 
-    // STRICT: Rust mean DR2 should be >= Java (higher DR2 = better quality)
-    // Allow 0.01 tolerance for numerical differences
+    // STRICT: Rust mean DR2 must be >= Java (zero tolerance)
     assert!(
-        rust_mean >= java_mean - 0.01,
+        rust_mean >= java_mean,
         "[{}] STRICT FAIL: Rust mean DR2 ({:.4}) WORSE than Java ({:.4})",
         name, rust_mean, java_mean
     );
@@ -2043,16 +2049,16 @@ fn test_diverse_mask_scenarios() {
         println!("{:<25} {:>12.4} {:>12.4}", "Brier Score",
                  java_acc.brier_score(), rust_acc.brier_score());
 
-        // STRICT assertions
+        // STRICT assertions (zero tolerance)
         assert!(
-            rust_acc.concordance() >= java_acc.concordance() - 0.001,
+            rust_acc.concordance() >= java_acc.concordance(),
             "{}: Rust concordance ({:.4}%) worse than Java ({:.4}%)",
             scenario_name, rust_acc.concordance() * 100.0, java_acc.concordance() * 100.0
         );
 
         if !java_acc.brier_score().is_nan() && !rust_acc.brier_score().is_nan() {
             assert!(
-                rust_acc.brier_score() <= java_acc.brier_score() + 0.001,
+                rust_acc.brier_score() <= java_acc.brier_score(),
                 "{}: Rust Brier ({:.6}) worse than Java ({:.6})",
                 scenario_name, rust_acc.brier_score(), java_acc.brier_score()
             );
