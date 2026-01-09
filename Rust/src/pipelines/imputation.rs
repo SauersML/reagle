@@ -206,6 +206,49 @@ fn build_marker_cluster_index(
     marker_cluster
 }
 
+fn compute_cluster_mismatches(
+    hap_indices: &[Vec<u32>],
+    cluster_bounds: &[(usize, usize)],
+    genotyped_markers: &[usize],
+    target_gt: &GenotypeMatrix<Phased>,
+    ref_gt: &GenotypeMatrix<Phased>,
+    alignment: &MarkerAlignment,
+    targ_hap: usize,
+    n_states: usize,
+) -> (Vec<Vec<u16>>, Vec<u16>) {
+    let n_clusters = hap_indices.len();
+    let mut mismatches = vec![vec![0u16; n_states]; n_clusters];
+    let mut non_missing = vec![0u16; n_clusters];
+    let targ_hap_idx = HapIdx::new(targ_hap as u32);
+
+    for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
+        if c >= n_clusters {
+            break;
+        }
+        for &ref_m in &genotyped_markers[start..end] {
+            let Some(target_m) = alignment.target_marker(ref_m) else {
+                continue;
+            };
+            let target_marker_idx = MarkerIdx::new(target_m as u32);
+            let targ_allele = target_gt.allele(target_marker_idx, targ_hap_idx);
+            if targ_allele == 255 {
+                continue;
+            }
+            non_missing[c] = non_missing[c].saturating_add(1);
+
+            for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
+                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap));
+                let mapped = alignment.reverse_map_allele(target_m, ref_allele);
+                if mapped != targ_allele {
+                    mismatches[c][j] = mismatches[c][j].saturating_add(1);
+                }
+            }
+        }
+    }
+
+    (mismatches, non_missing)
+}
+
 fn compute_targ_block_end(
     ref_gt: &GenotypeMatrix<Phased>,
     alignment: &MarkerAlignment,
@@ -1400,16 +1443,25 @@ impl ImputationPipeline {
                 },
                 |(workspace, imp_states), h| {
                     let mut hap_indices: Vec<Vec<u32>> = Vec::new();
-                    let mut allele_match: Vec<Vec<bool>> = Vec::new();
                     let actual_n_states = imp_states.ibs_states_cluster(
                         h,
-                        &cluster_seqs,
                         &mut hap_indices,
-                        &mut allele_match,
                     );
 
-                    let cluster_state_probs = run_hmm_forward_backward_clusters_match(
-                        &allele_match,
+                    let (cluster_mismatches, cluster_non_missing) = compute_cluster_mismatches(
+                        &hap_indices,
+                        &cluster_bounds,
+                        &genotyped_markers_vec,
+                        &target_gt,
+                        &ref_gt,
+                        &alignment,
+                        h,
+                        actual_n_states,
+                    );
+
+                    let cluster_state_probs = run_hmm_forward_backward_clusters_counts(
+                        &cluster_mismatches,
+                        &cluster_non_missing,
                         &cluster_p_recomb,
                         &cluster_err_prob,
                         actual_n_states,
@@ -1878,30 +1930,41 @@ fn run_hmm_forward_backward_clusters(
 }
 
 /// Forward-backward HMM on cluster-coded observations (Java ImpLSBaum model).
-fn run_hmm_forward_backward_clusters_match(
-    allele_match: &[Vec<bool>],
+fn run_hmm_forward_backward_clusters_counts(
+    cluster_mismatches: &[Vec<u16>],
+    cluster_non_missing: &[u16],
     p_recomb: &[f32],
     err_prob: &[f32],
     n_states: usize,
     workspace: &mut ImpWorkspace,
 ) -> Vec<f32> {
-    let n_clusters = allele_match.len();
+    let n_clusters = cluster_mismatches.len();
     let fwd = &mut workspace.fwd;
     fwd.resize(n_clusters * n_states, 0.0);
 
     let mut last_sum = 1.0f32;
+    let mut ratio_pows: Vec<f32> = Vec::new();
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
-        let p_err = err_prob.get(m).copied().unwrap_or(0.0);
+        let p_err = err_prob.get(m).copied().unwrap_or(0.0).clamp(1e-8, 0.5);
         let p_no_err = 1.0 - p_err;
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
+
+        let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
+        let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
+        let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
+        ratio_pows.resize(n_obs.saturating_add(1), 1.0);
+        for i in 1..=n_obs {
+            ratio_pows[i] = ratio_pows[i - 1] * ratio;
+        }
 
         let row_offset = m * n_states;
         let prev_offset = if m > 0 { (m - 1) * n_states } else { 0 };
         let mut sum = 0.0f32;
         for k in 0..n_states {
-            let em = if allele_match[m][k] { p_no_err } else { p_err };
+            let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0) as usize;
+            let em = if mism <= n_obs { base_emit * ratio_pows[mism] } else { base_emit };
             let val = if m == 0 {
                 em
             } else {
@@ -1921,10 +1984,18 @@ fn run_hmm_forward_backward_clusters_match(
     for m in (0..n_clusters).rev() {
         let m_p1 = m + 1;
         let p_rec = p_recomb.get(m_p1).copied().unwrap_or(0.0);
-        let p_err = err_prob.get(m).copied().unwrap_or(0.0);
+        let p_err = err_prob.get(m).copied().unwrap_or(0.0).clamp(1e-8, 0.5);
         let p_no_err = 1.0 - p_err;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
         let shift = p_rec / n_states as f32;
+
+        let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
+        let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
+        let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
+        ratio_pows.resize(n_obs.saturating_add(1), 1.0);
+        for i in 1..=n_obs {
+            ratio_pows[i] = ratio_pows[i - 1] * ratio;
+        }
 
         let row_offset = m * n_states;
         let mut bwd_sum = 0.0f32;
@@ -1935,7 +2006,8 @@ fn run_hmm_forward_backward_clusters_match(
             fwd[idx] *= bwd[k];
             state_sum += fwd[idx];
 
-            let em = if allele_match[m][k] { p_no_err } else { p_err };
+            let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0) as usize;
+            let em = if mism <= n_obs { base_emit * ratio_pows[mism] } else { base_emit };
             bwd[k] *= em;
             bwd_sum += bwd[k];
         }

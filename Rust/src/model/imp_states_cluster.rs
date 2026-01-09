@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use crate::model::imp_ibs::{ClusterHapSequences, ImpIbs};
+use crate::model::imp_ibs::ImpIbs;
 use crate::model::states::ThreadedHaps;
 
 const IBS_NIL: i32 = i32::MIN;
@@ -68,9 +68,7 @@ impl<'a> ImpStatesCluster<'a> {
     pub fn ibs_states_cluster(
         &mut self,
         targ_hap: usize,
-        cluster_seqs: &ClusterHapSequences,
         hap_indices: &mut Vec<Vec<u32>>,
-        allele_match: &mut Vec<Vec<bool>>,
     ) -> usize {
         self.initialize();
 
@@ -87,7 +85,7 @@ impl<'a> ImpStatesCluster<'a> {
         }
 
         let n_states = self.queue.len().min(self.max_states);
-        self.build_output(cluster_seqs, targ_hap, n_states, hap_indices, allele_match);
+        self.build_output(n_states, hap_indices);
         n_states
     }
 
@@ -173,33 +171,20 @@ impl<'a> ImpStatesCluster<'a> {
         }
     }
 
-    fn build_output(
-        &mut self,
-        cluster_seqs: &ClusterHapSequences,
-        targ_hap: usize,
-        n_states: usize,
-        hap_indices: &mut Vec<Vec<u32>>,
-        allele_match: &mut Vec<Vec<bool>>,
-    ) {
+    fn build_output(&mut self, n_states: usize, hap_indices: &mut Vec<Vec<u32>>) {
         hap_indices.clear();
         hap_indices.resize(self.n_clusters, vec![0u32; n_states]);
-        allele_match.clear();
-        allele_match.resize(self.n_clusters, vec![false; n_states]);
 
         self.threaded_haps.reset_cursors();
 
         let mut entries: Vec<CompHapEntry> = self.queue.iter().cloned().take(n_states).collect();
         entries.sort_by_key(|e| e.comp_hap_idx);
 
-        let targ_hap_idx = self.n_ref_haps + targ_hap;
         for c in 0..self.n_clusters {
-            let target_seq = cluster_seqs.hap_to_seq[c][targ_hap_idx];
             for (j, entry) in entries.iter().enumerate() {
                 if entry.comp_hap_idx < self.threaded_haps.n_states() {
                     let hap = self.threaded_haps.hap_at_raw(entry.comp_hap_idx, c);
                     hap_indices[c][j] = hap;
-                    let ref_seq = cluster_seqs.hap_to_seq[c][hap as usize];
-                    allele_match[c][j] = ref_seq == target_seq;
                 }
             }
         }
