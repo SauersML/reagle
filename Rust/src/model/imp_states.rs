@@ -224,8 +224,17 @@ impl<'a> ImpStates<'a> {
                     Some((&mut bwd_virtual_pos, target_pattern)),
                 );
 
+                // Restrict to the target's pattern bucket (matches forward pass / Java)
+                let pattern_idx = target_pattern as usize;
+                let bucket_start = workspace.sort_offsets_bwd.get(pattern_idx).copied().unwrap_or(0);
+                let bucket_end = workspace
+                    .sort_offsets_bwd
+                    .get(pattern_idx + 1)
+                    .copied()
+                    .unwrap_or(n_ref_haps);
+
                 let bwd_ibs: Vec<u32> = pbwt_bwd
-                    .select_neighbors_in_bucket(bwd_virtual_pos, n_ibs_haps, 0, n_ref_haps)
+                    .select_neighbors_in_bucket(bwd_virtual_pos, n_ibs_haps, bucket_start, bucket_end)
                     .into_iter()
                     .map(|h| h.0)
                     .collect();
