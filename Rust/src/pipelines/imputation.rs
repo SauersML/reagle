@@ -525,7 +525,7 @@ impl StateProbs {
         let threshold = if n_genotyped <= 1000 {
             0.0
         } else {
-            (0.005f32).min(0.9999 / n_states.max(1) as f32)
+            (0.005f32).min(0.9999f32 / n_states.max(1) as f32)
         };
         let include_all_states = threshold == 0.0;
 
@@ -1529,17 +1529,12 @@ impl ImputationPipeline {
             // Process marker-by-marker (streaming, O(n_markers × n_samples) total)
             for m in 0..n_ref_markers {
                 let n_alleles = n_alleles_per_marker[m];
-                let is_genotyped = has_observed[m];
 
                 // Use an iterator over chunks to access cursors mutably for each sample
                 // This avoids splitting the slice inside the loop
                 let mut cursors_iter = cursors.chunks_exact_mut(2);
 
-                for s in 0..n_target_samples {
-                    let hap1_idx = HapIdx::new((s * 2) as u32);
-                    let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-                    
-                    let cursors_pair = cursors_iter.next().unwrap();
+                while let Some(cursors_pair) = cursors_iter.next() {
                     let (left, right) = cursors_pair.split_at_mut(1);
                     let cursor1 = &mut left[0];
                     let cursor2 = &mut right[0];
@@ -1550,52 +1545,21 @@ impl ImputationPipeline {
                         probs2[a] = 0.0;
                     }
 
-                    let mut skip_sample = false;
-                    if is_genotyped {
-                        // For genotyped markers: use OBSERVED alleles with probability 1.0
-                        // This matches Java's setToObsAlleles() behavior
-                        if let Some(target_m) = alignment.target_marker(m) {
-                            let target_marker_idx = MarkerIdx::new(target_m as u32);
-                            let a1 = target_gt.allele(target_marker_idx, hap1_idx);
-                            let a2 = target_gt.allele(target_marker_idx, hap2_idx);
-                            
-                            // Map target alleles to reference allele space
-                            let a1_mapped = alignment.map_allele(target_m, a1);
-                            let a2_mapped = alignment.map_allele(target_m, a2);
-                            
-                            // Set probability 1.0 for observed allele (if not missing)
-                            // If missing, fall back to HMM posteriors
-                            if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
-                                probs1[a1_mapped as usize] = 1.0;
-                            } else {
-                                skip_sample = true;
-                                let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs1[a] = post1.prob(a); }
-                            }
+                    // For DR2 calculation, we ALWAYS use the HMM's posterior probabilities
+                    // for the numerator (variance of estimated dosage). The HMM re-evaluates
+                    // known genotypes, and this is the basis for the DR2 metric.
+                    // Forcing posteriors to 1.0 for known genotypes leads to zero variance
+                    // if all samples are the same, incorrectly giving DR2=0.0.
+                    let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+                    let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
 
-                            if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
-                                probs2[a2_mapped as usize] = 1.0;
-                            } else {
-                                skip_sample = true;
-                                let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs2[a] = post2.prob(a); }
-                            }
-                        }
-                    } else {
-                        // For imputed markers: use HMM posteriors
-                        let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                        let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-
-                        for a in 0..n_alleles {
-                            probs1[a] = post1.prob(a);
-                            probs2[a] = post2.prob(a);
-                        }
+                    for a in 0..n_alleles {
+                        probs1[a] = post1.prob(a);
+                        probs2[a] = post2.prob(a);
                     }
 
                     if let Some(stats) = quality.get_mut(m) {
-                        if !(is_genotyped && skip_sample) {
-                            stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
-                        }
+                        stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
                     }
                 }
             }
@@ -1959,7 +1923,7 @@ fn run_hmm_forward_backward_clusters_counts(
             let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0) as usize;
             let em = if mism <= n_obs { base_emit * ratio_pows[mism] } else { base_emit };
             let val = if m == 0 {
-                em
+                em / (n_states as f32)
             } else {
                 em * (scale * fwd[prev_offset + k] + shift)
             };
