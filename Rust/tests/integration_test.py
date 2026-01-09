@@ -1383,7 +1383,7 @@ def stage_minimac():
     if not minimac_out.exists():
         print("Running Minimac4...")
         try:
-            run(f"{minimac_bin} --refHaps {paths['ref_vcf']} --haps {paths['input_vcf']} --prefix {data_dir}/minimac_imputed --cpus 4 --format GT,DS")
+            run(f"{minimac_bin} {paths['ref_vcf']} {paths['input_vcf']} --output {data_dir}/minimac_imputed.dose.vcf.gz --threads 4 --format GT,DS --region chr22")
             # Minimac outputs to .dose.vcf.gz
             if (data_dir / "minimac_imputed.dose.vcf.gz").exists():
                 run(f"mv {data_dir}/minimac_imputed.dose.vcf.gz {minimac_out}")
@@ -1415,7 +1415,7 @@ def stage_glimpse():
     if not glimpse_out.exists():
         print("Running GLIMPSE...")
         try:
-            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --output {data_dir}/glimpse_imputed.bcf --threads 4")
+            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region chr22 --output {data_dir}/glimpse_imputed.bcf --threads 4")
             run(f"bcftools view {data_dir}/glimpse_imputed.bcf -O z -o {glimpse_out}")
             run(f"bcftools index -f {glimpse_out}")
         except Exception as e:
@@ -1655,8 +1655,8 @@ def run_minimac_chr(chrom, paths):
         print(f"Running Minimac4 on chr{chrom}...")
         try:
             prefix = data_dir / "minimac_imputed"
-            # Minimac4: --refHaps ref.vcf --haps input.vcf --prefix out
-            run(f"{minimac_bin} --refHaps {paths['ref_vcf']} --haps {paths['input_vcf']} --prefix {prefix} --cpus 4 --format GT,DS")
+            # Minimac4: --refHaps ref.vcf --haps input.vcf --prefix out --region chr
+            run(f"{minimac_bin} {paths['ref_vcf']} {paths['input_vcf']} --output {prefix}.dose.vcf.gz --threads 4 --format GT,DS --region chr{chrom}")
             
             # Helper to move output
             dose_out = data_dir / "minimac_imputed.dose.vcf.gz"
@@ -1688,9 +1688,9 @@ def run_glimpse_chr(chrom, paths):
     if not out.exists():
         print(f"Running GLIMPSE on chr{chrom}...")
         try:
-            # GLIMPSE2_phase: --input-gl input.vcf --reference ref.vcf --output out.bcf
+            # GLIMPSE2_phase: --input-gl input.vcf --reference ref.vcf --input-region chr --output out.bcf
             bcf_out = data_dir / "glimpse_imputed.bcf"
-            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --output {bcf_out} --threads 4")
+            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region chr{chrom} --output {bcf_out} --threads 4")
             run(f"bcftools view {bcf_out} -O z -o {out}")
             run(f"bcftools index -f {out}")
         except Exception as e:
