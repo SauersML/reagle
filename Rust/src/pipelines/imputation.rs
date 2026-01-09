@@ -1395,7 +1395,6 @@ impl ImputationPipeline {
                         n_clusters,
                         n_ref_haps,
                         n_states,
-                        self.config.seed as u64,
                     );
                     (workspace, imp_states)
                 },

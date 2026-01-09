@@ -41,7 +41,6 @@ pub struct ImpStatesCluster<'a> {
     max_states: usize,
     n_clusters: usize,
     n_ref_haps: usize,
-    seed: u64,
     ibs: &'a ImpIbs,
     threaded_haps: ThreadedHaps,
     hap_to_last_ibs: Vec<i32>,
@@ -54,13 +53,11 @@ impl<'a> ImpStatesCluster<'a> {
         n_clusters: usize,
         n_ref_haps: usize,
         max_states: usize,
-        seed: u64,
     ) -> Self {
         Self {
             max_states,
             n_clusters,
             n_ref_haps,
-            seed,
             ibs,
             threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_clusters),
             hap_to_last_ibs: vec![IBS_NIL; n_ref_haps],
@@ -158,7 +155,7 @@ impl<'a> ImpStatesCluster<'a> {
             return;
         }
 
-        let mut rng = StdRng::seed_from_u64(targ_hap_hash as u64 ^ self.seed);
+        let mut rng = StdRng::seed_from_u64(targ_hap_hash as u64);
         let ibs_step = 0;
         let mut attempts = 0;
         while self.queue.len() < n_states && attempts < self.n_ref_haps * 2 {
