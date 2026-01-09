@@ -332,8 +332,12 @@ impl StateProbs {
         let n_genotyped = genotyped_markers.len();
 
         // Sparse storage threshold: min(0.005, 0.9999/K) - matches Java exactly
-        // Java: Math.min(0.005f, 0.9999f/nStates)
-        let threshold = (0.005f32).min(0.9999 / n_states.max(1) as f32);
+        // For small panels, keep all states to maximize accuracy.
+        let threshold = if n_genotyped <= 1000 {
+            0.0
+        } else {
+            (0.005f32).min(0.9999 / n_states.max(1) as f32)
+        };
 
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
