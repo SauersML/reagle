@@ -133,7 +133,7 @@ def create_regions_file(sites, output_path):
 
 def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2):
     """Run Java Beagle for imputation."""
-    cmd = f"java -Xmx4g -jar {beagle_jar} ref={ref_vcf} gt={target_vcf} out={output_prefix} nthreads={nthreads}"
+    cmd = f"java -Xmx4g -jar {beagle_jar} ref={ref_vcf} gt={target_vcf} out={output_prefix} nthreads={nthreads} gp=true"
     try:
         run(cmd)
         output = f"{output_prefix}.vcf.gz"
@@ -148,7 +148,7 @@ def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2):
 def run_reagle(ref_vcf, target_vcf, output_prefix, reagle_bin):
     """Run Reagle for imputation."""
     output_vcf = f"{output_prefix}.vcf.gz"
-    cmd = f"{reagle_bin} --ref {ref_vcf} --gt {target_vcf} --out {output_prefix}"
+    cmd = f"{reagle_bin} --ref {ref_vcf} --gt {target_vcf} --out {output_prefix} --gp"
     try:
         run(cmd)
         if os.path.exists(output_vcf):
@@ -236,16 +236,33 @@ def _parse_imputed_line(line, samples):
             gt_field = fields[0]
             gt = parse_genotype(gt_field)
             is_phased = '|' in gt_field
+            
+            # Expecting GT:DS:GP from bcftools query
+            ds = None
             gp = None
+            
+            # Parse DS (Estimated Dosage)
             if len(fields) > 1 and fields[1] != '.':
                 try:
-                    gp_parts = fields[1].split(',')
+                    ds = float(fields[1])
+                except ValueError:
+                    pass
+            
+            # Parse GP (Genotype Probabilities)
+            if len(fields) > 2 and fields[2] != '.':
+                try:
+                    gp_parts = fields[2].split(',')
                     if len(gp_parts) == 3:
                         gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
                 except:
                     pass
+            
+            # Fallback to hard-call dosage if DS missing
+            if ds is None and gt is not None:
+                ds = calculate_dosage(gt)
+
             if gt is not None:
-                sample_data[samples[i]] = (gt, calculate_dosage(gt), is_phased, gp)
+                sample_data[samples[i]] = (gt, ds, is_phased, gp)
     return key, sample_data
 
 
@@ -372,16 +389,16 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
 
     # Try to get GP field for Hellinger score (Beagle outputs GP)
     # First try with GP, fall back to without
-    imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%GP]\\n' {imputed_vcf} 2>/dev/null"
+    # Request GT:DS:GP to capture Estimated Dosage
+    imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf} 2>/dev/null"
     try:
         imputed_lines = list(_stream_vcf_lines(imputed_cmd))
-        # Check if GP field was present
-        if imputed_lines and ':.' not in imputed_lines[0].split('\t')[4]:
-            pass  # GP field present
-        else:
-            raise ValueError("No GP field")
+        # Check if query succeeded (some tools might not support DS/GP)
+        if not imputed_lines:
+            raise ValueError("Empty output")
     except:
-        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:.]\\n' {imputed_vcf}"
+        # Fallback to GT only (implies DS=GT)
+        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:.:.]\\n' {imputed_vcf}"
         imputed_lines = list(_stream_vcf_lines(imputed_cmd))
 
     # Track previous het for switch error calculation per sample

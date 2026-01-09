@@ -413,6 +413,104 @@ fn extract_dr2(records: &[ParsedRecord]) -> Vec<f64> {
         .collect()
 }
 
+/// Convert a GT string (e.g. "0|1", "1/1") to a dosage value
+fn gt_to_dosage(gt: &str) -> Option<f64> {
+    if gt.contains('.') {
+        return None;
+    }
+    // Simple counting of '1' alleles for biallelic variants
+    // This handles "|" and "/" delimiters automatically
+    Some(gt.matches('1').count() as f64)
+}
+
+/// Helper to compare Java vs Rust imputation results against Ground Truth
+fn compare_imputation_results(
+    name: &str,
+    truth_vcf: &Path,
+    java_vcf: &Path,
+    rust_vcf: &Path,
+) {
+    let (_, java_records) = parse_vcf(java_vcf);
+    let (_, rust_records) = parse_vcf(rust_vcf);
+    let (_, truth_records) = parse_vcf(truth_vcf);
+
+    println!("[{}] Java: {} records, Rust: {} records, Truth: {} records",
+             name, java_records.len(), rust_records.len(), truth_records.len());
+
+    assert_eq!(java_records.len(), rust_records.len(),
+               "{}: Record count mismatch (Java vs Rust)", name);
+    // Truth might have different record count if imputation output includes only imputed sites?
+    // But usually in these tests we expect matching records.
+    if java_records.len() != truth_records.len() {
+        println!("WARNING: [{}] Tuple count mismatch with Truth ({} vs {})",
+                 name, java_records.len(), truth_records.len());
+    }
+
+    // Compare dosages and calculate R^2
+    let mut dosage_diffs: Vec<f64> = Vec::new();
+    let mut truth_dosages: Vec<f64> = Vec::new();
+    let mut java_dosages_r2: Vec<f64> = Vec::new();
+    let mut rust_dosages_r2: Vec<f64> = Vec::new();
+
+    // Iterate up to the length of the shortest vector to avoid panics
+    let len = java_records.len().min(rust_records.len()).min(truth_records.len());
+
+    for i in 0..len {
+        let j_rec = &java_records[i];
+        let r_rec = &rust_records[i];
+        let t_rec = &truth_records[i];
+        
+        // Check if positions match, otherwise alignment is broken
+        assert_eq!(j_rec.pos, r_rec.pos, "{}: Position mismatch (Java vs Rust) at index {}", name, i);
+        assert_eq!(j_rec.pos, t_rec.pos, "{}: Position mismatch (Java vs Truth) at index {}", name, i);
+
+        for k in 0..j_rec.genotypes.len() {
+            if k >= r_rec.genotypes.len() || k >= t_rec.genotypes.len() { continue; }
+            
+            let j_gt = &j_rec.genotypes[k];
+            let r_gt = &r_rec.genotypes[k];
+            let t_gt = &t_rec.genotypes[k];
+
+             if let (Some(j_ds), Some(r_ds)) = (j_gt.ds, r_gt.ds) {
+                let diff = (j_ds - r_ds).abs();
+                dosage_diffs.push(diff);
+
+                if let Some(t_ds) = gt_to_dosage(&t_gt.gt) {
+                    truth_dosages.push(t_ds);
+                    java_dosages_r2.push(j_ds);
+                    rust_dosages_r2.push(r_ds);
+                }
+            }
+        }
+    }
+
+    if !truth_dosages.is_empty() {
+        let java_r2 = dosage_correlation(&truth_dosages, &java_dosages_r2);
+        let rust_r2 = dosage_correlation(&truth_dosages, &rust_dosages_r2);
+        println!("[{}] Overall R^2 (Truth vs Java): {:.6}", name, java_r2);
+        println!("[{}] Overall R^2 (Truth vs Rust): {:.6}", name, rust_r2);
+    }
+
+    if !dosage_diffs.is_empty() {
+        let mean_diff: f64 = dosage_diffs.iter().sum::<f64>() / dosage_diffs.len() as f64;
+        let max_diff: f64 = dosage_diffs.iter().cloned().fold(0.0, f64::max);
+        let within_02: usize = dosage_diffs.iter().filter(|&&d| d < 0.02).count();
+        let within_01: usize = dosage_diffs.iter().filter(|&&d| d < 0.01).count();
+        let pct_within_02 = 100.0 * within_02 as f64 / dosage_diffs.len() as f64;
+        let pct_within_01 = 100.0 * within_01 as f64 / dosage_diffs.len() as f64;
+
+        println!("[{}] Dosage comparison: {} values, mean diff={:.6}, max diff={:.6}",
+                 name, dosage_diffs.len(), mean_diff, max_diff);
+        println!("[{}] Dosages within 0.01: {:.1}%, within 0.02: {:.1}%",
+                 name, pct_within_01, pct_within_02);
+
+        // STRICT: Mean dosage difference must be very small
+        assert!(mean_diff < 0.02, "{}: STRICT FAIL: Mean dosage diff {:.6} >= 0.02", name, mean_diff);
+        // STRICT: 99% of dosages must be within 0.02 of Java
+        assert!(pct_within_02 >= 99.0, "{}: STRICT FAIL: Only {:.1}% of dosages within 0.02", name, pct_within_02);
+    }
+}
+
 /// Run Java BEAGLE with given arguments
 fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::process::Output {
     let mut cmd = Command::new("java");
@@ -560,43 +658,7 @@ fn run_imputation_comparison(source: &TestDataSource) {
     let rust_vcf = work_dir.path().join("rust_imputed.vcf.gz");
 
     // Compare outputs
-    let (_, java_records) = parse_vcf(&java_vcf);
-    let (_, rust_records) = parse_vcf(&rust_vcf);
-
-    println!("[{}] Java: {} records, Rust: {} records",
-             source.name, java_records.len(), rust_records.len());
-
-    assert_eq!(java_records.len(), rust_records.len(),
-               "{}: Record count mismatch", source.name);
-
-    // Compare dosages
-    let mut dosage_diffs: Vec<f64> = Vec::new();
-    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
-        for (j_gt, r_gt) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()) {
-            if let (Some(j_ds), Some(r_ds)) = (j_gt.ds, r_gt.ds) {
-                dosage_diffs.push((j_ds - r_ds).abs());
-            }
-        }
-    }
-
-    if !dosage_diffs.is_empty() {
-        let mean_diff: f64 = dosage_diffs.iter().sum::<f64>() / dosage_diffs.len() as f64;
-        let max_diff: f64 = dosage_diffs.iter().cloned().fold(0.0, f64::max);
-        let within_02: usize = dosage_diffs.iter().filter(|&&d| d < 0.02).count();
-        let within_01: usize = dosage_diffs.iter().filter(|&&d| d < 0.01).count();
-        let pct_within_02 = 100.0 * within_02 as f64 / dosage_diffs.len() as f64;
-        let pct_within_01 = 100.0 * within_01 as f64 / dosage_diffs.len() as f64;
-
-        println!("[{}] Dosage comparison: {} values, mean diff={:.6}, max diff={:.6}",
-                 source.name, dosage_diffs.len(), mean_diff, max_diff);
-        println!("[{}] Dosages within 0.01: {:.1}%, within 0.02: {:.1}%",
-                 source.name, pct_within_01, pct_within_02);
-
-        // STRICT: Mean dosage difference must be very small
-        assert!(mean_diff < 0.02, "{}: STRICT FAIL: Mean dosage diff {:.6} >= 0.02", source.name, mean_diff);
-        // STRICT: 99% of dosages must be within 0.02 of Java
-        assert!(pct_within_02 >= 99.0, "{}: STRICT FAIL: Only {:.1}% of dosages within 0.02", source.name, pct_within_02);
-    }
+    compare_imputation_results(source.name, &gt_path, &java_vcf, &rust_vcf);
 }
 
 #[test]
@@ -690,44 +752,7 @@ fn test_imputation_bref3_ref_rust_vs_java() {
     assert!(java_vcf.exists(), "Java output not created");
     assert!(rust_vcf.exists(), "Rust output not created");
 
-    let (_, java_records) = parse_vcf(&java_vcf);
-    let (_, rust_records) = parse_vcf(&rust_vcf);
-
-    println!("\n=== bref3 Imputation: Rust vs Java ===");
-    println!("Java: {} records, {} bytes", java_records.len(), fs::metadata(&java_vcf).unwrap().len());
-    println!("Rust: {} records, {} bytes", rust_records.len(), fs::metadata(&rust_vcf).unwrap().len());
-
-    assert_eq!(java_records.len(), rust_records.len(), "Record count mismatch");
-
-    // Compare dosages
-    let mut dosage_diffs: Vec<f64> = Vec::new();
-    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
-        for (j_gt, r_gt) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()) {
-            if let (Some(j_ds), Some(r_ds)) = (j_gt.ds, r_gt.ds) {
-                dosage_diffs.push((j_ds - r_ds).abs());
-            }
-        }
-    }
-
-    if !dosage_diffs.is_empty() {
-        let mean_diff: f64 = dosage_diffs.iter().sum::<f64>() / dosage_diffs.len() as f64;
-        let max_diff: f64 = dosage_diffs.iter().cloned().fold(0.0, f64::max);
-        let within_02: usize = dosage_diffs.iter().filter(|&&d| d < 0.02).count();
-        let within_01: usize = dosage_diffs.iter().filter(|&&d| d < 0.01).count();
-        let pct_within_02 = 100.0 * within_02 as f64 / dosage_diffs.len() as f64;
-        let pct_within_01 = 100.0 * within_01 as f64 / dosage_diffs.len() as f64;
-
-        println!("Dosage comparison: {} values, mean diff={:.6}, max diff={:.6}",
-                 dosage_diffs.len(), mean_diff, max_diff);
-        println!("Dosages within 0.01: {:.1}%, within 0.02: {:.1}%", pct_within_01, pct_within_02);
-
-        // STRICT: Mean dosage difference must be very small
-        assert!(mean_diff < 0.02, "STRICT FAIL: Mean dosage diff {:.6} >= 0.02", mean_diff);
-        // STRICT: 99% of dosages must be within 0.02 of Java
-        assert!(pct_within_02 >= 99.0, "STRICT FAIL: Only {:.1}% of dosages within 0.02", pct_within_02);
-    }
-
-    println!("bref3 imputation: Rust matches Java (STRICT)!");
+    compare_imputation_results("bref3 Imputation", &gt_path, &java_vcf, &rust_vcf);
 }
 
 #[test]
@@ -798,6 +823,7 @@ fn run_full_workflow_comparison(source: &TestDataSource) {
             ("gt", gt_path.to_str().unwrap()),
             ("out", java_imp.to_str().unwrap()),
             ("seed", "42"),
+            ("gp", "true"),
         ],
         work_dir.path(),
     );
@@ -809,10 +835,9 @@ fn run_full_workflow_comparison(source: &TestDataSource) {
 
     let java_vcf = work_dir.path().join("java_imputed.vcf.gz");
     let rust_vcf = work_dir.path().join("rust_imputed.vcf.gz");
-    assert!(java_vcf.exists() && rust_vcf.exists());
-    println!("  Java: {} bytes, Rust: {} bytes",
-             fs::metadata(&java_vcf).unwrap().len(),
-             fs::metadata(&rust_vcf).unwrap().len());
+    
+    // Compare outputs including R^2
+    compare_imputation_results(&format!("{} Imputation", source.name), &gt_path, &java_vcf, &rust_vcf);
 
     println!("\n=== [{}] Full workflow passed ===", source.name);
 }
