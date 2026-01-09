@@ -995,8 +995,8 @@ impl ImputationPipeline {
         // Run imputation for each target haplotype with per-thread workspaces
         // Optimization: ImpStates is now created once per thread (not per haplotype)
         // to avoid allocator contention from HashMap/BinaryHeap allocation
-        let state_probs: Vec<Arc<StateProbs>> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
-            (0..n_target_haps)
+        let state_probs: Vec<Arc<StateProbs>> = info_span!("run_hmm", n_samples = n_target_samples).in_scope(|| {
+            (0..n_target_samples)
             .into_par_iter()
             .map_init(
                 // Initialize workspace AND ImpStates for each thread (reduces allocations)
@@ -1016,109 +1016,114 @@ impl ImputationPipeline {
                     (workspace, imp_states)
                 },
                 // Process each haplotype with its thread's workspace and ImpStates
-                |(workspace, imp_states), h| {
-                    let hap_idx = HapIdx::new(h as u32);
+                |(workspace, imp_states), s| {
+                    let sample_idx = crate::data::SampleIdx::new(s as u32);
+                    let mut sample_state_probs = Vec::with_capacity(2);
 
-                    // Build target alleles in DENSE space (with 255s for ungenotyped markers)
-                    // Needed for HMM output computation
-                    let target_alleles_dense: Vec<u8> = (0..n_ref_markers)
-                        .map(|ref_m| {
-                            if let Some(target_m) = alignment.target_marker(ref_m) {
-                                let raw_allele = target_gt.allele(MarkerIdx::new(target_m as u32), hap_idx);
-                                alignment.map_allele(target_m, raw_allele)
-                            } else {
-                                255 // Missing - marker not in target
-                            }
-                        })
-                        .collect();
+                    for hap_idx in [sample_idx.hap1(), sample_idx.hap2()] {
+                        // Build target alleles in DENSE space (with 255s for ungenotyped markers)
+                        // Needed for HMM output computation
+                        let target_alleles_dense: Vec<u8> = (0..n_ref_markers)
+                            .map(|ref_m| {
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let raw_allele = target_gt.allele(MarkerIdx::new(target_m as u32), hap_idx);
+                                    alignment.map_allele(target_m, raw_allele)
+                                } else {
+                                    255 // Missing - marker not in target
+                                }
+                            })
+                            .collect();
 
-                    // Build target alleles in PROJECTED space (indexed by genotyped marker position)
-                    // May still have 255s if this specific sample has missing data at a "genotyped" marker
-                    let target_alleles_projected: Vec<u8> = genotyped_markers_vec
-                        .iter()
-                        .map(|&ref_m| target_alleles_dense[ref_m])
-                        .collect();
+                        // Build target alleles in PROJECTED space (indexed by genotyped marker position)
+                        // May still have 255s if this specific sample has missing data at a "genotyped" marker
+                        let target_alleles_projected: Vec<u8> = genotyped_markers_vec
+                            .iter()
+                            .map(|&ref_m| target_alleles_dense[ref_m])
+                            .collect();
 
-                    // Get reference allele closure (dense space)
-                    let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
-                        ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
-                    };
+                        // Get reference allele closure (dense space)
+                        let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
+                            ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
+                        };
 
-                    // Get IBS-based states using PROJECTED PBWT (exact matching)
-                    // This is the key fix for DR2 regression - PBWT runs on genotyped markers only
-                    let mut sparse_hap_indices: Vec<Vec<u32>> = Vec::new();
-                    let mut sparse_allele_match: Vec<Vec<bool>> = Vec::new();
-                    let actual_n_states = imp_states.ibs_states_projected(
-                        get_ref_allele,
-                        &target_alleles_projected,
-                        &target_alleles_dense,
-                        &genotyped_markers,
-                        workspace,
-                        &mut sparse_hap_indices,
-                        &mut sparse_allele_match,
-                    );
+                        // Get IBS-based states using PROJECTED PBWT (exact matching)
+                        // This is the key fix for DR2 regression - PBWT runs on genotyped markers only
+                        let mut sparse_hap_indices: Vec<Vec<u32>> = Vec::new();
+                        let mut sparse_allele_match: Vec<Vec<bool>> = Vec::new();
+                        let actual_n_states = imp_states.ibs_states_projected(
+                            get_ref_allele,
+                            &target_alleles_projected,
+                            &target_alleles_dense,
+                            &genotyped_markers,
+                            workspace,
+                            &mut sparse_hap_indices,
+                            &mut sparse_allele_match,
+                        );
 
-                    // Aggregate marker-level matches into cluster-level matches.
-                    // A state matches a cluster IFF it matches ALL non-missing markers in that cluster.
-                    // This matches Java's pattern-based matching at the cluster level.
-                    let cluster_allele_match: Vec<Vec<bool>> = clusters
-                        .iter()
-                        .map(|cluster| {
-                            (0..actual_n_states)
-                                .map(|k| {
-                                    // Check if state k matches all markers in this cluster
-                                    (cluster.start..cluster.end).all(|m| {
-                                        // Missing target alleles (255) are treated as matching
-                                        // Note: m is index into genotyped_markers (projected space)
-                                        let target_allele = target_alleles_projected.get(m).copied().unwrap_or(255);
-                                        target_allele == 255 || sparse_allele_match[m][k]
+                        // Aggregate marker-level matches into cluster-level matches.
+                        // A state matches a cluster IFF it matches ALL non-missing markers in that cluster.
+                        // This matches Java's pattern-based matching at the cluster level.
+                        let cluster_allele_match: Vec<Vec<bool>> = clusters
+                            .iter()
+                            .map(|cluster| {
+                                (0..actual_n_states)
+                                    .map(|k| {
+                                        // Check if state k matches all markers in this cluster
+                                        (cluster.start..cluster.end).all(|m| {
+                                            // Missing target alleles (255) are treated as matching
+                                            // Note: m is index into genotyped_markers (projected space)
+                                            let target_allele = target_alleles_projected.get(m).copied().unwrap_or(255);
+                                            target_allele == 255 || sparse_allele_match[m][k]
+                                        })
                                     })
-                                })
-                                .collect()
-                        })
-                        .collect();
+                                    .collect()
+                            })
+                            .collect();
 
-                    // Run forward-backward HMM on CLUSTERS (matches Java ImpLSBaum)
-                    // This is faster (C iterations vs M) and uses correct math
-                    let cluster_state_probs = run_hmm_forward_backward_clusters(
-                        &cluster_allele_match,
-                        &cluster_p_recomb,
-                        &cluster_err,
-                        actual_n_states,
-                        workspace,
-                    );
+                        // Run forward-backward HMM on CLUSTERS (matches Java ImpLSBaum)
+                        // This is faster (C iterations vs M) and uses correct math
+                        let cluster_state_probs = run_hmm_forward_backward_clusters(
+                            &cluster_allele_match,
+                            &cluster_p_recomb,
+                            &cluster_err,
+                            actual_n_states,
+                            workspace,
+                        );
 
-                    // Expand cluster-level state probs to marker-level
-                    // All markers in a cluster get the same state probabilities
-                    let n_genotyped_local = genotyped_markers.len();
-                    let mut hmm_state_probs: Vec<f32> = Vec::with_capacity(n_genotyped_local * actual_n_states);
-                    let default_prob = 1.0 / actual_n_states as f32;
-                    for m in 0..n_genotyped_local {
-                        let cluster_idx = marker_to_cluster[m];
-                        let cluster_offset = cluster_idx * actual_n_states;
-                        for k in 0..actual_n_states {
-                            let prob = cluster_state_probs
-                                .get(cluster_offset + k)
-                                .copied()
-                                .unwrap_or(default_prob);
-                            hmm_state_probs.push(prob);
+                        // Expand cluster-level state probs to marker-level
+                        // All markers in a cluster get the same state probabilities
+                        let n_genotyped_local = genotyped_markers.len();
+                        let mut hmm_state_probs: Vec<f32> = Vec::with_capacity(n_genotyped_local * actual_n_states);
+                        let default_prob = 1.0 / actual_n_states as f32;
+                        for m in 0..n_genotyped_local {
+                            let cluster_idx = marker_to_cluster[m];
+                            let cluster_offset = cluster_idx * actual_n_states;
+                            for k in 0..actual_n_states {
+                                let prob = cluster_state_probs
+                                    .get(cluster_offset + k)
+                                    .copied()
+                                    .unwrap_or(default_prob);
+                                hmm_state_probs.push(prob);
+                            }
                         }
-                    }
 
-                    // Create StateProbs with interpolation support
-                    // NOTE: probs_p1 uses "next marker" which correctly produces:
-                    // - Constant values within clusters (since same-cluster markers have equal probs)
-                    // - Smooth transitions between clusters
-                    Arc::new(StateProbs::new(
-                        std::sync::Arc::clone(&genotyped_markers),
-                        actual_n_states,
-                        sparse_hap_indices,
-                        hmm_state_probs,
-                        std::sync::Arc::clone(&gen_positions),
-                        std::sync::Arc::clone(&marker_to_cluster),
-                    ))
+                        // Create StateProbs with interpolation support
+                        // NOTE: probs_p1 uses "next marker" which correctly produces:
+                        // - Constant values within clusters (since same-cluster markers have equal probs)
+                        // - Smooth transitions between clusters
+                        sample_state_probs.push(Arc::new(StateProbs::new(
+                            std::sync::Arc::clone(&genotyped_markers),
+                            actual_n_states,
+                            sparse_hap_indices,
+                            hmm_state_probs,
+                            std::sync::Arc::clone(&gen_positions),
+                            std::sync::Arc::clone(&marker_to_cluster),
+                        )));
+                    }
+                    sample_state_probs
                 },
             )
+            .flatten()
             .collect()
         });
 
