@@ -3,7 +3,6 @@
 //! Polymorphic storage for genotype data. Replaces Java's `GTRec` class hierarchy
 //! with a single Rust enum.
 
-pub mod coded_steps;
 pub mod dense;
 pub mod dictionary;
 pub mod matrix;
