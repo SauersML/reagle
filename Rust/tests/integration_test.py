@@ -1349,7 +1349,7 @@ def stage_impute5():
     if not impute5_out.exists():
         print("Running IMPUTE5...")
         try:
-            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r chr22 --o {impute5_out} --threads 4")
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r chr22 --buffer-region chr22 --o {impute5_out} --threads 4")
             run(f"bcftools index -f {impute5_out}")
         except Exception as e:
             print(f"IMPUTE5 failed: {e}")
@@ -1602,7 +1602,7 @@ def run_impute5_chr(chrom, paths):
         try:
             # IMPUTE5 requires an indexed reference and map file usually, but minimal example:
             # --h reference --g input --r region --o output
-            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r chr{chrom} --o {out} --threads 4")
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r chr{chrom} --buffer-region chr{chrom} --o {out} --threads 4")
             run(f"bcftools index -f {out}")
         except Exception as e:
             print(f"IMPUTE5 failed on chr{chrom}: {e}")
