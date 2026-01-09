@@ -9,6 +9,9 @@ use crate::model::imp_ibs::ImpIbs;
 use crate::model::states::ThreadedHaps;
 
 const IBS_NIL: i32 = i32::MIN;
+const JAVA_RNG_MULT: u64 = 0x5DEECE66D;
+const JAVA_RNG_ADD: u64 = 0xB;
+const JAVA_RNG_MASK: u64 = (1u64 << 48) - 1;
 
 #[derive(Clone, Debug)]
 struct CompHapEntry {
@@ -34,6 +37,39 @@ impl PartialOrd for CompHapEntry {
 impl Ord for CompHapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         other.last_ibs_step.cmp(&self.last_ibs_step)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JavaRng {
+    seed: u64,
+}
+
+impl JavaRng {
+    fn new(seed: u64) -> Self {
+        let seed = (seed ^ JAVA_RNG_MULT) & JAVA_RNG_MASK;
+        Self { seed }
+    }
+
+    fn next_bits(&mut self, bits: u32) -> u32 {
+        self.seed = (self.seed.wrapping_mul(JAVA_RNG_MULT).wrapping_add(JAVA_RNG_ADD)) & JAVA_RNG_MASK;
+        (self.seed >> (48 - bits)) as u32
+    }
+
+    fn next_int(&mut self, bound: usize) -> usize {
+        if bound <= 1 {
+            return 0;
+        }
+        if bound.is_power_of_two() {
+            return (((bound as u64) * (self.next_bits(31) as u64)) >> 31) as usize;
+        }
+        loop {
+            let bits = self.next_bits(31) as i64;
+            let val = (bits % bound as i64) as i64;
+            if bits - val + (bound as i64 - 1) >= 0 {
+                return val as usize;
+            }
+        }
     }
 }
 
@@ -144,20 +180,16 @@ impl<'a> ImpStatesCluster<'a> {
     }
 
     fn fill_with_random(&mut self, targ_hap_hash: u32) {
-        use rand::rngs::StdRng;
-        use rand::Rng;
-        use rand::SeedableRng;
-
         let n_states = self.max_states.min(self.n_ref_haps);
         if self.queue.len() >= n_states {
             return;
         }
 
-        let mut rng = StdRng::seed_from_u64(targ_hap_hash as u64);
+        let mut rng = JavaRng::new(targ_hap_hash as u64);
         let ibs_step = 0;
         let mut attempts = 0;
         while self.queue.len() < n_states && attempts < self.n_ref_haps * 2 {
-            let h = rng.random_range(0..self.n_ref_haps as u32);
+            let h = rng.next_int(self.n_ref_haps) as u32;
             if self.hap_to_last_ibs[h as usize] == IBS_NIL {
                 let comp_hap_idx = self.threaded_haps.push_new(h);
                 self.queue.push(CompHapEntry {
