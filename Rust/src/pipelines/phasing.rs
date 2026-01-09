@@ -504,14 +504,16 @@ impl PhasingPipeline {
     ) -> Result<GenotypeMatrix<crate::data::storage::phase_state::Phased>> {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
 
         if n_markers == 0 {
             return Ok(target_gt.clone().into_phased());
         }
 
-        self.params = ModelParams::for_phasing(n_haps, self.config.ne, self.config.err);
+        self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
         self.params
-            .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
+            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
 
         // Initialize genotypes preserving actual allele values including missing (255)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
@@ -600,14 +602,16 @@ impl PhasingPipeline {
     ) -> Result<GenotypeMatrix<crate::data::storage::phase_state::Phased>> {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
 
         if n_markers == 0 {
             return Ok(target_gt.clone().into_phased());
         }
 
-        self.params = ModelParams::for_phasing(n_haps, self.config.ne, self.config.err);
+        self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
         self.params
-            .set_n_states(self.config.phase_states.min(n_haps.saturating_sub(2)));
+            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
 
         // Initialize genotypes preserving actual allele values including missing (255)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
