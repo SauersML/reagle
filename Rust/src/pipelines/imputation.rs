@@ -1942,11 +1942,7 @@ fn run_hmm_forward_backward_clusters_counts(
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
-        let mut p_err = base_err_rate * (n_obs as f32);
-        if p_err > 0.5 {
-            p_err = 0.5;
-        }
-        p_err = p_err.clamp(1e-8, 0.5);
+        let p_err = base_err_rate.clamp(1e-8, 0.5);
         let p_no_err = 1.0 - p_err;
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
@@ -1984,11 +1980,7 @@ fn run_hmm_forward_backward_clusters_counts(
         let m_p1 = m + 1;
         let p_rec = p_recomb.get(m_p1).copied().unwrap_or(0.0);
         let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
-        let mut p_err = base_err_rate * (n_obs as f32);
-        if p_err > 0.5 {
-            p_err = 0.5;
-        }
-        p_err = p_err.clamp(1e-8, 0.5);
+        let p_err = base_err_rate.clamp(1e-8, 0.5);
         let p_no_err = 1.0 - p_err;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
         let shift = p_rec / n_states as f32;
