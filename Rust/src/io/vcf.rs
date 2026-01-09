@@ -32,8 +32,10 @@ pub struct MarkerImputationStats {
     pub sum_dosages: Vec<f32>,
     /// Sum of squared dosages (p1 + p2)^2 for each ALT allele
     pub sum_dosages_sq: Vec<f32>,
-    /// Sum of expected true variance second moments (p1 + p2 + 2*p1*p2)
-    pub sum_expected_truth: Vec<f32>,
+    /// Sum of TRUE allele counts (0, 1, or 2) for genotyped markers
+    pub sum_truth: Vec<f32>,
+    /// Sum of SQUARED TRUE allele counts for genotyped markers
+    pub sum_truth_sq: Vec<f32>,
     /// Number of SAMPLES processed (not haplotypes)
     pub n_samples: usize,
     /// Whether this marker was imputed (not in target genotypes)
@@ -46,41 +48,73 @@ impl MarkerImputationStats {
         Self {
             sum_dosages: vec![0.0; n_alleles],
             sum_dosages_sq: vec![0.0; n_alleles],
-            sum_expected_truth: vec![0.0; n_alleles],
+            sum_truth: vec![0.0; n_alleles],
+            sum_truth_sq: vec![0.0; n_alleles],
             n_samples: 0,
             is_imputed: false,
         }
     }
 
-    /// Add dosage contribution from a diploid sample
+    /// Add dosage contribution from an IMPUTED sample
+    ///
+    /// For imputed markers, we don't know the true genotypes. We estimate the
+    /// variance of truth using the second moment of the genotype distribution
+    /// derived from HMM posteriors.
     ///
     /// # Arguments
     /// * `probs1` - Allele probabilities for haplotype 1 (length = n_alleles)
     /// * `probs2` - Allele probabilities for haplotype 2 (length = n_alleles)
-    pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
+    pub fn add_imputed_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
         self.n_samples += 1;
         for a in 1..self.sum_dosages.len() {
             let p1 = probs1.get(a).copied().unwrap_or(0.0);
             let p2 = probs2.get(a).copied().unwrap_or(0.0);
-            
             let dose = p1 + p2;
-            let dose_sq = dose * dose;
-            
-            // m = second moment = p1 + p2 + 2*p1*p2
-            // logic:
-            // P(X=0) = (1-p1)(1-p2)
-            // P(X=1) = p1(1-p2) + p2(1-p1) = p1 + p2 - 2p1p2
-            // P(X=2) = p1p2
-            // E[X^2] = 0*P(0) + 1*P(1) + 4*P(2)
-            //        = p1 + p2 - 2p1p2 + 4p1p2
-            //        = p1 + p2 + 2p1p2
-            let m = p1 + p2 + 2.0 * p1 * p2;
-
             self.sum_dosages[a] += dose;
-            self.sum_dosages_sq[a] += dose_sq;
-            self.sum_expected_truth[a] += m;
+            self.sum_dosages_sq[a] += dose * dose;
+
+            // Estimate Var(X) using posteriors, since truth is unknown
+            // E[X^2] = 1*P(X=1) + 4*P(X=2)
+            //        = (p1(1-p2) + p2(1-p1)) + 4(p1*p2)
+            //        = p1 + p2 + 2*p1*p2
+            let second_moment = p1 + p2 + 2.0 * p1 * p2;
+            self.sum_truth[a] += second_moment; // Store E[X^2] in sum_truth for imputed
         }
     }
+
+    /// Add dosage contribution from a GENOTYPED sample
+    ///
+    /// For genotyped markers, we know the true allele counts. This allows a
+    /// direct, exact calculation of the true variance, which is required for
+    /// an accurate DR2.
+    ///
+    /// # Arguments
+    /// * `a1` - Hard-called allele for haplotype 1 (255 for missing)
+    /// * `a2` - Hard-called allele for haplotype 2 (255 for missing)
+    /// * `posteriors1` - Allele probabilities for haplotype 1 (HMM-refined)
+    /// * `posteriors2` - Allele probabilities for haplotype 2 (HMM-refined)
+    pub fn add_genotyped_sample(&mut self, a1: u8, a2: u8, posteriors1: &[f32], posteriors2: &[f32]) {
+        // Only include non-missing genotypes in DR2 calculation
+        if a1 == 255 || a2 == 255 {
+            return;
+        }
+        self.n_samples += 1;
+
+        // Calculate dosage from HMM-refined posteriors
+        for a in 1..self.sum_dosages.len() {
+            let p1 = posteriors1.get(a).copied().unwrap_or(0.0);
+            let p2 = posteriors2.get(a).copied().unwrap_or(0.0);
+            let dose = p1 + p2;
+            self.sum_dosages[a] += dose;
+            self.sum_dosages_sq[a] += dose * dose;
+
+            // Calculate true allele count from hard-called genotypes
+            let truth = (a1 == a as u8) as u8 + (a2 == a as u8) as u8;
+            self.sum_truth[a] += truth as f32;
+            self.sum_truth_sq[a] += (truth * truth) as f32;
+        }
+    }
+
 
     /// Calculate DR2 (dosage R-squared) for the specified ALT allele
     ///
@@ -92,29 +126,30 @@ impl MarkerImputationStats {
 
         let n = self.n_samples as f32;
         let sum_d = self.sum_dosages[allele];
-        // let mean_d = sum_d / n;
-
-        // Var(d) = Mean(d^2) - Mean(d)^2
-        //        = (sum_d_sq / n) - (sum_d / n)^2
-        //        = (sum_d_sq - sum_d^2/n) / n
         let sum_d_sq = self.sum_dosages_sq[allele];
-        let var_d_num = sum_d_sq - (sum_d * sum_d / n);
-        
-        if var_d_num <= 0.0 {
+
+        // Var(d) = E[d^2] - E[d]^2
+        //        = (sum_d_sq / n) - (sum_d / n)^2
+        let var_d = (sum_d_sq / n) - (sum_d / n).powi(2);
+        if var_d <= 0.0 {
             return 0.0;
         }
-        let var_d = var_d_num / n;
 
-        // Var(X) = Mean(m) - Mean(d)^2
-        //        = (sum_m / n) - (sum_d / n)^2
-        //        = (sum_m - sum_d^2/n) / n
-        let sum_m = self.sum_expected_truth[allele];
-        let var_x_num = sum_m - (sum_d * sum_d / n);
-
-        if var_x_num <= 0.0 {
-            return 0.0;
-        }
-        let var_x = var_x_num / n;
+        // Var(X) calculation depends on whether marker was imputed or genotyped
+        let var_x = if self.is_imputed {
+            // For IMPUTED markers, truth is unknown. We estimate Var(X) from posteriors.
+            // Var(X) = E[X^2] - E[X]^2
+            // E[X] is approximated by E[d] = sum_d / n
+            // E[X^2] is stored in sum_truth (calculated as second moment in add_imputed_sample)
+            let e_x2 = self.sum_truth[allele] / n;
+            e_x2 - (sum_d / n).powi(2)
+        } else {
+            // For GENOTYPED markers, we calculate Var(X) directly from true counts.
+            // Var(X) = E[X^2] - E[X]^2
+            let sum_x = self.sum_truth[allele];
+            let sum_x_sq = self.sum_truth_sq[allele];
+            (sum_x_sq / n) - (sum_x / n).powi(2)
+        };
 
         if var_x <= 1e-9 {
             // No variance in truth (monomorphic site) -> undefined correlation
