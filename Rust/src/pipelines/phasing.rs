@@ -1538,14 +1538,17 @@ impl PhasingPipeline {
                         let allele2 = seq2[m];
                         let is_het = allele1 != 255 && allele2 != 255 && allele1 != allele2;
 
-                        // At het positions: STORE then COLLAPSE
+                        // At het positions: STORE then COLLAPSE only for changeable hets
                         if is_het && het_rev_idx > 0 && het_positions[het_rev_idx - 1] == m {
+                            let cache_idx = het_rev_idx - 1;
                             het_rev_idx -= 1;
-                            bwd1_cache[het_rev_idx].copy_from_slice(&bwd1);
-                            bwd2_cache[het_rev_idx].copy_from_slice(&bwd2);
-                            // COLLAPSE: marginalize over phase
-                            bwd1.copy_from_slice(&bwd0);
-                            bwd2.copy_from_slice(&bwd0);
+                            if cache_idx >= first_changeable_het {
+                                bwd1_cache[cache_idx].copy_from_slice(&bwd1);
+                                bwd2_cache[cache_idx].copy_from_slice(&bwd2);
+                                // COLLAPSE: marginalize over phase
+                                bwd1.copy_from_slice(&bwd0);
+                                bwd2.copy_from_slice(&bwd0);
+                            }
                         }
 
                         if m > 0 {
@@ -1630,7 +1633,8 @@ impl PhasingPipeline {
                 for m in 0..n_markers {
                     let allele1 = seq1_working[m];
                     let allele2 = seq2_working[m];
-                    let is_het = het_idx < n_hets && het_positions[het_idx] == m;
+                    let is_het_any = allele1 != 255 && allele2 != 255 && allele1 != allele2;
+                    let is_unphased_het = het_idx < n_hets && het_positions[het_idx] == m;
 
                     // Cache reference alleles for this marker
                     for k in 0..n_states {
@@ -1659,7 +1663,7 @@ impl PhasingPipeline {
                         }
                     }
 
-                    if is_het {
+                    if is_unphased_het {
                         // Only make phase decisions for hets AFTER overlap region
                         if het_idx >= first_changeable_het {
                             let b1 = &bwd1_cache[het_idx];
@@ -1731,8 +1735,41 @@ impl PhasingPipeline {
                         fwd2_sum = fwd0_sum;
 
                         het_idx += 1;
+                    } else if is_het_any {
+                        // Phased heterozygote (overlap): emit allele-specific tracks, no collapse
+                        fwd0_sum = 0.0;
+                        fwd1_sum = 0.0;
+                        fwd2_sum = 0.0;
+
+                        for k in 0..n_states {
+                            let ref_al = ref_alleles[k];
+                            let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            let emit0 = if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            fwd0[k] = fwd0_prior[k] * emit0;
+                            fwd1[k] = fwd1_prior[k] * emit1;
+                            fwd2[k] = fwd2_prior[k] * emit2;
+                            fwd0_sum += fwd0[k];
+                            fwd1_sum += fwd1[k];
+                            fwd2_sum += fwd2[k];
+                        }
+                        fwd0_sum = fwd0_sum.max(1e-30);
+                        fwd1_sum = fwd1_sum.max(1e-30);
+                        fwd2_sum = fwd2_sum.max(1e-30);
                     } else {
-                        // Not a het: all tracks emit the observed allele
+                        // Homozygous or missing: all tracks emit the observed allele
                         let observed = if allele1 != 255 { allele1 } else { allele2 };
 
                         fwd0_sum = 0.0;
@@ -2056,7 +2093,8 @@ impl PhasingPipeline {
                 for i in 0..n_hi_freq {
                     let allele1 = seq1_working[i];
                     let allele2 = seq2_working[i];
-                    let is_het = het_idx < n_hets && het_positions[het_idx] == i;
+                    let is_het_any = allele1 != 255 && allele2 != 255 && allele1 != allele2;
+                    let is_unphased_het = het_idx < n_hets && het_positions[het_idx] == i;
 
                     // Cache reference alleles for this marker
                     for k in 0..n_states {
@@ -2085,7 +2123,7 @@ impl PhasingPipeline {
                         }
                     }
 
-                    if is_het {
+                    if is_unphased_het {
                         let b1 = &bwd1_cache[het_idx];
                         let b2 = &bwd2_cache[het_idx];
 
@@ -2163,8 +2201,41 @@ impl PhasingPipeline {
                         fwd2_sum = fwd0_sum;
 
                         het_idx += 1;
+                    } else if is_het_any {
+                        // Phased heterozygote: emit allele-specific tracks, no collapse
+                        fwd0_sum = 0.0;
+                        fwd1_sum = 0.0;
+                        fwd2_sum = 0.0;
+
+                        for k in 0..n_states {
+                            let ref_al = ref_alleles[k];
+                            let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            let emit0 = if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            fwd0[k] = fwd0_prior[k] * emit0;
+                            fwd1[k] = fwd1_prior[k] * emit1;
+                            fwd2[k] = fwd2_prior[k] * emit2;
+                            fwd0_sum += fwd0[k];
+                            fwd1_sum += fwd1[k];
+                            fwd2_sum += fwd2[k];
+                        }
+                        fwd0_sum = fwd0_sum.max(1e-30);
+                        fwd1_sum = fwd1_sum.max(1e-30);
+                        fwd2_sum = fwd2_sum.max(1e-30);
                     } else {
-                        // Not a het: all tracks emit the observed allele
+                        // Homozygous or missing: all tracks emit the observed allele
                         let observed = if allele1 != 255 { allele1 } else { allele2 };
 
                         fwd0_sum = 0.0;
