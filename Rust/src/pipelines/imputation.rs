@@ -1510,6 +1510,7 @@ impl ImputationPipeline {
                         probs2[a] = 0.0;
                     }
 
+                    let mut skip_sample = false;
                     if is_genotyped {
                         // For genotyped markers: use OBSERVED alleles with probability 1.0
                         // This matches Java's setToObsAlleles() behavior
@@ -1527,6 +1528,7 @@ impl ImputationPipeline {
                             if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
                                 probs1[a1_mapped as usize] = 1.0;
                             } else {
+                                skip_sample = true;
                                 let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
                                 for a in 0..n_alleles { probs1[a] = post1.prob(a); }
                             }
@@ -1534,6 +1536,7 @@ impl ImputationPipeline {
                             if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
                                 probs2[a2_mapped as usize] = 1.0;
                             } else {
+                                skip_sample = true;
                                 let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
                                 for a in 0..n_alleles { probs2[a] = post2.prob(a); }
                             }
@@ -1550,7 +1553,9 @@ impl ImputationPipeline {
                     }
 
                     if let Some(stats) = quality.get_mut(m) {
-                        stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
+                        if !(is_genotyped && skip_sample) {
+                            stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
+                        }
                     }
                 }
             }
