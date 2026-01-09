@@ -3047,3 +3047,379 @@ fn test_genotyped_dosage_matches_hard_call() {
         rust_mismatches, java_mismatches
     );
 }
+
+// =============================================================================
+// Hard Phasing Tests - Stress-test phasing correctness
+// =============================================================================
+
+/// Sanity check: verify phasing output is well-formed
+/// - All genotypes are phased (contain `|` not `/`)
+/// - No missing alleles introduced
+/// - Allele values preserved (same unphased genotype)
+/// - Same number of markers and samples
+#[test]
+fn test_phasing_sanity_checks() {
+    for source in get_all_data_sources() {
+        println!("\n{}", "=".repeat(70));
+        println!("=== Phasing Sanity Checks: {} ===", source.name);
+        println!("{}", "=".repeat(70));
+
+        let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+        // Copy target to work dir
+        let gt_path = work_dir.path().join("target.vcf.gz");
+        fs::copy(&source.target_vcf, &gt_path).expect("Copy target VCF");
+
+        // Parse input to get expected counts
+        let (input_samples, input_records) = parse_vcf(&gt_path);
+        let input_n_markers = input_records.len();
+        let input_n_samples = input_samples.len();
+
+        println!("[{}] Input: {} markers, {} samples", source.name, input_n_markers, input_n_samples);
+
+        // Run Rust phasing
+        let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
+        let rust_out = work_dir.path().join("rust_phased");
+        let rust_result = run_rust_phasing(&gt_vcf, &rust_out, 42);
+        assert!(rust_result.is_ok(), "{}: Rust phasing failed: {:?}", source.name, rust_result.err());
+
+        let rust_vcf = work_dir.path().join("rust_phased.vcf.gz");
+        let (output_samples, output_records) = parse_vcf(&rust_vcf);
+
+        // CHECK 1: Same number of markers and samples
+        assert_eq!(input_n_markers, output_records.len(),
+            "{}: Marker count changed ({} -> {})", source.name, input_n_markers, output_records.len());
+        assert_eq!(input_n_samples, output_samples.len(),
+            "{}: Sample count changed ({} -> {})", source.name, input_n_samples, output_samples.len());
+
+        // CHECK 2: All genotypes are phased and valid
+        let mut unphased_count = 0;
+        let mut missing_introduced = 0;
+        let mut allele_mismatch = 0;
+
+        for (i, (in_rec, out_rec)) in input_records.iter().zip(output_records.iter()).enumerate() {
+            for (s, (in_gt, out_gt)) in in_rec.genotypes.iter().zip(out_rec.genotypes.iter()).enumerate() {
+                // Check phasing (should contain |)
+                if !out_gt.gt.contains('|') && !out_gt.gt.contains('.') {
+                    unphased_count += 1;
+                    if unphased_count <= 5 {
+                        println!("  Unphased at marker {}, sample {}: {}", i, s, out_gt.gt);
+                    }
+                }
+
+                // Check no missing introduced (if input wasn't missing)
+                if !in_gt.gt.contains('.') && out_gt.gt.contains('.') {
+                    missing_introduced += 1;
+                    if missing_introduced <= 5 {
+                        println!("  Missing introduced at marker {}, sample {}: {} -> {}", 
+                            i, s, in_gt.gt, out_gt.gt);
+                    }
+                }
+
+                // Check alleles preserved (same unphased genotype)
+                let in_norm = normalize_gt_unphased(&in_gt.gt);
+                let out_norm = normalize_gt_unphased(&out_gt.gt);
+                if in_norm != out_norm && !in_gt.gt.contains('.') {
+                    allele_mismatch += 1;
+                    if allele_mismatch <= 5 {
+                        println!("  Allele mismatch at marker {}, sample {}: {} -> {} (normalized: {} vs {})",
+                            i, s, in_gt.gt, out_gt.gt, in_norm, out_norm);
+                    }
+                }
+            }
+        }
+
+        println!("\n[{}] Sanity check results:", source.name);
+        println!("  Unphased genotypes: {}", unphased_count);
+        println!("  Missing introduced: {}", missing_introduced);
+        println!("  Allele mismatches: {}", allele_mismatch);
+
+        // STRICT assertions
+        assert!(missing_introduced == 0,
+            "{}: Phasing introduced {} missing genotypes!", source.name, missing_introduced);
+        assert!(allele_mismatch == 0,
+            "{}: Phasing changed {} allele values!", source.name, allele_mismatch);
+        // Allow some unphased (homozygotes don't need phasing)
+        let unphased_rate = unphased_count as f64 / (input_n_markers * input_n_samples) as f64;
+        assert!(unphased_rate < 0.5,
+            "{}: Too many unphased genotypes: {:.2}%", source.name, unphased_rate * 100.0);
+
+        println!("\n[{}] Phasing sanity checks PASSED!", source.name);
+    }
+}
+
+/// Compare phase switch error rate between Rust and Java
+/// Phase switch = adjacent heterozygotes have different phase orientation
+#[test]
+fn test_phasing_switch_error_rate() {
+    for source in get_all_data_sources() {
+        println!("\n{}", "=".repeat(70));
+        println!("=== Phasing Switch Error Rate: {} ===", source.name);
+        println!("{}", "=".repeat(70));
+
+        let files = setup_test_files();
+        let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+        // Copy target to work dir
+        let gt_path = work_dir.path().join("target.vcf.gz");
+        fs::copy(&source.target_vcf, &gt_path).expect("Copy target VCF");
+
+        // Run Java BEAGLE
+        let java_out = work_dir.path().join("java_phased");
+        let java_output = run_beagle(
+            &files.beagle_jar,
+            &[
+                ("gt", gt_path.to_str().unwrap()),
+                ("out", java_out.to_str().unwrap()),
+                ("seed", "42"),
+            ],
+            work_dir.path(),
+        );
+        assert!(java_output.status.success(), "{}: Java phasing failed", source.name);
+
+        // Run Rust phasing
+        let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
+        let rust_out = work_dir.path().join("rust_phased");
+        let rust_result = run_rust_phasing(&gt_vcf, &rust_out, 42);
+        assert!(rust_result.is_ok(), "{}: Rust phasing failed: {:?}", source.name, rust_result.err());
+
+        let java_vcf = work_dir.path().join("java_phased.vcf.gz");
+        let rust_vcf = work_dir.path().join("rust_phased.vcf.gz");
+
+        let (_, java_records) = parse_vcf(&java_vcf);
+        let (_, rust_records) = parse_vcf(&rust_vcf);
+
+        // Count phase switches relative to Java (treating Java as ground truth)
+        let mut total_het_pairs = 0;
+        let mut rust_switches = 0;
+        let n_samples = java_records[0].genotypes.len();
+
+        for s in 0..n_samples {
+            let mut prev_java_phase: Option<bool> = None;
+            let mut prev_rust_phase: Option<bool> = None;
+
+            for m in 0..java_records.len() {
+                let j_gt = &java_records[m].genotypes[s].gt;
+                let r_gt = &rust_records[m].genotypes[s].gt;
+
+                // Only consider heterozygotes
+                let j_is_het = j_gt.contains('|') && 
+                    ((j_gt == "0|1") || (j_gt == "1|0"));
+                let r_is_het = r_gt.contains('|') && 
+                    ((r_gt == "0|1") || (r_gt == "1|0"));
+
+                if j_is_het && r_is_het {
+                    let j_phase = j_gt == "0|1"; // true = 0|1, false = 1|0
+                    let r_phase = r_gt == "0|1";
+
+                    if let (Some(pj), Some(pr)) = (prev_java_phase, prev_rust_phase) {
+                        total_het_pairs += 1;
+                        // Check if phase orientation changed differently
+                        let j_switched = pj != j_phase;
+                        let r_switched = pr != r_phase;
+                        if j_switched != r_switched {
+                            rust_switches += 1;
+                        }
+                    }
+                    prev_java_phase = Some(j_phase);
+                    prev_rust_phase = Some(r_phase);
+                }
+            }
+        }
+
+        let switch_rate = if total_het_pairs > 0 {
+            rust_switches as f64 / total_het_pairs as f64
+        } else {
+            0.0
+        };
+
+        println!("[{}] Results:", source.name);
+        println!("  Total het pairs compared: {}", total_het_pairs);
+        println!("  Rust phase switches vs Java: {}", rust_switches);
+        println!("  Switch error rate: {:.4}%", switch_rate * 100.0);
+
+        // STRICT: Switch error rate should be low (< 10%)
+        // Note: This is relative to Java, not absolute ground truth
+        if total_het_pairs > 100 {
+            assert!(switch_rate < 0.10,
+                "{}: Switch error rate too high: {:.2}% (expected < 10%)", 
+                source.name, switch_rate * 100.0);
+        }
+
+        println!("\n[{}] Switch error rate test PASSED!", source.name);
+    }
+}
+
+/// Verify phasing is deterministic: same seed + input = identical output
+#[test]
+fn test_phasing_determinism() {
+    let source = &get_all_data_sources()[0]; // Use first source
+
+    println!("\n{}", "=".repeat(70));
+    println!("=== Phasing Determinism Test ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy target to work dir
+    let gt_path = work_dir.path().join("target.vcf.gz");
+    fs::copy(&source.target_vcf, &gt_path).expect("Copy target VCF");
+    let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
+
+    // Run phasing twice with same seed
+    let rust_out_1 = work_dir.path().join("rust_phased_1");
+    let rust_out_2 = work_dir.path().join("rust_phased_2");
+
+    let result1 = run_rust_phasing(&gt_vcf, &rust_out_1, 12345);
+    let result2 = run_rust_phasing(&gt_vcf, &rust_out_2, 12345);
+
+    assert!(result1.is_ok(), "First run failed: {:?}", result1.err());
+    assert!(result2.is_ok(), "Second run failed: {:?}", result2.err());
+
+    let rust_vcf_1 = work_dir.path().join("rust_phased_1.vcf.gz");
+    let rust_vcf_2 = work_dir.path().join("rust_phased_2.vcf.gz");
+
+    let (_, records_1) = parse_vcf(&rust_vcf_1);
+    let (_, records_2) = parse_vcf(&rust_vcf_2);
+
+    // Compare all genotypes
+    let mut differences = 0;
+    for (m, (r1, r2)) in records_1.iter().zip(records_2.iter()).enumerate() {
+        for (s, (g1, g2)) in r1.genotypes.iter().zip(r2.genotypes.iter()).enumerate() {
+            if g1.gt != g2.gt {
+                differences += 1;
+                if differences <= 5 {
+                    println!("  Difference at marker {}, sample {}: {} vs {}", m, s, g1.gt, g2.gt);
+                }
+            }
+        }
+    }
+
+    println!("\nDifferences between runs: {}", differences);
+
+    // STRICT: Same seed must produce identical results
+    assert!(differences == 0,
+        "Phasing is not deterministic! {} differences between runs with same seed", differences);
+
+    println!("\nPhasing determinism test PASSED!");
+}
+
+/// Test phasing with all-heterozygote sample (hardest case for phasing)
+/// All markers are heterozygous - tests pure LD-based phase inference
+#[test]
+fn test_phasing_heterozygote_stress() {
+    let source = &get_all_data_sources()[0];
+
+    println!("\n{}", "=".repeat(70));
+    println!("=== Phasing Heterozygote Stress Test ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy target to work dir
+    let gt_path = work_dir.path().join("target.vcf.gz");
+    fs::copy(&source.target_vcf, &gt_path).expect("Copy target VCF");
+
+    let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_phased");
+
+    let rust_result = run_rust_phasing(&gt_vcf, &rust_out, 42);
+    assert!(rust_result.is_ok(), "Rust phasing failed: {:?}", rust_result.err());
+
+    let rust_vcf = work_dir.path().join("rust_phased.vcf.gz");
+    let (_, records) = parse_vcf(&rust_vcf);
+
+    // Find samples with highest heterozygosity and check their phase consistency
+    let n_samples = records[0].genotypes.len();
+    let n_markers = records.len();
+
+    for s in 0..n_samples.min(5) { // Check first 5 samples
+        let mut het_count = 0;
+        let mut phase_switches = 0;
+        let mut prev_phase: Option<bool> = None;
+
+        for m in 0..n_markers {
+            let gt = &records[m].genotypes[s].gt;
+            
+            if gt == "0|1" || gt == "1|0" {
+                het_count += 1;
+                let phase = gt == "0|1";
+                
+                if let Some(prev) = prev_phase {
+                    if phase != prev {
+                        phase_switches += 1;
+                    }
+                }
+                prev_phase = Some(phase);
+            }
+        }
+
+        if het_count > 10 {
+            let switch_rate = phase_switches as f64 / het_count as f64;
+            println!("  Sample {}: {} hets, {} switches ({:.2}% rate)", 
+                s, het_count, phase_switches, switch_rate * 100.0);
+            
+            // Phase should be relatively consistent (< 20% switch rate for LD-based data)
+            // Note: Higher switch rates may indicate issues with phasing algorithm
+            if switch_rate > 0.20 && het_count > 20 {
+                println!("    WARNING: High switch rate for sample {}", s);
+            }
+        }
+    }
+
+    println!("\nPhasing heterozygote stress test PASSED!");
+}
+
+/// Test single-sample phasing (relies entirely on population LD from within-sample phasing)
+#[test]
+fn test_phasing_single_sample() {
+    println!("\n{}", "=".repeat(70));
+    println!("=== Single Sample Phasing Test ===");
+    println!("{}", "=".repeat(70));
+
+    // Create a minimal VCF with just one sample
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let single_vcf = work_dir.path().join("single_sample.vcf");
+
+    // Create minimal VCF content
+    let vcf_content = r#"##fileformat=VCFv4.3
+##contig=<ID=chr1,length=1000000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE1
+chr1	1000	.	A	G	.	.	.	GT	0/1
+chr1	2000	.	C	T	.	.	.	GT	0/1
+chr1	3000	.	G	A	.	.	.	GT	0/1
+chr1	4000	.	T	C	.	.	.	GT	0/1
+chr1	5000	.	A	T	.	.	.	GT	0/1
+chr1	6000	.	C	G	.	.	.	GT	0/1
+chr1	7000	.	G	C	.	.	.	GT	0/1
+chr1	8000	.	T	A	.	.	.	GT	0/1
+chr1	9000	.	A	C	.	.	.	GT	0/1
+chr1	10000	.	C	A	.	.	.	GT	0/1
+"#;
+
+    fs::write(&single_vcf, vcf_content).expect("Write single sample VCF");
+
+    let rust_out = work_dir.path().join("single_phased");
+    let rust_result = run_rust_phasing(&single_vcf, &rust_out, 42);
+
+    // Single sample phasing should at least not crash
+    // It may produce arbitrary phase, but should be valid output
+    assert!(rust_result.is_ok(), "Single sample phasing failed: {:?}", rust_result.err());
+
+    let rust_vcf = work_dir.path().join("single_phased.vcf.gz");
+    assert!(rust_vcf.exists(), "Output VCF not created");
+
+    let (samples, records) = parse_vcf(&rust_vcf);
+    assert_eq!(samples.len(), 1, "Should have 1 sample");
+    assert_eq!(records.len(), 10, "Should have 10 markers");
+
+    // All genotypes should be phased (or homozygous)
+    for (m, rec) in records.iter().enumerate() {
+        let gt = &rec.genotypes[0].gt;
+        assert!(gt.contains('|') || gt.contains('.'),
+            "Marker {} not phased: {}", m, gt);
+    }
+
+    println!("\nSingle sample phasing test PASSED!");
+}

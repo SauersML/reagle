@@ -1974,37 +1974,51 @@ fn run_hmm_forward_backward_clusters_counts(
     let bwd = &mut workspace.bwd;
     bwd.resize(n_states, 0.0);
     bwd.fill(1.0 / n_states as f32);
-    last_sum = 1.0f32;
 
     for m in (0..n_clusters).rev() {
-        let m_p1 = m + 1;
-        let p_rec = p_recomb.get(m_p1).copied().unwrap_or(0.0);
-        let n_obs = cluster_non_missing.get(m).copied().unwrap_or(0) as usize;
-        let p_err = base_err_rate.clamp(1e-8, 0.5);
-        let p_no_err = 1.0 - p_err;
-        let scale = (1.0 - p_rec) / last_sum.max(1e-30);
-        let shift = p_rec / n_states as f32;
+        // Update bwd to correspond to cluster m using emissions at m+1 and transition.
+        if m + 1 < n_clusters {
+            let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
+            let shift = p_rec / n_states as f32;
 
-        let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
-        let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
-        ratio_pows.resize(n_obs.saturating_add(1), 1.0);
-        for i in 1..=n_obs {
-            ratio_pows[i] = ratio_pows[i - 1] * ratio;
+            let n_obs = cluster_non_missing.get(m + 1).copied().unwrap_or(0) as usize;
+            let p_err = base_err_rate.clamp(1e-8, 0.5);
+            let p_no_err = 1.0 - p_err;
+            let base_emit = if n_obs == 0 { 1.0 } else { p_no_err.powi(n_obs as i32) };
+            let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
+            ratio_pows.resize(n_obs.saturating_add(1), 1.0);
+            for i in 1..=n_obs {
+                ratio_pows[i] = ratio_pows[i - 1] * ratio;
+            }
+
+            let mut emitted_sum = 0.0f32;
+            let mismatches = &cluster_mismatches[m + 1];
+            for k in 0..n_states {
+                let mism = mismatches.get(k).copied().unwrap_or(0) as usize;
+                let em = if mism <= n_obs { base_emit * ratio_pows[mism] } else { base_emit };
+                bwd[k] *= em;
+                emitted_sum += bwd[k];
+            }
+
+            if emitted_sum > 0.0 {
+                let scale = (1.0 - p_rec) / emitted_sum;
+                for k in 0..n_states {
+                    bwd[k] = scale * bwd[k] + shift;
+                }
+            } else {
+                let uniform = 1.0 / n_states as f32;
+                for k in 0..n_states {
+                    bwd[k] = uniform;
+                }
+            }
         }
 
         let row_offset = m * n_states;
-        let mut bwd_sum = 0.0f32;
         let mut state_sum = 0.0f32;
         for k in 0..n_states {
-            bwd[k] = scale * bwd[k] + shift;
             let idx = row_offset + k;
             fwd[idx] *= bwd[k];
             state_sum += fwd[idx];
-
-            let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0) as usize;
-            let em = if mism <= n_obs { base_emit * ratio_pows[mism] } else { base_emit };
-            bwd[k] *= em;
-            bwd_sum += bwd[k];
         }
 
         if state_sum > 0.0 {
@@ -2013,7 +2027,6 @@ fn run_hmm_forward_backward_clusters_counts(
                 fwd[row_offset + k] *= inv;
             }
         }
-        last_sum = bwd_sum.max(1e-30);
     }
 
     fwd.to_vec()

@@ -114,9 +114,15 @@ pub fn build_cluster_hap_sequences(
             // Update target hap sequences first.
             for h in 0..n_targ_haps {
                 let hap_idx = HapIdx::new(h as u32);
-                let mut allele = target_gt.allele(target_marker_idx, hap_idx) as usize;
+                let allele_raw = target_gt.allele(target_marker_idx, hap_idx);
+                if allele_raw == 255 {
+                    targ_seq[h] = 0;
+                    continue;
+                }
+                let allele = allele_raw as usize;
                 if allele >= n_alleles {
-                    allele = 0;
+                    targ_seq[h] = 0;
+                    continue;
                 }
                 let index = (targ_seq[h] as usize) * n_alleles + allele;
                 if seq_map[index] == 0 {
