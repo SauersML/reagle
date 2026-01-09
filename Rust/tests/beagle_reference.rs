@@ -490,10 +490,10 @@ fn compare_imputation_results(
         println!("[{}] Overall R^2 (Truth vs Java): {:.6}", name, java_r2);
         println!("[{}] Overall R^2 (Truth vs Rust): {:.6}", name, rust_r2);
 
-        // STRICT: Rust R² vs truth must be >= Java R² vs truth (zero tolerance)
+        // Strict: Rust R² vs truth must be >= Java R² vs truth (zero tolerance)
         assert!(
             rust_r2 >= java_r2,
-            "[{}] STRICT: Rust R² ({:.6}) WORSE than Java R² ({:.6}) vs truth",
+            "[{}] Strict: Rust R² ({:.6}) WORSE than Java R² ({:.6}) vs truth",
             name, rust_r2, java_r2
         );
     }
@@ -511,10 +511,10 @@ fn compare_imputation_results(
         println!("[{}] Dosages within 0.01: {:.1}%, within 0.02: {:.1}%",
                  name, pct_within_01, pct_within_02);
 
-        // STRICT: Mean dosage difference must be very small
-        assert!(mean_diff < 0.02, "{}: STRICT FAIL: Mean dosage diff {:.6} >= 0.02", name, mean_diff);
-        // STRICT: 99% of dosages must be within 0.02 of Java
-        assert!(pct_within_02 >= 99.0, "{}: STRICT FAIL: Only {:.1}% of dosages within 0.02", name, pct_within_02);
+        // Strict: Mean dosage difference must be very small
+        assert!(mean_diff < 0.02, "{}: Strict FAIL: Mean dosage diff {:.6} >= 0.02", name, mean_diff);
+        // Strict: 99% of dosages must be within 0.02 of Java
+        assert!(pct_within_02 >= 99.0, "{}: Strict FAIL: Only {:.1}% of dosages within 0.02", name, pct_within_02);
     }
 }
 
@@ -1512,12 +1512,12 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     assert!(java_acc.concordance() > 0.80, "{}: Java concordance too low", source.name);
     assert!(rust_acc.concordance() > 0.80, "{}: Rust concordance too low", source.name);
 
-    // STRICT: Rust must be AT LEAST as good as Java - NO TOLERANCE
+    // Strict: Rust must be AT LEAST as good as Java - NO TOLERANCE
     // Brier score: lower is better, so Rust <= Java
     if !java_acc.brier_score().is_nan() && !rust_acc.brier_score().is_nan() {
         assert!(
             rust_acc.brier_score() <= java_acc.brier_score(),
-            "{}: STRICT FAIL: Rust Brier score ({:.6}) WORSE than Java ({:.6})",
+            "{}: Strict FAIL: Rust Brier score ({:.6}) WORSE than Java ({:.6})",
             source.name,
             rust_acc.brier_score(),
             java_acc.brier_score()
@@ -1528,7 +1528,7 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     if rust_acc.rare_total > 0 && java_acc.rare_total > 0 {
         assert!(
             rust_acc.rare_f1() >= java_acc.rare_f1(),
-            "{}: STRICT FAIL: Rust rare F1 ({:.6}) WORSE than Java ({:.6})",
+            "{}: Strict FAIL: Rust rare F1 ({:.6}) WORSE than Java ({:.6})",
             source.name,
             rust_acc.rare_f1(),
             java_acc.rare_f1()
@@ -1538,7 +1538,7 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     // Concordance: higher is better, so Rust >= Java - NO TOLERANCE
     assert!(
         rust_acc.concordance() >= java_acc.concordance(),
-        "{}: STRICT FAIL: Rust concordance ({:.4}%) WORSE than Java ({:.4}%)",
+        "{}: Strict FAIL: Rust concordance ({:.4}%) WORSE than Java ({:.4}%)",
         source.name,
         rust_acc.concordance() * 100.0,
         java_acc.concordance() * 100.0
@@ -1651,7 +1651,7 @@ fn compare_against_beagle(
         beagle_baseline.brier_score
     );
 
-    // STRICT: Pass ONLY if AT LEAST as good as BEAGLE - NO TOLERANCE
+    // Strict: Pass ONLY if AT LEAST as good as BEAGLE - NO TOLERANCE
     let concordance_ok = accuracy.concordance() >= beagle_baseline.concordance;
     let rare_f1_ok = accuracy.rare_f1() >= beagle_baseline.rare_f1;
     let calibration_ok = accuracy.calibration_error() <= beagle_baseline.calibration_error;
@@ -1662,7 +1662,7 @@ fn compare_against_beagle(
         accuracy.brier_score() <= beagle_baseline.brier_score
     };
 
-    println!("\nSTRICT Pass criteria (NO TOLERANCE - must be >= BEAGLE):");
+    println!("\nStrict Pass criteria (NO TOLERANCE - must be >= BEAGLE):");
     println!("  Concordance >= BEAGLE: {}", if concordance_ok { "PASS" } else { "FAIL" });
     println!("  Rare F1 >= BEAGLE: {}", if rare_f1_ok { "PASS" } else { "FAIL" });
     println!("  Calibration <= BEAGLE: {}", if calibration_ok { "PASS" } else { "FAIL" });
@@ -1781,10 +1781,10 @@ fn run_rust_imputation(
 }
 
 // =============================================================================
-// STRICT Quality Metrics Comparison Tests
+// Strict Quality Metrics Comparison Tests
 // =============================================================================
 
-/// Compare DR2 values between Java and Rust (STRICT: Rust must be >= Java)
+/// Compare DR2 values between Java and Rust (Strict: Rust must be >= Java)
 fn compare_dr2_values(java_records: &[ParsedRecord], rust_records: &[ParsedRecord], name: &str) {
     let java_dr2: Vec<f64> = java_records
         .iter()
@@ -1869,14 +1869,14 @@ fn compare_dr2_values(java_records: &[ParsedRecord], rust_records: &[ParsedRecor
              rust_mean, rust_genotyped_mean, rust_genotyped_dr2.len(), rust_imputed_mean, rust_imputed_dr2.len());
     println!("  DR2 correlation: {:.4}", dr2_correlation);
 
-    // STRICT: Rust mean DR2 must be >= Java (zero tolerance)
+    // Strict: Rust mean DR2 must be >= Java (zero tolerance)
     assert!(
         rust_mean >= java_mean,
-        "[{}] STRICT FAIL: Rust mean DR2 ({:.4}) WORSE than Java ({:.4})",
+        "[{}] Strict FAIL: Rust mean DR2 ({:.4}) WORSE than Java ({:.4})",
         name, rust_mean, java_mean
     );
 
-    // STRICT: Rust mean DR2 must be >= Java (already asserted above)
+    // Strict: Rust mean DR2 must be >= Java (already asserted above)
     // Note: Correlation between implementations may be low due to different 
     // imputation strategies, but what matters is that Rust performs at least as well.
     println!("  DR2 correlation (informational): {:.4}", dr2_correlation);
@@ -1908,7 +1908,7 @@ fn compare_dosages(java_records: &[ParsedRecord], rust_records: &[ParsedRecord],
     println!("  Dosage correlation: {:.6}", ds_correlation);
     println!("  Mean absolute diff: {:.6}", mad);
 
-    // STRICT: Dosages should be highly correlated
+    // Strict: Dosages should be highly correlated
     assert!(
         ds_correlation > 0.95,
         "[{}] Dosage correlation too low: {:.6} (expected > 0.95)",
@@ -1981,11 +1981,11 @@ fn compare_genotyped_dosages_to_truth(
     println!("  Dosage correlation with truth: {:.6}", correlation);
     println!("  Mean absolute difference: {:.6}", mad);
     
-    // STRICT: Genotyped markers should have near-perfect correlation with truth (>0.99)
+    // Strict: Genotyped markers should have near-perfect correlation with truth (>0.99)
     // These are markers we already know - no imputation needed
     assert!(
         correlation > 0.99,
-        "[{}] STRICT FAIL: Genotyped marker dosage correlation with truth too low: {:.6} (expected > 0.99)",
+        "[{}] Strict FAIL: Genotyped marker dosage correlation with truth too low: {:.6} (expected > 0.99)",
         name, correlation
     );
 }
@@ -2030,7 +2030,7 @@ fn test_strict_dr2_and_dosage_comparison() {
     // Comprehensive quality metrics comparison between Rust and Java
     for source in get_all_data_sources() {
         println!("\n{}", "=".repeat(70));
-        println!("=== STRICT Quality Metrics Test: {} ===", source.name);
+        println!("=== Strict Quality Metrics Test: {} ===", source.name);
         println!("{}", "=".repeat(70));
 
         let files = setup_test_files();
@@ -2068,13 +2068,13 @@ fn test_strict_dr2_and_dosage_comparison() {
         let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
         let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
 
-        // Compare DR2 values (STRICT)
+        // Compare DR2 values (Strict)
         compare_dr2_values(&java_records, &rust_records, source.name);
 
         // Compare dosages
         compare_dosages(&java_records, &rust_records, source.name);
 
-        println!("\n[{}] STRICT quality metrics test PASSED!", source.name);
+        println!("\n[{}] Strict quality metrics test PASSED!", source.name);
     }
 }
 
@@ -2156,7 +2156,7 @@ fn test_diverse_mask_scenarios() {
         println!("{:<25} {:>12.4} {:>12.4}", "Brier Score",
                  java_acc.brier_score(), rust_acc.brier_score());
 
-        // STRICT assertions (zero tolerance)
+        // Strict assertions (zero tolerance)
         assert!(
             rust_acc.concordance() >= java_acc.concordance(),
             "{}: Rust concordance ({:.4}%) worse than Java ({:.4}%)",
@@ -2432,7 +2432,7 @@ fn test_per_sample_imputation_accuracy() {
         println!("  Worst sample: {} (gap: {:.2}%)", sample_names[worst_sample_idx], max_accuracy_gap * 100.0);
     }
 
-    // STRICT: Rust should not be significantly worse on any sample
+    // Strict: Rust should not be significantly worse on any sample
     assert!(
         max_accuracy_gap < 0.05,
         "Per-sample accuracy gap too large: {:.2}% on sample {}",
@@ -2440,7 +2440,7 @@ fn test_per_sample_imputation_accuracy() {
         sample_names[worst_sample_idx]
     );
 
-    // STRICT: Less than 50% of samples should show Rust worse
+    // Strict: Less than 50% of samples should show Rust worse
     let pct_worse = samples_with_rust_worse as f64 / n_samples as f64;
     assert!(
         pct_worse < 0.5,
@@ -2448,7 +2448,7 @@ fn test_per_sample_imputation_accuracy() {
         pct_worse * 100.0
     );
 
-    // STRICT: Overall Rust accuracy must be >= Java - 1%
+    // Strict: Overall Rust accuracy must be >= Java - 1%
     assert!(
         rust_overall >= java_overall - 0.01,
         "Rust overall accuracy ({:.2}%) worse than Java ({:.2}%) by more than 1%",
@@ -2614,14 +2614,14 @@ fn test_dr2_genotyped_vs_imputed() {
     println!("  Imputed markers where Rust DR2 significantly worse: {}/{}", 
              worse_imp_count, imputed_gaps.len());
 
-    // STRICT: Rust genotyped DR2 should be >= 0.9 on average (known values)
+    // Strict: Rust genotyped DR2 should be >= 0.9 on average (known values)
     assert!(
         rust_geno_mean >= 0.9,
         "GENOTYPED DR2 FAIL: Rust genotyped DR2 ({:.4}) should be >= 0.9 since we know the true values",
         rust_geno_mean
     );
     
-    // STRICT: Rust imputed DR2 should not be much worse than Java
+    // Strict: Rust imputed DR2 should not be much worse than Java
     assert!(
         rust_imp_mean >= java_imp_mean - 0.02,
         "IMPUTED DR2 FAIL: Rust ({:.4}) worse than Java ({:.4}) by more than 0.02",
@@ -2773,7 +2773,7 @@ fn test_dosage_by_distance_from_genotyped() {
     println!("  Imputed markers MAD:   {:.4}", imputed_mad);
     println!("  Difference:            {:.4}", imputed_mad - genotyped_mad);
 
-    // STRICT: No bucket should have mean MAD > 0.05
+    // Strict: No bucket should have mean MAD > 0.05
     assert!(
         !any_bucket_failed,
         "DISTANCE TEST FAIL: At least one distance bucket has mean MAD > 0.05"
@@ -2888,7 +2888,7 @@ fn test_posterior_probability_calibration() {
     println!("  Java: {} ({:.1}%)", java_high_conf, 100.0 * java_high_conf as f64 / java_gp0.len() as f64);
     println!("  Rust: {} ({:.1}%)", rust_high_conf, 100.0 * rust_high_conf as f64 / rust_gp0.len() as f64);
 
-    // STRICT: GP correlation should be high
+    // Strict: GP correlation should be high
     let min_corr = corr_gp0.min(corr_gp1).min(corr_gp2);
     assert!(
         min_corr > 0.90,
@@ -2896,7 +2896,7 @@ fn test_posterior_probability_calibration() {
         min_corr
     );
 
-    // STRICT: Mean GP values should be close
+    // Strict: Mean GP values should be close
     let max_mean_diff = (java_mean_gp0 - rust_mean_gp0).abs()
         .max((java_mean_gp1 - rust_mean_gp1).abs())
         .max((java_mean_gp2 - rust_mean_gp2).abs());
@@ -3040,7 +3040,7 @@ fn test_genotyped_dosage_matches_hard_call() {
         println!("  Rust has MORE mismatches than Java - this is a bug!");
     }
 
-    // STRICT: For genotyped markers, DS MUST equal GT. Java has 0 mismatches.
+    // Strict: For genotyped markers, DS MUST equal GT. Java has 0 mismatches.
     assert!(
         rust_mismatches == 0,
         "GENOTYPED DOSAGE BUG: Rust has {} mismatches (DS != GT), Java has {}", 
@@ -3050,7 +3050,7 @@ fn test_genotyped_dosage_matches_hard_call() {
 
 // =============================================================================
 // Hard Phasing Tests - Stress-test phasing correctness
-// STRICT: Rust must be AT LEAST AS GOOD as Java Beagle
+// Strict: Rust must be AT LEAST AS GOOD as Java Beagle
 // =============================================================================
 
 /// Sanity check: verify phasing output is well-formed
@@ -3058,7 +3058,7 @@ fn test_genotyped_dosage_matches_hard_call() {
 /// - No missing alleles introduced
 /// - Allele values preserved (same unphased genotype)
 /// - Same number of markers and samples
-/// STRICT: Zero tolerance for corruption
+/// Strict: Zero tolerance for corruption
 #[test]
 fn test_phasing_sanity_checks() {
     for source in get_all_data_sources() {
@@ -3088,13 +3088,13 @@ fn test_phasing_sanity_checks() {
         let rust_vcf = work_dir.path().join("rust_phased.vcf.gz");
         let (output_samples, output_records) = parse_vcf(&rust_vcf);
 
-        // CHECK 1: Same number of markers and samples - STRICT
+        // CHECK 1: Same number of markers and samples - Strict
         assert_eq!(input_n_markers, output_records.len(),
             "{}: Marker count changed ({} -> {})", source.name, input_n_markers, output_records.len());
         assert_eq!(input_n_samples, output_samples.len(),
             "{}: Sample count changed ({} -> {})", source.name, input_n_samples, output_samples.len());
 
-        // CHECK 2: All genotypes are phased and valid - STRICT
+        // CHECK 2: All genotypes are phased and valid - Strict
         let mut unphased_count = 0;
         let mut missing_introduced = 0;
         let mut allele_mismatch = 0;
@@ -3136,12 +3136,12 @@ fn test_phasing_sanity_checks() {
         println!("  Missing introduced: {}", missing_introduced);
         println!("  Allele mismatches: {}", allele_mismatch);
 
-        // STRICT: ZERO TOLERANCE for data corruption
+        // Strict: ZERO TOLERANCE for data corruption
         assert!(missing_introduced == 0,
             "{}: PHASING CORRUPTED DATA: introduced {} missing genotypes!", source.name, missing_introduced);
         assert!(allele_mismatch == 0,
             "{}: PHASING CORRUPTED DATA: changed {} allele values!", source.name, allele_mismatch);
-        // STRICT: Almost all genotypes must be phased (< 1% unphased for non-hom sites)
+        // Strict: Almost all genotypes must be phased (< 1% unphased for non-hom sites)
         let unphased_rate = unphased_count as f64 / (input_n_markers * input_n_samples) as f64;
         assert!(unphased_rate < 0.01,
             "{}: Too many unphased genotypes: {:.2}% (must be < 1%)", source.name, unphased_rate * 100.0);
@@ -3150,13 +3150,13 @@ fn test_phasing_sanity_checks() {
     }
 }
 
-/// STRICT: Compare phase switch error rate between Rust and Java
+/// Strict: Compare phase switch error rate between Rust and Java
 /// Rust must have switch error rate <= Java (not worse than reference implementation)
 #[test]
 fn test_phasing_switch_error_rate() {
     for source in get_all_data_sources() {
         println!("\n{}", "=".repeat(70));
-        println!("=== STRICT Phasing Switch Error Rate: {} ===", source.name);
+        println!("=== Strict Phasing Switch Error Rate: {} ===", source.name);
         println!("{}", "=".repeat(70));
 
         let files = setup_test_files();
@@ -3348,7 +3348,7 @@ fn test_phasing_determinism() {
 
     println!("\nDifferences between runs: {}", differences);
 
-    // STRICT: Same seed must produce identical results
+    // Strict: Same seed must produce identical results
     assert!(differences == 0,
         "Phasing is not deterministic! {} differences between runs with same seed", differences);
 
