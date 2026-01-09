@@ -155,7 +155,8 @@ def call_jules(prompt, attempt=1):
         "sourceContext": {
             "source": f"sources/github/{repo}",
             "githubRepoContext": {"startingBranch": "main"}
-        }
+        },
+        "automationMode": "AUTO_CREATE_PR"
     }
 
     print("Sending payload to Jules API:")
@@ -413,17 +414,50 @@ def main():
     print(f"Pushing changes to branch {branch_name}...")
     run_command(f"git push origin {branch_name}", check=True)
 
-    # Create PR via GitHub API
+    # Create PR via GitHub CLI (more reliable than API)
     print("\n--- Creating Pull Request ---")
     github_token = os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
 
-    if github_token and repo:
+    if not github_token:
+        print("WARNING: GITHUB_TOKEN not set, cannot create PR.")
+        sys.exit(0)
+
+    if not repo:
+        print("WARNING: GITHUB_REPOSITORY not set, cannot create PR.")
+        sys.exit(0)
+
+    print(f"Repository: {repo}")
+    print(f"Branch: {branch_name}")
+
+    # Try gh CLI first (most reliable)
+    pr_title = msg[:200] if len(msg) > 200 else msg
+    pr_body = f"Automated improvement by Jules.\n\n**Summary:**\n{msg}"
+
+    # Set GH_TOKEN for gh CLI
+    os.environ["GH_TOKEN"] = github_token
+
+    gh_cmd = [
+        "gh", "pr", "create",
+        "--title", pr_title,
+        "--body", pr_body,
+        "--base", "main",
+        "--head", branch_name
+    ]
+
+    stdout, stderr, code = run_command(gh_cmd)
+    if code == 0:
+        print(f"PR created successfully via gh CLI: {stdout}")
+    else:
+        print(f"gh CLI failed (code {code}): {stderr}")
+        print("Falling back to GitHub API...")
+
+        # Fallback to GitHub API
         pr_payload = {
-            "title": msg[:200] if len(msg) > 200 else msg,
+            "title": pr_title,
             "head": branch_name,
             "base": "main",
-            "body": f"Automated improvement by Jules.\n\n**Summary:**\n{msg}"
+            "body": pr_body
         }
 
         try:
@@ -437,18 +471,19 @@ def main():
                 timeout=30
             )
 
+            print(f"API Response Status: {pr_resp.status_code}")
             if pr_resp.status_code == 201:
                 pr_url = pr_resp.json().get("html_url")
                 print(f"PR created successfully: {pr_url}")
             else:
-                print(f"Failed to create PR: {pr_resp.status_code} - {pr_resp.text}")
+                print(f"Failed to create PR: {pr_resp.status_code}")
+                print(f"Response: {pr_resp.text}")
         except requests.exceptions.RequestException as e:
             print(f"Error creating PR: {e}")
-    else:
-        print("GITHUB_TOKEN or GITHUB_REPOSITORY not set, skipping PR creation.")
 
-    print("Done. PR created for review.")
+    print("Done. PR creation attempted.")
 
 
 if __name__ == "__main__":
     main()
+
