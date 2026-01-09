@@ -1202,43 +1202,16 @@ impl ImputationPipeline {
                         probs2[a] = 0.0;
                     }
 
-                    if is_genotyped {
-                        // For genotyped markers: use OBSERVED alleles with probability 1.0
-                        // This matches Java's setToObsAlleles() behavior
-                        if let Some(target_m) = alignment.target_marker(m) {
-                            let target_marker_idx = MarkerIdx::new(target_m as u32);
-                            let a1 = target_gt.allele(target_marker_idx, hap1_idx);
-                            let a2 = target_gt.allele(target_marker_idx, hap2_idx);
-                            
-                            // Map target alleles to reference allele space
-                            let a1_mapped = alignment.map_allele(target_m, a1);
-                            let a2_mapped = alignment.map_allele(target_m, a2);
-                            
-                            // Set probability 1.0 for observed allele (if not missing)
-                            // If missing, fall back to HMM posteriors
-                            if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
-                                probs1[a1_mapped as usize] = 1.0;
-                            } else {
-                                let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs1[a] = post1.prob(a); }
-                            }
+                    // For genotyped markers, we now use HMM posteriors just like imputed markers.
+                    // This matches Java BEAGLE's behavior where it re-estimates dosages even for
+                    // known genotypes, which is why DR2 for genotyped markers is not always 1.0.
+                    // The 'truth' for DR2 is still the original hard-called genotype.
+                    let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+                    let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
 
-                            if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
-                                probs2[a2_mapped as usize] = 1.0;
-                            } else {
-                                let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs2[a] = post2.prob(a); }
-                            }
-                        }
-                    } else {
-                        // For imputed markers: use HMM posteriors
-                        let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                        let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-
-                        for a in 0..n_alleles {
-                            probs1[a] = post1.prob(a);
-                            probs2[a] = post2.prob(a);
-                        }
+                    for a in 0..n_alleles {
+                        probs1[a] = post1.prob(a);
+                        probs2[a] = post2.prob(a);
                     }
 
                     if let Some(stats) = quality.get_mut(m) {
@@ -1286,76 +1259,33 @@ impl ImputationPipeline {
         let alignment_for_dosage = alignment.clone();
         let target_gt_for_dosage = Arc::clone(&target_gt);
         let get_dosage = move |m: usize, s: usize| -> f32 {
-            if let Some(target_m) = alignment_for_dosage.target_marker(m) {
-                let hap1_idx = HapIdx::new((s * 2) as u32);
-                let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-                let a1 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap1_idx);
-                let a2 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap2_idx);
-                let a1_mapped = alignment_for_dosage.map_allele(target_m, a1);
-                let a2_mapped = alignment_for_dosage.map_allele(target_m, a2);
-                if a1_mapped != 255 && a2_mapped != 255 {
-                    return a1_mapped as f32 + a2_mapped as f32;
-                }
-            }
             let n_alleles = n_alleles_for_dosage[m];
-
-            // Check if genotyped in target
-            if alignment_for_dosage.is_genotyped(m) {
-                if let Some(target_m) = alignment_for_dosage.target_marker(m) {
-                    let target_marker_idx = MarkerIdx::new(target_m as u32);
-                    let hap1_idx = HapIdx::new((s * 2) as u32);
-                    let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-
-                    let a1 = target_gt_for_dosage.allele(target_marker_idx, hap1_idx);
-                    let a2 = target_gt_for_dosage.allele(target_marker_idx, hap2_idx);
-                    
-                    let a1_mapped = alignment_for_dosage.map_allele(target_m, a1);
-                    let a2_mapped = alignment_for_dosage.map_allele(target_m, a2);
-
-                    // Use observed alleles if available, else fall back to HMM
-                    let use_a1 = a1_mapped != 255 && (a1_mapped as usize) < n_alleles;
-                    let use_a2 = a2_mapped != 255 && (a2_mapped as usize) < n_alleles;
-
-                    if use_a1 && use_a2 {
-                        return (a1_mapped as f32) + (a2_mapped as f32);
-                    }
-                    
-                    let mut cursors = cursors_for_dosage.borrow_mut();
-                    let (cursor1, cursor2) = {
-                        let mid = s * 2 + 1;
-                        let (left, right) = cursors.split_at_mut(mid);
-                        (&mut left[s * 2], &mut right[0])
-                    };
-                    let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
-                        ref_gt_for_dosage.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
-                    };
-
-                    let d1 = if use_a1 { a1_mapped as f32 }
-                        else { cursor1.allele_posteriors(m, n_alleles, get_ref_allele).dosage() };
-                    let d2 = if use_a2 { a2_mapped as f32 }
-                        else { cursor2.allele_posteriors(m, n_alleles, get_ref_allele).dosage() };
-                    
-                    return d1 + d2;
-                }
-            }
-
             let mut cursors = cursors_for_dosage.borrow_mut();
+            
+            // Get mutable access to this sample's pair of cursors
+            let (cursor1, cursor2) = {
+                let mid = s * 2 + 1;
+                let (left, right) = cursors.split_at_mut(mid);
+                (&mut left[s * 2], &mut right[0])
+            };
+
             let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                 ref_gt_for_dosage.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
             };
-            let post1 = cursors[s * 2].allele_posteriors(m, n_alleles, &get_ref_allele);
-            let post2 = cursors[s * 2 + 1].allele_posteriors(m, n_alleles, &get_ref_allele);
+            
+            // For ALL markers (genotyped or imputed), compute dosage from HMM posteriors.
+            // This aligns with Java BEAGLE behavior.
+            let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+            let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
             post1.dosage() + post2.dosage()
         };
 
         // Streaming closure: compute posteriors on-the-fly
         type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
         let get_posteriors: Option<GetPosteriorsFn> = if need_allele_probs {
-            let cursors_post: RefCell<Vec<StateProbsCursor>> = RefCell::new(state_probs.iter().map(|sp| sp.clone().cursor()).collect());
+            let cursors_for_post = Rc::clone(&cursors);
             let n_alleles_per_marker = n_alleles_shared.as_ref().clone();
             let ref_gt_for_post = Arc::clone(&ref_gt);
-            let alignment_for_post = alignment.clone();
-            let target_gt_for_post = Arc::clone(&target_gt);
             Some(Box::new(
                 move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
                     let n_alleles = n_alleles_per_marker[m];
@@ -1363,31 +1293,15 @@ impl ImputationPipeline {
                         ref_gt_for_post.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
                     };
 
-                    if let Some(target_m) = alignment_for_post.target_marker(m) {
-                        let hap1_idx = HapIdx::new((s * 2) as u32);
-                        let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-                        let a1 = target_gt_for_post.allele(MarkerIdx::new(target_m as u32), hap1_idx);
-                        let a2 = target_gt_for_post.allele(MarkerIdx::new(target_m as u32), hap2_idx);
-                        let a1_mapped = alignment_for_post.map_allele(target_m, a1);
-                        let a2_mapped = alignment_for_post.map_allele(target_m, a2);
-
-                        let mut cursors = cursors_post.borrow_mut();
-                        let post1 = if a1_mapped != 255 {
-                            one_hot_posterior(a1_mapped, n_alleles)
-                        } else {
-                            cursors[s * 2].allele_posteriors(m, n_alleles, &get_ref_allele)
-                        };
-                        let post2 = if a2_mapped != 255 {
-                            one_hot_posterior(a2_mapped, n_alleles)
-                        } else {
-                            cursors[s * 2 + 1].allele_posteriors(m, n_alleles, &get_ref_allele)
-                        };
-                        return (post1, post2);
-                    }
-
-                    let mut cursors = cursors_post.borrow_mut();
-                    let post1 = cursors[s * 2].allele_posteriors(m, n_alleles, &get_ref_allele);
-                    let post2 = cursors[s * 2 + 1].allele_posteriors(m, n_alleles, &get_ref_allele);
+                    // For all markers, compute posteriors from HMM
+                    let mut cursors = cursors_for_post.borrow_mut();
+                    let (cursor1, cursor2) = {
+                        let mid = s * 2 + 1;
+                        let (left, right) = cursors.split_at_mut(mid);
+                        (&mut left[s * 2], &mut right[0])
+                    };
+                    let post1 = cursor1.allele_posteriors(m, n_alleles, &get_ref_allele);
+                    let post2 = cursor2.allele_posteriors(m, n_alleles, &get_ref_allele);
                     (post1, post2)
                 },
             ))
