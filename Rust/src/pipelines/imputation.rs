@@ -280,6 +280,8 @@ pub struct StateProbs {
     /// State probabilities at the NEXT genotyped marker (for interpolation)
     /// At the last marker, this equals probs (no next marker)
     probs_p1: Vec<Vec<f32>>,
+    /// Reference haplotype indices at the NEXT genotyped marker (optional, accuracy boost)
+    haps_p1: Option<Vec<Vec<u32>>>,
     /// Genetic positions of ALL reference markers (for interpolation)
     /// Uses Arc to share across all haplotypes (avoids cloning ~8MB per haplotype)
     gen_positions: std::sync::Arc<Vec<f64>>,
@@ -330,6 +332,7 @@ impl StateProbs {
         marker_to_cluster: std::sync::Arc<Vec<usize>>,
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
+        let store_haps_p1 = n_genotyped <= 1000;
 
         // Sparse storage threshold: min(0.005, 0.9999/K) - matches Java exactly
         // For small panels, keep all states to maximize accuracy.
@@ -342,6 +345,11 @@ impl StateProbs {
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
         let mut filtered_probs_p1 = Vec::with_capacity(n_genotyped);
+        let mut filtered_haps_p1: Option<Vec<Vec<u32>>> = if store_haps_p1 {
+            Some(Vec::with_capacity(n_genotyped))
+        } else {
+            None
+        };
 
         // Filter states by probability threshold (sparse storage)
         // Java does NOT renormalize after filtering - it stores raw probabilities
@@ -354,6 +362,7 @@ impl StateProbs {
             let mut haps = Vec::new();
             let mut probs = Vec::new();
             let mut probs_p1 = Vec::new();
+            let mut haps_p1 = if store_haps_p1 { Some(Vec::new()) } else { None };
 
             // Collect states ABOVE threshold (Java uses >, not >=)
             for j in 0..n_states.min(hap_indices.get(sparse_m).map(|v| v.len()).unwrap_or(0)) {
@@ -364,6 +373,10 @@ impl StateProbs {
                     haps.push(hap_indices[sparse_m][j]);
                     probs.push(prob);
                     probs_p1.push(prob_p1);
+                    if let Some(ref mut haps_p1_vec) = haps_p1 {
+                        let hap_p1 = hap_indices[m_p1].get(j).copied().unwrap_or(hap_indices[sparse_m][j]);
+                        haps_p1_vec.push(hap_p1);
+                    }
                 }
             }
 
@@ -371,6 +384,9 @@ impl StateProbs {
             filtered_haps.push(haps);
             filtered_probs.push(probs);
             filtered_probs_p1.push(probs_p1);
+            if let Some(ref mut all_haps_p1) = filtered_haps_p1 {
+                all_haps_p1.push(haps_p1.unwrap_or_default());
+            }
         }
 
         Self {
@@ -378,6 +394,7 @@ impl StateProbs {
             hap_indices: filtered_haps,
             probs: filtered_probs,
             probs_p1: filtered_probs_p1,
+            haps_p1: filtered_haps_p1,
             gen_positions,
             marker_to_cluster,
         }
@@ -527,6 +544,7 @@ impl StateProbs {
         let haps = &self.hap_indices[left_sparse];
         let probs = &self.probs[left_sparse];
         let probs_p1 = &self.probs_p1[left_sparse];
+        let haps_p1 = self.haps_p1.as_ref().map(|v| &v[left_sparse]);
 
         // Java Beagle uses constant probability for markers within a cluster and
         // interpolates only for markers BETWEEN clusters.
@@ -545,21 +563,42 @@ impl StateProbs {
                 // Interpolate state probability ONLY if between clusters.
                 // Otherwise, probability is constant within the cluster.
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                let interpolated_prob = if is_between_clusters {
+                if is_between_clusters {
                     let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    weight_left * prob + (1.0 - weight_left) * prob_p1
-                } else {
-                    prob
-                };
+                    let prob_left = weight_left * prob;
+                    let prob_right = (1.0 - weight_left) * prob_p1;
 
-                // Look up allele at the interpolated marker
-                let allele = get_ref_allele(ref_marker, hap);
-                if allele == 1 {
-                    p_alt += interpolated_prob;
-                } else if allele == 0 {
-                    p_ref += interpolated_prob;
+                    let allele_left = get_ref_allele(ref_marker, hap);
+                    if allele_left == 1 {
+                        p_alt += prob_left;
+                    } else if allele_left == 0 {
+                        p_ref += prob_left;
+                    }
+
+                    if let Some(haps_p1_row) = haps_p1 {
+                        let hap_right = haps_p1_row.get(j).copied().unwrap_or(hap);
+                        let allele_right = get_ref_allele(ref_marker, hap_right);
+                        if allele_right == 1 {
+                            p_alt += prob_right;
+                        } else if allele_right == 0 {
+                            p_ref += prob_right;
+                        }
+                    } else {
+                        let allele_right = get_ref_allele(ref_marker, hap);
+                        if allele_right == 1 {
+                            p_alt += prob_right;
+                        } else if allele_right == 0 {
+                            p_ref += prob_right;
+                        }
+                    }
+                } else {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele == 1 {
+                        p_alt += prob;
+                    } else if allele == 0 {
+                        p_ref += prob;
+                    }
                 }
-                // allele == 255 (missing): don't add to either, will renormalize
             }
 
             // Renormalize if there was any missing data
@@ -572,17 +611,33 @@ impl StateProbs {
             for (j, &hap) in haps.iter().enumerate() {
                 // Interpolate state probability ONLY if between clusters.
                 let prob = probs.get(j).copied().unwrap_or(0.0);
-                let interpolated_prob = if is_between_clusters {
+                if is_between_clusters {
                     let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    weight_left * prob + (1.0 - weight_left) * prob_p1
-                } else {
-                    prob
-                };
+                    let prob_left = weight_left * prob;
+                    let prob_right = (1.0 - weight_left) * prob_p1;
 
-                // Look up allele at the interpolated marker
-                let allele = get_ref_allele(ref_marker, hap);
-                if allele != 255 && (allele as usize) < n_alleles {
-                    al_probs[allele as usize] += interpolated_prob;
+                    let allele_left = get_ref_allele(ref_marker, hap);
+                    if allele_left != 255 && (allele_left as usize) < n_alleles {
+                        al_probs[allele_left as usize] += prob_left;
+                    }
+
+                    if let Some(haps_p1_row) = haps_p1 {
+                        let hap_right = haps_p1_row.get(j).copied().unwrap_or(hap);
+                        let allele_right = get_ref_allele(ref_marker, hap_right);
+                        if allele_right != 255 && (allele_right as usize) < n_alleles {
+                            al_probs[allele_right as usize] += prob_right;
+                        }
+                    } else {
+                        let allele_right = get_ref_allele(ref_marker, hap);
+                        if allele_right != 255 && (allele_right as usize) < n_alleles {
+                            al_probs[allele_right as usize] += prob_right;
+                        }
+                    }
+                } else {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs[allele as usize] += prob;
+                    }
                 }
             }
 
