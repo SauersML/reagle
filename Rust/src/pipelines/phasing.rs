@@ -1634,7 +1634,7 @@ impl PhasingPipeline {
                     let allele1 = seq1_working[m];
                     let allele2 = seq2_working[m];
                     let is_het_any = allele1 != 255 && allele2 != 255 && allele1 != allele2;
-                    let is_unphased_het = het_idx < n_hets && het_positions[het_idx] == m;
+                    let is_changeable_het = is_het_any && m >= overlap_markers;
 
                     // Cache reference alleles for this marker
                     for k in 0..n_states {
@@ -1663,54 +1663,51 @@ impl PhasingPipeline {
                         }
                     }
 
-                    if is_unphased_het {
-                        // Only make phase decisions for hets AFTER overlap region
-                        if het_idx >= first_changeable_het {
-                            let b1 = &bwd1_cache[het_idx];
-                            let b2 = &bwd2_cache[het_idx];
+                    if is_changeable_het {
+                        let b1 = &bwd1_cache[het_idx];
+                        let b2 = &bwd2_cache[het_idx];
 
-                            // Use fwd1 and fwd2 for proper 3-track likelihoods
-                            let mut p11 = 0.0f64;
-                            let mut p12 = 0.0f64;
-                            let mut p21 = 0.0f64;
-                            let mut p22 = 0.0f64;
+                        // Use fwd1 and fwd2 for proper 3-track likelihoods
+                        let mut p11 = 0.0f64;
+                        let mut p12 = 0.0f64;
+                        let mut p21 = 0.0f64;
+                        let mut p22 = 0.0f64;
 
-                            for k in 0..n_states {
-                                let ref_al = ref_alleles[k];
-                                let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
-                                    p_no_err
-                                } else {
-                                    p_err
-                                };
-                                let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
-                                    p_no_err
-                                } else {
-                                    p_err
-                                };
+                        for k in 0..n_states {
+                            let ref_al = ref_alleles[k];
+                            let emit1 = if ref_al == allele1 || ref_al == 255 || allele1 == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            let emit2 = if ref_al == allele2 || ref_al == 255 || allele2 == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
 
-                                let fwd1_k = fwd1_prior[k] as f64;
-                                let fwd2_k = fwd2_prior[k] as f64;
-                                let b1_k = b1[k] as f64;
-                                let b2_k = b2[k] as f64;
+                            let fwd1_k = fwd1_prior[k] as f64;
+                            let fwd2_k = fwd2_prior[k] as f64;
+                            let b1_k = b1[k] as f64;
+                            let b2_k = b2[k] as f64;
 
-                                p11 += fwd1_k * (emit1 as f64) * b1_k;
-                                p12 += fwd1_k * (emit2 as f64) * b2_k;
-                                p21 += fwd2_k * (emit1 as f64) * b1_k;
-                                p22 += fwd2_k * (emit2 as f64) * b2_k;
+                            p11 += fwd1_k * (emit1 as f64) * b1_k;
+                            p12 += fwd1_k * (emit2 as f64) * b2_k;
+                            p21 += fwd2_k * (emit1 as f64) * b1_k;
+                            p22 += fwd2_k * (emit2 as f64) * b2_k;
+                        }
+
+                        let l_keep = p11 * p22;
+                        let l_swap = p12 * p21;
+
+                        if l_swap > l_keep {
+                            // SWAP: exchange alleles from this position forward
+                            for m_swap in m..n_markers {
+                                std::mem::swap(&mut seq1_working[m_swap], &mut seq2_working[m_swap]);
                             }
-
-                            let l_keep = p11 * p22;
-                            let l_swap = p12 * p21;
-
-                            if l_swap > l_keep {
-                                // SWAP: exchange alleles from this position forward
-                                for m_swap in m..n_markers {
-                                    std::mem::swap(&mut seq1_working[m_swap], &mut seq2_working[m_swap]);
-                                }
-                                // Swap backward caches for future het decisions
-                                for h in het_idx..n_hets {
-                                    std::mem::swap(&mut bwd1_cache[h], &mut bwd2_cache[h]);
-                                }
+                            // Swap backward caches for future het decisions
+                            for h in het_idx..n_hets {
+                                std::mem::swap(&mut bwd1_cache[h], &mut bwd2_cache[h]);
                             }
                         }
 
@@ -1768,6 +1765,7 @@ impl PhasingPipeline {
                         fwd0_sum = fwd0_sum.max(1e-30);
                         fwd1_sum = fwd1_sum.max(1e-30);
                         fwd2_sum = fwd2_sum.max(1e-30);
+                        het_idx += 1;
                     } else {
                         // Homozygous or missing: all tracks emit the observed allele
                         let observed = if allele1 != 255 { allele1 } else { allele2 };
