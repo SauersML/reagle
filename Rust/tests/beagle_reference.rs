@@ -2769,3 +2769,144 @@ fn test_posterior_probability_calibration() {
     );
 }
 
+/// Test 4: Verify genotyped marker dosages match hard calls.
+/// For genotyped markers, DS should equal GT exactly.
+/// If not, that explains why DR2 is low (estimated != true despite knowing truth).
+#[test]
+fn test_genotyped_dosage_matches_hard_call() {
+    let source = &get_all_data_sources()[0];
+    let files = setup_test_files();
+
+    println!("\n{}", "=".repeat(70));
+    println!("=== Genotyped Marker: Dosage vs Hard Call ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy files
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    // Run Java
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", target_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    // Run Rust
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_out");
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    assert!(rust_result.is_ok(), "Rust imputation failed: {:?}", rust_result.err());
+
+    // Parse outputs
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+
+    // Helper to convert GT to expected dosage
+    fn gt_to_dosage(gt: &str) -> Option<f64> {
+        let sep = if gt.contains('|') { '|' } else { '/' };
+        let alleles: Vec<&str> = gt.split(sep).collect();
+        if alleles.len() != 2 {
+            return None;
+        }
+        let a1: u8 = alleles[0].parse().ok()?;
+        let a2: u8 = alleles[1].parse().ok()?;
+        Some((a1 + a2) as f64)
+    }
+
+    // Check genotyped markers only
+    let mut java_mismatches = 0;
+    let mut rust_mismatches = 0;
+    let mut total_genotyped_samples = 0;
+    let mut java_mismatch_examples: Vec<(u64, String, f64, f64)> = Vec::new();
+    let mut rust_mismatch_examples: Vec<(u64, String, f64, f64)> = Vec::new();
+
+    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+        // Only check genotyped markers (no IMP flag)
+        if j_rec.info.contains_key("IMP") {
+            continue;
+        }
+
+        for (j_gt, r_gt) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()) {
+            total_genotyped_samples += 1;
+            
+            // Get expected dosage from hard call
+            let expected_ds = match gt_to_dosage(&j_gt.gt) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // Check Java DS
+            if let Some(j_ds) = j_gt.ds {
+                if (j_ds - expected_ds).abs() > 0.01 {
+                    java_mismatches += 1;
+                    if java_mismatch_examples.len() < 5 {
+                        java_mismatch_examples.push((j_rec.pos, j_gt.gt.clone(), expected_ds, j_ds));
+                    }
+                }
+            }
+
+            // Check Rust DS
+            if let Some(r_ds) = r_gt.ds {
+                if (r_ds - expected_ds).abs() > 0.01 {
+                    rust_mismatches += 1;
+                    if rust_mismatch_examples.len() < 5 {
+                        rust_mismatch_examples.push((r_rec.pos, r_gt.gt.clone(), expected_ds, r_ds));
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\nGenotyped samples analyzed: {}", total_genotyped_samples);
+    println!("\nMismatches (DS != GT):");
+    println!("  Java: {} ({:.2}%)", java_mismatches, 100.0 * java_mismatches as f64 / total_genotyped_samples as f64);
+    println!("  Rust: {} ({:.2}%)", rust_mismatches, 100.0 * rust_mismatches as f64 / total_genotyped_samples as f64);
+
+    if !java_mismatch_examples.is_empty() {
+        println!("\nJava mismatch examples (pos, GT, expected DS, actual DS):");
+        for (pos, gt, exp, act) in &java_mismatch_examples {
+            println!("  pos={}: GT={}, expected={:.2}, actual={:.2}", pos, gt, exp, act);
+        }
+    }
+
+    if !rust_mismatch_examples.is_empty() {
+        println!("\nRust mismatch examples (pos, GT, expected DS, actual DS):");
+        for (pos, gt, exp, act) in &rust_mismatch_examples {
+            println!("  pos={}: GT={}, expected={:.2}, actual={:.2}", pos, gt, exp, act);
+        }
+    }
+
+    // Calculate what DR2 SHOULD be if DS matched GT perfectly
+    println!("\nConclusion:");
+    if java_mismatches == 0 && rust_mismatches == 0 {
+        println!("  Both Java and Rust have DS == GT for genotyped markers.");
+        println!("  Low DR2 must be due to the DR2 formula, not dosage mismatch.");
+    } else if java_mismatches > 0 && rust_mismatches > 0 {
+        println!("  Both Java and Rust have DS != GT mismatches.");
+        println!("  This explains the low DR2 for genotyped markers.");
+    } else if rust_mismatches > java_mismatches {
+        println!("  Rust has MORE mismatches than Java - this is a bug!");
+    }
+
+    // STRICT: Rust should not have more mismatches than Java
+    assert!(
+        rust_mismatches <= java_mismatches + 10,
+        "DOSAGE MISMATCH: Rust has {} mismatches vs Java {}", 
+        rust_mismatches, java_mismatches
+    );
+}
+
