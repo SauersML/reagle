@@ -490,8 +490,10 @@ impl<'a> ImpStates<'a> {
                     hap_indices[sparse_idx][j] = hap;
 
                     let ref_allele = get_ref_allele(ref_m, hap);
-                    // For missing target alleles (255), treat as mismatch (matches Java behavior)
-                    allele_match[sparse_idx][j] = target_allele != 255 && ref_allele == target_allele;
+                    // Treat missing reference as wildcard (no penalty).
+                    // For missing target alleles (255), leave as mismatch (Java behavior).
+                    allele_match[sparse_idx][j] =
+                        target_allele != 255 && (ref_allele == target_allele || ref_allele == 255);
                 }
             }
         }
