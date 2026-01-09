@@ -323,13 +323,15 @@ impl<'a> ImpStates<'a> {
                         let last_step_idx = head.last_ibs_step.max(0) as usize;
                         let curr_step_idx = step.max(0) as usize;
 
-                        // Get genetic positions of the steps (start of the step)
+                        // Get genetic positions of the steps (using midpoint for accuracy)
                         // Be careful with bounds: step index can be up to n_steps
-                        // ref_panel.step(i).start is the projected marker index
                         let get_pos = |step_idx: usize| -> f64 {
                             if step_idx < self.ref_panel.n_steps() {
-                                let proj_idx = self.ref_panel.step(step_idx).start;
-                                proj_pos.get(proj_idx).copied().unwrap_or(0.0)
+                                let step = self.ref_panel.step(step_idx);
+                                let start_pos = proj_pos.get(step.start).copied().unwrap_or(0.0);
+                                // step.end is exclusive, so use end-1 for last marker in step
+                                let end_pos = proj_pos.get(step.end.saturating_sub(1)).copied().unwrap_or(start_pos);
+                                (start_pos + end_pos) / 2.0
                             } else {
                                 // After last step
                                 proj_pos.last().copied().unwrap_or(0.0)
