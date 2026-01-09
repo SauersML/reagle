@@ -1016,11 +1016,9 @@ impl ImputationPipeline {
         let ref_panel_coded = info_span!("build_coded_panel").in_scope(|| {
             eprintln!("Building coded reference panel (projected space)...");
             let effective_step = if n_genotyped <= 1000 {
-                let span = projected_gen_positions
-                    .last()
-                    .copied()
-                    .unwrap_or(0.0)
-                    .saturating_sub(projected_gen_positions.first().copied().unwrap_or(0.0));
+                let last = projected_gen_positions.last().copied().unwrap_or(0.0);
+                let first = projected_gen_positions.first().copied().unwrap_or(0.0);
+                let span = (last - first).max(0.0);
                 let avg = if n_genotyped > 1 {
                     (span / n_genotyped as f64).max(1e-6)
                 } else {
