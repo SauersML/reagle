@@ -1802,8 +1802,8 @@ impl ImputationPipeline {
             let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
                 ref_gt_for_dosage.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap))
             };
-            let post1 = cursors[s * 2].allele_posteriors(m, n_alleles, &get_ref_allele);
-            let post2 = cursors[s * 2 + 1].allele_posteriors(m, n_alleles, &get_ref_allele);
+            let post1 = cursors[s * 2].allele_posteriors(m, n_alleles, get_ref_allele);
+            let post2 = cursors[s * 2 + 1].allele_posteriors(m, n_alleles, get_ref_allele);
             post1.dosage() + post2.dosage()
         };
 
