@@ -215,11 +215,12 @@ fn compute_cluster_mismatches(
     alignment: &MarkerAlignment,
     targ_hap: usize,
     n_states: usize,
-) -> (Vec<Vec<u16>>, Vec<Vec<u16>>) {
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let n_clusters = hap_indices.len();
-    let mut mismatches = vec![vec![0u16; n_states]; n_clusters];
-    let mut non_missing = vec![vec![0u16; n_states]; n_clusters];
+    let mut mismatches = vec![vec![0.0f32; n_states]; n_clusters];
+    let mut non_missing = vec![vec![0.0f32; n_states]; n_clusters];
     let targ_hap_idx = HapIdx::new(targ_hap as u32);
+    let sample_idx = targ_hap_idx.sample().as_usize();
 
     for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
         if c >= n_clusters {
@@ -234,6 +235,10 @@ fn compute_cluster_mismatches(
             if targ_allele == 255 {
                 continue;
             }
+            let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
+            if confidence <= 0.0 {
+                continue;
+            }
 
             for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap));
@@ -241,9 +246,9 @@ fn compute_cluster_mismatches(
                 if mapped == 255 {
                     continue;
                 }
-                non_missing[c][j] = non_missing[c][j].saturating_add(1);
+                non_missing[c][j] += confidence;
                 if mapped != targ_allele {
-                    mismatches[c][j] = mismatches[c][j].saturating_add(1);
+                    mismatches[c][j] += confidence;
                 }
             }
         }
@@ -1872,8 +1877,8 @@ impl ImputationPipeline {
 /// Flat array of state probabilities: cluster_state_probs[c * n_states + k] = P(state k | cluster c)
 #[cfg(test)]
 fn run_hmm_forward_backward_clusters(
-    cluster_mismatches: &[Vec<u16>],
-    cluster_non_missing: &[Vec<u16>],
+    cluster_mismatches: &[Vec<f32>],
+    cluster_non_missing: &[Vec<f32>],
     p_recomb: &[f32],
     p_err: f32,
     n_states: usize,
@@ -1889,30 +1894,18 @@ fn run_hmm_forward_backward_clusters(
 
     let p_err = p_err.clamp(1e-8, 0.5);
     let p_no_err = 1.0 - p_err;
-    let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
+    let log_p_err = p_err.ln();
+    let log_p_no_err = p_no_err.ln();
 
     // Forward pass
     let total_size = n_clusters * n_states;
     let mut fwd: Vec<f32> = vec![0.0; total_size];
     let mut fwd_sum = 1.0f32;
 
-    let mut ratio_pows: Vec<f32> = Vec::new();
-    let mut no_err_pows: Vec<f32> = Vec::new();
     for (c, mismatches) in cluster_mismatches.iter().enumerate().take(n_clusters) {
         let p_rec = p_recomb.get(c).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / fwd_sum;
-
-        let max_obs = cluster_non_missing
-            .get(c)
-            .map(|row| row.iter().copied().max().unwrap_or(0) as usize)
-            .unwrap_or(0);
-        ratio_pows.resize(max_obs.saturating_add(1), 1.0);
-        no_err_pows.resize(max_obs.saturating_add(1), 1.0);
-        for i in 1..=max_obs {
-            ratio_pows[i] = ratio_pows[i - 1] * ratio;
-            no_err_pows[i] = no_err_pows[i - 1] * p_no_err;
-        }
 
         let mut new_sum = 0.0f32;
         let row_offset = c * n_states;
@@ -1923,12 +1916,10 @@ fn run_hmm_forward_backward_clusters(
                 .get(c)
                 .and_then(|row| row.get(k))
                 .copied()
-                .unwrap_or(0) as usize;
-            let n_obs = n_obs.min(max_obs);
-            let mismatch_count = mismatches[k] as usize;
-            let mismatch_count = mismatch_count.min(n_obs);
-            let base_emit = no_err_pows.get(n_obs).copied().unwrap_or(1.0);
-            let emit = base_emit * ratio_pows.get(mismatch_count).copied().unwrap_or(1.0);
+                .unwrap_or(0.0);
+            let mismatch_count = mismatches[k].min(n_obs);
+            let match_count = (n_obs - mismatch_count).max(0.0);
+            let emit = (match_count * log_p_no_err + mismatch_count * log_p_err).exp();
 
             let val = if c == 0 {
                 emit
@@ -1954,16 +1945,6 @@ fn run_hmm_forward_backward_clusters(
             let shift = p_rec / n_states as f32;
 
             let mismatches = &cluster_mismatches[c + 1];
-            let max_obs = cluster_non_missing
-                .get(c + 1)
-                .map(|row| row.iter().copied().max().unwrap_or(0) as usize)
-                .unwrap_or(0);
-            ratio_pows.resize(max_obs.saturating_add(1), 1.0);
-            no_err_pows.resize(max_obs.saturating_add(1), 1.0);
-            for i in 1..=max_obs {
-                ratio_pows[i] = ratio_pows[i - 1] * ratio;
-                no_err_pows[i] = no_err_pows[i - 1] * p_no_err;
-            }
 
             let mut emitted_sum = 0.0f32;
             for k in 0..n_states.min(mismatches.len()) {
@@ -1971,12 +1952,10 @@ fn run_hmm_forward_backward_clusters(
                     .get(c + 1)
                     .and_then(|row| row.get(k))
                     .copied()
-                    .unwrap_or(0) as usize;
-                let n_obs = n_obs.min(max_obs);
-                let mismatch_count = mismatches[k] as usize;
-                let mismatch_count = mismatch_count.min(n_obs);
-                let base_emit = no_err_pows.get(n_obs).copied().unwrap_or(1.0);
-                let emit = base_emit * ratio_pows.get(mismatch_count).copied().unwrap_or(1.0);
+                    .unwrap_or(0.0);
+                let mismatch_count = mismatches[k].min(n_obs);
+                let match_count = (n_obs - mismatch_count).max(0.0);
+                let emit = (match_count * log_p_no_err + mismatch_count * log_p_err).exp();
                 bwd[k] *= emit;
                 emitted_sum += bwd[k];
             }
@@ -2016,9 +1995,9 @@ fn run_hmm_forward_backward_clusters(
 }
 
 /// Forward-backward HMM on cluster-coded observations (Java ImpLSBaum model).
-fn run_hmm_forward_backward_clusters_counts(
-    cluster_mismatches: &[Vec<u16>],
-    cluster_non_missing: &[Vec<u16>],
+pub fn run_hmm_forward_backward_clusters_counts(
+    cluster_mismatches: &[Vec<f32>],
+    cluster_non_missing: &[Vec<f32>],
     p_recomb: &[f32],
     base_err_rate: f32,
     n_states: usize,
@@ -2029,42 +2008,29 @@ fn run_hmm_forward_backward_clusters_counts(
     fwd.resize(n_clusters * n_states, 0.0);
 
     let mut last_sum = 1.0f32;
-    let mut ratio_pows: Vec<f32> = Vec::new();
-    let mut no_err_pows: Vec<f32> = Vec::new();
+    let p_err = base_err_rate.clamp(1e-8, 0.5);
+    let p_no_err = 1.0 - p_err;
+    let log_p_err = p_err.ln();
+    let log_p_no_err = p_no_err.ln();
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
-        let p_err = base_err_rate.clamp(1e-8, 0.5);
-        let p_no_err = 1.0 - p_err;
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
-
-        let max_obs = cluster_non_missing
-            .get(m)
-            .map(|row| row.iter().copied().max().unwrap_or(0) as usize)
-            .unwrap_or(0);
-        let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
-        ratio_pows.resize(max_obs.saturating_add(1), 1.0);
-        no_err_pows.resize(max_obs.saturating_add(1), 1.0);
-        for i in 1..=max_obs {
-            ratio_pows[i] = ratio_pows[i - 1] * ratio;
-            no_err_pows[i] = no_err_pows[i - 1] * p_no_err;
-        }
 
         let row_offset = m * n_states;
         let prev_offset = if m > 0 { (m - 1) * n_states } else { 0 };
         let mut sum = 0.0f32;
 
         for k in 0..n_states {
-            let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0) as usize;
+            let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0.0);
             let n_obs = cluster_non_missing
                 .get(m)
                 .and_then(|row| row.get(k))
                 .copied()
-                .unwrap_or(0) as usize;
-            let n_obs = n_obs.min(max_obs);
+                .unwrap_or(0.0);
             let mism = mism.min(n_obs);
-            let base_emit = no_err_pows.get(n_obs).copied().unwrap_or(1.0);
-            let em = base_emit * ratio_pows.get(mism).copied().unwrap_or(1.0);
+            let match_count = (n_obs - mism).max(0.0);
+            let em = (match_count * log_p_no_err + mism * log_p_err).exp();
             let val = if m == 0 {
                 em
             } else {
@@ -2086,33 +2052,18 @@ fn run_hmm_forward_backward_clusters_counts(
             let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
             let shift = p_rec / n_states as f32;
 
-            let p_err = base_err_rate.clamp(1e-8, 0.5);
-            let p_no_err = 1.0 - p_err;
-            let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
-            let max_obs = cluster_non_missing
-                .get(m + 1)
-                .map(|row| row.iter().copied().max().unwrap_or(0) as usize)
-                .unwrap_or(0);
-            ratio_pows.resize(max_obs.saturating_add(1), 1.0);
-            no_err_pows.resize(max_obs.saturating_add(1), 1.0);
-            for i in 1..=max_obs {
-                ratio_pows[i] = ratio_pows[i - 1] * ratio;
-                no_err_pows[i] = no_err_pows[i - 1] * p_no_err;
-            }
-
             let mut emitted_sum = 0.0f32;
             let mismatches = &cluster_mismatches[m + 1];
             for k in 0..n_states {
-                let mism = mismatches.get(k).copied().unwrap_or(0) as usize;
+                let mism = mismatches.get(k).copied().unwrap_or(0.0);
                 let n_obs = cluster_non_missing
                     .get(m + 1)
                     .and_then(|row| row.get(k))
                     .copied()
-                    .unwrap_or(0) as usize;
-                let n_obs = n_obs.min(max_obs);
+                    .unwrap_or(0.0);
                 let mism = mism.min(n_obs);
-                let base_emit = no_err_pows.get(n_obs).copied().unwrap_or(1.0);
-                let em = base_emit * ratio_pows.get(mism).copied().unwrap_or(1.0);
+                let match_count = (n_obs - mism).max(0.0);
+                let em = (match_count * log_p_no_err + mism * log_p_err).exp();
                 bwd[k] *= em;
                 emitted_sum += bwd[k];
             }
@@ -2153,15 +2104,15 @@ fn run_hmm_forward_backward_clusters_counts(
 mod tests {
     use super::*;
 
-    fn matches_to_mismatches(allele_match: &[Vec<bool>]) -> (Vec<Vec<u16>>, Vec<Vec<u16>>) {
+    fn matches_to_mismatches(allele_match: &[Vec<bool>]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let mut mismatches = Vec::with_capacity(allele_match.len());
         let mut non_missing = Vec::with_capacity(allele_match.len());
         for row in allele_match {
             let mut row_mismatches = Vec::with_capacity(row.len());
             let mut row_non_missing = Vec::with_capacity(row.len());
             for &is_match in row {
-                row_mismatches.push(if is_match { 0 } else { 1 });
-                row_non_missing.push(1);
+                row_mismatches.push(if is_match { 0.0 } else { 1.0 });
+                row_non_missing.push(1.0);
             }
             mismatches.push(row_mismatches);
             non_missing.push(row_non_missing);
@@ -2388,10 +2339,10 @@ mod tests {
         let n_states = 2;
         let p_recomb = vec![0.0f32; n_clusters];
         let p_err = 0.01f32;
-        let mismatches = vec![vec![0u16, 1u16]];
+        let mismatches = vec![vec![0.0f32, 1.0f32]];
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
 
-        let non_missing_equal = vec![vec![2u16, 2u16]];
+        let non_missing_equal = vec![vec![2.0f32, 2.0f32]];
         let post_equal = run_hmm_forward_backward_clusters_counts(
             &mismatches,
             &non_missing_equal,
@@ -2401,7 +2352,7 @@ mod tests {
             &mut workspace,
         );
 
-        let non_missing_unequal = vec![vec![2u16, 0u16]];
+        let non_missing_unequal = vec![vec![2.0f32, 0.0f32]];
         let post_unequal = run_hmm_forward_backward_clusters_counts(
             &mismatches,
             &non_missing_unequal,
