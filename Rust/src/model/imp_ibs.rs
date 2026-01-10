@@ -240,6 +240,94 @@ pub fn build_cluster_hap_sequences(
     }
 }
 
+/// Build per-cluster haplotype sequences for a selected subset of target haplotypes.
+///
+/// This avoids cross-sample leakage by defining sequence IDs only from the
+/// specified target haplotypes (typically the two haplotypes of a sample).
+pub fn build_cluster_hap_sequences_for_targets(
+    ref_gt: &GenotypeMatrix<Phased>,
+    target_gt: &GenotypeMatrix<Phased>,
+    alignment: &MarkerAlignment,
+    genotyped_markers: &[usize],
+    cluster_bounds: &[(usize, usize)],
+    target_haps: &[HapIdx],
+) -> ClusterHapSequences {
+    let n_ref_haps = ref_gt.n_haplotypes();
+    let n_targ_haps = target_haps.len();
+    let n_haps = n_ref_haps + n_targ_haps;
+
+    let mut hap_to_seq = Vec::with_capacity(cluster_bounds.len());
+    let mut value_sizes = Vec::with_capacity(cluster_bounds.len());
+
+    for &(start, end) in cluster_bounds {
+        let mut targ_seq = vec![1u32; n_targ_haps];
+        let mut ref_seq = vec![1u32; n_ref_haps];
+        let mut seq_cnt = 2u32;
+
+        for &ref_m in &genotyped_markers[start..end] {
+            let Some(target_m) = alignment.target_marker(ref_m) else {
+                continue;
+            };
+            let target_marker_idx = MarkerIdx::new(target_m as u32);
+            let n_alleles = 1 + target_gt.marker(target_marker_idx).alt_alleles.len();
+            if n_alleles == 0 {
+                continue;
+            }
+
+            let n_alleles_with_missing = n_alleles + 1;
+            let mut seq_map = vec![0u32; (seq_cnt as usize) * n_alleles_with_missing];
+            seq_cnt = 1;
+            let missing_allele = n_alleles;
+
+            // Update selected target hap sequences first.
+            for (idx, hap_idx) in target_haps.iter().enumerate() {
+                let allele_raw = target_gt.allele(target_marker_idx, *hap_idx);
+                let allele = if allele_raw == 255 || (allele_raw as usize) >= n_alleles {
+                    missing_allele
+                } else {
+                    allele_raw as usize
+                };
+                let index = (targ_seq[idx] as usize) * n_alleles_with_missing + allele;
+                if seq_map[index] == 0 {
+                    seq_map[index] = seq_cnt;
+                    seq_cnt += 1;
+                }
+                targ_seq[idx] = seq_map[index];
+            }
+
+            // Map reference hap sequences using target-defined seq_map.
+            for h in 0..n_ref_haps {
+                if ref_seq[h] == 0 {
+                    continue;
+                }
+                let hap_idx = HapIdx::new(h as u32);
+                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), hap_idx);
+                let mapped = alignment.reverse_map_allele(target_m, ref_allele);
+                let allele = if mapped == 255 || (mapped as usize) >= n_alleles {
+                    missing_allele
+                } else {
+                    mapped as usize
+                };
+                let index = (ref_seq[h] as usize) * n_alleles_with_missing + allele;
+                ref_seq[h] = seq_map.get(index).copied().unwrap_or(0);
+            }
+        }
+
+        let mut combined = Vec::with_capacity(n_haps);
+        combined.extend_from_slice(&ref_seq);
+        combined.extend_from_slice(&targ_seq);
+        hap_to_seq.push(combined);
+        value_sizes.push(seq_cnt);
+    }
+
+    ClusterHapSequences {
+        hap_to_seq,
+        value_sizes,
+        n_ref_haps,
+        n_haps,
+    }
+}
+
 impl ClusterCodedSteps {
     pub fn from_cluster_sequences(
         cluster_seqs: &ClusterHapSequences,

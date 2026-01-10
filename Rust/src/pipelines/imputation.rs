@@ -27,7 +27,7 @@ use crate::io::bref3::Bref3Reader;
 use crate::io::vcf::{ImputationQuality, VcfReader, VcfWriter};
 use crate::utils::workspace::ImpWorkspace;
 
-use crate::model::imp_ibs::{build_cluster_hap_sequences, ClusterCodedSteps, ImpIbs};
+use crate::model::imp_ibs::{build_cluster_hap_sequences_for_targets, ClusterCodedSteps, ImpIbs};
 use crate::model::imp_states_cluster::ImpStatesCluster;
 use crate::model::parameters::ModelParams;
 
@@ -1414,141 +1414,160 @@ impl ImputationPipeline {
             std::sync::Arc::new(positions)
         };
 
-        // Compute marker clusters based on genetic distance (matching Java ImpData)
-        // Respect block boundaries induced by reference allele-coding changes.
+        // Compute marker clusters per sample to avoid cross-sample leakage.
         let cluster_dist = self.config.cluster as f64;
-        let targ_block_end = compute_targ_block_end(&ref_gt, &target_gt, &alignment, &genotyped_markers_vec);
-        let clusters = compute_marker_clusters_with_blocks(
-            &genotyped_markers_vec,
-            &gen_positions,
-            cluster_dist,
-            &targ_block_end,
-        );
-        let n_clusters = clusters.len();
-
-        eprintln!(
-            "  HMM on {} clusters ({} genotyped markers), interpolating {} ungenotyped",
-            n_clusters, n_genotyped, n_to_impute
-        );
-
-        // Cluster-aggregated HMM: run on C clusters, not M markers.
-        // This matches Java's ImpLSBaum which operates on nClusters, not nMarkers.
-        //
-        // Benefits:
-        // 1. Faster: C iterations instead of M (typically 10-50x fewer)
-        // 2. Correct math: cluster-scaled error applied ONCE per cluster
-        // 3. Matches Java exactly
         let base_err_rate = self.params.p_mismatch;
 
-        // Compute cluster midpoints for recombination
-        let cluster_midpoints: Vec<f64> = clusters
-            .iter()
-            .map(|c| {
-                if c.end > c.start {
-                    (gen_positions[genotyped_markers_vec[c.start]]
-                        + gen_positions[genotyped_markers_vec[c.end - 1]])
-                        / 2.0
-                } else {
-                    gen_positions[genotyped_markers_vec[c.start]]
-                }
-            })
-            .collect();
-
-        // Cluster-level recombination probabilities
-        let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain((1..n_clusters).map(|c| {
-                let gen_dist = (cluster_midpoints[c] - cluster_midpoints[c - 1]).abs();
-                self.params.p_recomb(gen_dist)
-            }))
-            .collect();
-
-        let cluster_bounds: Vec<(usize, usize)> = clusters.iter().map(|c| (c.start, c.end)).collect();
-        let (ref_cluster_start, ref_cluster_end) = compute_ref_cluster_bounds(&genotyped_markers_vec, &clusters);
-        let ref_cluster_start = std::sync::Arc::new(ref_cluster_start);
-        let ref_cluster_end = std::sync::Arc::new(ref_cluster_end);
-        let marker_cluster = std::sync::Arc::new(build_marker_cluster_index(&ref_cluster_start, n_ref_markers));
-        let cluster_weights = std::sync::Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
-
-        let cluster_seqs = std::sync::Arc::new(build_cluster_hap_sequences(
-            &ref_gt,
-            &target_gt,
-            &alignment,
-            &genotyped_markers_vec,
-            &cluster_bounds,
-        ));
-
-        let coded_steps = ClusterCodedSteps::from_cluster_sequences(
-            &cluster_seqs,
-            &cluster_midpoints,
-            self.config.imp_step as f64,
+        eprintln!(
+            "  HMM on per-sample clusters ({} genotyped markers), interpolating {} ungenotyped",
+            n_genotyped, n_to_impute
         );
-        let imp_ibs = std::sync::Arc::new(ImpIbs::new(
-            coded_steps,
-            self.config.imp_nsteps,
-            n_ibs_haps,
-            n_ref_haps,
-            n_target_haps,
-            self.config.seed as u64,
-        ));
 
-        // Run imputation for each target haplotype with per-thread workspaces
-        let state_probs: Vec<Arc<ClusterStateProbs>> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
-            (0..n_target_haps)
-            .into_par_iter()
-            .map_init(
-                || {
-                    let workspace = ImpWorkspace::with_ref_size(n_states);
-                    let imp_states = ImpStatesCluster::new(
+        let state_probs: Vec<Arc<ClusterStateProbs>> = info_span!("run_hmm", n_samples = n_target_samples).in_scope(|| {
+            (0..n_target_samples)
+                .into_par_iter()
+                .map(|s| {
+                    let hap1_idx = HapIdx::new((s * 2) as u32);
+                    let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
+                    let target_haps = [hap1_idx, hap2_idx];
+
+                    // Determine genotyped markers for this sample only (either hap non-missing).
+                    let sample_genotyped: Vec<usize> = (0..n_ref_markers)
+                        .filter(|&ref_m| {
+                            if let Some(target_m) = alignment.target_marker(ref_m) {
+                                let marker_idx = MarkerIdx::new(target_m as u32);
+                                let a1 = target_gt.allele(marker_idx, hap1_idx);
+                                let a2 = target_gt.allele(marker_idx, hap2_idx);
+                                a1 != 255 || a2 != 255
+                            } else {
+                                false
+                            }
+                        })
+                        .collect();
+
+                    if sample_genotyped.is_empty() {
+                        let empty = Arc::new(ClusterStateProbs::new(
+                            std::sync::Arc::new(vec![0usize; n_ref_markers]),
+                            std::sync::Arc::new(Vec::new()),
+                            std::sync::Arc::new(Vec::new()),
+                            0,
+                            Vec::new(),
+                            Vec::new(),
+                        ));
+                        return (empty.clone(), empty);
+                    }
+
+                    let targ_block_end = compute_targ_block_end(&ref_gt, &target_gt, &alignment, &sample_genotyped);
+                    let clusters = compute_marker_clusters_with_blocks(
+                        &sample_genotyped,
+                        &gen_positions,
+                        cluster_dist,
+                        &targ_block_end,
+                    );
+                    let n_clusters = clusters.len();
+                    let cluster_bounds: Vec<(usize, usize)> = clusters.iter().map(|c| (c.start, c.end)).collect();
+
+                    let cluster_midpoints: Vec<f64> = clusters
+                        .iter()
+                        .map(|c| {
+                            if c.end > c.start {
+                                (gen_positions[sample_genotyped[c.start]]
+                                    + gen_positions[sample_genotyped[c.end - 1]])
+                                    / 2.0
+                            } else {
+                                gen_positions[sample_genotyped[c.start]]
+                            }
+                        })
+                        .collect();
+
+                    let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+                        .chain((1..n_clusters).map(|c| {
+                            let gen_dist = (cluster_midpoints[c] - cluster_midpoints[c - 1]).abs();
+                            self.params.p_recomb(gen_dist)
+                        }))
+                        .collect();
+
+                    let (ref_cluster_start, ref_cluster_end) = compute_ref_cluster_bounds(&sample_genotyped, &clusters);
+                    let marker_cluster = std::sync::Arc::new(build_marker_cluster_index(&ref_cluster_start, n_ref_markers));
+                    let ref_cluster_end = std::sync::Arc::new(ref_cluster_end);
+                    let cluster_weights = std::sync::Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
+
+                    let cluster_seqs = build_cluster_hap_sequences_for_targets(
+                        &ref_gt,
+                        &target_gt,
+                        &alignment,
+                        &sample_genotyped,
+                        &cluster_bounds,
+                        &target_haps,
+                    );
+                    let coded_steps = ClusterCodedSteps::from_cluster_sequences(
+                        &cluster_seqs,
+                        &cluster_midpoints,
+                        self.config.imp_step as f64,
+                    );
+                    let imp_ibs = ImpIbs::new(
+                        coded_steps,
+                        self.config.imp_nsteps,
+                        n_ibs_haps,
+                        n_ref_haps,
+                        target_haps.len(),
+                        self.config.seed as u64,
+                    );
+
+                    let mut workspace = ImpWorkspace::with_ref_size(n_states);
+                    let mut imp_states = ImpStatesCluster::new(
                         &imp_ibs,
                         n_clusters,
                         n_ref_haps,
                         n_states,
                     );
-                    (workspace, imp_states)
-                },
-                |(workspace, imp_states), h| {
-                    let (hap_indices, actual_n_states) = if n_ref_haps <= 1000 {
-                        let all: Vec<u32> = (0..n_ref_haps as u32).collect();
-                        (vec![all; n_clusters], n_ref_haps)
-                    } else {
-                        let mut hap_indices: Vec<Vec<u32>> = Vec::new();
-                        let actual_n_states = imp_states.ibs_states_cluster(
-                            h,
-                            &mut hap_indices,
+
+                    let mut out = Vec::with_capacity(2);
+                    for (local_h, &global_h) in target_haps.iter().enumerate() {
+                        let (hap_indices, actual_n_states) = if n_ref_haps <= 1000 {
+                            let all: Vec<u32> = (0..n_ref_haps as u32).collect();
+                            (vec![all; n_clusters], n_ref_haps)
+                        } else {
+                            let mut hap_indices: Vec<Vec<u32>> = Vec::new();
+                            let actual_n_states = imp_states.ibs_states_cluster(local_h, &mut hap_indices);
+                            (hap_indices, actual_n_states)
+                        };
+
+                        let (cluster_mismatches, cluster_non_missing) = compute_cluster_mismatches(
+                            &hap_indices,
+                            &cluster_bounds,
+                            &sample_genotyped,
+                            &target_gt,
+                            &ref_gt,
+                            &alignment,
+                            global_h.as_usize(),
+                            actual_n_states,
                         );
-                        (hap_indices, actual_n_states)
-                    };
+                        let cluster_state_probs = run_hmm_forward_backward_clusters_counts(
+                            &cluster_mismatches,
+                            &cluster_non_missing,
+                            &cluster_p_recomb,
+                            base_err_rate,
+                            actual_n_states,
+                            &mut workspace,
+                        );
 
-                    let (cluster_mismatches, cluster_non_missing) = compute_cluster_mismatches(
-                        &hap_indices,
-                        &cluster_bounds,
-                        &genotyped_markers_vec,
-                        &target_gt,
-                        &ref_gt,
-                        &alignment,
-                        h,
-                        actual_n_states,
-                    );
-                    let cluster_state_probs = run_hmm_forward_backward_clusters_counts(
-                        &cluster_mismatches,
-                        &cluster_non_missing,
-                        &cluster_p_recomb,
-                        base_err_rate,
-                        actual_n_states,
-                        workspace,
-                    );
+                        out.push(Arc::new(ClusterStateProbs::new(
+                            std::sync::Arc::clone(&marker_cluster),
+                            std::sync::Arc::clone(&ref_cluster_end),
+                            std::sync::Arc::clone(&cluster_weights),
+                            actual_n_states,
+                            hap_indices,
+                            cluster_state_probs,
+                        )));
+                    }
 
-                    Arc::new(ClusterStateProbs::new(
-                        std::sync::Arc::clone(&marker_cluster),
-                        std::sync::Arc::clone(&ref_cluster_end),
-                        std::sync::Arc::clone(&cluster_weights),
-                        actual_n_states,
-                        hap_indices,
-                        cluster_state_probs,
-                    ))
-                },
-            )
-            .collect()
+                    (out[0].clone(), out[1].clone())
+                })
+                .collect::<Vec<(Arc<ClusterStateProbs>, Arc<ClusterStateProbs>)>>()
+                .into_iter()
+                .flat_map(|(sp1, sp2)| vec![sp1, sp2])
+                .collect()
         });
 
         eprintln!("Computing dosages with interpolation and quality metrics...");
