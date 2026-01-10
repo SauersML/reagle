@@ -1350,6 +1350,12 @@ impl PhasingPipeline {
                         }
                     }
 
+                    // Collapse hap-specific tracks into the combined prior after decision.
+                    for k in 0..n_states {
+                        fwd1_prior[k] = fwd0_prior[k];
+                        fwd2_prior[k] = fwd0_prior[k];
+                    }
+
                     // After the phase decision, continue with hap-specific tracks.
                     let allele1_eff = seq1_working[m];
                     let allele2_eff = seq2_working[m];
@@ -1767,6 +1773,12 @@ impl PhasingPipeline {
                             for h in het_idx..n_hets {
                                 std::mem::swap(&mut bwd1_cache[h], &mut bwd2_cache[h]);
                             }
+                        }
+
+                        // Collapse hap-specific tracks into the combined prior after decision.
+                        for k in 0..n_states {
+                            fwd1_prior[k] = fwd0_prior[k];
+                            fwd2_prior[k] = fwd0_prior[k];
                         }
 
                         let allele1_eff = seq1_working[m];
@@ -2246,6 +2258,12 @@ impl PhasingPipeline {
                             for h in het_idx..n_hets {
                                 std::mem::swap(&mut bwd1_cache[h], &mut bwd2_cache[h]);
                             }
+                        }
+
+                        // Collapse hap-specific tracks into the combined prior after decision.
+                        for k in 0..n_states {
+                            fwd1_prior[k] = fwd0_prior[k];
+                            fwd2_prior[k] = fwd0_prior[k];
                         }
 
                         let allele1_eff = seq1_working[i];
