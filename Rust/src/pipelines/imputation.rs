@@ -2087,42 +2087,29 @@ fn run_hmm_forward_backward_binary_emission(
         last_sum = sum.max(1e-30);
     }
 
-    // Backward pass with emission-weighted probabilities
+    // Backward pass - matches Java ImpLSBaum.setBwdValue()
+    // Order: transition (using p_recomb[m+1]), combine fwd*bwd, then emission (using errProb[m])
     let bwd = &mut workspace.bwd;
     bwd.resize(n_states, 0.0);
     bwd.fill(1.0 / n_states as f32);
 
+    // prev_sum tracks the sum of backward values after emission (used for scaling)
+    // Java initializes this to 1.0
+    let mut prev_sum = 1.0f32;
+
     for m in (0..n_clusters).rev() {
+        // Step 1: Apply backward transition from m+1 to m (if not at last cluster)
         if m + 1 < n_clusters {
             let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
             let shift = p_rec / n_states as f32;
+            let scale = (1.0 - p_rec) / prev_sum.max(1e-30);
 
-            let cluster_size = cluster_sizes.get(m + 1).copied().unwrap_or(1) as f32;
-            let err_prob = (base_err_rate * cluster_size).min(0.5);
-            let match_prob = 1.0 - err_prob;
-
-            let mut emitted_sum = 0.0f32;
             for k in 0..n_states {
-                let matches = cluster_matches[m + 1].get(k).copied().unwrap_or(true);
-                let em = if matches { match_prob } else { err_prob };
-                bwd[k] *= em;
-                emitted_sum += bwd[k];
-            }
-
-            if emitted_sum > 0.0 {
-                let scale = (1.0 - p_rec) / emitted_sum;
-                for k in 0..n_states {
-                    bwd[k] = scale * bwd[k] + shift;
-                }
-            } else {
-                let uniform = 1.0 / n_states as f32;
-                for k in 0..n_states {
-                    bwd[k] = uniform;
-                }
+                bwd[k] = scale * bwd[k] + shift;
             }
         }
 
-        // Combine forward and backward
+        // Step 2: Combine forward and backward at position m
         let row_offset = m * n_states;
         let mut state_sum = 0.0f32;
         for k in 0..n_states {
@@ -2137,6 +2124,20 @@ fn run_hmm_forward_backward_binary_emission(
                 fwd[row_offset + k] *= inv;
             }
         }
+
+        // Step 3: Apply emission at position m (preparing for next backward iteration at m-1)
+        let cluster_size = cluster_sizes.get(m).copied().unwrap_or(1) as f32;
+        let err_prob = (base_err_rate * cluster_size).min(0.5);
+        let match_prob = 1.0 - err_prob;
+
+        let mut emitted_sum = 0.0f32;
+        for k in 0..n_states {
+            let matches = cluster_matches[m].get(k).copied().unwrap_or(true);
+            let em = if matches { match_prob } else { err_prob };
+            bwd[k] *= em;
+            emitted_sum += bwd[k];
+        }
+        prev_sum = emitted_sum.max(1e-30);
     }
 
     fwd.to_vec()
