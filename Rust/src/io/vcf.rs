@@ -276,6 +276,9 @@ impl VcfReader {
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
         let mut markers = Markers::new();
         let mut columns = Vec::new();
+        // Accumulate per-marker confidence scores (one Vec<u8> per marker, indexed by sample)
+        let mut all_confidences: Vec<Vec<u8>> = Vec::new();
+        let mut has_any_confidence = false;
 
         let mut line = String::new();
         let mut line_num = 0usize;
@@ -299,8 +302,8 @@ impl VcfReader {
                 continue;
             }
 
-            // Parse VCF record
-            let (marker, mut alleles, is_phased) =
+            // Parse VCF record (now returns confidence if GL is present)
+            let (marker, mut alleles, is_phased, mut confidences) =
                 self.parse_record(line, &mut markers, line_num)?;
 
             // Track if any marker is unphased
@@ -330,6 +333,27 @@ impl VcfReader {
                     }
                 }
                 alleles = filtered_alleles;
+
+                // Also filter confidence scores if present
+                if let Some(ref conf) = confidences {
+                    let mut filtered_conf = Vec::with_capacity(include_indices.len());
+                    for &sample_idx in include_indices {
+                        if sample_idx < conf.len() {
+                            filtered_conf.push(conf[sample_idx]);
+                        }
+                    }
+                    confidences = Some(filtered_conf);
+                }
+            }
+
+            // Store confidence scores
+            if let Some(conf) = confidences {
+                has_any_confidence = true;
+                all_confidences.push(conf);
+            } else if has_any_confidence {
+                // If we've seen confidence before but this marker has none, fill with 255
+                let n_samples = self.samples.len();
+                all_confidences.push(vec![255; n_samples]);
             }
 
             // Calculate actual number of alleles: 1 REF + N ALT
@@ -368,7 +392,16 @@ impl VcfReader {
 
         // Return unphased by default - caller should phase if needed
         // The is_phased detection is informational only
-        let matrix = GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples));
+        let matrix = if has_any_confidence && all_confidences.len() == columns.len() {
+            GenotypeMatrix::new_unphased_with_confidence(
+                markers,
+                columns,
+                Arc::clone(&self.samples),
+                all_confidences,
+            )
+        } else {
+            GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
+        };
         Ok(matrix)
     }
 
@@ -432,12 +465,15 @@ impl VcfReader {
     }
 
     /// Parse a single VCF record line
+    ///
+    /// Returns (marker, alleles, is_phased, confidences).
+    /// Confidences is Some if the GL field is present, None otherwise.
     fn parse_record(
         &mut self,
         line: &str,
         markers: &mut Markers,
         line_num: usize,
-    ) -> Result<(Marker, Vec<u8>, bool)> {
+    ) -> Result<(Marker, Vec<u8>, bool, Option<Vec<u8>>)> {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 10 {
             return Err(ReagleError::parse(
@@ -488,17 +524,21 @@ impl VcfReader {
             None
         };
 
-        // Parse FORMAT to find GT position
+        // Parse FORMAT to find GT position and optionally GL position
         let format = fields[8];
-        let gt_idx = format
-            .split(':')
-            .position(|f| f == "GT")
+        let format_fields: Vec<&str> = format.split(':').collect();
+        let gt_idx = format_fields
+            .iter()
+            .position(|&f| f == "GT")
             .ok_or_else(|| ReagleError::parse(line_num, "No GT field in FORMAT"))?;
+        let gl_idx = format_fields.iter().position(|&f| f == "GL");
 
         // Parse genotypes
         let n_samples = self.samples.len();
         let mut alleles = Vec::with_capacity(n_samples * 2);
         let mut is_phased = true;
+        // Confidence scores (only populated if GL field is present)
+        let mut confidences: Option<Vec<u8>> = gl_idx.map(|_| Vec::with_capacity(n_samples));
 
         // Initialize ploidy tracking on first variant if not already done
         if self.sample_ploidy.is_none() {
@@ -510,7 +550,8 @@ impl VcfReader {
                 break;
             }
 
-            let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
+            let sample_parts: Vec<&str> = sample_field.split(':').collect();
+            let gt_field = sample_parts.get(gt_idx).copied().unwrap_or("./.");
 
             // Parse genotype (handle both phased | and unphased /)
             let (a1, a2, phased, is_haploid) = parse_genotype(gt_field)?;
@@ -528,11 +569,22 @@ impl VcfReader {
 
             alleles.push(a1);
             alleles.push(a2);
+
+            // Parse GL field if present and compute confidence
+            if let Some(gl_i) = gl_idx {
+                if let Some(conf_vec) = confidences.as_mut() {
+                    let confidence = sample_parts
+                        .get(gl_i)
+                        .and_then(|gl_str| compute_gl_confidence(gl_str, a1, a2))
+                        .unwrap_or(255); // Default to full confidence if GL missing/unparseable
+                    conf_vec.push(confidence);
+                }
+            }
         }
 
         let marker = Marker::with_end(chrom_idx, pos, end_pos, id, ref_allele, alt_alleles);
 
-        Ok((marker, alleles, is_phased))
+        Ok((marker, alleles, is_phased, confidences))
     }
 
     /// Rebuild Samples with detected ploidy information
@@ -637,6 +689,97 @@ fn parse_allele(s: &str) -> u8 {
         }
         Err(_) => 255,
     }
+}
+
+/// Compute genotype confidence from GL field.
+///
+/// GL field contains log10 likelihoods for each possible genotype.
+/// For diploid biallelic: GL = P(0/0), P(0/1), P(1/1)
+///
+/// Returns confidence (0-255) for the called genotype.
+/// Low confidence (uniform GLs like -0.48,-0.48,-0.48) returns low values.
+/// High confidence (one GL much higher than others) returns high values.
+///
+/// # Arguments
+/// * `gl_str` - GL field value, e.g., "-0.48,-0.48,-0.48" or "0,-5,-10"
+/// * `a1` - First called allele (0=ref, 1+=alt)
+/// * `a2` - Second called allele
+fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
+    // Skip missing values
+    if gl_str.is_empty() || gl_str == "." {
+        return None;
+    }
+
+    // Parse GL values
+    let gls: Vec<f64> = gl_str
+        .split(',')
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    // Need at least 3 values for diploid biallelic
+    if gls.len() < 3 {
+        return None;
+    }
+
+    // Map genotype to GL index:
+    // For biallelic: 0/0 -> 0, 0/1 -> 1, 1/1 -> 2
+    // For multiallelic: use triangular number formula
+    let (min_a, max_a) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
+    let gt_idx = if a1 == 255 || a2 == 255 {
+        // Missing allele - can't compute confidence
+        return None;
+    } else {
+        // Triangular number index: for (a, b) where a <= b, index = b*(b+1)/2 + a
+        let max_a_usize = max_a as usize;
+        let min_a_usize = min_a as usize;
+        max_a_usize * (max_a_usize + 1) / 2 + min_a_usize
+    };
+
+    if gt_idx >= gls.len() {
+        return None;
+    }
+
+    // Get the GL for the called genotype
+    let called_gl = gls[gt_idx];
+
+    // Find max GL
+    let max_gl = gls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    // If called genotype has max GL, compute confidence based on gap to second-best
+    // If called genotype doesn't have max GL, confidence is low
+
+    // Sort GLs descending
+    let mut sorted_gls = gls.clone();
+    sorted_gls.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Gap between best and second-best GL (in log10 units)
+    let gl_gap = if sorted_gls.len() >= 2 {
+        sorted_gls[0] - sorted_gls[1]
+    } else {
+        0.0
+    };
+
+    // Check if called genotype is the most likely
+    let is_best_call = (called_gl - max_gl).abs() < 0.001;
+
+    // Compute confidence:
+    // - Uniform GLs (gap ≈ 0) -> low confidence
+    // - Clear winner (gap > 1) -> high confidence
+    // - If call doesn't match best GL -> very low confidence
+
+    let confidence = if !is_best_call {
+        // Called genotype is not the most likely - very uncertain
+        (10.0 * (1.0 + (called_gl - max_gl))) as u8
+    } else {
+        // Convert GL gap to confidence
+        // GL gap of 0 -> confidence ~128 (uncertain)
+        // GL gap of 1 -> confidence ~200
+        // GL gap of 2+ -> confidence ~255
+        let conf = 128.0 + 63.5 * gl_gap.min(2.0);
+        conf.min(255.0) as u8
+    };
+
+    Some(confidence)
 }
 
 /// VCF file writer

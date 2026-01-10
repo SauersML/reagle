@@ -35,6 +35,12 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased> {
     /// Whether markers are in reverse order
     is_reversed: bool,
 
+    /// Optional per-sample genotype confidence scores (from GL or DS).
+    /// Stored as u8 (0-255) representing confidence 0.0-1.0.
+    /// Layout: `confidence[marker][sample]`
+    /// None if no confidence information available (assume full confidence).
+    confidence: Option<Vec<Vec<u8>>>,
+
     /// Phantom data to hold the State type parameter (zero-sized)
     phantom: PhantomData<State>,
 }
@@ -88,7 +94,37 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Total memory usage in bytes (approximate)
     pub fn size_bytes(&self) -> usize {
         let column_bytes: usize = self.columns.iter().map(|c| c.size_bytes()).sum();
-        column_bytes + std::mem::size_of::<Self>()
+        let confidence_bytes: usize = self.confidence.as_ref()
+            .map(|c| c.iter().map(|v| v.len()).sum())
+            .unwrap_or(0);
+        column_bytes + confidence_bytes + std::mem::size_of::<Self>()
+    }
+
+    /// Check if confidence scores are available
+    pub fn has_confidence(&self) -> bool {
+        self.confidence.is_some()
+    }
+
+    /// Get confidence score for a sample at a marker (0-255 representing 0.0-1.0).
+    /// Returns 255 (full confidence) if confidence data is not available.
+    #[inline]
+    pub fn sample_confidence(&self, marker: MarkerIdx, sample_idx: usize) -> u8 {
+        self.confidence.as_ref()
+            .and_then(|c| c.get(marker.as_usize()))
+            .and_then(|row| row.get(sample_idx))
+            .copied()
+            .unwrap_or(255)
+    }
+
+    /// Get confidence score as f32 (0.0-1.0)
+    #[inline]
+    pub fn sample_confidence_f32(&self, marker: MarkerIdx, sample_idx: usize) -> f32 {
+        self.sample_confidence(marker, sample_idx) as f32 / 255.0
+    }
+
+    /// Clone the confidence data (for transferring to a new matrix)
+    pub fn confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
+        self.confidence.clone()
     }
 }
 
@@ -109,6 +145,26 @@ impl GenotypeMatrix<Unphased> {
             columns,
             samples,
             is_reversed: false,
+            confidence: None,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Create new unphased matrix with confidence scores
+    pub fn new_unphased_with_confidence(
+        markers: Markers,
+        columns: Vec<GenotypeColumn>,
+        samples: Arc<Samples>,
+        confidence: Vec<Vec<u8>>,
+    ) -> Self {
+        debug_assert_eq!(markers.len(), columns.len());
+        debug_assert_eq!(markers.len(), confidence.len());
+        Self {
+            markers,
+            columns,
+            samples,
+            is_reversed: false,
+            confidence: Some(confidence),
             phantom: PhantomData,
         }
     }
@@ -123,6 +179,7 @@ impl GenotypeMatrix<Unphased> {
             columns: self.columns,
             samples: self.samples,
             is_reversed: self.is_reversed,
+            confidence: self.confidence,
             phantom: PhantomData,
         }
     }
@@ -145,6 +202,26 @@ impl GenotypeMatrix<Phased> {
             columns,
             samples,
             is_reversed: false,
+            confidence: None,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Create a new phased genotype matrix with confidence scores
+    pub fn new_phased_with_confidence(
+        markers: Markers,
+        columns: Vec<GenotypeColumn>,
+        samples: Arc<Samples>,
+        confidence: Vec<Vec<u8>>,
+    ) -> Self {
+        debug_assert_eq!(markers.len(), columns.len());
+        debug_assert_eq!(markers.len(), confidence.len());
+        Self {
+            markers,
+            columns,
+            samples,
+            is_reversed: false,
+            confidence: Some(confidence),
             phantom: PhantomData,
         }
     }
@@ -241,5 +318,72 @@ mod tests {
         // Transform to phased
         let phased = unphased.into_phased();
         assert_eq!(phased.n_markers(), 2);
+    }
+
+    #[test]
+    fn test_confidence_scores() {
+        let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
+        let mut markers = Markers::new();
+        markers.add_chrom("chr1");
+
+        let m1 = Marker::new(
+            ChromIdx::new(0),
+            100,
+            None,
+            Allele::Base(0),
+            vec![Allele::Base(1)],
+        );
+        let m2 = Marker::new(
+            ChromIdx::new(0),
+            200,
+            None,
+            Allele::Base(0),
+            vec![Allele::Base(1)],
+        );
+
+        markers.push(m1);
+        markers.push(m2);
+
+        let col1 = GenotypeColumn::from_alleles(&[0, 1, 0, 1], 2);
+        let col2 = GenotypeColumn::from_alleles(&[1, 1, 0, 0], 2);
+
+        // Create confidence scores: marker 0 has full confidence, marker 1 has 50% for sample 0
+        let confidence = vec![
+            vec![255, 255],         // marker 0: full confidence for both samples
+            vec![128, 255],         // marker 1: 50% for sample 0, full for sample 1
+        ];
+
+        let matrix = GenotypeMatrix::new_unphased_with_confidence(
+            markers,
+            vec![col1, col2],
+            samples,
+            confidence,
+        );
+
+        assert!(matrix.has_confidence());
+        assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), 255);
+        assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 0), 128);
+        assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 1), 255);
+
+        // Check f32 conversion
+        assert!((matrix.sample_confidence_f32(MarkerIdx::new(0), 0) - 1.0).abs() < 0.01);
+        assert!((matrix.sample_confidence_f32(MarkerIdx::new(1), 0) - 0.502).abs() < 0.01);
+
+        // Verify confidence survives phase transition
+        let phased = matrix.into_phased();
+        assert!(phased.has_confidence());
+        assert_eq!(phased.sample_confidence(MarkerIdx::new(1), 0), 128);
+    }
+
+    #[test]
+    fn test_no_confidence_defaults_to_full() {
+        let matrix = make_test_matrix_unphased();
+
+        // Without confidence data, has_confidence returns false
+        assert!(!matrix.has_confidence());
+
+        // But sample_confidence defaults to 255 (full confidence)
+        assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), 255);
+        assert!((matrix.sample_confidence_f32(MarkerIdx::new(0), 0) - 1.0).abs() < 0.01);
     }
 }

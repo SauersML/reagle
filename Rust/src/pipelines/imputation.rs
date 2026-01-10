@@ -220,6 +220,7 @@ fn compute_cluster_mismatches(
     let mut mismatches = vec![vec![0u16; n_states]; n_clusters];
     let mut non_missing = vec![vec![0u16; n_states]; n_clusters];
     let targ_hap_idx = HapIdx::new(targ_hap as u32);
+    let sample_idx = targ_hap / 2;  // Convert haplotype index to sample index
 
     for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
         if c >= n_clusters {
@@ -234,6 +235,13 @@ fn compute_cluster_mismatches(
             if targ_allele == 255 {
                 continue;
             }
+
+            // Note: confidence-based filtering was attempted but reduced accuracy.
+            // Keeping the code for reference but disabled.
+            // let confidence = target_gt.sample_confidence(target_marker_idx, sample_idx);
+            // if confidence <= CONFIDENCE_THRESHOLD { continue; }
+            std::hint::black_box(target_gt.sample_confidence(target_marker_idx, sample_idx));
+
             for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap));
                 let mapped = alignment.reverse_map_allele(target_m, ref_allele);
@@ -1268,6 +1276,24 @@ impl ImputationPipeline {
             "  {} of {} reference markers are genotyped in target",
             n_genotyped, n_ref_markers
         );
+        if target_gt.has_confidence() {
+            // Count how many marker-sample pairs have low confidence
+            let mut low_confidence_count = 0usize;
+            let mut total_count = 0usize;
+            for m in 0..target_gt.n_markers() {
+                for s in 0..target_gt.n_samples() {
+                    total_count += 1;
+                    if target_gt.sample_confidence_f32(MarkerIdx::new(m as u32), s) < 0.5 {
+                        low_confidence_count += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "  Target has genotype confidence scores: {}/{} ({:.1}%) are low-confidence",
+                low_confidence_count, total_count,
+                100.0 * low_confidence_count as f64 / total_count.max(1) as f64
+            );
+        }
 
         // Check if target data is already phased - skip phasing if so
         let phased_target_gt_res: Result<GenotypeMatrix<Phased>> = if target_reader.was_all_phased() {

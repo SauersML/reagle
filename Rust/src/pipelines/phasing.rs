@@ -2414,7 +2414,12 @@ impl PhasingPipeline {
             })
             .collect();
 
-        GenotypeMatrix::new_phased(markers, columns, samples)
+        // Preserve confidence scores from original matrix
+        if let Some(confidence) = original.confidence_clone() {
+            GenotypeMatrix::new_phased_with_confidence(markers, columns, samples, confidence)
+        } else {
+            GenotypeMatrix::new_phased(markers, columns, samples)
+        }
     }
 
     /// Stage 2: Phase rare markers using HMM state probability interpolation
