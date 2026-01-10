@@ -1394,7 +1394,7 @@ impl ImputationPipeline {
         // Respect block boundaries induced by reference allele-coding changes.
         let mut cluster_dist = self.config.cluster as f64;
         if n_genotyped <= 1000 {
-            cluster_dist = cluster_dist.min(0.001);
+            cluster_dist = 0.0;
         }
         let targ_block_end = compute_targ_block_end(&ref_gt, &target_gt, &alignment, &genotyped_markers_vec);
         let clusters = compute_marker_clusters_with_blocks(
@@ -3356,6 +3356,127 @@ mod tests {
                 "P(ALT) should be in [0,1], got {}", p_alt
             );
         }
+    }
+
+    // =========================================================================
+    // DIAGNOSTIC TESTS: Interpolation Behavior Documentation
+    // =========================================================================
+    //
+    // These tests document the current interpolation behavior and provide
+    // diagnostic information about how ClusterStateProbs handles markers
+    // between clusters where haplotype assignments may differ.
+
+    /// Diagnostic test: Document how interpolation handles haplotype changes between clusters
+    ///
+    /// When a state maps to different haplotypes at cluster M vs M+1 (due to recombination),
+    /// this test documents what the current implementation produces.
+    #[test]
+    fn test_interpolation_with_haplotype_change_between_clusters() {
+        // Setup: State 0 maps to haplotype 0 at cluster 0, haplotype 1 at cluster 1
+        // - Haplotype 0 carries REF at all positions
+        // - Haplotype 1 carries ALT at all positions
+        let marker_cluster = Arc::new(vec![0usize, 0, 1]);
+        let ref_cluster_end = Arc::new(vec![1usize, 3]);
+        let weight = Arc::new(vec![f32::NAN, 0.5, f32::NAN]);  // 50/50 weight
+
+        let hap_indices = vec![vec![0u32], vec![1u32]];
+        let cluster_probs = vec![1.0f32, 1.0f32];
+
+        let state_probs = ClusterStateProbs::new(
+            marker_cluster,
+            ref_cluster_end,
+            weight,
+            1,
+            hap_indices,
+            cluster_probs,
+        );
+
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            std::hint::black_box(marker);
+            if hap == 0 { 0 } else { 1 }
+        };
+
+        let post = state_probs.allele_posteriors(1, 2, &get_ref_allele);
+        let p_alt = post.prob(1);
+
+        // Document current behavior:
+        // If using LEFT haplotype only: P(ALT) = 0 (hap 0 = REF)
+        // If using both haplotypes: P(ALT) = 0.5 (50% from hap0=REF, 50% from hap1=ALT)
+        eprintln!("DIAGNOSTIC: Interpolation with haplotype change");
+        eprintln!("  State maps: cluster 0 -> hap 0 (REF), cluster 1 -> hap 1 (ALT)");
+        eprintln!("  Weight: 0.5 (equal left/right)");
+        eprintln!("  P(ALT) = {:.4}", p_alt);
+        eprintln!("  If LEFT-only: expect 0.0, If BOTH: expect 0.5");
+
+        // This is a diagnostic - we want to know which approach is used
+        // The test passes either way but documents the behavior
+        assert!(
+            (0.0..=1.0).contains(&p_alt),
+            "P(ALT) should be in [0,1], got {}", p_alt
+        );
+    }
+
+    /// Diagnostic test: Linear interpolation behavior across multiple markers
+    #[test]
+    fn test_interpolation_gradient_across_interval() {
+        let n_markers = 12;
+        let mut marker_cluster = vec![0usize; n_markers];
+        marker_cluster[11] = 1;
+
+        let marker_cluster = Arc::new(marker_cluster);
+        let ref_cluster_end = Arc::new(vec![1usize, 12]);
+
+        let mut weight = vec![f32::NAN; n_markers];
+        for m in 1..11 {
+            weight[m] = 1.0 - (m as f32 / 10.0);
+        }
+        let weight = Arc::new(weight);
+
+        // Haplotype change between clusters
+        let hap_indices = vec![vec![0u32], vec![1u32]];
+        let cluster_probs = vec![1.0f32, 1.0f32];
+
+        let state_probs = ClusterStateProbs::new(
+            marker_cluster,
+            ref_cluster_end,
+            weight,
+            1,
+            hap_indices,
+            cluster_probs,
+        );
+
+        let get_ref_allele = |marker: usize, hap: u32| -> u8 {
+            std::hint::black_box(marker);
+            if hap == 0 { 0 } else { 1 }
+        };
+
+        eprintln!("DIAGNOSTIC: Interpolation gradient across interval");
+        eprintln!("  Hap 0 = REF, Hap 1 = ALT");
+        eprintln!("  Marker | Weight | P(ALT)");
+        eprintln!("  -------+--------+-------");
+
+        let mut p_alts = Vec::new();
+        for m in 1..11 {
+            let post = state_probs.allele_posteriors(m, 2, &get_ref_allele);
+            let p_alt = post.prob(1);
+            let w = 1.0 - (m as f32 / 10.0);
+            eprintln!("  {:6} | {:6.2} | {:6.4}", m, w, p_alt);
+            p_alts.push(p_alt);
+        }
+
+        // Check monotonicity - P(ALT) should increase as we move toward cluster 1
+        // (if using both haplotypes) or stay constant (if using LEFT only)
+        let is_monotonic_increasing = p_alts.windows(2).all(|w| w[1] >= w[0] - 0.001);
+        let is_constant = p_alts.iter().all(|&p| (p - p_alts[0]).abs() < 0.01);
+
+        eprintln!("  Monotonic increasing: {}", is_monotonic_increasing);
+        eprintln!("  Constant: {}", is_constant);
+
+        // Either behavior is valid - this is diagnostic
+        assert!(
+            is_monotonic_increasing || is_constant,
+            "P(ALT) should be either monotonic increasing or constant"
+        );
     }
 
 }
