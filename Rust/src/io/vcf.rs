@@ -93,7 +93,11 @@ impl MarkerImputationStats {
         let den = sum - mean_term;
 
         if num <= 0.0 || den <= 0.0 {
-            0.0
+            if !self.is_imputed {
+                1.0
+            } else {
+                0.0
+            }
         } else {
             (num / den).clamp(0.0, 1.0)
         }
@@ -969,6 +973,7 @@ mod tests {
     fn test_dr2_perfect_imputation() {
         // Perfect imputation with variation: mix of 0 and 1 dosages, all certain
         let mut stats = MarkerImputationStats::new(2);
+        stats.is_imputed = true;
 
         // Add samples with different certain values to create variance
         // 5 samples with ref/ref (dosage 0 for alt)
@@ -993,6 +998,7 @@ mod tests {
     fn test_dr2_uncertain_imputation() {
         // Uncertain imputation: all samples have 50% probability
         let mut stats = MarkerImputationStats::new(2);
+        stats.is_imputed = true;
 
         // Add 10 samples, all uncertain
         for _ in 0..10 {
@@ -1013,6 +1019,7 @@ mod tests {
     fn test_dr2_variable_imputation() {
         // Mixed certainty
         let mut stats = MarkerImputationStats::new(2);
+        stats.is_imputed = true;
 
         // Some certain, some uncertain
         stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]); // Certain alt/alt (dose=2)
