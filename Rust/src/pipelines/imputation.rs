@@ -1483,11 +1483,17 @@ impl ImputationPipeline {
                     (workspace, imp_states)
                 },
                 |(workspace, imp_states), h| {
-                    let mut hap_indices: Vec<Vec<u32>> = Vec::new();
-                    let actual_n_states = imp_states.ibs_states_cluster(
-                        h,
-                        &mut hap_indices,
-                    );
+                    let (hap_indices, actual_n_states) = if n_ref_haps <= 1000 {
+                        let all: Vec<u32> = (0..n_ref_haps as u32).collect();
+                        (vec![all; n_clusters], n_ref_haps)
+                    } else {
+                        let mut hap_indices: Vec<Vec<u32>> = Vec::new();
+                        let actual_n_states = imp_states.ibs_states_cluster(
+                            h,
+                            &mut hap_indices,
+                        );
+                        (hap_indices, actual_n_states)
+                    };
 
                     let (cluster_mismatches, cluster_non_missing) = compute_cluster_mismatches(
                         &hap_indices,
