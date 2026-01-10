@@ -1483,54 +1483,53 @@ impl ImputationPipeline {
         let marker_cluster = std::sync::Arc::new(build_marker_cluster_index(&ref_cluster_start, n_ref_markers));
         let cluster_weights = std::sync::Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
 
-        let cluster_seqs = std::sync::Arc::new(build_cluster_hap_sequences(
-            &ref_gt,
-            &target_gt,
-            &alignment,
-            &genotyped_markers_vec,
-            &cluster_bounds,
-        ));
-
-        let coded_steps = ClusterCodedSteps::from_cluster_sequences(
-            &cluster_seqs,
-            &cluster_midpoints,
-            self.config.imp_step as f64,
-        );
-        let imp_ibs = std::sync::Arc::new(ImpIbs::new(
-            coded_steps,
-            self.config.imp_nsteps,
-            n_ibs_haps,
-            n_ref_haps,
-            n_target_haps,
-            self.config.seed as u64,
-        ));
+        // Create shareable, read-only IBS data structures once
+        let coded_steps = Arc::new({
+            let cluster_seqs = build_cluster_hap_sequences(
+                &ref_gt,
+                &target_gt,
+                &alignment,
+                &genotyped_markers_vec,
+                &cluster_bounds,
+            );
+            ClusterCodedSteps::from_cluster_sequences(
+                &cluster_seqs,
+                &cluster_midpoints,
+                self.config.imp_step as f64,
+            )
+        });
 
         // Run imputation for each target haplotype with per-thread workspaces
         let state_probs: Vec<Arc<ClusterStateProbs>> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
             (0..n_target_haps)
-            .into_par_iter()
-            .map_init(
-                || {
-                    let workspace = ImpWorkspace::with_ref_size(n_states);
-                    let imp_states = ImpStatesCluster::new(
+                .into_par_iter()
+                .map(|h| {
+                    // These structures have internal state (RNG) and MUST be created per-thread
+                    let imp_ibs = ImpIbs::new(
+                        Arc::clone(&coded_steps),
+                        self.config.imp_nsteps,
+                        n_ibs_haps,
+                        n_ref_haps,
+                        n_target_haps,
+                        self.config.seed as u64 + h as u64,
+                    );
+                    let mut imp_states = ImpStatesCluster::new(
                         &imp_ibs,
                         n_clusters,
                         n_ref_haps,
                         n_states,
                     );
-                    (workspace, imp_states)
-                },
-                |(workspace, imp_states), h| {
+
                     let (hap_indices, actual_n_states) = if n_ref_haps <= 1000 {
                         let all: Vec<u32> = (0..n_ref_haps as u32).collect();
                         (vec![all; n_clusters], n_ref_haps)
                     } else {
                         let mut hap_indices: Vec<Vec<u32>> = Vec::new();
-                        let actual_n_states = imp_states.ibs_states_cluster(
+                        let n_states = imp_states.ibs_states_cluster(
                             h,
                             &mut hap_indices,
                         );
-                        (hap_indices, actual_n_states)
+                        (hap_indices, n_states)
                     };
 
                     // Compute cluster matches using Java-style binary emission model
@@ -1544,13 +1543,15 @@ impl ImputationPipeline {
                         h,
                         actual_n_states,
                     );
+
+                    let mut workspace = ImpWorkspace::with_ref_size(actual_n_states);
                     let cluster_state_probs = run_hmm_forward_backward_binary_emission(
                         &cluster_matches,
                         &cluster_sizes,
                         &cluster_p_recomb,
                         base_err_rate,
                         actual_n_states,
-                        workspace,
+                        &mut workspace,
                     );
 
                     Arc::new(ClusterStateProbs::new(
@@ -1561,9 +1562,8 @@ impl ImputationPipeline {
                         hap_indices,
                         cluster_state_probs,
                     ))
-                },
-            )
-            .collect()
+                })
+                .collect()
         });
 
         eprintln!("Computing dosages with interpolation and quality metrics...");

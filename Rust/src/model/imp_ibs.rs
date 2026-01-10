@@ -34,6 +34,8 @@ const JAVA_RNG_MULT: u64 = 0x5DEECE66D;
 const JAVA_RNG_ADD: u64 = 0xB;
 const JAVA_RNG_MASK: u64 = (1u64 << 48) - 1;
 
+use std::sync::Arc;
+
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::phase_state::Phased;
@@ -93,7 +95,7 @@ pub struct ClusterCodedSteps {
 #[derive(Clone, Debug)]
 pub struct ImpIbs {
     /// The underlying coded steps used to derive IBS sets
-    pub coded_steps: ClusterCodedSteps,
+    pub coded_steps: Arc<ClusterCodedSteps>,
     /// IBS haplotype indices: `ibs_haps[step][target_hap_idx] = Vec<reference_hap_idx>`
     /// where target_hap_idx is 0-based within target panel (not offset by n_ref_haps)
     pub ibs_haps: Vec<Vec<Vec<u32>>>,
@@ -322,7 +324,7 @@ impl ClusterCodedSteps {
 
 impl ImpIbs {
     pub fn new(
-        coded_steps: ClusterCodedSteps,
+        coded_steps: Arc<ClusterCodedSteps>,
         n_steps_to_merge: usize,
         n_haps_per_step: usize,
         n_ref_haps: usize,
