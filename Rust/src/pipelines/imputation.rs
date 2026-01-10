@@ -1844,7 +1844,7 @@ impl ImputationPipeline {
 ///
 /// # Arguments
 /// * `cluster_mismatches` - For each cluster, mismatch counts per state
-/// * `cluster_non_missing` - For each cluster, number of observed markers
+/// * `cluster_non_missing` - For each cluster, observed marker counts per state
 /// * `p_recomb` - Per-cluster recombination probabilities
 /// * `p_err` - Per-marker mismatch probability
 /// * `n_states` - Number of HMM states
