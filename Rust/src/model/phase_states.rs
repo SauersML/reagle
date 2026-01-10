@@ -86,9 +86,9 @@ impl PhaseStates {
     /// This enforces a lower bound on segment length to prevent rapid thrashing,
     /// while scaling up for dense panels where many markers can fit within 1 cM.
     pub fn min_segment_len(n_markers: usize, gen_dists: &[f64]) -> usize {
-        let base = (n_markers / 100).max(50).max(1);
+        let max_len = n_markers.saturating_sub(1).max(1);
         if gen_dists.is_empty() {
-            return base;
+            return 200.min(max_len);
         }
 
         let mut dist_cm = 0.0;
@@ -107,7 +107,7 @@ impl PhaseStates {
             n_markers.saturating_sub(1).max(1)
         };
 
-        base.max(per_cm)
+        200.max(per_cm).min(max_len)
     }
 
     /// Create a new phase state selector
