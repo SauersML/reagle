@@ -1,3 +1,29 @@
+//! # Bidirectional PBWT for Phasing HMM State Selection
+//!
+//! This module implements bidirectional Positional Burrows-Wheeler Transform (PBWT)
+//! based neighbor finding for haplotype phasing. It is used to select HMM states
+//! (reference haplotypes) that are likely to match the target haplotype.
+//!
+//! ## Algorithm Overview
+//!
+//! The PBWT maintains a sorted order of haplotypes such that those with longer
+//! matching prefixes (forward) or suffixes (backward) are adjacent. By storing
+//! both directions, we can find haplotypes that match well both upstream and
+//! downstream of the current marker.
+//!
+//! ## Key Concepts
+//!
+//! - Prefix array (PPA): Permutation of haplotypes sorted by allele history
+//! - Divergence array: For each position in PPA, stores where the match started/ended
+//! - Forward PBWT: `div[i]` = marker where the match with predecessor started
+//! - Backward PBWT: `div[i]` = marker where the match with predecessor ends
+//!
+//! ## Integration with IBS2
+//!
+//! IBS2 segments (regions where two samples share both haplotypes) are also
+//! included as high-priority neighbors, as they indicate recent common ancestry
+//! and strong phase concordance.
+
 use crate::data::haplotype::SampleIdx;
 use crate::model::ibs2::Ibs2;
 use crate::model::pbwt::PbwtDivUpdater;
@@ -15,18 +41,26 @@ use crate::model::pbwt::PbwtDivUpdater;
 /// use global marker indices. The `subset_to_global` mapping handles this
 /// coordinate space conversion automatically in `find_neighbors`.
 pub struct BidirectionalPhaseIbs {
-    /// Forward divergence at each marker: fwd_div[m] = divergence array after processing markers 0..=m
+    /// Forward divergence at each marker: `fwd_div[m]` = divergence array after
+    /// processing markers 0..=m. For position i in the sorted order, `div[i]` is
+    /// the marker where the match with the haplotype at position i-1 started.
     fwd_div: Vec<Vec<i32>>,
-    /// Forward prefix array at each marker
+    /// Forward prefix array at each marker: `fwd_ppa[m][i]` = haplotype index at
+    /// sorted position i after processing markers 0..=m
     fwd_ppa: Vec<Vec<u32>>,
-    /// Backward divergence at each marker: bwd_div[m] = divergence array after processing markers m..n_markers
+    /// Backward divergence at each marker: `bwd_div[m]` = divergence array after
+    /// processing markers m..n_markers (in reverse). For position i, `div[i]` is
+    /// the marker where the match with the haplotype at position i-1 ends.
     bwd_div: Vec<Vec<i32>>,
     /// Backward prefix array at each marker
     bwd_ppa: Vec<Vec<u32>>,
+    /// Total number of haplotypes in the PBWT
     n_haps: usize,
+    /// Number of markers in the PBWT (may be subset of full chromosome)
     n_markers: usize,
     /// Optional mapping from subset marker index to global marker index.
-    /// When Some, IBS2 lookups use the mapped global index.
+    /// When Some, IBS2 lookups use the mapped global index since IBS2 segments
+    /// are defined in global marker space.
     /// When None (full chromosome), marker indices are used directly.
     subset_to_global: Option<Vec<usize>>,
 }
@@ -79,17 +113,22 @@ impl BidirectionalPhaseIbs {
         }
     }
 
-    /// Build bidirectional PBWT for a marker subset with global index mapping
+    /// Build bidirectional PBWT for a marker subset with global index mapping.
     ///
-    /// This variant stores the subset-to-global marker mapping so that IBS2
-    /// lookups (which use global indices) work correctly when the PBWT is
-    /// built on a marker subset (e.g., high-frequency markers in Stage 1).
+    /// This variant is used when phasing operates on a subset of markers (e.g.,
+    /// high-frequency markers in Stage 1 phasing). The subset_to_global mapping
+    /// ensures IBS2 segment lookups (which use global indices) work correctly.
     ///
     /// # Arguments
-    /// * `alleles` - Allele data per subset marker
+    /// * `alleles` - Allele data per subset marker (2D: [marker][haplotype])
     /// * `n_haps` - Number of haplotypes
-    /// * `n_markers` - Number of markers in subset
+    /// * `n_markers` - Number of markers in the subset
     /// * `subset_to_global` - Mapping from subset index to global marker index
+    ///
+    /// # Example Use Case
+    /// Stage 1 phasing uses only high-frequency markers (e.g., MAF > 0.1) to
+    /// establish initial phase. The subset indices (0, 1, 2, ...) map to
+    /// non-contiguous global indices (e.g., 0, 5, 12, ...).
     pub fn build_for_subset(
         alleles: &[Vec<u8>],
         n_haps: usize,
@@ -101,10 +140,30 @@ impl BidirectionalPhaseIbs {
         result
     }
 
-    /// Find neighbors at a marker using both forward and backward PBWT
+    /// Find neighbor haplotypes at a marker using bidirectional PBWT and IBS2.
     ///
-    /// When built with `build_for_subset`, automatically converts the subset
-    /// marker index to global space for IBS2 segment lookups.
+    /// This is the main entry point for HMM state selection during phasing.
+    /// It combines three sources of potential matching haplotypes:
+    ///
+    /// 1. **IBS2 segments**: Haplotypes from samples that share both haplotypes
+    ///    with the target sample at this marker (highest priority)
+    /// 2. **Forward PBWT neighbors**: Haplotypes with matching allele prefixes
+    ///    (markers 0..=marker_idx)
+    /// 3. **Backward PBWT neighbors**: Haplotypes with matching allele suffixes
+    ///    (markers marker_idx..n_markers)
+    ///
+    /// The combined set excludes the target haplotype and its pair from the
+    /// same sample.
+    ///
+    /// # Arguments
+    /// * `hap_idx` - Target haplotype index
+    /// * `marker_idx` - Current marker (in subset space if built with subset)
+    /// * `ibs2` - IBS2 segment data
+    /// * `n_candidates` - Approximate number of neighbors to return
+    ///
+    /// # Returns
+    /// Vector of neighbor haplotype indices (may contain duplicates from
+    /// multiple sources, which is intentional for weighting)
     pub fn find_neighbors(
         &self,
         hap_idx: u32,

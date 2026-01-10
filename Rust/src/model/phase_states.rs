@@ -183,6 +183,7 @@ impl PhaseStates {
 
         // Only replace when queue is FULL - matches Java BasicPhaseStates behavior
         // The staleness check determines WHICH entry to replace, not WHETHER to replace
+        let mut inserted = false;
         if self.queue.len() < self.max_states {
             // Queue has room - add new entry
             let index = self.queue.len();
@@ -193,6 +194,7 @@ impl PhaseStates {
                 start_marker: 0,
                 last_ibs_marker: marker,
             });
+            inserted = true;
         } else if !self.queue.is_empty() {
             // Queue is full - check if oldest entry is stale enough to replace
             let oldest = self.queue.peek().unwrap();
@@ -226,11 +228,14 @@ impl PhaseStates {
                     start_marker: next_start,
                     last_ibs_marker: marker,
                 });
+                inserted = true;
             }
             // If oldest entry is not stale enough, don't replace - just track the hap
         }
 
-        self.hap_to_last_ibs.insert(ibs_hap, marker);
+        if inserted {
+            self.hap_to_last_ibs.insert(ibs_hap, marker);
+        }
     }
 
     /// Update the head of the queue to reflect latest IBS marker
