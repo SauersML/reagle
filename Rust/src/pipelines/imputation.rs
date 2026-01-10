@@ -220,7 +220,6 @@ fn compute_cluster_mismatches(
     let mut mismatches = vec![vec![0u16; n_states]; n_clusters];
     let mut non_missing = vec![vec![0u16; n_states]; n_clusters];
     let targ_hap_idx = HapIdx::new(targ_hap as u32);
-    let sample_idx = targ_hap / 2;  // Convert haplotype index to sample index
 
     for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
         if c >= n_clusters {
@@ -247,8 +246,6 @@ fn compute_cluster_mismatches(
                     mismatches[c][j] = mismatches[c][j].saturating_add(1);
                 }
             }
-            // Keep this to mark sample_confidence as used
-            std::hint::black_box(target_gt.sample_confidence(target_marker_idx, sample_idx));
         }
     }
 

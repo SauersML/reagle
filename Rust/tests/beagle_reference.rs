@@ -1855,10 +1855,56 @@ fn compare_dr2_values(java_records: &[ParsedRecord], rust_records: &[ParsedRecor
     let rust_mean: f64 = rust_dr2.iter().sum::<f64>() / rust_dr2.len() as f64;
 
     println!("[{}] DR2 Comparison:", name);
-    println!("  Java mean DR2: {:.4} (genotyped: {:.4} [n={}], imputed: {:.4} [n={}])", 
+    println!("  Java mean DR2: {:.4} (genotyped: {:.4} [n={}], imputed: {:.4} [n={}])",
              java_mean, java_genotyped_mean, java_genotyped_dr2.len(), java_imputed_mean, java_imputed_dr2.len());
-    println!("  Rust mean DR2: {:.4} (genotyped: {:.4} [n={}], imputed: {:.4} [n={}])", 
+    println!("  Rust mean DR2: {:.4} (genotyped: {:.4} [n={}], imputed: {:.4} [n={}])",
              rust_mean, rust_genotyped_mean, rust_genotyped_dr2.len(), rust_imputed_mean, rust_imputed_dr2.len());
+
+    // Diagnostic: Find markers where Rust is much worse than Java for imputed markers
+    let java_imputed: Vec<_> = java_records.iter()
+        .filter(|r| r.info.contains_key("IMP"))
+        .collect();
+    let rust_imputed: Vec<_> = rust_records.iter()
+        .filter(|r| r.info.contains_key("IMP"))
+        .collect();
+
+    let mut dr2_diffs: Vec<(u64, f64, f64, f64)> = Vec::new(); // (pos, java_dr2, rust_dr2, diff)
+    for (j, r) in java_imputed.iter().zip(rust_imputed.iter()) {
+        if j.pos == r.pos {
+            if let (Some(java_d), Some(rust_d)) = (
+                j.info.get("DR2").and_then(|v| v.parse::<f64>().ok()),
+                r.info.get("DR2").and_then(|v| v.parse::<f64>().ok()),
+            ) {
+                let diff = java_d - rust_d;
+                if diff > 0.3 { // Java much better
+                    dr2_diffs.push((j.pos, java_d, rust_d, diff));
+                }
+            }
+        }
+    }
+    dr2_diffs.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+    if !dr2_diffs.is_empty() {
+        println!("  Markers where Java DR2 >> Rust DR2 (diff > 0.3):");
+        for (pos, java_d, rust_d, diff) in dr2_diffs.iter().take(5) {
+            println!("    pos={}: Java={:.4}, Rust={:.4}, diff={:.4}", pos, java_d, rust_d, diff);
+        }
+
+        // Detailed dosage comparison for worst marker
+        if let Some(&(worst_pos, _, _, _)) = dr2_diffs.first() {
+            println!("  Detailed dosages at pos={}:", worst_pos);
+            let java_rec = java_imputed.iter().find(|r| r.pos == worst_pos);
+            let rust_rec = rust_imputed.iter().find(|r| r.pos == worst_pos);
+            if let (Some(j), Some(r)) = (java_rec, rust_rec) {
+                println!("    AF: Java={:?}, Rust={:?}",
+                    j.info.get("AF"), r.info.get("AF"));
+                for (i, (jg, rg)) in j.genotypes.iter().zip(r.genotypes.iter()).enumerate().take(5) {
+                    println!("    Sample {}: Java DS={:?}, Rust DS={:?}",
+                        i, jg.ds, rg.ds);
+                }
+            }
+        }
+    }
+
     // Strict: Rust genotyped DR2 must be >= Java
     assert!(
         rust_genotyped_mean >= java_genotyped_mean,
