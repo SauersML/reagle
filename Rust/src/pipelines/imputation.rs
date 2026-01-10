@@ -1263,6 +1263,8 @@ impl ImputationPipeline {
 
         let n_ref_haps = ref_gt.n_haplotypes();
         let n_ref_markers = ref_gt.n_markers();
+        let n_total_haps = n_ref_haps + target_gt.n_haplotypes();
+        self.params = ModelParams::for_imputation(n_ref_haps, n_total_haps, self.config.ne, self.config.err);
         let n_genotyped = alignment.ref_to_target.iter().filter(|&&x| x >= 0).count();
         eprintln!(
             "  {} of {} reference markers are genotyped in target",
