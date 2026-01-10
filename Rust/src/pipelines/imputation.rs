@@ -206,22 +206,7 @@ fn build_marker_cluster_index(
     marker_cluster
 }
 
-/// Compute binary cluster matches and cluster sizes (Java-style emission model).
-///
-/// Java BEAGLE uses a binary match/mismatch model per cluster:
-/// - If ALL markers in a cluster match: allelesMatch = true
-/// - If ANY marker in a cluster mismatches: allelesMatch = false
-/// - Emission = (1 - errProb) for match, errProb for mismatch
-/// - Where errProb = baseErr * clusterSize (capped at 0.5)
-///
-/// IMPORTANT: Java's clusterSize is (clusterEnd - clusterStart), i.e., the number of
-/// genotyped markers that DEFINE the cluster, NOT the count of observed genotypes.
-/// This is because Java uses targClustStartEnd array where size = end - start.
-///
-/// Returns (cluster_matches, cluster_sizes):
-/// - cluster_matches[c][j] = true if state j matches all markers in cluster c
-/// - cluster_sizes[c] = number of genotyped markers defining the cluster (end - start)
-fn compute_cluster_binary_matches(
+fn compute_cluster_mismatches(
     hap_indices: &[Vec<u32>],
     cluster_bounds: &[(usize, usize)],
     genotyped_markers: &[usize],
@@ -230,20 +215,16 @@ fn compute_cluster_binary_matches(
     alignment: &MarkerAlignment,
     targ_hap: usize,
     n_states: usize,
-) -> (Vec<Vec<bool>>, Vec<u16>) {
+) -> (Vec<Vec<u16>>, Vec<Vec<u16>>) {
     let n_clusters = hap_indices.len();
-    // Initialize to true - a state matches until proven otherwise
-    let mut all_match = vec![vec![true; n_states]; n_clusters];
-    let mut cluster_sizes = vec![0u16; n_clusters];
+    let mut mismatches = vec![vec![0u16; n_states]; n_clusters];
+    let mut non_missing = vec![vec![0u16; n_states]; n_clusters];
     let targ_hap_idx = HapIdx::new(targ_hap as u32);
 
     for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
         if c >= n_clusters {
             break;
         }
-        // Java clusterSize = clusterEnd - clusterStart (number of markers in cluster bounds)
-        cluster_sizes[c] = (end - start) as u16;
-
         for &ref_m in &genotyped_markers[start..end] {
             let Some(target_m) = alignment.target_marker(ref_m) else {
                 continue;
@@ -260,15 +241,15 @@ fn compute_cluster_binary_matches(
                 if mapped == 255 {
                     continue;
                 }
-                // If ANY marker mismatches, the whole cluster is a mismatch
+                non_missing[c][j] = non_missing[c][j].saturating_add(1);
                 if mapped != targ_allele {
-                    all_match[c][j] = false;
+                    mismatches[c][j] = mismatches[c][j].saturating_add(1);
                 }
             }
         }
     }
 
-    (all_match, cluster_sizes)
+    (mismatches, non_missing)
 }
 
 fn compute_targ_block_end<S: crate::data::storage::phase_state::PhaseState>(
@@ -1533,8 +1514,7 @@ impl ImputationPipeline {
                         (hap_indices, actual_n_states)
                     };
 
-                    // Compute cluster matches using Java-style binary emission model
-                    let (cluster_matches, cluster_sizes) = compute_cluster_binary_matches(
+                    let (cluster_mismatches, cluster_non_missing) = compute_cluster_mismatches(
                         &hap_indices,
                         &cluster_bounds,
                         &genotyped_markers_vec,
@@ -1544,9 +1524,9 @@ impl ImputationPipeline {
                         h,
                         actual_n_states,
                     );
-                    let cluster_state_probs = run_hmm_forward_backward_binary_emission(
-                        &cluster_matches,
-                        &cluster_sizes,
+                    let cluster_state_probs = run_hmm_forward_backward_clusters_counts(
+                        &cluster_mismatches,
+                        &cluster_non_missing,
                         &cluster_p_recomb,
                         base_err_rate,
                         actual_n_states,
@@ -2035,47 +2015,56 @@ fn run_hmm_forward_backward_clusters(
     fwd
 }
 
-/// Forward-backward HMM using Java BEAGLE's binary emission model.
-///
-/// Java BEAGLE uses a simpler emission model:
-/// - If state matches ALL markers in cluster: emission = (1 - errProb)
-/// - If state has ANY mismatch in cluster: emission = errProb
-/// - Where errProb = baseErr * clusterSize, capped at 0.5
-///
-/// This is fundamentally different from our previous approach which computed:
-/// emission = (1-p_err)^matches * p_err^mismatches
-fn run_hmm_forward_backward_binary_emission(
-    cluster_matches: &[Vec<bool>],
-    cluster_sizes: &[u16],
+/// Forward-backward HMM on cluster-coded observations (Java ImpLSBaum model).
+fn run_hmm_forward_backward_clusters_counts(
+    cluster_mismatches: &[Vec<u16>],
+    cluster_non_missing: &[Vec<u16>],
     p_recomb: &[f32],
     base_err_rate: f32,
     n_states: usize,
     workspace: &mut ImpWorkspace,
 ) -> Vec<f32> {
-    let n_clusters = cluster_matches.len();
+    let n_clusters = cluster_mismatches.len();
     let fwd = &mut workspace.fwd;
     fwd.resize(n_clusters * n_states, 0.0);
 
     let mut last_sum = 1.0f32;
+    let mut ratio_pows: Vec<f32> = Vec::new();
+    let mut no_err_pows: Vec<f32> = Vec::new();
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
-
-        // Java errProb = baseErr * clusterSize, capped at 0.5
-        let cluster_size = cluster_sizes.get(m).copied().unwrap_or(1) as f32;
-        let err_prob = (base_err_rate * cluster_size).min(0.5);
-        let match_prob = 1.0 - err_prob;
-
+        let p_err = base_err_rate.clamp(1e-8, 0.5);
+        let p_no_err = 1.0 - p_err;
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
+
+        let max_obs = cluster_non_missing
+            .get(m)
+            .map(|row| row.iter().copied().max().unwrap_or(0) as usize)
+            .unwrap_or(0);
+        let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
+        ratio_pows.resize(max_obs.saturating_add(1), 1.0);
+        no_err_pows.resize(max_obs.saturating_add(1), 1.0);
+        for i in 1..=max_obs {
+            ratio_pows[i] = ratio_pows[i - 1] * ratio;
+            no_err_pows[i] = no_err_pows[i - 1] * p_no_err;
+        }
 
         let row_offset = m * n_states;
         let prev_offset = if m > 0 { (m - 1) * n_states } else { 0 };
         let mut sum = 0.0f32;
 
         for k in 0..n_states {
-            let matches = cluster_matches[m].get(k).copied().unwrap_or(true);
-            let em = if matches { match_prob } else { err_prob };
-
+            let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0) as usize;
+            let n_obs = cluster_non_missing
+                .get(m)
+                .and_then(|row| row.get(k))
+                .copied()
+                .unwrap_or(0) as usize;
+            let n_obs = n_obs.min(max_obs);
+            let mism = mism.min(n_obs);
+            let base_emit = no_err_pows.get(n_obs).copied().unwrap_or(1.0);
+            let em = base_emit * ratio_pows.get(mism).copied().unwrap_or(1.0);
             let val = if m == 0 {
                 em
             } else {
@@ -2087,29 +2076,60 @@ fn run_hmm_forward_backward_binary_emission(
         last_sum = sum.max(1e-30);
     }
 
-    // Backward pass - matches Java ImpLSBaum.setBwdValue()
-    // Order: transition (using p_recomb[m+1]), combine fwd*bwd, then emission (using errProb[m])
     let bwd = &mut workspace.bwd;
     bwd.resize(n_states, 0.0);
     bwd.fill(1.0 / n_states as f32);
 
-    // prev_sum tracks the sum of backward values after emission (used for scaling)
-    // Java initializes this to 1.0
-    let mut prev_sum = 1.0f32;
-
     for m in (0..n_clusters).rev() {
-        // Step 1: Apply backward transition from m+1 to m (if not at last cluster)
+        // Update bwd to correspond to cluster m using emissions at m+1 and transition.
         if m + 1 < n_clusters {
             let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
             let shift = p_rec / n_states as f32;
-            let scale = (1.0 - p_rec) / prev_sum.max(1e-30);
 
+            let p_err = base_err_rate.clamp(1e-8, 0.5);
+            let p_no_err = 1.0 - p_err;
+            let ratio = if p_no_err > 0.0 { p_err / p_no_err } else { 1.0 };
+            let max_obs = cluster_non_missing
+                .get(m + 1)
+                .map(|row| row.iter().copied().max().unwrap_or(0) as usize)
+                .unwrap_or(0);
+            ratio_pows.resize(max_obs.saturating_add(1), 1.0);
+            no_err_pows.resize(max_obs.saturating_add(1), 1.0);
+            for i in 1..=max_obs {
+                ratio_pows[i] = ratio_pows[i - 1] * ratio;
+                no_err_pows[i] = no_err_pows[i - 1] * p_no_err;
+            }
+
+            let mut emitted_sum = 0.0f32;
+            let mismatches = &cluster_mismatches[m + 1];
             for k in 0..n_states {
-                bwd[k] = scale * bwd[k] + shift;
+                let mism = mismatches.get(k).copied().unwrap_or(0) as usize;
+                let n_obs = cluster_non_missing
+                    .get(m + 1)
+                    .and_then(|row| row.get(k))
+                    .copied()
+                    .unwrap_or(0) as usize;
+                let n_obs = n_obs.min(max_obs);
+                let mism = mism.min(n_obs);
+                let base_emit = no_err_pows.get(n_obs).copied().unwrap_or(1.0);
+                let em = base_emit * ratio_pows.get(mism).copied().unwrap_or(1.0);
+                bwd[k] *= em;
+                emitted_sum += bwd[k];
+            }
+
+            if emitted_sum > 0.0 {
+                let scale = (1.0 - p_rec) / emitted_sum;
+                for k in 0..n_states {
+                    bwd[k] = scale * bwd[k] + shift;
+                }
+            } else {
+                let uniform = 1.0 / n_states as f32;
+                for k in 0..n_states {
+                    bwd[k] = uniform;
+                }
             }
         }
 
-        // Step 2: Combine forward and backward at position m
         let row_offset = m * n_states;
         let mut state_sum = 0.0f32;
         for k in 0..n_states {
@@ -2124,20 +2144,6 @@ fn run_hmm_forward_backward_binary_emission(
                 fwd[row_offset + k] *= inv;
             }
         }
-
-        // Step 3: Apply emission at position m (preparing for next backward iteration at m-1)
-        let cluster_size = cluster_sizes.get(m).copied().unwrap_or(1) as f32;
-        let err_prob = (base_err_rate * cluster_size).min(0.5);
-        let match_prob = 1.0 - err_prob;
-
-        let mut emitted_sum = 0.0f32;
-        for k in 0..n_states {
-            let matches = cluster_matches[m].get(k).copied().unwrap_or(true);
-            let em = if matches { match_prob } else { err_prob };
-            bwd[k] *= em;
-            emitted_sum += bwd[k];
-        }
-        prev_sum = emitted_sum.max(1e-30);
     }
 
     fwd.to_vec()
@@ -2375,35 +2381,50 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_emission_match_vs_mismatch() {
+    fn test_per_state_non_missing_affects_emission() {
         use crate::utils::workspace::ImpWorkspace;
 
         let n_clusters = 1;
         let n_states = 2;
         let p_recomb = vec![0.0f32; n_clusters];
         let p_err = 0.01f32;
+        let mismatches = vec![vec![0u16, 1u16]];
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
 
-        // State 0 matches all markers, state 1 has mismatch
-        let cluster_matches = vec![vec![true, false]];
-        let cluster_sizes = vec![2u16]; // 2 markers in cluster
-
-        let posteriors = run_hmm_forward_backward_binary_emission(
-            &cluster_matches,
-            &cluster_sizes,
+        let non_missing_equal = vec![vec![2u16, 2u16]];
+        let post_equal = run_hmm_forward_backward_clusters_counts(
+            &mismatches,
+            &non_missing_equal,
             &p_recomb,
             p_err,
             n_states,
             &mut workspace,
         );
 
-        let p0 = posteriors[0];
-        let p1 = posteriors[1];
+        let non_missing_unequal = vec![vec![2u16, 0u16]];
+        let post_unequal = run_hmm_forward_backward_clusters_counts(
+            &mismatches,
+            &non_missing_unequal,
+            &p_recomb,
+            p_err,
+            n_states,
+            &mut workspace,
+        );
 
-        // State 0 (all match) should dominate over state 1 (has mismatch)
-        assert!(p0 > p1, "Matching state should have higher posterior, got p0={}, p1={}", p0, p1);
-        let sum = p0 + p1;
-        assert!((sum - 1.0).abs() < 1e-6, "Posteriors should sum to 1, got {}", sum);
+        let p0_equal = post_equal[0];
+        let p1_equal = post_equal[1];
+        let p0_unequal = post_unequal[0];
+        let p1_unequal = post_unequal[1];
+
+        assert!(p0_equal > p1_equal, "State 0 should dominate with fewer mismatches");
+        assert!(
+            p1_unequal > p1_equal,
+            "State 1 posterior should increase with fewer observed markers"
+        );
+        let sum_equal = p0_equal + p1_equal;
+        let sum_unequal = p0_unequal + p1_unequal;
+        assert!((sum_equal - 1.0).abs() < 1e-6, "Posteriors should sum to 1");
+        assert!((sum_unequal - 1.0).abs() < 1e-6, "Posteriors should sum to 1");
     }
 
     #[test]
