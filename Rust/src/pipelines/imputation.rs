@@ -271,7 +271,7 @@ fn compute_targ_block_end<S: crate::data::storage::phase_state::PhaseState>(
         };
         let target_marker_idx = MarkerIdx::new(target_m as u32);
         let n_alleles = 1 + target_gt.marker(target_marker_idx).alt_alleles.len();
-        let missing_allele = n_alleles.saturating_sub(1) as u8;
+        let missing_allele = n_alleles as u8;
         let mut hash = 0xcbf29ce484222325u64;
         for h in 0..n_ref_haps {
             let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32));

@@ -185,9 +185,10 @@ pub fn build_cluster_hap_sequences(
                 continue;
             }
 
-            let mut seq_map = vec![0u32; (seq_cnt as usize) * n_alleles];
+            let n_alleles_with_missing = n_alleles + 1;
+            let mut seq_map = vec![0u32; (seq_cnt as usize) * n_alleles_with_missing];
             seq_cnt = 1;
-            let missing_allele = n_alleles.saturating_sub(1);
+            let missing_allele = n_alleles;
 
             // Update target hap sequences first.
             for h in 0..n_targ_haps {
@@ -198,7 +199,7 @@ pub fn build_cluster_hap_sequences(
                 } else {
                     allele_raw as usize
                 };
-                let index = (targ_seq[h] as usize) * n_alleles + allele;
+                let index = (targ_seq[h] as usize) * n_alleles_with_missing + allele;
                 if seq_map[index] == 0 {
                     seq_map[index] = seq_cnt;
                     seq_cnt += 1;
@@ -219,7 +220,7 @@ pub fn build_cluster_hap_sequences(
                 } else {
                     mapped as usize
                 };
-                let index = (ref_seq[h] as usize) * n_alleles + allele;
+                let index = (ref_seq[h] as usize) * n_alleles_with_missing + allele;
                 ref_seq[h] = seq_map.get(index).copied().unwrap_or(0);
             }
         }
