@@ -554,7 +554,7 @@ impl StateProbs {
         let threshold = if n_genotyped <= 1000 {
             0.0
         } else {
-            (0.005f32).min(0.9999 / n_states.max(1) as f32)
+            (0.005f32).min(0.9999f32 / n_states.max(1) as f32)
         };
         let include_all_states = threshold == 0.0;
 
