@@ -1361,9 +1361,13 @@ impl ImputationPipeline {
         let imp_states = self.params.n_states;
         let n_steps_per_segment = (self.config.imp_segment / self.config.imp_step).round() as usize;
         let n_steps_per_segment = n_steps_per_segment.max(1);
-        let n_ibs_haps = (imp_states / n_steps_per_segment)
-            .max(1)
-            .min(n_ref_haps);
+        let n_ibs_haps = if n_ref_haps <= 1000 {
+            n_ref_haps
+        } else {
+            (imp_states / n_steps_per_segment)
+                .max(1)
+                .min(n_ref_haps)
+        };
 
         // Cluster-coded haplotype sequences and recursive IBS matching (Java ImpIbs)
 
