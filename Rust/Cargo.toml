@@ -47,7 +47,7 @@ flate2 = "1.0"
 
 [build-dependencies]
 grep = "0.4.1"
-walkdir = "2.5.0"
+walkdir = "2"
 
 [profile.release]
 lto = true
