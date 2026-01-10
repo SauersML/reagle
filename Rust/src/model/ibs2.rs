@@ -89,6 +89,15 @@ impl Ibs2 {
         }
     }
 
+    /// Build IBS2 segments for a single sample.
+    ///
+    /// Pipeline:
+    /// 1. Get initial segments from partition-based detection (Ibs2Sets)
+    /// 2. Sort by other sample ID for efficient merging
+    /// 3. Merge adjacent segments that are close in genetic distance
+    /// 4. Extend segments through homozygous regions (where IBS2 is ambiguous)
+    /// 5. Merge again after extension (may have created new adjacencies)
+    /// 6. Filter out segments below minimum length threshold
     fn build_sample_segments(
         gt: &GenotypeMatrix,
         gen_maps: &GeneticMaps,
@@ -117,6 +126,14 @@ impl Ibs2 {
         segments
     }
 
+    /// Merge adjacent IBS2 segments for the same sample pair if close in genetic distance.
+    ///
+    /// Short gaps between segments are common due to:
+    /// - Genotyping errors or missing data
+    /// - Recombination hotspots within true IBD segments
+    /// - Marker filtering removing informative markers
+    ///
+    /// Segments with gap < MAX_IBS2_GAP_CM cM are merged into a single segment.
     fn merge_segments(
         segments: Vec<Ibs2Segment>,
         gen_maps: &GeneticMaps,
@@ -159,6 +176,13 @@ impl Ibs2 {
         gen_maps.gen_dist(chrom, pos1, pos2)
     }
 
+    /// Extend segments through regions where both samples are homozygous.
+    ///
+    /// At homozygous sites, IBS2 status is ambiguous (both orderings match).
+    /// We optimistically extend segments through these regions since:
+    /// 1. True IBD segments often span homozygous sites
+    /// 2. Conservative extension rarely causes false positives
+    /// 3. Short gaps from homozygosity don't break true IBD
     fn extend_segments(
         gt: &GenotypeMatrix,
         sample: SampleIdx,
@@ -173,12 +197,12 @@ impl Ibs2 {
                 let mut start = seg.start;
                 let mut end = seg.incl_end;
 
-                // Extend left
+                // Extend left through compatible markers (IBS2 or homozygous)
                 while start > 0 && Self::is_ibs2_at(gt, start - 1, sample, other) {
                     start -= 1;
                 }
 
-                // Extend right
+                // Extend right through compatible markers
                 while end < n_markers - 1 && Self::is_ibs2_at(gt, end + 1, sample, other) {
                     end += 1;
                 }
@@ -205,7 +229,14 @@ impl Ibs2 {
             .collect()
     }
 
-    /// Check if two samples are IBS2 at a marker
+    /// Check if two samples are IBS2 at a marker position.
+    ///
+    /// IBS2 means the samples share BOTH haplotypes (identical diploid genotype).
+    /// This requires either:
+    /// - Same phase: (a1, a2) matches (b1, b2)
+    /// - Opposite phase: (a1, a2) matches (b2, b1)
+    ///
+    /// Missing data (255) is treated as "compatible" - it doesn't break IBS2.
     fn is_ibs2_at(gt: &GenotypeMatrix, marker: usize, s1: SampleIdx, s2: SampleIdx) -> bool {
         let m_idx = MarkerIdx::new(marker as u32);
 
@@ -214,9 +245,14 @@ impl Ibs2 {
         let b1 = gt.allele(m_idx, s2.hap1());
         let b2 = gt.allele(m_idx, s2.hap2());
 
+        // Check both phase orderings: (a1,a2)=(b1,b2) OR (a1,a2)=(b2,b1)
         Self::are_phase_consistent(a1, a2, b1, b2) || Self::are_phase_consistent(a1, a2, b2, b1)
     }
 
+    /// Check if two phased genotypes are consistent (allowing missing data).
+    ///
+    /// Returns true if the alleles match or either is missing (255).
+    /// This is a helper for is_ibs2_at to check one phase ordering.
     fn are_phase_consistent(a1: u8, a2: u8, b1: u8, b2: u8) -> bool {
         (a1 == 255 || b1 == 255 || a1 == b1) && (a2 == 255 || b2 == 255 || a2 == b2)
     }
@@ -240,16 +276,30 @@ impl Ibs2 {
     }
 }
 
-/// Identifies informative markers and partitions them into steps for IBS2 detection
+/// Identifies informative markers and partitions them into steps for IBS2 detection.
+///
+/// Not all markers are useful for IBS2 detection:
+/// - Rare variants (MAF < 0.1) have low discrimination power
+/// - High-missing markers reduce accuracy
+/// - Very close markers are redundant
+///
+/// This struct filters to informative markers and groups them into "steps"
+/// of approximately MIN_MARKER_CNT markers each, spaced by MIN_INTERMARKER_CM.
 struct Ibs2Markers {
+    /// Whether each marker is used for IBS2 detection
     use_marker: Vec<bool>,
+    /// Starting marker index for each step
     step_starts: Vec<usize>,
 }
 
 impl Ibs2Markers {
+    /// Maximum fraction of missing genotypes to include a marker
     const MAX_MISS_FREQ: f32 = 0.1;
+    /// Minimum minor allele frequency for discrimination power
     const MIN_MINOR_FREQ: f32 = 0.1;
+    /// Target number of markers per step
     const MIN_MARKER_CNT: usize = 50;
+    /// Minimum genetic distance between selected markers (cM)
     const MIN_INTERMARKER_CM: f64 = 0.02;
 
     fn new(gt: &GenotypeMatrix, gen_maps: &GeneticMaps, chrom: ChromIdx, maf: &[f32]) -> Self {
@@ -312,10 +362,26 @@ impl Ibs2Markers {
     }
 }
 
-/// Stores clusters of samples that are IBS2 within each step
+/// Stores clusters of samples that are IBS2 within each step.
+///
+/// Uses recursive partitioning by genotype to identify groups of samples
+/// that share both haplotypes across all markers in a step. This is the
+/// core data structure for efficient IBS2 segment detection.
+///
+/// ## Algorithm
+///
+/// For each step:
+/// 1. Start with all samples in one partition
+/// 2. For each marker in the step, split partitions by genotype
+/// 3. Samples remaining in the same partition after all markers are IBS2
+/// 4. Discard homozygous-only partitions (not informative for phasing)
 struct Ibs2Sets {
+    /// IBS2 clusters per step: `ibs2_sets[step][sample_idx] = Some(cluster)` if sample
+    /// is in an IBS2 group, where cluster is Arc<Vec<u32>> of sample indices
     ibs2_sets: Vec<Vec<Option<Arc<Vec<u32>>>>>,
+    /// Starting marker index for each step (from Ibs2Markers)
     step_starts: Vec<usize>,
+    /// Total number of markers
     n_markers: usize,
 }
 
@@ -393,6 +459,22 @@ impl Ibs2Sets {
         }
     }
 
+    /// Partition a cluster of samples by genotype at a single marker.
+    ///
+    /// This is the core operation for IBS2 detection: samples with different
+    /// genotypes cannot be IBS2, so we split the parent cluster by genotype.
+    ///
+    /// # Genotype Indexing
+    /// Genotypes are indexed by unordered allele pair: gt_idx = a2*(a2+1)/2 + a1
+    /// where a1 <= a2. This handles both homozygotes and heterozygotes uniformly.
+    ///
+    /// # Missing Data Handling
+    /// Samples with missing data at this marker are added to ALL partitions,
+    /// since they could potentially match any genotype.
+    ///
+    /// # Homozygosity Tracking
+    /// Tracks whether each partition contains only homozygous genotypes,
+    /// since homozygous-only partitions aren't informative for phasing.
     fn partition_cluster(gt: &GenotypeMatrix, parent: SampClust, m: usize) -> Vec<SampClust> {
         let m_idx = MarkerIdx::new(m as u32);
         let n_alleles = 1 + gt.marker(m_idx).alt_alleles.len();
@@ -475,8 +557,15 @@ impl Ibs2Sets {
     }
 }
 
+/// A cluster of samples during recursive partitioning.
+///
+/// Tracks both the sample indices and whether all genotypes seen so far are
+/// homozygous. Homozygous-only clusters aren't useful for phasing since they
+/// don't constrain phase relationships.
 struct SampClust {
+    /// Sample indices in this cluster
     samples: Vec<u32>,
+    /// True if all genotypes seen in this cluster are homozygous
     is_homozygous: bool,
 }
 
