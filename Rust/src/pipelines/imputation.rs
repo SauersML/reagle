@@ -2386,7 +2386,7 @@ mod tests {
             &mut workspace,
         );
 
-        let non_missing_unequal = vec![vec![2u16, 1u16]];
+        let non_missing_unequal = vec![vec![2u16, 0u16]];
         let post_unequal = run_hmm_forward_backward_clusters_counts(
             &mismatches,
             &non_missing_unequal,
