@@ -84,6 +84,9 @@ impl MarkerImputationStats {
         if allele == 0 || allele >= self.sum_dosages.len() || self.n_haps == 0 {
             return 0.0;
         }
+        if !self.is_imputed {
+            return 1.0;
+        }
 
         let n = self.n_haps as f32;
         let sum = self.sum_dosages[allele];
@@ -93,11 +96,7 @@ impl MarkerImputationStats {
         let den = sum - mean_term;
 
         if num <= 0.0 || den <= 0.0 {
-            if !self.is_imputed {
-                1.0
-            } else {
-                0.0
-            }
+            0.0
         } else {
             (num / den).clamp(0.0, 1.0)
         }
