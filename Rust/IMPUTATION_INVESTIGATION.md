@@ -106,11 +106,54 @@ somewhere.
 - `src/io/vcf.rs`: GL parsing and confidence computation
 - `src/data/storage/matrix.rs`: Confidence storage
 
+## Additional Testing (Session 2)
+
+### Float-Based Soft Emissions
+- Implemented `compute_cluster_soft_emissions()` function
+- For uncertain markers: emit = 0.5 for all states (non-discriminating)
+- For confident markers: emit = (1-p_err) for match, p_err for mismatch
+- Result: MUCH WORSE (0.1193 vs 0.1542)
+- Reason: Applying soft emissions globally hurt confident observations
+
+### Per-Sample Per-Marker Confidence Skip
+- Skip observations ONLY when specific sample has low confidence at specific marker
+- Other samples with confident observations at same marker still contribute
+- Result: WORSE (0.1426 vs 0.1542)
+- Reason: Same as before - loses information from confident samples
+
+### Error Rate Tuning
+- Tested higher error rates (0.001, 0.01) to reduce mismatch penalty
+- Result: Marginal effect or worse
+- Baseline error rate ~0.0002 (match/mismatch ratio 5000:1)
+- Higher error rate affects ALL mismatches equally, not targeted
+
+### New Key Finding: DS/GT Inconsistency
+- Input VCF has inconsistent GT and DS at uncertain markers
+- Example: Position 20066422, Sample 0: GT=0/0 but DS=0.150
+- GT says "both alleles REF" but DS says "15% chance of ALT"
+- Java output shows DR2=0.00 at this marker (recognizes uncertainty)
+- But Java still correctly imputes DS=1.0 at nearby imputed marker
+
+### LD Structure Confirmation
+- Reference Sample 6: ALT at 20066422 AND ALT at 20066665 (perfect LD)
+- Sample 0's uncertain call at 20066422 penalizes ALT-carrying haplotypes
+- These same haplotypes carry ALT at 20066665 (the marker we want to impute)
+- Result: near-zero dosage at 20066665 for Sample 0
+
 ## Summary
 
 The gap between Rust (0.1542) and Java (0.1998) imputed DR2 persists. The root
 cause is well-understood: uncertain genotype calls at flanking markers bias
 the HMM against rare-variant-carrying haplotypes. However, simple fixes make
-accuracy worse because they affect all samples equally. A proper fix requires
-per-sample, per-marker soft emissions, which requires more significant
-refactoring of the mismatch counting and emission calculation code.
+accuracy worse because they affect all samples equally.
+
+Java appears to handle this differently - it produces DR2=0 at uncertain
+genotyped markers but still correctly imputes nearby markers. The mechanism
+Java uses is not yet understood. Possibilities include:
+1. Using DS field instead of GT during imputation
+2. Different windowing or LD handling
+3. Phasing differences that avoid over-committing to uncertain calls
+4. Post-hoc adjustment based on marker quality
+
+A proper fix likely requires understanding Java's approach more deeply rather
+than simple emission model modifications.
