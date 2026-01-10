@@ -1042,7 +1042,11 @@ impl ClusterStateProbs {
         cluster_probs: Vec<f32>,
     ) -> Self {
         let n_clusters = hap_indices.len();
-        let threshold = (0.9999f32 / n_states as f32).min(0.005f32);
+        let threshold = if n_clusters <= 1000 {
+            0.0
+        } else {
+            (0.9999f32 / n_states as f32).min(0.005f32)
+        };
         let mut filtered_haps = Vec::with_capacity(n_clusters);
         let mut filtered_haps_p1 = Vec::with_capacity(n_clusters);
         let mut probs = Vec::with_capacity(n_clusters);

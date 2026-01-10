@@ -1,10 +1,35 @@
-//! Cluster-coded haplotype sequences and IBS matching for imputation.
+//! # Cluster-Coded Haplotype Sequences and IBS Matching for Imputation
 //!
-//! This mirrors Java's HaplotypeCoder/CodedSteps/ImpIbs pipeline:
-//! - Build per-cluster haplotype sequence IDs (target-driven coding)
-//! - Build coded steps over clusters (step-based sequence IDs)
-//! - Partition haplotypes by coded sequences to produce IBS sets
+//! This module implements the sequence-based haplotype coding and IBS (Identity By State)
+//! set computation used in Beagle's imputation pipeline. It mirrors Java's
+//! `HaplotypeCoder`, `CodedSteps`, and `ImpIbs` classes.
+//!
+//! ## Pipeline Overview
+//!
+//! The imputation process uses a three-stage sequence coding scheme:
+//!
+//! 1. Cluster-level coding (`ClusterHapSequences`): Each marker cluster gets a
+//!    unique sequence ID per distinct allele pattern. Target haplotypes define the
+//!    sequence space; reference haplotypes are mapped into it (with 0 = unmapped).
+//!
+//! 2. Step-level coding (`ClusterCodedSteps`): Multiple adjacent clusters are
+//!    aggregated into "steps" (genetic distance windows). This produces a coarser
+//!    sequence ID that spans multiple clusters.
+//!
+//! 3. IBS set computation (`ImpIbs`): For each target haplotype at each step,
+//!    find reference haplotypes with matching sequence IDs. This creates the
+//!    "IBS sets" - reference haplotypes that are identical-by-state to the target
+//!    across the step's marker clusters.
+//!
+//! ## Sequence ID Encoding
+//!
+//! Sequence IDs are built incrementally by processing markers within a cluster:
+//! - Start with all haplotypes having sequence ID = 1 (base sequence)
+//! - At each marker, split sequences by allele: seq_new = hash(seq_old, allele)
+//! - Target haplotypes define the mapping; reference haps map to existing or 0
 
+/// Java Linear Congruential Generator (LCG) multiplier for reproducible random sampling.
+/// Using Java's constants ensures identical IBS set selection as Java Beagle.
 const JAVA_RNG_MULT: u64 = 0x5DEECE66D;
 const JAVA_RNG_ADD: u64 = 0xB;
 const JAVA_RNG_MASK: u64 = (1u64 << 48) - 1;
@@ -16,31 +41,69 @@ use crate::data::storage::GenotypeMatrix;
 use crate::pipelines::imputation::MarkerAlignment;
 
 /// Per-cluster haplotype sequence IDs.
-/// hap_to_seq[c][h] = sequence ID for haplotype h at cluster c.
+///
+/// Each cluster contains one or more adjacent genotyped markers. Within a cluster,
+/// haplotypes are assigned sequence IDs based on their allele patterns:
+/// - `hap_to_seq[c][h]` = sequence ID for haplotype h at cluster c
+/// - Sequence ID 0 means the reference haplotype's pattern wasn't seen in targets
+/// - Sequence ID 1 is the initial base sequence before any differentiation
+///
+/// The combined array stores reference haplotypes first, then target haplotypes:
+/// `[ref_hap_0, ref_hap_1, ..., ref_hap_n, targ_hap_0, targ_hap_1, ...]`
 #[derive(Clone, Debug)]
 pub struct ClusterHapSequences {
+    /// Sequence IDs: `hap_to_seq[cluster][haplotype]` where haplotype indices
+    /// are: 0..n_ref_haps for reference, n_ref_haps..n_haps for target
     pub hap_to_seq: Vec<Vec<u32>>,
+    /// Number of distinct sequence IDs at each cluster (for allocation sizing)
     pub value_sizes: Vec<u32>,
+    /// Number of reference panel haplotypes
     pub n_ref_haps: usize,
+    /// Total haplotypes (reference + target)
     pub n_haps: usize,
 }
 
-/// Coded steps over clusters (sequence IDs aggregated across multiple clusters).
+/// Coded steps: sequence IDs aggregated across multiple adjacent clusters.
+///
+/// Steps are defined by genetic distance (step_cm) and provide a coarser-grained
+/// view of haplotype identity than individual clusters. This aggregation:
+/// 1. Reduces the number of partitioning operations in IBS set computation
+/// 2. Provides more stable IBS sets that span multiple markers
+///
+/// The step_starts array maps step indices to their starting cluster indices.
 #[derive(Clone, Debug)]
 pub struct ClusterCodedSteps {
+    /// Starting cluster index for each step: step i covers clusters step_starts[i]..step_starts[i+1]
     pub step_starts: Vec<usize>,
-    pub hap_to_seq: Vec<Vec<u32>>, // [step][hap]
-    pub value_sizes: Vec<u32>,     // number of sequences at each step
+    /// Sequence IDs per step: `hap_to_seq[step][haplotype]`
+    pub hap_to_seq: Vec<Vec<u32>>,
+    /// Number of distinct sequences at each step
+    pub value_sizes: Vec<u32>,
 }
 
-/// IBS sets derived from coded steps.
+/// IBS (Identity By State) sets for imputation HMM state selection.
+///
+/// For each target haplotype at each step, stores the set of reference haplotypes
+/// that share the same coded sequence. These IBS sets are used to:
+/// 1. Initialize HMM state probabilities (states matching the target get higher weight)
+/// 2. Prune the HMM state space (only consider IBS-matching reference haplotypes)
+///
+/// The IBS sets are bounded in size (`n_haps_per_step`) and use deterministic
+/// random sampling (Java LCG) for reproducibility with Java Beagle.
 #[derive(Clone, Debug)]
 pub struct ImpIbs {
+    /// The underlying coded steps used to derive IBS sets
     pub coded_steps: ClusterCodedSteps,
-    /// ibs_haps[step][targ_hap] = Vec<ref_hap>
+    /// IBS haplotype indices: `ibs_haps[step][target_hap_idx] = Vec<reference_hap_idx>`
+    /// where target_hap_idx is 0-based within target panel (not offset by n_ref_haps)
     pub ibs_haps: Vec<Vec<Vec<u32>>>,
 }
 
+/// Java-compatible Linear Congruential Generator for deterministic random sampling.
+///
+/// Uses the same constants as `java.util.Random` to ensure identical results
+/// when sampling IBS sets with the same seed. This is critical for reproducing
+/// Java Beagle's exact imputation results.
 #[derive(Clone, Debug)]
 struct JavaRng {
     seed: u64,
@@ -74,11 +137,25 @@ impl JavaRng {
     }
 }
 
-/// Build per-cluster haplotype sequences (HaplotypeCoder equivalent).
+/// Build per-cluster haplotype sequences (equivalent to Java's HaplotypeCoder).
 ///
-/// The target haplotypes define sequence IDs; reference haplotypes are mapped
-/// into the target-derived sequence IDs, with 0 reserved for sequences not
-/// observed in targets.
+/// This function assigns unique sequence IDs to each distinct allele pattern
+/// within each marker cluster. The key insight is that target haplotypes define
+/// the sequence space:
+///
+/// 1. Process target haplotypes first to build the sequence ID mapping
+/// 2. Map reference haplotypes into the target-defined space
+/// 3. Reference patterns not seen in targets get sequence ID 0 (filtered out later)
+///
+/// This target-driven approach ensures IBS sets contain only reference haplotypes
+/// that match observed target patterns, improving imputation accuracy.
+///
+/// # Arguments
+/// * `ref_gt` - Reference panel genotypes (phased)
+/// * `target_gt` - Target sample genotypes (phased)
+/// * `alignment` - Marker alignment between target and reference panels
+/// * `genotyped_markers` - Indices of genotyped markers in reference panel
+/// * `cluster_bounds` - (start, end) indices into genotyped_markers for each cluster
 pub fn build_cluster_hap_sequences(
     ref_gt: &GenotypeMatrix<Phased>,
     target_gt: &GenotypeMatrix<Phased>,
@@ -276,22 +353,39 @@ impl ImpIbs {
     }
 }
 
+/// Compute step boundary indices based on genetic distance.
+///
+/// Steps are non-overlapping genetic distance windows. Each step covers
+/// approximately `step_cm` centiMorgans of genetic distance, with the first
+/// step starting at half the step size to center the first marker.
+///
+/// # Arguments
+/// * `pos` - Genetic positions (cM) for each cluster
+/// * `step_cm` - Target step size in centiMorgans
+///
+/// # Returns
+/// Vector of starting cluster indices for each step
 fn compute_step_starts(pos: &[f64], step_cm: f64) -> Vec<usize> {
     if pos.is_empty() {
         return Vec::new();
     }
     let mut starts = Vec::new();
     starts.push(0);
+    // First step boundary at half the step size to center first cluster
     let mut next_pos = pos[0] + step_cm / 2.0;
     let mut index = next_index(pos, 0, next_pos);
     while index < pos.len() {
         starts.push(index);
+        // Subsequent steps at full step_cm intervals
         next_pos = pos[index] + step_cm;
         index = next_index(pos, index, next_pos);
     }
     starts
 }
 
+/// Binary search for the first index where pos[index] >= target.
+///
+/// Used to find step boundaries based on genetic position thresholds.
 fn next_index(pos: &[f64], start: usize, target: f64) -> usize {
     let mut lo = start;
     let mut hi = pos.len();
@@ -306,6 +400,23 @@ fn next_index(pos: &[f64], start: usize, target: f64) -> usize {
     lo
 }
 
+/// Compute IBS haplotype sets for a single step by recursive partitioning.
+///
+/// This implements Beagle's IBS set construction algorithm:
+/// 1. Start with all haplotypes in one partition
+/// 2. Recursively split by sequence ID across merged steps
+/// 3. When a partition has few enough reference haps (<= n_haps_per_step),
+///    assign those as the IBS set for all target haps in that partition
+/// 4. Large partitions get randomly subsampled for stability
+///
+/// # Arguments
+/// * `coded_steps` - The coded step data
+/// * `index` - Which step to compute IBS sets for
+/// * `n_steps_to_merge` - Number of subsequent steps to merge for finer partitioning
+/// * `n_haps_per_step` - Maximum IBS set size (larger sets get subsampled)
+/// * `n_ref_haps` - Number of reference haplotypes
+/// * `n_targ_haps` - Number of target haplotypes
+/// * `seed` - RNG seed for reproducible subsampling
 fn compute_ibs_haps(
     coded_steps: &ClusterCodedSteps,
     index: usize,
@@ -570,6 +681,10 @@ fn set_result(child: &[u32], n_ref_haps: usize, ibs_list: &[u32], results: &mut 
     }
 }
 
+/// Find insertion point separating reference from target haplotypes in a sorted list.
+///
+/// Returns the index of the first target haplotype (or list.len() if none).
+/// This is used to efficiently separate reference and target haps in partitions.
 fn ins_pt(list: &[u32], n_ref_haps: usize) -> usize {
     list.partition_point(|&h| (h as usize) < n_ref_haps)
 }
