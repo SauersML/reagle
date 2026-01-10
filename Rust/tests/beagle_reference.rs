@@ -2619,17 +2619,13 @@ fn test_dr2_genotyped_vs_imputed() {
     println!("  Imputed markers where Rust DR2 significantly worse: {}/{}", 
              worse_imp_count, imputed_gaps.len());
 
-    // For polymorphic genotyped markers (non-zero variance), DR2 should be ~1.0
-    // because we know the true values and output them as dosages
-    if !polymorphic_rust.is_empty() {
-        let poly_mean: f64 = polymorphic_rust.iter().map(|(_, d)| *d).sum::<f64>() 
-            / polymorphic_rust.len() as f64;
-        println!("\n  Polymorphic genotyped mean DR2: {:.4}", poly_mean);
-        
+    // For genotyped markers, Rust DR2 should not be significantly worse than Java.
+    // NOTE: DR2 is not expected to be 1.0 because Beagle re-evaluates known genotypes.
+    if !genotyped_java_dr2.is_empty() {
         assert!(
-            poly_mean >= 0.99,
-            "GENOTYPED DR2 FAIL: Polymorphic markers mean DR2 ({:.4}) should be >= 0.99 (we know the true values)",
-            poly_mean
+            rust_geno_mean >= java_geno_mean - 0.02,
+            "GENOTYPED DR2 FAIL: Rust ({:.4}) worse than Java ({:.4}) by more than 0.02",
+            rust_geno_mean, java_geno_mean
         );
     }
     
