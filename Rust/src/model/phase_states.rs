@@ -81,16 +81,42 @@ pub struct PhaseStates {
 const NIL: i32 = -103;
 
 impl PhaseStates {
+    /// Compute a minimum segment length based on marker density and genetic distance.
+    ///
+    /// This enforces a lower bound on segment length to prevent rapid thrashing,
+    /// while scaling up for dense panels where many markers can fit within 1 cM.
+    pub fn min_segment_len(n_markers: usize, gen_dists: &[f64]) -> usize {
+        let base = (n_markers / 100).max(50).max(1);
+        if gen_dists.is_empty() {
+            return base;
+        }
+
+        let mut dist_cm = 0.0;
+        let mut steps = 0usize;
+        for &d in gen_dists {
+            dist_cm += d;
+            steps += 1;
+            if dist_cm >= 1.0 {
+                break;
+            }
+        }
+
+        let per_cm = if dist_cm >= 1.0 {
+            steps.max(1)
+        } else {
+            n_markers.saturating_sub(1).max(1)
+        };
+
+        base.max(per_cm)
+    }
+
     /// Create a new phase state selector
     ///
     /// # Arguments
     /// * `max_states` - Maximum number of composite haplotypes (K in Li-Stephens model)
     /// * `n_markers` - Number of markers in the HMM
-    pub fn new(max_states: usize, n_markers: usize) -> Self {
-        // Minimum segment length: scale with marker density to avoid over-smoothing
-        // Dense panels need shorter segments to preserve local haplotype structure.
-        let min_segment_len = (n_markers / 1000).max(5).min(n_markers / 4);
-
+    /// * `min_segment_len` - Minimum markers between segment switches
+    pub fn new(max_states: usize, n_markers: usize, min_segment_len: usize) -> Self {
         Self {
             max_states,
             threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_markers),
@@ -300,7 +326,8 @@ mod tests {
 
     #[test]
     fn test_phase_states_basic() {
-        let mut ps = PhaseStates::new(10, 100);
+        let min_len = PhaseStates::min_segment_len(100, &[]);
+        let mut ps = PhaseStates::new(10, 100, min_len);
         assert_eq!(ps.n_states(), 0);
 
         // Add some IBS haps
@@ -313,7 +340,8 @@ mod tests {
 
     #[test]
     fn test_phase_states_replacement() {
-        let mut ps = PhaseStates::new(2, 1000); // Only 2 states
+        let min_len = PhaseStates::min_segment_len(1000, &[]);
+        let mut ps = PhaseStates::new(2, 1000, min_len); // Only 2 states
 
         // Fill up the queue
         ps.add_ibs_hap(0, 0);
@@ -330,7 +358,8 @@ mod tests {
 
     #[test]
     fn test_composite_haps_have_multiple_segments() {
-        let mut ps = PhaseStates::new(2, 1000);
+        let min_len = PhaseStates::min_segment_len(1000, &[]);
+        let mut ps = PhaseStates::new(2, 1000, min_len);
 
         // Add haplotype 0 at marker 0
         ps.add_ibs_hap(0, 0);
