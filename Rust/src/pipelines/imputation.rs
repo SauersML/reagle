@@ -1941,7 +1941,9 @@ fn run_hmm_forward_backward_clusters(
             let emit = (match_count * log_p_no_err + mismatch_count * log_p_err).exp();
 
             let val = if c == 0 {
-                emit / n_states as f32
+                // BEAGLE uses non-standard HMM initialization:
+                // fwd[0] = emit, not emit / n_states
+                emit
             } else {
                 emit * (scale * fwd[prev_row_offset + k] + shift)
             };
@@ -2051,7 +2053,9 @@ pub fn run_hmm_forward_backward_clusters_counts(
             let match_count = (n_obs - mism).max(0.0);
             let em = (match_count * log_p_no_err + mism * log_p_err).exp();
             let val = if m == 0 {
-                em / n_states as f32
+                // BEAGLE uses non-standard HMM initialization:
+                // fwd[0] = emit, not emit / n_states
+                em
             } else {
                 em * (scale * fwd[prev_offset + k] + shift)
             };
