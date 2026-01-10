@@ -1343,25 +1343,31 @@ impl PhasingPipeline {
                         }
                     }
 
-                    // Apply combined emission to fwd0 (match-any at hets)
-                    fwd0_sum = 0.0;
-                    for (k, item) in fwd0.iter_mut().enumerate().take(n_states) {
+                    // After the phase decision, continue with hap-specific tracks.
+                    let allele1_eff = seq1_working[m];
+                    let allele2_eff = seq2_working[m];
+
+                    fwd1_sum = 0.0;
+                    fwd2_sum = 0.0;
+                    for k in 0..n_states {
                         let ref_al = ref_alleles[k];
-                        let emit = if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                        let emit1 = if ref_al == allele1_eff || ref_al == 255 || allele1_eff == 255 {
                             p_no_err
                         } else {
                             p_err
                         };
-                        *item = fwd0_prior[k] * emit;
-                        fwd0_sum += *item;
+                        let emit2 = if ref_al == allele2_eff || ref_al == 255 || allele2_eff == 255 {
+                            p_no_err
+                        } else {
+                            p_err
+                        };
+                        fwd1[k] = fwd1_prior[k] * emit1;
+                        fwd2[k] = fwd2_prior[k] * emit2;
+                        fwd1_sum += fwd1[k];
+                        fwd2_sum += fwd2[k];
                     }
-                    fwd0_sum = fwd0_sum.max(1e-30);
-
-                    // RESET: fwd1 = fwd2 = fwd0 (after decision, tracks converge)
-                    fwd1.copy_from_slice(&fwd0);
-                    fwd2.copy_from_slice(&fwd0);
-                    fwd1_sum = fwd0_sum;
-                    fwd2_sum = fwd0_sum;
+                    fwd1_sum = fwd1_sum.max(1e-30);
+                    fwd2_sum = fwd2_sum.max(1e-30);
 
                     het_idx += 1;
                 } else {
@@ -1749,25 +1755,30 @@ impl PhasingPipeline {
                             }
                         }
 
-                        // Apply combined emission to fwd0 (match-any at hets)
-                        fwd0_sum = 0.0;
+                        let allele1_eff = seq1_working[m];
+                        let allele2_eff = seq2_working[m];
+
+                        fwd1_sum = 0.0;
+                        fwd2_sum = 0.0;
                         for k in 0..n_states {
                             let ref_al = ref_alleles[k];
-                            let emit = if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                            let emit1 = if ref_al == allele1_eff || ref_al == 255 || allele1_eff == 255 {
                                 p_no_err
                             } else {
                                 p_err
                             };
-                            fwd0[k] = fwd0_prior[k] * emit;
-                            fwd0_sum += fwd0[k];
+                            let emit2 = if ref_al == allele2_eff || ref_al == 255 || allele2_eff == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            fwd1[k] = fwd1_prior[k] * emit1;
+                            fwd2[k] = fwd2_prior[k] * emit2;
+                            fwd1_sum += fwd1[k];
+                            fwd2_sum += fwd2[k];
                         }
-                        fwd0_sum = fwd0_sum.max(1e-30);
-
-                        // RESET: fwd1 = fwd2 = fwd0
-                        fwd1.copy_from_slice(&fwd0);
-                        fwd2.copy_from_slice(&fwd0);
-                        fwd1_sum = fwd0_sum;
-                        fwd2_sum = fwd0_sum;
+                        fwd1_sum = fwd1_sum.max(1e-30);
+                        fwd2_sum = fwd2_sum.max(1e-30);
 
                         het_idx += 1;
                     } else if is_het_any {
@@ -2216,25 +2227,30 @@ impl PhasingPipeline {
                             }
                         }
 
-                        // Apply combined emission to fwd0 (match-any at hets)
-                        fwd0_sum = 0.0;
+                        let allele1_eff = seq1_working[i];
+                        let allele2_eff = seq2_working[i];
+
+                        fwd1_sum = 0.0;
+                        fwd2_sum = 0.0;
                         for k in 0..n_states {
                             let ref_al = ref_alleles[k];
-                            let emit = if ref_al == allele1 || ref_al == allele2 || ref_al == 255 {
+                            let emit1 = if ref_al == allele1_eff || ref_al == 255 || allele1_eff == 255 {
                                 p_no_err
                             } else {
                                 p_err
                             };
-                            fwd0[k] = fwd0_prior[k] * emit;
-                            fwd0_sum += fwd0[k];
+                            let emit2 = if ref_al == allele2_eff || ref_al == 255 || allele2_eff == 255 {
+                                p_no_err
+                            } else {
+                                p_err
+                            };
+                            fwd1[k] = fwd1_prior[k] * emit1;
+                            fwd2[k] = fwd2_prior[k] * emit2;
+                            fwd1_sum += fwd1[k];
+                            fwd2_sum += fwd2[k];
                         }
-                        fwd0_sum = fwd0_sum.max(1e-30);
-
-                        // RESET: fwd1 = fwd2 = fwd0
-                        fwd1.copy_from_slice(&fwd0);
-                        fwd2.copy_from_slice(&fwd0);
-                        fwd1_sum = fwd0_sum;
-                        fwd2_sum = fwd0_sum;
+                        fwd1_sum = fwd1_sum.max(1e-30);
+                        fwd2_sum = fwd2_sum.max(1e-30);
 
                         het_idx += 1;
                     } else if is_het_any {

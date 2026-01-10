@@ -240,6 +240,7 @@ fn compute_cluster_mismatches(
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap));
                 let mapped = alignment.reverse_map_allele(target_m, ref_allele);
                 if mapped == 255 {
+                    mismatches[c][j] = mismatches[c][j].saturating_add(1);
                     continue;
                 }
                 if mapped != targ_allele {
