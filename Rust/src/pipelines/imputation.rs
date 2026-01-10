@@ -2365,6 +2365,54 @@ mod tests {
     }
 
     #[test]
+    fn test_per_state_non_missing_affects_emission() {
+        use crate::utils::workspace::ImpWorkspace;
+
+        let n_clusters = 1;
+        let n_states = 2;
+        let p_recomb = vec![0.0f32; n_clusters];
+        let p_err = 0.01f32;
+
+        let mismatches = vec![vec![0u16, 1u16]];
+        let mut workspace = ImpWorkspace::with_ref_size(n_states);
+
+        let non_missing_equal = vec![vec![2u16, 2u16]];
+        let post_equal = run_hmm_forward_backward_clusters_counts(
+            &mismatches,
+            &non_missing_equal,
+            &p_recomb,
+            p_err,
+            n_states,
+            &mut workspace,
+        );
+
+        let non_missing_unequal = vec![vec![2u16, 1u16]];
+        let post_unequal = run_hmm_forward_backward_clusters_counts(
+            &mismatches,
+            &non_missing_unequal,
+            &p_recomb,
+            p_err,
+            n_states,
+            &mut workspace,
+        );
+
+        let p0_equal = post_equal[0];
+        let p1_equal = post_equal[1];
+        let p0_unequal = post_unequal[0];
+        let p1_unequal = post_unequal[1];
+
+        assert!(p0_equal > p1_equal, "State 0 should dominate with fewer mismatches");
+        assert!(
+            p1_unequal > p1_equal,
+            "State 1 posterior should increase with fewer observed markers"
+        );
+        let sum_equal = p0_equal + p1_equal;
+        let sum_unequal = p0_unequal + p1_unequal;
+        assert!((sum_equal - 1.0).abs() < 1e-6, "Posteriors should sum to 1");
+        assert!((sum_unequal - 1.0).abs() < 1e-6, "Posteriors should sum to 1");
+    }
+
+    #[test]
     fn test_hmm_perfect_match_gives_high_posterior() {
         use crate::utils::workspace::ImpWorkspace;
 
