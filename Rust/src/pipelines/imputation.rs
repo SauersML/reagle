@@ -1132,7 +1132,6 @@ impl ClusterStateProbs {
         }
 
         let haps = &self.hap_indices[cluster];
-        let haps_p1 = &self.haps_p1[cluster];
         let probs = &self.probs[cluster];
         let probs_p1 = &self.probs_p1[cluster];
 
@@ -1150,22 +1149,17 @@ impl ClusterStateProbs {
                         p_ref += prob;
                     }
                 } else {
-                    let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
-                    let prob_left = weight * prob;
-                    let prob_right = (1.0 - weight) * prob_p1;
+                    // Interpolate state probability, then use haplotype from genetically
+                    // closer cluster (left if weight > 0.5, right otherwise)
+                    let interpolated_prob = weight * prob + (1.0 - weight) * prob_p1;
+                    let hap_right = self.haps_p1[cluster].get(j).copied().unwrap_or(hap);
+                    let allele_hap = if weight > 0.5 { hap } else { hap_right };
+                    let allele = get_ref_allele(ref_marker, allele_hap);
 
-                    let allele_left = get_ref_allele(ref_marker, hap);
-                    if allele_left == 1 {
-                        p_alt += prob_left;
-                    } else if allele_left == 0 {
-                        p_ref += prob_left;
-                    }
-
-                    let allele_right = get_ref_allele(ref_marker, hap_right);
-                    if allele_right == 1 {
-                        p_alt += prob_right;
-                    } else if allele_right == 0 {
-                        p_ref += prob_right;
+                    if allele == 1 {
+                        p_alt += interpolated_prob;
+                    } else if allele == 0 {
+                        p_ref += interpolated_prob;
                     }
                 }
             }
@@ -1183,18 +1177,15 @@ impl ClusterStateProbs {
                         al_probs[allele as usize] += prob;
                     }
                 } else {
-                    let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
-                    let prob_left = weight * prob;
-                    let prob_right = (1.0 - weight) * prob_p1;
+                    // Interpolate state probability, then use haplotype from genetically
+                    // closer cluster (left if weight > 0.5, right otherwise)
+                    let interpolated_prob = weight * prob + (1.0 - weight) * prob_p1;
+                    let hap_right = self.haps_p1[cluster].get(j).copied().unwrap_or(hap);
+                    let allele_hap = if weight > 0.5 { hap } else { hap_right };
+                    let allele = get_ref_allele(ref_marker, allele_hap);
 
-                    let allele_left = get_ref_allele(ref_marker, hap);
-                    if allele_left != 255 && (allele_left as usize) < n_alleles {
-                        al_probs[allele_left as usize] += prob_left;
-                    }
-
-                    let allele_right = get_ref_allele(ref_marker, hap_right);
-                    if allele_right != 255 && (allele_right as usize) < n_alleles {
-                        al_probs[allele_right as usize] += prob_right;
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs[allele as usize] += interpolated_prob;
                     }
                 }
             }
@@ -2926,7 +2917,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_state_probs_between_clusters_uses_left_and_right_haps() {
+    fn test_cluster_state_probs_between_clusters() {
         let marker_cluster = Arc::new(vec![0usize, 0usize, 1usize]);
         let ref_cluster_end = Arc::new(vec![1usize, 3usize]);
         let weight = Arc::new(vec![1.0f32, 0.25f32, 1.0f32]);
@@ -2953,7 +2944,7 @@ mod tests {
 
         let post = state_probs.allele_posteriors(1, 2, &get_ref_allele);
         let p_alt = post.prob(1);
-        let expected = 0.15 / (0.2 + 0.15);
+        let expected = 1.0;
         assert!((p_alt - expected).abs() < 1e-6, "p_alt={}, expected={}", p_alt, expected);
     }
 
