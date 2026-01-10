@@ -197,13 +197,13 @@ impl BidirectionalPhaseIbs {
         let bwd_neighbors = self.find_bwd_neighbors(hap_idx, marker_idx, n_candidates);
 
         for h in fwd_neighbors {
-            if h != hap_idx && h / 2 != sample.0 && !neighbors.contains(&h) {
+            if h != hap_idx && h / 2 != sample.0 {
                 neighbors.push(h);
             }
         }
 
         for h in bwd_neighbors {
-            if h != hap_idx && h / 2 != sample.0 && !neighbors.contains(&h) {
+            if h != hap_idx && h / 2 != sample.0 {
                 neighbors.push(h);
             }
         }

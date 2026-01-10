@@ -809,8 +809,10 @@ impl VcfWriter {
     {
         let n_samples = self.samples.len();
         let format_prob = |val: f32| -> String {
-            let rounded = (val * 100.0).round() / 100.0;
-            format!("{:.2}", rounded)
+            if !val.is_finite() {
+                return "0.0000".to_string();
+            }
+            format!("{:.4}", val)
         };
 
         for m in start..end {
