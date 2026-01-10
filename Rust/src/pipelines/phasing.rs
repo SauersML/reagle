@@ -1333,7 +1333,13 @@ impl PhasingPipeline {
                     let l_keep = p11 * p22;
                     let l_swap = p12 * p21;
 
-                    if l_swap > l_keep {
+                    let swap_threshold = if self.params.lr_threshold.is_finite() {
+                        self.params.lr_threshold
+                    } else {
+                        1.0
+                    };
+                    let lr = (l_swap / l_keep.max(1e-300)) as f32;
+                    if l_swap > l_keep && lr >= swap_threshold {
                         // SWAP: exchange alleles from this position forward
                         for m_swap in m..n_markers {
                             std::mem::swap(&mut seq1_working[m_swap], &mut seq2_working[m_swap]);
@@ -1746,7 +1752,13 @@ impl PhasingPipeline {
                         let l_keep = p11 * p22;
                         let l_swap = p12 * p21;
 
-                        if l_swap > l_keep {
+                        let swap_threshold = if self.params.lr_threshold.is_finite() {
+                            self.params.lr_threshold
+                        } else {
+                            1.0
+                        };
+                        let lr = (l_swap / l_keep.max(1e-300)) as f32;
+                        if l_swap > l_keep && lr >= swap_threshold {
                             // SWAP: exchange alleles from this position forward
                             for m_swap in m..n_markers {
                                 std::mem::swap(&mut seq1_working[m_swap], &mut seq2_working[m_swap]);
@@ -2210,7 +2222,13 @@ impl PhasingPipeline {
                         let l_keep = p11 * p22;
                         let l_swap = p12 * p21;
 
-                        let should_swap = l_swap > l_keep;
+                        let swap_threshold = if self.params.lr_threshold.is_finite() {
+                            self.params.lr_threshold
+                        } else {
+                            1.0
+                        };
+                        let should_swap = l_swap > l_keep
+                            && (l_swap / l_keep.max(1e-300)) as f32 >= swap_threshold;
                         // Compute likelihood ratio for threshold check
                         let lr = if l_swap > l_keep {
                             (l_swap / l_keep.max(1e-300)) as f32
