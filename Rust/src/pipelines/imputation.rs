@@ -1742,19 +1742,6 @@ impl ImputationPipeline {
         let has_observed_for_dosage = std::sync::Arc::clone(&has_observed);
         let target_gt_for_dosage = Arc::clone(&target_gt);
         let get_dosage = move |m: usize, s: usize| -> f32 {
-            if has_observed_for_dosage[m] {
-                if let Some(target_m) = alignment_for_dosage.target_marker(m) {
-                    let hap1_idx = HapIdx::new((s * 2) as u32);
-                    let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-                    let a1 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap1_idx);
-                    let a2 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap2_idx);
-                    let a1_mapped = alignment_for_dosage.map_allele(target_m, a1);
-                    let a2_mapped = alignment_for_dosage.map_allele(target_m, a2);
-                    if a1_mapped != 255 && a2_mapped != 255 {
-                        return a1_mapped as f32 + a2_mapped as f32;
-                    }
-                }
-            }
 
             let n_alleles = n_alleles_for_dosage[m];
 
