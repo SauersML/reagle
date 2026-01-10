@@ -80,12 +80,11 @@ impl MarkerImputationStats {
     /// Calculate DR2 (dosage R-squared) for the specified ALT allele
     ///
     /// Matches Java Beagle ImputedRecBuilder.r2.
+    /// DR2 measures how well the imputed dosages correlate with true dosages.
+    /// For genotyped markers with uncertain calls (low GL confidence), DR2 will be low.
     pub fn dr2(&self, allele: usize) -> f32 {
         if allele == 0 || allele >= self.sum_dosages.len() || self.n_haps == 0 {
             return 0.0;
-        }
-        if !self.is_imputed {
-            return 1.0;
         }
 
         let n = self.n_haps as f32;
