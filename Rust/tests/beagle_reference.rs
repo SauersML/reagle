@@ -3556,17 +3556,18 @@ fn test_perfect_ld_trap_rare_variant() {
     let work_dir = tempfile::tempdir().expect("Create temp dir");
     let rust_out = work_dir.path().join("rust_imp");
 
-    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345, false);
+    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345)
+        .expect("Rust imputation failed");
 
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
     let (_, rust_records) = parse_vcf(&rust_vcf);
 
     // Position 20066665: Java DS=1.0 for Sample 0, Rust DS≈0.0001
-    let problem_pos = 20066665u32;
+    let problem_pos = 20066665u64;
     let problem_rec = rust_records.iter().find(|r| r.pos == problem_pos);
 
     if let Some(rec) = problem_rec {
-        let ds: f64 = rec.genotypes[0].ds.parse().unwrap_or(0.0);
+        let ds = rec.genotypes[0].ds.unwrap_or(0.0);
 
         // Should correctly identify carrier (Java gives DS ≈ 1.0)
         assert!(
@@ -3596,8 +3597,8 @@ fn test_gl_confidence_affects_emission() {
     for m in 0..gt.n_markers().min(200) {
         for s in 0..gt.n_samples() {
             let conf = gt.sample_confidence_f32(MarkerIdx::new(m as u32), s);
-            // Confidence < 200 indicates uncertain genotype
-            if conf < 200.0 {
+            // Confidence < 0.8 indicates uncertain genotype
+            if conf < 0.8 {
                 low_conf_markers.push((m, s, conf));
                 break;
             }
@@ -3615,46 +3616,34 @@ fn test_gl_confidence_affects_emission() {
     // When implemented, low-confidence markers should not decimate haplotypes.
 }
 
-/// Hypothesis test: Single mismatch should not be catastrophic
+/// Single mismatch with 5000:1 penalty decimates otherwise-perfect haplotype.
 ///
-/// With Li-Stephens error rate ~0.0002, a single mismatch applies a ~5000:1
-/// penalty. If a haplotype matches everywhere EXCEPT one uncertain position,
-/// it should still be considered viable.
+/// With Li-Stephens error rate ~0.0002 (382 haplotypes), match/mismatch
+/// ratio is ~5000:1. One mismatch at a low-confidence marker should not
+/// eliminate an otherwise-viable haplotype.
 ///
-/// Current behavior: One mismatch = 5000x reduction in probability
-/// This can eliminate otherwise-perfect haplotypes based on uncertain data.
+/// Setup: State 0 matches all 10 markers. State 1 matches 9/10 (one mismatch).
+/// Expected: State 1 should have P > 0.001 due to recombination.
+/// Current: State 1 gets ~5000x reduction, essentially 0.
 #[test]
-fn test_hypothesis_single_mismatch_not_catastrophic() {
+fn test_single_mismatch_not_catastrophic() {
     use reagle::utils::workspace::ImpWorkspace;
-
-    println!("\n{}", "=".repeat(70));
-    println!("=== HYPOTHESIS: Single Mismatch Not Catastrophic ===");
-    println!("{}", "=".repeat(70));
-
-    // Setup: 10 markers, 2 states
-    // State 0 matches at ALL markers
-    // State 1 matches at 9/10 markers (one mismatch)
-    //
-    // With 382 haplotypes, p_err ≈ 0.0002, so match/mismatch ratio ≈ 5000:1
-    //
-    // Question: Should state 1 still have reasonable probability?
 
     let n_markers = 10;
     let n_states = 2;
 
-    // State 0: perfect match (all true)
-    // State 1: one mismatch at marker 5 (9 true, 1 false)
+    // State 0: matches all markers (0 mismatches)
+    // State 1: mismatches at marker 5 only (1 mismatch)
     let mismatches: Vec<Vec<f32>> = (0..n_markers)
         .map(|m| vec![0.0f32, if m == 5 { 1.0f32 } else { 0.0f32 }])
         .collect();
     let non_missing: Vec<Vec<f32>> = vec![vec![1.0f32, 1.0f32]; n_markers];
 
-    // Li-Stephens recombination: small but non-zero
     let p_recomb: Vec<f32> = (0..n_markers)
         .map(|m| if m == 0 { 0.0 } else { 0.001 })
         .collect();
 
-    // Error rate for ~382 haplotypes
+    // Error rate for ~382 haplotypes: ~0.0002
     let base_err_rate = 0.0002f32;
 
     let mut workspace = ImpWorkspace::with_ref_size(n_states);
@@ -3668,56 +3657,49 @@ fn test_hypothesis_single_mismatch_not_catastrophic() {
         &mut workspace,
     );
 
-    // Check state 1's probability at marker 5 (the mismatch point)
     let prob_state1_at_mismatch = posteriors[5 * n_states + 1];
 
-    println!("Base error rate: {:.6}", base_err_rate);
-    println!("Match/mismatch ratio: {:.0}:1", (1.0 - base_err_rate) / base_err_rate);
-    println!("State 0 (perfect match) posterior at m=5: {:.6}", posteriors[5 * n_states]);
-    println!("State 1 (one mismatch) posterior at m=5: {:.6}", prob_state1_at_mismatch);
-
-    // HYPOTHESIS: State 1 should still have meaningful probability
-    // Even with one mismatch, 9/10 matches should count for something
-    //
-    // Current reality: State 1 gets ~5000x reduction, essentially 0
-    // Expected: State 1 should have P > 0.001 (accounting for recombination)
-
+    // State with single mismatch should still have meaningful probability
+    // due to recombination allowing state switches.
     assert!(
         prob_state1_at_mismatch > 0.001,
-        "HYPOTHESIS FAILED: State with single mismatch should have P > 0.001.\n\
-         Got P = {:.6}. The 5000:1 match/mismatch ratio makes single mismatches\n\
-         catastrophic, eliminating otherwise-viable haplotypes.\n\
-         This is problematic when the mismatch is due to uncertain genotype data.",
+        "State 1 (1 mismatch) has P={:.6}, should be >0.001",
         prob_state1_at_mismatch
     );
 }
 
-/// Real-world test: Compare Rust vs Java at the specific problem position
+/// Rust vs Java dosage comparison at position 20066665.
 ///
-/// Position 20066665 shows the largest discrepancy between Rust and Java:
-/// - Java: DS ≈ 1.0 for Sample 0 (correctly identifies carrier)
-/// - Rust: DS ≈ 0.0001 for Sample 0 (fails to identify carrier)
+/// Java: DS ≈ 1.0 for Sample 0 (correctly identifies carrier)
+/// Rust: DS ≈ 0.0001 for Sample 0 (fails to identify carrier)
 ///
-/// This test runs both implementations and compares the results.
+/// Max gap should be < 0.1 when imputation is working correctly.
 #[test]
 fn test_position_20066665_rust_vs_java() {
-    println!("\n{}", "=".repeat(70));
-    println!("=== Position 20066665: Rust vs Java Comparison ===");
-    println!("{}", "=".repeat(70));
-
     let beagle = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
 
-    // Run Java imputation
     let java_out = work_dir.path().join("java_imp");
-    if run_java_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &java_out, 12345).is_err() {
-        println!("Java BEAGLE not available, skipping comparison");
+    let java_out_str = java_out.to_str().expect("java_out path");
+    let java_output = run_beagle(
+        &beagle.beagle_jar,
+        &[
+            ("ref", beagle.ref_vcf.to_str().unwrap()),
+            ("gt", beagle.target_sparse_vcf.to_str().unwrap()),
+            ("out", java_out_str),
+            ("seed", "12345"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    if !java_output.status.success() {
+        // Java BEAGLE not available - skip silently
         return;
     }
 
-    // Run Rust imputation
     let rust_out = work_dir.path().join("rust_imp");
-    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345, false);
+    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345)
+        .expect("Rust imputation failed");
 
     let java_vcf = work_dir.path().join("java_imp.vcf.gz");
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
@@ -3725,51 +3707,31 @@ fn test_position_20066665_rust_vs_java() {
     let (_, java_records) = parse_vcf(&java_vcf);
     let (_, rust_records) = parse_vcf(&rust_vcf);
 
-    // Find position 20066665
-    let problem_pos = 20066665u32;
+    let problem_pos = 20066665u64;
     let java_rec = java_records.iter().find(|r| r.pos == problem_pos);
     let rust_rec = rust_records.iter().find(|r| r.pos == problem_pos);
 
-    match (java_rec, rust_rec) {
-        (Some(java), Some(rust)) => {
-            println!("Position {} comparison:", problem_pos);
-            println!("{:>10} | {:>12} | {:>12} | {:>10}", "Sample", "Java DS", "Rust DS", "Gap");
-            println!("{}", "-".repeat(50));
+    if let (Some(java), Some(rust)) = (java_rec, rust_rec) {
+        let mut max_gap = 0.0f64;
+        let mut max_gap_sample = 0;
 
-            let mut max_gap = 0.0f64;
-            let mut max_gap_sample = 0;
+        for (s, (jgt, rgt)) in java.genotypes.iter().zip(rust.genotypes.iter()).enumerate() {
+            let java_ds: f64 = jgt.ds.unwrap_or(0.0);
+            let rust_ds: f64 = rgt.ds.unwrap_or(0.0);
+            let gap = (java_ds - rust_ds).abs();
 
-            for (s, (jgt, rgt)) in java.genotypes.iter().zip(rust.genotypes.iter()).enumerate() {
-                let java_ds: f64 = jgt.ds.parse().unwrap_or(0.0);
-                let rust_ds: f64 = rgt.ds.parse().unwrap_or(0.0);
-                let gap = (java_ds - rust_ds).abs();
-
-                if gap > max_gap {
-                    max_gap = gap;
-                    max_gap_sample = s;
-                }
-
-                if gap > 0.1 {
-                    println!("{:>10} | {:>12.6} | {:>12.6} | {:>10.6}", s, java_ds, rust_ds, gap);
-                }
+            if gap > max_gap {
+                max_gap = gap;
+                max_gap_sample = s;
             }
-
-            println!("\nMax gap: {:.6} at sample {}", max_gap, max_gap_sample);
-
-            // HYPOTHESIS: Rust should match Java within reasonable tolerance
-            // Current reality: Gap can be ~1.0 for rare variant carriers
-            assert!(
-                max_gap < 0.1,
-                "HYPOTHESIS FAILED: Rust and Java should agree within 0.1 DS.\n\
-                 Max gap at position {}: {:.6} (sample {})\n\
-                 Java correctly identifies carriers, Rust does not.\n\
-                 Root cause: Perfect LD trap in HMM decimates ALT-carrying haplotypes.",
-                problem_pos, max_gap, max_gap_sample
-            );
         }
-        _ => {
-            println!("Position {} not found in one or both outputs", problem_pos);
-        }
+
+        // Rust should match Java within 0.1 DS
+        assert!(
+            max_gap < 0.1,
+            "Position {}: max DS gap={:.4} at sample {} (should be <0.1)",
+            problem_pos, max_gap, max_gap_sample
+        );
     }
 }
 
@@ -3795,7 +3757,8 @@ fn test_dr2_zero_variance_genotyped_marker() {
     let work_dir = tempfile::tempdir().expect("Create temp dir");
     let rust_out = work_dir.path().join("rust_imp");
 
-    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345, false);
+    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345)
+        .expect("Rust imputation failed");
 
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
     let (_, rust_records) = parse_vcf(&rust_vcf);
@@ -3807,7 +3770,7 @@ fn test_dr2_zero_variance_genotyped_marker() {
     for rec in &rust_records {
         // Check if all samples have the same dosage
         let dosages: Vec<f64> = rec.genotypes.iter()
-            .map(|gt| gt.ds.parse().unwrap_or(f64::NAN))
+            .map(|gt| gt.ds.unwrap_or(f64::NAN))
             .filter(|d| d.is_finite())
             .collect();
 
@@ -3819,12 +3782,7 @@ fn test_dr2_zero_variance_genotyped_marker() {
         let all_same = dosages.iter().all(|&d| (d - first_ds).abs() < 0.01);
 
         if all_same && !rec.info.is_empty() {
-            // Extract DR2 from INFO field
-            if let Some(dr2_str) = rec.info.split(';')
-                .find(|s| s.starts_with("DR2="))
-                .map(|s| &s[4..])
-            {
-                let dr2: f64 = dr2_str.parse().unwrap_or(1.0);
+            if let Some(dr2) = rec.info.get("DR2").and_then(|s| s.parse::<f64>().ok()) {
 
                 if (first_ds - first_ds.round()).abs() < 0.01 {
                     // This is likely a genotyped marker with integer dosages
