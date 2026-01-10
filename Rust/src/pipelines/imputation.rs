@@ -540,7 +540,7 @@ impl StateProbs {
         let threshold = if n_genotyped <= 1000 {
             0.0
         } else {
-            (0.005f32).min(0.9999 / n_states.max(1) as f32)
+            (0.005f32).min(0.9999f32 / n_states.max(1) as f32)
         };
         let include_all_states = threshold == 0.0;
 
@@ -1922,7 +1922,7 @@ fn run_hmm_forward_backward_clusters(
             let emit = (match_count * log_p_no_err + mismatch_count * log_p_err).exp();
 
             let val = if c == 0 {
-                emit
+                emit / n_states as f32
             } else {
                 emit * (scale * fwd[prev_row_offset + k] + shift)
             };
@@ -2032,7 +2032,7 @@ pub fn run_hmm_forward_backward_clusters_counts(
             let match_count = (n_obs - mism).max(0.0);
             let em = (match_count * log_p_no_err + mism * log_p_err).exp();
             let val = if m == 0 {
-                em
+                em / n_states as f32
             } else {
                 em * (scale * fwd[prev_offset + k] + shift)
             };
