@@ -1124,12 +1124,9 @@ impl ClusterStateProbs {
         F: Fn(usize, u32) -> u8,
     {
         let cluster = *self.marker_cluster.get(ref_marker).unwrap_or(&0);
-        let mut in_cluster = ref_marker < *self.ref_cluster_end.get(cluster).unwrap_or(&0);
-        let mut weight = self.weight.get(ref_marker).copied().unwrap_or(0.5);
-        if !weight.is_finite() {
-            in_cluster = true;
-            weight = 0.5;
-        }
+        let weight = self.weight.get(ref_marker).copied().unwrap_or(0.5);
+        let in_cluster = ref_marker < *self.ref_cluster_end.get(cluster).unwrap_or(&0)
+            || !weight.is_finite();
 
         let haps = &self.hap_indices[cluster];
         let haps_p1 = &self.haps_p1[cluster];
