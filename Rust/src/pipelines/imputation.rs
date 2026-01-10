@@ -1392,7 +1392,10 @@ impl ImputationPipeline {
 
         // Compute marker clusters based on genetic distance (matching Java ImpData)
         // Respect block boundaries induced by reference allele-coding changes.
-        let cluster_dist = self.config.cluster as f64;
+        let mut cluster_dist = self.config.cluster as f64;
+        if n_genotyped <= 1000 {
+            cluster_dist = cluster_dist.min(0.001);
+        }
         let targ_block_end = compute_targ_block_end(&ref_gt, &target_gt, &alignment, &genotyped_markers_vec);
         let clusters = compute_marker_clusters_with_blocks(
             &genotyped_markers_vec,
