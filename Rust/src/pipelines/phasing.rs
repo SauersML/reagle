@@ -2992,9 +2992,12 @@ impl Stage2Phaser {
                 } else if match2 && !match1 {
                     // Only a2 matches (and is rare) - add full probability to a2
                     al_probs[1] += prob;
+                } else if match1 && match2 {
+                    // Both match (ambiguous) - split probability mass
+                    al_probs[0] += 0.5 * prob;
+                    al_probs[1] += 0.5 * prob;
                 }
-                // If both match or neither match (ambiguous), no contribution
-                // This is consistent with Java Stage2Baum.unscaledAlProbs behavior
+                // If neither match, no contribution
             }
         }
 
