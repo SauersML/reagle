@@ -1130,6 +1130,10 @@ impl ClusterStateProbs {
             in_cluster = true;
             weight = 0.5;
         }
+        if !weight.is_finite() {
+            in_cluster = true;
+            weight = 0.5;
+        }
 
         let haps = &self.hap_indices[cluster];
         let haps_p1 = &self.haps_p1[cluster];
