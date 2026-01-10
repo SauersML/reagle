@@ -1150,22 +1150,13 @@ impl ClusterStateProbs {
                         p_ref += prob;
                     }
                 } else {
-                    let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
-                    let prob_left = weight * prob;
-                    let prob_right = (1.0 - weight) * prob_p1;
-
-                    let allele_left = get_ref_allele(ref_marker, hap);
-                    if allele_left == 1 {
-                        p_alt += prob_left;
-                    } else if allele_left == 0 {
-                        p_ref += prob_left;
-                    }
-
-                    let allele_right = get_ref_allele(ref_marker, hap_right);
-                    if allele_right == 1 {
-                        p_alt += prob_right;
-                    } else if allele_right == 0 {
-                        p_ref += prob_right;
+                    // Interpolate state probability, then use LEFT haplotype for allele
+                    let interpolated_prob = weight * prob + (1.0 - weight) * prob_p1;
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele == 1 {
+                        p_alt += interpolated_prob;
+                    } else if allele == 0 {
+                        p_ref += interpolated_prob;
                     }
                 }
             }
@@ -1183,18 +1174,11 @@ impl ClusterStateProbs {
                         al_probs[allele as usize] += prob;
                     }
                 } else {
-                    let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
-                    let prob_left = weight * prob;
-                    let prob_right = (1.0 - weight) * prob_p1;
-
-                    let allele_left = get_ref_allele(ref_marker, hap);
-                    if allele_left != 255 && (allele_left as usize) < n_alleles {
-                        al_probs[allele_left as usize] += prob_left;
-                    }
-
-                    let allele_right = get_ref_allele(ref_marker, hap_right);
-                    if allele_right != 255 && (allele_right as usize) < n_alleles {
-                        al_probs[allele_right as usize] += prob_right;
+                    // Interpolate state probability, then use LEFT haplotype for allele
+                    let interpolated_prob = weight * prob + (1.0 - weight) * prob_p1;
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs[allele as usize] += interpolated_prob;
                     }
                 }
             }
