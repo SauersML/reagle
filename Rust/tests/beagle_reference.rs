@@ -2575,6 +2575,24 @@ fn test_dr2_genotyped_vs_imputed() {
         println!("  {:>12} {:>10.4} {:>10.4} {:>+10.4}", pos, java_dr2, rust_dr2, gap);
     }
 
+    // Diagnostic: Show actual dosages at worst markers
+    let worst_positions: std::collections::HashSet<u64> = imputed_gaps.iter().take(5).map(|(p, _, _)| *p).collect();
+    println!("\n  DIAGNOSTIC: Dosages at worst 5 markers");
+    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+        if worst_positions.contains(&j_rec.pos) {
+            println!("\n  Position {}", j_rec.pos);
+            let j_info_af = j_rec.info.get("AF").map(|s| s.as_str()).unwrap_or("?");
+            let r_info_af = r_rec.info.get("AF").map(|s| s.as_str()).unwrap_or("?");
+            println!("    Java AF={}, Rust AF={}", j_info_af, r_info_af);
+            println!("    Sample dosages (Java | Rust):");
+            for (i, (jg, rg)) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()).enumerate().take(5) {
+                let j_ds = jg.ds.map(|d| format!("{:.4}", d)).unwrap_or("?".to_string());
+                let r_ds = rg.ds.map(|d| format!("{:.4}", d)).unwrap_or("?".to_string());
+                println!("      Sample {}: {} | {}", i, j_ds, r_ds);
+            }
+        }
+    }
+
     // Assertions for DR2 quality
     println!("\n{}", "=".repeat(70));
     println!("ASSERTIONS:");
