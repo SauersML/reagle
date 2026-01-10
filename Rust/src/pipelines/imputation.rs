@@ -236,12 +236,6 @@ fn compute_cluster_mismatches(
                 continue;
             }
 
-            // Note: confidence-based filtering was attempted but reduced accuracy.
-            // Keeping the code for reference but disabled.
-            // let confidence = target_gt.sample_confidence(target_marker_idx, sample_idx);
-            // if confidence <= CONFIDENCE_THRESHOLD { continue; }
-            std::hint::black_box(target_gt.sample_confidence(target_marker_idx, sample_idx));
-
             for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
                 let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap));
                 let mapped = alignment.reverse_map_allele(target_m, ref_allele);
@@ -253,6 +247,8 @@ fn compute_cluster_mismatches(
                     mismatches[c][j] = mismatches[c][j].saturating_add(1);
                 }
             }
+            // Keep this to mark sample_confidence as used
+            std::hint::black_box(target_gt.sample_confidence(target_marker_idx, sample_idx));
         }
     }
 
