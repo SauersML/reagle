@@ -101,6 +101,11 @@ impl<'a> ImpStatesCluster<'a> {
         }
     }
 
+    pub fn set_n_clusters(&mut self, n_clusters: usize) {
+        self.n_clusters = n_clusters;
+        self.threaded_haps.set_n_markers(n_clusters);
+    }
+
     pub fn ibs_states_cluster(
         &mut self,
         targ_hap: usize,

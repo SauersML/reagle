@@ -11,7 +11,6 @@
 //!
 //! This matches Java `imp/ImpLS.java`, `imp/ImpLSBaum.java`, and related classes.
 
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info_span, instrument};
@@ -522,10 +521,11 @@ impl StateProbs {
 
         // Sparse storage threshold: min(0.005, 0.9999/K) - matches Java exactly
         // For small panels, keep all states to maximize accuracy.
+        // The `f32` literal is critical for matching Java's single-precision floating point math.
         let threshold = if n_genotyped <= 1000 {
             0.0
         } else {
-            (0.005f32).min(0.9999 / n_states.max(1) as f32)
+            (0.005f32).min(0.9999f32 / n_states.max(1) as f32)
         };
         let include_all_states = threshold == 0.0;
 
@@ -1378,20 +1378,7 @@ impl ImputationPipeline {
             })
             .collect();
 
-        // Cluster-level recombination probabilities
-        let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain((1..n_clusters).map(|c| {
-                let gen_dist = (cluster_midpoints[c] - cluster_midpoints[c - 1]).abs();
-                self.params.p_recomb(gen_dist)
-            }))
-            .collect();
-
         let cluster_bounds: Vec<(usize, usize)> = clusters.iter().map(|c| (c.start, c.end)).collect();
-        let (ref_cluster_start, ref_cluster_end) = compute_ref_cluster_bounds(&genotyped_markers_vec, &clusters);
-        let ref_cluster_start = std::sync::Arc::new(ref_cluster_start);
-        let ref_cluster_end = std::sync::Arc::new(ref_cluster_end);
-        let marker_cluster = std::sync::Arc::new(build_marker_cluster_index(&ref_cluster_start, n_ref_markers));
-        let cluster_weights = std::sync::Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
 
         let cluster_seqs = std::sync::Arc::new(build_cluster_hap_sequences(
             &ref_gt,
@@ -1415,32 +1402,69 @@ impl ImputationPipeline {
             self.config.seed as u64,
         ));
 
-        // Run imputation for each target haplotype with per-thread workspaces
+        // Run imputation for each target haplotype sequentially to avoid data leakage
         let state_probs: Vec<Arc<ClusterStateProbs>> = info_span!("run_hmm", n_haps = n_target_haps).in_scope(|| {
-            (0..n_target_haps)
-            .into_par_iter()
-            .map_init(
-                || {
-                    let workspace = ImpWorkspace::with_ref_size(n_states);
-                    let imp_states = ImpStatesCluster::new(
-                        &imp_ibs,
-                        n_clusters,
-                        n_ref_haps,
-                        n_states,
-                    );
-                    (workspace, imp_states)
-                },
-                |(workspace, imp_states), h| {
-                    let mut hap_indices: Vec<Vec<u32>> = Vec::new();
-                    let actual_n_states = imp_states.ibs_states_cluster(
-                        h,
-                        &mut hap_indices,
-                    );
+            let mut workspace = ImpWorkspace::with_ref_size(n_states);
+            let mut imp_states = ImpStatesCluster::new(&imp_ibs, n_clusters, n_ref_haps, n_states);
 
+            (0..n_target_haps)
+                .map(|h| {
+                    // Recompute genotyped markers and clusters FOR EACH HAPLOTYPE
+                    // This is the critical fix for the data leakage bug where a global
+                    // marker list was used for all samples.
+                    let sample_genotyped_markers: Vec<usize> = genotyped_markers_vec
+                        .iter()
+                        .filter(|&&ref_m| {
+                            let targ_m = alignment.target_marker(ref_m).unwrap();
+                            let targ_allele = target_gt.allele(
+                                MarkerIdx::new(targ_m as u32),
+                                crate::data::haplotype::HapIdx::new(h as u32),
+                            );
+                            targ_allele != 255
+                        })
+                        .copied()
+                        .collect();
+
+                    let sample_targ_block_end =
+                        compute_targ_block_end(&ref_gt, &alignment, &sample_genotyped_markers);
+                    let sample_clusters = compute_marker_clusters_with_blocks(
+                        &sample_genotyped_markers,
+                        &gen_positions,
+                        cluster_dist,
+                        &sample_targ_block_end,
+                    );
+                    let n_sample_clusters = sample_clusters.len();
+
+                    let sample_cluster_midpoints: Vec<f64> = sample_clusters
+                        .iter()
+                        .map(|c| {
+                            if c.end > c.start {
+                                (gen_positions[sample_genotyped_markers[c.start]]
+                                    + gen_positions[sample_genotyped_markers[c.end - 1]])
+                                    / 2.0
+                            } else {
+                                gen_positions[sample_genotyped_markers[c.start]]
+                            }
+                        })
+                        .collect();
+
+                    let sample_cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+                        .chain((1..n_sample_clusters).map(|c| {
+                            let gen_dist = (sample_cluster_midpoints[c] - sample_cluster_midpoints[c - 1]).abs();
+                            self.params.p_recomb(gen_dist)
+                        }))
+                        .collect();
+
+                    imp_states.set_n_clusters(n_sample_clusters);
+
+                    let mut hap_indices: Vec<Vec<u32>> = Vec::new();
+                    let actual_n_states = imp_states.ibs_states_cluster(h, &mut hap_indices);
+
+                    let sample_cluster_bounds: Vec<(usize, usize)> = sample_clusters.iter().map(|c| (c.start, c.end)).collect();
                     let (cluster_mismatches, cluster_non_missing) = compute_cluster_mismatches(
                         &hap_indices,
-                        &cluster_bounds,
-                        &genotyped_markers_vec,
+                        &sample_cluster_bounds,
+                        &sample_genotyped_markers,
                         &target_gt,
                         &ref_gt,
                         &alignment,
@@ -1451,23 +1475,37 @@ impl ImputationPipeline {
                     let cluster_state_probs = run_hmm_forward_backward_clusters_counts(
                         &cluster_mismatches,
                         &cluster_non_missing,
-                        &cluster_p_recomb,
+                        &sample_cluster_p_recomb,
                         base_err_rate,
                         actual_n_states,
-                        workspace,
+                        &mut workspace,
                     );
 
+                    // Per-sample cluster metadata is required to avoid data leakage
+                    let (sample_ref_cluster_start, sample_ref_cluster_end) =
+                        compute_ref_cluster_bounds(&sample_genotyped_markers, &sample_clusters);
+
+                    let sample_marker_cluster = Arc::new(build_marker_cluster_index(
+                        &sample_ref_cluster_start,
+                        n_ref_markers,
+                    ));
+                    let sample_ref_cluster_end = Arc::new(sample_ref_cluster_end);
+                    let sample_cluster_weights = Arc::new(compute_cluster_weights(
+                        &gen_positions,
+                        &sample_ref_cluster_start,
+                        &sample_ref_cluster_end,
+                    ));
+
                     Arc::new(ClusterStateProbs::new(
-                        std::sync::Arc::clone(&marker_cluster),
-                        std::sync::Arc::clone(&ref_cluster_end),
-                        std::sync::Arc::clone(&cluster_weights),
+                        sample_marker_cluster,
+                        sample_ref_cluster_end,
+                        sample_cluster_weights,
                         actual_n_states,
                         hap_indices,
                         cluster_state_probs,
                     ))
-                },
-            )
-            .collect()
+                })
+                .collect()
         });
 
         eprintln!("Computing dosages with interpolation and quality metrics...");
@@ -1552,54 +1590,49 @@ impl ImputationPipeline {
                         probs2[a] = 0.0;
                     }
 
+                    // For DR2, Var(d) uses HMM posteriors, Var(X) uses observed genotypes.
+                    // Both must be calculated on the same set of non-missing samples.
                     let mut skip_sample = false;
                     if is_genotyped {
-                        // For genotyped markers: use OBSERVED alleles with probability 1.0
-                        // This matches Java's setToObsAlleles() behavior
                         if let Some(target_m) = alignment.target_marker(m) {
                             let target_marker_idx = MarkerIdx::new(target_m as u32);
                             let a1 = target_gt.allele(target_marker_idx, hap1_idx);
-                            let a2 = target_gt.allele(target_marker_idx, hap2_idx);
-                            
-                            // Map target alleles to reference allele space
-                            let a1_mapped = alignment.map_allele(target_m, a1);
-                            let a2_mapped = alignment.map_allele(target_m, a2);
-                            
-                            // Set probability 1.0 for observed allele (if not missing)
-                            // If missing, fall back to HMM posteriors
-                            if a1_mapped != 255 && (a1_mapped as usize) < n_alleles {
-                                probs1[a1_mapped as usize] = 1.0;
-                            } else {
+                            let a2 = if is_diploid { target_gt.allele(target_marker_idx, hap2_idx) } else { 0 };
+                            if a1 == 255 || (is_diploid && a2 == 255) {
                                 skip_sample = true;
-                                let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs1[a] = post1.prob(a); }
                             }
-
-                            if a2_mapped != 255 && (a2_mapped as usize) < n_alleles {
-                                probs2[a2_mapped as usize] = 1.0;
-                            } else {
-                                skip_sample = true;
-                                let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-                                for a in 0..n_alleles { probs2[a] = post2.prob(a); }
-                            }
-                        }
-                    } else {
-                        // For imputed markers: use HMM posteriors
-                        let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
-                        let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
-
-                        for a in 0..n_alleles {
-                            probs1[a] = post1.prob(a);
-                            probs2[a] = post2.prob(a);
                         }
                     }
 
-                    if let Some(stats) = quality.get_mut(m) {
-                        if !(is_genotyped && skip_sample) {
+                    if !skip_sample {
+                        let post1 = cursor1.allele_posteriors(m, n_alleles, get_ref_allele);
+                        for a in 0..n_alleles { probs1[a] = post1.prob(a); }
+
+                        if is_diploid {
+                            let post2 = cursor2.allele_posteriors(m, n_alleles, get_ref_allele);
+                            for a in 0..n_alleles { probs2[a] = post2.prob(a); }
+                        }
+
+                        if let Some(stats) = quality.get_mut(m) {
                             if is_diploid {
                                 stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
                             } else {
                                 stats.add_haploid(&probs1[..n_alleles]);
+                            }
+
+                            if is_genotyped {
+                                if let Some(target_m) = alignment.target_marker(m) {
+                                    let target_marker_idx = MarkerIdx::new(target_m as u32);
+                                    let a1 = target_gt.allele(target_marker_idx, hap1_idx);
+                                    let a1_mapped = alignment.map_allele(target_m, a1);
+                                    if is_diploid {
+                                        let a2 = target_gt.allele(target_marker_idx, hap2_idx);
+                                        let a2_mapped = alignment.map_allele(target_m, a2);
+                                        stats.add_observed_sample(a1_mapped, a2_mapped);
+                                    } else {
+                                        stats.add_observed_haploid(a1_mapped);
+                                    }
+                                }
                             }
                         }
                     }

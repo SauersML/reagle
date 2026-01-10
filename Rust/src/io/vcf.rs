@@ -27,12 +27,18 @@ use crate::error::{ReagleError, Result};
 /// - n = number of target haplotypes (2 * n_samples)
 #[derive(Clone, Debug, Default)]
 pub struct MarkerImputationStats {
-    /// Sum of dosages (p1 + p2) for each ALT allele
+    /// Sum of dosages (p1 + p2) for each ALT allele, from HMM posteriors
     pub sum_dosages: Vec<f32>,
-    /// Sum of squared allele probabilities (p1^2 + p2^2) for each ALT allele
+    /// Sum of squared allele probabilities (p1^2 + p2^2) for each ALT allele, from HMM posteriors
     pub sum_dosages_sq: Vec<f32>,
-    /// Number of input haplotypes processed (accounts for ploidy)
+    /// Number of input haplotypes processed for estimated dosages
     pub n_haps: usize,
+    /// Sum of observed hard-called ALT allele dosages (for genotyped markers)
+    pub sum_observed_dosages: Vec<f32>,
+    /// Sum of squared observed hard-called ALT allele dosages (for genotyped markers)
+    pub sum_observed_dosages_sq: Vec<f32>,
+    /// Number of samples with observed genotypes (non-missing)
+    pub n_observed_samples: usize,
     /// Whether this marker was imputed (not in target genotypes)
     pub is_imputed: bool,
 }
@@ -44,11 +50,14 @@ impl MarkerImputationStats {
             sum_dosages: vec![0.0; n_alleles],
             sum_dosages_sq: vec![0.0; n_alleles],
             n_haps: 0,
+            sum_observed_dosages: vec![0.0; n_alleles],
+            sum_observed_dosages_sq: vec![0.0; n_alleles],
+            n_observed_samples: 0,
             is_imputed: false,
         }
     }
 
-    /// Add dosage contribution from a diploid sample
+    /// Add estimated dosage contribution from a diploid sample using HMM posteriors
     ///
     /// # Arguments
     /// * `probs1` - Allele probabilities for haplotype 1 (length = n_alleles)
@@ -58,7 +67,7 @@ impl MarkerImputationStats {
         for a in 1..self.sum_dosages.len() {
             let p1 = probs1.get(a).copied().unwrap_or(0.0);
             let p2 = probs2.get(a).copied().unwrap_or(0.0);
-            
+
             let dose = p1 + p2;
             let dose_sq = p1 * p1 + p2 * p2;
 
@@ -67,7 +76,7 @@ impl MarkerImputationStats {
         }
     }
 
-    /// Add dosage contribution from a haploid sample
+    /// Add estimated dosage contribution from a haploid sample using HMM posteriors
     pub fn add_haploid(&mut self, probs: &[f32]) {
         self.n_haps += 1;
         for a in 1..self.sum_dosages.len() {
@@ -77,20 +86,62 @@ impl MarkerImputationStats {
         }
     }
 
+    /// Add observed dosage from a hard-called diploid sample (for genotyped markers)
+    pub fn add_observed_sample(&mut self, a1: u8, a2: u8) {
+        self.n_observed_samples += 1;
+        for k in 1..self.sum_dosages.len() {
+            let allele_k = k as u8;
+            let dose = (if a1 == allele_k { 1.0 } else { 0.0 })
+                     + (if a2 == allele_k { 1.0 } else { 0.0 });
+            self.sum_observed_dosages[k] += dose;
+            self.sum_observed_dosages_sq[k] += dose * dose;
+        }
+    }
+
+    /// Add observed dosage from a hard-called haploid sample (for genotyped markers)
+    pub fn add_observed_haploid(&mut self, a1: u8) {
+        self.n_observed_samples += 1; // Still count as one sample
+        for k in 1..self.sum_dosages.len() {
+            let allele_k = k as u8;
+            let dose = if a1 == allele_k { 1.0 } else { 0.0 };
+            self.sum_observed_dosages[k] += dose;
+            self.sum_observed_dosages_sq[k] += dose * dose;
+        }
+    }
+
     /// Calculate DR2 (dosage R-squared) for the specified ALT allele
     ///
     /// Matches Java Beagle ImputedRecBuilder.r2.
+    /// DR2 = Var(d) / Var(X)
+    ///   Var(d) = Variance of estimated dosages (from HMM posteriors)
+    ///   Var(X) = Variance of true allele count (from observed genotypes if available,
+    ///            otherwise estimated from HMM posteriors).
     pub fn dr2(&self, allele: usize) -> f32 {
         if allele == 0 || allele >= self.sum_dosages.len() || self.n_haps == 0 {
             return 0.0;
         }
 
-        let n = self.n_haps as f32;
-        let sum = self.sum_dosages[allele];
-        let sum2 = self.sum_dosages_sq[allele];
-        let mean_term = sum * sum / n;
-        let num = sum2 - mean_term;
-        let den = sum - mean_term;
+        // Numerator: Var(d) * n_samples, calculated from HMM posteriors
+        // The BEAGLE formula is sum(p_i^2) - (sum(p_i))^2/n, where n is n_haps
+        // This is not a standard variance formula but is what Beagle uses.
+        let n_haps_f = self.n_haps as f32;
+        let sum_est_d = self.sum_dosages[allele];
+        let sum_est_d_sq_prob = self.sum_dosages_sq[allele]; // sum(p1^2 + p2^2)
+        let num = sum_est_d_sq_prob - (sum_est_d * sum_est_d / n_haps_f);
+
+        // Denominator: Var(X) * n_samples, using observed genotypes if available
+        let den = if !self.is_imputed && self.n_observed_samples > 0 {
+            // For genotyped markers, calculate Var(X) from hard calls
+            let n_obs_f = self.n_observed_samples as f32;
+            let sum_obs_d = self.sum_observed_dosages[allele];
+            let sum_obs_d_sq = self.sum_observed_dosages_sq[allele];
+            sum_obs_d_sq - (sum_obs_d * sum_obs_d / n_obs_f)
+        } else {
+            // For imputed markers, estimate Var(X) from HMM posteriors
+            // The BEAGLE formula assumes X is Bernoulli(p), so Var(X)=p(1-p).
+            // n*Var(X) is estimated as sum(d) - sum(d)^2/n
+            sum_est_d - (sum_est_d * sum_est_d / n_haps_f)
+        };
 
         if num <= 0.0 || den <= 0.0 {
             0.0

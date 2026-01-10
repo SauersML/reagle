@@ -49,6 +49,10 @@ impl ThreadedHaps {
     }
 
     /// Clear all states (keeps capacity)
+    pub fn set_n_markers(&mut self, n_markers: usize) {
+        self.n_markers = n_markers;
+    }
+
     pub fn clear(&mut self) {
         self.segments_hap.clear();
         self.segments_end.clear();
