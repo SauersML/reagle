@@ -850,7 +850,7 @@ impl PhasingPipeline {
             }
             alleles_by_marker.push(alleles);
         }
-        BidirectionalPhaseIbs::build(&alleles_by_marker, n_haps, n_markers)
+        BidirectionalPhaseIbs::build(alleles_by_marker, n_haps, n_markers)
     }
 
     /// Build bidirectional PBWT for a subset of markers (e.g., high-frequency only)
@@ -872,7 +872,7 @@ impl PhasingPipeline {
         }
 
         BidirectionalPhaseIbs::build_for_subset(
-            &alleles_by_marker,
+            alleles_by_marker,
             n_haps,
             n_subset,
             marker_indices,
@@ -897,7 +897,7 @@ impl PhasingPipeline {
             }
             alleles_by_marker.push(alleles);
         }
-        BidirectionalPhaseIbs::build(&alleles_by_marker, n_total_haps, n_markers)
+        BidirectionalPhaseIbs::build(alleles_by_marker, n_total_haps, n_markers)
     }
 
     /// Build bidirectional PBWT for combined haplotype space on a marker subset
@@ -922,7 +922,7 @@ impl PhasingPipeline {
         }
 
         BidirectionalPhaseIbs::build_for_subset(
-            &alleles_by_marker,
+            alleles_by_marker,
             n_total_haps,
             n_subset,
             marker_indices,
@@ -1007,11 +1007,12 @@ impl PhasingPipeline {
             // This iterates through all markers and builds mosaic haplotypes
             // that provide local IBS matches everywhere, not just at midpoint.
             let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
+            let n_candidates = self.params.n_states.min(n_total_haps).max(20);
             let threaded_haps = phase_states.build_composite_haps(
                 s as u32,
                 &phase_ibs,
                 ibs2,
-                20, // n_candidates per marker
+                n_candidates,
             );
             let n_states = phase_states.n_states();
 

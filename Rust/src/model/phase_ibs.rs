@@ -73,7 +73,7 @@ impl BidirectionalPhaseIbs {
     /// * `n_haps` - Number of haplotypes
     /// * `n_markers` - Number of markers
     pub fn build(
-        alleles: &[Vec<u8>],
+        mut alleles: Vec<Vec<u8>>,
         n_haps: usize,
         n_markers: usize,
     ) -> Self {
@@ -81,6 +81,7 @@ impl BidirectionalPhaseIbs {
         let mut fwd_ppa = Vec::with_capacity(n_markers);
         let mut bwd_div = vec![Vec::new(); n_markers];
         let mut bwd_ppa = vec![Vec::new(); n_markers];
+        let mut n_alleles_by_marker = vec![2usize; n_markers];
 
         let mut updater = PbwtDivUpdater::new(n_haps);
 
@@ -88,7 +89,9 @@ impl BidirectionalPhaseIbs {
         let mut div: Vec<i32> = vec![0; n_haps + 1];
 
         for m in 0..n_markers {
-            updater.fwd_update(&alleles[m], 2, m, &mut ppa, &mut div);
+            let n_alleles = normalize_pbwt_alleles(&mut alleles[m]);
+            n_alleles_by_marker[m] = n_alleles;
+            updater.fwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
             fwd_ppa.push(ppa.clone());
             fwd_div.push(div[..n_haps].to_vec());
         }
@@ -97,7 +100,8 @@ impl BidirectionalPhaseIbs {
         div = vec![n_markers as i32; n_haps + 1];
 
         for m in (0..n_markers).rev() {
-            updater.bwd_update(&alleles[m], 2, m, &mut ppa, &mut div);
+            let n_alleles = n_alleles_by_marker[m];
+            updater.bwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
             bwd_ppa[m] = ppa.clone();
             bwd_div[m] = div[..n_haps].to_vec();
         }
@@ -130,7 +134,7 @@ impl BidirectionalPhaseIbs {
     /// establish initial phase. The subset indices (0, 1, 2, ...) map to
     /// non-contiguous global indices (e.g., 0, 5, 12, ...).
     pub fn build_for_subset(
-        alleles: &[Vec<u8>],
+        alleles: Vec<Vec<u8>>,
         n_haps: usize,
         n_markers: usize,
         subset_to_global: &[usize],
@@ -264,6 +268,23 @@ impl BidirectionalPhaseIbs {
             v += 1;
         }
 
+        // Fallback: if strict PBWT matching yields too few neighbors,
+        // expand outward without divergence constraints to fill the pool.
+        while result.len() < n_candidates && u > 0 {
+            u -= 1;
+            let h = ppa[u];
+            if h != hap_idx {
+                result.push(h);
+            }
+        }
+        while result.len() < n_candidates && v < self.n_haps {
+            let h = ppa[v];
+            if h != hap_idx {
+                result.push(h);
+            }
+            v += 1;
+        }
+
         result
     }
 
@@ -314,6 +335,22 @@ impl BidirectionalPhaseIbs {
             v += 1;
         }
 
+        // Fallback: widen search without divergence constraints if needed.
+        while result.len() < n_candidates && u > 0 {
+            u -= 1;
+            let h = ppa[u];
+            if h != hap_idx {
+                result.push(h);
+            }
+        }
+        while result.len() < n_candidates && v < self.n_haps {
+            let h = ppa[v];
+            if h != hap_idx {
+                result.push(h);
+            }
+            v += 1;
+        }
+
         result
     }
 
@@ -321,4 +358,21 @@ impl BidirectionalPhaseIbs {
     pub fn n_haps(&self) -> usize {
         self.n_haps
     }
+}
+
+fn normalize_pbwt_alleles(alleles: &mut [u8]) -> usize {
+    let mut max_allele = 1u8;
+    for &a in alleles.iter() {
+        if a != 255 && a > max_allele {
+            max_allele = a;
+        }
+    }
+    let n_alleles = (max_allele as usize + 1).max(2);
+    let missing_u8 = n_alleles as u8;
+    for a in alleles.iter_mut() {
+        if *a == 255 {
+            *a = missing_u8;
+        }
+    }
+    n_alleles + 1
 }
