@@ -134,30 +134,65 @@ impl PbwtDivUpdater {
         // 4. Scatter to scratch buffers with p propagation (Counting Sort Phase 3)
         // This single pass matches Java's loop exactly:
         //   propagate p -> store -> reset p[allele]
-        for i in 0..self.n_haps {
-            let hap = prefix[i];
-            let div = divergence[i];
-            let allele = alleles[hap as usize] as usize;
-            let allele = if allele >= n_alleles { 0 } else { allele };
+        if n_alleles == 2 {
+            // Optimized biallelic path - unrolled inner loop
+            let mut p0 = init_value;
+            let mut p1 = init_value;
+            let base0 = self.offsets[0];
+            let base1 = self.offsets[1];
+            let mut count0 = 0usize;
+            let mut count1 = 0usize;
 
-            // Update p (Max Divergence Propagation) for ALL alleles
-            for j in 0..n_alleles {
-                if div > self.p[j] {
-                    self.p[j] = div;
+            for i in 0..self.n_haps {
+                let hap = prefix[i];
+                let div = divergence[i];
+                let allele = alleles[hap as usize];
+
+                // Propagate max to both alleles
+                if div > p0 { p0 = div; }
+                if div > p1 { p1 = div; }
+
+                if allele == 0 {
+                    let pos = base0 + count0;
+                    self.scratch_a[pos] = hap;
+                    self.scratch_d[pos] = p0;
+                    p0 = i32::MIN;
+                    count0 += 1;
+                } else {
+                    let pos = base1 + count1;
+                    self.scratch_a[pos] = hap;
+                    self.scratch_d[pos] = p1;
+                    p1 = i32::MIN;
+                    count1 += 1;
                 }
             }
+        } else {
+            // General multiallelic path
+            for i in 0..self.n_haps {
+                let hap = prefix[i];
+                let div = divergence[i];
+                let allele = alleles[hap as usize] as usize;
+                let allele = if allele >= n_alleles { 0 } else { allele };
 
-            let base = self.offsets[allele];
-            let offset = self.counts[allele];
-            let pos = base + offset;
+                // Update p (Max Divergence Propagation) for ALL alleles
+                for j in 0..n_alleles {
+                    if div > self.p[j] {
+                        self.p[j] = div;
+                    }
+                }
 
-            self.scratch_a[pos] = hap;
-            self.scratch_d[pos] = self.p[allele];
+                let base = self.offsets[allele];
+                let offset = self.counts[allele];
+                let pos = base + offset;
 
-            // Reset p for this allele after output
-            self.p[allele] = i32::MIN;
+                self.scratch_a[pos] = hap;
+                self.scratch_d[pos] = self.p[allele];
 
-            self.counts[allele] += 1;
+                // Reset p for this allele after output
+                self.p[allele] = i32::MIN;
+
+                self.counts[allele] += 1;
+            }
         }
 
         // 5. Copy back
@@ -220,31 +255,66 @@ impl PbwtDivUpdater {
         self.counts[..n_alleles].fill(0);
         self.p[..n_alleles].fill(init_value);
 
-        for i in 0..self.n_haps {
-            let hap = prefix[i];
-            let div = divergence[i];
-            let allele = alleles[hap as usize] as usize;
-            let allele = if allele >= n_alleles { 0 } else { allele };
+        if n_alleles == 2 {
+            // Optimized biallelic path - unrolled inner loop
+            let mut p0 = init_value;
+            let mut p1 = init_value;
+            let base0 = self.offsets[0];
+            let base1 = self.offsets[1];
+            let mut count0 = 0usize;
+            let mut count1 = 0usize;
 
-            // Update p: min(p, div) for backward PBWT
-            // Smaller divergence = earlier end point = shorter match
-            // We propagate the minimum to find the "worst case" match length
-            for j in 0..n_alleles {
-                if div < self.p[j] {
-                    self.p[j] = div;
+            for i in 0..self.n_haps {
+                let hap = prefix[i];
+                let div = divergence[i];
+                let allele = alleles[hap as usize];
+
+                // Propagate min to both alleles (backward PBWT)
+                if div < p0 { p0 = div; }
+                if div < p1 { p1 = div; }
+
+                if allele == 0 {
+                    let pos = base0 + count0;
+                    self.scratch_a[pos] = hap;
+                    self.scratch_d[pos] = p0;
+                    p0 = i32::MAX;
+                    count0 += 1;
+                } else {
+                    let pos = base1 + count1;
+                    self.scratch_a[pos] = hap;
+                    self.scratch_d[pos] = p1;
+                    p1 = i32::MAX;
+                    count1 += 1;
                 }
             }
+        } else {
+            // General multiallelic path
+            for i in 0..self.n_haps {
+                let hap = prefix[i];
+                let div = divergence[i];
+                let allele = alleles[hap as usize] as usize;
+                let allele = if allele >= n_alleles { 0 } else { allele };
 
-            let base = self.offsets[allele];
-            let offset = self.counts[allele];
-            let pos = base + offset;
+                // Update p: min(p, div) for backward PBWT
+                // Smaller divergence = earlier end point = shorter match
+                // We propagate the minimum to find the "worst case" match length
+                for j in 0..n_alleles {
+                    if div < self.p[j] {
+                        self.p[j] = div;
+                    }
+                }
 
-            self.scratch_a[pos] = hap;
-            self.scratch_d[pos] = self.p[allele];
+                let base = self.offsets[allele];
+                let offset = self.counts[allele];
+                let pos = base + offset;
 
-            // Reset to MAX so next haplotype takes its own divergence
-            self.p[allele] = i32::MAX;
-            self.counts[allele] += 1;
+                self.scratch_a[pos] = hap;
+                self.scratch_d[pos] = self.p[allele];
+
+                // Reset to MAX so next haplotype takes its own divergence
+                self.p[allele] = i32::MAX;
+                self.counts[allele] += 1;
+            }
         }
 
         // 5. Copy back

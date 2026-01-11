@@ -3,7 +3,6 @@ use reagle::pipelines::imputation::ImputationPipeline;
 use reagle::pipelines::phasing::PhasingPipeline;
 use std::io::Write;
 use tempfile::NamedTempFile;
-use std::path::PathBuf;
 use std::fs::File;
 use ::noodles::bgzf::io as bgzf_io;
 use ::noodles::vcf as noodles_vcf;
