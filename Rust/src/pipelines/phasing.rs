@@ -51,38 +51,66 @@ pub struct PhasingPipeline {
 
 const MOSAIC_BLOCK_SIZE: usize = 128;  // Smaller = less memory per sample
 
-struct RefAlleleLookup<'a> {
-    state_haps: &'a [Vec<u32>],
-    n_target_haps: usize,
-    ref_geno: &'a MutableGenotypes,
-    reference_gt: Option<&'a GenotypeMatrix<Phased>>,
-    alignment: Option<&'a MarkerAlignment>,
-    marker_map: Option<&'a [usize]>,
+/// Pre-computed allele lookup for HMM states.
+///
+/// Stores alleles as a flat Vec<u8> with layout [marker0_state0, marker0_state1, ..., marker1_state0, ...]
+/// This eliminates per-lookup overhead from alignment mapping and reference genotype access.
+struct RefAlleleLookup {
+    /// Pre-computed alleles: alleles[m * n_states + k] = allele for state k at marker m
+    alleles: Vec<u8>,
+    /// Number of HMM states
+    n_states: usize,
 }
 
-impl<'a> RefAlleleLookup<'a> {
-    fn orig_marker(&self, m: usize) -> usize {
-        self.marker_map.map(|map| map[m]).unwrap_or(m)
-    }
+impl RefAlleleLookup {
+    /// Create a new lookup by pre-computing all alleles upfront
+    fn new(
+        state_haps: &[Vec<u32>],
+        n_markers: usize,
+        n_states: usize,
+        n_target_haps: usize,
+        ref_geno: &MutableGenotypes,
+        reference_gt: Option<&GenotypeMatrix<Phased>>,
+        alignment: Option<&MarkerAlignment>,
+        marker_map: Option<&[usize]>,
+    ) -> Self {
+        let mut alleles = vec![0u8; n_markers * n_states];
 
-    fn allele(&self, m: usize, state: usize) -> u8 {
-        let orig_m = self.orig_marker(m);
-        let hap = self.state_haps[m][state] as usize;
-        if hap < self.n_target_haps {
-            self.ref_geno.get(orig_m, HapIdx::new(hap as u32))
-        } else {
-            let ref_h = (hap - self.n_target_haps) as u32;
-            if let (Some(ref_gt), Some(align)) = (self.reference_gt, self.alignment) {
-                if let Some(ref_m) = align.target_to_ref(orig_m) {
-                    let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
-                    align.reverse_map_allele(orig_m, ref_allele)
+        for m in 0..n_markers {
+            let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
+            let base = m * n_states;
+
+            for k in 0..n_states {
+                let hap = state_haps[m][k] as usize;
+                let allele = if hap < n_target_haps {
+                    ref_geno.get(orig_m, HapIdx::new(hap as u32))
                 } else {
-                    255
-                }
-            } else {
-                255
+                    let ref_h = (hap - n_target_haps) as u32;
+                    if let (Some(ref_gt), Some(align)) = (reference_gt, alignment) {
+                        if let Some(ref_m) = align.target_to_ref(orig_m) {
+                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
+                            align.reverse_map_allele(orig_m, ref_allele)
+                        } else {
+                            255
+                        }
+                    } else {
+                        255
+                    }
+                };
+                alleles[base + k] = allele;
             }
         }
+
+        Self {
+            alleles,
+            n_states,
+        }
+    }
+
+    #[inline(always)]
+    fn allele(&self, m: usize, state: usize) -> u8 {
+        // Direct array access - no branching, no indirection
+        self.alleles[m * self.n_states + state]
     }
 }
 
@@ -137,7 +165,7 @@ struct MosaicChain<'a> {
     seq1: &'a [u8],
     seq2: &'a [u8],
     conf: &'a [f32],
-    lookup: &'a RefAlleleLookup<'a>,
+    lookup: &'a RefAlleleLookup,
     combined_checkpoints: Arc<FwdCheckpoints>,
     hap2_checkpoints: FwdCheckpoints,
     hap2_allele: Vec<u8>,
@@ -159,7 +187,7 @@ impl<'a> MosaicChain<'a> {
         seq1: &'a [u8],
         seq2: &'a [u8],
         conf: &'a [f32],
-        lookup: &'a RefAlleleLookup<'a>,
+        lookup: &'a RefAlleleLookup,
         combined_checkpoints: Arc<FwdCheckpoints>,
         p_no_err: f32,
         p_err: f32,
@@ -1392,14 +1420,16 @@ impl PhasingPipeline {
                 state_haps
             };
 
-            let lookup = RefAlleleLookup {
-                state_haps: &state_haps,
-                n_target_haps: n_haps,
-                ref_geno: &ref_geno,
-                reference_gt: self.reference_gt.as_deref(),
-                alignment: self.alignment.as_ref(),
-                marker_map: None,
-            };
+            let lookup = RefAlleleLookup::new(
+                &state_haps,
+                n_markers,
+                n_states,
+                n_haps,
+                &ref_geno,
+                self.reference_gt.as_deref(),
+                self.alignment.as_ref(),
+                None,
+            );
 
             let (swap_bits, swap_lr) = sample_swap_bits_mosaic(
                 n_markers,
@@ -1590,14 +1620,16 @@ impl PhasingPipeline {
                     state_haps
                 };
 
-                let lookup = RefAlleleLookup {
-                    state_haps: &state_haps,
-                    n_target_haps: n_haps,
-                    ref_geno: &ref_geno,
-                    reference_gt: self.reference_gt.as_deref(),
-                    alignment: self.alignment.as_ref(),
-                    marker_map: None,
-                };
+                let lookup = RefAlleleLookup::new(
+                    &state_haps,
+                    n_markers,
+                    n_states,
+                    n_haps,
+                    &ref_geno,
+                    self.reference_gt.as_deref(),
+                    self.alignment.as_ref(),
+                    None,
+                );
 
                 let (swap_bits, swap_lr) = sample_swap_bits_mosaic(
                     n_markers,
@@ -1805,14 +1837,16 @@ impl PhasingPipeline {
                     state_haps
                 };
 
-                let lookup = RefAlleleLookup {
-                    state_haps: &state_haps,
-                    n_target_haps: n_haps,
-                    ref_geno: &ref_geno,
-                    reference_gt: self.reference_gt.as_deref(),
-                    alignment: self.alignment.as_ref(),
-                    marker_map: Some(hi_freq_to_orig),
-                };
+                let lookup = RefAlleleLookup::new(
+                    &state_haps,
+                    n_hi_freq,
+                    n_states,
+                    n_haps,
+                    &ref_geno,
+                    self.reference_gt.as_deref(),
+                    self.alignment.as_ref(),
+                    Some(hi_freq_to_orig),
+                );
 
                 let (swap_bits, swap_lr) = sample_swap_bits_mosaic(
                     n_hi_freq,
@@ -2470,7 +2504,7 @@ fn build_fwd_checkpoints(
     conf: &[f32],
     hap2_allele: &[u8],
     hap2_use_combined: &[bool],
-    lookup: &RefAlleleLookup<'_>,
+    lookup: &RefAlleleLookup,
     p_no_err: f32,
     p_err: f32,
     mode: EmissionMode,
@@ -2633,7 +2667,7 @@ fn sample_path_from_checkpoints(
     conf: &[f32],
     hap2_allele: &[u8],
     hap2_use_combined: &[bool],
-    lookup: &RefAlleleLookup<'_>,
+    lookup: &RefAlleleLookup,
     p_no_err: f32,
     p_err: f32,
     rng: &mut rand::rngs::SmallRng,
@@ -2822,7 +2856,7 @@ fn sample_swap_bits_mosaic(
     seq1: &[u8],
     seq2: &[u8],
     conf: &[f32],
-    lookup: &RefAlleleLookup<'_>,
+    lookup: &RefAlleleLookup,
     het_positions: &[usize],
     seed: u64,
     burnin: usize,
