@@ -3632,12 +3632,11 @@ fn test_single_mismatch_not_catastrophic() {
     let n_markers = 10;
     let n_states = 2;
 
-    // State 0: matches all markers (0 mismatches)
-    // State 1: mismatches at marker 5 only (1 mismatch)
-    let mismatches: Vec<Vec<f32>> = (0..n_markers)
-        .map(|m| vec![0.0f32, if m == 5 { 1.0f32 } else { 0.0f32 }])
+    // State 0: matches all markers
+    // State 1: mismatches at marker 5 only
+    let cluster_matches: Vec<Vec<bool>> = (0..n_markers)
+        .map(|m| vec![true, m != 5]) // State 0 always matches, State 1 mismatches at m=5
         .collect();
-    let non_missing: Vec<Vec<f32>> = vec![vec![1.0f32, 1.0f32]; n_markers];
 
     let p_recomb: Vec<f32> = (0..n_markers)
         .map(|m| if m == 0 { 0.0 } else { 0.001 })
@@ -3649,8 +3648,7 @@ fn test_single_mismatch_not_catastrophic() {
     let mut workspace = ImpWorkspace::with_ref_size(n_states);
 
     let posteriors = reagle::pipelines::imputation::run_hmm_forward_backward_clusters_counts(
-        &mismatches,
-        &non_missing,
+        &cluster_matches,
         &p_recomb,
         base_err_rate,
         n_states,
