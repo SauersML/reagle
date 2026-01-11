@@ -897,6 +897,17 @@ impl AllelePosteriors {
         }
     }
 
+    /// Get the expected allele dosage (E[X] = sum(i * P(i)))
+    #[inline]
+    #[cfg(test)]
+    pub fn dosage(&self) -> f32 {
+        match self {
+            AllelePosteriors::Biallelic(p_alt) => *p_alt,
+            AllelePosteriors::Multiallelic(probs) => {
+                probs.iter().enumerate().map(|(i, &p)| i as f32 * p).sum()
+            }
+        }
+    }
 }
 
 /// Cursor for efficient sequential marker access to StateProbs.
