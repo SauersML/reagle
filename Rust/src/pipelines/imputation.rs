@@ -830,43 +830,68 @@ impl StateProbs {
             // (matches Java: both prob and prob_p1 contribute to current haplotype's allele)
             let mut p_alt = 0.0f32;
             let mut p_ref = 0.0f32;
-            for (j, &hap) in haps.iter().enumerate() {
+            for j in 0..haps.len() {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
 
-                let interp_prob = if is_between_clusters {
-                    let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    weight_left * prob + (1.0 - weight_left) * prob_p1
+                let prob_p1 = if is_between_clusters {
+                    probs_p1.get(j).copied().unwrap_or(0.0)
                 } else {
                     prob
                 };
 
+                let hap = haps[j];
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele == 1 {
-                    p_alt += interp_prob;
+                    p_alt += weight_left * prob;
                 } else if allele == 0 {
-                    p_ref += interp_prob;
+                    p_ref += weight_left * prob;
+                }
+
+                if let Some(haps_p1) = haps_p1 {
+                    let hap_p1 = haps_p1.get(j).copied().unwrap_or(hap);
+                    let allele_p1 = get_ref_allele(ref_marker, hap_p1);
+                    if allele_p1 == 1 {
+                        p_alt += (1.0 - weight_left) * prob_p1;
+                    } else if allele_p1 == 0 {
+                        p_ref += (1.0 - weight_left) * prob_p1;
+                    }
+                } else {
+                     if allele == 1 {
+                        p_alt += (1.0 - weight_left) * prob_p1;
+                    } else if allele == 0 {
+                        p_ref += (1.0 - weight_left) * prob_p1;
+                    }
                 }
             }
-
             let total = p_ref + p_alt;
             let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
             AllelePosteriors::Biallelic(p_alt)
         } else {
             // Interpolate state probability, anchor to LEFT haplotype's allele
             let mut al_probs = vec![0.0f32; n_alleles];
-            for (j, &hap) in haps.iter().enumerate() {
+            for j in 0..haps.len() {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
 
-                let interp_prob = if is_between_clusters {
-                    let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    weight_left * prob + (1.0 - weight_left) * prob_p1
+                let prob_p1 = if is_between_clusters {
+                    probs_p1.get(j).copied().unwrap_or(0.0)
                 } else {
                     prob
                 };
 
+                let hap = haps[j];
                 let allele = get_ref_allele(ref_marker, hap);
                 if allele != 255 && (allele as usize) < n_alleles {
-                    al_probs[allele as usize] += interp_prob;
+                    al_probs[allele as usize] += weight_left * prob;
+                }
+
+                if let Some(haps_p1) = haps_p1 {
+                    let hap_p1 = haps_p1.get(j).copied().unwrap_or(hap);
+                    let allele_p1 = get_ref_allele(ref_marker, hap_p1);
+                    if allele_p1 != 255 && (allele_p1 as usize) < n_alleles {
+                        al_probs[allele_p1 as usize] += (1.0 - weight_left) * prob_p1;
+                    }
+                } else if allele != 255 && (allele as usize) < n_alleles {
+                    al_probs[allele as usize] += (1.0 - weight_left) * prob_p1;
                 }
             }
 
