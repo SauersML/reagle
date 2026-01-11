@@ -109,11 +109,14 @@ impl MarkerImputationStats {
         }
 
         let n = self.n_samples as f32;
-        let var_d = self.sum_d_sq[allele] - (self.sum_d[allele] * self.sum_d[allele] / n);
+        // Variance = E[X²] - E[X]² = (Σx²/n) - (Σx/n)²
+        // Previous bug: calculated SSD (N*Var) instead of Var by not dividing by n
+        let mean_d = self.sum_d[allele] / n;
+        let var_d = (self.sum_d_sq[allele] / n) - (mean_d * mean_d);
 
         // Use expected variance under HWE: 2*p*(1-p) where p is allele frequency
         // AF = mean_dosage / 2 = (sum_d / n) / 2
-        let p = (self.sum_d[allele] / n) / 2.0;
+        let p = mean_d / 2.0;
         let var_expected = 2.0 * p * (1.0 - p);
 
         if var_d <= 0.0 || var_expected <= 0.0 {
