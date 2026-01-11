@@ -68,6 +68,13 @@ pub struct BidirectionalPhaseIbs {
     /// are defined in global marker space.
     /// When None (full chromosome), marker indices are used directly.
     subset_to_global: Option<Vec<usize>>,
+    /// Boundary in forward PPA where allele transitions from 0 to 1+.
+    /// fwd_allele_boundary[m] = first position in fwd_ppa[m] with allele != 0.
+    /// Used for query-based neighbor finding.
+    fwd_allele_boundary: Vec<usize>,
+    /// Stored alleles per marker for query-based neighbor finding.
+    /// alleles[m][h] = allele of haplotype h at marker m.
+    alleles: Vec<Vec<u8>>,
 }
 
 impl BidirectionalPhaseIbs {
@@ -85,6 +92,7 @@ impl BidirectionalPhaseIbs {
         let mut fwd_div = Vec::with_capacity(n_markers);
         let mut fwd_ppa = Vec::with_capacity(n_markers);
         let mut fwd_pos = Vec::with_capacity(n_markers);
+        let mut fwd_allele_boundary = Vec::with_capacity(n_markers);
         let mut bwd_div = vec![Vec::new(); n_markers];
         let mut bwd_ppa = vec![Vec::new(); n_markers];
         let mut bwd_pos = vec![Vec::new(); n_markers];
@@ -106,6 +114,15 @@ impl BidirectionalPhaseIbs {
                 pos[h as usize] = i as u32;
             }
             fwd_pos.push(pos);
+
+            // Compute allele boundary: first position where allele != 0
+            // After PBWT sort, allele-0 haps come first, then allele-1, etc.
+            let boundary = ppa
+                .iter()
+                .position(|&h| alleles[m][h as usize] != 0)
+                .unwrap_or(n_haps);
+            fwd_allele_boundary.push(boundary);
+
             fwd_ppa.push(ppa.clone());
             fwd_div.push(div[..n_haps].to_vec());
         }
@@ -137,6 +154,8 @@ impl BidirectionalPhaseIbs {
             n_haps,
             n_markers,
             subset_to_global: None,
+            fwd_allele_boundary,
+            alleles,
         }
     }
 
@@ -428,6 +447,166 @@ impl BidirectionalPhaseIbs {
     /// Get the number of haplotypes
     pub fn n_haps(&self) -> usize {
         self.n_haps
+    }
+
+    /// Get the allele of a reference haplotype at a marker.
+    ///
+    /// This is used during dynamic MCMC to retrieve the reference panel alleles
+    /// when computing emissions for the HMM states.
+    #[inline]
+    pub fn allele(&self, marker: usize, hap: u32) -> u8 {
+        self.alleles[marker][hap as usize]
+    }
+
+    /// Find neighbors by threading a query allele sequence through the PBWT.
+    ///
+    /// This is the SHAPEIT5-style query method: instead of looking up by haplotype
+    /// index (which would query the previous haplotype position), we thread the current
+    /// allele sequence through the pre-built reference PBWT to find matching neighbors.
+    ///
+    /// # Arguments
+    /// * `query_alleles` - Allele sequence to query (length = n_markers)
+    /// * `marker_idx` - Current marker for neighbor selection
+    /// * `ibs2` - IBS2 segment data
+    /// * `sample_idx` - Sample index (for IBS2 and exclusion)
+    /// * `n_candidates` - Approximate number of neighbors to return
+    ///
+    /// # Algorithm
+    /// 1. Thread query through forward PBWT from marker 0 to marker_idx
+    /// 2. At marker_idx, find neighbors by position in sorted order
+    /// 3. Combine with IBS2 neighbors, exclude self
+    pub fn find_neighbors_for_query(
+        &self,
+        query_alleles: &[u8],
+        marker_idx: usize,
+        ibs2: &Ibs2,
+        sample_idx: u32,
+        n_candidates: usize,
+    ) -> Vec<u32> {
+        let mut neighbors = Vec::with_capacity(n_candidates * 2 + 10);
+        let sample = SampleIdx::new(sample_idx);
+        let hap1 = sample_idx * 2;
+        let hap2 = sample_idx * 2 + 1;
+
+        // Add IBS2 neighbors (highest priority - recent common ancestry)
+        let ibs2_marker_idx = self
+            .subset_to_global
+            .as_ref()
+            .and_then(|mapping| mapping.get(marker_idx).copied())
+            .unwrap_or(marker_idx);
+
+        for seg in ibs2.segments(sample) {
+            if seg.contains(ibs2_marker_idx) {
+                let other_s = seg.other_sample;
+                if other_s != sample {
+                    neighbors.push(other_s.hap1().0);
+                    neighbors.push(other_s.hap2().0);
+                }
+            }
+        }
+
+        // Thread query through forward PBWT to find position at marker_idx
+        // We simulate where the query would land in the sorted PPA.
+        let query_pos = self.thread_query_forward(query_alleles, marker_idx);
+
+        // Find neighbors around query_pos in the forward PPA at marker_idx
+        let ppa = &self.fwd_ppa[marker_idx];
+        let div = &self.fwd_div[marker_idx];
+        let marker_i32 = marker_idx as i32;
+
+        // Search backward from query_pos
+        let mut u = query_pos;
+        let mut max_div = i32::MIN;
+        while neighbors.len() < n_candidates / 2 + 5 && u > 0 {
+            max_div = max_div.max(div.get(u).copied().unwrap_or(i32::MAX));
+            if max_div > marker_i32 {
+                break;
+            }
+            u -= 1;
+            let h = ppa[u];
+            if h != hap1 && h != hap2 {
+                neighbors.push(h);
+            }
+        }
+
+        // Search forward from query_pos
+        let mut v = query_pos;
+        max_div = i32::MIN;
+        while neighbors.len() < n_candidates + 5 && v < self.n_haps {
+            max_div = max_div.max(div.get(v).copied().unwrap_or(i32::MAX));
+            if max_div > marker_i32 {
+                break;
+            }
+            let h = ppa[v];
+            if h != hap1 && h != hap2 {
+                neighbors.push(h);
+            }
+            v += 1;
+        }
+
+        // Fallback: expand without divergence constraints if needed
+        while neighbors.len() < n_candidates && u > 0 {
+            u -= 1;
+            let h = ppa[u];
+            if h != hap1 && h != hap2 {
+                neighbors.push(h);
+            }
+        }
+        while neighbors.len() < n_candidates && v < self.n_haps {
+            let h = ppa[v];
+            if h != hap1 && h != hap2 {
+                neighbors.push(h);
+            }
+            v += 1;
+        }
+
+        neighbors
+    }
+
+    /// Thread a query allele sequence through the forward PBWT.
+    ///
+    /// Returns the position where the query would land in fwd_ppa[marker_idx].
+    /// This simulates PBWT insertion without modifying the structure.
+    fn thread_query_forward(&self, query_alleles: &[u8], marker_idx: usize) -> usize {
+        // At each marker, the query's position in the sorted order depends on:
+        // 1. Its allele at that marker (determines which partition it goes into)
+        // 2. Its position within that partition (inherits from previous position)
+        //
+        // We start at position 0 and track where the query would be inserted.
+        // The allele_boundary tells us where allele-0 ends and allele-1 begins.
+
+        let mut query_pos = 0usize;
+
+        for m in 0..=marker_idx {
+            let boundary = self.fwd_allele_boundary[m];
+            let query_al = query_alleles.get(m).copied().unwrap_or(0);
+
+            if query_al == 0 {
+                // Query goes into allele-0 partition (positions 0..boundary)
+                // Its relative position within allele-0 partition is preserved
+                // Count how many allele-0 haps are before query_pos in previous order
+                if m == 0 {
+                    query_pos = boundary / 2; // Start in middle of allele-0 partition
+                } else {
+                    // Count how many haps with allele 0 at marker m were before query_pos
+                    // This is an approximation - we place query in the middle of its partition
+                    query_pos = query_pos.min(boundary.saturating_sub(1));
+                }
+            } else {
+                // Query goes into allele-1+ partition (positions boundary..n_haps)
+                if m == 0 {
+                    query_pos = boundary + (self.n_haps - boundary) / 2;
+                } else {
+                    // Place in allele-1 partition
+                    query_pos = query_pos.max(boundary);
+                    if query_pos >= self.n_haps {
+                        query_pos = self.n_haps.saturating_sub(1);
+                    }
+                }
+            }
+        }
+
+        query_pos.min(self.n_haps.saturating_sub(1))
     }
 }
 

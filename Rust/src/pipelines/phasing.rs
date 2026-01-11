@@ -2470,6 +2470,52 @@ enum EmissionMode {
     Hap,
 }
 
+/// Compute haploid emission probability with heterozygote constraint.
+///
+/// At heterozygous sites, the target haplotype (H1) must emit the allele that,
+/// when combined with the fixed haplotype (H2), produces the observed genotype.
+/// This is the core of SHAPEIT5-style constrained Gibbs sampling.
+///
+/// # Arguments
+/// * `ref_al` - Reference haplotype allele at this marker
+/// * `geno_a1` - First allele of genotype
+/// * `geno_a2` - Second allele of genotype
+/// * `fixed_allele` - The allele of the fixed haplotype (H2), or 255 if homozygous
+/// * `conf` - Genotype confidence (0..1)
+/// * `p_no_err` - Probability of no error (e.g., 0.999)
+/// * `p_err` - Probability of error (e.g., 0.001)
+///
+/// # Returns
+/// Emission probability for this state
+#[inline]
+fn emit_haploid_constrained(
+    ref_al: u8,
+    geno_a1: u8,
+    geno_a2: u8,
+    fixed_allele: u8,
+    conf: f32,
+    p_no_err: f32,
+    p_err: f32,
+) -> f32 {
+    // At homozygous sites (fixed_allele == 255), both alleles are same
+    // so H1 must emit geno_a1
+    // At heterozygous sites, H1 must emit the allele opposite to fixed_allele
+    let required_allele = if fixed_allele == 255 {
+        geno_a1 // Homozygous: H1 must emit the homozygous allele
+    } else if fixed_allele == geno_a1 {
+        geno_a2 // H2 has a1, so H1 must have a2
+    } else {
+        geno_a1 // H2 has a2, so H1 must have a1
+    };
+
+    // Emission: does ref_al match the required allele?
+    let matches = (ref_al == required_allele) as u8 as f32;
+    let raw_emit = matches * p_no_err + (1.0 - matches) * p_err;
+
+    // Blend with uniform based on confidence
+    conf * raw_emit + (1.0 - conf) * 0.5
+}
+
 fn build_fwd_checkpoints(
     checkpoints: &mut FwdCheckpoints,
     n_markers: usize,
@@ -2961,6 +3007,7 @@ fn sample_dynamic_mcmc(
     seq2: &[u8],
     conf: &[f32],
     phase_ibs: &BidirectionalPhaseIbs,
+    ibs2: &Ibs2,
     sample_idx: u32,
     het_positions: &[usize],
     seed: u64,
@@ -3009,7 +3056,7 @@ fn sample_dynamic_mcmc(
 
         // 1. Select neighbors by threading current H1 through PBWT
         let neighbors_h1 = phase_ibs.find_neighbors_for_query(
-            &h1_alleles, n_markers / 2, sample_idx, n_states
+            &h1_alleles, n_markers / 2, ibs2, sample_idx, n_states
         );
         if neighbors_h1.is_empty() {
             continue;
@@ -3053,7 +3100,7 @@ fn sample_dynamic_mcmc(
 
         // 1. Select neighbors by threading current H2 through PBWT
         let neighbors_h2 = phase_ibs.find_neighbors_for_query(
-            &h2_alleles, n_markers / 2, sample_idx, n_states
+            &h2_alleles, n_markers / 2, ibs2, sample_idx, n_states
         );
         if neighbors_h2.is_empty() {
             continue;
