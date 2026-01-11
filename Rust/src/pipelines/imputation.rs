@@ -1889,13 +1889,8 @@ pub fn run_hmm_forward_backward_clusters_counts(
                 .unwrap_or(0.0);
             let mism = mism.min(n_obs);
             let match_count = (n_obs - mism).max(0.0);
-            // Geometric mean: treats cluster as single evidence unit while preserving
-            // granular mismatch info. More robust to genotyping errors than Java's binary.
-            let em = if n_obs > 0.0 {
-                ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
-            } else {
-                1.0
-            };
+            // BEAGLE binary emission: p_err if any mismatches, p_no_err otherwise
+            let em = if mism > 0.0 { p_err } else { p_no_err };
             let val = if m == 0 {
                 em / n_states as f32
             } else {
@@ -1926,14 +1921,8 @@ pub fn run_hmm_forward_backward_clusters_counts(
                     .and_then(|row| row.get(k))
                     .copied()
                     .unwrap_or(0.0);
-                let mism = mism.min(n_obs);
-                let match_count = (n_obs - mism).max(0.0);
-                // Geometric mean: treats cluster as single evidence unit
-                let em = if n_obs > 0.0 {
-                    ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
-                } else {
-                    1.0
-                };
+                // BEAGLE binary emission: p_err if any mismatches, p_no_err otherwise
+                let em = if mism > 0.0 { p_err } else { p_no_err };
                 bwd[k] *= em;
                 emitted_sum += bwd[k];
             }
