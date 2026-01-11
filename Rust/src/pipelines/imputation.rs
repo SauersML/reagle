@@ -1515,7 +1515,7 @@ impl ImputationPipeline {
                         n_ibs_haps,
                         n_ref_haps,
                         target_haps.len(),
-                        self.config.seed as u64,
+                        self.config.seed as u64 + s as u64, // Per-sample RNG seed for diversity
                     );
 
                     let mut workspace = ImpWorkspace::with_ref_size(n_states);
@@ -1701,7 +1701,26 @@ impl ImputationPipeline {
                     if let Some(stats) = quality.get_mut(m) {
                         if !(is_genotyped && skip_sample) {
                             if is_diploid {
-                                stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles]);
+                                // Pass true genotype for genotyped markers (for accurate DR2)
+                                let true_gt = if is_genotyped && !skip_sample {
+                                    if let Some(target_m) = alignment.target_marker(m) {
+                                        let target_marker_idx = MarkerIdx::new(target_m as u32);
+                                        let a1 = target_gt.allele(target_marker_idx, hap1_idx);
+                                        let a2 = target_gt.allele(target_marker_idx, hap2_idx);
+                                        let a1_mapped = alignment.map_allele(target_m, a1);
+                                        let a2_mapped = alignment.map_allele(target_m, a2);
+                                        if a1_mapped != 255 && a2_mapped != 255 {
+                                            Some((a1_mapped, a2_mapped))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                stats.add_sample(&probs1[..n_alleles], &probs2[..n_alleles], true_gt);
                             } else {
                                 stats.add_haploid(&probs1[..n_alleles]);
                             }
@@ -1750,20 +1769,6 @@ impl ImputationPipeline {
         let has_observed_for_dosage = std::sync::Arc::clone(&has_observed);
         let target_gt_for_dosage = Arc::clone(&target_gt);
         let get_dosage = move |m: usize, s: usize| -> f32 {
-            if has_observed_for_dosage[m] {
-                if let Some(target_m) = alignment_for_dosage.target_marker(m) {
-                    let hap1_idx = HapIdx::new((s * 2) as u32);
-                    let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-                    let a1 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap1_idx);
-                    let a2 = target_gt_for_dosage.allele(MarkerIdx::new(target_m as u32), hap2_idx);
-                    let a1_mapped = alignment_for_dosage.map_allele(target_m, a1);
-                    let a2_mapped = alignment_for_dosage.map_allele(target_m, a2);
-                    if a1_mapped != 255 && a2_mapped != 255 {
-                        return a1_mapped as f32 + a2_mapped as f32;
-                    }
-                }
-            }
-
             let n_alleles = n_alleles_for_dosage[m];
 
             // Check if genotyped in target
@@ -1942,7 +1947,12 @@ fn run_hmm_forward_backward_clusters(
                 .unwrap_or(0.0);
             let mismatch_count = mismatches[k].min(n_obs);
             let match_count = (n_obs - mismatch_count).max(0.0);
-            let emit = (match_count * log_p_no_err + mismatch_count * log_p_err).exp();
+            // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
+            let emit = if n_obs > 0.0 {
+                ((match_count * log_p_no_err + mismatch_count * log_p_err) / n_obs).exp()
+            } else {
+                1.0
+            };
 
             let val = if c == 0 {
                 emit / n_states as f32
@@ -1978,7 +1988,12 @@ fn run_hmm_forward_backward_clusters(
                     .unwrap_or(0.0);
                 let mismatch_count = mismatches[k].min(n_obs);
                 let match_count = (n_obs - mismatch_count).max(0.0);
-                let emit = (match_count * log_p_no_err + mismatch_count * log_p_err).exp();
+                // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
+                let emit = if n_obs > 0.0 {
+                    ((match_count * log_p_no_err + mismatch_count * log_p_err) / n_obs).exp()
+                } else {
+                    1.0
+                };
                 bwd[k] *= emit;
                 emitted_sum += bwd[k];
             }
@@ -2055,7 +2070,13 @@ pub fn run_hmm_forward_backward_clusters_counts(
                 .unwrap_or(0.0);
             let mism = mism.min(n_obs);
             let match_count = (n_obs - mism).max(0.0);
-            let em = (match_count * log_p_no_err + mism * log_p_err).exp();
+            // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
+            // This matches Java Beagle's cluster-level emission (not marker-level)
+            let em = if n_obs > 0.0 {
+                ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
+            } else {
+                1.0
+            };
             let val = if m == 0 {
                 em / n_states as f32
             } else {
@@ -2088,7 +2109,12 @@ pub fn run_hmm_forward_backward_clusters_counts(
                     .unwrap_or(0.0);
                 let mism = mism.min(n_obs);
                 let match_count = (n_obs - mism).max(0.0);
-                let em = (match_count * log_p_no_err + mism * log_p_err).exp();
+                // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
+                let em = if n_obs > 0.0 {
+                    ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
+                } else {
+                    1.0
+                };
                 bwd[k] *= em;
                 emitted_sum += bwd[k];
             }
