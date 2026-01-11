@@ -1126,37 +1126,34 @@ impl ClusterStateProbs {
         let probs = &self.probs[cluster];
         let probs_p1 = &self.probs_p1[cluster];
 
+        // Nearest-neighbor interpolation: use haplotype from nearest cluster
+        let use_left_hap = weight >= 0.5;
+
         if n_alleles == 2 {
             let mut p_alt = 0.0f32;
             let mut p_ref = 0.0f32;
             for (j, &hap) in haps.iter().enumerate() {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
                 let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                if in_cluster {
-                    let allele = get_ref_allele(ref_marker, hap);
-                    if allele == 1 {
-                        p_alt += prob;
-                    } else if allele == 0 {
-                        p_ref += prob;
-                    }
+
+                // Interpolate state probability, use nearest haplotype for allele
+                let interp_prob = if in_cluster {
+                    prob
+                } else {
+                    weight * prob + (1.0 - weight) * prob_p1
+                };
+
+                let allele = if in_cluster || use_left_hap {
+                    get_ref_allele(ref_marker, hap)
                 } else {
                     let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
-                    let prob_left = weight * prob;
-                    let prob_right = (1.0 - weight) * prob_p1;
+                    get_ref_allele(ref_marker, hap_right)
+                };
 
-                    let allele_left = get_ref_allele(ref_marker, hap);
-                    if allele_left == 1 {
-                        p_alt += prob_left;
-                    } else if allele_left == 0 {
-                        p_ref += prob_left;
-                    }
-
-                    let allele_right = get_ref_allele(ref_marker, hap_right);
-                    if allele_right == 1 {
-                        p_alt += prob_right;
-                    } else if allele_right == 0 {
-                        p_ref += prob_right;
-                    }
+                if allele == 1 {
+                    p_alt += interp_prob;
+                } else if allele == 0 {
+                    p_ref += interp_prob;
                 }
             }
             let total = p_ref + p_alt;
@@ -1167,25 +1164,23 @@ impl ClusterStateProbs {
             for (j, &hap) in haps.iter().enumerate() {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
                 let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                if in_cluster {
-                    let allele = get_ref_allele(ref_marker, hap);
-                    if allele != 255 && (allele as usize) < n_alleles {
-                        al_probs[allele as usize] += prob;
-                    }
+
+                // Interpolate state probability, use nearest haplotype for allele
+                let interp_prob = if in_cluster {
+                    prob
+                } else {
+                    weight * prob + (1.0 - weight) * prob_p1
+                };
+
+                let allele = if in_cluster || use_left_hap {
+                    get_ref_allele(ref_marker, hap)
                 } else {
                     let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
-                    let prob_left = weight * prob;
-                    let prob_right = (1.0 - weight) * prob_p1;
+                    get_ref_allele(ref_marker, hap_right)
+                };
 
-                    let allele_left = get_ref_allele(ref_marker, hap);
-                    if allele_left != 255 && (allele_left as usize) < n_alleles {
-                        al_probs[allele_left as usize] += prob_left;
-                    }
-
-                    let allele_right = get_ref_allele(ref_marker, hap_right);
-                    if allele_right != 255 && (allele_right as usize) < n_alleles {
-                        al_probs[allele_right as usize] += prob_right;
-                    }
+                if allele != 255 && (allele as usize) < n_alleles {
+                    al_probs[allele as usize] += interp_prob;
                 }
             }
             let total: f32 = al_probs.iter().sum();
