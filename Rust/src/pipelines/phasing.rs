@@ -1375,12 +1375,10 @@ impl PhasingPipeline {
             // 4. After the forward pass, sample a swap mask via MCMC
             // 5. Apply the sampled mask to update phase
             //
-            // This ensures forward probabilities after a het correctly reflect the phase decision
-            // by using the decided alleles for emission probabilities.
-            let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
-
             // Collect EM statistics if requested (using original sequences)
+            // Only create HMM when needed to avoid unnecessary p_recomb.clone()
             if let Some(atomic) = atomic_estimates {
+                let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
                 let mut local_est = crate::model::parameters::ParamEstimates::new();
                 hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
                 hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
