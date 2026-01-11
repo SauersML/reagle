@@ -247,6 +247,7 @@ impl<'a> BeagleHmm<'a> {
     pub fn forward_backward_raw(
         &self,
         target_alleles: &[u8],
+        target_conf: Option<&[f32]>,
         threaded_haps: &ThreadedHaps,
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
@@ -262,9 +263,8 @@ impl<'a> BeagleHmm<'a> {
         fwd.resize(total_size, 0.0);
         bwd.resize(total_size, 0.0);
 
-        let p_err = self.params.p_mismatch;
-        let p_no_err = 1.0 - p_err;
-        let emit_probs = [p_no_err, p_err];
+        let p_err_base = self.params.p_mismatch;
+        let p_no_err_base = 1.0 - p_err_base;
 
         // Allocate scratch buffer for allele materialization
         let mut scratch = AlleleScratch::new(n_states);
@@ -298,6 +298,14 @@ impl<'a> BeagleHmm<'a> {
             for k in 0..n_states {
                 mismatches[k] = if scratch.alleles[k] == targ_al { 0 } else { 1 };
             }
+
+            let conf = target_conf
+                .and_then(|c| c.get(m).copied())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+            let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+            let emit_probs = [p_no_err, p_err];
 
             // Phase C: Math kernel (SIMD-friendly on contiguous data)
             let row_offset = m * n_states;
@@ -367,6 +375,14 @@ impl<'a> BeagleHmm<'a> {
             for k in 0..n_states {
                 bwd[curr_row + k] = bwd[next_row + k];
             }
+
+            let conf = target_conf
+                .and_then(|c| c.get(m_next).copied())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+            let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+            let emit_probs = [p_no_err, p_err];
 
             // Apply backward update (same Li-Stephens formula, different direction)
             // bwd_update expects p_switch = ρ (raw recombination probability)
@@ -605,7 +621,8 @@ mod tests {
         let mut fwd = Vec::new();
         let mut bwd = Vec::new();
 
-        let log_likelihood = hmm.forward_backward_raw(&target_alleles, &threaded_haps, &mut fwd, &mut bwd);
+        let log_likelihood =
+            hmm.forward_backward_raw(&target_alleles, None, &threaded_haps, &mut fwd, &mut bwd);
 
         assert_eq!(fwd.len(), 5 * 3); // 5 markers * 3 states
         assert_eq!(bwd.len(), 5 * 3);

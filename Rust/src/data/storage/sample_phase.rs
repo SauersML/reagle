@@ -35,6 +35,8 @@ pub struct SamplePhase {
     hap1: Vec<u8>,
     /// Alleles on second haplotype
     hap2: Vec<u8>,
+    /// Genotype confidence per marker (0.0-1.0)
+    confidence: Vec<f32>,
     /// Status of each marker
     status: Vec<ClusterStatus>,
     /// Count of each status type for quick access
@@ -49,6 +51,7 @@ impl SamplePhase {
     /// * `n_markers` - Number of markers
     /// * `hap1_alleles` - Alleles on first haplotype (0-254 for alleles, 255 for missing)
     /// * `hap2_alleles` - Alleles on second haplotype
+    /// * `confidence` - Per-marker genotype confidence (0.0-1.0)
     /// * `unphased_hets` - Sorted indices of markers that are unphased heterozygotes
     /// * `missing` - Sorted indices of markers with missing data
     ///
@@ -60,15 +63,18 @@ impl SamplePhase {
         n_markers: usize,
         hap1_alleles: &[u8],
         hap2_alleles: &[u8],
+        confidence: &[f32],
         unphased_hets: &[usize],
         missing: &[usize],
     ) -> Self {
         assert_eq!(hap1_alleles.len(), n_markers, "hap1 length mismatch");
         assert_eq!(hap2_alleles.len(), n_markers, "hap2 length mismatch");
+        assert_eq!(confidence.len(), n_markers, "confidence length mismatch");
 
         // Copy alleles directly - preserves multiallelic values
         let hap1: Vec<u8> = hap1_alleles.to_vec();
         let hap2: Vec<u8> = hap2_alleles.to_vec();
+        let confidence: Vec<f32> = confidence.to_vec();
 
         let mut status = Vec::with_capacity(n_markers);
         let mut status_counts = [0usize; ClusterStatus::COUNT];
@@ -98,6 +104,7 @@ impl SamplePhase {
         Self {
             hap1,
             hap2,
+            confidence,
             status,
             status_counts,
         }
@@ -129,6 +136,12 @@ impl SamplePhase {
     #[inline]
     pub fn allele2(&self, marker: usize) -> u8 {
         self.hap2[marker]
+    }
+
+    /// Returns the per-marker genotype confidence (0.0-1.0).
+    #[inline]
+    pub fn confidence(&self, marker: usize) -> f32 {
+        self.confidence[marker]
     }
 
     /// Returns true if the marker is an unphased heterozygote.
@@ -198,10 +211,11 @@ mod tests {
     fn test_new_basic() {
         let hap1 = vec![0, 1, 0, 1, 0];
         let hap2 = vec![0, 0, 1, 1, 0];
+        let conf = vec![1.0; 5];
         let unphased = vec![2usize];
         let missing = vec![4usize];
 
-        let sp = SamplePhase::new(0, 5, &hap1, &hap2, &unphased, &missing);
+        let sp = SamplePhase::new(0, 5, &hap1, &hap2, &conf, &unphased, &missing);
 
         assert_eq!(sp.hap1.len(), 5);
         assert_eq!(sp.hap2.len(), 5);
@@ -211,8 +225,9 @@ mod tests {
     fn test_allele_access() {
         let hap1 = vec![0, 1, 0, 1];
         let hap2 = vec![1, 0, 1, 1];
+        let conf = vec![1.0; 4];
 
-        let sp = SamplePhase::new(0, 4, &hap1, &hap2, &[], &[]);
+        let sp = SamplePhase::new(0, 4, &hap1, &hap2, &conf, &[], &[]);
 
         assert_eq!(sp.allele1(0), 0);
         assert_eq!(sp.allele1(1), 1);
@@ -224,10 +239,11 @@ mod tests {
     fn test_is_unphased() {
         let hap1 = vec![0, 1, 0, 0];
         let hap2 = vec![0, 0, 1, 0];
+        let conf = vec![1.0; 4];
         let unphased = vec![2usize];
         let missing = vec![3usize];
 
-        let sp = SamplePhase::new(0, 4, &hap1, &hap2, &unphased, &missing);
+        let sp = SamplePhase::new(0, 4, &hap1, &hap2, &conf, &unphased, &missing);
 
         assert!(!sp.is_unphased(0)); // homozygous
         assert!(!sp.is_unphased(1)); // phased
@@ -239,9 +255,10 @@ mod tests {
     fn test_swap_haps() {
         let hap1 = vec![0, 1, 0];
         let hap2 = vec![1, 0, 1];
+        let conf = vec![1.0; 3];
         let unphased = vec![0usize, 2];
 
-        let mut sp = SamplePhase::new(0, 3, &hap1, &hap2, &unphased, &[]);
+        let mut sp = SamplePhase::new(0, 3, &hap1, &hap2, &conf, &unphased, &[]);
 
         // Marker 1 is phased het, markers 0 and 2 are unphased
         sp.swap_haps(0, 3);
@@ -259,9 +276,10 @@ mod tests {
     fn test_mark_phased() {
         let hap1 = vec![0, 0];
         let hap2 = vec![1, 1];
+        let conf = vec![1.0; 2];
         let unphased = vec![0usize, 1];
 
-        let mut sp = SamplePhase::new(0, 2, &hap1, &hap2, &unphased, &[]);
+        let mut sp = SamplePhase::new(0, 2, &hap1, &hap2, &conf, &unphased, &[]);
 
         assert!(sp.is_unphased(0));
         sp.mark_phased(0);
@@ -273,10 +291,11 @@ mod tests {
         // Test that multiallelic alleles (2, 3, etc.) are preserved correctly
         let hap1 = vec![0, 1, 2, 3, 255]; // REF, ALT1, ALT2, ALT3, missing
         let hap2 = vec![2, 0, 1, 2, 255]; // ALT2, REF, ALT1, ALT2, missing
+        let conf = vec![1.0; 5];
         let unphased = vec![1usize, 2, 3];
         let missing = vec![4usize];
 
-        let sp = SamplePhase::new(0, 5, &hap1, &hap2, &unphased, &missing);
+        let sp = SamplePhase::new(0, 5, &hap1, &hap2, &conf, &unphased, &missing);
 
         // Verify alleles are preserved exactly
         assert_eq!(sp.allele1(0), 0);
@@ -290,8 +309,9 @@ mod tests {
     fn test_swap_alleles() {
         let hap1 = vec![0, 2, 3];
         let hap2 = vec![1, 0, 2];
+        let conf = vec![1.0; 3];
 
-        let mut sp = SamplePhase::new(0, 3, &hap1, &hap2, &[], &[]);
+        let mut sp = SamplePhase::new(0, 3, &hap1, &hap2, &conf, &[], &[]);
 
         sp.swap_alleles(1);
 

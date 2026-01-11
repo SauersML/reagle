@@ -304,6 +304,9 @@ fn default_test_config() -> Config {
         excludemarkers: None,
         burnin: 3,
         iterations: 12,
+        mcmc_burnin: 2,
+        mcmc_samples: 4,
+        mcmc_chains: 2,
         phase_states: 280,
         rare: 0.002,
         impute: true,
@@ -1531,4 +1534,3 @@ fn test_high_density_array_imputation() {
     // STRICT: Mean DR2 should be positive
     assert!(mean_dr2 > 0.0, "Mean DR2 should be positive, got {:.4}", mean_dr2);
 }
-

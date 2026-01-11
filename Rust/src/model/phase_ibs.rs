@@ -215,6 +215,72 @@ impl BidirectionalPhaseIbs {
         neighbors
     }
 
+    /// Estimate the best match span (in marker steps) for a haplotype at a marker.
+    ///
+    /// Uses adjacent PBWT neighbors and divergence arrays to approximate the
+    /// longest shared segment around `marker_idx`.
+    pub fn best_match_span(&self, hap_idx: u32, marker_idx: usize) -> usize {
+        if marker_idx >= self.n_markers {
+            return 0;
+        }
+
+        let fwd_ppa = &self.fwd_ppa[marker_idx];
+        let mut pos_fwd = None;
+        for (i, &h) in fwd_ppa.iter().enumerate() {
+            if h == hap_idx {
+                pos_fwd = Some(i);
+                break;
+            }
+        }
+        let Some(pos_fwd) = pos_fwd else {
+            return 0;
+        };
+
+        let bwd_ppa = &self.bwd_ppa[marker_idx];
+        let mut pos_bwd = None;
+        for (i, &h) in bwd_ppa.iter().enumerate() {
+            if h == hap_idx {
+                pos_bwd = Some(i);
+                break;
+            }
+        }
+        let Some(pos_bwd) = pos_bwd else {
+            return 0;
+        };
+
+        let mut best_fwd = 0usize;
+        for pos in [pos_fwd.wrapping_sub(1), pos_fwd + 1] {
+            if pos < self.n_haps {
+                let start = self.fwd_div[marker_idx][pos];
+                if marker_idx as i32 >= start {
+                    let span = (marker_idx as i32 - start + 1) as usize;
+                    if span > best_fwd {
+                        best_fwd = span;
+                    }
+                }
+            }
+        }
+
+        let mut best_bwd = 0usize;
+        for pos in [pos_bwd.wrapping_sub(1), pos_bwd + 1] {
+            if pos < self.n_haps {
+                let end = self.bwd_div[marker_idx][pos];
+                if end >= marker_idx as i32 {
+                    let span = (end - marker_idx as i32 + 1) as usize;
+                    if span > best_bwd {
+                        best_bwd = span;
+                    }
+                }
+            }
+        }
+
+        if best_fwd > 0 && best_bwd > 0 {
+            best_fwd + best_bwd - 1
+        } else {
+            best_fwd.max(best_bwd)
+        }
+    }
+
     fn find_fwd_neighbors(&self, hap_idx: u32, marker_idx: usize, n_candidates: usize) -> Vec<u32> {
         if marker_idx >= self.n_markers {
             return Vec::new();

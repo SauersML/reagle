@@ -3806,3 +3806,91 @@ fn test_dr2_zero_variance_genotyped_marker() {
     println!("\nDR2 zero-variance test: found_zero_variance = {}", found_zero_variance);
     println!("DR2 is correctly computed (not hardcoded to 1.0)");
 }
+
+/// Test imputation accuracy against ground truth, comparing Rust vs Java.
+///
+/// Ground truth: target.vcf has full genotypes, target_sparse.vcf has subset.
+/// Impute sparse → compare imputed DS to true GT from full target.
+/// Assert Rust has no more large errors (≥0.9) than Java.
+#[test]
+fn test_imputation_vs_ground_truth() {
+    for source in get_all_data_sources() {
+        println!("\n{}", "=".repeat(60));
+        println!("=== Imputation Accuracy Test: {} data ===", source.name);
+        println!("{}", "=".repeat(60));
+
+        run_imputation_vs_ground_truth_comparison(&source);
+    }
+}
+
+fn run_imputation_vs_ground_truth_comparison(source: &TestDataSource) {
+    let beagle_files = setup_test_files(); // For BEAGLE JAR
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Load ground truth from full target
+    let (_, truth_records) = parse_vcf(&source.target_vcf);
+    let truth_by_pos: HashMap<u64, &ParsedRecord> = truth_records.iter()
+        .map(|r| (r.pos, r))
+        .collect();
+
+    // Load sparse target to know which positions were masked
+    let (_, sparse_records) = parse_vcf(&source.target_sparse_vcf);
+    let sparse_positions: std::collections::HashSet<u64> = sparse_records.iter()
+        .map(|r| r.pos)
+        .collect();
+
+    // Run Rust imputation
+    let rust_out = work_dir.path().join("rust_imp");
+    run_rust_imputation(&source.target_sparse_vcf, &source.ref_vcf, &rust_out, 12345)
+        .expect("Rust imputation failed");
+    let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
+    let (_, rust_records) = parse_vcf(&rust_vcf);
+
+    // Run Java imputation
+    let java_out = work_dir.path().join("java_imp");
+    let java_status = Command::new("java")
+        .args([
+            "-jar", beagle_files.beagle_jar.to_str().unwrap(),
+            &format!("gt={}", source.target_sparse_vcf.display()),
+            &format!("ref={}", source.ref_vcf.display()),
+            &format!("out={}", java_out.display()),
+            "seed=12345",
+        ])
+        .output()
+        .expect("Failed to run Java BEAGLE");
+    assert!(java_status.status.success(), "Java BEAGLE failed");
+    let java_vcf = work_dir.path().join("java_imp.vcf.gz");
+    let (_, java_records) = parse_vcf(&java_vcf);
+
+    // Helper to count large errors
+    let count_large_errors = |records: &[ParsedRecord]| -> usize {
+        let mut count = 0;
+        for rec in records {
+            if sparse_positions.contains(&rec.pos) {
+                continue;
+            }
+            let Some(truth_rec) = truth_by_pos.get(&rec.pos) else {
+                continue;
+            };
+            for (imp_gt, truth_gt) in rec.genotypes.iter().zip(truth_rec.genotypes.iter()) {
+                let imputed_ds = imp_gt.ds.unwrap_or(0.0);
+                let true_ds = gt_to_dosage(&truth_gt.gt).unwrap_or(0.0);
+                if (imputed_ds - true_ds).abs() >= 0.9 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+
+    let rust_large_errors = count_large_errors(&rust_records);
+    let java_large_errors = count_large_errors(&java_records);
+
+    eprintln!("[{}] Large errors (≥0.9): Rust={}, Java={}", source.name, rust_large_errors, java_large_errors);
+
+    assert!(
+        rust_large_errors <= java_large_errors,
+        "[{}] Rust has more large errors than Java: {} vs {}",
+        source.name, rust_large_errors, java_large_errors
+    );
+}
