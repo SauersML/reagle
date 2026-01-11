@@ -1533,7 +1533,7 @@ impl ImputationPipeline {
                             (hap_indices, actual_n_states)
                         };
 
-                        let (cluster_mismatches, cluster_non_missing) = compute_cluster_mismatches(
+                        let (cluster_mismatches, _) = compute_cluster_mismatches(
                             &hap_indices,
                             &cluster_bounds,
                             &sample_genotyped,
@@ -1545,7 +1545,6 @@ impl ImputationPipeline {
                         );
                         let cluster_state_probs = run_hmm_forward_backward_clusters_counts(
                             &cluster_mismatches,
-                            &cluster_non_missing,
                             &cluster_p_recomb,
                             base_err_rate,
                             actual_n_states,
@@ -1897,7 +1896,6 @@ impl ImputationPipeline {
 #[cfg(test)]
 fn run_hmm_forward_backward_clusters(
     cluster_mismatches: &[Vec<f32>],
-    cluster_non_missing: &[Vec<f32>],
     p_recomb: &[f32],
     p_err: f32,
     n_states: usize,
@@ -1913,8 +1911,6 @@ fn run_hmm_forward_backward_clusters(
 
     let p_err = p_err.clamp(1e-8, 0.5);
     let p_no_err = 1.0 - p_err;
-    let log_p_err = p_err.ln();
-    let log_p_no_err = p_no_err.ln();
 
     // Forward pass
     let total_size = n_clusters * n_states;
@@ -1931,17 +1927,18 @@ fn run_hmm_forward_backward_clusters(
         let prev_row_offset = if c > 0 { (c - 1) * n_states } else { 0 };
 
         for k in 0..n_states.min(mismatches.len()) {
-            let n_obs = cluster_non_missing
-                .get(c)
-                .and_then(|row| row.get(k))
-                .copied()
-                .unwrap_or(0.0);
-            let mismatch_count = mismatches[k].min(n_obs);
-            let match_count = (n_obs - mismatch_count).max(0.0);
-            let emit = (match_count * log_p_no_err + mismatch_count * log_p_err).exp();
+            // BEAGLE EMISSION MODEL: Java reference uses a simple binary model.
+            // If there are >0 mismatches in a cluster, P(emit) = p_err.
+            // If there are 0 mismatches, P(emit) = p_no_err.
+            // This differs from a standard binomial model.
+            let mismatch_count = mismatches[k];
+            let emit = if mismatch_count > 0.0 { p_err } else { p_no_err };
 
             let val = if c == 0 {
-                emit / n_states as f32
+                // BEAGLE HMM INITIALIZATION: The Java reference ImpLSBaum.java does not
+                // scale the initial forward probabilities by the uniform state
+                // probability (1/n_states). To match its output, we must also omit this.
+                emit
             } else {
                 emit * (scale * fwd[prev_row_offset + k] + shift)
             };
@@ -1967,14 +1964,8 @@ fn run_hmm_forward_backward_clusters(
 
             let mut emitted_sum = 0.0f32;
             for k in 0..n_states.min(mismatches.len()) {
-                let n_obs = cluster_non_missing
-                    .get(c + 1)
-                    .and_then(|row| row.get(k))
-                    .copied()
-                    .unwrap_or(0.0);
-                let mismatch_count = mismatches[k].min(n_obs);
-                let match_count = (n_obs - mismatch_count).max(0.0);
-                let emit = (match_count * log_p_no_err + mismatch_count * log_p_err).exp();
+                let mismatch_count = mismatches[k];
+                let emit = if mismatch_count > 0.0 { p_err } else { p_no_err };
                 bwd[k] *= emit;
                 emitted_sum += bwd[k];
             }
@@ -2016,7 +2007,6 @@ fn run_hmm_forward_backward_clusters(
 /// Forward-backward HMM on cluster-coded observations (Java ImpLSBaum model).
 pub fn run_hmm_forward_backward_clusters_counts(
     cluster_mismatches: &[Vec<f32>],
-    cluster_non_missing: &[Vec<f32>],
     p_recomb: &[f32],
     base_err_rate: f32,
     n_states: usize,
@@ -2031,8 +2021,6 @@ pub fn run_hmm_forward_backward_clusters_counts(
     let mut last_sum = 1.0f32;
     let p_err = base_err_rate.clamp(1e-8, 0.5);
     let p_no_err = 1.0 - p_err;
-    let log_p_err = p_err.ln();
-    let log_p_no_err = p_no_err.ln();
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
@@ -2044,16 +2032,13 @@ pub fn run_hmm_forward_backward_clusters_counts(
 
         for k in 0..n_states {
             let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0.0);
-            let n_obs = cluster_non_missing
-                .get(m)
-                .and_then(|row| row.get(k))
-                .copied()
-                .unwrap_or(0.0);
-            let mism = mism.min(n_obs);
-            let match_count = (n_obs - mism).max(0.0);
-            let em = (match_count * log_p_no_err + mism * log_p_err).exp();
+            // BEAGLE EMISSION MODEL: Java reference uses a simple binary model.
+            let em = if mism > 0.0 { p_err } else { p_no_err };
             let val = if m == 0 {
-                em / n_states as f32
+                // BEAGLE HMM INITIALIZATION: The Java reference ImpLSBaum.java does not
+                // scale the initial forward probabilities by the uniform state
+                // probability (1/n_states). To match its output, we must also omit this.
+                em
             } else {
                 em * (scale * fwd[prev_offset + k] + shift)
             };
@@ -2077,14 +2062,7 @@ pub fn run_hmm_forward_backward_clusters_counts(
             let mismatches = &cluster_mismatches[m + 1];
             for k in 0..n_states {
                 let mism = mismatches.get(k).copied().unwrap_or(0.0);
-                let n_obs = cluster_non_missing
-                    .get(m + 1)
-                    .and_then(|row| row.get(k))
-                    .copied()
-                    .unwrap_or(0.0);
-                let mism = mism.min(n_obs);
-                let match_count = (n_obs - mism).max(0.0);
-                let em = (match_count * log_p_no_err + mism * log_p_err).exp();
+                let em = if mism > 0.0 { p_err } else { p_no_err };
                 bwd[k] *= em;
                 emitted_sum += bwd[k];
             }
@@ -2334,10 +2312,9 @@ mod tests {
 
                 let mut workspace = ImpWorkspace::with_ref_size(n_states);
                 let p_err = 0.01f32;
-                let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
+                let (mismatches, _) = matches_to_mismatches(&allele_match);
                 let posteriors = run_hmm_forward_backward_clusters(
                     &mismatches,
-                    &non_missing,
                     &p_recomb,
                     p_err,
                     n_states,
@@ -2370,10 +2347,9 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
         let p_err = 0.01f32;
-        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
+        let (mismatches, _) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
             &mismatches,
-            &non_missing,
             &p_recomb,
             p_err,
             n_states,
@@ -2448,10 +2424,9 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
         let p_err = 0.001f32;
-        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
+        let (mismatches, _) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
             &mismatches,
-            &non_missing,
             &p_recomb,
             p_err,
             n_states,
@@ -2485,10 +2460,9 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
         let p_err = 0.01f32;
-        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
+        let (mismatches, _) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
             &mismatches,
-            &non_missing,
             &p_recomb,
             p_err,
             n_states,
@@ -2529,12 +2503,11 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
         let p_err = 0.01f32;
-        let (mismatches1, non_missing1) = matches_to_mismatches(&match1);
-        let (mismatches2, non_missing2) = matches_to_mismatches(&match2);
+        let (mismatches1, _) = matches_to_mismatches(&match1);
+        let (mismatches2, _) = matches_to_mismatches(&match2);
 
         let post1 = run_hmm_forward_backward_clusters(
             &mismatches1,
-            &non_missing1,
             &p_recomb,
             p_err,
             n_states,
@@ -2542,7 +2515,6 @@ mod tests {
         );
         let post2 = run_hmm_forward_backward_clusters(
             &mismatches2,
-            &non_missing2,
             &p_recomb,
             p_err,
             n_states,
@@ -2640,10 +2612,9 @@ mod tests {
         let p_recomb = vec![0.0, rho];  // First marker has 0 recomb
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
-        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
+        let (mismatches, _) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
             &mismatches,
-            &non_missing,
             &p_recomb,
             p_err,
             n_states,
@@ -2695,10 +2666,9 @@ mod tests {
 
             let mut workspace = ImpWorkspace::with_ref_size(n_states);
             let p_err = 0.01f32;
-            let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
+            let (mismatches, _) = matches_to_mismatches(&allele_match);
             let posteriors = run_hmm_forward_backward_clusters(
                 &mismatches,
-                &non_missing,
                 &p_recomb,
                 p_err,
                 n_states,
@@ -2740,10 +2710,9 @@ mod tests {
 
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
         let p_err = 0.01f32;  // small mismatch prob
-        let (mismatches, non_missing) = matches_to_mismatches(&allele_match);
+        let (mismatches, _) = matches_to_mismatches(&allele_match);
         let posteriors = run_hmm_forward_backward_clusters(
             &mismatches,
-            &non_missing,
             &p_recomb,
             p_err,
             n_states,

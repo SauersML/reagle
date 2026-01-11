@@ -3637,8 +3637,6 @@ fn test_single_mismatch_not_catastrophic() {
     let mismatches: Vec<Vec<f32>> = (0..n_markers)
         .map(|m| vec![0.0f32, if m == 5 { 1.0f32 } else { 0.0f32 }])
         .collect();
-    let non_missing: Vec<Vec<f32>> = vec![vec![1.0f32, 1.0f32]; n_markers];
-
     let p_recomb: Vec<f32> = (0..n_markers)
         .map(|m| if m == 0 { 0.0 } else { 0.001 })
         .collect();
@@ -3650,7 +3648,6 @@ fn test_single_mismatch_not_catastrophic() {
 
     let posteriors = reagle::pipelines::imputation::run_hmm_forward_backward_clusters_counts(
         &mismatches,
-        &non_missing,
         &p_recomb,
         base_err_rate,
         n_states,
