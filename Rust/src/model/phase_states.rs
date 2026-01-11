@@ -74,56 +74,23 @@ pub struct PhaseStates {
     queue: BinaryHeap<CompHapEntry>,
     /// Number of markers
     n_markers: usize,
-    /// Minimum markers between segment switches (prevents thrashing)
-    min_segment_len: usize,
 }
 
 const NIL: i32 = -103;
 
 impl PhaseStates {
-    /// Compute a minimum segment length based on marker density and genetic distance.
-    ///
-    /// This enforces a lower bound on segment length to prevent rapid thrashing,
-    /// while scaling up for dense panels where many markers can fit within 1 cM.
-    pub fn min_segment_len(n_markers: usize, gen_dists: &[f64]) -> usize {
-        let max_len = n_markers.saturating_sub(1).max(1);
-        if gen_dists.is_empty() {
-            return 200.min(max_len);
-        }
-
-        let mut dist_cm = 0.0;
-        let mut steps = 0usize;
-        for &d in gen_dists {
-            dist_cm += d;
-            steps += 1;
-            if dist_cm >= 1.0 {
-                break;
-            }
-        }
-
-        let per_cm = if dist_cm >= 1.0 {
-            steps.max(1)
-        } else {
-            n_markers.saturating_sub(1).max(1)
-        };
-
-        200.max(per_cm).min(max_len)
-    }
-
     /// Create a new phase state selector
     ///
     /// # Arguments
     /// * `max_states` - Maximum number of composite haplotypes (K in Li-Stephens model)
     /// * `n_markers` - Number of markers in the HMM
-    /// * `min_segment_len` - Minimum markers between segment switches
-    pub fn new(max_states: usize, n_markers: usize, min_segment_len: usize) -> Self {
+    pub fn new(max_states: usize, n_markers: usize) -> Self {
         Self {
             max_states,
             threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_markers),
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
             n_markers,
-            min_segment_len,
         }
     }
 
@@ -318,8 +285,7 @@ mod tests {
 
     #[test]
     fn test_phase_states_basic() {
-        let min_len = PhaseStates::min_segment_len(100, &[]);
-        let mut ps = PhaseStates::new(10, 100, min_len);
+        let mut ps = PhaseStates::new(10, 100);
         assert_eq!(ps.n_states(), 0);
 
         // Add some IBS haps
@@ -332,8 +298,7 @@ mod tests {
 
     #[test]
     fn test_phase_states_replacement() {
-        let min_len = PhaseStates::min_segment_len(1000, &[]);
-        let mut ps = PhaseStates::new(2, 1000, min_len); // Only 2 states
+        let mut ps = PhaseStates::new(2, 1000); // Only 2 states
 
         // Fill up the queue
         ps.add_ibs_hap(0, 0);
@@ -350,8 +315,7 @@ mod tests {
 
     #[test]
     fn test_composite_haps_have_multiple_segments() {
-        let min_len = PhaseStates::min_segment_len(1000, &[]);
-        let mut ps = PhaseStates::new(2, 1000, min_len);
+        let mut ps = PhaseStates::new(2, 1000);
 
         // Add haplotype 0 at marker 0
         ps.add_ibs_hap(0, 0);
@@ -360,8 +324,7 @@ mod tests {
         ps.add_ibs_hap(2, 0);
 
         // Now simulate IBS matches later that should cause segment changes
-        // After min_segment_len markers, a new IBS hap should replace a segment
-        // min_segment_len is approximately max(50, n_markers/100) = max(50, 10) = 50
+        // With LRU eviction, new IBS matches always replace oldest when queue is full
 
         // Add haplotype 10 repeatedly starting at marker 100
         // This should eventually replace one of the original states' segments

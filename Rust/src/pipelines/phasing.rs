@@ -1440,8 +1440,7 @@ impl PhasingPipeline {
             // Build dynamic composite haplotypes using PhaseStates
             // This iterates through all markers and builds mosaic haplotypes
             // that provide local IBS matches everywhere, not just at midpoint.
-            let min_segment_len = PhaseStates::min_segment_len(n_markers, gen_dists);
-            let mut phase_states = PhaseStates::new(self.params.n_states, n_markers, min_segment_len);
+            let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
             let n_candidates = self.params.n_states.min(n_total_haps).max(20);
             let threaded_haps = phase_states.build_composite_haps(
                 s as u32,
@@ -1645,8 +1644,7 @@ impl PhasingPipeline {
             .enumerate()
             .map(|(s, sp)| {
                 // Build dynamic composite haplotypes using PhaseStates
-                let min_segment_len = PhaseStates::min_segment_len(n_markers, gen_dists);
-                let mut phase_states = PhaseStates::new(self.params.n_states, n_markers, min_segment_len);
+                let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
                 let threaded_haps = phase_states.build_composite_haps(
                     s as u32,
                     &phase_ibs,
@@ -1856,8 +1854,7 @@ impl PhasingPipeline {
                 let n_hi_freq = hi_freq_to_orig.len();
 
                 // Build dynamic composite haplotypes using PhaseStates
-                let min_segment_len = PhaseStates::min_segment_len(n_hi_freq, stage1_gen_dists);
-                let mut phase_states = PhaseStates::new(self.params.n_states, n_hi_freq, min_segment_len);
+                let mut phase_states = PhaseStates::new(self.params.n_states, n_hi_freq);
                 let threaded_haps = phase_states.build_composite_haps(
                     s as u32,
                     &phase_ibs,
@@ -2076,15 +2073,6 @@ impl PhasingPipeline {
             return;
         }
 
-        let stage1_gen_dists: Vec<f64> = if hi_freq_markers.len() > 1 {
-            hi_freq_markers
-                .windows(2)
-                .map(|w| gen_positions[w[1]] - gen_positions[w[0]])
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         // Compute total haplotype count (target + reference)
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
@@ -2197,8 +2185,7 @@ impl PhasingPipeline {
                 let mut rng = rand::rngs::StdRng::seed_from_u64(sample_seed);
 
                 // Build dynamic composite haplotypes using PhaseStates
-                let min_segment_len = PhaseStates::min_segment_len(n_stage1, &stage1_gen_dists);
-                let mut phase_states = PhaseStates::new(self.params.n_states, n_stage1, min_segment_len);
+                let mut phase_states = PhaseStates::new(self.params.n_states, n_stage1);
                 let threaded_haps = phase_states.build_composite_haps(
                     s as u32,
                     &phase_ibs,

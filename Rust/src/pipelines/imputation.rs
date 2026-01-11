@@ -1727,7 +1727,8 @@ impl ImputationPipeline {
             };
 
             // Process markers in chunks for efficient transpose
-            const CHUNK_SIZE: usize = 10_000;
+            // Larger chunks = fewer seeks = faster (50k markers × 818 samples × 14 bytes = ~570 MB)
+            const CHUNK_SIZE: usize = 50_000;
             let n_chunks = (n_ref_markers + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
             // Buffers for chunked reading: chunk_data[m_local][s]
@@ -1735,84 +1736,99 @@ impl ImputationPipeline {
             let mut chunk_gt = vec![vec![(0u8, 0u8); n_target_samples]; CHUNK_SIZE];
             let mut chunk_post = vec![vec![(0.0f32, 0.0f32); n_target_samples]; CHUNK_SIZE];
 
+            // Bulk read buffers (avoid per-byte reads)
+            let mut dosage_buf = vec![0u8; CHUNK_SIZE * 4];
+            let mut gt_buf = vec![0u8; CHUNK_SIZE * 2];
+            let mut post_buf = vec![0u8; CHUNK_SIZE * 8];
+
             for chunk_idx in 0..n_chunks {
                 let chunk_start = chunk_idx * CHUNK_SIZE;
                 let chunk_end = (chunk_start + CHUNK_SIZE).min(n_ref_markers);
                 let chunk_len = chunk_end - chunk_start;
 
-                // Read all samples' data for this marker chunk (transpose on read)
+                // Read all samples' data for this marker chunk with bulk reads
                 for s in 0..n_target_samples {
-                    // Sample s, markers [chunk_start..chunk_end] in sample-major file
+                    // Bulk read dosages for sample s, markers [chunk_start..chunk_end]
                     let dosage_pos = (s * n_ref_markers + chunk_start) as u64 * 4;
                     dosage_file.seek(SeekFrom::Start(dosage_pos))?;
+                    dosage_file.read_exact(&mut dosage_buf[..chunk_len * 4])?;
                     for m_local in 0..chunk_len {
-                        let mut buf = [0u8; 4];
-                        dosage_file.read_exact(&mut buf)?;
-                        chunk_dosages[m_local][s] = f32::from_le_bytes(buf);
+                        let offset = m_local * 4;
+                        chunk_dosages[m_local][s] = f32::from_le_bytes([
+                            dosage_buf[offset], dosage_buf[offset + 1],
+                            dosage_buf[offset + 2], dosage_buf[offset + 3]
+                        ]);
                     }
 
+                    // Bulk read GTs
                     let gt_pos = (s * n_ref_markers + chunk_start) as u64 * 2;
                     gt_file.seek(SeekFrom::Start(gt_pos))?;
+                    gt_file.read_exact(&mut gt_buf[..chunk_len * 2])?;
                     for m_local in 0..chunk_len {
-                        let mut buf = [0u8; 2];
-                        gt_file.read_exact(&mut buf)?;
-                        chunk_gt[m_local][s] = (buf[0], buf[1]);
+                        let offset = m_local * 2;
+                        chunk_gt[m_local][s] = (gt_buf[offset], gt_buf[offset + 1]);
                     }
 
+                    // Bulk read posteriors
                     if let Some(ref mut pf) = post_file {
                         let post_pos = (s * n_ref_markers + chunk_start) as u64 * 8;
                         pf.seek(SeekFrom::Start(post_pos))?;
+                        pf.read_exact(&mut post_buf[..chunk_len * 8])?;
                         for m_local in 0..chunk_len {
-                            let mut b1 = [0u8; 4];
-                            let mut b2 = [0u8; 4];
-                            pf.read_exact(&mut b1)?;
-                            pf.read_exact(&mut b2)?;
-                            chunk_post[m_local][s] = (f32::from_le_bytes(b1), f32::from_le_bytes(b2));
+                            let offset = m_local * 8;
+                            let p1 = f32::from_le_bytes([
+                                post_buf[offset], post_buf[offset + 1],
+                                post_buf[offset + 2], post_buf[offset + 3]
+                            ]);
+                            let p2 = f32::from_le_bytes([
+                                post_buf[offset + 4], post_buf[offset + 5],
+                                post_buf[offset + 6], post_buf[offset + 7]
+                            ]);
+                            chunk_post[m_local][s] = (p1, p2);
                         }
                     }
                 }
 
-                // Write VCF lines for this chunk (now marker-major in RAM)
-                for m_local in 0..chunk_len {
-                    let m = chunk_start + m_local;
-                    let dosages = &chunk_dosages[m_local];
-                    let gts = &chunk_gt[m_local];
-                    let posts = &chunk_post[m_local];
+                // Write VCF lines for entire chunk at once
+                // Clone chunk_post slice for the closure (only the portion we need)
+                let chunk_post_for_closure: Vec<Vec<(f32, f32)>> = if need_allele_probs {
+                    chunk_post[..chunk_len].to_vec()
+                } else {
+                    Vec::new()
+                };
 
-                    let get_dosage = |marker: usize, s: usize| -> f32 {
-                        assert!(marker < n_ref_markers);
-                        dosages[s]
-                    };
-                    let get_best_gt = |marker: usize, s: usize| -> (u8, u8) {
-                        assert!(marker < n_ref_markers);
-                        gts[s]
-                    };
+                let get_dosage = |m: usize, s: usize| -> f32 {
+                    let m_local = m - chunk_start;
+                    chunk_dosages[m_local][s]
+                };
+                let get_best_gt = |m: usize, s: usize| -> (u8, u8) {
+                    let m_local = m - chunk_start;
+                    chunk_gt[m_local][s]
+                };
 
-                    type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
-                    let n_markers_for_assert = n_ref_markers;
-                    let get_posteriors: Option<GetPosteriorsFn> = if need_allele_probs {
-                        let posts_clone = posts.to_vec();
-                        Some(Box::new(move |marker: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
-                            assert!(marker < n_markers_for_assert);
-                            let (p1, p2) = posts_clone[s];
-                            (AllelePosteriors::Biallelic(p1), AllelePosteriors::Biallelic(p2))
-                        }))
-                    } else {
-                        None
-                    };
+                type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
+                let get_posteriors: Option<GetPosteriorsFn> = if need_allele_probs {
+                    let chunk_start_copy = chunk_start;
+                    Some(Box::new(move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
+                        let m_local = m - chunk_start_copy;
+                        let (p1, p2) = chunk_post_for_closure[m_local][s];
+                        (AllelePosteriors::Biallelic(p1), AllelePosteriors::Biallelic(p2))
+                    }))
+                } else {
+                    None
+                };
 
-                    writer.write_imputed_streaming(
-                        &ref_gt,
-                        get_dosage,
-                        get_best_gt,
-                        get_posteriors,
-                        &quality,
-                        m,
-                        m + 1,
-                        self.config.gp,
-                        self.config.ap,
-                    )?;
-                }
+                writer.write_imputed_streaming(
+                    &ref_gt,
+                    get_dosage,
+                    get_best_gt,
+                    get_posteriors,
+                    &quality,
+                    chunk_start,
+                    chunk_end,
+                    self.config.gp,
+                    self.config.ap,
+                )?;
 
                 if chunk_idx % 10 == 0 || chunk_idx == n_chunks - 1 {
                     eprintln!("  Written {} / {} markers", chunk_end, n_ref_markers);
