@@ -1965,9 +1965,11 @@ fn run_hmm_forward_backward_clusters(
                 .unwrap_or(0.0);
             let mismatch_count = mismatches[k].min(n_obs);
             let match_count = (n_obs - mismatch_count).max(0.0);
-            // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
+            // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
+            // Floor at -80 to prevent f32 underflow (exp(-80) ≈ 1.8e-35)
+            let log_emit = match_count * log_p_no_err + mismatch_count * log_p_err;
             let emit = if n_obs > 0.0 {
-                ((match_count * log_p_no_err + mismatch_count * log_p_err) / n_obs).exp()
+                log_emit.max(-80.0).exp()
             } else {
                 1.0
             };
@@ -2006,9 +2008,10 @@ fn run_hmm_forward_backward_clusters(
                     .unwrap_or(0.0);
                 let mismatch_count = mismatches[k].min(n_obs);
                 let match_count = (n_obs - mismatch_count).max(0.0);
-                // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
+                // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
+                let log_emit = match_count * log_p_no_err + mismatch_count * log_p_err;
                 let emit = if n_obs > 0.0 {
-                    ((match_count * log_p_no_err + mismatch_count * log_p_err) / n_obs).exp()
+                    log_emit.max(-80.0).exp()
                 } else {
                     1.0
                 };
@@ -2088,10 +2091,10 @@ pub fn run_hmm_forward_backward_clusters_counts(
                 .unwrap_or(0.0);
             let mism = mism.min(n_obs);
             let match_count = (n_obs - mism).max(0.0);
-            // Geometric mean: treats cluster as single evidence unit while preserving
-            // granular mismatch info. More robust to genotyping errors than Java's binary.
+            // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
+            let log_em = match_count * log_p_no_err + mism * log_p_err;
             let em = if n_obs > 0.0 {
-                ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
+                log_em.max(-80.0).exp()
             } else {
                 1.0
             };
@@ -2127,9 +2130,10 @@ pub fn run_hmm_forward_backward_clusters_counts(
                     .unwrap_or(0.0);
                 let mism = mism.min(n_obs);
                 let match_count = (n_obs - mism).max(0.0);
-                // Geometric mean: treats cluster as single evidence unit
+                // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
+                let log_em = match_count * log_p_no_err + mism * log_p_err;
                 let em = if n_obs > 0.0 {
-                    ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
+                    log_em.max(-80.0).exp()
                 } else {
                     1.0
                 };
