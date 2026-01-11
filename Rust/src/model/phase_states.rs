@@ -207,9 +207,10 @@ impl PhaseStates {
         // Hap is not in queue - try to add it
         self.update_head_of_queue();
 
-        // Only replace when queue is FULL - matches Java BasicPhaseStates behavior
-        // The staleness check determines WHICH entry to replace, not WHETHER to replace
-        let mut inserted = false;
+        // LRU eviction: when queue is full, ALWAYS evict the oldest entry
+        // to make room for the new IBS match. PBWT finds best local matches,
+        // so we must not discard them. This matches Java BasicPhaseStates
+        // where q.poll() always removes the LRU entry at capacity.
         if self.queue.len() < self.max_states {
             // Queue has room - add new entry
             let index = self.queue.len();
@@ -220,46 +221,37 @@ impl PhaseStates {
                 start_marker: 0,
                 last_ibs_marker: marker,
             });
-            inserted = true;
+            self.hap_to_last_ibs.insert(ibs_hap, marker);
         } else if !self.queue.is_empty() {
-            // Queue is full - check if oldest entry is stale enough to replace
-            let oldest = self.queue.peek().unwrap();
-            if (marker - oldest.last_ibs_marker) >= self.min_segment_len as i32 {
-                // Replace the oldest entry
-                let head = self.queue.pop().unwrap();
-                let index = head.comp_hap_idx;
-                let prev_hap = head.hap;
-                let prev_start = head.start_marker;
+            // Queue is full - evict oldest (LRU) to make room for new match
+            let head = self.queue.pop().unwrap();
+            let index = head.comp_hap_idx;
+            let prev_hap = head.hap;
+            let prev_start = head.start_marker;
 
-                // Calculate transition point (midpoint between last seen and current)
-                let next_start = ((head.last_ibs_marker + marker) / 2) as usize;
-                let next_start = next_start.max(prev_start).min(self.n_markers.saturating_sub(1));
+            // Calculate transition point (midpoint between last seen and current)
+            let next_start = ((head.last_ibs_marker + marker) / 2) as usize;
+            let next_start = next_start.max(prev_start).min(self.n_markers.saturating_sub(1));
 
-                // Remove old hap from tracking
-                self.hap_to_last_ibs.remove(&prev_hap);
+            // Remove old hap from tracking
+            self.hap_to_last_ibs.remove(&prev_hap);
 
-                // Add segment to threaded haps if this is the first segment for this state
-                // (later segments are added during finalization)
-                if self.threaded_haps.n_states() <= index {
-                    self.threaded_haps.push_new(prev_hap);
-                }
-                if next_start > prev_start && next_start < self.n_markers {
-                    self.threaded_haps.add_segment(index, ibs_hap, next_start);
-                }
-
-                // Add new entry for the replacement hap
-                self.queue.push(CompHapEntry {
-                    comp_hap_idx: index,
-                    hap: ibs_hap,
-                    start_marker: next_start,
-                    last_ibs_marker: marker,
-                });
-                inserted = true;
+            // Add segment to threaded haps if this is the first segment for this state
+            // (later segments are added during finalization)
+            if self.threaded_haps.n_states() <= index {
+                self.threaded_haps.push_new(prev_hap);
             }
-            // If oldest entry is not stale enough, don't replace - just track the hap
-        }
+            if next_start > prev_start && next_start < self.n_markers {
+                self.threaded_haps.add_segment(index, ibs_hap, next_start);
+            }
 
-        if inserted {
+            // Add new entry for the replacement hap
+            self.queue.push(CompHapEntry {
+                comp_hap_idx: index,
+                hap: ibs_hap,
+                start_marker: next_start,
+                last_ibs_marker: marker,
+            });
             self.hap_to_last_ibs.insert(ibs_hap, marker);
         }
     }
