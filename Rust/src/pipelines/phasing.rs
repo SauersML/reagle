@@ -3683,4 +3683,171 @@ mod tests {
         assert_eq!(phased.n_markers(), n_markers);
         assert_eq!(phased.n_haplotypes(), n_samples * 2);
     }
+
+    #[test]
+    fn test_emit_haploid_constrained_at_het() {
+        // At a het site with genotype {0, 1}, if H2 is fixed to 0,
+        // H1 must be 1. Emission should be high if reference has 1, low if 0.
+        let p_no_err = 0.999;
+        let p_err = 0.001;
+        let conf = 1.0;
+
+        // H2 = 0, so H1 must = 1. Reference has 1 -> high emission
+        let emit_match = emit_haploid_constrained(1, 0, 1, 0, conf, p_no_err, p_err);
+        assert!(emit_match > 0.9, "Expected high emission when ref matches required allele, got {}", emit_match);
+
+        // H2 = 0, so H1 must = 1. Reference has 0 -> low emission
+        let emit_mismatch = emit_haploid_constrained(0, 0, 1, 0, conf, p_no_err, p_err);
+        assert!(emit_mismatch < 0.1, "Expected low emission when ref doesn't match, got {}", emit_mismatch);
+
+        // At homozygous site (fixed_allele = 255), H1 must match genotype
+        let emit_hom = emit_haploid_constrained(0, 0, 0, 255, conf, p_no_err, p_err);
+        assert!(emit_hom > 0.9, "Expected high emission at hom site when ref matches, got {}", emit_hom);
+
+        let emit_hom_mismatch = emit_haploid_constrained(1, 0, 0, 255, conf, p_no_err, p_err);
+        assert!(emit_hom_mismatch < 0.1, "Expected low emission at hom when ref doesn't match, got {}", emit_hom_mismatch);
+    }
+
+    #[test]
+    fn test_emit_haploid_constrained_confidence_blending() {
+        // With low confidence, emission should be closer to 0.5
+        let p_no_err = 0.999;
+        let p_err = 0.001;
+
+        // Full confidence: emission should be ~p_no_err
+        let emit_full_conf = emit_haploid_constrained(1, 0, 1, 0, 1.0, p_no_err, p_err);
+        assert!((emit_full_conf - p_no_err).abs() < 0.01);
+
+        // Zero confidence: emission should be 0.5
+        let emit_zero_conf = emit_haploid_constrained(1, 0, 1, 0, 0.0, p_no_err, p_err);
+        assert!((emit_zero_conf - 0.5).abs() < 0.01, "Expected 0.5 with zero confidence, got {}", emit_zero_conf);
+
+        // Half confidence: emission should be blend
+        let emit_half_conf = emit_haploid_constrained(1, 0, 1, 0, 0.5, p_no_err, p_err);
+        let expected = 0.5 * p_no_err + 0.5 * 0.5;
+        assert!((emit_half_conf - expected).abs() < 0.01, "Expected {}, got {}", expected, emit_half_conf);
+    }
+
+    #[test]
+    fn test_dynamic_mcmc_deterministic_phase() {
+        // Create a scenario where the correct phase is deterministic:
+        // All reference haplotypes have allele 0 at all markers.
+        // Sample genotype is {0, 1} at all markers.
+        // The HMM should consistently set H1 = 0 (matching reference).
+        use crate::model::phase_ibs::BidirectionalPhaseIbs;
+        use crate::model::ibs2::Ibs2;
+
+        let n_markers = 10;
+        let n_ref_haps = 8;
+
+        // Build reference with all 0s
+        let alleles: Vec<Vec<u8>> = (0..n_markers)
+            .map(|_| vec![0u8; n_ref_haps])
+            .collect();
+        let phase_ibs = BidirectionalPhaseIbs::build(alleles, n_ref_haps, n_markers);
+
+        // Empty IBS2
+        let ibs2 = Ibs2::empty(1);
+
+        // Genotype: het at all sites (0/1)
+        let seq1 = vec![0u8; n_markers];
+        let seq2 = vec![1u8; n_markers];
+        let conf = vec![1.0f32; n_markers];
+
+        // p_recomb: low recombination
+        let p_recomb = vec![0.01f32; n_markers];
+
+        let het_positions: Vec<usize> = (0..n_markers).collect();
+
+        let (swap_bits, swap_lr) = sample_dynamic_mcmc(
+            n_markers,
+            n_ref_haps,
+            &p_recomb,
+            &seq1,
+            &seq2,
+            &conf,
+            &phase_ibs,
+            &ibs2,
+            0, // sample_idx
+            &het_positions,
+            12345, // seed
+            5,     // n_mcmc_steps
+            0.999,
+            0.001,
+        );
+
+        // With all reference having allele 0, H1 should be set to 0 at all hets.
+        // Since seq1 = 0, this means no swap (swap_bit = 0).
+        let n_swaps: usize = swap_bits.iter().map(|&b| b as usize).sum();
+
+        // We expect very few or no swaps since reference strongly supports H1 = 0
+        assert!(
+            n_swaps <= 2,
+            "Expected <=2 swaps with consistent reference, got {} swaps out of {} hets",
+            n_swaps,
+            het_positions.len()
+        );
+
+        // LR should be high confidence
+        assert_eq!(swap_lr.len(), het_positions.len());
+    }
+
+    #[test]
+    fn test_dynamic_mcmc_opposite_phase() {
+        // Create a scenario where reference haplotypes all have allele 1.
+        // Sample genotype is {0, 1}. The HMM should set H1 = 1 (matching reference).
+        // Since seq1 = 0 and H1 = 1, we need a swap.
+        use crate::model::phase_ibs::BidirectionalPhaseIbs;
+        use crate::model::ibs2::Ibs2;
+
+        let n_markers = 10;
+        let n_ref_haps = 8;
+
+        // Build reference with all 1s
+        let alleles: Vec<Vec<u8>> = (0..n_markers)
+            .map(|_| vec![1u8; n_ref_haps])
+            .collect();
+        let phase_ibs = BidirectionalPhaseIbs::build(alleles, n_ref_haps, n_markers);
+
+        let ibs2 = Ibs2::empty(1);
+
+        // Genotype: het at all sites (0/1)
+        let seq1 = vec![0u8; n_markers];
+        let seq2 = vec![1u8; n_markers];
+        let conf = vec![1.0f32; n_markers];
+        let p_recomb = vec![0.01f32; n_markers];
+        let het_positions: Vec<usize> = (0..n_markers).collect();
+
+        let (swap_bits, swap_lr) = sample_dynamic_mcmc(
+            n_markers,
+            n_ref_haps,
+            &p_recomb,
+            &seq1,
+            &seq2,
+            &conf,
+            &phase_ibs,
+            &ibs2,
+            0,
+            &het_positions,
+            12345,
+            5,
+            0.999,
+            0.001,
+        );
+
+        // With all reference having allele 1, H1 should be set to 1 at all hets.
+        // Since seq1 = 0, this means swap (swap_bit = 1).
+        let n_swaps: usize = swap_bits.iter().map(|&b| b as usize).sum();
+
+        // We expect most or all to swap since reference strongly supports H1 = 1
+        assert!(
+            n_swaps >= n_markers - 2,
+            "Expected >={} swaps with opposite reference, got {} swaps",
+            n_markers - 2,
+            n_swaps
+        );
+
+        // Verify LR values exist
+        assert_eq!(swap_lr.len(), het_positions.len());
+    }
 }

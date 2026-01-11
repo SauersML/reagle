@@ -89,6 +89,15 @@ impl Ibs2 {
         }
     }
 
+    /// Create an empty IBS2 structure with no segments.
+    /// Useful for testing or when IBS2 detection is not needed.
+    #[cfg(test)]
+    pub fn empty(n_samples: usize) -> Self {
+        Self {
+            sample_segs: vec![Vec::new(); n_samples],
+        }
+    }
+
     /// Build IBS2 segments for a single sample.
     ///
     /// Pipeline:
