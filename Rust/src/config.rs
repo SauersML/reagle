@@ -46,7 +46,7 @@ pub struct Config {
 
     // ============ Phasing Parameters ============
     /// Maximum burn-in iterations
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "6")]
     pub burnin: usize,
 
     /// Phasing iterations
@@ -54,11 +54,11 @@ pub struct Config {
     pub iterations: usize,
 
     /// MCMC burn-in sweeps (lets the chain mix before sampling)
-    #[arg(long = "mcmc-burnin", default_value = "1")]
+    #[arg(long = "mcmc-burnin", default_value = "2")]
     pub mcmc_burnin: usize,
 
-    /// Model states for phasing
-    #[arg(long = "phase-states", default_value = "280")]
+    /// Model states for phasing (more states = better accuracy)
+    #[arg(long = "phase-states", default_value = "400")]
     pub phase_states: usize,
 
     /// Rare variant frequency threshold

@@ -2577,7 +2577,8 @@ fn sample_path_from_checkpoints(
             let next_state = current_state.unwrap();
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
             let shift = r / n_states as f32;
-            let stay = 1.0 - r;
+            // Li-Stephens: P(stay) = (1-r) + r/K, P(switch) = r/K
+            let stay = (1.0 - r) + shift;
             let row_idx = (m - 1 - start) * row_stride;
             let prev_row = &fwd_buf[row_idx..row_idx + row_stride];
 
