@@ -11,6 +11,8 @@ pub struct ImpWorkspace {
     pub fwd: Vec<f32>,
     /// Backward probabilities
     pub bwd: Vec<f32>,
+    /// Pre-computed emissions (clusters × states)
+    pub emissions: Vec<f32>,
 }
 
 impl ImpWorkspace {
@@ -19,6 +21,7 @@ impl ImpWorkspace {
         Self {
             fwd: vec![0.0; n_states],
             bwd: vec![0.0; n_states],
+            emissions: Vec::new(),
         }
     }
 
