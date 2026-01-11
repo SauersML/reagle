@@ -426,6 +426,104 @@ fn bench_imputation_e2e(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark PBWT forward and backward updates
+fn bench_pbwt_update(c: &mut Criterion) {
+    use reagle::model::pbwt::PbwtDivUpdater;
+
+    let mut group = c.benchmark_group("pbwt_update");
+
+    for n_haps in [1000, 5000, 20000] {
+        group.throughput(Throughput::Elements(n_haps as u64));
+
+        // Create random-ish biallelic alleles
+        let alleles: Vec<u8> = (0..n_haps).map(|i| ((i * 7 + 13) % 2) as u8).collect();
+        let n_alleles = 2usize;
+
+        group.bench_with_input(
+            BenchmarkId::new("fwd", n_haps),
+            &(alleles.clone(), n_alleles),
+            |b, (alleles, n_alleles)| {
+                let mut updater = PbwtDivUpdater::new(n_haps);
+                let mut prefix: Vec<u32> = (0..n_haps as u32).collect();
+                let mut divergence: Vec<i32> = vec![0; n_haps + 1];
+                b.iter(|| {
+                    // Reset state for each iteration
+                    for (i, p) in prefix.iter_mut().enumerate() {
+                        *p = i as u32;
+                    }
+                    divergence.fill(0);
+                    updater.fwd_update(
+                        black_box(alleles),
+                        black_box(*n_alleles),
+                        black_box(50),
+                        black_box(&mut prefix),
+                        black_box(&mut divergence),
+                    );
+                    black_box(prefix.len())
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("bwd", n_haps),
+            &(alleles.clone(), n_alleles),
+            |b, (alleles, n_alleles)| {
+                let mut updater = PbwtDivUpdater::new(n_haps);
+                let mut prefix: Vec<u32> = (0..n_haps as u32).collect();
+                let mut divergence: Vec<i32> = vec![100; n_haps + 1];
+                b.iter(|| {
+                    for (i, p) in prefix.iter_mut().enumerate() {
+                        *p = i as u32;
+                    }
+                    divergence.fill(100);
+                    updater.bwd_update(
+                        black_box(alleles),
+                        black_box(*n_alleles),
+                        black_box(50),
+                        black_box(&mut prefix),
+                        black_box(&mut divergence),
+                    );
+                    black_box(prefix.len())
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark BidirectionalPhaseIbs position lookups and best_match_span
+fn bench_phase_ibs_operations(c: &mut Criterion) {
+    use reagle::model::phase_ibs::BidirectionalPhaseIbs;
+
+    let mut group = c.benchmark_group("phase_ibs");
+    group.sample_size(50);
+
+    let n_haps = 2000;
+    let n_markers = 500;
+
+    // Build PBWT from random-ish allele data
+    let alleles: Vec<Vec<u8>> = (0..n_markers)
+        .map(|m| (0..n_haps).map(|h| ((m * 7 + h * 13) % 2) as u8).collect())
+        .collect();
+
+    let pbwt = BidirectionalPhaseIbs::build(alleles, n_haps, n_markers);
+
+    group.throughput(Throughput::Elements(100)); // 100 lookups
+
+    group.bench_function("best_match_span_100", |b| {
+        b.iter(|| {
+            let mut total_span = 0usize;
+            for hap in 0..100u32 {
+                total_span += pbwt.best_match_span(hap, n_markers / 2);
+            }
+            black_box(total_span)
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fwd_update,
@@ -437,6 +535,8 @@ criterion_group!(
     bench_priority_queue,
     bench_hashmap_vs_vec,
     bench_imputation_e2e,
+    bench_pbwt_update,
+    bench_phase_ibs_operations,
 );
 
 criterion_main!(benches);
