@@ -2589,6 +2589,11 @@ fn emit_haploid_constrained(
     p_no_err: f32,
     p_err: f32,
 ) -> f32 {
+    // Missing data: return neutral emission (no information)
+    if geno_a1 == 255 || geno_a2 == 255 {
+        return 1.0;
+    }
+
     // At homozygous sites (fixed_allele == 255), both alleles are same
     // so H1 must emit geno_a1
     // At heterozygous sites, H1 must emit the allele opposite to fixed_allele
@@ -3149,9 +3154,10 @@ fn sample_dynamic_mcmc(
         return (Vec::new(), Vec::new());
     }
 
-    // Path stores the sampled reference state index at each marker
-    // Initialize to reference the first neighbor (will be overwritten)
-    let mut path = vec![0u32; n_markers];
+    // Separate paths for H1 and H2 to avoid cross-talk in Gibbs sampling
+    // Each haplotype's neighbor selection should use its own previous latent state
+    let mut path1 = vec![0u32; n_markers];
+    let mut path2 = vec![0u32; n_markers];
     let mut fixed_allele = vec![255u8; n_markers];
 
     // Current set of neighbors (reused across markers within an MCMC step)
@@ -3162,14 +3168,14 @@ fn sample_dynamic_mcmc(
         // === Sample H1 | (G, H2_fixed) ===
 
         // 1. Select neighbors using "Latent State" approach:
-        //    Use the previously sampled state at a marker to find neighbors
+        //    Use H1's previously sampled state at a marker to find neighbors
         //    Vary the marker position across steps for robustness
         let center_marker = if n_mcmc_steps > 1 {
             n_markers / 4 + step * n_markers / (2 * n_mcmc_steps)
         } else {
             n_markers / 2
         };
-        let prev_state = path[center_marker] as usize;
+        let prev_state = path1[center_marker] as usize;
         if prev_state < neighbors.len() {
             let ref_hap = neighbors[prev_state];
             neighbors = phase_ibs.find_neighbors_of_state(ref_hap, center_marker, sample_idx, n_states);
@@ -3189,9 +3195,9 @@ fn sample_dynamic_mcmc(
             }
         }
 
-        // 3. Run haploid FFBS
+        // 3. Run haploid FFBS for H1
         ffbs_haploid_constrained(
-            &mut path, n_markers, neighbors.len(), p_recomb,
+            &mut path1, n_markers, neighbors.len(), p_recomb,
             seq1, seq2, conf, &fixed_allele, &neighbors,
             phase_ibs, p_no_err, p_err, &mut rng
         );
@@ -3200,7 +3206,7 @@ fn sample_dynamic_mcmc(
         //    GIBBS SAMPLING: only update H1, leave H2 fixed
         //    At hets, set H1 to match the reference's allele (if compatible).
         for m in 0..n_markers {
-            let state = path[m] as usize;
+            let state = path1[m] as usize;
             let a1 = seq1[m];
             let a2 = seq2[m];
 
@@ -3222,8 +3228,8 @@ fn sample_dynamic_mcmc(
 
         // === Sample H2 | (G, H1_new) ===
 
-        // 1. Select neighbors for H2 using latent state
-        let prev_state = path[center_marker] as usize;
+        // 1. Select neighbors for H2 using H2's own latent state (not H1's!)
+        let prev_state = path2[center_marker] as usize;
         if prev_state < neighbors.len() {
             let ref_hap = neighbors[prev_state];
             neighbors = phase_ibs.find_neighbors_of_state(ref_hap, center_marker, sample_idx, n_states);
@@ -3243,9 +3249,9 @@ fn sample_dynamic_mcmc(
             }
         }
 
-        // 3. Run haploid FFBS
+        // 3. Run haploid FFBS for H2
         ffbs_haploid_constrained(
-            &mut path, n_markers, neighbors.len(), p_recomb,
+            &mut path2, n_markers, neighbors.len(), p_recomb,
             seq1, seq2, conf, &fixed_allele, &neighbors,
             phase_ibs, p_no_err, p_err, &mut rng
         );
@@ -3292,9 +3298,9 @@ fn sample_dynamic_mcmc(
         let swap = h1_alleles[m] != a1;
         swap_bits.push(if swap { 1 } else { 0 });
 
-        // Compute LR from the reference allele at this position
-        let ref_al = if (path[m] as usize) < neighbors.len() {
-            phase_ibs.allele(m, neighbors[path[m] as usize])
+        // Compute LR from the reference allele at this position (use H1's path)
+        let ref_al = if (path1[m] as usize) < neighbors.len() {
+            phase_ibs.allele(m, neighbors[path1[m] as usize])
         } else {
             255
         };
