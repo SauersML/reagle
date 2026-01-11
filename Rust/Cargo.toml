@@ -47,8 +47,8 @@ tempfile = "3.24.0"
 flate2 = "1.0"
 
 [build-dependencies]
-grep = "0.4.1"
-walkdir = "2.5.0"
+grep = "0.4"
+walkdir = "2.5"
 
 [profile.release]
 lto = true
