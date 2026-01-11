@@ -443,7 +443,7 @@ mod tests {
         let cursor = MosaicCursor::from_threaded(&th);
         let mut scratch = AlleleScratch::new(3);
 
-        scratch.materialize(&cursor, 5, |marker, h| if marker > 0 { h as u8 } else { h as u8 });
+        scratch.materialize(&cursor, 5, |_, h| h as u8);
 
         assert_eq!(scratch.alleles[0], 0);
         assert_eq!(scratch.alleles[1], 1);

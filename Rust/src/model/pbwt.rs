@@ -475,8 +475,8 @@ mod tests {
 
         for marker in 0..5 {
             let alleles = vec![
-                if marker == 0 { 0u8 } else { 0 },  // hap 0
-                if marker == 0 { 0 } else { 0 },     // hap 1
+                0u8,                                 // hap 0: always 0
+                0,                                   // hap 1: always 0
                 if marker < 1 { 1 } else { 0 },      // hap 2: 1 at m0
                 if marker < 2 { 1 } else { 0 },      // hap 3: 1 at m0,m1
             ];

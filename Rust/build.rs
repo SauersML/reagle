@@ -78,6 +78,12 @@ struct TodoCommentCollector {
     file_path: PathBuf,
 }
 
+// A custom collector for meaningless conditionals where both branches are identical
+struct MeaninglessConditionalCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn warnings_enabled() -> bool {
@@ -614,6 +620,42 @@ impl TodoCommentCollector {
     }
 }
 
+impl MeaninglessConditionalCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} meaningless conditionals in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ Meaningless conditionals (identical if/else branches) are STRICTLY FORBIDDEN.\n",
+        );
+        error_msg.push_str("   Either remove the conditional entirely or ensure branches differ.\n");
+        error_msg.push_str(
+            "   If-else with same result is an anti-pattern to make unused variables appear used.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
 // Implement the `Sink` trait for our collector.
 // The `matched` method is called by the searcher for every line that matches the regex.
 impl Sink for ViolationCollector {
@@ -1124,6 +1166,64 @@ impl Sink for TodoCommentCollector {
     }
 }
 
+impl Sink for MeaninglessConditionalCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        // Skip pure comments
+        let trimmed = line_text.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            return Ok(true);
+        }
+
+        // Extract the two branches from the if-else expression
+        // Pattern: if COND { BRANCH1 } else { BRANCH2 }
+        if let Some((branch1, branch2)) = extract_if_else_branches(line_text) {
+            let b1 = branch1.trim();
+            let b2 = branch2.trim();
+            if b1 == b2 && !b1.is_empty() {
+                self.violations.push(format!("{line_number}:{line_text}"));
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+// Helper function to extract branches from a single-line if-else expression
+fn extract_if_else_branches(line: &str) -> Option<(String, String)> {
+    // Find "if" followed by condition and two brace-delimited blocks
+    let if_pos = line.find("if ")?;
+    let rest = &line[if_pos..];
+
+    // Find the first opening brace (start of then-branch)
+    let first_open = rest.find('{')?;
+    let after_first_open = &rest[first_open + 1..];
+
+    // Find the matching close brace for the then-branch
+    // Simple approach: find first } (works for single expressions)
+    let first_close = after_first_open.find('}')?;
+    let branch1 = &after_first_open[..first_close];
+
+    // Now look for "else {"
+    let after_first_block = &after_first_open[first_close + 1..];
+    let else_pos = after_first_block.find("else")?;
+    let after_else = &after_first_block[else_pos + 4..];
+
+    // Find the opening brace after else
+    let second_open = after_else.find('{')?;
+    let after_second_open = &after_else[second_open + 1..];
+
+    // Find the closing brace
+    let second_close = after_second_open.find('}')?;
+    let branch2 = &after_second_open[..second_close];
+
+    Some((branch1.to_string(), branch2.to_string()))
+}
+
 #[derive(Clone, Debug)]
 enum EmptyBlockTokenKind {
     Ident(String),
@@ -1282,6 +1382,16 @@ fn main() {
     );
     emit_stage_detail(&todo_report);
     all_violations.extend(todo_violations);
+
+    // Scan for meaningless conditionals (same branches)
+    update_stage("scan meaningless conditionals");
+    let meaningless_cond_violations = scan_for_meaningless_conditionals();
+    let meaningless_cond_report = format!(
+        "meaningless conditional scan identified {} violation groups",
+        meaningless_cond_violations.len()
+    );
+    emit_stage_detail(&meaningless_cond_report);
+    all_violations.extend(meaningless_cond_violations);
 
     // If any violations were found, print them all and exit with error
     if !all_violations.is_empty() {
@@ -2189,6 +2299,53 @@ fn scan_for_debug_assert_usage() -> Vec<String> {
         Err(e) => {
             all_violations.push(format!(
                 "Error creating debug_assert regex matcher: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_meaningless_conditionals() -> Vec<String> {
+    // Match single-line if-else expressions to find candidates
+    // The Sink implementation will then compare the branches
+    let pattern = r"if\s+.+\s*\{[^}]+\}\s*else\s*\{[^}]+\}";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = MeaninglessConditionalCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating meaningless conditional regex matcher: {}",
                 e
             ));
         }
