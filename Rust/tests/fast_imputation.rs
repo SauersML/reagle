@@ -294,38 +294,7 @@ fn compute_mean_dr2(dr2_values: &[f64]) -> f64 {
 
 // --- Helper for Config ---
 fn default_test_config() -> Config {
-    Config {
-        gt: PathBuf::from(""),
-        r#ref: None,
-        out: PathBuf::from(""),
-        map: None,
-        chrom: None,
-        excludesamples: None,
-        excludemarkers: None,
-        burnin: 6,
-        iterations: 12,
-        mcmc_burnin: 2,
-        phase_states: 400,
-        rare: 0.002,
-        impute: true,
-        imp_states: 1600,
-        imp_segment: 6.0,
-        imp_step: 0.1,
-        imp_nsteps: 7,
-        cluster: 0.005,
-        ap: false,
-        gp: false,
-        ne: 100000.0,
-        err: None,
-        em: true,
-        window: 40.0,
-        window_markers: 4000000,
-        overlap: 2.0,
-        streaming: None,
-        seed: -99999,
-        nthreads: None,
-        profile: false,
-    }
+    Config::default()
 }
 
 // --- Tests ---
