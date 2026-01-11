@@ -2389,10 +2389,6 @@ fn emit_combined_fast(ref_al: u8, mode: CombinedEmitMode, conf: f32, p_no_err: f
     base * conf + 0.5 * (1.0 - conf)
 }
 
-#[inline]
-fn emit_combined(ref_al: u8, a1: u8, a2: u8, conf: f32, p_no_err: f32, p_err: f32) -> f32 {
-    emit_combined_fast(ref_al, classify_combined(a1, a2), conf, p_no_err, p_err)
-}
 
 #[derive(Clone, Copy, Debug)]
 enum EmissionMode {
@@ -2580,6 +2576,8 @@ fn sample_path_from_checkpoints(
     fwd_block: &mut [f32],
     mode: EmissionMode,
 ) {
+    use wide::f32x8;
+
     if n_markers == 0 || n_states == 0 {
         return;
     }
@@ -2589,6 +2587,7 @@ fn sample_path_from_checkpoints(
     let mut current_state: Option<usize> = None;
 
     let mut weights = vec![0.0f32; n_states];
+    let mut ref_alleles = vec![0u8; n_states];
 
     for block_idx in (0..n_blocks).rev() {
         let start = block_idx * block_size;
@@ -2616,24 +2615,85 @@ fn sample_path_from_checkpoints(
             let (prev_part, curr_part) = fwd_buf.split_at_mut(row_idx);
             let prev_row = &prev_part[row_idx - row_stride..];
 
-            let mut row_sum = 0.0f32;
+            // Batch lookup ref alleles
             for k in 0..n_states {
-                let prior = scale * prev_row[k] + shift;
-                let ref_al = lookup.allele(m, k);
-                let emit = match mode {
-                    EmissionMode::Combined => emit_combined(ref_al, a1, a2, conf_m, p_no_err, p_err),
-                    EmissionMode::Hap => {
-                        if hap2_use_combined[m] {
-                            emit_combined(ref_al, a1, a2, conf_m, p_no_err, p_err)
-                        } else {
-                            emit_prob(ref_al, hap2_allele[m], conf_m, p_no_err, p_err)
-                        }
-                    }
-                };
-                curr_part[k] = prior * emit;
-                row_sum += curr_part[k];
+                ref_alleles[k] = lookup.allele(m, k);
             }
-            prev_sum = row_sum.max(1e-30);
+
+            // SIMD-optimized forward update
+            let shift_vec = f32x8::splat(shift);
+            let scale_vec = f32x8::splat(scale);
+            let mut sum_vec = f32x8::splat(0.0);
+            let mut k = 0;
+
+            let use_combined = matches!(mode, EmissionMode::Combined) || hap2_use_combined[m];
+
+            if use_combined {
+                let emit_mode = classify_combined(a1, a2);
+                while k + 8 <= n_states {
+                    let prev_arr: [f32; 8] = prev_row[k..k+8].try_into().unwrap();
+                    let prev_vec = f32x8::from(prev_arr);
+                    let prior_vec = scale_vec * prev_vec + shift_vec;
+
+                    let emit_arr = [
+                        emit_combined_fast(ref_alleles[k], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_alleles[k+1], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_alleles[k+2], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_alleles[k+3], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_alleles[k+4], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_alleles[k+5], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_alleles[k+6], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_alleles[k+7], emit_mode, conf_m, p_no_err, p_err),
+                    ];
+                    let emit_vec = f32x8::from(emit_arr);
+
+                    let res = prior_vec * emit_vec;
+                    let res_arr: [f32; 8] = res.into();
+                    curr_part[k..k+8].copy_from_slice(&res_arr);
+                    sum_vec += res;
+                    k += 8;
+                }
+                prev_sum = sum_vec.reduce_add();
+                for i in k..n_states {
+                    let prior = scale * prev_row[i] + shift;
+                    let emit = emit_combined_fast(ref_alleles[i], emit_mode, conf_m, p_no_err, p_err);
+                    curr_part[i] = prior * emit;
+                    prev_sum += curr_part[i];
+                }
+            } else {
+                let h2_al = hap2_allele[m];
+                while k + 8 <= n_states {
+                    let prev_arr: [f32; 8] = prev_row[k..k+8].try_into().unwrap();
+                    let prev_vec = f32x8::from(prev_arr);
+                    let prior_vec = scale_vec * prev_vec + shift_vec;
+
+                    let emit_arr = [
+                        emit_prob(ref_alleles[k], h2_al, conf_m, p_no_err, p_err),
+                        emit_prob(ref_alleles[k+1], h2_al, conf_m, p_no_err, p_err),
+                        emit_prob(ref_alleles[k+2], h2_al, conf_m, p_no_err, p_err),
+                        emit_prob(ref_alleles[k+3], h2_al, conf_m, p_no_err, p_err),
+                        emit_prob(ref_alleles[k+4], h2_al, conf_m, p_no_err, p_err),
+                        emit_prob(ref_alleles[k+5], h2_al, conf_m, p_no_err, p_err),
+                        emit_prob(ref_alleles[k+6], h2_al, conf_m, p_no_err, p_err),
+                        emit_prob(ref_alleles[k+7], h2_al, conf_m, p_no_err, p_err),
+                    ];
+                    let emit_vec = f32x8::from(emit_arr);
+
+                    let res = prior_vec * emit_vec;
+                    let res_arr: [f32; 8] = res.into();
+                    curr_part[k..k+8].copy_from_slice(&res_arr);
+                    sum_vec += res;
+                    k += 8;
+                }
+                prev_sum = sum_vec.reduce_add();
+                for i in k..n_states {
+                    let prior = scale * prev_row[i] + shift;
+                    let emit = emit_prob(ref_alleles[i], h2_al, conf_m, p_no_err, p_err);
+                    curr_part[i] = prior * emit;
+                    prev_sum += curr_part[i];
+                }
+            }
+            prev_sum = prev_sum.max(1e-30);
         }
 
         if current_state.is_none() {
@@ -2652,10 +2712,26 @@ fn sample_path_from_checkpoints(
             let row_idx = (m - 1 - start) * row_stride;
             let prev_row = &fwd_buf[row_idx..row_idx + row_stride];
 
-            for k in 0..n_states {
-                let trans = if k == next_state { stay } else { shift };
-                weights[k] = prev_row[k] * trans;
+            // SIMD-optimized weight computation
+            let shift_vec = f32x8::splat(shift);
+            let mut k = 0;
+            while k + 8 <= n_states {
+                let prev_arr: [f32; 8] = prev_row[k..k+8].try_into().unwrap();
+                let prev_vec = f32x8::from(prev_arr);
+                // Most states get shift transition
+                let res = prev_vec * shift_vec;
+                let res_arr: [f32; 8] = res.into();
+                weights[k..k+8].copy_from_slice(&res_arr);
+                k += 8;
             }
+            for i in k..n_states {
+                weights[i] = prev_row[i] * shift;
+            }
+            // Fix up the stay state
+            if next_state < n_states {
+                weights[next_state] = prev_row[next_state] * stay;
+            }
+
             let sampled = sample_from_weights(&weights, rng);
             path[m - 1] = sampled as u32;
             current_state = Some(sampled);
