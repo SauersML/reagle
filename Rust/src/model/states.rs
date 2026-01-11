@@ -131,37 +131,76 @@ impl ThreadedHaps {
         self.segments_hap[cur]
     }
 
-    /// Batch materialize haplotypes for all states at a given marker.
+    /// Reset cursors for all states (for new iteration pass)
+    pub fn reset_cursors(&mut self) {
+        self.state_cursors.copy_from_slice(&self.state_heads);
+    }
+
+    /// Materialize haplotypes for a single marker without mutating cursors.
     ///
-    /// This is more efficient than calling `hap_at_raw()` for each state because:
-    /// 1. Single marker bounds check amortized across all states
-    /// 2. Better cache locality - processes all states together
-    /// 3. Output buffer can be used directly by SIMD kernels
+    /// This method takes `&self` (immutable) since it walks the segment linked lists
+    /// from scratch without using the internal cursors. O(segments) per call.
     ///
-    /// # Arguments
-    /// * `marker` - The marker index to query
-    /// * `out` - Output buffer to fill with haplotype indices (must be len >= n_states)
+    /// Use this for sparse access patterns (Stage 2). For dense access across all
+    /// markers, prefer `materialize_all()` which is O(markers + segments) total.
     #[inline]
-    pub fn materialize_haps(&mut self, marker: usize, out: &mut [u32]) {
+    pub fn materialize_at(&self, marker: usize, out: &mut [u32]) {
         let n_states = self.state_heads.len();
         assert!(out.len() >= n_states);
 
         for state_idx in 0..n_states {
-            let cur = self.state_cursors[state_idx] as usize;
+            let mut cur = self.state_heads[state_idx] as usize;
 
-            // Fast path: within current segment
-            if marker < self.segments_end[cur] as usize {
-                out[state_idx] = self.segments_hap[cur];
-            } else {
-                // Slow path: advance and store
-                out[state_idx] = self.advance_cursor_slow(state_idx, cur, marker);
+            // Walk linked list to find segment containing marker
+            while marker >= self.segments_end[cur] as usize {
+                let next = self.segments_next[cur];
+                if next == Self::NIL {
+                    break;
+                }
+                cur = next as usize;
             }
+
+            out[state_idx] = self.segments_hap[cur];
         }
     }
 
-    /// Reset cursors for all states (for new iteration pass)
-    pub fn reset_cursors(&mut self) {
-        self.state_cursors.copy_from_slice(&self.state_heads);
+    /// Materialize all haplotypes for all markers without mutating cursors.
+    ///
+    /// Returns a Vec<Vec<u32>> where result[m][k] = haplotype for state k at marker m.
+    /// This method takes `&self` (immutable) since it walks the segment linked lists
+    /// from scratch without using the internal cursors.
+    ///
+    /// This is more efficient than cloning ThreadedHaps and calling materialize_haps
+    /// repeatedly when you need all markers.
+    pub fn materialize_all(&self) -> Vec<Vec<u32>> {
+        let n_states = self.state_heads.len();
+        let n_markers = self.n_markers;
+
+        // Pre-allocate output
+        let mut result = vec![vec![0u32; n_states]; n_markers];
+
+        // For each state, walk its segment list once
+        for state_idx in 0..n_states {
+            let mut cur = self.state_heads[state_idx] as usize;
+            let mut seg_end = self.segments_end[cur] as usize;
+            let mut hap = self.segments_hap[cur];
+
+            for m in 0..n_markers {
+                // Advance to next segment if needed
+                while m >= seg_end {
+                    let next = self.segments_next[cur];
+                    if next == Self::NIL {
+                        break;
+                    }
+                    cur = next as usize;
+                    seg_end = self.segments_end[cur] as usize;
+                    hap = self.segments_hap[cur];
+                }
+                result[m][state_idx] = hap;
+            }
+        }
+
+        result
     }
 }
 
