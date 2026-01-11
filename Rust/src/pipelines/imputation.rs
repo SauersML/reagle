@@ -2089,6 +2089,16 @@ pub fn run_hmm_forward_backward_clusters_counts(
     let p_no_err = 1.0 - p_err;
     let log_p_err = p_err.ln();
     let log_p_no_err = p_no_err.ln();
+
+    // Helper to compute emission for one state
+    #[inline(always)]
+    fn compute_emit(mism: f32, n_obs: f32, log_p_no_err: f32, log_p_err: f32) -> f32 {
+        let mism = mism.min(n_obs);
+        let match_count = (n_obs - mism).max(0.0);
+        let log_em = match_count * log_p_no_err + mism * log_p_err;
+        if n_obs > 0.0 { log_em.max(-80.0).exp() } else { 1.0 }
+    }
+
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
@@ -2096,33 +2106,68 @@ pub fn run_hmm_forward_backward_clusters_counts(
 
         let row_offset = m * n_states;
         let prev_offset = if m > 0 { (m - 1) * n_states } else { 0 };
-        let mut sum = 0.0f32;
 
-        for k in 0..n_states {
-            let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0.0);
-            let n_obs = cluster_non_missing
-                .get(m)
-                .and_then(|row| row.get(k))
-                .copied()
-                .unwrap_or(0.0);
-            let mism = mism.min(n_obs);
-            let match_count = (n_obs - mism).max(0.0);
-            // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
-            let log_em = match_count * log_p_no_err + mism * log_p_err;
-            let em = if n_obs > 0.0 {
-                log_em.max(-80.0).exp()
-            } else {
-                1.0
-            };
-            let val = if m == 0 {
-                em / n_states as f32
-            } else {
-                em * (scale * fwd[prev_offset + k] + shift)
-            };
-            fwd[row_offset + k] = val;
-            sum += val;
+        let mismatches = &cluster_mismatches[m];
+        let non_missing = &cluster_non_missing[m];
+
+        if m == 0 {
+            // First cluster: uniform prior * emission (no SIMD benefit for scalar prior)
+            let prior = 1.0 / n_states as f32;
+            let mut sum = 0.0f32;
+            for k in 0..n_states {
+                let mism = mismatches.get(k).copied().unwrap_or(0.0);
+                let n_obs = non_missing.get(k).copied().unwrap_or(0.0);
+                let em = compute_emit(mism, n_obs, log_p_no_err, log_p_err);
+                let val = em * prior;
+                fwd[row_offset + k] = val;
+                sum += val;
+            }
+            last_sum = sum.max(1e-30);
+        } else {
+            // SIMD-optimized: compute emissions on-the-fly in chunks of 8
+            let shift_vec = f32x8::splat(shift);
+            let scale_vec = f32x8::splat(scale);
+            let mut sum_vec = f32x8::splat(0.0);
+
+            let mut k = 0;
+            while k + 8 <= n_states {
+                // Compute 8 emissions on-the-fly (no storage)
+                let emit_arr = [
+                    compute_emit(mismatches.get(k).copied().unwrap_or(0.0), non_missing.get(k).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                    compute_emit(mismatches.get(k+1).copied().unwrap_or(0.0), non_missing.get(k+1).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                    compute_emit(mismatches.get(k+2).copied().unwrap_or(0.0), non_missing.get(k+2).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                    compute_emit(mismatches.get(k+3).copied().unwrap_or(0.0), non_missing.get(k+3).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                    compute_emit(mismatches.get(k+4).copied().unwrap_or(0.0), non_missing.get(k+4).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                    compute_emit(mismatches.get(k+5).copied().unwrap_or(0.0), non_missing.get(k+5).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                    compute_emit(mismatches.get(k+6).copied().unwrap_or(0.0), non_missing.get(k+6).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                    compute_emit(mismatches.get(k+7).copied().unwrap_or(0.0), non_missing.get(k+7).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                ];
+                let emit_vec = f32x8::from(emit_arr);
+
+                // Load previous forward values
+                let prev_arr: [f32; 8] = fwd[prev_offset + k..prev_offset + k + 8].try_into().unwrap();
+                let prev_vec = f32x8::from(prev_arr);
+
+                // fwd = emit * (scale * prev + shift)
+                let res = emit_vec * (scale_vec * prev_vec + shift_vec);
+                let res_arr: [f32; 8] = res.into();
+                fwd[row_offset + k..row_offset + k + 8].copy_from_slice(&res_arr);
+                sum_vec += res;
+                k += 8;
+            }
+
+            let mut sum = sum_vec.reduce_add();
+            // Scalar tail
+            for i in k..n_states {
+                let mism = mismatches.get(i).copied().unwrap_or(0.0);
+                let n_obs = non_missing.get(i).copied().unwrap_or(0.0);
+                let em = compute_emit(mism, n_obs, log_p_no_err, log_p_err);
+                let val = em * (scale * fwd[prev_offset + i] + shift);
+                fwd[row_offset + i] = val;
+                sum += val;
+            }
+            last_sum = sum.max(1e-30);
         }
-        last_sum = sum.max(1e-30);
     }
 
     let bwd = &mut workspace.bwd;
