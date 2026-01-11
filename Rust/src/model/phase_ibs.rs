@@ -54,6 +54,11 @@ pub struct BidirectionalPhaseIbs {
     bwd_div: Vec<Vec<i32>>,
     /// Backward prefix array at each marker
     bwd_ppa: Vec<Vec<u32>>,
+    /// Inverse index for forward PPA: fwd_pos[m][h] = position of haplotype h in fwd_ppa[m]
+    /// Enables O(1) position lookup instead of O(n_haps) linear search.
+    fwd_pos: Vec<Vec<u32>>,
+    /// Inverse index for backward PPA: bwd_pos[m][h] = position of haplotype h in bwd_ppa[m]
+    bwd_pos: Vec<Vec<u32>>,
     /// Total number of haplotypes in the PBWT
     n_haps: usize,
     /// Number of markers in the PBWT (may be subset of full chromosome)
@@ -79,8 +84,10 @@ impl BidirectionalPhaseIbs {
     ) -> Self {
         let mut fwd_div = Vec::with_capacity(n_markers);
         let mut fwd_ppa = Vec::with_capacity(n_markers);
+        let mut fwd_pos = Vec::with_capacity(n_markers);
         let mut bwd_div = vec![Vec::new(); n_markers];
         let mut bwd_ppa = vec![Vec::new(); n_markers];
+        let mut bwd_pos = vec![Vec::new(); n_markers];
         let mut n_alleles_by_marker = vec![2usize; n_markers];
 
         let mut updater = PbwtDivUpdater::new(n_haps);
@@ -92,6 +99,13 @@ impl BidirectionalPhaseIbs {
             let n_alleles = normalize_pbwt_alleles(&mut alleles[m]);
             n_alleles_by_marker[m] = n_alleles;
             updater.fwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
+
+            // Build inverse index: fwd_pos[m][h] = position of haplotype h in fwd_ppa[m]
+            let mut pos = vec![0u32; n_haps];
+            for (i, &h) in ppa.iter().enumerate() {
+                pos[h as usize] = i as u32;
+            }
+            fwd_pos.push(pos);
             fwd_ppa.push(ppa.clone());
             fwd_div.push(div[..n_haps].to_vec());
         }
@@ -102,6 +116,13 @@ impl BidirectionalPhaseIbs {
         for m in (0..n_markers).rev() {
             let n_alleles = n_alleles_by_marker[m];
             updater.bwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
+
+            // Build inverse index: bwd_pos[m][h] = position of haplotype h in bwd_ppa[m]
+            let mut pos = vec![0u32; n_haps];
+            for (i, &h) in ppa.iter().enumerate() {
+                pos[h as usize] = i as u32;
+            }
+            bwd_pos[m] = pos;
             bwd_ppa[m] = ppa.clone();
             bwd_div[m] = div[..n_haps].to_vec();
         }
@@ -111,6 +132,8 @@ impl BidirectionalPhaseIbs {
             fwd_ppa,
             bwd_div,
             bwd_ppa,
+            fwd_pos,
+            bwd_pos,
             n_haps,
             n_markers,
             subset_to_global: None,
@@ -220,33 +243,13 @@ impl BidirectionalPhaseIbs {
     /// Uses adjacent PBWT neighbors and divergence arrays to approximate the
     /// longest shared segment around `marker_idx`.
     pub fn best_match_span(&self, hap_idx: u32, marker_idx: usize) -> usize {
-        if marker_idx >= self.n_markers {
+        if marker_idx >= self.n_markers || (hap_idx as usize) >= self.n_haps {
             return 0;
         }
 
-        let fwd_ppa = &self.fwd_ppa[marker_idx];
-        let mut pos_fwd = None;
-        for (i, &h) in fwd_ppa.iter().enumerate() {
-            if h == hap_idx {
-                pos_fwd = Some(i);
-                break;
-            }
-        }
-        let Some(pos_fwd) = pos_fwd else {
-            return 0;
-        };
-
-        let bwd_ppa = &self.bwd_ppa[marker_idx];
-        let mut pos_bwd = None;
-        for (i, &h) in bwd_ppa.iter().enumerate() {
-            if h == hap_idx {
-                pos_bwd = Some(i);
-                break;
-            }
-        }
-        let Some(pos_bwd) = pos_bwd else {
-            return 0;
-        };
+        // O(1) position lookup using inverse index
+        let pos_fwd = self.fwd_pos[marker_idx][hap_idx as usize] as usize;
+        let pos_bwd = self.bwd_pos[marker_idx][hap_idx as usize] as usize;
 
         let mut best_fwd = 0usize;
         for pos in [pos_fwd.wrapping_sub(1), pos_fwd + 1] {
@@ -282,14 +285,15 @@ impl BidirectionalPhaseIbs {
     }
 
     fn find_fwd_neighbors(&self, hap_idx: u32, marker_idx: usize, n_candidates: usize) -> Vec<u32> {
-        if marker_idx >= self.n_markers {
+        if marker_idx >= self.n_markers || (hap_idx as usize) >= self.n_haps {
             return Vec::new();
         }
 
         let ppa = &self.fwd_ppa[marker_idx];
         let div = &self.fwd_div[marker_idx];
 
-        let sorted_pos = ppa.iter().position(|&h| h == hap_idx).unwrap_or(0);
+        // O(1) position lookup using inverse index
+        let sorted_pos = self.fwd_pos[marker_idx][hap_idx as usize] as usize;
         let marker_i32 = marker_idx as i32;
 
         // For forward PBWT, div[i] = marker where match started (divergence point).
@@ -355,14 +359,15 @@ impl BidirectionalPhaseIbs {
     }
 
     fn find_bwd_neighbors(&self, hap_idx: u32, marker_idx: usize, n_candidates: usize) -> Vec<u32> {
-        if marker_idx >= self.n_markers {
+        if marker_idx >= self.n_markers || (hap_idx as usize) >= self.n_haps {
             return Vec::new();
         }
 
         let ppa = &self.bwd_ppa[marker_idx];
         let div = &self.bwd_div[marker_idx];
 
-        let sorted_pos = ppa.iter().position(|&h| h == hap_idx).unwrap_or(0);
+        // O(1) position lookup using inverse index
+        let sorted_pos = self.bwd_pos[marker_idx][hap_idx as usize] as usize;
         let marker_i32 = marker_idx as i32;
 
         // For backward PBWT, div[i] = marker where match ENDS (going backward).
