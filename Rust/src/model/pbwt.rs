@@ -132,27 +132,20 @@ impl PbwtDivUpdater {
         self.p[..n_alleles].fill(init_value);
 
         // 4. Scatter to scratch buffers with p propagation (Counting Sort Phase 3)
-        // OPTIMIZED: Instead of O(n_alleles) inner loop, track a running global max.
-        // p[allele] = max(init_value, max_div_seen_since_last_output_of_allele)
-        // This works because the "propagation" means: for each allele, the output
-        // divergence is the maximum of:
-        //   - init_value (marker + 1)
-        //   - all divergence values seen since the last haplotype of that allele was output
-        // We can track this with a single running max that gets reset per-allele on output.
-        let mut running_max = i32::MIN;
-
+        // This single pass matches Java's loop exactly:
+        //   propagate p -> store -> reset p[allele]
         for i in 0..self.n_haps {
             let hap = prefix[i];
             let div = divergence[i];
             let allele = alleles[hap as usize] as usize;
             let allele = if allele >= n_alleles { 0 } else { allele };
 
-            // Update running max with current divergence
-            running_max = running_max.max(div);
-
-            // p[allele] should be max of init_value and all divs since last output
-            // We update it with the running_max
-            self.p[allele] = self.p[allele].max(running_max);
+            // Update p (Max Divergence Propagation) for ALL alleles
+            for j in 0..n_alleles {
+                if div > self.p[j] {
+                    self.p[j] = div;
+                }
+            }
 
             let base = self.offsets[allele];
             let offset = self.counts[allele];
@@ -161,7 +154,7 @@ impl PbwtDivUpdater {
             self.scratch_a[pos] = hap;
             self.scratch_d[pos] = self.p[allele];
 
-            // Reset p for this allele after output (so next time it starts fresh)
+            // Reset p for this allele after output
             self.p[allele] = i32::MIN;
 
             self.counts[allele] += 1;
@@ -223,11 +216,9 @@ impl PbwtDivUpdater {
         }
 
         // 4. Scatter with MIN propagation for backward PBWT
-        // OPTIMIZED: Instead of O(n_alleles) inner loop, track a running global min.
-        // p[allele] = min(init_value, min_div_seen_since_last_output_of_allele)
+        // p[j] tracks the minimum divergence seen since last output for allele j
         self.counts[..n_alleles].fill(0);
         self.p[..n_alleles].fill(init_value);
-        let mut running_min = i32::MAX;
 
         for i in 0..self.n_haps {
             let hap = prefix[i];
@@ -235,11 +226,14 @@ impl PbwtDivUpdater {
             let allele = alleles[hap as usize] as usize;
             let allele = if allele >= n_alleles { 0 } else { allele };
 
-            // Update running min with current divergence
-            running_min = running_min.min(div);
-
-            // p[allele] should be min of init_value and all divs since last output
-            self.p[allele] = self.p[allele].min(running_min);
+            // Update p: min(p, div) for backward PBWT
+            // Smaller divergence = earlier end point = shorter match
+            // We propagate the minimum to find the "worst case" match length
+            for j in 0..n_alleles {
+                if div < self.p[j] {
+                    self.p[j] = div;
+                }
+            }
 
             let base = self.offsets[allele];
             let offset = self.counts[allele];

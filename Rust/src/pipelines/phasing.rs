@@ -823,6 +823,9 @@ impl PhasingPipeline {
             .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
             .collect();
 
+        // Build confidence data for PBWT filtering
+        let confidence_by_sample = build_sample_confidence(target_gt);
+
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
@@ -840,6 +843,7 @@ impl PhasingPipeline {
                 &gen_dists,
                 &ibs2,
                 atomic_estimates.as_ref(),
+                &confidence_by_sample,
             )?;
 
             // Update parameters from EM estimates and recompute recombination probabilities
@@ -1219,6 +1223,10 @@ impl PhasingPipeline {
     /// This uses the full Forward-Backward algorithm to compute posterior probabilities
     /// of the phase, ensuring that phasing decisions are informed by both upstream
     /// and downstream data.
+    /// Confidence threshold for PBWT state selection.
+    /// Markers with confidence below this are treated as missing in IBS matching.
+    const PBWT_CONFIDENCE_THRESHOLD: f32 = 0.9;
+
     #[instrument(skip_all, fields(n_samples, n_markers))]
     fn run_phase_baum_iteration(
         &mut self,
@@ -1228,6 +1236,7 @@ impl PhasingPipeline {
         gen_dists: &[f64],
         ibs2: &Ibs2,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
+        confidence_by_sample: &[Vec<f32>],
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
@@ -1256,13 +1265,26 @@ impl PhasingPipeline {
         };
 
         // Build PBWT over combined haplotype space when reference is available
+        // Filter low-confidence target markers to prevent bad hard calls from
+        // excluding correct reference haplotypes during state selection.
         let phase_ibs = tracing::info_span!("build_pbwt").in_scope(|| {
             if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
                 self.build_bidirectional_pbwt_combined(
                 |m, h| {
                     if h < n_haps {
-                        ref_geno.get(m, HapIdx::new(h as u32))
+                        // Target haplotype: check confidence before using
+                        let sample = h / 2;
+                        let conf = confidence_by_sample.get(sample)
+                            .and_then(|c| c.get(m))
+                            .copied()
+                            .unwrap_or(1.0);
+                        if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                            255 // Treat low-confidence calls as missing for IBS
+                        } else {
+                            ref_geno.get(m, HapIdx::new(h as u32))
+                        }
                     } else {
+                        // Reference haplotype: always use actual allele
                         let ref_h = h - n_haps;
                         if let Some(ref_m) = alignment.target_to_ref(m) {
                             let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
