@@ -826,45 +826,25 @@ impl StateProbs {
 
 
         if n_alleles == 2 {
-            // Interpolate haplotype alleles with distance-weighted mixing.
+            // Interpolate state probability, anchor to LEFT haplotype's allele
+            // (matches Java: both prob and prob_p1 contribute to current haplotype's allele)
             let mut p_alt = 0.0f32;
             let mut p_ref = 0.0f32;
             for (j, &hap) in haps.iter().enumerate() {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
 
-                let (prob_left, prob_right) = if is_between_clusters {
+                let interp_prob = if is_between_clusters {
                     let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    (weight_left * prob, (1.0 - weight_left) * prob_p1)
-                } else if haps_p1.is_some() {
-                    (weight_left * prob, (1.0 - weight_left) * prob)
+                    weight_left * prob + (1.0 - weight_left) * prob_p1
                 } else {
-                    (prob, 0.0)
+                    prob
                 };
 
-                let allele_left = get_ref_allele(ref_marker, hap);
-                if allele_left == 1 {
-                    p_alt += prob_left;
-                } else if allele_left == 0 {
-                    p_ref += prob_left;
-                }
-
-                if prob_right > 0.0 {
-                    if let Some(haps_p1_row) = haps_p1 {
-                        let hap_right = haps_p1_row.get(j).copied().unwrap_or(hap);
-                        let allele_right = get_ref_allele(ref_marker, hap_right);
-                        if allele_right == 1 {
-                            p_alt += prob_right;
-                        } else if allele_right == 0 {
-                            p_ref += prob_right;
-                        }
-                    } else {
-                        let allele_right = get_ref_allele(ref_marker, hap);
-                        if allele_right == 1 {
-                            p_alt += prob_right;
-                        } else if allele_right == 0 {
-                            p_ref += prob_right;
-                        }
-                    }
+                let allele = get_ref_allele(ref_marker, hap);
+                if allele == 1 {
+                    p_alt += interp_prob;
+                } else if allele == 0 {
+                    p_ref += interp_prob;
                 }
             }
 
@@ -872,37 +852,21 @@ impl StateProbs {
             let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
             AllelePosteriors::Biallelic(p_alt)
         } else {
+            // Interpolate state probability, anchor to LEFT haplotype's allele
             let mut al_probs = vec![0.0f32; n_alleles];
             for (j, &hap) in haps.iter().enumerate() {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
 
-                let (prob_left, prob_right) = if is_between_clusters {
+                let interp_prob = if is_between_clusters {
                     let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
-                    (weight_left * prob, (1.0 - weight_left) * prob_p1)
-                } else if haps_p1.is_some() {
-                    (weight_left * prob, (1.0 - weight_left) * prob)
+                    weight_left * prob + (1.0 - weight_left) * prob_p1
                 } else {
-                    (prob, 0.0)
+                    prob
                 };
 
-                let allele_left = get_ref_allele(ref_marker, hap);
-                if allele_left != 255 && (allele_left as usize) < n_alleles {
-                    al_probs[allele_left as usize] += prob_left;
-                }
-
-                if prob_right > 0.0 {
-                    if let Some(haps_p1_row) = haps_p1 {
-                        let hap_right = haps_p1_row.get(j).copied().unwrap_or(hap);
-                        let allele_right = get_ref_allele(ref_marker, hap_right);
-                        if allele_right != 255 && (allele_right as usize) < n_alleles {
-                            al_probs[allele_right as usize] += prob_right;
-                        }
-                    } else {
-                        let allele_right = get_ref_allele(ref_marker, hap);
-                        if allele_right != 255 && (allele_right as usize) < n_alleles {
-                            al_probs[allele_right as usize] += prob_right;
-                        }
-                    }
+                let allele = get_ref_allele(ref_marker, hap);
+                if allele != 255 && (allele as usize) < n_alleles {
+                    al_probs[allele as usize] += interp_prob;
                 }
             }
 
@@ -1036,7 +1000,6 @@ pub struct ClusterStateProbs {
     ref_cluster_end: std::sync::Arc<Vec<usize>>,
     weight: std::sync::Arc<Vec<f32>>,
     hap_indices: Vec<Vec<u32>>,
-    haps_p1: Vec<Vec<u32>>,
     probs: Vec<Vec<f32>>,
     probs_p1: Vec<Vec<f32>>,
 }
@@ -1057,7 +1020,6 @@ impl ClusterStateProbs {
             (0.9999f32 / n_states as f32).min(0.005f32)
         };
         let mut filtered_haps = Vec::with_capacity(n_clusters);
-        let mut filtered_haps_p1 = Vec::with_capacity(n_clusters);
         let mut probs = Vec::with_capacity(n_clusters);
         let mut probs_p1 = Vec::with_capacity(n_clusters);
 
@@ -1067,7 +1029,6 @@ impl ClusterStateProbs {
             let next_offset = next * n_states;
 
             let mut haps_row = Vec::new();
-            let mut haps_p1_row = Vec::new();
             let mut prob_row = Vec::new();
             let mut prob_p1_row = Vec::new();
 
@@ -1076,14 +1037,12 @@ impl ClusterStateProbs {
                 let prob_p1 = cluster_probs.get(next_offset + k).copied().unwrap_or(0.0);
                 if prob > threshold || prob_p1 > threshold {
                     haps_row.push(hap_indices[c][k]);
-                    haps_p1_row.push(hap_indices[next][k]);
                     prob_row.push(prob);
                     prob_p1_row.push(prob_p1);
                 }
             }
 
             filtered_haps.push(haps_row);
-            filtered_haps_p1.push(haps_p1_row);
             probs.push(prob_row);
             probs_p1.push(prob_p1_row);
         }
@@ -1093,7 +1052,6 @@ impl ClusterStateProbs {
             ref_cluster_end,
             weight,
             hap_indices: filtered_haps,
-            haps_p1: filtered_haps_p1,
             probs,
             probs_p1,
         }
@@ -1122,12 +1080,8 @@ impl ClusterStateProbs {
         }
 
         let haps = &self.hap_indices[cluster];
-        let haps_p1 = &self.haps_p1[cluster];
         let probs = &self.probs[cluster];
         let probs_p1 = &self.probs_p1[cluster];
-
-        // Nearest-neighbor interpolation: use haplotype from nearest cluster
-        let use_left_hap = weight >= 0.5;
 
         if n_alleles == 2 {
             let mut p_alt = 0.0f32;
@@ -1136,20 +1090,15 @@ impl ClusterStateProbs {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
                 let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
 
-                // Interpolate state probability, use nearest haplotype for allele
+                // Interpolate state probability, anchor to LEFT haplotype's allele
+                // (matches Java: both prob and prob_p1 contribute to current haplotype's allele)
                 let interp_prob = if in_cluster {
                     prob
                 } else {
                     weight * prob + (1.0 - weight) * prob_p1
                 };
 
-                let allele = if in_cluster || use_left_hap {
-                    get_ref_allele(ref_marker, hap)
-                } else {
-                    let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
-                    get_ref_allele(ref_marker, hap_right)
-                };
-
+                let allele = get_ref_allele(ref_marker, hap);
                 if allele == 1 {
                     p_alt += interp_prob;
                 } else if allele == 0 {
@@ -1165,20 +1114,14 @@ impl ClusterStateProbs {
                 let prob = probs.get(j).copied().unwrap_or(0.0);
                 let prob_p1 = probs_p1.get(j).copied().unwrap_or(0.0);
 
-                // Interpolate state probability, use nearest haplotype for allele
+                // Interpolate state probability, anchor to LEFT haplotype's allele
                 let interp_prob = if in_cluster {
                     prob
                 } else {
                     weight * prob + (1.0 - weight) * prob_p1
                 };
 
-                let allele = if in_cluster || use_left_hap {
-                    get_ref_allele(ref_marker, hap)
-                } else {
-                    let hap_right = haps_p1.get(j).copied().unwrap_or(hap);
-                    get_ref_allele(ref_marker, hap_right)
-                };
-
+                let allele = get_ref_allele(ref_marker, hap);
                 if allele != 255 && (allele as usize) < n_alleles {
                     al_probs[allele as usize] += interp_prob;
                 }
@@ -2065,8 +2008,8 @@ pub fn run_hmm_forward_backward_clusters_counts(
                 .unwrap_or(0.0);
             let mism = mism.min(n_obs);
             let match_count = (n_obs - mism).max(0.0);
-            // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
-            // This matches Java Beagle's cluster-level emission (not marker-level)
+            // Geometric mean: treats cluster as single evidence unit while preserving
+            // granular mismatch info. More robust to genotyping errors than Java's binary.
             let em = if n_obs > 0.0 {
                 ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
             } else {
@@ -2104,7 +2047,7 @@ pub fn run_hmm_forward_backward_clusters_counts(
                     .unwrap_or(0.0);
                 let mism = mism.min(n_obs);
                 let match_count = (n_obs - mism).max(0.0);
-                // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
+                // Geometric mean: treats cluster as single evidence unit
                 let em = if n_obs > 0.0 {
                     ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
                 } else {

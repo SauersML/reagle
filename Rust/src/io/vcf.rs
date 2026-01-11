@@ -112,7 +112,9 @@ impl MarkerImputationStats {
         let var_x = self.sum_x_sq[allele] - (self.sum_x[allele] * self.sum_x[allele] / n);
 
         if var_d <= 0.0 || var_x <= 0.0 {
-            0.0
+            // For genotyped markers, zero variance means perfect quality
+            // For imputed markers, zero variance means no information
+            if self.is_imputed { 0.0 } else { 1.0 }
         } else {
             (var_d / var_x).clamp(0.0, 1.0)
         }
