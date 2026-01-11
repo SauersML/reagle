@@ -3785,8 +3785,7 @@ mod tests {
         // Since seq1 = 0, this means no swap (swap_bit = 0).
         let n_swaps: usize = swap_bits.iter().map(|&b| b as usize).sum();
 
-        eprintln!("Test 1: swap_bits = {:?}, n_swaps = {}", swap_bits, n_swaps);
-
+        
         // We expect very few or no swaps since reference strongly supports H1 = 0
         assert!(
             n_swaps <= 2,
@@ -3856,8 +3855,7 @@ mod tests {
         // Since seq1 = 0, this means swap (swap_bit = 1).
         let n_swaps: usize = swap_bits.iter().map(|&b| b as usize).sum();
 
-        eprintln!("Test 2: swap_bits = {:?}, n_swaps = {}", swap_bits, n_swaps);
-
+        
         // We expect most or all to swap since reference strongly supports H1 = 1
         assert!(
             n_swaps >= n_markers - 2,
