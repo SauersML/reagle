@@ -762,20 +762,30 @@ fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     let is_best_call = (called_gl - max_gl).abs() < 0.001;
 
     // Compute confidence:
-    // - Uniform GLs (gap ≈ 0) -> low confidence
-    // - Clear winner (gap > 1) -> high confidence
+    // - Uniform GLs (gap ≈ 0) -> VERY low confidence (call is random)
+    // - Clear winner (gap > 1.5) -> high confidence
     // - If call doesn't match best GL -> very low confidence
+    //
+    // Note: Uniform GLs mean the called genotype is essentially random.
+    // Using 50% confidence (the old formula) causes the HMM to incorrectly
+    // penalize states that match the true allele when the call is wrong.
+    // This destroys imputation accuracy at rare variants.
 
     let confidence = if !is_best_call {
         // Called genotype is not the most likely - very uncertain
         (10.0 * (1.0 + (called_gl - max_gl))) as u8
     } else {
-        // Convert GL gap to confidence
-        // GL gap of 0 -> confidence ~128 (uncertain)
-        // GL gap of 1 -> confidence ~200
-        // GL gap of 2+ -> confidence ~255
-        let conf = 128.0 + 63.5 * gl_gap.min(2.0);
-        conf.min(255.0) as u8
+        // Convert GL gap to confidence using exponential scaling
+        // GL gap of 0 (uniform) -> confidence ~25 (0.1) - almost no weight
+        // GL gap of 0.5 -> confidence ~90 (0.35)
+        // GL gap of 1.0 -> confidence ~180 (0.7)
+        // GL gap of 1.5 -> confidence ~230 (0.9)
+        // GL gap of 2+ -> confidence ~255 (1.0)
+        //
+        // Formula: conf = 255 * (1 - exp(-1.5 * gap))
+        // This ensures uniform GLs contribute almost nothing to the HMM
+        let conf = 255.0 * (1.0 - (-1.5 * gl_gap).exp());
+        conf.min(255.0).max(1.0) as u8
     };
 
     Some(confidence)
