@@ -479,7 +479,6 @@ fn bench_pbwt_update(c: &mut Criterion) {
                     updater.bwd_update(
                         black_box(alleles),
                         black_box(*n_alleles),
-                        black_box(50),
                         black_box(&mut prefix),
                         black_box(&mut divergence),
                     );
