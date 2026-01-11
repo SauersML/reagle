@@ -2022,6 +2022,8 @@ pub fn run_hmm_forward_backward_clusters_counts(
     n_states: usize,
     workspace: &mut ImpWorkspace,
 ) -> Vec<f32> {
+    use wide::f32x8;
+
     let n_clusters = cluster_mismatches.len();
     let fwd = &mut workspace.fwd;
     fwd.resize(n_clusters * n_states, 0.0);
@@ -2088,30 +2090,64 @@ pub fn run_hmm_forward_backward_clusters_counts(
             }
 
             if emitted_sum > 0.0 {
-                let scale = (1.0 - p_rec) / emitted_sum;
-                for k in 0..n_states {
-                    bwd[k] = scale * bwd[k] + shift;
+                let scale_v = (1.0 - p_rec) / emitted_sum;
+                // SIMD-optimized bwd transition: bwd[k] = scale * bwd[k] + shift
+                let shift_vec = f32x8::splat(shift);
+                let scale_vec = f32x8::splat(scale_v);
+                let mut k = 0;
+                while k + 8 <= n_states {
+                    let bwd_arr: [f32; 8] = bwd[k..k+8].try_into().unwrap();
+                    let bwd_chunk = f32x8::from(bwd_arr);
+                    let res = scale_vec * bwd_chunk + shift_vec;
+                    let res_arr: [f32; 8] = res.into();
+                    bwd[k..k+8].copy_from_slice(&res_arr);
+                    k += 8;
+                }
+                for i in k..n_states {
+                    bwd[i] = scale_v * bwd[i] + shift;
                 }
             } else {
                 let uniform = 1.0 / n_states as f32;
-                for k in 0..n_states {
-                    bwd[k] = uniform;
-                }
+                bwd[..n_states].fill(uniform);
             }
         }
 
         let row_offset = m * n_states;
-        let mut state_sum = 0.0f32;
-        for k in 0..n_states {
-            let idx = row_offset + k;
-            fwd[idx] *= bwd[k];
-            state_sum += fwd[idx];
+        // SIMD-optimized posterior: fwd *= bwd with sum accumulation
+        let mut sum_vec = f32x8::splat(0.0);
+        let mut k = 0;
+        while k + 8 <= n_states {
+            let fwd_arr: [f32; 8] = fwd[row_offset + k..row_offset + k + 8].try_into().unwrap();
+            let bwd_arr: [f32; 8] = bwd[k..k+8].try_into().unwrap();
+            let fwd_vec = f32x8::from(fwd_arr);
+            let bwd_vec = f32x8::from(bwd_arr);
+            let res = fwd_vec * bwd_vec;
+            let res_arr: [f32; 8] = res.into();
+            fwd[row_offset + k..row_offset + k + 8].copy_from_slice(&res_arr);
+            sum_vec += res;
+            k += 8;
+        }
+        let mut state_sum = sum_vec.reduce_add();
+        for i in k..n_states {
+            fwd[row_offset + i] *= bwd[i];
+            state_sum += fwd[row_offset + i];
         }
 
         if state_sum > 0.0 {
             let inv = 1.0 / state_sum;
-            for k in 0..n_states {
-                fwd[row_offset + k] *= inv;
+            // SIMD-optimized normalization: fwd *= inv
+            let inv_vec = f32x8::splat(inv);
+            let mut k = 0;
+            while k + 8 <= n_states {
+                let fwd_arr: [f32; 8] = fwd[row_offset + k..row_offset + k + 8].try_into().unwrap();
+                let fwd_vec = f32x8::from(fwd_arr);
+                let res = fwd_vec * inv_vec;
+                let res_arr: [f32; 8] = res.into();
+                fwd[row_offset + k..row_offset + k + 8].copy_from_slice(&res_arr);
+                k += 8;
+            }
+            for i in k..n_states {
+                fwd[row_offset + i] *= inv;
             }
         }
     }
