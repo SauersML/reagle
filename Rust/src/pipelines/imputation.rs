@@ -2089,30 +2089,6 @@ pub fn run_hmm_forward_backward_clusters_counts(
     let p_no_err = 1.0 - p_err;
     let log_p_err = p_err.ln();
     let log_p_no_err = p_no_err.ln();
-
-    // Pre-compute emissions for all clusters/states to enable SIMD in transition
-    let emissions = &mut workspace.emissions;
-    emissions.resize(n_clusters * n_states, 1.0);
-    for m in 0..n_clusters {
-        let row_offset = m * n_states;
-        let mismatches = &cluster_mismatches[m];
-        let non_missing = &cluster_non_missing[m];
-        for k in 0..n_states {
-            let mism = mismatches.get(k).copied().unwrap_or(0.0);
-            let n_obs = non_missing.get(k).copied().unwrap_or(0.0);
-            let mism = mism.min(n_obs);
-            let match_count = (n_obs - mism).max(0.0);
-            // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
-            let log_em = match_count * log_p_no_err + mism * log_p_err;
-            emissions[row_offset + k] = if n_obs > 0.0 {
-                log_em.max(-80.0).exp()
-            } else {
-                1.0
-            };
-        }
-    }
-
-    // Forward pass with SIMD
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
@@ -2120,48 +2096,33 @@ pub fn run_hmm_forward_backward_clusters_counts(
 
         let row_offset = m * n_states;
         let prev_offset = if m > 0 { (m - 1) * n_states } else { 0 };
+        let mut sum = 0.0f32;
 
-        if m == 0 {
-            // First cluster: uniform prior * emission
-            let prior = 1.0 / n_states as f32;
-            let mut sum = 0.0f32;
-            for k in 0..n_states {
-                let val = emissions[row_offset + k] * prior;
-                fwd[row_offset + k] = val;
-                sum += val;
-            }
-            last_sum = sum.max(1e-30);
-        } else {
-            // SIMD-optimized forward update: fwd[k] = emit[k] * (scale * prev_fwd[k] + shift)
-            let shift_vec = f32x8::splat(shift);
-            let scale_vec = f32x8::splat(scale);
-            let mut sum_vec = f32x8::splat(0.0);
-
-            let mut k = 0;
-            while k + 8 <= n_states {
-                // Load emission, prev_fwd
-                let emit_arr: [f32; 8] = emissions[row_offset + k..row_offset + k + 8].try_into().unwrap();
-                let prev_arr: [f32; 8] = fwd[prev_offset + k..prev_offset + k + 8].try_into().unwrap();
-                let emit_vec = f32x8::from(emit_arr);
-                let prev_vec = f32x8::from(prev_arr);
-
-                // fwd = emit * (scale * prev + shift)
-                let res = emit_vec * (scale_vec * prev_vec + shift_vec);
-                let res_arr: [f32; 8] = res.into();
-                fwd[row_offset + k..row_offset + k + 8].copy_from_slice(&res_arr);
-                sum_vec += res;
-                k += 8;
-            }
-
-            let mut sum = sum_vec.reduce_add();
-            // Scalar tail
-            for i in k..n_states {
-                let val = emissions[row_offset + i] * (scale * fwd[prev_offset + i] + shift);
-                fwd[row_offset + i] = val;
-                sum += val;
-            }
-            last_sum = sum.max(1e-30);
+        for k in 0..n_states {
+            let mism = cluster_mismatches[m].get(k).copied().unwrap_or(0.0);
+            let n_obs = cluster_non_missing
+                .get(m)
+                .and_then(|row| row.get(k))
+                .copied()
+                .unwrap_or(0.0);
+            let mism = mism.min(n_obs);
+            let match_count = (n_obs - mism).max(0.0);
+            // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
+            let log_em = match_count * log_p_no_err + mism * log_p_err;
+            let em = if n_obs > 0.0 {
+                log_em.max(-80.0).exp()
+            } else {
+                1.0
+            };
+            let val = if m == 0 {
+                em / n_states as f32
+            } else {
+                em * (scale * fwd[prev_offset + k] + shift)
+            };
+            fwd[row_offset + k] = val;
+            sum += val;
         }
+        last_sum = sum.max(1e-30);
     }
 
     let bwd = &mut workspace.bwd;
