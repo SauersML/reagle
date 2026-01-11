@@ -89,6 +89,12 @@ impl PbwtDivUpdater {
     ///   - Uses MIN propagation: earliest end point limits the match
     ///   - Reset to MAX_VALUE after output
     ///
+    /// # Missing Data Handling
+    ///
+    /// Missing data (allele >= n_alleles, typically 255) is placed in its own bin
+    /// at index n_alleles. This prevents reference bias that would occur from
+    /// grouping missing data with the reference allele.
+    ///
     /// # Arguments
     /// * `alleles` - Allele for each haplotype
     /// * `n_alleles` - Number of distinct alleles
@@ -107,63 +113,81 @@ impl PbwtDivUpdater {
         assert_eq!(prefix.len(), self.n_haps);
         assert!(divergence.len() >= self.n_haps);
 
-        self.ensure_capacity(n_alleles);
+        // Use n_alleles + 1 bins: 0..n_alleles for valid alleles, n_alleles for missing
+        let n_bins = n_alleles + 1;
+        self.ensure_capacity(n_bins);
 
         // 1. Count frequencies of each allele (Counting Sort Phase 1)
-        self.counts[..n_alleles].fill(0);
+        self.counts[..n_bins].fill(0);
 
         for i in 0..self.n_haps {
             let hap = prefix[i];
             let allele = alleles[hap as usize] as usize;
-            let allele = if allele >= n_alleles { 0 } else { allele };
-            self.counts[allele] += 1;
+            // Map missing/invalid alleles to the dedicated missing bin
+            let bin = if allele >= n_alleles { n_alleles } else { allele };
+            self.counts[bin] += 1;
         }
 
         // 2. Compute Offsets (Counting Sort Phase 2)
         let mut running = 0;
-        for i in 0..n_alleles {
+        for i in 0..n_bins {
             self.offsets[i] = running;
             running += self.counts[i];
         }
 
         // 3. Initialize p array and reset counts for scatter pass
         let init_value = (marker + 1) as i32;
-        self.counts[..n_alleles].fill(0);
-        self.p[..n_alleles].fill(init_value);
+        self.counts[..n_bins].fill(0);
+        self.p[..n_bins].fill(init_value);
 
         // 4. Scatter to scratch buffers with p propagation (Counting Sort Phase 3)
         // This single pass matches Java's loop exactly:
         //   propagate p -> store -> reset p[allele]
         if n_alleles == 2 {
-            // Optimized biallelic path - unrolled inner loop
+            // Optimized biallelic path with 3 bins: REF(0), ALT(1), MISSING(2)
             let mut p0 = init_value;
             let mut p1 = init_value;
+            let mut p_miss = init_value;
             let base0 = self.offsets[0];
             let base1 = self.offsets[1];
+            let base_miss = self.offsets[2];
             let mut count0 = 0usize;
             let mut count1 = 0usize;
+            let mut count_miss = 0usize;
 
             for i in 0..self.n_haps {
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = alleles[hap as usize];
 
-                // Propagate max to both alleles
+                // Propagate max to all bins
                 if div > p0 { p0 = div; }
                 if div > p1 { p1 = div; }
+                if div > p_miss { p_miss = div; }
 
-                if allele == 0 {
-                    let pos = base0 + count0;
-                    self.scratch_a[pos] = hap;
-                    self.scratch_d[pos] = p0;
-                    p0 = i32::MIN;
-                    count0 += 1;
-                } else {
-                    let pos = base1 + count1;
-                    self.scratch_a[pos] = hap;
-                    self.scratch_d[pos] = p1;
-                    p1 = i32::MIN;
-                    count1 += 1;
+                match allele {
+                    0 => {
+                        let pos = base0 + count0;
+                        self.scratch_a[pos] = hap;
+                        self.scratch_d[pos] = p0;
+                        p0 = i32::MIN;
+                        count0 += 1;
+                    }
+                    1 => {
+                        let pos = base1 + count1;
+                        self.scratch_a[pos] = hap;
+                        self.scratch_d[pos] = p1;
+                        p1 = i32::MIN;
+                        count1 += 1;
+                    }
+                    _ => {
+                        // Missing or invalid allele
+                        let pos = base_miss + count_miss;
+                        self.scratch_a[pos] = hap;
+                        self.scratch_d[pos] = p_miss;
+                        p_miss = i32::MIN;
+                        count_miss += 1;
+                    }
                 }
             }
         } else {
@@ -172,26 +196,27 @@ impl PbwtDivUpdater {
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = alleles[hap as usize] as usize;
-                let allele = if allele >= n_alleles { 0 } else { allele };
+                // Map missing/invalid alleles to the dedicated missing bin
+                let bin = if allele >= n_alleles { n_alleles } else { allele };
 
-                // Update p (Max Divergence Propagation) for ALL alleles
-                for j in 0..n_alleles {
+                // Update p (Max Divergence Propagation) for ALL bins
+                for j in 0..n_bins {
                     if div > self.p[j] {
                         self.p[j] = div;
                     }
                 }
 
-                let base = self.offsets[allele];
-                let offset = self.counts[allele];
+                let base = self.offsets[bin];
+                let offset = self.counts[bin];
                 let pos = base + offset;
 
                 self.scratch_a[pos] = hap;
-                self.scratch_d[pos] = self.p[allele];
+                self.scratch_d[pos] = self.p[bin];
 
-                // Reset p for this allele after output
-                self.p[allele] = i32::MIN;
+                // Reset p for this bin after output
+                self.p[bin] = i32::MIN;
 
-                self.counts[allele] += 1;
+                self.counts[bin] += 1;
             }
         }
 
@@ -216,6 +241,12 @@ impl PbwtDivUpdater {
     ///   - Uses MIN propagation: earliest end point limits the match
     ///   - Reset to MAX_VALUE after output
     ///
+    /// # Missing Data Handling
+    ///
+    /// Missing data (allele >= n_alleles, typically 255) is placed in its own bin
+    /// at index n_alleles. This prevents reference bias that would occur from
+    /// grouping missing data with the reference allele.
+    ///
     /// This matches the Java Beagle implementation in PbwtDivUpdater.bwdUpdate.
     pub fn bwd_update(
         &mut self,
@@ -229,62 +260,80 @@ impl PbwtDivUpdater {
         assert_eq!(prefix.len(), self.n_haps);
         assert!(divergence.len() >= self.n_haps);
 
-        self.ensure_capacity(n_alleles);
+        // Use n_alleles + 1 bins: 0..n_alleles for valid alleles, n_alleles for missing
+        let n_bins = n_alleles + 1;
+        self.ensure_capacity(n_bins);
 
         // 1. Initialize p array - Backward uses (marker - 1) as init value
         let init_value = (marker as i32) - 1;
 
         // 2. Count frequencies
-        self.counts[..n_alleles].fill(0);
+        self.counts[..n_bins].fill(0);
         for i in 0..self.n_haps {
             let hap = prefix[i];
             let allele = alleles[hap as usize] as usize;
-            let allele = if allele >= n_alleles { 0 } else { allele };
-            self.counts[allele] += 1;
+            // Map missing/invalid alleles to the dedicated missing bin
+            let bin = if allele >= n_alleles { n_alleles } else { allele };
+            self.counts[bin] += 1;
         }
 
         // 3. Compute Offsets
         let mut running = 0;
-        for i in 0..n_alleles {
+        for i in 0..n_bins {
             self.offsets[i] = running;
             running += self.counts[i];
         }
 
         // 4. Scatter with MIN propagation for backward PBWT
         // p[j] tracks the minimum divergence seen since last output for allele j
-        self.counts[..n_alleles].fill(0);
-        self.p[..n_alleles].fill(init_value);
+        self.counts[..n_bins].fill(0);
+        self.p[..n_bins].fill(init_value);
 
         if n_alleles == 2 {
-            // Optimized biallelic path - unrolled inner loop
+            // Optimized biallelic path with 3 bins: REF(0), ALT(1), MISSING(2)
             let mut p0 = init_value;
             let mut p1 = init_value;
+            let mut p_miss = init_value;
             let base0 = self.offsets[0];
             let base1 = self.offsets[1];
+            let base_miss = self.offsets[2];
             let mut count0 = 0usize;
             let mut count1 = 0usize;
+            let mut count_miss = 0usize;
 
             for i in 0..self.n_haps {
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = alleles[hap as usize];
 
-                // Propagate min to both alleles (backward PBWT)
+                // Propagate min to all bins (backward PBWT)
                 if div < p0 { p0 = div; }
                 if div < p1 { p1 = div; }
+                if div < p_miss { p_miss = div; }
 
-                if allele == 0 {
-                    let pos = base0 + count0;
-                    self.scratch_a[pos] = hap;
-                    self.scratch_d[pos] = p0;
-                    p0 = i32::MAX;
-                    count0 += 1;
-                } else {
-                    let pos = base1 + count1;
-                    self.scratch_a[pos] = hap;
-                    self.scratch_d[pos] = p1;
-                    p1 = i32::MAX;
-                    count1 += 1;
+                match allele {
+                    0 => {
+                        let pos = base0 + count0;
+                        self.scratch_a[pos] = hap;
+                        self.scratch_d[pos] = p0;
+                        p0 = i32::MAX;
+                        count0 += 1;
+                    }
+                    1 => {
+                        let pos = base1 + count1;
+                        self.scratch_a[pos] = hap;
+                        self.scratch_d[pos] = p1;
+                        p1 = i32::MAX;
+                        count1 += 1;
+                    }
+                    _ => {
+                        // Missing or invalid allele
+                        let pos = base_miss + count_miss;
+                        self.scratch_a[pos] = hap;
+                        self.scratch_d[pos] = p_miss;
+                        p_miss = i32::MAX;
+                        count_miss += 1;
+                    }
                 }
             }
         } else {
@@ -293,27 +342,28 @@ impl PbwtDivUpdater {
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = alleles[hap as usize] as usize;
-                let allele = if allele >= n_alleles { 0 } else { allele };
+                // Map missing/invalid alleles to the dedicated missing bin
+                let bin = if allele >= n_alleles { n_alleles } else { allele };
 
                 // Update p: min(p, div) for backward PBWT
                 // Smaller divergence = earlier end point = shorter match
                 // We propagate the minimum to find the "worst case" match length
-                for j in 0..n_alleles {
+                for j in 0..n_bins {
                     if div < self.p[j] {
                         self.p[j] = div;
                     }
                 }
 
-                let base = self.offsets[allele];
-                let offset = self.counts[allele];
+                let base = self.offsets[bin];
+                let offset = self.counts[bin];
                 let pos = base + offset;
 
                 self.scratch_a[pos] = hap;
-                self.scratch_d[pos] = self.p[allele];
+                self.scratch_d[pos] = self.p[bin];
 
                 // Reset to MAX so next haplotype takes its own divergence
-                self.p[allele] = i32::MAX;
-                self.counts[allele] += 1;
+                self.p[bin] = i32::MAX;
+                self.counts[bin] += 1;
             }
         }
 
@@ -445,6 +495,97 @@ mod tests {
             hap1_div <= 2,
             "Hap 1 should have long match with hap 0, but divergence is {} (expected <= 2)",
             hap1_div
+        );
+    }
+
+    /// Test that missing data (255) is handled correctly without reference bias.
+    ///
+    /// This tests the fix for the CRITIC-identified bug where missing data was
+    /// being mapped to REF (allele 0), creating systematic reference bias.
+    /// Missing data should be placed in its own bin, not grouped with REF or ALT.
+    #[test]
+    fn test_pbwt_missing_data_no_reference_bias() {
+        let mut updater = PbwtDivUpdater::new(4);
+        let mut prefix: Vec<u32> = vec![0, 1, 2, 3];
+        let mut divergence: Vec<i32> = vec![0, 0, 0, 0];
+
+        // Haplotypes:
+        // Hap 0: REF (0)
+        // Hap 1: ALT (1)
+        // Hap 2: MISSING (255)
+        // Hap 3: REF (0)
+        let alleles = vec![0u8, 1, 255, 0];
+        updater.fwd_update(&alleles, 2, 0, &mut prefix, &mut divergence);
+
+        // With the fix: missing (255) goes to bin 2 (separate from REF and ALT)
+        // Sorted order should be: [REF haps (0,3), ALT haps (1), MISSING haps (2)]
+        // = [0, 3, 1, 2] or similar grouping
+
+        // Key assertion: hap 2 (MISSING) should NOT be grouped with hap 0 (REF)
+        // Find positions of hap 0 and hap 2 in sorted array
+        let hap0_pos = prefix.iter().position(|&h| h == 0).unwrap();
+        let hap2_pos = prefix.iter().position(|&h| h == 2).unwrap();
+        let hap1_pos = prefix.iter().position(|&h| h == 1).unwrap();
+        let hap3_pos = prefix.iter().position(|&h| h == 3).unwrap();
+
+        // REF haps (0 and 3) should be adjacent (grouped together)
+        assert!(
+            (hap0_pos as i32 - hap3_pos as i32).abs() == 1,
+            "REF haps 0 and 3 should be adjacent in PBWT. Positions: hap0={}, hap3={}",
+            hap0_pos, hap3_pos
+        );
+
+        // MISSING hap (2) should NOT be adjacent to REF haps
+        // If the bug existed, hap 2 would be in the REF group
+        let hap2_near_ref = (hap2_pos as i32 - hap0_pos as i32).abs() == 1
+            || (hap2_pos as i32 - hap3_pos as i32).abs() == 1;
+
+        // hap 2 should be in its own bin at the end, not adjacent to REF
+        // Actually, the order is: REF bin, ALT bin, MISSING bin
+        // So hap 2 should be at the end (position 3)
+        assert!(
+            !hap2_near_ref || hap1_pos < hap2_pos,
+            "MISSING hap 2 should be in separate bin from REF. \
+             Positions: hap0={}, hap1={}, hap2={}, hap3={}. \
+             If hap2 is adjacent to REF, reference bias exists!",
+            hap0_pos, hap1_pos, hap2_pos, hap3_pos
+        );
+    }
+
+    /// Test backward PBWT also handles missing data correctly.
+    #[test]
+    fn test_pbwt_bwd_missing_data_no_reference_bias() {
+        let mut updater = PbwtDivUpdater::new(4);
+        let mut prefix: Vec<u32> = vec![0, 1, 2, 3];
+        let mut divergence: Vec<i32> = vec![10, 10, 10, 10]; // High initial values for backward
+
+        // Haplotypes:
+        // Hap 0: REF (0)
+        // Hap 1: ALT (1)
+        // Hap 2: MISSING (255)
+        // Hap 3: REF (0)
+        let alleles = vec![0u8, 1, 255, 0];
+        updater.bwd_update(&alleles, 2, 5, &mut prefix, &mut divergence);
+
+        // Same logic as forward: MISSING should be in its own bin
+        let hap0_pos = prefix.iter().position(|&h| h == 0).unwrap();
+        let hap2_pos = prefix.iter().position(|&h| h == 2).unwrap();
+        let hap3_pos = prefix.iter().position(|&h| h == 3).unwrap();
+
+        // REF haps (0 and 3) should be adjacent
+        assert!(
+            (hap0_pos as i32 - hap3_pos as i32).abs() == 1,
+            "REF haps 0 and 3 should be adjacent in backward PBWT. Positions: hap0={}, hap3={}",
+            hap0_pos, hap3_pos
+        );
+
+        // MISSING hap should be separate from REF group
+        let hap2_near_ref = (hap2_pos as i32 - hap0_pos as i32).abs() == 1
+            || (hap2_pos as i32 - hap3_pos as i32).abs() == 1;
+        assert!(
+            !hap2_near_ref,
+            "MISSING hap 2 should NOT be adjacent to REF haps in backward PBWT. Position: {}",
+            hap2_pos
         );
     }
 }

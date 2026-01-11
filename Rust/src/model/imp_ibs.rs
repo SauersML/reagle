@@ -269,15 +269,17 @@ impl ClusterCodedSteps {
                     continue;
                 }
 
-                let mut seq_map = vec![0u32; (seq_cnt as usize) * n_alleles];
+                // Use n_alleles + 1 bins to handle missing data in its own bin
+                // This prevents reference bias from grouping missing with REF
+                let n_bins = n_alleles + 1;
+                let mut seq_map = vec![0u32; (seq_cnt as usize) * n_bins];
                 seq_cnt = 1;
 
                 for h in n_ref_haps..n_haps {
-                    let mut allele = alleles[h] as usize;
-                    if allele >= n_alleles {
-                        allele = 0;
-                    }
-                    let index = (hap_to_seq[h] as usize) * n_alleles + allele;
+                    let allele = alleles[h] as usize;
+                    // Map missing/invalid alleles to the dedicated missing bin
+                    let bin = if allele >= n_alleles { n_alleles } else { allele };
+                    let index = (hap_to_seq[h] as usize) * n_bins + bin;
                     if seq_map[index] == 0 {
                         seq_map[index] = seq_cnt;
                         seq_cnt += 1;
@@ -289,11 +291,10 @@ impl ClusterCodedSteps {
                     if hap_to_seq[h] == 0 {
                         continue;
                     }
-                    let mut allele = alleles[h] as usize;
-                    if allele >= n_alleles {
-                        allele = 0;
-                    }
-                    let index = (hap_to_seq[h] as usize) * n_alleles + allele;
+                    let allele = alleles[h] as usize;
+                    // Map missing/invalid alleles to the dedicated missing bin
+                    let bin = if allele >= n_alleles { n_alleles } else { allele };
+                    let index = (hap_to_seq[h] as usize) * n_bins + bin;
                     hap_to_seq[h] = seq_map.get(index).copied().unwrap_or(0);
                 }
             }
