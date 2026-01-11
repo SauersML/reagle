@@ -2415,6 +2415,8 @@ fn build_fwd_checkpoints(
     p_err: f32,
     mode: EmissionMode,
 ) {
+    use wide::f32x8;
+
     if n_markers == 0 || n_states == 0 {
         return;
     }
@@ -2430,8 +2432,22 @@ fn build_fwd_checkpoints(
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
             let shift = r / n_states as f32;
             let scale = (1.0 - r) / fwd_sum.max(1e-30);
-            for k in 0..n_states {
-                fwd_prior[k] = scale * fwd[k] + shift;
+
+            // SIMD-optimized fwd_prior = scale * fwd + shift
+            let shift_vec = f32x8::splat(shift);
+            let scale_vec = f32x8::splat(scale);
+            let mut k = 0;
+            while k + 8 <= n_states {
+                let fwd_arr: [f32; 8] = fwd[k..k+8].try_into().unwrap();
+                let fwd_chunk = f32x8::from(fwd_arr);
+                let res = scale_vec * fwd_chunk + shift_vec;
+                let res_arr: [f32; 8] = res.into();
+                fwd_prior[k..k+8].copy_from_slice(&res_arr);
+                k += 8;
+            }
+            // Scalar tail
+            for i in k..n_states {
+                fwd_prior[i] = scale * fwd[i] + shift;
             }
         } else {
             fwd_prior.fill(init);
@@ -2446,23 +2462,77 @@ fn build_fwd_checkpoints(
             ref_alleles[k] = lookup.allele(m, k);
         }
 
-        fwd_sum = 0.0;
         let use_combined = matches!(mode, EmissionMode::Combined) || hap2_use_combined[m];
 
+        // Compute fwd[k] = fwd_prior[k] * emit and accumulate sum
+        // SIMD-optimized accumulation
+        let mut sum_vec = f32x8::splat(0.0);
+        let mut k = 0;
+
         if use_combined {
-            // Classify once per marker, then fast emit per state
             let emit_mode = classify_combined(a1, a2);
-            for k in 0..n_states {
-                let emit = emit_combined_fast(ref_alleles[k], emit_mode, conf_m, p_no_err, p_err);
-                fwd[k] = fwd_prior[k] * emit;
-                fwd_sum += fwd[k];
+            // Vectorized loop
+            while k + 8 <= n_states {
+                let prior_arr: [f32; 8] = fwd_prior[k..k+8].try_into().unwrap();
+                let prior_vec = f32x8::from(prior_arr);
+
+                // Compute emissions for 8 states
+                let emit_arr = [
+                    emit_combined_fast(ref_alleles[k], emit_mode, conf_m, p_no_err, p_err),
+                    emit_combined_fast(ref_alleles[k+1], emit_mode, conf_m, p_no_err, p_err),
+                    emit_combined_fast(ref_alleles[k+2], emit_mode, conf_m, p_no_err, p_err),
+                    emit_combined_fast(ref_alleles[k+3], emit_mode, conf_m, p_no_err, p_err),
+                    emit_combined_fast(ref_alleles[k+4], emit_mode, conf_m, p_no_err, p_err),
+                    emit_combined_fast(ref_alleles[k+5], emit_mode, conf_m, p_no_err, p_err),
+                    emit_combined_fast(ref_alleles[k+6], emit_mode, conf_m, p_no_err, p_err),
+                    emit_combined_fast(ref_alleles[k+7], emit_mode, conf_m, p_no_err, p_err),
+                ];
+                let emit_vec = f32x8::from(emit_arr);
+
+                let res = prior_vec * emit_vec;
+                let res_arr: [f32; 8] = res.into();
+                fwd[k..k+8].copy_from_slice(&res_arr);
+                sum_vec += res;
+                k += 8;
+            }
+            // Scalar tail
+            fwd_sum = sum_vec.reduce_add();
+            for i in k..n_states {
+                let emit = emit_combined_fast(ref_alleles[i], emit_mode, conf_m, p_no_err, p_err);
+                fwd[i] = fwd_prior[i] * emit;
+                fwd_sum += fwd[i];
             }
         } else {
             let h2_al = hap2_allele[m];
-            for k in 0..n_states {
-                let emit = emit_prob(ref_alleles[k], h2_al, conf_m, p_no_err, p_err);
-                fwd[k] = fwd_prior[k] * emit;
-                fwd_sum += fwd[k];
+            // Vectorized loop
+            while k + 8 <= n_states {
+                let prior_arr: [f32; 8] = fwd_prior[k..k+8].try_into().unwrap();
+                let prior_vec = f32x8::from(prior_arr);
+
+                let emit_arr = [
+                    emit_prob(ref_alleles[k], h2_al, conf_m, p_no_err, p_err),
+                    emit_prob(ref_alleles[k+1], h2_al, conf_m, p_no_err, p_err),
+                    emit_prob(ref_alleles[k+2], h2_al, conf_m, p_no_err, p_err),
+                    emit_prob(ref_alleles[k+3], h2_al, conf_m, p_no_err, p_err),
+                    emit_prob(ref_alleles[k+4], h2_al, conf_m, p_no_err, p_err),
+                    emit_prob(ref_alleles[k+5], h2_al, conf_m, p_no_err, p_err),
+                    emit_prob(ref_alleles[k+6], h2_al, conf_m, p_no_err, p_err),
+                    emit_prob(ref_alleles[k+7], h2_al, conf_m, p_no_err, p_err),
+                ];
+                let emit_vec = f32x8::from(emit_arr);
+
+                let res = prior_vec * emit_vec;
+                let res_arr: [f32; 8] = res.into();
+                fwd[k..k+8].copy_from_slice(&res_arr);
+                sum_vec += res;
+                k += 8;
+            }
+            // Scalar tail
+            fwd_sum = sum_vec.reduce_add();
+            for i in k..n_states {
+                let emit = emit_prob(ref_alleles[i], h2_al, conf_m, p_no_err, p_err);
+                fwd[i] = fwd_prior[i] * emit;
+                fwd_sum += fwd[i];
             }
         }
         fwd_sum = fwd_sum.max(1e-30);
