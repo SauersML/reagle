@@ -2031,8 +2031,6 @@ pub fn run_hmm_forward_backward_clusters_counts(
     let mut last_sum = 1.0f32;
     let p_err = base_err_rate.clamp(1e-8, 0.5);
     let p_no_err = 1.0 - p_err;
-    let log_p_err = p_err.ln();
-    let log_p_no_err = p_no_err.ln();
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
@@ -2050,8 +2048,11 @@ pub fn run_hmm_forward_backward_clusters_counts(
                 .copied()
                 .unwrap_or(0.0);
             let mism = mism.min(n_obs);
-            let match_count = (n_obs - mism).max(0.0);
-            let em = (match_count * log_p_no_err + mism * log_p_err).exp();
+            let em = if n_obs > 0.0 {
+                if mism > 0.0 { p_err } else { p_no_err }
+            } else {
+                1.0
+            };
             let val = if m == 0 {
                 em / n_states as f32
             } else {
@@ -2083,8 +2084,11 @@ pub fn run_hmm_forward_backward_clusters_counts(
                     .copied()
                     .unwrap_or(0.0);
                 let mism = mism.min(n_obs);
-                let match_count = (n_obs - mism).max(0.0);
-                let em = (match_count * log_p_no_err + mism * log_p_err).exp();
+                let em = if n_obs > 0.0 {
+                    if mism > 0.0 { p_err } else { p_no_err }
+                } else {
+                    1.0
+                };
                 bwd[k] *= em;
                 emitted_sum += bwd[k];
             }
