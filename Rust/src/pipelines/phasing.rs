@@ -1824,20 +1824,41 @@ impl PhasingPipeline {
                     Some(hi_freq_to_orig),
                 );
 
-                let (swap_bits, swap_lr) = sample_swap_bits_mosaic(
-                    n_hi_freq,
-                    n_states,
-                    stage1_p_recomb,
-                    &seq1,
-                    &seq2,
-                    &sample_conf,
-                    &lookup,
-                    &het_positions,
-                    sample_seed,
-                    self.config.mcmc_burnin,
-                    p_no_err,
-                    p_err,
-                );
+                let (swap_bits, swap_lr) = if self.config.dynamic_mcmc {
+                    // SHAPEIT5-style dynamic MCMC: re-select states each step
+                    sample_dynamic_mcmc(
+                        n_hi_freq,
+                        n_states,
+                        stage1_p_recomb,
+                        &seq1,
+                        &seq2,
+                        &sample_conf,
+                        &phase_ibs,
+                        ibs2,
+                        s as u32,
+                        &het_positions,
+                        sample_seed,
+                        self.config.mcmc_steps,
+                        p_no_err,
+                        p_err,
+                    )
+                } else {
+                    // Classic Beagle-style: static state space MCMC
+                    sample_swap_bits_mosaic(
+                        n_hi_freq,
+                        n_states,
+                        stage1_p_recomb,
+                        &seq1,
+                        &seq2,
+                        &sample_conf,
+                        &lookup,
+                        &het_positions,
+                        sample_seed,
+                        self.config.mcmc_burnin,
+                        p_no_err,
+                        p_err,
+                    )
+                };
 
                 let mut swap_mask = vec![false; n_hi_freq];
                 let mut current_phase = 0u8;
@@ -2998,7 +3019,9 @@ fn ffbs_haploid_constrained(
 /// 4. Repeat for n_steps
 ///
 /// The "implicit anchoring" comes from state selection being biased toward
-/// haplotypes that match the current phase estimate.
+/// haplotypes that match the current phase estimate via the "Latent State" approach:
+/// neighbors are found by looking up the position of the PREVIOUSLY SAMPLED reference
+/// state in the PBWT, giving O(1) lookup and preserving phase inertia.
 fn sample_dynamic_mcmc(
     n_markers: usize,
     n_states: usize,
@@ -3022,8 +3045,9 @@ fn sample_dynamic_mcmc(
     }
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+    let hap1_idx = sample_idx * 2;
 
-    // Initialize H1, H2 from genotype (random phase at hets)
+    // Initialize H1, H2 alleles from genotype (random phase at hets)
     let mut h1_alleles = vec![0u8; n_markers];
     let mut h2_alleles = vec![0u8; n_markers];
     for m in 0..n_markers {
@@ -3047,97 +3071,141 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    // Initialize path with starting states from standard neighbor finding
+    // This gives the first iteration something to work with
+    let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
+    if initial_neighbors.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Path stores the sampled reference state index at each marker
+    // Initialize to reference the first neighbor (will be overwritten)
     let mut path = vec![0u32; n_markers];
     let mut fixed_allele = vec![255u8; n_markers];
+
+    // Current set of neighbors (reused across markers within an MCMC step)
+    let mut neighbors = initial_neighbors;
 
     // MCMC loop: Gibbs sampling alternating between H1 and H2
     for step in 0..n_mcmc_steps {
         // === Sample H1 | (G, H2_fixed) ===
 
-        // 1. Select neighbors by threading current H1 through PBWT
-        let neighbors_h1 = phase_ibs.find_neighbors_for_query(
-            &h1_alleles, n_markers / 2, ibs2, sample_idx, n_states
-        );
-        if neighbors_h1.is_empty() {
+        // 1. Select neighbors using "Latent State" approach:
+        //    Use the previously sampled state at a marker to find neighbors
+        //    Vary the marker position across steps for robustness
+        let center_marker = if n_mcmc_steps > 1 {
+            n_markers / 4 + step * n_markers / (2 * n_mcmc_steps)
+        } else {
+            n_markers / 2
+        };
+        let prev_state = path[center_marker] as usize;
+        if prev_state < neighbors.len() {
+            let ref_hap = neighbors[prev_state];
+            neighbors = phase_ibs.find_neighbors_of_state(ref_hap, center_marker, sample_idx, n_states);
+        }
+        if neighbors.is_empty() {
             continue;
         }
 
-        // 2. Build constraint: H1 must be opposite of H2 at hets
+        // 2. Build constraint: at hets, H1 must produce genotype with H2
         for m in 0..n_markers {
             let a1 = seq1[m];
             let a2 = seq2[m];
             if a1 == 255 || a2 == 255 || a1 == a2 {
-                fixed_allele[m] = 255; // No constraint
+                fixed_allele[m] = 255; // No constraint (hom/missing)
             } else {
-                fixed_allele[m] = h2_alleles[m]; // H1 must be opposite
+                fixed_allele[m] = h2_alleles[m]; // H1 must be opposite of H2
             }
         }
 
         // 3. Run haploid FFBS
         ffbs_haploid_constrained(
-            &mut path, n_markers, n_states, p_recomb,
-            seq1, seq2, conf, &fixed_allele, &neighbors_h1,
+            &mut path, n_markers, neighbors.len(), p_recomb,
+            seq1, seq2, conf, &fixed_allele, &neighbors,
             phase_ibs, p_no_err, p_err, &mut rng
         );
 
-        // 4. Update H1 from sampled path
+        // 4. Update phase based on sampled reference alleles at hets
+        //    The sampled path tells us which reference we're copying.
+        //    At hets, we set H1 to match the reference's allele (if compatible).
         for m in 0..n_markers {
             let state = path[m] as usize;
-            if state < neighbors_h1.len() {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    // Hom/missing: take allele from genotype
-                    h1_alleles[m] = if a1 != 255 { a1 } else { a2 };
-                } else {
-                    // Het: H1 is opposite of H2 (which is in fixed_allele)
-                    h1_alleles[m] = if h2_alleles[m] == a1 { a2 } else { a1 };
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+
+            if a1 == 255 && a2 == 255 {
+                h1_alleles[m] = 255;
+            } else if a1 == a2 {
+                h1_alleles[m] = a1;
+            } else if state < neighbors.len() {
+                // Het: use reference allele to determine phase
+                let ref_al = phase_ibs.allele(m, neighbors[state]);
+                if ref_al == a1 {
+                    h1_alleles[m] = a1;
+                    h2_alleles[m] = a2;
+                } else if ref_al == a2 {
+                    h1_alleles[m] = a2;
+                    h2_alleles[m] = a1;
                 }
+                // If ref_al is missing/different, keep current phase
             }
         }
 
         // === Sample H2 | (G, H1_new) ===
 
-        // 1. Select neighbors by threading current H2 through PBWT
-        let neighbors_h2 = phase_ibs.find_neighbors_for_query(
-            &h2_alleles, n_markers / 2, ibs2, sample_idx, n_states
-        );
-        if neighbors_h2.is_empty() {
+        // 1. Select neighbors for H2 using latent state
+        let prev_state = path[center_marker] as usize;
+        if prev_state < neighbors.len() {
+            let ref_hap = neighbors[prev_state];
+            neighbors = phase_ibs.find_neighbors_of_state(ref_hap, center_marker, sample_idx, n_states);
+        }
+        if neighbors.is_empty() {
             continue;
         }
 
-        // 2. Build constraint: H2 must be opposite of H1 at hets
+        // 2. Build constraint: at hets, H2 must produce genotype with H1
         for m in 0..n_markers {
             let a1 = seq1[m];
             let a2 = seq2[m];
             if a1 == 255 || a2 == 255 || a1 == a2 {
                 fixed_allele[m] = 255;
             } else {
-                fixed_allele[m] = h1_alleles[m]; // H2 must be opposite
+                fixed_allele[m] = h1_alleles[m]; // H2 must be opposite of H1
             }
         }
 
         // 3. Run haploid FFBS
         ffbs_haploid_constrained(
-            &mut path, n_markers, n_states, p_recomb,
-            seq1, seq2, conf, &fixed_allele, &neighbors_h2,
+            &mut path, n_markers, neighbors.len(), p_recomb,
+            seq1, seq2, conf, &fixed_allele, &neighbors,
             phase_ibs, p_no_err, p_err, &mut rng
         );
 
-        // 4. Update H2 from sampled path
+        // 4. Update phase based on sampled reference alleles
         for m in 0..n_markers {
             let state = path[m] as usize;
-            if state < neighbors_h2.len() {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    h2_alleles[m] = if a2 != 255 { a2 } else { a1 };
-                } else {
-                    // Het: H2 is opposite of H1
-                    h2_alleles[m] = if h1_alleles[m] == a1 { a2 } else { a1 };
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+
+            if a1 == 255 && a2 == 255 {
+                h2_alleles[m] = 255;
+            } else if a1 == a2 {
+                h2_alleles[m] = a2;
+            } else if state < neighbors.len() {
+                // Het: use reference allele to determine phase
+                let ref_al = phase_ibs.allele(m, neighbors[state]);
+                if ref_al == a2 {
+                    h2_alleles[m] = a2;
+                    h1_alleles[m] = a1;
+                } else if ref_al == a1 {
+                    h2_alleles[m] = a1;
+                    h1_alleles[m] = a2;
                 }
             }
         }
+
+        // After first step, we have a valid path to use for latent state lookup
+        // in subsequent iterations
     }
 
     // Determine swap decisions from final H1, H2 vs original seq1, seq2
@@ -3155,11 +3223,10 @@ fn sample_dynamic_mcmc(
         }
 
         // Original phase: seq1[m] on H1, seq2[m] on H2
-        // New phase: h1_alleles[m] on H1, h2_alleles[m] on H2
-        // Swap if new H1 allele differs from original seq1
+        // Swap if final H1 allele differs from original seq1
         let swap = h1_alleles[m] != a1;
         swap_bits.push(if swap { 1 } else { 0 });
-        swap_lr.push(1e6); // High confidence
+        swap_lr.push(1e6); // High confidence from MCMC
     }
 
     (swap_bits, swap_lr)
@@ -3492,6 +3559,8 @@ mod tests {
             burnin: 3,
             iterations: 12,
             mcmc_burnin: 1,
+            dynamic_mcmc: false,
+            mcmc_steps: 3,
             phase_states: 280,
             rare: 0.002,
             impute: true,
@@ -3580,6 +3649,8 @@ mod tests {
             burnin: 2,
             iterations: 2,
             mcmc_burnin: 1,
+            dynamic_mcmc: false,
+            mcmc_steps: 3,
             phase_states: 10,
             rare: 0.002,
             impute: true,

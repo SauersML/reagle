@@ -57,6 +57,14 @@ pub struct Config {
     #[arg(long = "mcmc-burnin", default_value = "2")]
     pub mcmc_burnin: usize,
 
+    /// Enable SHAPEIT5-style dynamic MCMC (re-selects states each step)
+    #[arg(long = "dynamic-mcmc", default_value = "false")]
+    pub dynamic_mcmc: bool,
+
+    /// Number of MCMC steps per outer iteration (for dynamic MCMC)
+    #[arg(long = "mcmc-steps", default_value = "3")]
+    pub mcmc_steps: usize,
+
     /// Model states for phasing (more states = better accuracy)
     #[arg(long = "phase-states", default_value = "400")]
     pub phase_states: usize,
@@ -153,6 +161,8 @@ impl Default for Config {
             burnin: 6,
             iterations: 12,
             mcmc_burnin: 2,
+            dynamic_mcmc: false,
+            mcmc_steps: 3,
             phase_states: 400,
             rare: 0.002,
             impute: true,

@@ -170,7 +170,7 @@ impl ThreadedHaps {
     /// This method takes `&self` (immutable) since it walks the segment linked lists
     /// from scratch without using the internal cursors.
     ///
-    /// This is more efficient than cloning ThreadedHaps and calling materialize_haps
+    /// This is more efficient than cloning ThreadedHaps and calling materialize_at
     /// repeatedly when you need all markers.
     pub fn materialize_all(&self) -> Vec<Vec<u32>> {
         let n_states = self.state_heads.len();
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_haps() {
+    fn test_materialize_at() {
         let mut th = ThreadedHaps::new(3, 8, 100);
 
         // State 0: hap 10 for [0, 50), hap 15 for [50, 100)
@@ -525,26 +525,26 @@ mod tests {
         let mut buffer = vec![0u32; 3];
 
         // Test at marker 10 - before any segment transitions
-        th.materialize_haps(10, &mut buffer);
+        th.materialize_at(10, &mut buffer);
         assert_eq!(buffer[0], 10);
         assert_eq!(buffer[1], 20);
         assert_eq!(buffer[2], 30);
 
         // Test at marker 30 - after state 2's transition
-        th.materialize_haps(30, &mut buffer);
+        th.materialize_at(30, &mut buffer);
         assert_eq!(buffer[0], 10);
         assert_eq!(buffer[1], 20);
         assert_eq!(buffer[2], 35);
 
         // Test at marker 60 - after state 0's transition
-        th.materialize_haps(60, &mut buffer);
+        th.materialize_at(60, &mut buffer);
         assert_eq!(buffer[0], 15);
         assert_eq!(buffer[1], 20);
         assert_eq!(buffer[2], 35);
 
         // Reset and test again to verify cursor handling
         th.reset_cursors();
-        th.materialize_haps(5, &mut buffer);
+        th.materialize_at(5, &mut buffer);
         assert_eq!(buffer[0], 10);
         assert_eq!(buffer[1], 20);
         assert_eq!(buffer[2], 30);
