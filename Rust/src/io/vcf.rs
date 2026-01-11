@@ -970,10 +970,11 @@ impl VcfWriter {
     ///
     /// Eliminates O(n_markers * n_samples) flat_dosages allocation by using
     /// closures to access sample-major data directly during write.
-    pub fn write_imputed_streaming<S, F, G>(
+    pub fn write_imputed_streaming<S, F, B, G>(
         &mut self,
         matrix: &GenotypeMatrix<S>,
         get_dosage: F,
+        get_best_gt: B,
         get_posteriors: Option<G>,
         quality: &ImputationQuality,
         start: usize,
@@ -984,6 +985,7 @@ impl VcfWriter {
     where
         S: PhaseState,
         F: Fn(usize, usize) -> f32,
+        B: Fn(usize, usize) -> (u8, u8),
         G: Fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors),
     {
         let n_samples = self.samples.len();
@@ -1032,9 +1034,10 @@ impl VcfWriter {
             for s in 0..n_samples {
                 let ds = get_dosage(m, s);
                 let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
+                // Use best-guess GT from HMM (preserves phase info), fallback to posteriors max_allele
                 let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
                     (p1.max_allele(), p2.max_allele())
-                } else { gt_from_dosage(ds) };
+                } else { get_best_gt(m, s) };
 
                 write!(self.writer, "\t{}|{}:{}", a1, a2, format_prob(ds))?;
 
@@ -1089,22 +1092,6 @@ impl Drop for VcfWriter {
     }
 }
 
-/// Derive hard-call GT from ALT dosage
-///
-/// This matches Java Beagle's ImputedRecBuilder behavior:
-/// - DS < 0.5 → 0|0 (homozygous REF)
-/// - 0.5 <= DS < 1.5 → 0|1 (heterozygous)
-/// - DS >= 1.5 → 1|1 (homozygous ALT)
-#[inline]
-fn gt_from_dosage(ds: f32) -> (u8, u8) {
-    if ds < 0.5 {
-        (0, 0)
-    } else if ds < 1.5 {
-        (0, 1)
-    } else {
-        (1, 1)
-    }
-}
 
 
 #[cfg(test)]

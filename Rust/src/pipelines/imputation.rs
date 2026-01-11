@@ -23,7 +23,7 @@ use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::{PhaseState, Phased};
 use crate::error::Result;
-use crate::io::bref3::Bref3Reader;
+use crate::io::bref3::{StreamingBref3Reader, WindowConfig, WindowedBref3Reader};
 use crate::io::vcf::{ImputationQuality, VcfReader, VcfWriter};
 use crate::utils::workspace::ImpWorkspace;
 
@@ -897,6 +897,19 @@ impl AllelePosteriors {
         }
     }
 
+    /// Get expected ALT allele count (dosage)
+    /// For biallelic: P(ALT)
+    /// For multiallelic: sum of i * P(allele i) for i >= 1
+    #[cfg(test)]
+    #[inline]
+    pub fn dosage(&self) -> f32 {
+        match self {
+            AllelePosteriors::Biallelic(p_alt) => *p_alt,
+            AllelePosteriors::Multiallelic(probs) => {
+                probs.iter().enumerate().skip(1).map(|(i, &p)| i as f32 * p).sum()
+            }
+        }
+    }
 }
 
 /// Cursor for efficient sequential marker access to StateProbs.
@@ -1134,9 +1147,9 @@ impl ImputationPipeline {
 
             // Detect file format by extension and load accordingly
             Ok::<_, crate::error::ReagleError>(Arc::new(if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
-                eprintln!("  Detected BREF3 format");
-                let reader = Bref3Reader::open(ref_path)?;
-                reader.read_all()?
+                eprintln!("  Detected BREF3 format (streaming)");
+                // Use streaming loader for memory-efficient loading
+                Self::load_reference_streaming(ref_path, None)?
             } else {
                 eprintln!("  Detected VCF format");
                 let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
@@ -1330,34 +1343,35 @@ impl ImputationPipeline {
         // Check if we need per-haplotype allele probabilities for AP/GP output
         let need_allele_probs = self.config.ap || self.config.gp;
 
-        // =========================================================================
-        // SAMPLE-STREAMING ARCHITECTURE: Process one sample at a time
-        // =========================================================================
-        //
-        // Previous architecture (OOM-causing):
-        //   - Collected ALL ClusterStateProbs for ALL haplotypes: ~100+ GB
-        //   - Then processed DR2 and output
-        //
-        // New architecture (sample-streaming):
-        //   - Process each sample: compute HMM -> accumulate DR2 -> buffer dosages -> drop
-        //   - Memory: O(n_markers × n_samples) for dosages (~3.6 GB) instead of ~100 GB
-        //   - For AP/GP mode: also buffer per-haplotype posteriors
-        //
-        // =========================================================================
+        // Disk-buffered storage: write sample-major (sequential, fast), read chunked for output.
+        // This avoids the ~5-12 GB RAM buffer that would cause OOM on small machines.
+        // Layout: sample-major = [S0_M0, S0_M1, ..., S0_Mn, S1_M0, S1_M1, ...]
+        // Sequential writes during processing, chunked transpose during output.
 
-        // Pre-allocate dosage buffer: sample_dosages[s][m] = dosage for sample s, marker m
-        // Size: n_target_samples × n_ref_markers × 4 bytes = ~3.6 GB for 818 samples × 1.1M markers
-        let mut sample_dosages: Vec<Vec<f32>> = vec![Vec::new(); n_target_samples];
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let dosage_path = temp_dir.join(format!("reagle_{}_dosages.tmp", pid));
+        let best_gt_path = temp_dir.join(format!("reagle_{}_gt.tmp", pid));
+        let posteriors_path = temp_dir.join(format!("reagle_{}_post.tmp", pid));
 
-        // For AP/GP mode, also store per-haplotype posteriors (p_alt for biallelic)
-        // We store (hap1_p_alt, hap2_p_alt) per sample per marker
-        let mut sample_posteriors: Option<Vec<Vec<(f32, f32)>>> = if need_allele_probs {
-            Some(vec![Vec::new(); n_target_samples])
+        // Create temp files with pre-allocated size for sequential writes
+        use std::io::Write as IoWrite;
+        let dosage_file = std::fs::File::create(&dosage_path)?;
+        dosage_file.set_len((n_target_samples * n_ref_markers * 4) as u64)?;
+        let mut dosage_writer = std::io::BufWriter::with_capacity(8 * 1024 * 1024, dosage_file);
+
+        let gt_file = std::fs::File::create(&best_gt_path)?;
+        gt_file.set_len((n_target_samples * n_ref_markers * 2) as u64)?;
+        let mut gt_writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, gt_file);
+
+        let mut post_writer: Option<std::io::BufWriter<std::fs::File>> = if need_allele_probs {
+            let post_file = std::fs::File::create(&posteriors_path)?;
+            post_file.set_len((n_target_samples * n_ref_markers * 8) as u64)?;
+            Some(std::io::BufWriter::with_capacity(8 * 1024 * 1024, post_file))
         } else {
             None
         };
 
-        // Reusable buffers for allele probabilities
         let max_alleles = n_alleles_per_marker.iter().copied().max().unwrap_or(2);
 
         // Batch size for parallel processing - balances parallelism vs memory
@@ -1375,9 +1389,9 @@ impl ImputationPipeline {
                 let batch_samples: Vec<usize> = (batch_start..batch_end).collect();
 
                 // Parallel HMM computation for this batch
-                // Returns: Vec<(sample_idx, dosages, posteriors, dr2_data)>
+                // Returns: Vec<(sample_idx, dosages, best_gt, posteriors, dr2_data)>
                 type Dr2Data = Vec<(usize, Vec<f32>, Vec<f32>, bool, Option<(u8, u8)>)>; // (marker, probs1, probs2, skip, true_gt)
-                let batch_results: Vec<(usize, Vec<f32>, Option<Vec<(f32, f32)>>, Dr2Data)> = batch_samples
+                let batch_results: Vec<(usize, Vec<f32>, Vec<(u8, u8)>, Option<Vec<(f32, f32)>>, Dr2Data)> = batch_samples
                     .par_iter()
                     .map(|&s| {
                         let hap1_idx = HapIdx::new((s * 2) as u32);
@@ -1517,6 +1531,7 @@ impl ImputationPipeline {
                         };
 
                         let mut dosages = Vec::with_capacity(n_ref_markers);
+                        let mut best_gt_for_sample: Vec<(u8, u8)> = Vec::with_capacity(n_ref_markers);
                         let mut posteriors_for_sample = if need_allele_probs {
                             Some(Vec::with_capacity(n_ref_markers))
                         } else {
@@ -1593,6 +1608,21 @@ impl ImputationPipeline {
                             };
                             dosages.push(d1 + d2);
 
+                            // ALWAYS store best-guess GT from HMM to preserve phase info
+                            let best_a1 = if use_observed_a1 {
+                                observed_a1
+                            } else {
+                                // argmax of probs1[0..n_alleles]
+                                (0..n_alleles).max_by(|&a, &b| probs1[a].partial_cmp(&probs1[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0) as u8
+                            };
+                            let best_a2 = if use_observed_a2 {
+                                observed_a2
+                            } else {
+                                // argmax of probs2[0..n_alleles]
+                                (0..n_alleles).max_by(|&a, &b| probs2[a].partial_cmp(&probs2[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0) as u8
+                            };
+                            best_gt_for_sample.push((best_a1, best_a2));
+
                             // Store posteriors for AP/GP if needed
                             if let Some(ref mut post_vec) = posteriors_for_sample {
                                 let p1 = if use_observed_a1 { observed_a1 as f32 } else { probs1.get(1).copied().unwrap_or(0.0) };
@@ -1624,19 +1654,31 @@ impl ImputationPipeline {
                         }
 
                         // sp1, sp2 are dropped here when returning
-                        (s, dosages, posteriors_for_sample, dr2_data)
+                        (s, dosages, best_gt_for_sample, posteriors_for_sample, dr2_data)
                     })
                     .collect();
 
-                // Sequentially merge batch results
-                for (s, dosages, posteriors, dr2_data) in batch_results {
+                // Sort results by sample index for sequential writes
+                let mut sorted_results = batch_results;
+                sorted_results.sort_by_key(|(s, _, _, _, _)| *s);
+
+                // Write sample-major (sequential = fast!) and accumulate DR2
+                for (s, dosages, best_gt, posteriors, dr2_data) in sorted_results {
                     let is_diploid = target_samples.is_diploid(SampleIdx::new(s as u32));
 
-                    // Store dosages
-                    sample_dosages[s] = dosages;
-                    if let Some(ref mut all_posteriors) = sample_posteriors {
-                        if let Some(post) = posteriors {
-                            all_posteriors[s] = post;
+                    // Write to temp files (sequential, no seeks!)
+                    for &d in &dosages {
+                        dosage_writer.write_all(&d.to_le_bytes()).expect("temp file write failed");
+                    }
+                    for &(a1, a2) in &best_gt {
+                        gt_writer.write_all(&[a1, a2]).expect("temp file write failed");
+                    }
+                    if let Some(ref mut pw) = post_writer {
+                        if let Some(ref posts) = posteriors {
+                            for &(p1, p2) in posts {
+                                pw.write_all(&p1.to_le_bytes()).expect("temp file write failed");
+                                pw.write_all(&p2.to_le_bytes()).expect("temp file write failed");
+                            }
                         }
                     }
 
@@ -1659,49 +1701,206 @@ impl ImputationPipeline {
             }
         });
 
-        // PASS 2: Write output using buffered dosages
+        // Flush temp files before reading
+        dosage_writer.flush()?;
+        gt_writer.flush()?;
+        if let Some(ref mut pw) = post_writer {
+            pw.flush()?;
+        }
+
+        // Output with chunked transpose: read sample-major, write marker-major
         info_span!("write_output").in_scope(move || {
+            use std::io::{Read as IoRead, Seek, SeekFrom};
+
             let output_path = self.config.out.with_extension("vcf.gz");
             eprintln!("Writing output to {:?}...", output_path);
-            let mut writer = VcfWriter::create(&output_path, target_samples)?;
+            let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
             writer.write_header_extended(ref_gt.markers(), true, self.config.gp, self.config.ap)?;
 
-            // Simple closure: look up pre-computed dosage from buffer
-            let get_dosage = |m: usize, s: usize| -> f32 {
-                sample_dosages[s][m]
-            };
-
-            // Posteriors closure: look up from buffer
-            type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
-            let get_posteriors: Option<GetPosteriorsFn> = if need_allele_probs {
-                if let Some(posteriors) = sample_posteriors {
-                    Some(Box::new(move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
-                        let (p1, p2) = posteriors[s][m];
-                        (AllelePosteriors::Biallelic(p1), AllelePosteriors::Biallelic(p2))
-                    }))
-                } else {
-                    None
-                }
+            // Open temp files for reading
+            let mut dosage_file = std::fs::File::open(&dosage_path)?;
+            let mut gt_file = std::fs::File::open(&best_gt_path)?;
+            let mut post_file: Option<std::fs::File> = if need_allele_probs {
+                Some(std::fs::File::open(&posteriors_path)?)
             } else {
                 None
             };
 
-            writer.write_imputed_streaming(
-                &ref_gt,
-                get_dosage,
-                get_posteriors,
-                &quality,
-                0,
-                n_ref_markers,
-                self.config.gp,
-                self.config.ap,
-            )?;
+            // Process markers in chunks for efficient transpose
+            const CHUNK_SIZE: usize = 10_000;
+            let n_chunks = (n_ref_markers + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+            // Buffers for chunked reading: chunk_data[m_local][s]
+            let mut chunk_dosages = vec![vec![0.0f32; n_target_samples]; CHUNK_SIZE];
+            let mut chunk_gt = vec![vec![(0u8, 0u8); n_target_samples]; CHUNK_SIZE];
+            let mut chunk_post = vec![vec![(0.0f32, 0.0f32); n_target_samples]; CHUNK_SIZE];
+
+            for chunk_idx in 0..n_chunks {
+                let chunk_start = chunk_idx * CHUNK_SIZE;
+                let chunk_end = (chunk_start + CHUNK_SIZE).min(n_ref_markers);
+                let chunk_len = chunk_end - chunk_start;
+
+                // Read all samples' data for this marker chunk (transpose on read)
+                for s in 0..n_target_samples {
+                    // Sample s, markers [chunk_start..chunk_end] in sample-major file
+                    let dosage_pos = (s * n_ref_markers + chunk_start) as u64 * 4;
+                    dosage_file.seek(SeekFrom::Start(dosage_pos))?;
+                    for m_local in 0..chunk_len {
+                        let mut buf = [0u8; 4];
+                        dosage_file.read_exact(&mut buf)?;
+                        chunk_dosages[m_local][s] = f32::from_le_bytes(buf);
+                    }
+
+                    let gt_pos = (s * n_ref_markers + chunk_start) as u64 * 2;
+                    gt_file.seek(SeekFrom::Start(gt_pos))?;
+                    for m_local in 0..chunk_len {
+                        let mut buf = [0u8; 2];
+                        gt_file.read_exact(&mut buf)?;
+                        chunk_gt[m_local][s] = (buf[0], buf[1]);
+                    }
+
+                    if let Some(ref mut pf) = post_file {
+                        let post_pos = (s * n_ref_markers + chunk_start) as u64 * 8;
+                        pf.seek(SeekFrom::Start(post_pos))?;
+                        for m_local in 0..chunk_len {
+                            let mut b1 = [0u8; 4];
+                            let mut b2 = [0u8; 4];
+                            pf.read_exact(&mut b1)?;
+                            pf.read_exact(&mut b2)?;
+                            chunk_post[m_local][s] = (f32::from_le_bytes(b1), f32::from_le_bytes(b2));
+                        }
+                    }
+                }
+
+                // Write VCF lines for this chunk (now marker-major in RAM)
+                for m_local in 0..chunk_len {
+                    let m = chunk_start + m_local;
+                    let dosages = &chunk_dosages[m_local];
+                    let gts = &chunk_gt[m_local];
+                    let posts = &chunk_post[m_local];
+
+                    let get_dosage = |marker: usize, s: usize| -> f32 {
+                        assert!(marker < n_ref_markers);
+                        dosages[s]
+                    };
+                    let get_best_gt = |marker: usize, s: usize| -> (u8, u8) {
+                        assert!(marker < n_ref_markers);
+                        gts[s]
+                    };
+
+                    type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
+                    let n_markers_for_assert = n_ref_markers;
+                    let get_posteriors: Option<GetPosteriorsFn> = if need_allele_probs {
+                        let posts_clone = posts.to_vec();
+                        Some(Box::new(move |marker: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
+                            assert!(marker < n_markers_for_assert);
+                            let (p1, p2) = posts_clone[s];
+                            (AllelePosteriors::Biallelic(p1), AllelePosteriors::Biallelic(p2))
+                        }))
+                    } else {
+                        None
+                    };
+
+                    writer.write_imputed_streaming(
+                        &ref_gt,
+                        get_dosage,
+                        get_best_gt,
+                        get_posteriors,
+                        &quality,
+                        m,
+                        m + 1,
+                        self.config.gp,
+                        self.config.ap,
+                    )?;
+                }
+
+                if chunk_idx % 10 == 0 || chunk_idx == n_chunks - 1 {
+                    eprintln!("  Written {} / {} markers", chunk_end, n_ref_markers);
+                }
+            }
+
             writer.flush()?;
+
+            // Clean up temp files
+            let _ = std::fs::remove_file(&dosage_path);
+            let _ = std::fs::remove_file(&best_gt_path);
+            let _ = std::fs::remove_file(&posteriors_path);
+
             Ok::<_, crate::error::ReagleError>(())
         })?;
 
         eprintln!("Imputation complete!");
         Ok(())
+    }
+
+    /// Load reference panel using streaming/windowed approach
+    ///
+    /// This method uses the StreamingBref3Reader to load reference data in windows,
+    /// reducing peak memory usage for very large reference panels. The windows are
+    /// then merged into a single GenotypeMatrix for processing.
+    ///
+    /// For truly windowed imputation (processing each window separately), see the
+    /// WindowedBref3Reader which provides window iteration with HMM overlap handling.
+    pub fn load_reference_streaming(
+        path: &std::path::Path,
+        window_config: Option<WindowConfig>,
+    ) -> Result<GenotypeMatrix<Phased>> {
+        use crate::data::storage::GenotypeColumn;
+
+        let config = window_config.unwrap_or_default();
+        let streaming_reader = StreamingBref3Reader::open(path)?;
+        let n_haps = streaming_reader.n_haps();
+        eprintln!("    Reference panel: {} haplotypes", n_haps);
+
+        let mut windowed = WindowedBref3Reader::new(streaming_reader, config);
+
+        let samples = Arc::new(windowed.samples().clone());
+        let mut all_markers = crate::data::marker::Markers::new();
+        let mut all_columns: Vec<GenotypeColumn> = Vec::new();
+
+        let n_haps_check = windowed.n_haps();
+        debug_assert_eq!(n_haps, n_haps_check);
+
+        let mut window_num = 0;
+        // Read all windows and merge
+        while let Some(window) = windowed.next_window()? {
+            window_num += 1;
+            let window_type = if window.is_first && window.is_last {
+                "only"
+            } else if window.is_first {
+                "first"
+            } else if window.is_last {
+                "last"
+            } else {
+                "middle"
+            };
+            eprintln!(
+                "    Window {}: markers {}..{} (output {}..{}), {} window",
+                window_num,
+                window.global_start,
+                window.global_end,
+                window.output_start,
+                window.output_end,
+                window_type
+            );
+
+            // Merge chromosome names
+            for chrom in window.markers.chrom_names() {
+                if !all_markers.chrom_names().iter().any(|c| c.as_ref() == chrom.as_ref()) {
+                    all_markers.add_chrom(chrom);
+                }
+            }
+
+            // Add markers and columns
+            for m in 0..window.markers.len() {
+                let marker = window.markers.marker(MarkerIdx::new(m as u32));
+                all_markers.push(marker.clone());
+            }
+            all_columns.extend(window.columns);
+        }
+
+        eprintln!("    Loaded {} markers in {} windows", all_markers.len(), window_num);
+        Ok(GenotypeMatrix::new_phased(all_markers, all_columns, samples))
     }
 }
 
