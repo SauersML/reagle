@@ -2030,9 +2030,19 @@ pub fn run_hmm_forward_backward_clusters_counts(
 
     let mut last_sum = 1.0f32;
     let p_err = base_err_rate.clamp(1e-8, 0.5);
-    let p_no_err = 1.0 - p_err;
-    let log_p_err = p_err.ln();
-    let log_p_no_err = p_no_err.ln();
+    let p_no_err = 1.0f32 - p_err;
+
+    // BEAGLE HMM Emission Model:
+    // The reference Java implementation uses a simple binary emission model.
+    // If a state has zero mismatches within a cluster, its emission probability
+    // is high (p_no_err). If it has one or more mismatches, the probability
+    // is low (p_err).
+    //
+    // An earlier implementation in this port used a binomial model based on the
+    // COUNT of mismatches (e.g., p_err^n_mismatches). This was found to be
+    // overly punitive, especially for large clusters, and did not match the
+    // reference behavior, leading to significant accuracy degradation.
+    // The current binary model is a direct port of the validated Java logic.
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
@@ -2050,8 +2060,7 @@ pub fn run_hmm_forward_backward_clusters_counts(
                 .copied()
                 .unwrap_or(0.0);
             let mism = mism.min(n_obs);
-            let match_count = (n_obs - mism).max(0.0);
-            let em = (match_count * log_p_no_err + mism * log_p_err).exp();
+            let em = if mism > 0.0f32 { p_err } else { p_no_err };
             let val = if m == 0 {
                 em / n_states as f32
             } else {
@@ -2083,8 +2092,7 @@ pub fn run_hmm_forward_backward_clusters_counts(
                     .copied()
                     .unwrap_or(0.0);
                 let mism = mism.min(n_obs);
-                let match_count = (n_obs - mism).max(0.0);
-                let em = (match_count * log_p_no_err + mism * log_p_err).exp();
+            let em = if mism > 0.0f32 { p_err } else { p_no_err };
                 bwd[k] *= em;
                 emitted_sum += bwd[k];
             }
