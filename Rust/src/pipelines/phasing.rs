@@ -3125,9 +3125,9 @@ fn sample_dynamic_mcmc(
             phase_ibs, p_no_err, p_err, &mut rng
         );
 
-        // 4. Update phase based on sampled reference alleles at hets
-        //    The sampled path tells us which reference we're copying.
-        //    At hets, we set H1 to match the reference's allele (if compatible).
+        // 4. Update H1 based on sampled reference alleles at hets
+        //    GIBBS SAMPLING: only update H1, leave H2 fixed
+        //    At hets, set H1 to match the reference's allele (if compatible).
         for m in 0..n_markers {
             let state = path[m] as usize;
             let a1 = seq1[m];
@@ -3138,14 +3138,12 @@ fn sample_dynamic_mcmc(
             } else if a1 == a2 {
                 h1_alleles[m] = a1;
             } else if state < neighbors.len() {
-                // Het: use reference allele to determine phase
+                // Het: use reference allele to determine H1
                 let ref_al = phase_ibs.allele(m, neighbors[state]);
-                if ref_al == a1 {
-                    h1_alleles[m] = a1;
-                    h2_alleles[m] = a2;
-                } else if ref_al == a2 {
-                    h1_alleles[m] = a2;
-                    h2_alleles[m] = a1;
+                if ref_al == a1 || ref_al == a2 {
+                    // Set H1 to ref_al, and H2 must be the other allele
+                    h1_alleles[m] = ref_al;
+                    h2_alleles[m] = if ref_al == a1 { a2 } else { a1 };
                 }
                 // If ref_al is missing/different, keep current phase
             }
@@ -3181,9 +3179,10 @@ fn sample_dynamic_mcmc(
             phase_ibs, p_no_err, p_err, &mut rng
         );
 
-        // 4. Update phase based on sampled reference alleles
+        // 4. Update H2 based on sampled reference alleles
+        //    GIBBS SAMPLING: only update H2, leave H1 fixed
+        //    At hets, H2 is constrained to be opposite of H1, so just verify consistency.
         for m in 0..n_markers {
-            let state = path[m] as usize;
             let a1 = seq1[m];
             let a2 = seq2[m];
 
@@ -3191,16 +3190,11 @@ fn sample_dynamic_mcmc(
                 h2_alleles[m] = 255;
             } else if a1 == a2 {
                 h2_alleles[m] = a2;
-            } else if state < neighbors.len() {
-                // Het: use reference allele to determine phase
-                let ref_al = phase_ibs.allele(m, neighbors[state]);
-                if ref_al == a2 {
-                    h2_alleles[m] = a2;
-                    h1_alleles[m] = a1;
-                } else if ref_al == a1 {
-                    h2_alleles[m] = a1;
-                    h1_alleles[m] = a2;
-                }
+            } else {
+                // Het: H2 must be opposite of H1 (already determined in H1 step)
+                // The constraint in emit_haploid_constrained enforced this.
+                // Just ensure consistency - H2 is the allele NOT assigned to H1.
+                h2_alleles[m] = if h1_alleles[m] == a1 { a2 } else { a1 };
             }
         }
 
@@ -3731,22 +3725,32 @@ mod tests {
     #[test]
     fn test_dynamic_mcmc_deterministic_phase() {
         // Create a scenario where the correct phase is deterministic:
-        // All reference haplotypes have allele 0 at all markers.
-        // Sample genotype is {0, 1} at all markers.
-        // The HMM should consistently set H1 = 0 (matching reference).
+        // Target sample (haps 0-1) with het genotype {0, 1}
+        // Reference haplotypes (haps 2-9) all have allele 0
+        // The HMM should set H1 = 0 (matching reference majority)
         use crate::model::phase_ibs::BidirectionalPhaseIbs;
         use crate::model::ibs2::Ibs2;
 
         let n_markers = 10;
-        let n_ref_haps = 8;
+        let n_target_haps = 2;  // Sample 0: haplotypes 0 and 1
+        let n_ref_haps = 8;     // Reference: haplotypes 2-9
+        let n_total_haps = n_target_haps + n_ref_haps;
 
-        // Build reference with all 0s
+        // Build PBWT with target + reference
+        // Target haps (0, 1): missing (255) - we're phasing these
+        // Reference haps (2-9): all have allele 0
         let alleles: Vec<Vec<u8>> = (0..n_markers)
-            .map(|_| vec![0u8; n_ref_haps])
+            .map(|_| {
+                let mut haps = vec![255u8; n_total_haps]; // Start with missing
+                for h in n_target_haps..n_total_haps {
+                    haps[h] = 0; // Reference haplotypes have allele 0
+                }
+                haps
+            })
             .collect();
-        let phase_ibs = BidirectionalPhaseIbs::build(alleles, n_ref_haps, n_markers);
+        let phase_ibs = BidirectionalPhaseIbs::build(alleles, n_total_haps, n_markers);
 
-        // Empty IBS2
+        // Empty IBS2 - need at least 1 sample for the structure
         let ibs2 = Ibs2::empty(1);
 
         // Genotype: het at all sites (0/1)
@@ -3759,16 +3763,17 @@ mod tests {
 
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
+        // Sample 0: haplotypes 0 and 1
         let (swap_bits, swap_lr) = sample_dynamic_mcmc(
             n_markers,
-            n_ref_haps,
+            n_total_haps,
             &p_recomb,
             &seq1,
             &seq2,
             &conf,
             &phase_ibs,
             &ibs2,
-            0, // sample_idx
+            0, // sample_idx = 0 (haplotypes 0 and 1)
             &het_positions,
             12345, // seed
             5,     // n_mcmc_steps
@@ -3779,6 +3784,8 @@ mod tests {
         // With all reference having allele 0, H1 should be set to 0 at all hets.
         // Since seq1 = 0, this means no swap (swap_bit = 0).
         let n_swaps: usize = swap_bits.iter().map(|&b| b as usize).sum();
+
+        eprintln!("Test 1: swap_bits = {:?}, n_swaps = {}", swap_bits, n_swaps);
 
         // We expect very few or no swaps since reference strongly supports H1 = 0
         assert!(
@@ -3794,20 +3801,30 @@ mod tests {
 
     #[test]
     fn test_dynamic_mcmc_opposite_phase() {
-        // Create a scenario where reference haplotypes all have allele 1.
-        // Sample genotype is {0, 1}. The HMM should set H1 = 1 (matching reference).
-        // Since seq1 = 0 and H1 = 1, we need a swap.
+        // Target sample (haps 0-1) with het genotype {0, 1}
+        // Reference haplotypes (haps 2-9) all have allele 1
+        // The HMM should set H1 = 1 (matching reference) -> swap needed
         use crate::model::phase_ibs::BidirectionalPhaseIbs;
         use crate::model::ibs2::Ibs2;
 
         let n_markers = 10;
-        let n_ref_haps = 8;
+        let n_target_haps = 2;  // Sample 0: haplotypes 0 and 1
+        let n_ref_haps = 8;     // Reference: haplotypes 2-9
+        let n_total_haps = n_target_haps + n_ref_haps;
 
-        // Build reference with all 1s
+        // Build PBWT with target + reference
+        // Target haps (0, 1): missing (255)
+        // Reference haps (2-9): all have allele 1
         let alleles: Vec<Vec<u8>> = (0..n_markers)
-            .map(|_| vec![1u8; n_ref_haps])
+            .map(|_| {
+                let mut haps = vec![255u8; n_total_haps];
+                for h in n_target_haps..n_total_haps {
+                    haps[h] = 1; // Reference haplotypes have allele 1
+                }
+                haps
+            })
             .collect();
-        let phase_ibs = BidirectionalPhaseIbs::build(alleles, n_ref_haps, n_markers);
+        let phase_ibs = BidirectionalPhaseIbs::build(alleles, n_total_haps, n_markers);
 
         let ibs2 = Ibs2::empty(1);
 
@@ -3820,14 +3837,14 @@ mod tests {
 
         let (swap_bits, swap_lr) = sample_dynamic_mcmc(
             n_markers,
-            n_ref_haps,
+            n_total_haps,
             &p_recomb,
             &seq1,
             &seq2,
             &conf,
             &phase_ibs,
             &ibs2,
-            0,
+            0, // sample_idx = 0 (haplotypes 0 and 1)
             &het_positions,
             12345,
             5,
@@ -3838,6 +3855,8 @@ mod tests {
         // With all reference having allele 1, H1 should be set to 1 at all hets.
         // Since seq1 = 0, this means swap (swap_bit = 1).
         let n_swaps: usize = swap_bits.iter().map(|&b| b as usize).sum();
+
+        eprintln!("Test 2: swap_bits = {:?}, n_swaps = {}", swap_bits, n_swaps);
 
         // We expect most or all to swap since reference strongly supports H1 = 1
         assert!(
