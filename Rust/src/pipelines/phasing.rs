@@ -2320,17 +2320,14 @@ impl PhasingPipeline {
                         continue;
                     }
 
-                    // Fallback to interpolated allele probabilities for non-rare markers
-                    let is_a1_rare = a1 > 0 && marker_maf < rare_threshold;
-                    let is_a2_rare = a2 > 0 && marker_maf < rare_threshold;
-
+                    // Fallback to interpolated allele probabilities
                     let mkr_a = stage2_phaser.prev_stage1_marker[m];
                     let state_haps_for_interp = get_haps!(mkr_a);
                     let al_probs1 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs1, state_haps_for_interp, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
+                        m, &probs1, state_haps_for_interp, &get_allele, a1, a2,
                     );
                     let al_probs2 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs2, state_haps_for_interp, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
+                        m, &probs2, state_haps_for_interp, &get_allele, a1, a2,
                     );
 
                     let p1 = al_probs1[0] * al_probs2[1];
@@ -3542,12 +3539,11 @@ impl Stage2Phaser {
     /// Following Java Stage2Baum.unscaledAlProbs:
     /// - For each HMM state, interpolate probability from flanking Stage 1 markers
     /// - Accumulate allele probabilities based on reference haplotype alleles
-    /// - Only rare alleles trigger the match logic (Java's isLowFreq check)
-    /// - Use full probability (1.0), not the 0.55/0.45 heuristic (that's for imputation)
+    /// Compute allele probabilities using haploid Li-Stephens emission model.
     ///
-    /// # Arguments
-    /// * `is_a1_rare` - Whether target allele a1 is low frequency
-    /// * `is_a2_rare` - Whether target allele a2 is low frequency
+    /// Each HMM state corresponds to a specific reference haplotype. The emission
+    /// probability depends ONLY on that haplotype's allele - checking paired
+    /// haplotypes would violate the haploid model assumption.
     fn interpolated_allele_probs<F>(
         &self,
         marker: usize,
@@ -3556,8 +3552,6 @@ impl Stage2Phaser {
         get_allele: &F,                 // Closure to get allele for any haplotype
         a1: u8,
         a2: u8,
-        is_a1_rare: bool,
-        is_a2_rare: bool,
     ) -> [f32; 2]
     where
         F: Fn(usize, usize) -> u8, // (marker, hap_index) -> allele
@@ -3576,16 +3570,14 @@ impl Stage2Phaser {
         for j in 0..n_states {
             let hap = haps_at_mkr_a[j] as usize;
 
-            // Get allele from this haplotype at rare marker (handles both target and reference)
-            let b1 = get_allele(marker, hap);
+            // Get allele from this specific haplotype at the rare marker.
+            // Li-Stephens HMM models haploid copying: state k means we're copying
+            // haplotype k, so emission depends ONLY on haplotype k's allele.
+            // The paired haplotype (hap ^ 1) is irrelevant - checking it would
+            // introduce "free switching" and wash out the phasing signal.
+            let ref_allele = get_allele(marker, hap);
 
-            // Get allele from paired haplotype (for het handling)
-            // For target: paired_hap = hap ^ 1 (same sample, other haplotype)
-            // For reference: paired_hap = hap ^ 1 (same sample in ref panel)
-            let paired_hap = hap ^ 1;
-            let b2 = get_allele(marker, paired_hap);
-
-            if b1 == 255 || b2 == 255 {
+            if ref_allele == 255 {
                 continue;
             }
 
@@ -3593,32 +3585,14 @@ impl Stage2Phaser {
             let prob = wt * probs_a.get(j).copied().unwrap_or(0.0)
                 + (1.0 - wt) * probs_b.get(j).copied().unwrap_or(0.0);
 
-            if b1 == b2 {
-                // Homozygous reference haplotype
-                if b1 == a1 {
-                    al_probs[0] += prob;
-                } else if b1 == a2 {
-                    al_probs[1] += prob;
-                }
-            } else {
-                // Heterozygous reference haplotype - use rare allele matching
-                // Following Java Stage2Baum.unscaledAlProbs:
-                // - match1 is true ONLY if a1 is rare AND matches a reference allele
-                // - match2 is true ONLY if a2 is rare AND matches a reference allele
-                // - Use FULL probability (1.0), NOT the 0.55/0.45 heuristic (that's for imputation)
-                let match1 = is_a1_rare && (a1 == b1 || a1 == b2);
-                let match2 = is_a2_rare && (a2 == b1 || a2 == b2);
-
-                if match1 && !match2 {
-                    // Only a1 matches (and is rare) - add full probability to a1
-                    al_probs[0] += prob;
-                } else if match2 && !match1 {
-                    // Only a2 matches (and is rare) - add full probability to a2
-                    al_probs[1] += prob;
-                }
-                // If both match or neither match (ambiguous), no contribution
-                // This is consistent with Java Stage2Baum.unscaledAlProbs behavior
+            // Simple haploid emission: if this reference haplotype carries a1, add
+            // probability to a1; if it carries a2, add to a2.
+            if ref_allele == a1 {
+                al_probs[0] += prob;
+            } else if ref_allele == a2 {
+                al_probs[1] += prob;
             }
+            // If ref_allele matches neither (e.g., multiallelic), no contribution
         }
 
         al_probs
