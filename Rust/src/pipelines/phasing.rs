@@ -2484,6 +2484,80 @@ fn emit_combined_fast(ref_al: u8, mode: CombinedEmitMode, conf: f32, p_no_err: f
     base * conf + 0.5 * (1.0 - conf)
 }
 
+/// Compute the likelihood ratio for a phase decision at a heterozygous site.
+///
+/// Given het alleles (a1, a2) and reference alleles (ref1, ref2) from sampled paths,
+/// compute LR = P(better phase) / P(worse phase) based on emission probabilities.
+///
+/// This measures how much more likely the chosen phase is compared to the alternative,
+/// providing a meaningful confidence metric for the phase decision.
+#[inline]
+fn compute_phase_lr(
+    a1: u8,
+    a2: u8,
+    ref1: u8,
+    ref2: u8,
+    conf: f32,
+    p_no_err: f32,
+    p_err: f32,
+) -> f32 {
+    // Phase 0: H1=a1 matches ref1, H2=a2 matches ref2
+    let e0_h1 = emit_prob(ref1, a1, conf, p_no_err, p_err);
+    let e0_h2 = emit_prob(ref2, a2, conf, p_no_err, p_err);
+    let p0 = e0_h1 * e0_h2;
+
+    // Phase 1: H1=a2 matches ref1, H2=a1 matches ref2
+    let e1_h1 = emit_prob(ref1, a2, conf, p_no_err, p_err);
+    let e1_h2 = emit_prob(ref2, a1, conf, p_no_err, p_err);
+    let p1 = e1_h1 * e1_h2;
+
+    // LR = max / min, with bounds to avoid numerical issues
+    let (max_p, min_p) = if p0 >= p1 { (p0, p1) } else { (p1, p0) };
+    if min_p < 1e-30 {
+        if max_p < 1e-30 {
+            1.0 // Both essentially zero, no information
+        } else {
+            1e6 // Strong evidence for one phase (capped)
+        }
+    } else {
+        (max_p / min_p).min(1e6)
+    }
+}
+
+/// Compute the likelihood ratio for a phase decision with a single reference.
+///
+/// Used when only one reference haplotype path is available (e.g., in Gibbs sampling).
+/// The LR is computed based on whether the reference supports the chosen allele.
+#[inline]
+fn compute_phase_lr_single(
+    chosen_allele: u8,
+    other_allele: u8,
+    ref_allele: u8,
+    conf: f32,
+    p_no_err: f32,
+    p_err: f32,
+) -> f32 {
+    if ref_allele == 255 {
+        // Missing reference - no information
+        return 1.0;
+    }
+
+    // Emission probability if chosen allele is correct
+    let p_chosen = emit_prob(ref_allele, chosen_allele, conf, p_no_err, p_err);
+    // Emission probability if other allele is correct
+    let p_other = emit_prob(ref_allele, other_allele, conf, p_no_err, p_err);
+
+    // LR = P(chosen) / P(other)
+    if p_other < 1e-30 {
+        if p_chosen < 1e-30 {
+            1.0
+        } else {
+            1e6
+        }
+    } else {
+        (p_chosen / p_other).min(1e6)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum EmissionMode {
@@ -3220,7 +3294,22 @@ fn sample_dynamic_mcmc(
         // Swap if final H1 allele differs from original seq1
         let swap = h1_alleles[m] != a1;
         swap_bits.push(if swap { 1 } else { 0 });
-        swap_lr.push(1e6); // High confidence from MCMC
+
+        // Compute LR from the reference allele at this position
+        let ref_al = if (path[m] as usize) < neighbors.len() {
+            phase_ibs.allele(m, neighbors[path[m] as usize])
+        } else {
+            255
+        };
+        let lr = compute_phase_lr_single(
+            h1_alleles[m], // chosen allele for H1
+            h2_alleles[m], // other allele (H2)
+            ref_al,
+            conf[m],
+            p_no_err,
+            p_err,
+        );
+        swap_lr.push(lr);
     }
 
     (swap_bits, swap_lr)
@@ -3346,8 +3435,9 @@ fn sample_swap_bits_mosaic(
         };
 
         swap_bits.push(orient);
-        // High confidence since this is a deterministic decision from the sample
-        swap_lr.push(1e6);
+        // Compute LR from the emission probabilities under both phase hypotheses
+        let lr = compute_phase_lr(a1, a2, ref1, ref2, conf[m], p_no_err, p_err);
+        swap_lr.push(lr);
     }
 
     (swap_bits, swap_lr)
