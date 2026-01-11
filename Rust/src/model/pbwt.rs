@@ -135,16 +135,53 @@ impl PbwtDivUpdater {
             running += self.counts[i];
         }
 
-        // 3. Initialize p array and reset counts for scatter pass
+        // 3. Check if there's any missing data (before resetting counts)
+        // This lets us use a faster 2-bin path when there's no missing data
+        let has_missing = self.counts[n_alleles] > 0;
+
+        // 4. Initialize p array and reset counts for scatter pass
         let init_value = (marker + 1) as i32;
         self.counts[..n_bins].fill(0);
         self.p[..n_bins].fill(init_value);
 
-        // 4. Scatter to scratch buffers with p propagation (Counting Sort Phase 3)
+        // 5. Scatter to scratch buffers with p propagation (Counting Sort Phase 3)
         // This single pass matches Java's loop exactly:
         //   propagate p -> store -> reset p[allele]
-        if n_alleles == 2 {
-            // Optimized biallelic path with 3 bins: REF(0), ALT(1), MISSING(2)
+        if n_alleles == 2 && !has_missing {
+            // Fast biallelic path when no missing data - only 2 bins needed
+            // This is the common case and avoids the 3rd comparison per haplotype
+            let mut p0 = init_value;
+            let mut p1 = init_value;
+            let base0 = self.offsets[0];
+            let base1 = self.offsets[1];
+            let mut count0 = 0usize;
+            let mut count1 = 0usize;
+
+            for i in 0..self.n_haps {
+                let hap = prefix[i];
+                let div = divergence[i];
+                let allele = alleles[hap as usize];
+
+                // Propagate max to both bins
+                if div > p0 { p0 = div; }
+                if div > p1 { p1 = div; }
+
+                if allele == 0 {
+                    let pos = base0 + count0;
+                    self.scratch_a[pos] = hap;
+                    self.scratch_d[pos] = p0;
+                    p0 = i32::MIN;
+                    count0 += 1;
+                } else {
+                    let pos = base1 + count1;
+                    self.scratch_a[pos] = hap;
+                    self.scratch_d[pos] = p1;
+                    p1 = i32::MIN;
+                    count1 += 1;
+                }
+            }
+        } else if n_alleles == 2 {
+            // Biallelic path with missing data - needs 3 bins
             let mut p0 = init_value;
             let mut p1 = init_value;
             let mut p_miss = init_value;
@@ -160,7 +197,8 @@ impl PbwtDivUpdater {
                 let div = divergence[i];
                 let allele = alleles[hap as usize];
 
-                // Propagate max to all bins
+                // Propagate max to all bins - this is essential for correctness
+                // The divergence must propagate through all allele bins
                 if div > p0 { p0 = div; }
                 if div > p1 { p1 = div; }
                 if div > p_miss { p_miss = div; }
@@ -289,13 +327,48 @@ impl PbwtDivUpdater {
             running += self.counts[i];
         }
 
-        // 4. Scatter with MIN propagation for backward PBWT
+        // 4. Check if there's any missing data (before resetting counts)
+        let has_missing = self.counts[n_alleles] > 0;
+
+        // 5. Scatter with MIN propagation for backward PBWT
         // p[j] tracks the minimum divergence seen since last output for allele j
         self.counts[..n_bins].fill(0);
         self.p[..n_bins].fill(init_value);
 
-        if n_alleles == 2 {
-            // Optimized biallelic path with 3 bins: REF(0), ALT(1), MISSING(2)
+        if n_alleles == 2 && !has_missing {
+            // Fast biallelic path when no missing data - only 2 bins needed
+            let mut p0 = init_value;
+            let mut p1 = init_value;
+            let base0 = self.offsets[0];
+            let base1 = self.offsets[1];
+            let mut count0 = 0usize;
+            let mut count1 = 0usize;
+
+            for i in 0..self.n_haps {
+                let hap = prefix[i];
+                let div = divergence[i];
+                let allele = alleles[hap as usize];
+
+                // Propagate min to both bins (backward PBWT)
+                if div < p0 { p0 = div; }
+                if div < p1 { p1 = div; }
+
+                if allele == 0 {
+                    let pos = base0 + count0;
+                    self.scratch_a[pos] = hap;
+                    self.scratch_d[pos] = p0;
+                    p0 = i32::MAX;
+                    count0 += 1;
+                } else {
+                    let pos = base1 + count1;
+                    self.scratch_a[pos] = hap;
+                    self.scratch_d[pos] = p1;
+                    p1 = i32::MAX;
+                    count1 += 1;
+                }
+            }
+        } else if n_alleles == 2 {
+            // Biallelic path with missing data - needs 3 bins
             let mut p0 = init_value;
             let mut p1 = init_value;
             let mut p_miss = init_value;
