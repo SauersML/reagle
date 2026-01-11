@@ -352,4 +352,99 @@ mod tests {
         assert_eq!(divergence[2], 1); // Hap 1, first with allele 1
         assert_eq!(divergence[3], 0); // Hap 3, second with allele 1
     }
+
+    /// Test PBWT divergence propagation across multiple markers.
+    /// This tests the CRITIC's claim that "PBWT forgets history at every step".
+    /// If that were true, divergence would reset to marker+1 at each step,
+    /// and we couldn't find matches longer than 1 marker.
+    #[test]
+    fn test_pbwt_multi_marker_divergence_propagation() {
+        let mut updater = PbwtDivUpdater::new(4);
+        let mut prefix: Vec<u32> = vec![0, 1, 2, 3];
+        let mut divergence: Vec<i32> = vec![0, 0, 0, 0]; // Match started at marker 0
+
+        // Haplotypes:
+        // Hap 0: [0, 0, 0]  - all allele 0
+        // Hap 1: [0, 0, 0]  - all allele 0 (matches hap 0)
+        // Hap 2: [1, 1, 1]  - all allele 1
+        // Hap 3: [1, 1, 1]  - all allele 1 (matches hap 2)
+
+        // Marker 0
+        let alleles_m0 = vec![0u8, 0, 1, 1];
+        updater.fwd_update(&alleles_m0, 2, 0, &mut prefix, &mut divergence);
+        // After m0: prefix=[0,1,2,3], divergence=[1,0,1,0]
+        // Haps 0,1 grouped (allele 0), 2,3 grouped (allele 1)
+
+        // Marker 1
+        let alleles_m1 = vec![0u8, 0, 1, 1];
+        updater.fwd_update(&alleles_m1, 2, 1, &mut prefix, &mut divergence);
+        // After m1: same grouping, divergence should propagate
+        // If CRITIC were right, divergence would be [2,2,2,2] (marker+1)
+        // But with correct propagation, hap 1's divergence carries forward from m0
+
+        // Marker 2
+        let alleles_m2 = vec![0u8, 0, 1, 1];
+        updater.fwd_update(&alleles_m2, 2, 2, &mut prefix, &mut divergence);
+
+        // Key assertion: If divergence propagates correctly, hap 1 should have
+        // divergence value propagated from marker 0 (when it was first grouped with hap 0).
+        // If CRITIC were right, all divergences would be marker+1 = 3.
+
+        // The second hap in each allele group should have LOW divergence (0 or 1),
+        // indicating a match that started early.
+        assert!(
+            divergence[1] < 3,
+            "PBWT divergence NOT propagating! Second hap in group has div={}, expected < 3",
+            divergence[1]
+        );
+        assert!(
+            divergence[3] < 3,
+            "PBWT divergence NOT propagating! Fourth hap in group has div={}, expected < 3",
+            divergence[3]
+        );
+
+        // First hap in each group can have marker+1 (no predecessor with same allele yet)
+        // That's expected behavior, not a bug.
+    }
+
+    /// Test that matches are detected when haplotypes share a long identical segment.
+    /// This tests the core PBWT functionality for finding IBS matches.
+    #[test]
+    fn test_pbwt_long_match_detection() {
+        let mut updater = PbwtDivUpdater::new(4);
+        let mut prefix: Vec<u32> = vec![0, 1, 2, 3];
+        let mut divergence: Vec<i32> = vec![0, 0, 0, 0];
+
+        // Haplotypes sharing a 5-marker segment:
+        // Hap 0: [0, 0, 0, 0, 0]
+        // Hap 1: [0, 0, 0, 0, 0]  - matches hap 0 from start
+        // Hap 2: [1, 0, 0, 0, 0]  - matches haps 0,1 from marker 1
+        // Hap 3: [1, 1, 0, 0, 0]  - matches haps 0,1,2 from marker 2
+
+        for marker in 0..5 {
+            let alleles = vec![
+                if marker == 0 { 0u8 } else { 0 },  // hap 0
+                if marker == 0 { 0 } else { 0 },     // hap 1
+                if marker < 1 { 1 } else { 0 },      // hap 2: 1 at m0
+                if marker < 2 { 1 } else { 0 },      // hap 3: 1 at m0,m1
+            ];
+            updater.fwd_update(&alleles, 2, marker, &mut prefix, &mut divergence);
+        }
+
+        // After marker 4:
+        // Haps 0,1 have been together since marker 0 -> one should have low divergence
+        // Hap 2 joined allele-0 group at marker 1 -> divergence should be ~1
+        // Hap 3 joined allele-0 group at marker 2 -> divergence should be ~2
+
+        // Find hap 1 in the sorted prefix array
+        let hap1_pos = prefix.iter().position(|&h| h == 1).unwrap();
+        let hap1_div = divergence[hap1_pos];
+
+        // Hap 1 should have a match starting early (div close to 0 or 1)
+        assert!(
+            hap1_div <= 2,
+            "Hap 1 should have long match with hap 0, but divergence is {} (expected <= 2)",
+            hap1_div
+        );
+    }
 }
