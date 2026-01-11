@@ -1741,8 +1741,6 @@ fn run_hmm_forward_backward_clusters(
 
     let p_err = p_err.clamp(1e-8, 0.5);
     let p_no_err = 1.0 - p_err;
-    let log_p_err = p_err.ln();
-    let log_p_no_err = p_no_err.ln();
 
     // Forward pass
     let total_size = n_clusters * n_states;
@@ -1766,12 +1764,8 @@ fn run_hmm_forward_backward_clusters(
                 .unwrap_or(0.0);
             let mismatch_count = mismatches[k].min(n_obs);
             let match_count = (n_obs - mismatch_count).max(0.0);
-            // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
-            let emit = if n_obs > 0.0 {
-                ((match_count * log_p_no_err + mismatch_count * log_p_err) / n_obs).exp()
-            } else {
-                1.0
-            };
+            // BEAGLE binary emission: p_err if any mismatches, p_no_err otherwise
+            let emit = if mismatch_count > 0.0 { p_err } else { p_no_err };
 
             let val = if c == 0 {
                 emit / n_states as f32
@@ -1806,13 +1800,8 @@ fn run_hmm_forward_backward_clusters(
                     .copied()
                     .unwrap_or(0.0);
                 let mismatch_count = mismatches[k].min(n_obs);
-                let match_count = (n_obs - mismatch_count).max(0.0);
-                // Geometric mean: normalize by n_obs to treat cluster as single evidence unit
-                let emit = if n_obs > 0.0 {
-                    ((match_count * log_p_no_err + mismatch_count * log_p_err) / n_obs).exp()
-                } else {
-                    1.0
-                };
+                // BEAGLE binary emission: p_err if any mismatches, p_no_err otherwise
+                let emit = if mismatch_count > 0.0 { p_err } else { p_no_err };
                 bwd[k] *= emit;
                 emitted_sum += bwd[k];
             }
@@ -1869,8 +1858,6 @@ pub fn run_hmm_forward_backward_clusters_counts(
     let mut last_sum = 1.0f32;
     let p_err = base_err_rate.clamp(1e-8, 0.5);
     let p_no_err = 1.0 - p_err;
-    let log_p_err = p_err.ln();
-    let log_p_no_err = p_no_err.ln();
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = p_rec / n_states as f32;
@@ -1888,14 +1875,8 @@ pub fn run_hmm_forward_backward_clusters_counts(
                 .copied()
                 .unwrap_or(0.0);
             let mism = mism.min(n_obs);
-            let match_count = (n_obs - mism).max(0.0);
-            // Geometric mean: treats cluster as single evidence unit while preserving
-            // granular mismatch info. More robust to genotyping errors than Java's binary.
-            let em = if n_obs > 0.0 {
-                ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
-            } else {
-                1.0
-            };
+            // BEAGLE binary emission: p_err if any mismatches, p_no_err otherwise
+            let em = if mism > 0.0 { p_err } else { p_no_err };
             let val = if m == 0 {
                 em / n_states as f32
             } else {
@@ -1921,19 +1902,8 @@ pub fn run_hmm_forward_backward_clusters_counts(
             let mismatches = &cluster_mismatches[m + 1];
             for k in 0..n_states {
                 let mism = mismatches.get(k).copied().unwrap_or(0.0);
-                let n_obs = cluster_non_missing
-                    .get(m + 1)
-                    .and_then(|row| row.get(k))
-                    .copied()
-                    .unwrap_or(0.0);
-                let mism = mism.min(n_obs);
-                let match_count = (n_obs - mism).max(0.0);
-                // Geometric mean: treats cluster as single evidence unit
-                let em = if n_obs > 0.0 {
-                    ((match_count * log_p_no_err + mism * log_p_err) / n_obs).exp()
-                } else {
-                    1.0
-                };
+                // BEAGLE binary emission: p_err if any mismatches, p_no_err otherwise
+                let em = if mism > 0.0 { p_err } else { p_no_err };
                 bwd[k] *= em;
                 emitted_sum += bwd[k];
             }
