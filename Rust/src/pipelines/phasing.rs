@@ -564,6 +564,7 @@ impl PhasingPipeline {
                 &mut sample_phases,
                 atomic_estimates.as_ref(),
                 it,
+                &confidence_by_sample,
             )?;
 
             // Update parameters from EM estimates and recompute recombination probabilities
@@ -613,6 +614,7 @@ impl PhasingPipeline {
                 &mut sample_phases,
                 &maf,
                 rare_threshold,
+                &confidence_by_sample,
             );
             
             // Sync again after Stage 2
@@ -968,6 +970,7 @@ impl PhasingPipeline {
                 &mut sample_phases,
                 overlap_markers,
                 atomic_estimates.as_ref(),
+                &confidence_by_sample,
             )?;
 
             // Update parameters from EM estimates and recompute recombination probabilities
@@ -1465,6 +1468,7 @@ impl PhasingPipeline {
         sample_phases: &mut [SamplePhase],
         overlap_markers: usize,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
+        confidence_by_sample: &[Vec<f32>],
     ) -> Result<()> {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
@@ -1487,11 +1491,23 @@ impl PhasingPipeline {
         };
 
         // Build bidirectional PBWT for better state selection around recombination hotspots
+        // Filter low-confidence target markers to prevent bad hard calls from
+        // excluding correct reference haplotypes during state selection.
         let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
             self.build_bidirectional_pbwt_combined(
                 |m, h| {
                     if h < n_haps {
-                        ref_geno.get(m, HapIdx::new(h as u32))
+                        // Target haplotype: check confidence before using
+                        let sample = h / 2;
+                        let conf = confidence_by_sample.get(sample)
+                            .and_then(|c| c.get(m))
+                            .copied()
+                            .unwrap_or(1.0);
+                        if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                            255 // Treat low-confidence calls as missing for IBS
+                        } else {
+                            ref_geno.get(m, HapIdx::new(h as u32))
+                        }
                     } else {
                         let ref_h = h - n_haps;
                         if let Some(ref_m) = alignment.target_to_ref(m) {
@@ -1656,6 +1672,7 @@ impl PhasingPipeline {
         sample_phases: &mut [SamplePhase],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
+        confidence_by_sample: &[Vec<f32>],
     ) -> Result<()> {
         let n_haps = geno.n_haps();
 
@@ -1683,12 +1700,24 @@ impl PhasingPipeline {
 
         // 2. Build bidirectional PBWT on high-frequency markers only
         // When reference is available, include reference haplotypes in the PBWT
+        // Filter low-confidence target markers to prevent bad hard calls from
+        // excluding correct reference haplotypes during state selection.
 
         let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
             self.build_bidirectional_pbwt_combined_subset(
                 |orig_m, h| {
                     if h < n_haps {
-                        ref_geno.get(orig_m, HapIdx::new(h as u32))
+                        // Target haplotype: check confidence before using
+                        let sample = h / 2;
+                        let conf = confidence_by_sample.get(sample)
+                            .and_then(|c| c.get(orig_m))
+                            .copied()
+                            .unwrap_or(1.0);
+                        if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                            255 // Treat low-confidence calls as missing for IBS
+                        } else {
+                            ref_geno.get(orig_m, HapIdx::new(h as u32))
+                        }
                     } else {
                         let ref_h = h - n_haps;
                         if let Some(ref_m) = alignment.target_to_ref(orig_m) {
@@ -1912,6 +1941,7 @@ impl PhasingPipeline {
         sample_phases: &mut [SamplePhase],
         maf: &[f32],
         rare_threshold: f32,
+        confidence_by_sample: &[Vec<f32>],
     ) {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
@@ -1993,11 +2023,23 @@ impl PhasingPipeline {
 
         // Build bidirectional PBWT on hi-freq markers for consistent state selection
         // When reference is available, include reference haplotypes
+        // Filter low-confidence target markers to prevent bad hard calls from
+        // excluding correct reference haplotypes during state selection.
         let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
             self.build_bidirectional_pbwt_combined_subset(
                 |orig_m, h| {
                     if h < n_haps {
-                        ref_geno.get(orig_m, HapIdx::new(h as u32))
+                        // Target haplotype: check confidence before using
+                        let sample = h / 2;
+                        let conf = confidence_by_sample.get(sample)
+                            .and_then(|c| c.get(orig_m))
+                            .copied()
+                            .unwrap_or(1.0);
+                        if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                            255 // Treat low-confidence calls as missing for IBS
+                        } else {
+                            ref_geno.get(orig_m, HapIdx::new(h as u32))
+                        }
                     } else {
                         let ref_h = h - n_haps;
                         if let Some(ref_m) = alignment.target_to_ref(orig_m) {
