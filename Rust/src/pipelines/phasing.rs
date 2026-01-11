@@ -49,7 +49,7 @@ pub struct PhasingPipeline {
     alignment: Option<MarkerAlignment>,
 }
 
-const MOSAIC_BLOCK_SIZE: usize = 512;
+const MOSAIC_BLOCK_SIZE: usize = 128;  // Smaller = less memory per sample
 
 struct RefAlleleLookup<'a> {
     state_haps: &'a [Vec<u32>],
@@ -142,8 +142,8 @@ struct MosaicChain<'a> {
     hap2_checkpoints: FwdCheckpoints,
     hap2_allele: Vec<u8>,
     hap2_use_combined: Vec<bool>,
-    path1: Vec<usize>,
-    path2: Vec<usize>,
+    path1: Vec<u32>,  // u32 saves 50% memory vs usize
+    path2: Vec<u32>,
     fwd_block: Vec<f32>,
     trace: MosaicTrace,
     p_no_err: f32,
@@ -177,8 +177,8 @@ impl<'a> MosaicChain<'a> {
             hap2_checkpoints: FwdCheckpoints::new(n_markers, n_states, MOSAIC_BLOCK_SIZE),
             hap2_allele: vec![255u8; n_markers],
             hap2_use_combined: vec![true; n_markers],
-            path1: vec![0usize; n_markers],
-            path2: vec![0usize; n_markers],
+            path1: vec![0u32; n_markers],
+            path2: vec![0u32; n_markers],
             fwd_block: vec![0.0f32; n_states * MOSAIC_BLOCK_SIZE],
             trace: MosaicTrace {
                 mean_state: 0.0,
@@ -191,7 +191,7 @@ impl<'a> MosaicChain<'a> {
         out
     }
 
-    fn paths(&self) -> (&[usize], &[usize]) {
+    fn paths(&self) -> (&[u32], &[u32]) {
         (&self.path1, &self.path2)
     }
 
@@ -246,7 +246,7 @@ impl<'a> MosaicChain<'a> {
                 continue;
             }
 
-            let ref_al = self.lookup.allele(m, self.path1[m]);
+            let ref_al = self.lookup.allele(m, self.path1[m] as usize);
             if ref_al == a1 {
                 self.hap2_use_combined[m] = false;
                 self.hap2_allele[m] = a2;
@@ -1387,8 +1387,6 @@ impl PhasingPipeline {
                 &het_positions,
                 sample_seed,
                 self.config.mcmc_burnin,
-                self.config.mcmc_samples,
-                self.config.mcmc_chains,
                 p_no_err,
                 p_err,
             );
@@ -1574,8 +1572,6 @@ impl PhasingPipeline {
                     &changeable_positions,
                     sample_seed,
                     self.config.mcmc_burnin,
-                    self.config.mcmc_samples,
-                    self.config.mcmc_chains,
                     p_no_err,
                     p_err,
                 );
@@ -1778,8 +1774,6 @@ impl PhasingPipeline {
                     &het_positions,
                     sample_seed,
                     self.config.mcmc_burnin,
-                    self.config.mcmc_samples,
-                    self.config.mcmc_chains,
                     p_no_err,
                     p_err,
                 );
@@ -2043,33 +2037,21 @@ impl PhasingPipeline {
                 let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
                 let probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
 
-                // Pre-compute state->hap mapping for all Stage 1 markers
-                // This is needed because ThreadedHaps uses cursor-based traversal
-                // Pre-allocate all memory upfront to avoid clone() overhead in hot loop
-                let state_haps_stage1: Vec<Vec<u32>> = {
-                    let mut threaded_haps_mut = threaded_haps.clone();
-                    let mut state_haps = vec![vec![0u32; n_states]; n_stage1];
-                    for m in 0..n_stage1 {
-                        threaded_haps_mut.materialize_haps(m, &mut state_haps[m]);
-                    }
-                    state_haps
-                };
+                // Lazy cache for state->hap mapping - O(1) indexing with Option<Vec>
+                let mut hap_cache: Vec<Option<Vec<u32>>> = vec![None; n_stage1];
+                let mut threaded_haps_mut = threaded_haps.clone();
 
-                let carrier_score = |m: usize, probs: &[Vec<f32>], carrier_set: &std::collections::HashSet<u32>| -> f32 {
-                    let mkr_a = stage2_phaser.prev_stage1_marker[m];
-                    let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
-                    let wt = stage2_phaser.prev_stage1_wt[m];
-                    let mut score = 0.0f32;
-                    for (j, &hap) in state_haps_stage1[mkr_a].iter().enumerate() {
-                        let prob_a = probs[mkr_a].get(j).copied().unwrap_or(0.0);
-                        let prob_b = probs[mkr_b].get(j).copied().unwrap_or(0.0);
-                        let prob = wt * prob_a + (1.0 - wt) * prob_b;
-                        if carrier_set.contains(&hap) {
-                            score += prob;
+                macro_rules! get_haps {
+                    ($marker:expr) => {{
+                        let m = $marker;
+                        if hap_cache[m].is_none() {
+                            let mut haps = vec![0u32; n_states];
+                            threaded_haps_mut.materialize_haps(m, &mut haps);
+                            hap_cache[m] = Some(haps);
                         }
-                    }
-                    score
-                };
+                        hap_cache[m].as_ref().unwrap()
+                    }};
+                }
 
                 // Closure to get allele for any haplotype (target or reference)
                 let get_allele = |marker: usize, hap: usize| -> u8 {
@@ -2094,92 +2076,113 @@ impl PhasingPipeline {
 
                 let mut decisions: Vec<Stage2Decision> = Vec::new();
 
-                // Function to impute a single allele for a haplotype
+                // Inline helper macro for imputing a single allele
                 // Matches Java Stage2Baum.imputeAllele()
-                let impute_allele = |m: usize, probs: &[Vec<f32>], state_haps: &[Vec<u32>]| -> u8 {
-                    // For biallelic sites (most common), use 2 alleles
-                    // For multiallelic, use a reasonable max
-                    let n_alleles = 4usize; // Conservative max for rare multiallelic sites
-                    let mut al_probs = vec![0.0f32; n_alleles];
+                macro_rules! impute_allele {
+                    ($m:expr, $probs:expr) => {{
+                        let m = $m;
+                        let probs = $probs;
+                        let n_alleles = 4usize;
+                        let mut al_probs = [0.0f32; 4];
 
-                    let mkr_a = stage2_phaser.prev_stage1_marker[m];
-                    let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
-                    let wt = stage2_phaser.prev_stage1_wt[m];
+                        let mkr_a = stage2_phaser.prev_stage1_marker[m];
+                        let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
+                        let wt = stage2_phaser.prev_stage1_wt[m];
+                        let state_haps = get_haps!(mkr_a);
 
-                    for (j, &hap) in state_haps[mkr_a].iter().enumerate() {
-                        let prob_a = probs[mkr_a].get(j).copied().unwrap_or(0.0);
-                        let prob_b = probs[mkr_b].get(j).copied().unwrap_or(0.0);
-                        let prob = wt * prob_a + (1.0 - wt) * prob_b;
+                        for (j, &hap) in state_haps.iter().enumerate() {
+                            let prob_a = probs[mkr_a].get(j).copied().unwrap_or(0.0);
+                            let prob_b = probs[mkr_b].get(j).copied().unwrap_or(0.0);
+                            let prob = wt * prob_a + (1.0 - wt) * prob_b;
 
-                        let b1 = get_allele(m, hap as usize);
-                        let b2 = get_allele(m, (hap ^ 1) as usize);
+                            let b1 = get_allele(m, hap as usize);
+                            let b2 = get_allele(m, (hap ^ 1) as usize);
 
-                        if b1 != 255 && b2 != 255 {
-                            if b1 == b2 || (hap as usize) >= n_haps {
-                                // Homozygous or reference haplotype
-                                if (b1 as usize) < n_alleles {
-                                    al_probs[b1 as usize] += prob;
-                                }
-                            } else {
-                                // Heterozygous target haplotype
-                                let is_rare1 = maf[m] < rare_threshold && b1 > 0;
-                                let is_rare2 = maf[m] < rare_threshold && b2 > 0;
-                                if is_rare1 != is_rare2 {
-                                    // One rare, one common: favor rare slightly
-                                    if is_rare1 && (b1 as usize) < n_alleles {
-                                        al_probs[b1 as usize] += 0.55 * prob;
-                                    }
-                                    if !is_rare1 && (b1 as usize) < n_alleles {
-                                        al_probs[b1 as usize] += 0.45 * prob;
-                                    }
-                                    if is_rare2 && (b2 as usize) < n_alleles {
-                                        al_probs[b2 as usize] += 0.55 * prob;
-                                    }
-                                    if !is_rare2 && (b2 as usize) < n_alleles {
-                                        al_probs[b2 as usize] += 0.45 * prob;
+                            if b1 != 255 && b2 != 255 {
+                                if b1 == b2 || (hap as usize) >= n_haps {
+                                    if (b1 as usize) < n_alleles {
+                                        al_probs[b1 as usize] += prob;
                                     }
                                 } else {
-                                    // Both rare or both common: equal weight
-                                    if (b1 as usize) < n_alleles {
-                                        al_probs[b1 as usize] += 0.5 * prob;
-                                    }
-                                    if (b2 as usize) < n_alleles {
-                                        al_probs[b2 as usize] += 0.5 * prob;
+                                    let is_rare1 = maf[m] < rare_threshold && b1 > 0;
+                                    let is_rare2 = maf[m] < rare_threshold && b2 > 0;
+                                    if is_rare1 != is_rare2 {
+                                        if is_rare1 && (b1 as usize) < n_alleles {
+                                            al_probs[b1 as usize] += 0.55 * prob;
+                                        }
+                                        if !is_rare1 && (b1 as usize) < n_alleles {
+                                            al_probs[b1 as usize] += 0.45 * prob;
+                                        }
+                                        if is_rare2 && (b2 as usize) < n_alleles {
+                                            al_probs[b2 as usize] += 0.55 * prob;
+                                        }
+                                        if !is_rare2 && (b2 as usize) < n_alleles {
+                                            al_probs[b2 as usize] += 0.45 * prob;
+                                        }
+                                    } else {
+                                        if (b1 as usize) < n_alleles {
+                                            al_probs[b1 as usize] += 0.5 * prob;
+                                        }
+                                        if (b2 as usize) < n_alleles {
+                                            al_probs[b2 as usize] += 0.5 * prob;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Return allele with highest probability
-                    al_probs
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(idx, _)| idx as u8)
-                        .unwrap_or(0)
-                };
+                        al_probs
+                            .iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                            .map(|(idx, _)| idx as u8)
+                            .unwrap_or(0)
+                    }};
+                }
 
-                let mut process_marker = |m: usize, rng: &mut rand::rngs::StdRng| {
+                // Inline helper macro for carrier score calculation
+                macro_rules! carrier_score {
+                    ($m:expr, $probs:expr, $carrier_set:expr) => {{
+                        let m = $m;
+                        let probs = $probs;
+                        let carrier_set = $carrier_set;
+                        let mkr_a = stage2_phaser.prev_stage1_marker[m];
+                        let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
+                        let wt = stage2_phaser.prev_stage1_wt[m];
+                        let state_haps = get_haps!(mkr_a);
+                        let mut score = 0.0f32;
+                        for (j, &hap) in state_haps.iter().enumerate() {
+                            let prob_a = probs[mkr_a].get(j).copied().unwrap_or(0.0);
+                            let prob_b = probs[mkr_b].get(j).copied().unwrap_or(0.0);
+                            let prob = wt * prob_a + (1.0 - wt) * prob_b;
+                            if carrier_set.contains(&hap) {
+                                score += prob;
+                            }
+                        }
+                        score
+                    }};
+                }
+
+                for &m in &rare_markers {
                     let a1 = sp.allele1(m);
                     let a2 = sp.allele2(m);
 
                     // Handle missing genotypes by imputation
                     if sp.is_missing(m) || a1 == 255 || a2 == 255 {
-                        let imp_a1 = impute_allele(m, &probs1, &state_haps_stage1);
-                        let imp_a2 = impute_allele(m, &probs2, &state_haps_stage1);
+                        let imp_a1 = impute_allele!(m, &probs1);
+                        let imp_a2 = impute_allele!(m, &probs2);
                         decisions.push(Stage2Decision::Impute { marker: m, a1: imp_a1, a2: imp_a2 });
-                        return;
+                        continue;
                     }
 
                     // Skip if not unphased heterozygote
                     if !sp.is_unphased(m) {
-                        return;
+                        continue;
                     }
 
                     // Skip homozygotes
                     if a1 == a2 {
-                        return;
+                        continue;
                     }
 
                     let marker_maf = maf[m];
@@ -2189,8 +2192,8 @@ impl PhasingPipeline {
                     if is_rare_marker && !carriers.is_empty() {
                         let carrier_set: std::collections::HashSet<u32> =
                             carriers.iter().copied().collect();
-                        let score1 = carrier_score(m, &probs1, &carrier_set);
-                        let score2 = carrier_score(m, &probs2, &carrier_set);
+                        let score1 = carrier_score!(m, &probs1, &carrier_set);
+                        let score2 = carrier_score!(m, &probs2, &carrier_set);
 
                         if carriers.len() == 1 || (score1 == 0.0 && score2 == 0.0) {
                             let stage1_idx = stage2_phaser.prev_stage1_marker[m];
@@ -2208,7 +2211,7 @@ impl PhasingPipeline {
                                     shorter_is_hap1
                                 };
                                 decisions.push(Stage2Decision::Phase { marker: m, should_swap, lr: 1.0 });
-                                return;
+                                continue;
                             }
                         }
 
@@ -2219,18 +2222,20 @@ impl PhasingPipeline {
                             (score1 / score2.max(1e-30)) as f32
                         };
                         decisions.push(Stage2Decision::Phase { marker: m, should_swap, lr });
-                        return;
+                        continue;
                     }
 
                     // Fallback to interpolated allele probabilities for non-rare markers
                     let is_a1_rare = a1 > 0 && marker_maf < rare_threshold;
                     let is_a2_rare = a2 > 0 && marker_maf < rare_threshold;
 
+                    let mkr_a = stage2_phaser.prev_stage1_marker[m];
+                    let state_haps_for_interp = get_haps!(mkr_a);
                     let al_probs1 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs1, &state_haps_stage1, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
+                        m, &probs1, state_haps_for_interp, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
                     );
                     let al_probs2 = stage2_phaser.interpolated_allele_probs(
-                        m, &probs2, &state_haps_stage1, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
+                        m, &probs2, state_haps_for_interp, &get_allele, a1, a2, is_a1_rare, is_a2_rare,
                     );
 
                     let p1 = al_probs1[0] * al_probs2[1];
@@ -2243,28 +2248,6 @@ impl PhasingPipeline {
                         (p1 / p2.max(1e-30)) as f32
                     };
                     decisions.push(Stage2Decision::Phase { marker: m, should_swap, lr });
-                };
-
-                // Process markers before first Stage 1 marker
-                if !hi_freq_markers.is_empty() {
-                    let first_hf = hi_freq_markers[0];
-                    for m in 0..first_hf {
-                        process_marker(m, &mut rng);
-                    }
-                }
-
-                // Process all Stage 2 markers (rare markers between Stage 1 markers)
-                for start_idx in 0..n_stage1 {
-                    let start_m = hi_freq_markers[start_idx];
-                    let end_m = if start_idx + 1 < n_stage1 {
-                        hi_freq_markers[start_idx + 1]
-                    } else {
-                        n_markers
-                    };
-
-                    for m in (start_m + 1)..end_m {
-                        process_marker(m, &mut rng);
-                    }
                 }
 
                 decisions
@@ -2361,37 +2344,54 @@ fn build_sample_confidence(target_gt: &GenotypeMatrix) -> Vec<Vec<f32>> {
         .collect()
 }
 
-#[inline]
+#[inline(always)]
 fn emit_prob(ref_al: u8, targ_al: u8, conf: f32, p_no_err: f32, p_err: f32) -> f32 {
     let base = if ref_al == targ_al || ref_al == 255 || targ_al == 255 {
         p_no_err
     } else {
         p_err
     };
-    let conf = conf.clamp(0.0, 1.0);
+    base * conf + 0.5 * (1.0 - conf)
+}
+
+/// Emission mode for combined diploid genotype
+#[derive(Clone, Copy)]
+enum CombinedEmitMode {
+    AllMissing,           // a1==255 && a2==255: always p_no_err
+    Het { a1: u8, a2: u8 }, // a1!=a2: match if ref in {a1,a2,255}
+    HomOrHemi { obs: u8 }, // hom or one missing: match if ref==obs or missing
+}
+
+#[inline]
+fn classify_combined(a1: u8, a2: u8) -> CombinedEmitMode {
+    if a1 == 255 && a2 == 255 {
+        CombinedEmitMode::AllMissing
+    } else if a1 != 255 && a2 != 255 && a1 != a2 {
+        CombinedEmitMode::Het { a1, a2 }
+    } else {
+        let obs = if a1 != 255 { a1 } else { a2 };
+        CombinedEmitMode::HomOrHemi { obs }
+    }
+}
+
+/// Fast emit - assumes conf is already clamped to [0,1]
+#[inline(always)]
+fn emit_combined_fast(ref_al: u8, mode: CombinedEmitMode, conf: f32, p_no_err: f32, p_err: f32) -> f32 {
+    let base = match mode {
+        CombinedEmitMode::AllMissing => p_no_err,
+        CombinedEmitMode::Het { a1, a2 } => {
+            if ref_al == a1 || ref_al == a2 || ref_al == 255 { p_no_err } else { p_err }
+        }
+        CombinedEmitMode::HomOrHemi { obs } => {
+            if ref_al == obs || ref_al == 255 || obs == 255 { p_no_err } else { p_err }
+        }
+    };
     base * conf + 0.5 * (1.0 - conf)
 }
 
 #[inline]
 fn emit_combined(ref_al: u8, a1: u8, a2: u8, conf: f32, p_no_err: f32, p_err: f32) -> f32 {
-    let base = if a1 == 255 && a2 == 255 {
-        p_no_err
-    } else if a1 != 255 && a2 != 255 && a1 != a2 {
-        if ref_al == a1 || ref_al == a2 || ref_al == 255 {
-            p_no_err
-        } else {
-            p_err
-        }
-    } else {
-        let obs = if a1 != 255 { a1 } else { a2 };
-        if ref_al == obs || ref_al == 255 || obs == 255 {
-            p_no_err
-        } else {
-            p_err
-        }
-    };
-    let conf = conf.clamp(0.0, 1.0);
-    base * conf + 0.5 * (1.0 - conf)
+    emit_combined_fast(ref_al, classify_combined(a1, a2), conf, p_no_err, p_err)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2422,6 +2422,7 @@ fn build_fwd_checkpoints(
     let init = 1.0f32 / n_states as f32;
     let mut fwd = vec![init; n_states];
     let mut fwd_prior = vec![0.0f32; n_states];
+    let mut ref_alleles = vec![0u8; n_states];  // Pre-compute alleles per marker
     let mut fwd_sum = 1.0f32;
 
     for m in 0..n_markers {
@@ -2438,23 +2439,31 @@ fn build_fwd_checkpoints(
 
         let a1 = seq1[m];
         let a2 = seq2[m];
-        let conf_m = conf[m];
-        fwd_sum = 0.0;
+        let conf_m = conf[m].clamp(0.0, 1.0);
 
+        // Batch lookup: get all ref alleles for this marker at once
         for k in 0..n_states {
-            let ref_al = lookup.allele(m, k);
-            let emit = match mode {
-                EmissionMode::Combined => emit_combined(ref_al, a1, a2, conf_m, p_no_err, p_err),
-                EmissionMode::Hap => {
-                    if hap2_use_combined[m] {
-                        emit_combined(ref_al, a1, a2, conf_m, p_no_err, p_err)
-                    } else {
-                        emit_prob(ref_al, hap2_allele[m], conf_m, p_no_err, p_err)
-                    }
-                }
-            };
-            fwd[k] = fwd_prior[k] * emit;
-            fwd_sum += fwd[k];
+            ref_alleles[k] = lookup.allele(m, k);
+        }
+
+        fwd_sum = 0.0;
+        let use_combined = matches!(mode, EmissionMode::Combined) || hap2_use_combined[m];
+
+        if use_combined {
+            // Classify once per marker, then fast emit per state
+            let emit_mode = classify_combined(a1, a2);
+            for k in 0..n_states {
+                let emit = emit_combined_fast(ref_alleles[k], emit_mode, conf_m, p_no_err, p_err);
+                fwd[k] = fwd_prior[k] * emit;
+                fwd_sum += fwd[k];
+            }
+        } else {
+            let h2_al = hap2_allele[m];
+            for k in 0..n_states {
+                let emit = emit_prob(ref_alleles[k], h2_al, conf_m, p_no_err, p_err);
+                fwd[k] = fwd_prior[k] * emit;
+                fwd_sum += fwd[k];
+            }
         }
         fwd_sum = fwd_sum.max(1e-30);
 
@@ -2484,7 +2493,7 @@ fn sample_from_weights(weights: &[f32], rng: &mut rand::rngs::SmallRng) -> usize
 }
 
 fn sample_path_from_checkpoints(
-    path: &mut [usize],
+    path: &mut [u32],
     checkpoints: &FwdCheckpoints,
     n_markers: usize,
     n_states: usize,
@@ -2561,7 +2570,7 @@ fn sample_path_from_checkpoints(
             let last_row = &fwd_buf[(block_len - 1) * row_stride..block_len * row_stride];
             let sampled = sample_from_weights(last_row, rng);
             current_state = Some(sampled);
-            path[end - 1] = sampled;
+            path[end - 1] = sampled as u32;
         }
 
         for m in (start + 1..end).rev() {
@@ -2577,12 +2586,24 @@ fn sample_path_from_checkpoints(
                 weights[k] = prev_row[k] * trans;
             }
             let sampled = sample_from_weights(&weights, rng);
-            path[m - 1] = sampled;
+            path[m - 1] = sampled as u32;
             current_state = Some(sampled);
         }
     }
 }
 
+/// Sample phase swap decisions using Stochastic EM (single chain MCMC).
+///
+/// This implements Forward-Filtering Backward-Sampling (FFBS) with a single
+/// Markov chain, which is the mathematically correct approach for phasing.
+/// Multiple chains would require phase alignment to avoid symmetric mode
+/// cancellation, so we use exactly one chain (Stochastic EM).
+///
+/// The algorithm:
+/// 1. Build forward checkpoints for the combined (both haplotypes uncertain) HMM
+/// 2. Run burn-in steps to let the chain mix
+/// 3. Take exactly ONE sample from the posterior
+/// 4. Return swap decisions directly from that sample
 fn sample_swap_bits_mosaic(
     n_markers: usize,
     n_states: usize,
@@ -2594,8 +2615,6 @@ fn sample_swap_bits_mosaic(
     het_positions: &[usize],
     seed: u64,
     burnin: usize,
-    samples: usize,
-    chains: usize,
     p_no_err: f32,
     p_err: f32,
 ) -> (Vec<u8>, Vec<f32>) {
@@ -2623,90 +2642,78 @@ fn sample_swap_bits_mosaic(
     );
 
     let combined_checkpoints = Arc::new(combined_checkpoints);
-    let n_chains = chains.max(1);
-    let n_samples = samples.max(1);
-    let total_steps = burnin + n_samples;
 
-    let mut swap_counts = vec![0usize; het_positions.len()];
-    let mut obs_counts = vec![0usize; het_positions.len()];
+    // Pure Stochastic EM: single chain, take the final sample after burn-in.
+    // No averaging, no counting - just sample once from the posterior.
+    let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
+    let mut chain = MosaicChain::new(
+        chain_seed,
+        n_markers,
+        n_states,
+        p_recomb,
+        seq1,
+        seq2,
+        conf,
+        lookup,
+        Arc::clone(&combined_checkpoints),
+        p_no_err,
+        p_err,
+    );
 
-    for chain_idx in 0..n_chains {
-        let chain_seed = seed
-            .wrapping_add((chain_idx as u64) << 32)
-            .wrapping_add(0xC0FFEE_BAAD_F00Du64);
-        let mut chain = MosaicChain::new(
-            chain_seed,
-            n_markers,
-            n_states,
-            p_recomb,
-            seq1,
-            seq2,
-            conf,
-            lookup,
-            Arc::clone(&combined_checkpoints),
-            p_no_err,
-            p_err,
-        );
-
-        for step in 0..total_steps {
-            chain.step();
-            if step < burnin {
-                continue;
-            }
-
-            let (path1, path2) = chain.paths();
-            for (idx, &m) in het_positions.iter().enumerate() {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    continue;
-                }
-
-                let ref1 = lookup.allele(m, path1[m]);
-                let ref2 = lookup.allele(m, path2[m]);
-                let mut orient: Option<u8> = None;
-
-                if ref1 == a1 && ref2 == a2 {
-                    orient = Some(0);
-                } else if ref1 == a2 && ref2 == a1 {
-                    orient = Some(1);
-                } else if ref1 == 255 && ref2 == a2 {
-                    orient = Some(0);
-                } else if ref1 == 255 && ref2 == a1 {
-                    orient = Some(1);
-                } else if ref2 == 255 && ref1 == a1 {
-                    orient = Some(0);
-                } else if ref2 == 255 && ref1 == a2 {
-                    orient = Some(1);
-                }
-
-                if let Some(bit) = orient {
-                    obs_counts[idx] += 1;
-                    if bit == 1 {
-                        swap_counts[idx] += 1;
-                    }
-                }
-            }
-        }
+    // Burn-in: let the chain mix
+    for _ in 0..burnin {
+        chain.step();
     }
 
+    // Take the final sample (Stochastic EM uses exactly one sample)
+    // Additional samples would be correlated, so we ignore the `samples` parameter
+    // and always take exactly one.
+    chain.step();
+    let (path1, path2) = chain.paths();
+
+    // Determine swap decisions directly from the sampled paths
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
-    for (count, obs) in swap_counts.into_iter().zip(obs_counts.into_iter()) {
-        if obs == 0 {
+
+    for &m in het_positions.iter() {
+        let a1 = seq1[m];
+        let a2 = seq2[m];
+
+        // Skip non-het positions
+        if a1 == 255 || a2 == 255 || a1 == a2 {
             swap_bits.push(0);
             swap_lr.push(1.0);
             continue;
         }
-        let p = (count as f64) / (obs as f64);
-        let p = p.clamp(1e-6, 1.0 - 1e-6);
-        let lr = if p >= 0.5 {
-            (p / (1.0 - p)) as f32
+
+        let ref1 = lookup.allele(m, path1[m] as usize);
+        let ref2 = lookup.allele(m, path2[m] as usize);
+
+        // Determine orientation from the sampled haplotype paths
+        // Orient=0: keep current phase (ref1 matches a1, ref2 matches a2)
+        // Orient=1: swap phase (ref1 matches a2, ref2 matches a1)
+        let orient = if ref1 == a1 && ref2 == a2 {
+            0u8
+        } else if ref1 == a2 && ref2 == a1 {
+            1u8
+        } else if ref1 == 255 && ref2 == a2 {
+            0u8
+        } else if ref1 == 255 && ref2 == a1 {
+            1u8
+        } else if ref2 == 255 && ref1 == a1 {
+            0u8
+        } else if ref2 == 255 && ref1 == a2 {
+            1u8
         } else {
-            ((1.0 - p) / p) as f32
+            // No clear orientation from reference - keep current phase
+            swap_bits.push(0);
+            swap_lr.push(1.0);
+            continue;
         };
-        swap_bits.push(if count * 2 >= obs { 1 } else { 0 });
-        swap_lr.push(lr);
+
+        swap_bits.push(orient);
+        // High confidence since this is a deterministic decision from the sample
+        swap_lr.push(1e6);
     }
 
     (swap_bits, swap_lr)
@@ -2821,7 +2828,7 @@ impl Stage2Phaser {
         &self,
         marker: usize,
         state_probs: &[Vec<f32>],      // [stage1_marker][state]
-        state_haps_stage1: &[Vec<u32>], // [stage1_marker][state] -> hap
+        haps_at_mkr_a: &[u32],         // haplotypes at flanking Stage 1 marker
         get_allele: &F,                 // Closure to get allele for any haplotype
         a1: u8,
         a2: u8,
@@ -2840,8 +2847,6 @@ impl Stage2Phaser {
         let probs_a = &state_probs[mkr_a];
         let probs_b = &state_probs[mkr_b];
 
-        // Use state haps at flanking Stage 1 marker A (following Java Stage2Baum)
-        let haps_at_mkr_a = &state_haps_stage1[mkr_a];
         let n_states = haps_at_mkr_a.len();
 
         for j in 0..n_states {
@@ -2913,9 +2918,7 @@ mod tests {
             excludemarkers: None,
             burnin: 3,
             iterations: 12,
-            mcmc_burnin: 2,
-            mcmc_samples: 4,
-            mcmc_chains: 2,
+            mcmc_burnin: 1,
             phase_states: 280,
             rare: 0.002,
             impute: true,
@@ -3003,9 +3006,7 @@ mod tests {
             excludemarkers: None,
             burnin: 2,
             iterations: 2,
-            mcmc_burnin: 2,
-            mcmc_samples: 4,
-            mcmc_chains: 2,
+            mcmc_burnin: 1,
             phase_states: 10,
             rare: 0.002,
             impute: true,

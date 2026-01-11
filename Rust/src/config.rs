@@ -53,17 +53,9 @@ pub struct Config {
     #[arg(long, default_value = "12")]
     pub iterations: usize,
 
-    /// MCMC burn-in sweeps per sample (phase sampling)
-    #[arg(long = "mcmc-burnin", default_value = "2")]
+    /// MCMC burn-in sweeps (lets the chain mix before sampling)
+    #[arg(long = "mcmc-burnin", default_value = "1")]
     pub mcmc_burnin: usize,
-
-    /// MCMC collected sweeps per sample (phase sampling)
-    #[arg(long = "mcmc-samples", default_value = "4")]
-    pub mcmc_samples: usize,
-
-    /// Number of independent MCMC chains per sample
-    #[arg(long = "mcmc-chains", default_value = "2")]
-    pub mcmc_chains: usize,
 
     /// Model states for phasing
     #[arg(long = "phase-states", default_value = "280")]
