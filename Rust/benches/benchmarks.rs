@@ -170,7 +170,7 @@ fn bench_threaded_haps_traversal(c: &mut Criterion) {
             th.reset_cursors();
             let mut sum = 0u32;
             for m in 0..n_markers {
-                th.materialize_haps(m, &mut hap_buffer);
+                th.materialize_at(m, &mut hap_buffer);
                 for &hap in &hap_buffer {
                     sum = sum.wrapping_add(hap);
                 }
