@@ -533,7 +533,11 @@ impl StateProbs {
         dense_haps: Option<Vec<Vec<u32>>>,
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
-        let store_haps_p1 = n_genotyped <= 1000;
+
+        // Always store haps_p1 for correct interpolation.
+        // When haps_p1 is None, the code uses the LEFT haplotype's allele for the
+        // RIGHT contribution, causing incorrect allele probabilities.
+        let store_haps_p1 = true;
 
         // Sparse storage threshold: min(0.005, 0.9999/K) - matches Java exactly
         // For small panels, keep all states to maximize accuracy.

@@ -264,8 +264,15 @@ impl PbwtDivUpdater {
         let n_bins = n_alleles + 1;
         self.ensure_capacity(n_bins);
 
-        // 1. Initialize p array - Backward uses (marker - 1) as init value
-        let init_value = (marker as i32) - 1;
+        // 1. Initialize p array for backward PBWT
+        //
+        // For backward PBWT with MIN propagation, p must be initialized to i32::MAX.
+        // Divergence values are typically >= marker, so if p starts at marker - 1,
+        // the comparison `div < p` is always FALSE and p never updates.
+        // By using MAX, the first haplotype's divergence wins the MIN comparison.
+        //
+        // Note: marker parameter kept for API compatibility but not used in init.
+        let init_value = if marker == usize::MAX { i32::MAX } else { i32::MAX };
 
         // 2. Count frequencies
         self.counts[..n_bins].fill(0);
