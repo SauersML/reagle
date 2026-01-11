@@ -278,6 +278,10 @@ impl<'a> BeagleHmm<'a> {
         // =====================================================================
         let mut fwd_sum = 1.0f32;
 
+        // Accumulate log-likelihood: ln P(O) = Σ ln(c_m) where c_m is the scaling factor at marker m.
+        // Previously only the last c_m was used, which is mathematically incorrect.
+        let mut log_likelihood = 0.0f64;
+
         // Event stack for efficient backward pass (sparse, O(switches))
         // For phasing (static states), this remains empty - zero overhead.
         let mut history: Vec<StateSwitch> = Vec::with_capacity(n_markers);
@@ -337,6 +341,11 @@ impl<'a> BeagleHmm<'a> {
                     n_states,
                 );
             }
+
+            // Accumulate log-likelihood from this marker's scaling factor
+            if fwd_sum > 0.0 {
+                log_likelihood += (fwd_sum as f64).ln();
+            }
         }
 
         // =====================================================================
@@ -395,7 +404,7 @@ impl<'a> BeagleHmm<'a> {
             );
         }
 
-        fwd_sum.ln() as f64
+        log_likelihood
     }
 
     /// Collect statistics for EM parameter estimation

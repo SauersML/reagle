@@ -167,6 +167,9 @@ struct MosaicChain<'a> {
     conf: &'a [f32],
     lookup: &'a RefAlleleLookup,
     combined_checkpoints: Arc<FwdCheckpoints>,
+    hap1_checkpoints: FwdCheckpoints,
+    hap1_allele: Vec<u8>,
+    hap1_use_combined: Vec<bool>,
     hap2_checkpoints: FwdCheckpoints,
     hap2_allele: Vec<u8>,
     hap2_use_combined: Vec<bool>,
@@ -176,6 +179,7 @@ struct MosaicChain<'a> {
     trace: MosaicTrace,
     p_no_err: f32,
     p_err: f32,
+    first_iteration: bool,
 }
 
 impl<'a> MosaicChain<'a> {
@@ -202,6 +206,9 @@ impl<'a> MosaicChain<'a> {
             conf,
             lookup,
             combined_checkpoints,
+            hap1_checkpoints: FwdCheckpoints::new(n_markers, n_states, MOSAIC_BLOCK_SIZE),
+            hap1_allele: vec![255u8; n_markers],
+            hap1_use_combined: vec![true; n_markers],
             hap2_checkpoints: FwdCheckpoints::new(n_markers, n_states, MOSAIC_BLOCK_SIZE),
             hap2_allele: vec![255u8; n_markers],
             hap2_use_combined: vec![true; n_markers],
@@ -215,6 +222,7 @@ impl<'a> MosaicChain<'a> {
             },
             p_no_err,
             p_err,
+            first_iteration: true,
         };
         out
     }
@@ -287,29 +295,114 @@ impl<'a> MosaicChain<'a> {
             }
         }
     }
+
+    /// Build hap1 inputs based on current path2 (for proper Gibbs sampling).
+    /// This determines what allele H1 must carry given H2's sampled path.
+    fn build_hap1_inputs(&mut self) {
+        for m in 0..self.n_markers {
+            let a1 = self.seq1[m];
+            let a2 = self.seq2[m];
+            if a1 == 255 && a2 == 255 {
+                self.hap1_use_combined[m] = true;
+                self.hap1_allele[m] = 255;
+                continue;
+            }
+            if a1 == a2 {
+                self.hap1_use_combined[m] = false;
+                self.hap1_allele[m] = a1;
+                continue;
+            }
+
+            // Given path2's reference allele, determine what H1 must be
+            let ref_al = self.lookup.allele(m, self.path2[m] as usize);
+            if ref_al == a1 {
+                // H2 carries a1, so H1 must carry a2
+                self.hap1_use_combined[m] = false;
+                self.hap1_allele[m] = a2;
+            } else if ref_al == a2 {
+                // H2 carries a2, so H1 must carry a1
+                self.hap1_use_combined[m] = false;
+                self.hap1_allele[m] = a1;
+            } else {
+                // Reference doesn't match either - use combined
+                self.hap1_use_combined[m] = true;
+                self.hap1_allele[m] = 255;
+            }
+        }
+    }
 }
 
 impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
     fn step(&mut self) -> &MosaicTrace {
-        sample_path_from_checkpoints(
-            &mut self.path1,
-            &self.combined_checkpoints,
-            self.n_markers,
-            self.n_states,
-            self.p_recomb,
-            self.seq1,
-            self.seq2,
-            self.conf,
-            &self.hap2_allele,
-            &self.hap2_use_combined,
-            self.lookup,
-            self.p_no_err,
-            self.p_err,
-            &mut self.rng,
-            &mut self.fwd_block,
-            EmissionMode::Combined,
-        );
+        // Proper Gibbs sampling: H1 and H2 must each condition on the other.
+        //
+        // First iteration: use combined_checkpoints (marginal) to initialize path1.
+        // Subsequent iterations: rebuild hap1_checkpoints based on current path2,
+        // then sample path1 conditioned on H2's state.
+        //
+        // This creates the feedback loop required for convergence to P(H1,H2|G).
 
+        if self.first_iteration {
+            // Initialize: sample path1 from combined (marginal) distribution
+            sample_path_from_checkpoints(
+                &mut self.path1,
+                &self.combined_checkpoints,
+                self.n_markers,
+                self.n_states,
+                self.p_recomb,
+                self.seq1,
+                self.seq2,
+                self.conf,
+                &self.hap2_allele,
+                &self.hap2_use_combined,
+                self.lookup,
+                self.p_no_err,
+                self.p_err,
+                &mut self.rng,
+                &mut self.fwd_block,
+                EmissionMode::Combined,
+            );
+            self.first_iteration = false;
+        } else {
+            // Gibbs step: sample H1 | H2
+            // Build hap1 constraints based on current path2
+            self.build_hap1_inputs();
+            build_fwd_checkpoints(
+                &mut self.hap1_checkpoints,
+                self.n_markers,
+                self.n_states,
+                self.p_recomb,
+                self.seq1,
+                self.seq2,
+                self.conf,
+                &self.hap1_allele,
+                &self.hap1_use_combined,
+                self.lookup,
+                self.p_no_err,
+                self.p_err,
+                EmissionMode::Hap,
+            );
+            sample_path_from_checkpoints(
+                &mut self.path1,
+                &self.hap1_checkpoints,
+                self.n_markers,
+                self.n_states,
+                self.p_recomb,
+                self.seq1,
+                self.seq2,
+                self.conf,
+                &self.hap1_allele,
+                &self.hap1_use_combined,
+                self.lookup,
+                self.p_no_err,
+                self.p_err,
+                &mut self.rng,
+                &mut self.fwd_block,
+                EmissionMode::Hap,
+            );
+        }
+
+        // Gibbs step: sample H2 | H1
         self.build_hap2_inputs();
         build_fwd_checkpoints(
             &mut self.hap2_checkpoints,
