@@ -2053,7 +2053,7 @@ pub fn run_hmm_forward_backward_clusters_counts(
             let match_count = (n_obs - mism).max(0.0);
             let em = (match_count * log_p_no_err + mism * log_p_err).exp();
             let val = if m == 0 {
-                em / n_states as f32
+                em
             } else {
                 em * (scale * fwd[prev_offset + k] + shift)
             };
