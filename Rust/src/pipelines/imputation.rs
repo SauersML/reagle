@@ -479,8 +479,6 @@ pub struct StateProbs {
     probs_p1: Vec<Vec<f32>>,
     /// Dense haplotypes for all markers (small panels only)
     dense_haps: Option<Vec<Vec<u32>>>,
-    /// Reference haplotype indices at the NEXT genotyped marker (optional, accuracy boost)
-    haps_p1: Option<Vec<Vec<u32>>>,
     /// Genetic positions of ALL reference markers (for interpolation)
     /// Uses Arc to share across all haplotypes (avoids cloning ~8MB per haplotype)
     gen_positions: std::sync::Arc<Vec<f64>>,
@@ -534,11 +532,6 @@ impl StateProbs {
     ) -> Self {
         let n_genotyped = genotyped_markers.len();
 
-        // Always store haps_p1 for correct interpolation.
-        // When haps_p1 is None, the code uses the LEFT haplotype's allele for the
-        // RIGHT contribution, causing incorrect allele probabilities.
-        let store_haps_p1 = true;
-
         // Sparse storage threshold: min(0.005, 0.9999/K) - matches Java exactly
         // For small panels, keep all states to maximize accuracy.
         let threshold = if n_genotyped <= 1000 {
@@ -551,11 +544,6 @@ impl StateProbs {
         let mut filtered_haps = Vec::with_capacity(n_genotyped);
         let mut filtered_probs = Vec::with_capacity(n_genotyped);
         let mut filtered_probs_p1 = Vec::with_capacity(n_genotyped);
-        let mut filtered_haps_p1: Option<Vec<Vec<u32>>> = if store_haps_p1 {
-            Some(Vec::with_capacity(n_genotyped))
-        } else {
-            None
-        };
 
         // Filter states by probability threshold (sparse storage)
         // Java does NOT renormalize after filtering - it stores raw probabilities
@@ -568,7 +556,6 @@ impl StateProbs {
             let mut haps = Vec::new();
             let mut probs = Vec::new();
             let mut probs_p1 = Vec::new();
-            let mut haps_p1 = if store_haps_p1 { Some(Vec::new()) } else { None };
 
             // Collect states ABOVE threshold (Java uses >, not >=)
             for j in 0..n_states.min(hap_indices.get(sparse_m).map(|v| v.len()).unwrap_or(0)) {
@@ -579,10 +566,6 @@ impl StateProbs {
                     haps.push(hap_indices[sparse_m][j]);
                     probs.push(prob);
                     probs_p1.push(prob_p1);
-                    if let Some(ref mut haps_p1_vec) = haps_p1 {
-                        let hap_p1 = hap_indices[m_p1].get(j).copied().unwrap_or(hap_indices[sparse_m][j]);
-                        haps_p1_vec.push(hap_p1);
-                    }
                 }
             }
 
@@ -590,9 +573,6 @@ impl StateProbs {
             filtered_haps.push(haps);
             filtered_probs.push(probs);
             filtered_probs_p1.push(probs_p1);
-            if let Some(ref mut all_haps_p1) = filtered_haps_p1 {
-                all_haps_p1.push(haps_p1.unwrap_or_default());
-            }
         }
 
         let dense_haps = if include_all_states {
@@ -606,7 +586,6 @@ impl StateProbs {
             hap_indices: filtered_haps,
             probs: filtered_probs,
             probs_p1: filtered_probs_p1,
-            haps_p1: filtered_haps_p1,
             dense_haps,
             gen_positions,
             marker_to_cluster,
@@ -814,7 +793,6 @@ impl StateProbs {
         let haps = &self.hap_indices[left_sparse];
         let probs = &self.probs[left_sparse];
         let probs_p1 = &self.probs_p1[left_sparse];
-        let haps_p1 = self.haps_p1.as_ref().map(|v| &v[left_sparse]);
 
         // Java Beagle uses constant probability for markers within a cluster and
         // interpolates only for markers BETWEEN clusters.
@@ -2921,7 +2899,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_state_probs_between_clusters_uses_left_and_right_haps() {
+    fn test_cluster_state_probs_between_clusters_uses_left_anchor() {
+        // After left-anchor fix: we only use the LEFT cluster's haplotypes for allele lookup.
+        // The probability is still interpolated between clusters, but allele lookup is anchored
+        // to the left haplotype.
         let marker_cluster = Arc::new(vec![0usize, 0usize, 1usize]);
         let ref_cluster_end = Arc::new(vec![1usize, 3usize]);
         let weight = Arc::new(vec![1.0f32, 0.25f32, 1.0f32]);
@@ -2938,6 +2919,8 @@ mod tests {
             cluster_probs,
         );
 
+        // At marker 1: cluster 0 has only hap 0 with allele=0 (REF)
+        // With left-anchor, we only look at hap 0's allele, so p_alt = 0
         let get_ref_allele = |m: usize, hap: u32| -> u8 {
             if m == 1 {
                 if hap == 0 { 0 } else { 1 }
@@ -2948,8 +2931,8 @@ mod tests {
 
         let post = state_probs.allele_posteriors(1, 2, &get_ref_allele);
         let p_alt = post.prob(1);
-        let expected = 0.15 / (0.2 + 0.15);
-        assert!((p_alt - expected).abs() < 1e-6, "p_alt={}, expected={}", p_alt, expected);
+        // Left-anchor: only hap 0 in left cluster, allele=0, so p_alt should be 0
+        assert!((p_alt - 0.0).abs() < 1e-6, "p_alt={}, expected=0.0", p_alt);
     }
 
     #[test]

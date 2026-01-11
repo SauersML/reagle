@@ -252,6 +252,7 @@ impl PbwtDivUpdater {
         &mut self,
         alleles: &[u8],
         n_alleles: usize,
+        marker: usize,
         prefix: &mut [u32],
         divergence: &mut [i32],
     ) {
@@ -265,9 +266,11 @@ impl PbwtDivUpdater {
 
         // 1. Initialize p array for backward PBWT
         //
-        // For backward PBWT with MIN propagation, p must be initialized to i32::MAX.
-        // This ensures the first haplotype's divergence wins the MIN comparison.
-        let init_value = i32::MAX;
+        // Java uses marker-1 for initialization. This correctly handles allele boundaries:
+        // when two adjacent haplotypes in sorted order have different alleles at marker m,
+        // their match must end at m-1 (they differ at m). Using i32::MAX would incorrectly
+        // suggest they match indefinitely.
+        let init_value = (marker as i32) - 1;
 
         // 2. Count frequencies
         self.counts[..n_bins].fill(0);
@@ -567,7 +570,8 @@ mod tests {
         // Hap 2: MISSING (255)
         // Hap 3: REF (0)
         let alleles = vec![0u8, 1, 255, 0];
-        updater.bwd_update(&alleles, 2, &mut prefix, &mut divergence);
+        let marker = 5; // Use marker 5 so init_value = 4
+        updater.bwd_update(&alleles, 2, marker, &mut prefix, &mut divergence);
 
         // Same logic as forward: MISSING should be in its own bin
         let hap0_pos = prefix.iter().position(|&h| h == 0).unwrap();

@@ -118,7 +118,7 @@ impl BidirectionalPhaseIbs {
 
         for m in (0..n_markers).rev() {
             let n_alleles = n_alleles_by_marker[m];
-            updater.bwd_update(&alleles[m], n_alleles, &mut ppa, &mut div);
+            updater.bwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
 
             // Build inverse index: bwd_pos[m][h] = position of haplotype h in bwd_ppa[m]
             let mut pos = vec![0u32; n_haps];
@@ -307,39 +307,45 @@ impl BidirectionalPhaseIbs {
 
         let mut result = Vec::with_capacity(n_candidates);
 
+        // Dynamic expansion: choose direction with lower divergence (= longer match = better neighbor)
+        // instead of forcing 50/50 split between up/down directions
         let mut u = sorted_pos;
-        let mut max_div = i32::MIN;
-        while result.len() < n_candidates / 2 && u > 0 {
-            max_div = max_div.max(div.get(u).copied().unwrap_or(i32::MAX));
-            // Forward PBWT: div values are where match started.
-            // Stop collecting when max_div > marker_idx (no match at current marker)
-            // AND max_div > backoff_limit (started too recently, outside tolerance).
-            // But since backoff_limit <= marker_idx, we effectively stop when
-            // max_div > backoff_limit (allowing backoff window).
-            // Corrected condition: break if divergence exceeds backoff tolerance.
-            // Match is valid if div <= backoff_limit + some tolerance
-            // Java uses: continue while d[u] <= dMax where dMax = min(matchStart + backoff, step)
-            // Simpler: break if max_div > marker_idx (no exact match and not within backoff)
-            if max_div > marker_i32 {
-                break;
-            }
-            u -= 1;
-            let h = ppa[u];
-            if h != hap_idx {
-                result.push(h);
-            }
-        }
-
         let mut v = sorted_pos + 1;
-        max_div = i32::MIN;
-        while result.len() < n_candidates && v < self.n_haps {
-            max_div = max_div.max(div.get(v).copied().unwrap_or(i32::MAX));
-            // Same logic as above
-            if max_div > marker_i32 {
-                break;
+        let mut max_div_up = i32::MIN;
+        let mut max_div_down = i32::MIN;
+
+        while result.len() < n_candidates {
+            // Get next divergence values in each direction
+            let div_up = if u > 0 { div.get(u).copied().unwrap_or(i32::MAX) } else { i32::MAX };
+            let div_down = if v < self.n_haps { div.get(v).copied().unwrap_or(i32::MAX) } else { i32::MAX };
+
+            // Check if either direction still has valid matches (divergence <= current marker)
+            let up_valid = u > 0 && max_div_up.max(div_up) <= marker_i32;
+            let down_valid = v < self.n_haps && max_div_down.max(div_down) <= marker_i32;
+
+            if !up_valid && !down_valid {
+                break; // No more valid matches in either direction
             }
-            result.push(ppa[v]);
-            v += 1;
+
+            // For forward PBWT: lower divergence = longer match = better neighbor
+            // Choose direction with lower next divergence value
+            let go_up = up_valid && (!down_valid || div_up <= div_down);
+
+            if go_up {
+                max_div_up = max_div_up.max(div_up);
+                u -= 1;
+                let h = ppa[u];
+                if h != hap_idx {
+                    result.push(h);
+                }
+            } else {
+                max_div_down = max_div_down.max(div_down);
+                let h = ppa[v];
+                if h != hap_idx {
+                    result.push(h);
+                }
+                v += 1;
+            }
         }
 
         // Fallback: if strict PBWT matching yields too few neighbors,
@@ -382,32 +388,45 @@ impl BidirectionalPhaseIbs {
 
         let mut result = Vec::with_capacity(n_candidates);
 
+        // Dynamic expansion: choose direction with higher divergence (= longer match = better neighbor)
+        // For backward PBWT, higher div = match ends later = longer match
         let mut u = sorted_pos;
-        let mut min_div = i32::MAX;
-        while result.len() < n_candidates / 2 && u > 0 {
-            min_div = min_div.min(div.get(u).copied().unwrap_or(0));
-            // Backward PBWT: div values are where match ends (going backward).
-            // Stop collecting when min_div < marker_idx (match ended before current marker).
-            if min_div < marker_i32 {
-                break;
-            }
-            u -= 1;
-            let h = ppa[u];
-            if h != hap_idx {
-                result.push(h);
-            }
-        }
-
         let mut v = sorted_pos + 1;
-        min_div = i32::MAX;
-        while result.len() < n_candidates && v < self.n_haps {
-            min_div = min_div.min(div.get(v).copied().unwrap_or(0));
-            // Same logic as above
-            if min_div < marker_i32 {
-                break;
+        let mut min_div_up = i32::MAX;
+        let mut min_div_down = i32::MAX;
+
+        while result.len() < n_candidates {
+            // Get next divergence values in each direction
+            let div_up = if u > 0 { div.get(u).copied().unwrap_or(0) } else { 0 };
+            let div_down = if v < self.n_haps { div.get(v).copied().unwrap_or(0) } else { 0 };
+
+            // Check if either direction still has valid matches (divergence >= current marker)
+            let up_valid = u > 0 && min_div_up.min(div_up) >= marker_i32;
+            let down_valid = v < self.n_haps && min_div_down.min(div_down) >= marker_i32;
+
+            if !up_valid && !down_valid {
+                break; // No more valid matches in either direction
             }
-            result.push(ppa[v]);
-            v += 1;
+
+            // For backward PBWT: higher divergence = longer match = better neighbor
+            // Choose direction with higher next divergence value
+            let go_up = up_valid && (!down_valid || div_up >= div_down);
+
+            if go_up {
+                min_div_up = min_div_up.min(div_up);
+                u -= 1;
+                let h = ppa[u];
+                if h != hap_idx {
+                    result.push(h);
+                }
+            } else {
+                min_div_down = min_div_down.min(div_down);
+                let h = ppa[v];
+                if h != hap_idx {
+                    result.push(h);
+                }
+                v += 1;
+            }
         }
 
         // Fallback: widen search without divergence constraints if needed.
