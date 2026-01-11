@@ -3661,6 +3661,7 @@ fn test_single_mismatch_not_catastrophic() {
 
     // State with single mismatch should still have meaningful probability
     // due to recombination allowing state switches.
+    println!("Posteriors: {:?}", posteriors);
     assert!(
         prob_state1_at_mismatch > 0.001,
         "State 1 (1 mismatch) has P={:.6}, should be >0.001",
