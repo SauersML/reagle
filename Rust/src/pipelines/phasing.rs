@@ -1407,8 +1407,16 @@ impl PhasingPipeline {
             let p_no_err = 1.0 - p_err;
 
             // Pre-compute state->hap mapping for all (marker, state) pairs
-            // Uses immutable materialize_all() to avoid clone() overhead
-            let state_haps = threaded_haps.materialize_all();
+            // This is needed because ThreadedHaps uses cursor-based traversal
+            // Pre-allocate all memory upfront to avoid clone() overhead in hot loop
+            let state_haps: Vec<Vec<u32>> = {
+                let mut threaded_haps_mut = threaded_haps.clone();
+                let mut state_haps = vec![vec![0u32; n_states]; n_markers];
+                for (m, item) in state_haps.iter_mut().enumerate().take(n_markers) {
+                    threaded_haps_mut.materialize_haps(m, item);
+                }
+                state_haps
+            };
 
             let lookup = RefAlleleLookup::new(
                 &state_haps,
@@ -1600,8 +1608,15 @@ impl PhasingPipeline {
                 let p_no_err = 1.0 - p_err;
 
                 // Pre-compute state->hap mapping for all (marker, state) pairs
-                // Uses immutable materialize_all() to avoid clone() overhead
-                let state_haps = threaded_haps.materialize_all();
+                // Pre-allocate all memory upfront to avoid clone() overhead in hot loop
+                let state_haps: Vec<Vec<u32>> = {
+                    let mut threaded_haps_mut = threaded_haps.clone();
+                    let mut state_haps = vec![vec![0u32; n_states]; n_markers];
+                    for m in 0..n_markers {
+                        threaded_haps_mut.materialize_haps(m, &mut state_haps[m]);
+                    }
+                    state_haps
+                };
 
                 let lookup = RefAlleleLookup::new(
                     &state_haps,
@@ -1810,8 +1825,15 @@ impl PhasingPipeline {
                 let p_no_err = 1.0 - p_err;
 
                 // Pre-compute state->hap mapping for all (hi_freq_idx, state) pairs
-                // Uses immutable materialize_all() to avoid clone() overhead
-                let state_haps = threaded_haps.materialize_all();
+                // Pre-allocate all memory upfront to avoid clone() overhead in hot loop
+                let state_haps: Vec<Vec<u32>> = {
+                    let mut threaded_haps_mut = threaded_haps.clone();
+                    let mut state_haps = vec![vec![0u32; n_states]; n_hi_freq];
+                    for m in 0..n_hi_freq {
+                        threaded_haps_mut.materialize_haps(m, &mut state_haps[m]);
+                    }
+                    state_haps
+                };
 
                 let lookup = RefAlleleLookup::new(
                     &state_haps,
@@ -2112,15 +2134,15 @@ impl PhasingPipeline {
                 let probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
 
                 // Lazy cache for state->hap mapping - O(1) indexing with Option<Vec>
-                // Uses immutable materialize_at() to avoid clone() overhead
                 let mut hap_cache: Vec<Option<Vec<u32>>> = vec![None; n_stage1];
+                let mut threaded_haps_mut = threaded_haps.clone();
 
                 macro_rules! get_haps {
                     ($marker:expr) => {{
                         let m = $marker;
                         if hap_cache[m].is_none() {
                             let mut haps = vec![0u32; n_states];
-                            threaded_haps.materialize_at(m, &mut haps);
+                            threaded_haps_mut.materialize_haps(m, &mut haps);
                             hap_cache[m] = Some(haps);
                         }
                         hap_cache[m].as_ref().unwrap()
@@ -2811,311 +2833,6 @@ fn sample_path_from_checkpoints(
             current_state = Some(sampled);
         }
     }
-}
-
-/// Forward-Filtering Backward-Sampling for haploid HMM with constraint.
-///
-/// This is the core of SHAPEIT5-style Gibbs sampling. It samples a haplotype
-/// path through K reference states, with emissions constrained at heterozygous
-/// sites to be opposite of the fixed other haplotype.
-///
-/// Returns the sampled state path in `path`.
-fn ffbs_haploid_constrained(
-    path: &mut [u32],
-    n_markers: usize,
-    n_states: usize,
-    p_recomb: &[f32],
-    geno_a1: &[u8],
-    geno_a2: &[u8],
-    conf: &[f32],
-    fixed_allele: &[u8],  // Allele assigned to OTHER haplotype (255 = no constraint)
-    neighbors: &[u32],     // Selected neighbor haplotype indices
-    phase_ibs: &BidirectionalPhaseIbs,
-    p_no_err: f32,
-    p_err: f32,
-    rng: &mut rand::rngs::SmallRng,
-) {
-    use wide::f32x8;
-
-    if n_markers == 0 || n_states == 0 || neighbors.is_empty() {
-        return;
-    }
-
-    let actual_n_states = neighbors.len().min(n_states);
-
-    // Rolling forward probabilities (2 rows)
-    let mut fwd_curr = vec![0.0f32; actual_n_states];
-    let mut fwd_prev = vec![0.0f32; actual_n_states];
-
-    // Store forward probs at each marker for backward sampling
-    let mut fwd_at_marker: Vec<Vec<f32>> = Vec::with_capacity(n_markers);
-
-    // Initialize at marker 0
-    let init = 1.0f32 / actual_n_states as f32;
-    for k in 0..actual_n_states {
-        let ref_al = phase_ibs.allele(0, neighbors[k]);
-        let emit = emit_haploid_constrained(
-            ref_al, geno_a1[0], geno_a2[0], fixed_allele[0],
-            conf[0], p_no_err, p_err
-        );
-        fwd_curr[k] = init * emit;
-    }
-    let mut fwd_sum: f32 = fwd_curr.iter().sum();
-    fwd_sum = fwd_sum.max(1e-30);
-    fwd_at_marker.push(fwd_curr.clone());
-
-    // Forward pass
-    for m in 1..n_markers {
-        std::mem::swap(&mut fwd_prev, &mut fwd_curr);
-
-        let r = p_recomb.get(m).copied().unwrap_or(0.0);
-        let shift = r / actual_n_states as f32;
-        let scale = (1.0 - r) / fwd_sum;
-
-        // SIMD-optimized transition + emission
-        let shift_vec = f32x8::splat(shift);
-        let scale_vec = f32x8::splat(scale);
-        let mut sum_vec = f32x8::splat(0.0);
-        let mut k = 0;
-
-        while k + 8 <= actual_n_states {
-            let prev_arr: [f32; 8] = fwd_prev[k..k+8].try_into().unwrap();
-            let prev_vec = f32x8::from(prev_arr);
-            let prior_vec = scale_vec * prev_vec + shift_vec;
-
-            // Compute emissions
-            let emit_arr = [
-                emit_haploid_constrained(phase_ibs.allele(m, neighbors[k]), geno_a1[m], geno_a2[m], fixed_allele[m], conf[m], p_no_err, p_err),
-                emit_haploid_constrained(phase_ibs.allele(m, neighbors[k+1]), geno_a1[m], geno_a2[m], fixed_allele[m], conf[m], p_no_err, p_err),
-                emit_haploid_constrained(phase_ibs.allele(m, neighbors[k+2]), geno_a1[m], geno_a2[m], fixed_allele[m], conf[m], p_no_err, p_err),
-                emit_haploid_constrained(phase_ibs.allele(m, neighbors[k+3]), geno_a1[m], geno_a2[m], fixed_allele[m], conf[m], p_no_err, p_err),
-                emit_haploid_constrained(phase_ibs.allele(m, neighbors[k+4]), geno_a1[m], geno_a2[m], fixed_allele[m], conf[m], p_no_err, p_err),
-                emit_haploid_constrained(phase_ibs.allele(m, neighbors[k+5]), geno_a1[m], geno_a2[m], fixed_allele[m], conf[m], p_no_err, p_err),
-                emit_haploid_constrained(phase_ibs.allele(m, neighbors[k+6]), geno_a1[m], geno_a2[m], fixed_allele[m], conf[m], p_no_err, p_err),
-                emit_haploid_constrained(phase_ibs.allele(m, neighbors[k+7]), geno_a1[m], geno_a2[m], fixed_allele[m], conf[m], p_no_err, p_err),
-            ];
-            let emit_vec = f32x8::from(emit_arr);
-
-            let res = prior_vec * emit_vec;
-            let res_arr: [f32; 8] = res.into();
-            fwd_curr[k..k+8].copy_from_slice(&res_arr);
-            sum_vec += res;
-            k += 8;
-        }
-
-        // Scalar tail
-        fwd_sum = sum_vec.reduce_add();
-        for i in k..actual_n_states {
-            let prior = scale * fwd_prev[i] + shift;
-            let emit = emit_haploid_constrained(
-                phase_ibs.allele(m, neighbors[i]), geno_a1[m], geno_a2[m], fixed_allele[m],
-                conf[m], p_no_err, p_err
-            );
-            fwd_curr[i] = prior * emit;
-            fwd_sum += fwd_curr[i];
-        }
-        fwd_sum = fwd_sum.max(1e-30);
-
-        fwd_at_marker.push(fwd_curr.clone());
-    }
-
-    // Backward sampling
-    let last_fwd = &fwd_at_marker[n_markers - 1];
-    path[n_markers - 1] = sample_from_weights(last_fwd, rng) as u32;
-
-    let mut weights = vec![0.0f32; actual_n_states];
-    for m in (1..n_markers).rev() {
-        let next_state = path[m] as usize;
-        let r = p_recomb.get(m).copied().unwrap_or(0.0);
-        let shift = r / actual_n_states as f32;
-        let stay = (1.0 - r) + shift;
-
-        let prev_fwd = &fwd_at_marker[m - 1];
-
-        for k in 0..actual_n_states {
-            weights[k] = prev_fwd[k] * shift;
-        }
-        if next_state < actual_n_states {
-            weights[next_state] = prev_fwd[next_state] * stay;
-        }
-
-        path[m - 1] = sample_from_weights(&weights, rng) as u32;
-    }
-}
-
-/// Dynamic MCMC phasing using SHAPEIT5-style Gibbs sampling.
-///
-/// This implements the correct MCMC approach with implicit anchoring:
-/// 1. At each MCMC step, select K neighbors by threading current H1/H2 through PBWT
-/// 2. Sample H1 | (G, H2_fixed) using haploid constrained HMM
-/// 3. Sample H2 | (G, H1_new) using haploid constrained HMM
-/// 4. Repeat for n_steps
-///
-/// The "implicit anchoring" comes from state selection being biased toward
-/// haplotypes that match the current phase estimate.
-fn sample_dynamic_mcmc(
-    n_markers: usize,
-    n_states: usize,
-    p_recomb: &[f32],
-    seq1: &[u8],
-    seq2: &[u8],
-    conf: &[f32],
-    phase_ibs: &BidirectionalPhaseIbs,
-    sample_idx: u32,
-    het_positions: &[usize],
-    seed: u64,
-    n_mcmc_steps: usize,
-    p_no_err: f32,
-    p_err: f32,
-) -> (Vec<u8>, Vec<f32>) {
-    use rand::SeedableRng;
-
-    if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
-        return (Vec::new(), Vec::new());
-    }
-
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-
-    // Initialize H1, H2 from genotype (random phase at hets)
-    let mut h1_alleles = vec![0u8; n_markers];
-    let mut h2_alleles = vec![0u8; n_markers];
-    for m in 0..n_markers {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-        if a1 == 255 && a2 == 255 {
-            h1_alleles[m] = 255;
-            h2_alleles[m] = 255;
-        } else if a1 == a2 {
-            h1_alleles[m] = a1;
-            h2_alleles[m] = a1;
-        } else {
-            // Het: random initial phase
-            if rng.random::<bool>() {
-                h1_alleles[m] = a1;
-                h2_alleles[m] = a2;
-            } else {
-                h1_alleles[m] = a2;
-                h2_alleles[m] = a1;
-            }
-        }
-    }
-
-    let mut path = vec![0u32; n_markers];
-    let mut fixed_allele = vec![255u8; n_markers];
-
-    // MCMC loop: Gibbs sampling alternating between H1 and H2
-    for step in 0..n_mcmc_steps {
-        // === Sample H1 | (G, H2_fixed) ===
-
-        // 1. Select neighbors by threading current H1 through PBWT
-        let neighbors_h1 = phase_ibs.find_neighbors_for_query(
-            &h1_alleles, n_markers / 2, sample_idx, n_states
-        );
-        if neighbors_h1.is_empty() {
-            continue;
-        }
-
-        // 2. Build constraint: H1 must be opposite of H2 at hets
-        for m in 0..n_markers {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
-            if a1 == 255 || a2 == 255 || a1 == a2 {
-                fixed_allele[m] = 255; // No constraint
-            } else {
-                fixed_allele[m] = h2_alleles[m]; // H1 must be opposite
-            }
-        }
-
-        // 3. Run haploid FFBS
-        ffbs_haploid_constrained(
-            &mut path, n_markers, n_states, p_recomb,
-            seq1, seq2, conf, &fixed_allele, &neighbors_h1,
-            phase_ibs, p_no_err, p_err, &mut rng
-        );
-
-        // 4. Update H1 from sampled path
-        for m in 0..n_markers {
-            let state = path[m] as usize;
-            if state < neighbors_h1.len() {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    // Hom/missing: take allele from genotype
-                    h1_alleles[m] = if a1 != 255 { a1 } else { a2 };
-                } else {
-                    // Het: H1 is opposite of H2 (which is in fixed_allele)
-                    h1_alleles[m] = if h2_alleles[m] == a1 { a2 } else { a1 };
-                }
-            }
-        }
-
-        // === Sample H2 | (G, H1_new) ===
-
-        // 1. Select neighbors by threading current H2 through PBWT
-        let neighbors_h2 = phase_ibs.find_neighbors_for_query(
-            &h2_alleles, n_markers / 2, sample_idx, n_states
-        );
-        if neighbors_h2.is_empty() {
-            continue;
-        }
-
-        // 2. Build constraint: H2 must be opposite of H1 at hets
-        for m in 0..n_markers {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
-            if a1 == 255 || a2 == 255 || a1 == a2 {
-                fixed_allele[m] = 255;
-            } else {
-                fixed_allele[m] = h1_alleles[m]; // H2 must be opposite
-            }
-        }
-
-        // 3. Run haploid FFBS
-        ffbs_haploid_constrained(
-            &mut path, n_markers, n_states, p_recomb,
-            seq1, seq2, conf, &fixed_allele, &neighbors_h2,
-            phase_ibs, p_no_err, p_err, &mut rng
-        );
-
-        // 4. Update H2 from sampled path
-        for m in 0..n_markers {
-            let state = path[m] as usize;
-            if state < neighbors_h2.len() {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    h2_alleles[m] = if a2 != 255 { a2 } else { a1 };
-                } else {
-                    // Het: H2 is opposite of H1
-                    h2_alleles[m] = if h1_alleles[m] == a1 { a2 } else { a1 };
-                }
-            }
-        }
-    }
-
-    // Determine swap decisions from final H1, H2 vs original seq1, seq2
-    let mut swap_bits = Vec::with_capacity(het_positions.len());
-    let mut swap_lr = Vec::with_capacity(het_positions.len());
-
-    for &m in het_positions {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-
-        if a1 == 255 || a2 == 255 || a1 == a2 {
-            swap_bits.push(0);
-            swap_lr.push(1.0);
-            continue;
-        }
-
-        // Original phase: seq1[m] on H1, seq2[m] on H2
-        // New phase: h1_alleles[m] on H1, h2_alleles[m] on H2
-        // Swap if new H1 allele differs from original seq1
-        let swap = h1_alleles[m] != a1;
-        swap_bits.push(if swap { 1 } else { 0 });
-        swap_lr.push(1e6); // High confidence
-    }
-
-    (swap_bits, swap_lr)
 }
 
 /// Sample phase swap decisions using Stochastic EM (single chain MCMC).
