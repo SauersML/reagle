@@ -479,8 +479,6 @@ pub struct StateProbs {
     probs_p1: Vec<Vec<f32>>,
     /// Dense haplotypes for all markers (small panels only)
     dense_haps: Option<Vec<Vec<u32>>>,
-    /// Reference haplotype indices at the NEXT genotyped marker (optional, accuracy boost)
-    haps_p1: Option<Vec<Vec<u32>>>,
     /// Genetic positions of ALL reference markers (for interpolation)
     /// Uses Arc to share across all haplotypes (avoids cloning ~8MB per haplotype)
     gen_positions: std::sync::Arc<Vec<f64>>,
