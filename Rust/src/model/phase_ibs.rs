@@ -118,7 +118,7 @@ impl BidirectionalPhaseIbs {
 
         for m in (0..n_markers).rev() {
             let n_alleles = n_alleles_by_marker[m];
-            updater.bwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
+            updater.bwd_update(&alleles[m], n_alleles, &mut ppa, &mut div);
 
             // Build inverse index: bwd_pos[m][h] = position of haplotype h in bwd_ppa[m]
             let mut pos = vec![0u32; n_haps];

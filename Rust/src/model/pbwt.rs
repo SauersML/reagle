@@ -252,7 +252,6 @@ impl PbwtDivUpdater {
         &mut self,
         alleles: &[u8],
         n_alleles: usize,
-        marker: usize,
         prefix: &mut [u32],
         divergence: &mut [i32],
     ) {
@@ -267,12 +266,8 @@ impl PbwtDivUpdater {
         // 1. Initialize p array for backward PBWT
         //
         // For backward PBWT with MIN propagation, p must be initialized to i32::MAX.
-        // Divergence values are typically >= marker, so if p starts at marker - 1,
-        // the comparison `div < p` is always FALSE and p never updates.
-        // By using MAX, the first haplotype's divergence wins the MIN comparison.
-        //
-        // Note: marker parameter kept for API compatibility but not used in init.
-        let init_value = if marker == usize::MAX { i32::MAX } else { i32::MAX };
+        // This ensures the first haplotype's divergence wins the MIN comparison.
+        let init_value = i32::MAX;
 
         // 2. Count frequencies
         self.counts[..n_bins].fill(0);
@@ -572,7 +567,7 @@ mod tests {
         // Hap 2: MISSING (255)
         // Hap 3: REF (0)
         let alleles = vec![0u8, 1, 255, 0];
-        updater.bwd_update(&alleles, 2, 5, &mut prefix, &mut divergence);
+        updater.bwd_update(&alleles, 2, &mut prefix, &mut divergence);
 
         // Same logic as forward: MISSING should be in its own bin
         let hap0_pos = prefix.iter().position(|&h| h == 0).unwrap();
