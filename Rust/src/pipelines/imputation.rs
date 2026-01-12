@@ -2276,20 +2276,44 @@ pub fn run_hmm_forward_backward_to_sparse(
             let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
             let shift = p_rec / n_states as f32;
 
-            let mut emitted_sum = 0.0f32;
             let mismatches = &cluster_mismatches[m + 1];
             let non_missing = &cluster_non_missing[m + 1];
             let mism_slice = &mismatches[..n_states.min(mismatches.len())];
             let nobs_slice = &non_missing[..n_states.min(non_missing.len())];
 
-            for k in 0..mism_slice.len() {
-                let mism = mism_slice[k].min(nobs_slice[k]);
-                let n_obs = nobs_slice[k];
+            // SIMD-optimized emission multiplication
+            let n_emit = mism_slice.len();
+            let mut sum_vec = f32x8::splat(0.0);
+            let mut k = 0;
+            while k + 8 <= n_emit {
+                let emit_arr = [
+                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
+                ];
+                let emit_vec = f32x8::from(emit_arr);
+                let bwd_arr: [f32; 8] = bwd[k..k+8].try_into().unwrap();
+                let bwd_chunk = f32x8::from(bwd_arr);
+                let res = bwd_chunk * emit_vec;
+                let res_arr: [f32; 8] = res.into();
+                bwd[k..k+8].copy_from_slice(&res_arr);
+                sum_vec += res;
+                k += 8;
+            }
+            let mut emitted_sum = sum_vec.reduce_add();
+            for i in k..n_emit {
+                let mism = mism_slice[i].min(nobs_slice[i]);
+                let n_obs = nobs_slice[i];
                 let match_count = (n_obs - mism).max(0.0);
                 let log_em = match_count * log_p_no_err + mism * log_p_err;
                 let em = if n_obs > 0.0 { log_em.max(-80.0).exp() } else { 1.0 };
-                bwd[k] *= em;
-                emitted_sum += bwd[k];
+                bwd[i] *= em;
+                emitted_sum += bwd[i];
             }
 
             if emitted_sum > 0.0 {
@@ -2338,13 +2362,38 @@ pub fn run_hmm_forward_backward_to_sparse(
             let non_missing = &cluster_non_missing[recomp_m];
             let n_emit = n_states.min(mismatches.len()).min(non_missing.len());
 
-            let mut sum = 0.0f32;
-            for k in 0..n_emit {
-                let mism = mismatches.get(k).copied().unwrap_or(0.0);
-                let n_obs = non_missing.get(k).copied().unwrap_or(0.0);
-                let em = compute_emit(mism, n_obs, log_p_no_err, log_p_err);
-                let val = em * (scale * fwd[prev_off + k] + shift);
-                fwd[curr_base + k] = val;
+            // SIMD-optimized forward recomputation
+            let mism_slice = &mismatches[..n_emit];
+            let nobs_slice = &non_missing[..n_emit];
+            let shift_vec = f32x8::splat(shift);
+            let scale_vec = f32x8::splat(scale);
+            let mut sum_vec = f32x8::splat(0.0);
+            let mut k = 0;
+            while k + 8 <= n_emit {
+                let emit_arr = [
+                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
+                ];
+                let emit_vec = f32x8::from(emit_arr);
+                let prev_arr: [f32; 8] = fwd[prev_off + k..prev_off + k + 8].try_into().unwrap();
+                let prev_vec = f32x8::from(prev_arr);
+                let res = emit_vec * (scale_vec * prev_vec + shift_vec);
+                let res_arr: [f32; 8] = res.into();
+                fwd[curr_base + k..curr_base + k + 8].copy_from_slice(&res_arr);
+                sum_vec += res;
+                k += 8;
+            }
+            let mut sum = sum_vec.reduce_add();
+            for i in k..n_emit {
+                let em = compute_emit(mism_slice[i], nobs_slice[i], log_p_no_err, log_p_err);
+                let val = em * (scale * fwd[prev_off + i] + shift);
+                fwd[curr_base + i] = val;
                 sum += val;
             }
             recomp_sum = sum.max(1e-30);

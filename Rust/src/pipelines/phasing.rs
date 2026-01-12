@@ -1658,172 +1658,179 @@ impl PhasingPipeline {
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
 
-        let ref_geno = tracing::info_span!("clone_geno").in_scope(|| geno.clone());
+        // No clone needed: the HMM phase is read-only; mutations happen after.
+        // We use a scoped immutable borrow that ends before the swap phase.
+        let swap_masks: Vec<BitVec<u8, Lsb0>> = {
+            // Immutable borrow of geno for the entire read phase
+            let ref_geno: &MutableGenotypes = geno;
 
-        // Use Composite view when reference panel is available
-        let ref_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            GenotypeView::Composite {
-                target: &ref_geno,
-                reference: ref_gt,
-                alignment,
-                n_target_haps: n_haps,
-            }
-        } else {
-            GenotypeView::from((&ref_geno, markers))
-        };
-
-        // Build composite haplotypes for all samples using streaming PBWT
-        // This uses O(N) memory instead of O(M*N) for the PBWT index
-        let n_candidates = self.params.n_states.min(n_total_haps).max(20);
-        let threaded_haps_vec: Vec<crate::model::states::ThreadedHaps> = tracing::info_span!("streaming_pbwt").in_scope(|| {
-            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                self.build_composite_haps_streaming(
-                    |m, h| {
-                        if h < n_haps {
-                            // Target haplotype: check confidence before using
-                            let sample = h / 2;
-                            let conf = confidence_by_sample.get(sample)
-                                .and_then(|c| c.get(m))
-                                .copied()
-                                .unwrap_or(1.0);
-                            if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                                255 // Treat low-confidence calls as missing for IBS
-                            } else {
-                                ref_geno.get(m, HapIdx::new(h as u32))
-                            }
-                        } else {
-                            // Reference haplotype: always use actual allele
-                            let ref_h = h - n_haps;
-                            if let Some(ref_m) = alignment.target_to_ref(m) {
-                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                                // Map reference allele to target encoding (handles strand flips)
-                                alignment.reverse_map_allele(m, ref_allele)
-                            } else {
-                                255 // Missing - marker not in reference
-                            }
-                        }
-                    },
-                    n_markers,
-                    n_total_haps,
-                    n_samples,
-                    ibs2,
-                    n_candidates,
-                    self.params.n_states,
-                )
+            // Use Composite view when reference panel is available
+            let ref_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                GenotypeView::Composite {
+                    target: ref_geno,
+                    reference: ref_gt,
+                    alignment,
+                    n_target_haps: n_haps,
+                }
             } else {
-                // Use optimized direct access version for no-reference case
-                self.build_composite_haps_streaming_direct(
-                    &ref_geno,
+                GenotypeView::from((ref_geno, markers))
+            };
+
+            // Build composite haplotypes for all samples using streaming PBWT
+            // This uses O(N) memory instead of O(M*N) for the PBWT index
+            let n_candidates = self.params.n_states.min(n_total_haps).max(20);
+            let threaded_haps_vec: Vec<crate::model::states::ThreadedHaps> = tracing::info_span!("streaming_pbwt").in_scope(|| {
+                if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                    self.build_composite_haps_streaming(
+                        |m, h| {
+                            if h < n_haps {
+                                // Target haplotype: check confidence before using
+                                let sample = h / 2;
+                                let conf = confidence_by_sample.get(sample)
+                                    .and_then(|c| c.get(m))
+                                    .copied()
+                                    .unwrap_or(1.0);
+                                if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                                    255 // Treat low-confidence calls as missing for IBS
+                                } else {
+                                    ref_geno.get(m, HapIdx::new(h as u32))
+                                }
+                            } else {
+                                // Reference haplotype: always use actual allele
+                                let ref_h = h - n_haps;
+                                if let Some(ref_m) = alignment.target_to_ref(m) {
+                                    let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                    // Map reference allele to target encoding (handles strand flips)
+                                    alignment.reverse_map_allele(m, ref_allele)
+                                } else {
+                                    255 // Missing - marker not in reference
+                                }
+                            }
+                        },
+                        n_markers,
+                        n_total_haps,
+                        n_samples,
+                        ibs2,
+                        n_candidates,
+                        self.params.n_states,
+                    )
+                } else {
+                    // Use optimized direct access version for no-reference case
+                    self.build_composite_haps_streaming_direct(
+                        ref_geno,
+                        n_markers,
+                        n_samples,
+                        ibs2,
+                        n_candidates,
+                        self.params.n_states,
+                    )
+                }
+            });
+
+            let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
+
+            tracing::info_span!("hmm_samples").in_scope(|| swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
+                let sample_idx = SampleIdx::new(s as u32);
+                let hap1 = sample_idx.hap1();
+                let hap2 = sample_idx.hap2();
+                let sample_seed = (self.config.seed as u64)
+                    .wrapping_add(s as u64)
+                    .wrapping_add(0xA5A5_5A5A_D00Du64);
+
+                // Use pre-built composite haplotypes from streaming PBWT
+                let threaded_haps = threaded_haps_vec[s].clone();
+                let n_states = threaded_haps.n_states();
+
+                // 2. Extract current alleles for H1 and H2
+                let seq1 = ref_geno.haplotype(hap1);
+                let seq2 = ref_geno.haplotype(hap2);
+                // Use pre-computed confidence instead of recomputing
+                let sample_conf = &confidence_by_sample[s];
+
+                // 3. Run HMM with per-heterozygote swap probabilities
+                // Following Java PhaseBaum2.java: interleave phase decisions in the forward pass.
+                //
+                // Key Algorithm (3-Track HMM):
+                // 1. Run backward pass for BOTH haplotypes first, storing backward values
+                // 2. Run forward pass marker-by-marker for BOTH haplotypes
+                // 3. At each het, compute swap probability using fwd and stored bwd
+                // 4. After the forward pass, sample a swap mask via MCMC
+                // 5. Apply the sampled mask to update phase
+                //
+                // Collect EM statistics if requested (using original sequences)
+                // Only create HMM when needed to avoid unnecessary p_recomb.clone()
+                if let Some(atomic) = atomic_estimates {
+                    let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
+                    let mut local_est = crate::model::parameters::ParamEstimates::new();
+                    hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
+                    hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
+                    atomic.add_estimation_data(&local_est);
+                }
+
+                // 3-Track HMM with Prior-First Approach
+                //
+                // This implementation avoids the numerically unstable division workaround.
+                // Instead, we:
+                // 1. Run sparse backward passes, storing only at het positions
+                // 2. Run forward with prior-first: compute transition before emission
+                // 3. At hets: use prior (no emission) to evaluate both hypotheses
+                // 4. Apply combined emission after decision for numerical stability
+
+                // Identify heterozygote positions first
+                let het_positions: Vec<usize> = (0..n_markers)
+                    .filter(|&m| {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        a1 != 255 && a2 != 255 && a1 != a2
+                    })
+                    .collect();
+
+                let p_err = self.params.p_mismatch;
+                let p_no_err = 1.0 - p_err;
+
+                // Pre-compute state->hap mapping for all (marker, state) pairs
+                // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
+                let lookup = RefAlleleLookup::new_from_threaded(
+                    &threaded_haps,
                     n_markers,
-                    n_samples,
-                    ibs2,
-                    n_candidates,
-                    self.params.n_states,
-                )
-            }
-        });
+                    n_states,
+                    n_haps,
+                    ref_geno,
+                    self.reference_gt.as_deref(),
+                    self.alignment.as_ref(),
+                    None,
+                );
 
-        let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
-
-        tracing::info_span!("hmm_samples").in_scope(|| swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
-            let sample_idx = SampleIdx::new(s as u32);
-            let hap1 = sample_idx.hap1();
-            let hap2 = sample_idx.hap2();
-            let sample_seed = (self.config.seed as u64)
-                .wrapping_add(s as u64)
-                .wrapping_add(0xA5A5_5A5A_D00Du64);
-
-            // Use pre-built composite haplotypes from streaming PBWT
-            let threaded_haps = threaded_haps_vec[s].clone();
-            let n_states = threaded_haps.n_states();
-
-            // 2. Extract current alleles for H1 and H2
-            let seq1 = ref_geno.haplotype(hap1);
-            let seq2 = ref_geno.haplotype(hap2);
-            // Use pre-computed confidence instead of recomputing
-            let sample_conf = &confidence_by_sample[s];
-
-            // 3. Run HMM with per-heterozygote swap probabilities
-            // Following Java PhaseBaum2.java: interleave phase decisions in the forward pass.
-            //
-            // Key Algorithm (3-Track HMM):
-            // 1. Run backward pass for BOTH haplotypes first, storing backward values
-            // 2. Run forward pass marker-by-marker for BOTH haplotypes
-            // 3. At each het, compute swap probability using fwd and stored bwd
-            // 4. After the forward pass, sample a swap mask via MCMC
-            // 5. Apply the sampled mask to update phase
-            //
-            // Collect EM statistics if requested (using original sequences)
-            // Only create HMM when needed to avoid unnecessary p_recomb.clone()
-            if let Some(atomic) = atomic_estimates {
-                let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
-                let mut local_est = crate::model::parameters::ParamEstimates::new();
-                hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
-                hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
-                atomic.add_estimation_data(&local_est);
-            }
-
-            // 3-Track HMM with Prior-First Approach
-            //
-            // This implementation avoids the numerically unstable division workaround.
-            // Instead, we:
-            // 1. Run sparse backward passes, storing only at het positions
-            // 2. Run forward with prior-first: compute transition before emission
-            // 3. At hets: use prior (no emission) to evaluate both hypotheses
-            // 4. Apply combined emission after decision for numerical stability
-
-            // Identify heterozygote positions first
-            let het_positions: Vec<usize> = (0..n_markers)
-                .filter(|&m| {
-                    let a1 = seq1[m];
-                    let a2 = seq2[m];
-                    a1 != 255 && a2 != 255 && a1 != a2
-                })
-                .collect();
-
-            let p_err = self.params.p_mismatch;
-            let p_no_err = 1.0 - p_err;
-
-            // Pre-compute state->hap mapping for all (marker, state) pairs
-            // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
-            let lookup = RefAlleleLookup::new_from_threaded(
-                &threaded_haps,
-                n_markers,
-                n_states,
-                n_haps,
-                &ref_geno,
-                self.reference_gt.as_deref(),
-                self.alignment.as_ref(),
-                None,
-            );
-
-            let (swap_bits, swap_lr) = sample_swap_bits_mosaic(
-                n_markers,
-                n_states,
-                p_recomb,
-                &seq1,
-                &seq2,
-                &sample_conf,
-                &lookup,
-                &het_positions,
-                sample_seed,
-                self.config.mcmc_burnin,
-                p_no_err,
-                p_err,
-            );
-            assert!(swap_lr.len() <= n_markers);
-            let mut swapped = false;
-            let mut swap_idx = 0usize;
-            for m in 0..n_markers {
-                if swap_idx < het_positions.len() && het_positions[swap_idx] == m {
-                    swapped = swap_bits.get(swap_idx).copied().unwrap_or(0) == 1;
-                    swap_idx += 1;
+                let (swap_bits, swap_lr) = sample_swap_bits_mosaic(
+                    n_markers,
+                    n_states,
+                    p_recomb,
+                    &seq1,
+                    &seq2,
+                    &sample_conf,
+                    &lookup,
+                    &het_positions,
+                    sample_seed,
+                    self.config.mcmc_burnin,
+                    p_no_err,
+                    p_err,
+                );
+                assert!(swap_lr.len() <= n_markers);
+                let mut swapped = false;
+                let mut swap_idx = 0usize;
+                for m in 0..n_markers {
+                    if swap_idx < het_positions.len() && het_positions[swap_idx] == m {
+                        swapped = swap_bits.get(swap_idx).copied().unwrap_or(0) == 1;
+                        swap_idx += 1;
+                    }
+                    if swapped {
+                        mask.set(m, true);
+                    }
                 }
-                if swapped {
-                    mask.set(m, true);
-                }
-            }
-        }));
+            }));
+
+            swap_masks
+        };  // ref_geno borrow ends here
 
         // Apply Swaps
         let mut total_switches = 0;
@@ -1874,150 +1881,156 @@ impl PhasingPipeline {
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
 
-        let ref_geno = geno.clone();
-        let ref_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            GenotypeView::Composite {
-                target: &ref_geno,
-                reference: ref_gt,
-                alignment,
-                n_target_haps: n_haps,
-            }
-        } else {
-            GenotypeView::from((&ref_geno, markers))
-        };
-
-        // Build bidirectional PBWT for better state selection around recombination hotspots
-        // Filter low-confidence target markers to prevent bad hard calls from
-        // excluding correct reference haplotypes during state selection.
-        let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            self.build_bidirectional_pbwt_combined(
-                |m, h| {
-                    if h < n_haps {
-                        // Target haplotype: check confidence before using
-                        let sample = h / 2;
-                        let conf = confidence_by_sample.get(sample)
-                            .and_then(|c| c.get(m))
-                            .copied()
-                            .unwrap_or(1.0);
-                        if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                            255 // Treat low-confidence calls as missing for IBS
-                        } else {
-                            ref_geno.get(m, HapIdx::new(h as u32))
-                        }
-                    } else {
-                        let ref_h = h - n_haps;
-                        if let Some(ref_m) = alignment.target_to_ref(m) {
-                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                            alignment.reverse_map_allele(m, ref_allele)
-                        } else {
-                            255
-                        }
-                    }
-                },
-                n_markers,
-                n_total_haps,
-            )
-        } else {
-            self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps)
-        };
-
-        // Collect swap masks per sample
+        // No clone needed: the HMM phase is read-only; mutations happen after.
+        // We use a scoped immutable borrow that ends before the swap phase.
         let n_samples = n_haps / 2;
-        let swap_masks: Vec<BitBox<u64, Lsb0>> = sample_phases
-            .par_iter()
-            .enumerate()
-            .map(|(s, sp)| {
-                // Build dynamic composite haplotypes using PhaseStates
-                let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
-                let threaded_haps = phase_states.build_composite_haps(
-                    s as u32,
-                    &phase_ibs,
-                    ibs2,
-                    20,
-                );
-                let n_states = phase_states.n_states();
+        let swap_masks: Vec<BitBox<u64, Lsb0>> = {
+            // Immutable borrow of geno for the entire read phase
+            let ref_geno: &MutableGenotypes = geno;
 
-                // Extract current alleles from SamplePhase
-                let seq1: Vec<u8> = (0..n_markers).map(|m| sp.allele1(m)).collect();
-                let seq2: Vec<u8> = (0..n_markers).map(|m| sp.allele2(m)).collect();
-                let sample_conf: Vec<f32> = (0..n_markers).map(|m| sp.confidence(m)).collect();
-                let sample_seed = (self.config.seed as u64)
-                    .wrapping_add(s as u64)
-                    .wrapping_add(0xBEEF_CAFE_55AAu64);
-
-                // Collect EM statistics if requested
-                if let Some(atomic) = atomic_estimates {
-                    let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
-                    let mut local_est = crate::model::parameters::ParamEstimates::new();
-                    hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
-                    hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
-                    atomic.add_estimation_data(&local_est);
+            let ref_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                GenotypeView::Composite {
+                    target: ref_geno,
+                    reference: ref_gt,
+                    alignment,
+                    n_target_haps: n_haps,
                 }
+            } else {
+                GenotypeView::from((ref_geno, markers))
+            };
 
-                // Identify heterozygote positions (ONLY after overlap region for decisions)
-                // But we still need full het list for backward pass
-                let het_positions: Vec<usize> = (0..n_markers)
-                    .filter(|&m| {
-                        let a1 = seq1[m];
-                        let a2 = seq2[m];
-                        a1 != 255 && a2 != 255 && a1 != a2
-                    })
-                    .collect();
-
-                // Find first het index after overlap region
-                let first_changeable_het = het_positions.iter().position(|&m| m >= overlap_markers).unwrap_or(het_positions.len());
-                let changeable_positions: Vec<usize> = het_positions[first_changeable_het..].to_vec();
-                if changeable_positions.is_empty() {
-                    return bitbox![u64, Lsb0; 0; n_markers];
-                }
-
-                let p_err = self.params.p_mismatch;
-                let p_no_err = 1.0 - p_err;
-
-                // Pre-compute state->hap mapping for all (marker, state) pairs
-                // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
-                let lookup = RefAlleleLookup::new_from_threaded(
-                    &threaded_haps,
+            // Build bidirectional PBWT for better state selection around recombination hotspots
+            // Filter low-confidence target markers to prevent bad hard calls from
+            // excluding correct reference haplotypes during state selection.
+            let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                self.build_bidirectional_pbwt_combined(
+                    |m, h| {
+                        if h < n_haps {
+                            // Target haplotype: check confidence before using
+                            let sample = h / 2;
+                            let conf = confidence_by_sample.get(sample)
+                                .and_then(|c| c.get(m))
+                                .copied()
+                                .unwrap_or(1.0);
+                            if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                                255 // Treat low-confidence calls as missing for IBS
+                            } else {
+                                ref_geno.get(m, HapIdx::new(h as u32))
+                            }
+                        } else {
+                            let ref_h = h - n_haps;
+                            if let Some(ref_m) = alignment.target_to_ref(m) {
+                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                alignment.reverse_map_allele(m, ref_allele)
+                            } else {
+                                255
+                            }
+                        }
+                    },
                     n_markers,
-                    n_states,
-                    n_haps,
-                    &ref_geno,
-                    self.reference_gt.as_deref(),
-                    self.alignment.as_ref(),
-                    None,
-                );
+                    n_total_haps,
+                )
+            } else {
+                self.build_bidirectional_pbwt(ref_geno, n_markers, n_haps)
+            };
 
-                let (swap_bits, swap_lr) = sample_swap_bits_mosaic(
-                    n_markers,
-                    n_states,
-                    p_recomb,
-                    &seq1,
-                    &seq2,
-                    &sample_conf,
-                    &lookup,
-                    &changeable_positions,
-                    sample_seed,
-                    self.config.mcmc_burnin,
-                    p_no_err,
-                    p_err,
-                );
-                assert!(swap_lr.len() <= changeable_positions.len());
-                let mut swap_mask = bitbox![u64, Lsb0; 0; n_markers];
-                let mut current_phase = 0u8;
-                let mut phase_idx = 0usize;
-                for m in overlap_markers..n_markers {
-                    if phase_idx < changeable_positions.len() && changeable_positions[phase_idx] == m {
-                        current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
-                        phase_idx += 1;
-                    }
-                    if current_phase == 1 {
-                        swap_mask.set(m, true);
-                    }
-                }
+            // Collect swap masks per sample
+            sample_phases
+                .par_iter()
+                .enumerate()
+                .map(|(s, sp)| {
+                    // Build dynamic composite haplotypes using PhaseStates
+                    let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
+                    let threaded_haps = phase_states.build_composite_haps(
+                        s as u32,
+                        &phase_ibs,
+                        ibs2,
+                        20,
+                    );
+                    let n_states = phase_states.n_states();
 
-                swap_mask
-            })
-            .collect();
+                    // Extract current alleles from SamplePhase
+                    let seq1: Vec<u8> = (0..n_markers).map(|m| sp.allele1(m)).collect();
+                    let seq2: Vec<u8> = (0..n_markers).map(|m| sp.allele2(m)).collect();
+                    let sample_conf: Vec<f32> = (0..n_markers).map(|m| sp.confidence(m)).collect();
+                    let sample_seed = (self.config.seed as u64)
+                        .wrapping_add(s as u64)
+                        .wrapping_add(0xBEEF_CAFE_55AAu64);
+
+                    // Collect EM statistics if requested
+                    if let Some(atomic) = atomic_estimates {
+                        let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
+                        let mut local_est = crate::model::parameters::ParamEstimates::new();
+                        hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
+                        hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
+                        atomic.add_estimation_data(&local_est);
+                    }
+
+                    // Identify heterozygote positions (ONLY after overlap region for decisions)
+                    // But we still need full het list for backward pass
+                    let het_positions: Vec<usize> = (0..n_markers)
+                        .filter(|&m| {
+                            let a1 = seq1[m];
+                            let a2 = seq2[m];
+                            a1 != 255 && a2 != 255 && a1 != a2
+                        })
+                        .collect();
+
+                    // Find first het index after overlap region
+                    let first_changeable_het = het_positions.iter().position(|&m| m >= overlap_markers).unwrap_or(het_positions.len());
+                    let changeable_positions: Vec<usize> = het_positions[first_changeable_het..].to_vec();
+                    if changeable_positions.is_empty() {
+                        return bitbox![u64, Lsb0; 0; n_markers];
+                    }
+
+                    let p_err = self.params.p_mismatch;
+                    let p_no_err = 1.0 - p_err;
+
+                    // Pre-compute state->hap mapping for all (marker, state) pairs
+                    // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
+                    let lookup = RefAlleleLookup::new_from_threaded(
+                        &threaded_haps,
+                        n_markers,
+                        n_states,
+                        n_haps,
+                        ref_geno,
+                        self.reference_gt.as_deref(),
+                        self.alignment.as_ref(),
+                        None,
+                    );
+
+                    let (swap_bits, swap_lr) = sample_swap_bits_mosaic(
+                        n_markers,
+                        n_states,
+                        p_recomb,
+                        &seq1,
+                        &seq2,
+                        &sample_conf,
+                        &lookup,
+                        &changeable_positions,
+                        sample_seed,
+                        self.config.mcmc_burnin,
+                        p_no_err,
+                        p_err,
+                    );
+                    assert!(swap_lr.len() <= changeable_positions.len());
+                    let mut swap_mask = bitbox![u64, Lsb0; 0; n_markers];
+                    let mut current_phase = 0u8;
+                    let mut phase_idx = 0usize;
+                    for m in overlap_markers..n_markers {
+                        if phase_idx < changeable_positions.len() && changeable_positions[phase_idx] == m {
+                            current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
+                            phase_idx += 1;
+                        }
+                        if current_phase == 1 {
+                            swap_mask.set(m, true);
+                        }
+                    }
+
+                    swap_mask
+                })
+                .collect()
+        };  // ref_geno borrow ends here
 
         // Apply Swaps
         let mut total_switches = 0;
@@ -2068,188 +2081,194 @@ impl PhasingPipeline {
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
 
-        // 1. Create Subset View for Stage 1 markers
-        // Use CompositeSubset when reference panel is available
-        let ref_geno = geno.clone();
-        let subset_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            GenotypeView::CompositeSubset {
-                target: &ref_geno,
-                reference: ref_gt,
-                alignment,
-                subset: hi_freq_to_orig,
-                n_target_haps: n_haps,
-            }
-        } else {
-            GenotypeView::MutableSubset {
-                geno: &ref_geno,
-                subset: hi_freq_to_orig,
-            }
-        };
-
-        // 2. Build bidirectional PBWT on high-frequency markers only
-        // When reference is available, include reference haplotypes in the PBWT
-        // Filter low-confidence target markers to prevent bad hard calls from
-        // excluding correct reference haplotypes during state selection.
-
-        let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            self.build_bidirectional_pbwt_combined_subset(
-                |orig_m, h| {
-                    if h < n_haps {
-                        // Target haplotype: check confidence before using
-                        let sample = h / 2;
-                        let conf = confidence_by_sample.get(sample)
-                            .and_then(|c| c.get(orig_m))
-                            .copied()
-                            .unwrap_or(1.0);
-                        if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                            255 // Treat low-confidence calls as missing for IBS
-                        } else {
-                            ref_geno.get(orig_m, HapIdx::new(h as u32))
-                        }
-                    } else {
-                        let ref_h = h - n_haps;
-                        if let Some(ref_m) = alignment.target_to_ref(orig_m) {
-                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                            // Map reference allele to target encoding (handles strand flips)
-                            alignment.reverse_map_allele(orig_m, ref_allele)
-                        } else {
-                            255 // Missing - marker not in reference
-                        }
-                    }
-                },
-                hi_freq_to_orig,
-                n_total_haps,
-            )
-        } else {
-            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_to_orig, n_haps)
-        };
-
-        // Collect phase decisions per sample using correct per-het algorithm.
-        // Returns: (swap_mask, het_lr_values) per sample where:
-        //   - swap_mask[i] = true if the sampled phase orientation at marker i is swapped
-        //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
+        // No clone needed: the HMM phase is read-only; mutations happen after.
+        // We use a scoped immutable borrow that ends before the apply phase.
         type PhaseDecision = (Vec<bool>, Vec<(usize, f32)>);
-        let phase_decisions: Vec<PhaseDecision> = sample_phases
-            .par_iter()
-            .enumerate()
-            .map(|(s, sp)| {
-                let n_hi_freq = hi_freq_to_orig.len();
+        let phase_decisions: Vec<PhaseDecision> = {
+            // Immutable borrow of geno for the entire read phase
+            let ref_geno: &MutableGenotypes = geno;
 
-                // Build dynamic composite haplotypes using PhaseStates
-                let mut phase_states = PhaseStates::new(self.params.n_states, n_hi_freq);
-                let threaded_haps = phase_states.build_composite_haps(
-                    s as u32,
-                    &phase_ibs,
-                    ibs2,
-                    20,
-                );
-                let n_states = phase_states.n_states();
-
-                // Extract alleles from SamplePhase for SUBSET of markers
-                let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
-                let seq2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele2(m)).collect();
-                let sample_conf: Vec<f32> = hi_freq_to_orig.iter().map(|&m| sp.confidence(m)).collect();
-                let sample_seed = (self.config.seed as u64)
-                    .wrapping_add(s as u64)
-                    .wrapping_add((iteration as u64) << 32)
-                    .wrapping_add(0xFEED_FACE_1234u64);
-
-                // Collect EM statistics if requested
-                if let Some(atomic) = atomic_estimates {
-                    let hmm = BeagleHmm::new(subset_view, &self.params, n_states, stage1_p_recomb.to_vec());
-                    let mut local_est = crate::model::parameters::ParamEstimates::new();
-                    hmm.collect_stats(&seq1, &threaded_haps, stage1_gen_dists, &mut local_est);
-                    hmm.collect_stats(&seq2, &threaded_haps, stage1_gen_dists, &mut local_est);
-                    atomic.add_estimation_data(&local_est);
+            // 1. Create Subset View for Stage 1 markers
+            // Use CompositeSubset when reference panel is available
+            let subset_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                GenotypeView::CompositeSubset {
+                    target: ref_geno,
+                    reference: ref_gt,
+                    alignment,
+                    subset: hi_freq_to_orig,
+                    n_target_haps: n_haps,
                 }
-
-                // Identify UNPHASED heterozygote positions in hi-freq marker space
-                let het_positions: Vec<usize> = (0..n_hi_freq)
-                    .filter(|&i| {
-                        let m = hi_freq_to_orig[i];
-                        let a1 = seq1[i];
-                        let a2 = seq2[i];
-                        a1 != 255 && a2 != 255 && a1 != a2 && sp.is_unphased(m)
-                    })
-                    .collect();
-
-                if het_positions.is_empty() {
-                    // No hets to phase: no swaps needed, no LR values
-                    return (vec![false; n_hi_freq], Vec::new());
+            } else {
+                GenotypeView::MutableSubset {
+                    geno: ref_geno,
+                    subset: hi_freq_to_orig,
                 }
+            };
 
-                let p_err = self.params.p_mismatch;
-                let p_no_err = 1.0 - p_err;
+            // 2. Build bidirectional PBWT on high-frequency markers only
+            // When reference is available, include reference haplotypes in the PBWT
+            // Filter low-confidence target markers to prevent bad hard calls from
+            // excluding correct reference haplotypes during state selection.
 
-                // Pre-compute state->hap mapping for all (hi_freq_idx, state) pairs
-                // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
-                let lookup = RefAlleleLookup::new_from_threaded(
-                    &threaded_haps,
-                    n_hi_freq,
-                    n_states,
-                    n_haps,
-                    &ref_geno,
-                    self.reference_gt.as_deref(),
-                    self.alignment.as_ref(),
-                    Some(hi_freq_to_orig),
-                );
+            let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                self.build_bidirectional_pbwt_combined_subset(
+                    |orig_m, h| {
+                        if h < n_haps {
+                            // Target haplotype: check confidence before using
+                            let sample = h / 2;
+                            let conf = confidence_by_sample.get(sample)
+                                .and_then(|c| c.get(orig_m))
+                                .copied()
+                                .unwrap_or(1.0);
+                            if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                                255 // Treat low-confidence calls as missing for IBS
+                            } else {
+                                ref_geno.get(orig_m, HapIdx::new(h as u32))
+                            }
+                        } else {
+                            let ref_h = h - n_haps;
+                            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                // Map reference allele to target encoding (handles strand flips)
+                                alignment.reverse_map_allele(orig_m, ref_allele)
+                            } else {
+                                255 // Missing - marker not in reference
+                            }
+                        }
+                    },
+                    hi_freq_to_orig,
+                    n_total_haps,
+                )
+            } else {
+                self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps)
+            };
 
-                let (swap_bits, swap_lr) = if self.config.dynamic_mcmc {
-                    // SHAPEIT5-style dynamic MCMC: re-select states each step
-                    sample_dynamic_mcmc(
-                        n_hi_freq,
-                        n_states,
-                        stage1_p_recomb,
-                        &seq1,
-                        &seq2,
-                        &sample_conf,
+            // Collect phase decisions per sample using correct per-het algorithm.
+            // Returns: (swap_mask, het_lr_values) per sample where:
+            //   - swap_mask[i] = true if the sampled phase orientation at marker i is swapped
+            //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
+            sample_phases
+                .par_iter()
+                .enumerate()
+                .map(|(s, sp)| {
+                    let n_hi_freq = hi_freq_to_orig.len();
+
+                    // Build dynamic composite haplotypes using PhaseStates
+                    let mut phase_states = PhaseStates::new(self.params.n_states, n_hi_freq);
+                    let threaded_haps = phase_states.build_composite_haps(
+                        s as u32,
                         &phase_ibs,
                         ibs2,
-                        s as u32,
-                        &het_positions,
-                        sample_seed,
-                        self.config.mcmc_steps,
-                        p_no_err,
-                        p_err,
-                    )
-                } else {
-                    // Classic Beagle-style: static state space MCMC
-                    sample_swap_bits_mosaic(
+                        20,
+                    );
+                    let n_states = phase_states.n_states();
+
+                    // Extract alleles from SamplePhase for SUBSET of markers
+                    let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
+                    let seq2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele2(m)).collect();
+                    let sample_conf: Vec<f32> = hi_freq_to_orig.iter().map(|&m| sp.confidence(m)).collect();
+                    let sample_seed = (self.config.seed as u64)
+                        .wrapping_add(s as u64)
+                        .wrapping_add((iteration as u64) << 32)
+                        .wrapping_add(0xFEED_FACE_1234u64);
+
+                    // Collect EM statistics if requested
+                    if let Some(atomic) = atomic_estimates {
+                        let hmm = BeagleHmm::new(subset_view, &self.params, n_states, stage1_p_recomb.to_vec());
+                        let mut local_est = crate::model::parameters::ParamEstimates::new();
+                        hmm.collect_stats(&seq1, &threaded_haps, stage1_gen_dists, &mut local_est);
+                        hmm.collect_stats(&seq2, &threaded_haps, stage1_gen_dists, &mut local_est);
+                        atomic.add_estimation_data(&local_est);
+                    }
+
+                    // Identify UNPHASED heterozygote positions in hi-freq marker space
+                    let het_positions: Vec<usize> = (0..n_hi_freq)
+                        .filter(|&i| {
+                            let m = hi_freq_to_orig[i];
+                            let a1 = seq1[i];
+                            let a2 = seq2[i];
+                            a1 != 255 && a2 != 255 && a1 != a2 && sp.is_unphased(m)
+                        })
+                        .collect();
+
+                    if het_positions.is_empty() {
+                        // No hets to phase: no swaps needed, no LR values
+                        return (vec![false; n_hi_freq], Vec::new());
+                    }
+
+                    let p_err = self.params.p_mismatch;
+                    let p_no_err = 1.0 - p_err;
+
+                    // Pre-compute state->hap mapping for all (hi_freq_idx, state) pairs
+                    // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
+                    let lookup = RefAlleleLookup::new_from_threaded(
+                        &threaded_haps,
                         n_hi_freq,
                         n_states,
-                        stage1_p_recomb,
-                        &seq1,
-                        &seq2,
-                        &sample_conf,
-                        &lookup,
-                        &het_positions,
-                        sample_seed,
-                        self.config.mcmc_burnin,
-                        p_no_err,
-                        p_err,
-                    )
-                };
+                        n_haps,
+                        ref_geno,
+                        self.reference_gt.as_deref(),
+                        self.alignment.as_ref(),
+                        Some(hi_freq_to_orig),
+                    );
 
-                let mut swap_mask = vec![false; n_hi_freq];
-                let mut current_phase = 0u8;
-                let mut phase_idx = 0usize;
-                for i in 0..n_hi_freq {
-                    if phase_idx < het_positions.len() && het_positions[phase_idx] == i {
-                        current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
-                        phase_idx += 1;
+                    let (swap_bits, swap_lr) = if self.config.dynamic_mcmc {
+                        // SHAPEIT5-style dynamic MCMC: re-select states each step
+                        sample_dynamic_mcmc(
+                            n_hi_freq,
+                            n_states,
+                            stage1_p_recomb,
+                            &seq1,
+                            &seq2,
+                            &sample_conf,
+                            &phase_ibs,
+                            ibs2,
+                            s as u32,
+                            &het_positions,
+                            sample_seed,
+                            self.config.mcmc_steps,
+                            p_no_err,
+                            p_err,
+                        )
+                    } else {
+                        // Classic Beagle-style: static state space MCMC
+                        sample_swap_bits_mosaic(
+                            n_hi_freq,
+                            n_states,
+                            stage1_p_recomb,
+                            &seq1,
+                            &seq2,
+                            &sample_conf,
+                            &lookup,
+                            &het_positions,
+                            sample_seed,
+                            self.config.mcmc_burnin,
+                            p_no_err,
+                            p_err,
+                        )
+                    };
+
+                    let mut swap_mask = vec![false; n_hi_freq];
+                    let mut current_phase = 0u8;
+                    let mut phase_idx = 0usize;
+                    for i in 0..n_hi_freq {
+                        if phase_idx < het_positions.len() && het_positions[phase_idx] == i {
+                            current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
+                            phase_idx += 1;
+                        }
+                        swap_mask[i] = current_phase == 1;
                     }
-                    swap_mask[i] = current_phase == 1;
-                }
 
-                let het_lr_values: Vec<(usize, f32)> = het_positions
-                    .iter()
-                    .copied()
-                    .zip(swap_lr.into_iter())
-                    .collect();
+                    let het_lr_values: Vec<(usize, f32)> = het_positions
+                        .iter()
+                        .copied()
+                        .zip(swap_lr.into_iter())
+                        .collect();
 
-                (swap_mask, het_lr_values)
-            })
-            .collect();
+                    (swap_mask, het_lr_values)
+                })
+                .collect()
+        };  // ref_geno borrow ends here
 
         // Apply phase decisions to SamplePhase
         let mut total_switches = 0;
@@ -2360,99 +2379,102 @@ impl PhasingPipeline {
         // Build Stage 2 interpolation mappings
         let stage2_phaser = Stage2Phaser::new(hi_freq_markers, gen_positions, n_markers);
 
-        // Clone current genotypes to use as a frozen reference panel
-        let ref_geno = geno.clone();
+        // No clone needed: this function never mutates geno - only sample_phases.
+        // We use a scoped immutable borrow for the entire computation phase.
+        let phase_changes: Vec<Vec<Stage2Decision>> = {
+            // Immutable borrow of geno for the entire read phase
+            let ref_geno: &MutableGenotypes = geno;
 
-        let rare_markers: Vec<usize> = (0..n_markers)
-            .filter(|&m| maf[m] < rare_threshold && maf[m] > 0.0)
-            .collect();
+            let rare_markers: Vec<usize> = (0..n_markers)
+                .filter(|&m| maf[m] < rare_threshold && maf[m] > 0.0)
+                .collect();
 
-        // Use CompositeSubset view when reference panel is available
-        let subset_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            GenotypeView::CompositeSubset {
-                target: &ref_geno,
-                reference: ref_gt,
-                alignment,
-                subset: hi_freq_markers,
-                n_target_haps: n_haps,
-            }
-        } else {
-            GenotypeView::MutableSubset {
-                geno: &ref_geno,
-                subset: hi_freq_markers,
-            }
-        };
-
-        let get_allele_global = |marker: usize, hap: usize| -> u8 {
-            if hap < n_haps {
-                ref_geno.get(marker, HapIdx::new(hap as u32))
+            // Use CompositeSubset view when reference panel is available
+            let subset_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                GenotypeView::CompositeSubset {
+                    target: ref_geno,
+                    reference: ref_gt,
+                    alignment,
+                    subset: hi_freq_markers,
+                    n_target_haps: n_haps,
+                }
             } else {
-                let ref_h = hap - n_haps;
-                if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                    if let Some(ref_m) = alignment.target_to_ref(marker) {
-                        let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                        alignment.reverse_map_allele(marker, ref_allele)
+                GenotypeView::MutableSubset {
+                    geno: ref_geno,
+                    subset: hi_freq_markers,
+                }
+            };
+
+            let get_allele_global = |marker: usize, hap: usize| -> u8 {
+                if hap < n_haps {
+                    ref_geno.get(marker, HapIdx::new(hap as u32))
+                } else {
+                    let ref_h = hap - n_haps;
+                    if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                        if let Some(ref_m) = alignment.target_to_ref(marker) {
+                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                            alignment.reverse_map_allele(marker, ref_allele)
+                        } else {
+                            255
+                        }
                     } else {
                         255
                     }
-                } else {
-                    255
                 }
-            }
-        };
+            };
 
-        let mut carrier_haps: Vec<Vec<u32>> = vec![Vec::new(); n_markers];
-        for &m in &rare_markers {
-            let mut carriers = Vec::new();
-            for h in 0..n_total_haps {
-                let allele = get_allele_global(m, h);
-                if allele > 0 && allele != 255 {
-                    carriers.push(h as u32);
-                }
-            }
-            carrier_haps[m] = carriers;
-        }
-
-        // Build bidirectional PBWT on hi-freq markers for consistent state selection
-        // When reference is available, include reference haplotypes
-        // Filter low-confidence target markers to prevent bad hard calls from
-        // excluding correct reference haplotypes during state selection.
-        let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            self.build_bidirectional_pbwt_combined_subset(
-                |orig_m, h| {
-                    if h < n_haps {
-                        // Target haplotype: check confidence before using
-                        let sample = h / 2;
-                        let conf = confidence_by_sample.get(sample)
-                            .and_then(|c| c.get(orig_m))
-                            .copied()
-                            .unwrap_or(1.0);
-                        if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                            255 // Treat low-confidence calls as missing for IBS
-                        } else {
-                            ref_geno.get(orig_m, HapIdx::new(h as u32))
-                        }
-                    } else {
-                        let ref_h = h - n_haps;
-                        if let Some(ref_m) = alignment.target_to_ref(orig_m) {
-                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                            // Map reference allele to target encoding (handles strand flips)
-                            alignment.reverse_map_allele(orig_m, ref_allele)
-                        } else {
-                            255 // Missing - marker not in reference
-                        }
+            let mut carrier_haps: Vec<Vec<u32>> = vec![Vec::new(); n_markers];
+            for &m in &rare_markers {
+                let mut carriers = Vec::new();
+                for h in 0..n_total_haps {
+                    let allele = get_allele_global(m, h);
+                    if allele > 0 && allele != 255 {
+                        carriers.push(h as u32);
                     }
-                },
-                hi_freq_markers,
-                n_total_haps,
-            )
-        } else {
-            self.build_bidirectional_pbwt_subset(&ref_geno, hi_freq_markers, n_haps)
-        };
+                }
+                carrier_haps[m] = carriers;
+            }
 
-        // Process samples in parallel - collect results: Stage2Decision
-        // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
-        let phase_changes: Vec<Vec<Stage2Decision>> = sample_phases
+            // Build bidirectional PBWT on hi-freq markers for consistent state selection
+            // When reference is available, include reference haplotypes
+            // Filter low-confidence target markers to prevent bad hard calls from
+            // excluding correct reference haplotypes during state selection.
+            let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                self.build_bidirectional_pbwt_combined_subset(
+                    |orig_m, h| {
+                        if h < n_haps {
+                            // Target haplotype: check confidence before using
+                            let sample = h / 2;
+                            let conf = confidence_by_sample.get(sample)
+                                .and_then(|c| c.get(orig_m))
+                                .copied()
+                                .unwrap_or(1.0);
+                            if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                                255 // Treat low-confidence calls as missing for IBS
+                            } else {
+                                ref_geno.get(orig_m, HapIdx::new(h as u32))
+                            }
+                        } else {
+                            let ref_h = h - n_haps;
+                            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                // Map reference allele to target encoding (handles strand flips)
+                                alignment.reverse_map_allele(orig_m, ref_allele)
+                            } else {
+                                255 // Missing - marker not in reference
+                            }
+                        }
+                    },
+                    hi_freq_markers,
+                    n_total_haps,
+                )
+            } else {
+                self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_markers, n_haps)
+            };
+
+            // Process samples in parallel - collect results: Stage2Decision
+            // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
+            sample_phases
             .par_iter()
             .enumerate()
             .map(|(s, sp)| {
@@ -2704,7 +2726,8 @@ impl PhasingPipeline {
 
                 decisions
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        };  // ref_geno borrow ends here
 
         // Apply phase changes and imputations to SamplePhase
         let mut total_switches = 0;
