@@ -133,49 +133,60 @@ impl PbwtDivUpdater {
         self.counts[..n_bins].fill(0);
 
         if n_alleles == 2 {
-            // Fast path for biallelic sites
+            // Fast path for biallelic sites - single pass counting
+            // Computes sum of bytes AND detects non-0/1 values simultaneously
             let data = &self.permuted_alleles[..self.n_haps];
 
-            // Check if we can use ultra-fast sum-only path (no missing data)
-            // For biallelic 0/1 data, sum of bytes equals count of 1s
-            let has_any_missing = data.iter().any(|&b| b > 1);
+            // Single-pass: sum all bytes and OR-reduce to detect values > 1
+            // For pure 0/1 data, sum = count of 1s, and any_high will be 0 or 1
+            // For data with missing (>1), any_high will have bits 1-7 set
+            let mut sum = 0usize;
+            let mut any_high = 0u8;
 
-            if !has_any_missing {
-                // Ultra-fast: just sum bytes (each is 0 or 1)
-                // This vectorizes very well as it's just a horizontal sum
-                let count1: usize = data.iter().map(|&b| b as usize).sum();
-                self.counts[0] = self.n_haps - count1;
-                self.counts[1] = count1;
+            // Process in chunks for autovectorization
+            let chunks = data.chunks_exact(32);
+            let remainder = chunks.remainder();
+
+            for chunk in chunks {
+                for &b in chunk {
+                    sum += b as usize;
+                    any_high |= b;
+                }
+            }
+            for &b in remainder {
+                sum += b as usize;
+                any_high |= b;
+            }
+
+            // any_high > 1 means some byte had value > 1 (missing data)
+            if any_high <= 1 {
+                // Pure 0/1 data - sum equals count of 1s
+                self.counts[0] = self.n_haps - sum;
+                self.counts[1] = sum;
                 self.counts[n_alleles] = 0;
             } else {
-                // Path with missing data
+                // Has missing data - need detailed count
+                // This path is rare (<1% of markers) so extra scan is acceptable
                 let mut count1 = 0usize;
                 let mut count_miss = 0usize;
 
-                // Process 32 bytes at a time using autovectorization hint
                 let chunks = data.chunks_exact(32);
                 let remainder = chunks.remainder();
 
                 for chunk in chunks {
                     for &b in chunk {
-                        if b == 1 {
-                            count1 += 1;
-                        } else if b > 1 {
-                            count_miss += 1;
-                        }
+                        count1 += (b == 1) as usize;
+                        count_miss += (b > 1) as usize;
                     }
                 }
                 for &b in remainder {
-                    if b == 1 {
-                        count1 += 1;
-                    } else if b > 1 {
-                        count_miss += 1;
-                    }
+                    count1 += (b == 1) as usize;
+                    count_miss += (b > 1) as usize;
                 }
 
                 self.counts[0] = self.n_haps - count1 - count_miss;
                 self.counts[1] = count1;
-                self.counts[n_alleles] = count_miss; // Missing bin
+                self.counts[n_alleles] = count_miss;
             }
         } else {
             // General path for multiallelic
@@ -378,20 +389,34 @@ impl PbwtDivUpdater {
         self.counts[..n_bins].fill(0);
 
         if n_alleles == 2 {
-            // Fast path for biallelic sites
+            // Fast path for biallelic sites - single pass counting
             let data = &self.permuted_alleles[..self.n_haps];
 
-            // Check if we can use ultra-fast sum-only path (no missing data)
-            let has_any_missing = data.iter().any(|&b| b > 1);
+            // Single-pass: sum all bytes and OR-reduce to detect values > 1
+            let mut sum = 0usize;
+            let mut any_high = 0u8;
 
-            if !has_any_missing {
-                // Ultra-fast: just sum bytes (each is 0 or 1)
-                let count1: usize = data.iter().map(|&b| b as usize).sum();
-                self.counts[0] = self.n_haps - count1;
-                self.counts[1] = count1;
+            let chunks = data.chunks_exact(32);
+            let remainder = chunks.remainder();
+
+            for chunk in chunks {
+                for &b in chunk {
+                    sum += b as usize;
+                    any_high |= b;
+                }
+            }
+            for &b in remainder {
+                sum += b as usize;
+                any_high |= b;
+            }
+
+            if any_high <= 1 {
+                // Pure 0/1 data - sum equals count of 1s
+                self.counts[0] = self.n_haps - sum;
+                self.counts[1] = sum;
                 self.counts[n_alleles] = 0;
             } else {
-                // Path with missing data
+                // Has missing data - need detailed count
                 let mut count1 = 0usize;
                 let mut count_miss = 0usize;
 
@@ -400,19 +425,13 @@ impl PbwtDivUpdater {
 
                 for chunk in chunks {
                     for &b in chunk {
-                        if b == 1 {
-                            count1 += 1;
-                        } else if b > 1 {
-                            count_miss += 1;
-                        }
+                        count1 += (b == 1) as usize;
+                        count_miss += (b > 1) as usize;
                     }
                 }
                 for &b in remainder {
-                    if b == 1 {
-                        count1 += 1;
-                    } else if b > 1 {
-                        count_miss += 1;
-                    }
+                    count1 += (b == 1) as usize;
+                    count_miss += (b > 1) as usize;
                 }
 
                 self.counts[0] = self.n_haps - count1 - count_miss;
