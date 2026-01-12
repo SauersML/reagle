@@ -1,6 +1,9 @@
 use reagle::config::Config;
 use reagle::pipelines::imputation::ImputationPipeline;
 use reagle::pipelines::phasing::PhasingPipeline;
+
+// Serialize tests to prevent OOM from parallel execution
+use serial_test::serial;
 use std::io::Write;
 use tempfile::NamedTempFile;
 use std::fs::File;
@@ -299,6 +302,7 @@ fn default_test_config() -> Config {
 // --- Tests ---
 
 #[test]
+#[serial]
 fn test_synthetic_slam_dunk() {
     let n_markers = 50;
     
@@ -353,6 +357,7 @@ fn test_synthetic_slam_dunk() {
 }
 
 #[test]
+#[serial]
 fn test_synthetic_recombination() {
     // Test imputation across a recombination breakpoint.
     // Use 100kb marker spacing to create ~5 cM total genetic distance,
@@ -415,6 +420,7 @@ fn test_synthetic_recombination() {
 }
 
 #[test]
+#[serial]
 fn test_simulated_chip_density() {
     // Simulate "Chip-Like" Sparsity with sufficient genetic distance.
     // Ref: 1000 markers at 10kb spacing (~10 cM total).
@@ -489,6 +495,7 @@ fn test_simulated_chip_density() {
 }
 
 #[test]
+#[serial]
 fn test_population_structure() {
     // Test population structure (admixture) with sufficient genetic distance.
     // Use 100kb spacing for ~10 cM total.
@@ -547,6 +554,7 @@ fn test_population_structure() {
 }
 
 #[test]
+#[serial]
 fn test_hotspot_switching() {
     // Test non-linear genetic maps with a recombination hotspot.
     // Markers 0-40 have low recombination, 41+ have high recombination.
@@ -616,6 +624,7 @@ fn test_hotspot_switching() {
 }
 
 #[test]
+#[serial]
 fn test_phase_switch_torture() {
     // Phase switch torture test with sufficient genetic distance.
     // Target: Heterozygous everywhere (0|1 or 1|0).
@@ -683,6 +692,7 @@ fn test_phase_switch_torture() {
 }
 
 #[test]
+#[serial]
 fn test_error_injection() {
     // Test error correction with sufficient genetic distance.
     // Ref: All 0. Target: All 0, but marker 25 is 1/1 (an error).
@@ -744,6 +754,7 @@ fn test_error_injection() {
 }
 
 #[test]
+#[serial]
 fn test_rare_variant() {
     // Test rare variant imputation with sufficient genetic distance.
     // Ref: Only hap 0 has '1' at marker 25, all others '0'.
@@ -825,6 +836,7 @@ fn test_rare_variant() {
 }
 
 #[test]
+#[serial]
 fn test_dr2_validation() {
     // Test DR2 quality metric output.
     // Use 100kb spacing for sufficient genetic distance.
@@ -915,6 +927,7 @@ fn test_dr2_validation() {
 }
 
 #[test]
+#[serial]
 fn test_phasing_perfect_ld() {
     // Test phasing with perfect LD and sufficient genetic distance.
     // Use 100kb spacing for ~1 cM total.
@@ -969,6 +982,7 @@ fn test_phasing_perfect_ld() {
 /// Test imputation of a singleton (variant present in only ONE reference haplotype)
 /// This is the hardest case for imputation - must correctly identify the single carrier
 #[test]
+#[serial]
 fn test_singleton_imputation() {
     // Reference panel: 100 haplotypes, marker 5 is a singleton (only hap 0 has ALT)
     let n_ref_markers = 20;
@@ -1041,6 +1055,7 @@ fn test_singleton_imputation() {
 /// Test imputation with extremely high recombination rate
 /// This stress-tests the HMM's ability to handle rapid state switching
 #[test]
+#[serial]
 fn test_high_recombination_stress() {
     // Create a scenario with very high recombination (markers very far apart)
     let n_ref_markers = 50;
@@ -1104,6 +1119,7 @@ fn test_high_recombination_stress() {
 /// Test that very dense markers (nearly zero recombination) are handled correctly
 /// This tests the HMM scaling when p_recomb approaches 0
 #[test]
+#[serial]
 fn test_ultra_dense_markers() {
     // Markers only 1bp apart - essentially zero recombination
     let n_ref_markers = 100;
@@ -1178,6 +1194,7 @@ fn test_ultra_dense_markers() {
 /// Test imputation with diverse reference panel where target has some mismatch
 /// This tests that imputation works when the target doesn't perfectly match reference.
 #[test]
+#[serial]
 fn test_diverse_reference_with_mismatch() {
     // Reference panel with DIVERSE haplotypes
     let n_ref_markers = 30;
@@ -1261,6 +1278,7 @@ fn test_diverse_reference_with_mismatch() {
 /// Microarray-style target (sparse ~1% of markers) vs WGS-style reference (dense)
 /// This is the realistic imputation scenario - compute R² to measure accuracy
 #[test]
+#[serial]
 fn test_microarray_vs_wgs_imputation() {
     // Dense WGS reference panel: 500 markers, 50 samples (100 haplotypes)
     let n_ref_markers = 500;
@@ -1403,6 +1421,7 @@ fn test_microarray_vs_wgs_imputation() {
 /// Test with lower-density genotyping array
 /// Simulate ~20% genotyped markers (every 5th)
 #[test]
+#[serial]
 fn test_high_density_array_imputation() {
     // Dense reference: 100 markers, 20 samples
     let n_ref_markers = 100;

@@ -48,6 +48,7 @@ mini-mcmc = { git = "https://github.com/SauersML/general-mcmc", package = "mini-
 criterion = "0.8.1"
 tempfile = "3.24.0"
 flate2 = "1.0"
+serial_test = "3.2"
 
 [build-dependencies]
 grep = "0.4.1"

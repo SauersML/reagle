@@ -20,6 +20,9 @@ use rand::SeedableRng;
 // Import Rust implementation for comparison tests
 use reagle::{Config, ImputationPipeline, PhasingPipeline};
 
+// Serialize tests to prevent OOM from parallel execution
+use serial_test::serial;
+
 // =============================================================================
 // gnomAD Test Data Source
 // =============================================================================
@@ -542,6 +545,8 @@ fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::proces
 }
 
 #[test]
+#[serial]
+#[serial]
 fn test_phasing_rust_vs_java() {
     // Run on all available data sources
     for source in get_all_data_sources() {
@@ -616,6 +621,7 @@ fn run_phasing_comparison(source: &TestDataSource) {
 }
 
 #[test]
+#[serial]
 fn test_imputation_vcf_ref_rust_vs_java() {
     // Run on all available data sources
     for source in get_all_data_sources() {
@@ -669,6 +675,7 @@ fn run_imputation_comparison(source: &TestDataSource) {
 }
 
 #[test]
+#[serial]
 fn test_java_beagle_bref3_creation() {
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
@@ -706,6 +713,7 @@ fn test_java_beagle_bref3_creation() {
 }
 
 #[test]
+#[serial]
 fn test_imputation_bref3_ref_rust_vs_java() {
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
@@ -763,6 +771,7 @@ fn test_imputation_bref3_ref_rust_vs_java() {
 }
 
 #[test]
+#[serial]
 fn test_full_workflow_rust_vs_java() {
     // Run full workflow on all data sources
     for source in get_all_data_sources() {
@@ -893,6 +902,7 @@ fn run_bref3_java_only_test() {
 }
 
 #[test]
+#[serial]
 fn test_output_structure_rust_vs_java() {
     // Run on all available data sources
     for source in get_all_data_sources() {
@@ -1007,6 +1017,7 @@ fn validate_output(vcf_path: &Path, name: &str) -> (usize, usize, usize, usize) 
 }
 
 #[test]
+#[serial]
 fn test_java_beagle_vcf_vs_bref3_consistency() {
     // Verify that imputation with VCF ref and bref3 ref produce identical results
     // Using sparse target for true imputation with DS/GP output
@@ -1416,6 +1427,7 @@ fn evaluate_imputation(
 }
 
 #[test]
+#[serial]
 fn test_mask_and_recover_rust_vs_java() {
     // Run on all available data sources
     for source in get_all_data_sources() {
@@ -1672,6 +1684,7 @@ fn compare_against_beagle(
 }
 
 #[test]
+#[serial]
 fn test_comparison_framework_self_check() {
     // Sanity check: BEAGLE compared against itself should pass trivially
     let files = setup_test_files();
@@ -2016,6 +2029,7 @@ fn compare_genotyped_dosages_to_truth(
 }
 
 #[test]
+#[serial]
 fn test_genotyped_dosage_correlation_with_truth() {
     // Test that genotyped markers (non-imputed) have near-perfect correlation
     // between Rust output dosage and ground truth dosage
@@ -2051,6 +2065,7 @@ fn test_genotyped_dosage_correlation_with_truth() {
 }
 
 #[test]
+#[serial]
 fn test_strict_dr2_and_dosage_comparison() {
     // Comprehensive quality metrics comparison between Rust and Java
     for source in get_all_data_sources() {
@@ -2104,6 +2119,7 @@ fn test_strict_dr2_and_dosage_comparison() {
 }
 
 #[test]
+#[serial]
 fn test_diverse_mask_scenarios() {
     // Test imputation with different masking fractions
     let source = &get_all_data_sources()[0]; // Use first data source
@@ -2201,6 +2217,7 @@ fn test_diverse_mask_scenarios() {
 }
 
 #[test]
+#[serial]
 fn test_multiple_seeds_consistency() {
     // Verify that different seeds don't cause catastrophic failures
     // and results remain consistent with Java
@@ -2305,6 +2322,7 @@ fn test_multiple_seeds_consistency() {
 /// This test breaks down accuracy by sample to help identify if failures
 /// are concentrated in specific samples or uniform across all samples.
 #[test]
+#[serial]
 fn test_per_sample_imputation_accuracy() {
     let source = &get_all_data_sources()[0];
     let files = setup_test_files();
@@ -2488,6 +2506,7 @@ fn test_per_sample_imputation_accuracy() {
 /// For genotyped markers, DR2 should be 1.0 (we know the truth, so estimated=actual).
 /// For imputed markers, Rust DR2 should match Java DR2.
 #[test]
+#[serial]
 fn test_dr2_genotyped_vs_imputed() {
     let source = &get_all_data_sources()[0];
     let files = setup_test_files();
@@ -2691,6 +2710,7 @@ fn test_dr2_genotyped_vs_imputed() {
 /// If interpolation is broken, farther markers should be worse.
 /// Also compares genotyped markers (distance=0) vs imputed.
 #[test]
+#[serial]
 fn test_dosage_by_distance_from_genotyped() {
     let source = &get_all_data_sources()[0];
     let files = setup_test_files();
@@ -2841,6 +2861,7 @@ fn test_dosage_by_distance_from_genotyped() {
 /// Test 3: Compare posterior probabilities (GP) against ground truth.
 /// Instead of comparing Rust GP to Java GP, we check if GP correctly predicts the actual genotype.
 #[test]
+#[serial]
 fn test_posterior_probability_calibration() {
     let source = &get_all_data_sources()[0];
 
@@ -2959,6 +2980,7 @@ fn test_posterior_probability_calibration() {
 /// For genotyped markers, DS should equal GT exactly.
 /// If not, that explains why DR2 is low (estimated != true despite knowing truth).
 #[test]
+#[serial]
 fn test_genotyped_dosage_matches_hard_call() {
     let source = &get_all_data_sources()[0];
     let files = setup_test_files();
@@ -3108,6 +3130,7 @@ fn test_genotyped_dosage_matches_hard_call() {
 /// - Same number of markers and samples
 /// Strict: Zero tolerance for corruption
 #[test]
+#[serial]
 fn test_phasing_sanity_checks() {
     for source in get_all_data_sources() {
         println!("\n{}", "=".repeat(70));
@@ -3201,6 +3224,7 @@ fn test_phasing_sanity_checks() {
 /// Strict: Compare phase switch error rate between Rust and Java
 /// Rust must have switch error rate <= Java (not worse than reference implementation)
 #[test]
+#[serial]
 fn test_phasing_switch_error_rate() {
     for source in get_all_data_sources() {
         println!("\n{}", "=".repeat(70));
@@ -3351,6 +3375,7 @@ fn test_phasing_switch_error_rate() {
 
 /// Verify phasing is deterministic: same seed + input = identical output
 #[test]
+#[serial]
 fn test_phasing_determinism() {
     let source = &get_all_data_sources()[0]; // Use first source
 
@@ -3406,6 +3431,7 @@ fn test_phasing_determinism() {
 /// Test phasing with all-heterozygote sample (hardest case for phasing)
 /// All markers are heterozygous - tests pure LD-based phase inference
 #[test]
+#[serial]
 fn test_phasing_heterozygote_stress() {
     let source = &get_all_data_sources()[0];
 
@@ -3471,6 +3497,7 @@ fn test_phasing_heterozygote_stress() {
 
 /// Test single-sample phasing (relies entirely on population LD from within-sample phasing)
 #[test]
+#[serial]
 fn test_phasing_single_sample() {
     println!("\n{}", "=".repeat(70));
     println!("=== Single Sample Phasing Test ===");
@@ -3551,6 +3578,7 @@ chr1	10000	.	C	A	.	.	.	GT	0/1
 /// Result: Rust gives DS ≈ 0.0001 for all samples at 20066665.
 /// Java Beagle gives DS ≈ 1.0 for Sample 0 (correctly identifies carrier).
 #[test]
+#[serial]
 fn test_perfect_ld_trap_rare_variant() {
     let beagle = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
@@ -3584,6 +3612,7 @@ fn test_perfect_ld_trap_rare_variant() {
 /// Currently: uniform GL still applies 5000:1 match/mismatch penalty.
 /// Expected: uniform GL should contribute ~neutral emission.
 #[test]
+#[serial]
 fn test_gl_confidence_affects_emission() {
     use reagle::io::vcf::VcfReader;
     use reagle::data::marker::MarkerIdx;
@@ -3626,6 +3655,7 @@ fn test_gl_confidence_affects_emission() {
 ///
 /// Max gap should be < 0.1 when imputation is working correctly.
 #[test]
+#[serial]
 fn test_position_20066665_rust_vs_java() {
     let beagle = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
@@ -3693,6 +3723,7 @@ fn test_position_20066665_rust_vs_java() {
 ///
 /// This test passes after the fix in commit b5b4c01.
 #[test]
+#[serial]
 fn test_dr2_zero_variance_genotyped_marker() {
     println!("\n{}", "=".repeat(70));
     println!("=== DR2 for Zero-Variance Genotyped Markers ===");
@@ -3764,6 +3795,7 @@ fn test_dr2_zero_variance_genotyped_marker() {
 /// Impute sparse → compare imputed DS to true GT from full target.
 /// Assert Rust has no more large errors (≥0.9) than Java.
 #[test]
+#[serial]
 fn test_imputation_vs_ground_truth() {
     for source in get_all_data_sources() {
         println!("\n{}", "=".repeat(60));
