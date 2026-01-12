@@ -1163,8 +1163,9 @@ impl PhasingPipeline {
                 let hap1 = HapIdx::new((s * 2) as u32);
                 let hap2 = HapIdx::new((s * 2 + 1) as u32);
 
-                let alleles1: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap1)).collect();
-                let alleles2: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap2)).collect();
+                // Use bulk haplotype access instead of per-marker get()
+                let alleles1 = geno.haplotype(hap1);
+                let alleles2 = geno.haplotype(hap2);
 
                 // Identify missing markers
                 let missing: Vec<usize> = (0..n_markers)
@@ -1205,9 +1206,10 @@ impl PhasingPipeline {
                 let hap1 = HapIdx::new((s * 2) as u32);
                 let hap2 = HapIdx::new((s * 2 + 1) as u32);
 
-                // geno.get() now returns 255 for missing positions
-                let alleles1: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap1)).collect();
-                let alleles2: Vec<u8> = (0..n_markers).map(|m| geno.get(m, hap2)).collect();
+                // Use bulk haplotype access instead of per-marker get()
+                // geno.haplotype() returns 255 for missing positions
+                let alleles1 = geno.haplotype(hap1);
+                let alleles2 = geno.haplotype(hap2);
 
                 // Identify missing markers using the internal missing tracking
                 let missing: Vec<usize> = (0..n_markers)
