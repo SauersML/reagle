@@ -1971,7 +1971,7 @@ impl ImputationPipeline {
 /// # Returns
 /// Flat array of state probabilities: cluster_state_probs[c * n_states + k] = P(state k | cluster c)
 #[cfg(test)]
-fn run_hmm_forward_backward_clusters(
+pub fn run_hmm_forward_backward_clusters(
     cluster_mismatches: &[Vec<f32>],
     cluster_non_missing: &[Vec<f32>],
     p_recomb: &[f32],

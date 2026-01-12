@@ -27,7 +27,7 @@ impl ImpWorkspace {
         Self::new(n_states)
     }
 
-    /// Resize buffers
+    /// Resize buffers (used by test HMM functions)
     #[cfg(test)]
     pub fn resize(&mut self, n_states: usize) {
         self.fwd.resize(n_states, 0.0);

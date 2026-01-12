@@ -3648,7 +3648,7 @@ fn test_single_mismatch_not_catastrophic() {
 
     let mut workspace = ImpWorkspace::with_ref_size(n_states);
 
-    let posteriors = reagle::pipelines::imputation::run_hmm_forward_backward_clusters_counts(
+    let posteriors = reagle::pipelines::imputation::run_hmm_forward_backward_clusters(
         &mismatches,
         &non_missing,
         &p_recomb,
