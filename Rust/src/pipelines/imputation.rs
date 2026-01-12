@@ -2217,14 +2217,40 @@ pub fn run_hmm_forward_backward_to_sparse(
         };
 
         if m == 0 {
+            // First marker: emit * prior, SIMD optimized
             let prior = 1.0 / n_states as f32;
-            let mut sum = 0.0f32;
-            for k in 0..n_states {
-                let mism = mismatches.get(k).copied().unwrap_or(0.0);
-                let n_obs = non_missing.get(k).copied().unwrap_or(0.0);
-                let em = compute_emit(mism, n_obs, log_p_no_err, log_p_err);
+            let n_emit = n_states.min(mismatches.len()).min(non_missing.len());
+            let mism_slice = &mismatches[..n_emit];
+            let nobs_slice = &non_missing[..n_emit];
+
+            let prior_vec = f32x8::splat(prior);
+            let mut sum_vec = f32x8::splat(0.0);
+
+            let mut k = 0;
+            while k + 8 <= n_emit {
+                let emit_arr = [
+                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
+                ];
+                let emit_vec = f32x8::from(emit_arr);
+                let res = emit_vec * prior_vec;
+                let res_arr: [f32; 8] = res.into();
+                fwd[curr_off + k..curr_off + k + 8].copy_from_slice(&res_arr);
+                sum_vec += res;
+                k += 8;
+            }
+
+            let mut sum = sum_vec.reduce_add();
+            for i in k..n_emit {
+                let em = compute_emit(mism_slice[i], nobs_slice[i], log_p_no_err, log_p_err);
                 let val = em * prior;
-                fwd[curr_off + k] = val;
+                fwd[curr_off + i] = val;
                 sum += val;
             }
             last_sum = sum.max(1e-30);
