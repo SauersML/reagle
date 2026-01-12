@@ -304,6 +304,71 @@ impl PhaseStates {
     pub fn n_states(&self) -> usize {
         self.threaded_haps.n_states()
     }
+
+    // ==================== Streaming PBWT Methods ====================
+    // These methods support incremental neighbor collection from streaming PBWT
+
+    /// Reset state for a new streaming pass
+    ///
+    /// Call this before collecting neighbors via add_neighbors_at_marker.
+    pub fn reset_for_streaming(&mut self) {
+        self.clear();
+    }
+
+    /// Add neighbors at a specific marker during streaming PBWT pass
+    ///
+    /// This is the incremental version of build_composite_haps for streaming PBWT.
+    /// Instead of querying a pre-built index, neighbors are provided by the streaming
+    /// wavefront at each sampling point.
+    ///
+    /// # Arguments
+    /// * `sample` - Sample index (used to exclude self-matches)
+    /// * `marker` - Current marker index
+    /// * `neighbors1` - Neighbors found for haplotype 1 (sample * 2)
+    /// * `neighbors2` - Neighbors found for haplotype 2 (sample * 2 + 1)
+    pub fn add_neighbors_at_marker(
+        &mut self,
+        sample: u32,
+        marker: usize,
+        neighbors1: &[u32],
+        neighbors2: &[u32],
+    ) {
+        let marker_i32 = marker as i32;
+
+        // Add neighbors from haplotype 1
+        for &ibs_hap in neighbors1 {
+            if ibs_hap / 2 != sample {
+                self.add_ibs_hap(ibs_hap, marker_i32);
+            }
+        }
+
+        // Add neighbors from haplotype 2
+        for &ibs_hap in neighbors2 {
+            if ibs_hap / 2 != sample {
+                self.add_ibs_hap(ibs_hap, marker_i32);
+            }
+        }
+    }
+
+    /// Finalize streaming collection and return composite haplotypes
+    ///
+    /// Call this after all streaming passes are complete.
+    ///
+    /// # Arguments
+    /// * `sample` - Sample index (for fallback random fill)
+    /// * `n_total_haps` - Total number of haplotypes (for random fill)
+    pub fn finalize_streaming(&mut self, sample: u32, n_total_haps: usize) -> ThreadedHaps {
+        // Fill with random haps if no IBS matches found
+        if self.queue.is_empty() {
+            self.fill_with_random(sample, n_total_haps);
+        }
+
+        // Finalize segments
+        self.finalize();
+
+        // Return owned copy
+        self.threaded_haps.clone()
+    }
 }
 
 #[cfg(test)]
