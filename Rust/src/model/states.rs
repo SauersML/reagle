@@ -164,45 +164,6 @@ impl ThreadedHaps {
         }
     }
 
-    /// Materialize all haplotypes for all markers without mutating cursors.
-    ///
-    /// Returns a Vec<Vec<u32>> where result[m][k] = haplotype for state k at marker m.
-    /// This method takes `&self` (immutable) since it walks the segment linked lists
-    /// from scratch without using the internal cursors.
-    ///
-    /// This is more efficient than cloning ThreadedHaps and calling materialize_at
-    /// repeatedly when you need all markers.
-    pub fn materialize_all(&self) -> Vec<Vec<u32>> {
-        let n_states = self.state_heads.len();
-        let n_markers = self.n_markers;
-
-        // Pre-allocate output
-        let mut result = vec![vec![0u32; n_states]; n_markers];
-
-        // For each state, walk its segment list once
-        for state_idx in 0..n_states {
-            let mut cur = self.state_heads[state_idx] as usize;
-            let mut seg_end = self.segments_end[cur] as usize;
-            let mut hap = self.segments_hap[cur];
-
-            for m in 0..n_markers {
-                // Advance to next segment if needed
-                while m >= seg_end {
-                    let next = self.segments_next[cur];
-                    if next == Self::NIL {
-                        break;
-                    }
-                    cur = next as usize;
-                    seg_end = self.segments_end[cur] as usize;
-                    hap = self.segments_hap[cur];
-                }
-                result[m][state_idx] = hap;
-            }
-        }
-
-        result
-    }
-
     /// Fill an allele array directly from segment data without intermediate allocation.
     ///
     /// This is more efficient than `materialize_all()` followed by allele lookup
@@ -331,16 +292,6 @@ impl MosaicCursor {
         self.cursor_indices[state] = cur as u32;
         self.active_haps[state] = th.segments_hap[cur];
         self.next_switch[state] = th.segments_end[cur] as usize;
-    }
-
-    /// Reset cursor to beginning (for backward pass or new iteration)
-    pub fn reset(&mut self, th: &ThreadedHaps) {
-        for state in 0..self.active_haps.len() {
-            let head = th.state_heads[state] as usize;
-            self.cursor_indices[state] = head as u32;
-            self.active_haps[state] = th.segments_hap[head];
-            self.next_switch[state] = th.segments_end[head] as usize;
-        }
     }
 
     /// Phase A with history: Advance to marker, recording state switches.
