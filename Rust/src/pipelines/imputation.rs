@@ -2215,7 +2215,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     fwd_buffer: &mut Vec<f32>,
     bwd_buffer: &mut Vec<f32>,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
-    // use wide::f32x8;
+    use wide::f32x8;
 
     let n_clusters = cluster_total_conf.len();
     if n_clusters == 0 {
@@ -2223,7 +2223,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     }
 
     // Checkpoint interval for memory efficiency
-    const CHECKPOINT_INTERVAL: usize = 10000;
+    const CHECKPOINT_INTERVAL: usize = 64;
     let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
 
     let p_err = base_err_rate.clamp(1e-8, 0.5);
@@ -2240,7 +2240,17 @@ pub fn run_hmm_forward_backward_to_sparse(
     err_ratio_pow[0] = 1.0;
     for i in 1..MAX_TABLE_SIZE {
         pow_no_err[i] = pow_no_err[i - 1] * p_no_err;
+        pow_no_err[i] = pow_no_err[i - 1] * p_no_err;
         err_ratio_pow[i] = err_ratio_pow[i - 1] * err_ratio;
+    }
+    
+    // Precompute missing ref correction: (1.0 / P(NoErr))^k
+    // This is used when a reference marker is missing, effectively undoing the base emission
+    let missing_ref_base = 1.0 / p_no_err;
+    let mut missing_ref_pow = [0.0f32; MAX_TABLE_SIZE];
+    missing_ref_pow[0] = 1.0;
+    for i in 1..MAX_TABLE_SIZE {
+        missing_ref_pow[i] = missing_ref_pow[i-1] * missing_ref_base;
     }
 
     // Allocate checkpoint storage + working buffers
@@ -2272,20 +2282,20 @@ pub fn run_hmm_forward_backward_to_sparse(
             (prev_base, curr_base)
         };
 
+        // Calculate base emission for this cluster
+        let total_conf = cluster_total_conf[m];
+        let base_emit = if total_conf < MAX_TABLE_SIZE as f32 && (total_conf - total_conf.round()).abs() < 0.01 {
+            pow_no_err[total_conf as usize]
+        } else {
+            (total_conf * log_p_no_err).exp()
+        };
+
         // Initialize transition values
         if m == 0 {
             // First step: uniform prior (implicit transition from start)
             // But we must apply Emission(0).
             // Emission(0) = BaseEmit * Penaltys.
             // BaseEmit = P(NoErr)^TotalConf
-            let total_conf = cluster_total_conf[m];
-            
-            // Calculate Base Emission
-            let base_emit = if total_conf < MAX_TABLE_SIZE as f32 && (total_conf - total_conf.round()).abs() < 0.01 {
-                pow_no_err[total_conf as usize]
-            } else {
-                (total_conf * log_p_no_err).exp()
-            };
             
             // Distribute Base Uniformly
             let val = base_emit / n_states as f32;
@@ -2293,18 +2303,9 @@ pub fn run_hmm_forward_backward_to_sparse(
         } else {
             // Standard transition: emit * (scale * prev + shift)
             // We apply (scale * prev + shift) first using SIMD
-            // Transition + Base Emission
-            // Calculate base emission for this cluster
-            let total_conf = cluster_total_conf[m];
-            let base_emit = if total_conf < MAX_TABLE_SIZE as f32 && (total_conf - total_conf.round()).abs() < 0.01 {
-                pow_no_err[total_conf as usize]
-            } else {
-                (total_conf * log_p_no_err).exp()
-            };
-
+            
             let (lower, upper) = fwd.split_at_mut(prev_base);
             // lower: [0..prev_base], upper: [prev_base..]
-            // curr_base is inside lower. prev_base is start of upper.
             
             let (curr_slice, prev_slice) = if m % 2 == 0 {
                 // curr at curr_base (in lower), prev at prev_base (in upper)
@@ -2314,8 +2315,32 @@ pub fn run_hmm_forward_backward_to_sparse(
                 (&mut upper[..n_states], &lower[curr_base..curr_base+n_states])
             };
 
-            for (p, c) in prev_slice.iter().zip(curr_slice.iter_mut()) {
-                *c = base_emit * (scale * p + shift);
+            // Vectorized Transition
+            let shift_vec = f32x8::splat(shift);
+            let scale_vec = f32x8::splat(scale);
+            let emit_vec = f32x8::splat(base_emit);
+            
+            let mut k = 0;
+            while k + 8 <= n_states {
+                // Safe slice conversion to arrayRef for f32x8
+                let prev_chunk_arr: &[f32; 8] = prev_slice[k..k+8].try_into().unwrap();
+                let prev_vec = f32x8::from(*prev_chunk_arr);
+                
+                // (prev * scale + shift) * emit
+                // mul_add(a, b, c) -> a * b + c
+                let trans = prev_vec.mul_add(scale_vec, shift_vec);
+                let res = trans * emit_vec;
+                
+                let res_arr: [f32; 8] = res.into();
+                curr_slice[k..k+8].copy_from_slice(&res_arr);
+                
+                k += 8;
+            }
+            
+            // Scalar Tail
+            for i in k..n_states {
+                let p = prev_slice[i];
+                curr_slice[i] = base_emit * (scale * p + shift);
             }
         }
         
@@ -2336,35 +2361,44 @@ pub fn run_hmm_forward_backward_to_sparse(
                 } else {
                     (val * (log_p_err - log_p_no_err)).exp()
                 };
-                curr_slice[col] *= penalty;
+                let trans_prob = curr_slice[col] / base_emit;
+                curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
             }
         }
 
         // Apply Sparse Missing Ref Penalties: * (1/P(NoErr))^Count
-        // Correction: We assumed base_emit includes P(NoErr)^Total.
-        // If ref is missing, effective n_obs is Total-Missing.
-        // Currently we have P(NoErr)^Total. We need P(NoErr)^(Total-Missing).
-        // So we multiply by P(NoErr)^(-Missing) = 1 / P(NoErr)^Missing.
         let start_missing = missing_ref_row_offsets[m];
         let end_missing = missing_ref_row_offsets[m+1];
         for i in start_missing..end_missing {
             let col = missing_ref_cols[i] as usize;
             let val = missing_ref_vals[i];
             if col < n_states {
+                // Use precomputed table for missing ref
                 let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
-                    1.0 / pow_no_err[val as usize]
+                     missing_ref_pow[val as usize]
                 } else {
                     (-val * log_p_no_err).exp()
                 };
-                curr_slice[col] *= correction;
+                let trans_prob = curr_slice[col] / base_emit;
+                curr_slice[col] = (curr_slice[col] * correction).max(trans_prob * 1e-20);
             }
         }
 
-        // Sum and Checkpoint
+        // Sum and Checkpoint (Vectorized)
         let mut new_sum = 0.0f32;
-        for &x in &curr_slice[..n_states] {
+        let mut k = 0;
+        let mut sum_vec = f32x8::splat(0.0);
+        while k + 8 <= n_states {
+             let chunk_arr: &[f32; 8] = curr_slice[k..k+8].try_into().unwrap();
+             let chunk = f32x8::from(*chunk_arr);
+             sum_vec += chunk;
+             k += 8;
+        }
+        new_sum += sum_vec.reduce_add();
+        for &x in &curr_slice[k..n_states] {
             new_sum += x;
         }
+
         fwd_sums[m] = new_sum;
         last_sum = new_sum;
 
@@ -2422,8 +2456,18 @@ pub fn run_hmm_forward_backward_to_sparse(
                 (total_conf * log_p_no_err).exp()
             };
 
-            // Apply base emission to bwd
-            for x in bwd.iter_mut() {
+            // Apply base emission to bwd (Vectorized)
+            let mut k = 0;
+            let base_emit_vec = f32x8::splat(base_emit);
+            while k + 8 <= n_states {
+                let initial_chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
+                let initial_chunk = f32x8::from(*initial_chunk_arr);
+                let res = initial_chunk * base_emit_vec;
+                let res_arr: [f32; 8] = res.into();
+                bwd[k..k+8].copy_from_slice(&res_arr);
+                k += 8;
+            }
+            for x in bwd[k..].iter_mut() {
                 *x *= base_emit;
             }
 
@@ -2434,43 +2478,64 @@ pub fn run_hmm_forward_backward_to_sparse(
                 let col = mismatch_cols[i] as usize;
                 let val = mismatch_vals[i];
                 if col < n_states {
-                     let penalty = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
-                        err_ratio_pow[val as usize]
-                    } else {
-                        (val * (log_p_err - log_p_no_err)).exp()
-                    };
-                    bwd[col] *= penalty;
-                }
+                let penalty = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                    err_ratio_pow[val as usize]
+                } else {
+                    (val * (log_p_err - log_p_no_err)).exp()
+                };
+                let trans_prob = bwd[col] / base_emit;
+                bwd[col] = (bwd[col] * penalty).max(trans_prob * 1e-20);
             }
+        }
 
-            // Apply Sparse Missing Ref to bwd
-            let mis_ref_start = missing_ref_row_offsets[m+1];
-            let mis_ref_end = missing_ref_row_offsets[m+2];
-            for i in mis_ref_start..mis_ref_end {
-                let col = missing_ref_cols[i] as usize;
-                let val = missing_ref_vals[i];
-                if col < n_states {
-                     let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
-                        1.0 / pow_no_err[val as usize]
-                    } else {
-                        (-val * log_p_no_err).exp()
-                    };
-                    bwd[col] *= correction;
-                }
+        // Apply Sparse Missing Ref to bwd
+        let mis_ref_start = missing_ref_row_offsets[m+1];
+        let mis_ref_end = missing_ref_row_offsets[m+2];
+        for i in mis_ref_start..mis_ref_end {
+            let col = missing_ref_cols[i] as usize;
+            let val = missing_ref_vals[i];
+            if col < n_states {
+                let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                     missing_ref_pow[val as usize]
+                } else {
+                    (-val * log_p_no_err).exp()
+                };
+                let trans_prob = bwd[col] / base_emit;
+                bwd[col] = (bwd[col] * correction).max(trans_prob * 1e-20);
             }
+        }
 
             let mut emitted_sum = 0.0f32;
-            for &x in bwd.iter() {
+            let mut sum_vec = f32x8::splat(0.0);
+            k = 0;
+            while k + 8 <= n_states {
+                let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
+                let chunk = f32x8::from(*chunk_arr);
+                sum_vec += chunk;
+                k += 8;
+            }
+            emitted_sum += sum_vec.reduce_add();
+            for &x in bwd[k..].iter() {
                 emitted_sum += x;
             }
 
             if emitted_sum > 0.0 {
                 let scale_v = (1.0 - p_rec) / emitted_sum;
                 // Transition logic: NewBwd[i] = Scale * Bwd[i] + Shift
-                // Note: Emitted Bwd[i] is effectively P(obs|next) * Beta(next)
-                // We just computed that in-place in bwd.
-                // Now apply transition backward.
-                for x in bwd.iter_mut() {
+                let scale_vec = f32x8::splat(scale_v);
+                let shift_vec = f32x8::splat(shift);
+                
+                k = 0;
+                while k + 8 <= n_states {
+                     let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
+                     let chunk = f32x8::from(*chunk_arr);
+                     // chunk * scale + shift
+                     let res = chunk.mul_add(scale_vec, shift_vec);
+                     let res_arr: [f32; 8] = res.into();
+                     bwd[k..k+8].copy_from_slice(&res_arr);
+                     k += 8;
+                }
+                for x in bwd[k..].iter_mut() {
                     *x = scale_v * *x + shift;
                 }
             } else {
@@ -2507,8 +2572,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             
             let val = base_emit / n_states as f32;
             curr_slice.fill(val);
-            
-            // Apply CSR Mismatch m=0
+                        // Apply CSR Mismatch m=0
              let mism_start = mismatch_row_offsets[0];
             let mism_end = mismatch_row_offsets[1];
             for i in mism_start..mism_end {
@@ -2520,7 +2584,8 @@ pub fn run_hmm_forward_backward_to_sparse(
                     } else {
                         (val * (log_p_err - log_p_no_err)).exp()
                     };
-                    curr_slice[col] *= penalty;
+                    let trans_prob = curr_slice[col] / base_emit;
+                    curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
                 }
             }
              // Apply CSR Missing Ref m=0
@@ -2535,7 +2600,8 @@ pub fn run_hmm_forward_backward_to_sparse(
                     } else {
                         (-val * log_p_no_err).exp()
                     };
-                    curr_slice[col] *= correction;
+                    let trans_prob = curr_slice[col] / base_emit;
+                    curr_slice[col] = (curr_slice[col] * correction).max(trans_prob * 1e-20);
                 }
             }
             
@@ -2549,14 +2615,20 @@ pub fn run_hmm_forward_backward_to_sparse(
             loop_start_m = 1;
         } else {
              // Load checkpoint
-            let checkpoint_off = checkpoint_idx * n_states;
+             // Critical Fix: Load PREVIOUS checkpoint (m=checksum_start-1)
+             // Checkpoint idx references the interval we are in.
+             // If m is in interval 1 (e.g. 64-127), idx=1.
+             // We want state at 63, which is checkpoint 0.
+             let load_idx = checkpoint_idx - 1;
+            let checkpoint_off = load_idx * n_states;
             {
                 let (checkpoint_region, working_region) = fwd.split_at_mut(curr_base);
                 let dst_off = prev_base - curr_base;
                 working_region[dst_off..dst_off + n_states]
                     .copy_from_slice(&checkpoint_region[checkpoint_off..checkpoint_off + n_states]);
             }
-            recomp_sum = fwd_sums[checkpoint_start];
+            // Checkpoints are normalized. Recomputing from them acts as if previous sum was 1.0.
+            recomp_sum = 1.0; 
             loop_start_m = checkpoint_start;
         }
 
@@ -2565,13 +2637,8 @@ pub fn run_hmm_forward_backward_to_sparse(
             let p_rec = p_recomb.get(recomp_m).copied().unwrap_or(0.0);
             let shift = p_rec / n_states as f32;
             
-            // Adjust scale: if loading from normalized checkpoint, do NOT divide by sum
-            let adjust_scale = if recomp_m == checkpoint_start && checkpoint_idx > 0 {
-                1.0
-            } else {
-                1.0 / recomp_sum.max(1e-30)
-            };
-            let scale = (1.0 - p_rec) * adjust_scale;
+            // Recompute sum is correctly initialized to 1.0 (if checkpoint) or actual sum (if m=0)
+            let scale = (1.0 - p_rec) / recomp_sum.max(1e-30);
 
             let mism_start = mismatch_row_offsets[recomp_m];
             let mism_end = mismatch_row_offsets[recomp_m + 1];
@@ -2593,9 +2660,31 @@ pub fn run_hmm_forward_backward_to_sparse(
                  (&mut upper[..n_states], &lower[curr_base..curr_base+n_states])
             };
 
-            // Transition + Base Emission
-            for (p, c) in prev_slice.iter().zip(curr_slice.iter_mut()) {
-                *c = base_emit * (scale * p + shift);
+            // Vectorized Transition
+            let shift_vec = f32x8::splat(shift);
+            let scale_vec = f32x8::splat(scale);
+            let emit_vec = f32x8::splat(base_emit);
+            
+            let mut k = 0;
+            while k + 8 <= n_states {
+                // Safe slice conversion to arrayRef for f32x8
+                let prev_chunk_arr: &[f32; 8] = prev_slice[k..k+8].try_into().unwrap();
+                let prev_vec = f32x8::from(*prev_chunk_arr);
+                
+                // (prev * scale + shift) * emit
+                let trans = prev_vec.mul_add(scale_vec, shift_vec);
+                let res = trans * emit_vec;
+                
+                let res_arr: [f32; 8] = res.into();
+                curr_slice[k..k+8].copy_from_slice(&res_arr);
+                
+                k += 8;
+            }
+            
+            // Scalar Tail
+            for i in k..n_states {
+                let p = prev_slice[i];
+                curr_slice[i] = base_emit * (scale * p + shift);
             }
 
             // Apply Sparse Mismatch Penalties
@@ -2603,27 +2692,29 @@ pub fn run_hmm_forward_backward_to_sparse(
                 let col = mismatch_cols[i] as usize;
                 let val = mismatch_vals[i];
                 if col < n_states {
-                     let penalty = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
-                        err_ratio_pow[val as usize]
-                    } else {
-                        (val * (log_p_err - log_p_no_err)).exp()
-                    };
-                    curr_slice[col] *= penalty;
-                }
+                let penalty = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                    err_ratio_pow[val as usize]
+                } else {
+                    (val * (log_p_err - log_p_no_err)).exp()
+                };
+                let trans_prob = curr_slice[col] / base_emit;
+                curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
             }
-             // Apply Sparse Missing Ref Penalties
-            for i in mis_ref_start..mis_ref_end {
-                let col = missing_ref_cols[i] as usize;
-                let val = missing_ref_vals[i];
-                if col < n_states {
-                     let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
-                        1.0 / pow_no_err[val as usize]
-                    } else {
-                        (-val * log_p_no_err).exp()
-                    };
-                    curr_slice[col] *= correction;
-                }
+        }
+         // Apply Sparse Missing Ref Penalties
+        for i in mis_ref_start..mis_ref_end {
+            let col = missing_ref_cols[i] as usize;
+            let val = missing_ref_vals[i];
+            if col < n_states {
+                 let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                    1.0 / pow_no_err[val as usize]
+                } else {
+                    (-val * log_p_no_err).exp()
+                };
+                let trans_prob = curr_slice[col] / base_emit;
+                curr_slice[col] = (curr_slice[col] * correction).max(trans_prob * 1e-20);
             }
+        }
 
              let mut new_sum = 0.0f32;
             for &x in &curr_slice[..n_states] {
