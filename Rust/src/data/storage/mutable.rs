@@ -11,16 +11,23 @@ use crate::data::HapIdx;
 
 /// Mutable genotype storage for phasing
 ///
-/// Uses byte storage (1 byte per allele) to support multiallelic markers.
-/// Outer vector is indexed by marker, inner vector by haplotype.
+/// Uses a flat byte array (1 byte per allele) for maximum memory efficiency
+/// and cache locality. Layout is marker-major: data[marker * n_haps + hap].
 ///
 /// Allele values: 0 = REF, 1+ = ALT alleles, 255 = missing
+///
+/// Memory efficiency vs Vec<Vec<u8>>:
+/// - Single allocation instead of n_markers allocations
+/// - No per-marker Vec overhead (24 bytes each)
+/// - Contiguous memory for better cache performance
 #[derive(Clone, Debug)]
 pub struct MutableGenotypes {
-    /// Alleles indexed by [marker][haplotype]
+    /// Alleles in flat layout: data[marker * n_haps + hap]
     /// Values: 0 = REF, 1-254 = ALT alleles, 255 = missing
-    alleles: Vec<Vec<u8>>,
-    /// Number of haplotypes
+    data: Vec<u8>,
+    /// Number of markers
+    n_markers: usize,
+    /// Number of haplotypes (stride for marker indexing)
     n_haps: usize,
 }
 
@@ -32,17 +39,29 @@ impl MutableGenotypes {
     where
         F: FnMut(usize, usize) -> u8,
     {
-        let alleles: Vec<Vec<u8>> = (0..n_markers)
-            .map(|m| (0..n_haps).map(|h| f(m, h)).collect())
-            .collect();
+        let total_size = n_markers * n_haps;
+        let mut data = vec![0u8; total_size];
 
-        Self { alleles, n_haps }
+        for m in 0..n_markers {
+            let base = m * n_haps;
+            for h in 0..n_haps {
+                data[base + h] = f(m, h);
+            }
+        }
+
+        Self { data, n_markers, n_haps }
+    }
+
+    /// Compute the flat index for (marker, hap)
+    #[inline(always)]
+    fn index(&self, marker: usize, hap: usize) -> usize {
+        marker * self.n_haps + hap
     }
 
     /// Number of markers
     #[inline]
     pub fn n_markers(&self) -> usize {
-        self.alleles.len()
+        self.n_markers
     }
 
     /// Number of haplotypes
@@ -56,13 +75,15 @@ impl MutableGenotypes {
     /// Returns 0 (REF), 1-254 (ALT alleles), or 255 (missing)
     #[inline]
     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
-        self.alleles[marker][hap.as_usize()]
+        let idx = self.index(marker, hap.as_usize());
+        // Safety: bounds are checked by caller or assumed correct
+        unsafe { *self.data.get_unchecked(idx) }
     }
 
     /// Check if position is missing
     #[inline]
     pub fn is_missing(&self, marker: usize, hap: HapIdx) -> bool {
-        self.alleles[marker][hap.as_usize()] == 255
+        self.get(marker, hap) == 255
     }
 
     /// Set allele at (marker, haplotype)
@@ -70,13 +91,16 @@ impl MutableGenotypes {
     /// Allele values: 0 = REF, 1-254 = ALT alleles, 255 = missing
     #[inline]
     pub fn set(&mut self, marker: usize, hap: HapIdx, allele: u8) {
-        self.alleles[marker][hap.as_usize()] = allele;
+        let idx = self.index(marker, hap.as_usize());
+        // Safety: bounds are checked by caller or assumed correct
+        unsafe { *self.data.get_unchecked_mut(idx) = allele; }
     }
 
     /// Get all alleles at a marker as a slice
     #[inline]
     pub fn marker_alleles(&self, marker: usize) -> &[u8] {
-        &self.alleles[marker]
+        let start = marker * self.n_haps;
+        &self.data[start..start + self.n_haps]
     }
 
     /// Get all alleles for a haplotype
@@ -84,7 +108,11 @@ impl MutableGenotypes {
     /// Returns a vector with values: 0 (REF), 1-254 (ALT), or 255 (missing)
     pub fn haplotype(&self, hap: HapIdx) -> Vec<u8> {
         let h = hap.as_usize();
-        self.alleles.iter().map(|row| row[h]).collect()
+        let mut result = Vec::with_capacity(self.n_markers);
+        for m in 0..self.n_markers {
+            result.push(self.data[m * self.n_haps + h]);
+        }
+        result
     }
 
     /// Swap alleles between two haplotypes at a marker
@@ -92,7 +120,8 @@ impl MutableGenotypes {
     pub fn swap(&mut self, marker: usize, hap1: HapIdx, hap2: HapIdx) {
         let h1 = hap1.as_usize();
         let h2 = hap2.as_usize();
-        self.alleles[marker].swap(h1, h2);
+        let base = marker * self.n_haps;
+        self.data.swap(base + h1, base + h2);
     }
 }
 
@@ -261,5 +290,30 @@ mod tests {
 
         let hap1 = geno.haplotype(HapIdx::new(1));
         assert_eq!(hap1, vec![1, 3, 2, 3]);
+    }
+
+    #[test]
+    fn test_marker_alleles() {
+        let geno = MutableGenotypes::from_fn(3, 4, |m, h| (m * 4 + h) as u8);
+
+        assert_eq!(geno.marker_alleles(0), &[0, 1, 2, 3]);
+        assert_eq!(geno.marker_alleles(1), &[4, 5, 6, 7]);
+        assert_eq!(geno.marker_alleles(2), &[8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn test_memory_layout() {
+        // Verify that the flat layout is correct: data[marker * n_haps + hap]
+        let geno = MutableGenotypes::from_fn(3, 2, |m, h| (m * 10 + h) as u8);
+
+        // Marker 0: [0, 1]
+        // Marker 1: [10, 11]
+        // Marker 2: [20, 21]
+        assert_eq!(geno.get(0, HapIdx::new(0)), 0);
+        assert_eq!(geno.get(0, HapIdx::new(1)), 1);
+        assert_eq!(geno.get(1, HapIdx::new(0)), 10);
+        assert_eq!(geno.get(1, HapIdx::new(1)), 11);
+        assert_eq!(geno.get(2, HapIdx::new(0)), 20);
+        assert_eq!(geno.get(2, HapIdx::new(1)), 21);
     }
 }
