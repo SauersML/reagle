@@ -1042,6 +1042,28 @@ impl ClusterStateProbs {
         }
     }
 
+    /// Create from pre-computed sparse CSR data (from run_hmm_forward_backward_to_sparse).
+    /// This avoids the O(n_clusters × n_states) dense intermediate allocation.
+    pub fn from_sparse(
+        marker_cluster: std::sync::Arc<Vec<usize>>,
+        ref_cluster_end: std::sync::Arc<Vec<usize>>,
+        weight: std::sync::Arc<Vec<f32>>,
+        offsets: Vec<usize>,
+        hap_indices: Vec<u32>,
+        probs: Vec<f32>,
+        probs_p1: Vec<f32>,
+    ) -> Self {
+        Self {
+            marker_cluster,
+            ref_cluster_end,
+            weight,
+            offsets,
+            hap_indices,
+            probs,
+            probs_p1,
+        }
+    }
+
     #[inline]
     fn allele_posteriors<F>(
         &self,
@@ -1504,22 +1526,33 @@ impl ImputationPipeline {
                                     global_h.as_usize(),
                                     actual_n_states,
                                 );
-                                let cluster_state_probs = run_hmm_forward_backward_clusters_counts(
-                                    &cluster_mismatches,
-                                    &cluster_non_missing,
-                                    &cluster_p_recomb,
-                                    base_err_rate,
-                                    actual_n_states,
-                                    &mut workspace,
-                                );
 
-                                out.push(Arc::new(ClusterStateProbs::new(
+                                // Use memory-efficient checkpointed HMM that outputs sparse directly
+                                let threshold = if n_clusters <= 1000 {
+                                    0.0
+                                } else {
+                                    (0.9999f32 / actual_n_states as f32).min(0.005f32)
+                                };
+                                let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) =
+                                    run_hmm_forward_backward_to_sparse(
+                                        &cluster_mismatches,
+                                        &cluster_non_missing,
+                                        &cluster_p_recomb,
+                                        base_err_rate,
+                                        actual_n_states,
+                                        &hap_indices,
+                                        threshold,
+                                        &mut workspace,
+                                    );
+
+                                out.push(Arc::new(ClusterStateProbs::from_sparse(
                                     std::sync::Arc::clone(&marker_cluster),
                                     std::sync::Arc::clone(&ref_cluster_end),
                                     std::sync::Arc::clone(&cluster_weights),
-                                    actual_n_states,
-                                    hap_indices,
-                                    cluster_state_probs,
+                                    offsets,
+                                    sparse_haps,
+                                    sparse_probs,
+                                    sparse_probs_p1,
                                 )));
                             }
                             (out[0].clone(), out[1].clone())
