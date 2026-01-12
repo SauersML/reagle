@@ -228,7 +228,11 @@ fn build_marker_cluster_index(
     marker_cluster
 }
 
-fn compute_cluster_mismatches(
+/// Compute cluster mismatches into pre-allocated workspace buffers.
+///
+/// This avoids allocation by reusing buffers from the workspace.
+/// The workspace buffers must be pre-sized with `workspace.ensure_cluster_buffers()`.
+fn compute_cluster_mismatches_into_workspace(
     hap_indices: &[Vec<u32>],
     cluster_bounds: &[(usize, usize)],
     genotyped_markers: &[usize],
@@ -237,10 +241,9 @@ fn compute_cluster_mismatches(
     alignment: &MarkerAlignment,
     targ_hap: usize,
     n_states: usize,
-) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    workspace: &mut ImpWorkspace,
+) {
     let n_clusters = hap_indices.len();
-    let mut mismatches = vec![vec![0.0f32; n_states]; n_clusters];
-    let mut non_missing = vec![vec![0.0f32; n_states]; n_clusters];
     let targ_hap_idx = HapIdx::new(targ_hap as u32);
     let sample_idx = targ_hap_idx.sample().as_usize();
 
@@ -268,15 +271,13 @@ fn compute_cluster_mismatches(
                 if mapped == 255 {
                     continue;
                 }
-                non_missing[c][j] += confidence;
+                workspace.cluster_non_missing[c][j] += confidence;
                 if mapped != targ_allele {
-                    mismatches[c][j] += confidence;
+                    workspace.cluster_mismatches[c][j] += confidence;
                 }
             }
         }
     }
-
-    (mismatches, non_missing)
 }
 
 fn compute_targ_block_end<S: crate::data::storage::phase_state::PhaseState>(
@@ -1539,7 +1540,9 @@ impl ImputationPipeline {
                                 let mut hap_indices: Vec<Vec<u32>> = Vec::new();
                                 let actual_n_states = imp_states.ibs_states_cluster(local_h, &mut hap_indices);
 
-                                let (cluster_mismatches, cluster_non_missing) = compute_cluster_mismatches(
+                                // Reuse workspace buffers for cluster mismatches (avoids allocation)
+                                workspace.ensure_cluster_buffers(n_clusters, actual_n_states);
+                                compute_cluster_mismatches_into_workspace(
                                     &hap_indices,
                                     &cluster_bounds,
                                     &sample_genotyped,
@@ -1548,6 +1551,7 @@ impl ImputationPipeline {
                                     &alignment,
                                     global_h.as_usize(),
                                     actual_n_states,
+                                    &mut workspace,
                                 );
 
                                 // Use memory-efficient checkpointed HMM that outputs sparse directly
@@ -1558,14 +1562,15 @@ impl ImputationPipeline {
                                 };
                                 let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) =
                                     run_hmm_forward_backward_to_sparse(
-                                        &cluster_mismatches,
-                                        &cluster_non_missing,
+                                        &workspace.cluster_mismatches[..n_clusters],
+                                        &workspace.cluster_non_missing[..n_clusters],
                                         &cluster_p_recomb,
                                         base_err_rate,
                                         actual_n_states,
                                         &hap_indices,
                                         threshold,
-                                        &mut workspace,
+                                        &mut workspace.fwd,
+                                        &mut workspace.bwd,
                                     );
 
                                 out.push(Arc::new(ClusterStateProbs::from_sparse(
@@ -2111,6 +2116,10 @@ pub fn run_hmm_forward_backward_clusters(
 /// then recomputes from checkpoints during backward pass.
 ///
 /// Memory: O(n_clusters/64 × n_states + n_clusters + n_states) instead of O(n_clusters × n_states)
+///
+/// # Arguments
+/// * `fwd_buffer` - Pre-allocated forward probabilities buffer (will be resized)
+/// * `bwd_buffer` - Pre-allocated backward probabilities buffer (will be resized)
 pub fn run_hmm_forward_backward_to_sparse(
     cluster_mismatches: &[Vec<f32>],
     cluster_non_missing: &[Vec<f32>],
@@ -2119,7 +2128,8 @@ pub fn run_hmm_forward_backward_to_sparse(
     n_states: usize,
     hap_indices_input: &[Vec<u32>],
     threshold: f32,
-    workspace: &mut ImpWorkspace,
+    fwd_buffer: &mut Vec<f32>,
+    bwd_buffer: &mut Vec<f32>,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
     use wide::f32x8;
 
@@ -2147,7 +2157,7 @@ pub fn run_hmm_forward_backward_to_sparse(
 
     // Allocate checkpoint storage + working buffers
     // Layout: [checkpoints...][curr_row][prev_row]
-    let fwd = &mut workspace.fwd;
+    let fwd = fwd_buffer;
     fwd.resize(n_checkpoints * n_states + 2 * n_states, 0.0);
     let curr_base = n_checkpoints * n_states;
     let prev_base = curr_base + n_states;
@@ -2242,7 +2252,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     }
 
     // ========== BACKWARD PASS: recompute forward and build sparse output ==========
-    let bwd = &mut workspace.bwd;
+    let bwd = bwd_buffer;
     bwd.resize(n_states, 0.0);
     bwd.fill(1.0 / n_states as f32);
 
