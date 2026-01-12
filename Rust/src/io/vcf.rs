@@ -101,6 +101,44 @@ impl MarkerImputationStats {
         }
     }
 
+    /// Add a biallelic sample's data with compact representation (no heap allocation).
+    /// p1 = P(ALT) for haplotype 1, p2 = P(ALT) for haplotype 2.
+    #[inline]
+    pub fn add_sample_biallelic(&mut self, p1: f32, p2: f32, true_gt: Option<(u8, u8)>) {
+        assert!(self.sum_d.len() == 2, "add_sample_biallelic requires biallelic marker");
+        self.n_samples += 1;
+
+        // Dosage for ALT allele (index 1)
+        let d_alt = p1 + p2;
+        self.sum_d[1] += d_alt;
+        self.sum_d_sq[1] += d_alt * d_alt;
+
+        // True allele count
+        let x_alt = if let Some((a1, a2)) = true_gt {
+            // For genotyped markers, use known alleles
+            (a1 == 1) as i32 as f32 + (a2 == 1) as i32 as f32
+        } else {
+            // For imputed markers, hard call: if p > 0.5, call ALT
+            let call1 = if p1 > 0.5 { 1.0 } else { 0.0 };
+            let call2 = if p2 > 0.5 { 1.0 } else { 0.0 };
+            call1 + call2
+        };
+        self.sum_x[1] += x_alt;
+        self.sum_x_sq[1] += x_alt * x_alt;
+    }
+
+    /// Add haploid biallelic sample (compact, no heap allocation).
+    #[inline]
+    pub fn add_haploid_biallelic(&mut self, p_alt: f32) {
+        assert!(self.sum_d.len() == 2, "add_haploid_biallelic requires biallelic marker");
+        self.sum_d[1] += p_alt;
+        self.sum_d_sq[1] += p_alt * p_alt;
+
+        let x_alt = if p_alt > 0.5 { 1.0 } else { 0.0 };
+        self.sum_x[1] += x_alt;
+        self.sum_x_sq[1] += x_alt * x_alt;
+    }
+
     /// Calculate DR2 (dosage R-squared) = Var(d) / Var_expected.
     /// Uses expected variance 2*p*(1-p) from allele frequency, not hard-call variance.
     pub fn dr2(&self, allele: usize) -> f32 {

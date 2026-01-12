@@ -34,6 +34,28 @@ use crate::model::parameters::ModelParams;
 /// Minimum genetic distance between markers (matches Java Beagle)
 const MIN_CM_DIST: f64 = 1e-7;
 
+/// Compact DR2 data entry to avoid heap allocation for biallelic sites.
+/// Biallelic sites (99%+ of markers) use inline f32s instead of Vec<f32>.
+/// This reduces memory from ~80 bytes/marker to ~20 bytes/marker.
+enum CompactDr2Entry {
+    /// Biallelic site: store P(ALT) for each haplotype (no heap allocation)
+    Biallelic {
+        marker: u32,
+        p1: f32,
+        p2: f32,
+        skip: bool,
+        true_gt: Option<(u8, u8)>,
+    },
+    /// Multiallelic site: store full probability vectors (rare)
+    Multiallelic {
+        marker: u32,
+        probs1: Vec<f32>,
+        probs2: Vec<f32>,
+        skip: bool,
+        true_gt: Option<(u8, u8)>,
+    },
+}
+
 /// Imputation pipeline
 pub struct ImputationPipeline {
     config: Config,
@@ -1412,7 +1434,8 @@ impl ImputationPipeline {
 
                 // Parallel HMM computation for this batch
                 // Returns: Vec<(sample_idx, dosages, best_gt, posteriors, dr2_data)>
-                type Dr2Data = Vec<(usize, Vec<f32>, Vec<f32>, bool, Option<(u8, u8)>)>; // (marker, probs1, probs2, skip, true_gt)
+                // CompactDr2Entry avoids heap allocation for biallelic sites (99%+)
+                type Dr2Data = Vec<CompactDr2Entry>;
                 let batch_results: Vec<(usize, Vec<f32>, Vec<(u8, u8)>, Option<Vec<(f32, f32)>>, Dr2Data)> = batch_samples
                     .par_iter()
                     .map(|&s| {
@@ -1682,8 +1705,25 @@ impl ImputationPipeline {
                             } else {
                                 None
                             };
-                            dr2_data.push((m, probs1[..n_alleles].to_vec(), probs2[..n_alleles].to_vec(),
-                                          is_genotyped && skip_sample, true_gt));
+                            // Use compact storage to avoid heap allocation for biallelic sites
+                            let skip = is_genotyped && skip_sample;
+                            if n_alleles == 2 {
+                                dr2_data.push(CompactDr2Entry::Biallelic {
+                                    marker: m as u32,
+                                    p1: probs1[1],
+                                    p2: probs2[1],
+                                    skip,
+                                    true_gt,
+                                });
+                            } else {
+                                dr2_data.push(CompactDr2Entry::Multiallelic {
+                                    marker: m as u32,
+                                    probs1: probs1[..n_alleles].to_vec(),
+                                    probs2: probs2[..n_alleles].to_vec(),
+                                    skip,
+                                    true_gt,
+                                });
+                            }
                         }
 
                         // sp1, sp2 are dropped here when returning
@@ -1716,13 +1756,28 @@ impl ImputationPipeline {
                     }
 
                     // Accumulate DR2 quality stats
-                    for (m, probs1, probs2, skip_sample, true_gt) in dr2_data {
-                        if let Some(stats) = quality.get_mut(m) {
-                            if !skip_sample {
-                                if is_diploid {
-                                    stats.add_sample(&probs1, &probs2, true_gt);
-                                } else {
-                                    stats.add_haploid(&probs1);
+                    for entry in dr2_data {
+                        match entry {
+                            CompactDr2Entry::Biallelic { marker, p1, p2, skip, true_gt } => {
+                                if let Some(stats) = quality.get_mut(marker as usize) {
+                                    if !skip {
+                                        if is_diploid {
+                                            stats.add_sample_biallelic(p1, p2, true_gt);
+                                        } else {
+                                            stats.add_haploid_biallelic(p1);
+                                        }
+                                    }
+                                }
+                            }
+                            CompactDr2Entry::Multiallelic { marker, probs1, probs2, skip, true_gt } => {
+                                if let Some(stats) = quality.get_mut(marker as usize) {
+                                    if !skip {
+                                        if is_diploid {
+                                            stats.add_sample(&probs1, &probs2, true_gt);
+                                        } else {
+                                            stats.add_haploid(&probs1);
+                                        }
+                                    }
                                 }
                             }
                         }
