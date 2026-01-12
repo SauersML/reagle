@@ -20,8 +20,6 @@
 //! The small wavefront state (~240KB for 10k haplotypes) fits entirely in L2 cache,
 //! making neighbor queries extremely fast compared to random access into a large index.
 
-use crate::data::haplotype::SampleIdx;
-use crate::model::ibs2::Ibs2;
 use crate::model::pbwt::PbwtDivUpdater;
 
 /// Streaming PBWT state that maintains only the current marker's arrays.
@@ -312,315 +310,6 @@ impl PbwtWavefront {
         result
     }
 
-    /// Find forward neighbors for a haplotype at the current marker
-    ///
-    /// Returns haplotypes that have matching allele prefixes up to current marker.
-    pub fn find_fwd_neighbors(&mut self, hap_idx: u32, n_candidates: usize) -> Vec<u32> {
-        if (hap_idx as usize) >= self.n_haps {
-            return Vec::new();
-        }
-
-        self.ensure_fwd_inverse();
-
-        let sorted_pos = self.fwd_inverse[hap_idx as usize] as usize;
-        let marker_i32 = (self.fwd_marker - 1) as i32; // Current marker (after advance)
-
-        let mut result = Vec::with_capacity(n_candidates);
-
-        // Dynamic expansion: choose direction with lower divergence (longer match)
-        let mut u = sorted_pos;
-        let mut v = sorted_pos + 1;
-        let mut max_div_up = i32::MIN;
-        let mut max_div_down = i32::MIN;
-
-        while result.len() < n_candidates {
-            let div_up = if u > 0 {
-                self.fwd_div.get(u).copied().unwrap_or(i32::MAX)
-            } else {
-                i32::MAX
-            };
-            let div_down = if v < self.n_haps {
-                self.fwd_div.get(v).copied().unwrap_or(i32::MAX)
-            } else {
-                i32::MAX
-            };
-
-            let up_valid = u > 0 && max_div_up.max(div_up) <= marker_i32;
-            let down_valid = v < self.n_haps && max_div_down.max(div_down) <= marker_i32;
-
-            if !up_valid && !down_valid {
-                break;
-            }
-
-            let go_up = up_valid && (!down_valid || div_up <= div_down);
-
-            if go_up {
-                max_div_up = max_div_up.max(div_up);
-                u -= 1;
-                let h = self.fwd_ppa[u];
-                if h != hap_idx {
-                    result.push(h);
-                }
-            } else {
-                max_div_down = max_div_down.max(div_down);
-                let h = self.fwd_ppa[v];
-                if h != hap_idx {
-                    result.push(h);
-                }
-                v += 1;
-            }
-        }
-
-        // Fallback: expand without divergence constraints
-        while result.len() < n_candidates && u > 0 {
-            u -= 1;
-            let h = self.fwd_ppa[u];
-            if h != hap_idx {
-                result.push(h);
-            }
-        }
-        while result.len() < n_candidates && v < self.n_haps {
-            let h = self.fwd_ppa[v];
-            if h != hap_idx {
-                result.push(h);
-            }
-            v += 1;
-        }
-
-        result
-    }
-
-    /// Find backward neighbors for a haplotype at the current marker
-    ///
-    /// Returns haplotypes that have matching allele suffixes from current marker onward.
-    pub fn find_bwd_neighbors(&mut self, hap_idx: u32, n_candidates: usize) -> Vec<u32> {
-        if (hap_idx as usize) >= self.n_haps {
-            return Vec::new();
-        }
-
-        self.ensure_bwd_inverse();
-
-        let sorted_pos = self.bwd_inverse[hap_idx as usize] as usize;
-        let marker_i32 = self.bwd_marker as i32;
-
-        let mut result = Vec::with_capacity(n_candidates);
-
-        // Dynamic expansion: choose direction with higher divergence (longer match for bwd)
-        let mut u = sorted_pos;
-        let mut v = sorted_pos + 1;
-        let mut min_div_up = i32::MAX;
-        let mut min_div_down = i32::MAX;
-
-        while result.len() < n_candidates {
-            let div_up = if u > 0 {
-                self.bwd_div.get(u).copied().unwrap_or(0)
-            } else {
-                0
-            };
-            let div_down = if v < self.n_haps {
-                self.bwd_div.get(v).copied().unwrap_or(0)
-            } else {
-                0
-            };
-
-            // For backward: valid if divergence >= marker (match extends past current)
-            let up_valid = u > 0 && min_div_up.min(div_up) >= marker_i32;
-            let down_valid = v < self.n_haps && min_div_down.min(div_down) >= marker_i32;
-
-            if !up_valid && !down_valid {
-                break;
-            }
-
-            // For backward: prefer higher divergence (longer match)
-            let go_up = up_valid && (!down_valid || div_up >= div_down);
-
-            if go_up {
-                min_div_up = min_div_up.min(div_up);
-                u -= 1;
-                let h = self.bwd_ppa[u];
-                if h != hap_idx {
-                    result.push(h);
-                }
-            } else {
-                min_div_down = min_div_down.min(div_down);
-                let h = self.bwd_ppa[v];
-                if h != hap_idx {
-                    result.push(h);
-                }
-                v += 1;
-            }
-        }
-
-        // Fallback: expand without divergence constraints
-        while result.len() < n_candidates && u > 0 {
-            u -= 1;
-            let h = self.bwd_ppa[u];
-            if h != hap_idx {
-                result.push(h);
-            }
-        }
-        while result.len() < n_candidates && v < self.n_haps {
-            let h = self.bwd_ppa[v];
-            if h != hap_idx {
-                result.push(h);
-            }
-            v += 1;
-        }
-
-        result
-    }
-
-    /// Find bidirectional neighbors by combining forward and backward results
-    ///
-    /// This combines the neighbor-finding from both PBWT directions,
-    /// plus IBS2 segments if provided.
-    pub fn find_neighbors(
-        &mut self,
-        hap_idx: u32,
-        ibs2: &Ibs2,
-        n_candidates: usize,
-        global_marker: usize,
-    ) -> Vec<u32> {
-        let mut neighbors = Vec::with_capacity(n_candidates * 2 + 10);
-        let sample = SampleIdx::new(hap_idx / 2);
-
-        // Add IBS2 neighbors first (highest priority)
-        for seg in ibs2.segments(sample) {
-            if seg.contains(global_marker) {
-                let other_s = seg.other_sample;
-                if other_s != sample {
-                    neighbors.push(other_s.hap1().0);
-                    neighbors.push(other_s.hap2().0);
-                }
-            }
-        }
-
-        // Add forward PBWT neighbors
-        let fwd_neighbors = self.find_fwd_neighbors(hap_idx, n_candidates);
-        for h in fwd_neighbors {
-            if h != hap_idx && h / 2 != sample.0 {
-                neighbors.push(h);
-            }
-        }
-
-        // Add backward PBWT neighbors
-        let bwd_neighbors = self.find_bwd_neighbors(hap_idx, n_candidates);
-        for h in bwd_neighbors {
-            if h != hap_idx && h / 2 != sample.0 {
-                neighbors.push(h);
-            }
-        }
-
-        neighbors
-    }
-
-    /// Get current forward marker index
-    pub fn fwd_marker(&self) -> usize {
-        self.fwd_marker
-    }
-
-    /// Get current backward marker index
-    pub fn bwd_marker(&self) -> usize {
-        self.bwd_marker
-    }
-
-    /// Get number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        self.n_haps
-    }
-}
-
-/// Builder for streaming PBWT-based neighbor collection.
-///
-/// This implements the two-pass streaming algorithm:
-/// 1. Forward pass: collect forward neighbors at sampling points
-/// 2. Backward pass: collect backward neighbors at sampling points
-/// 3. Finalize: combine neighbors into PhaseStates
-pub struct StreamingNeighborCollector {
-    /// Forward neighbors collected at each sampling point
-    /// fwd_neighbors[sample_idx][sampling_point] = Vec<neighbor_haps>
-    fwd_neighbors: Vec<Vec<Vec<u32>>>,
-    /// Backward neighbors collected at each sampling point
-    bwd_neighbors: Vec<Vec<Vec<u32>>>,
-    /// Sampling point marker indices
-    sampling_points: Vec<usize>,
-    /// Number of samples
-    n_samples: usize,
-    /// Number of candidates per query
-    n_candidates: usize,
-}
-
-impl StreamingNeighborCollector {
-    /// Create a new streaming neighbor collector
-    ///
-    /// # Arguments
-    /// * `n_samples` - Number of target samples
-    /// * `n_markers` - Total number of markers
-    /// * `n_candidates` - Number of candidates to collect at each sampling point
-    pub fn new(n_samples: usize, n_markers: usize, n_candidates: usize) -> Self {
-        // Sampling at sparse points (every 64 markers, matching PhaseStates behavior)
-        const MAX_SAMPLE_POINTS: usize = 64;
-        let step = (n_markers / MAX_SAMPLE_POINTS).max(1);
-        let sampling_points: Vec<usize> = (0..n_markers).step_by(step).collect();
-        let n_points = sampling_points.len();
-
-        Self {
-            fwd_neighbors: vec![vec![Vec::new(); n_points]; n_samples],
-            bwd_neighbors: vec![vec![Vec::new(); n_points]; n_samples],
-            sampling_points,
-            n_samples,
-            n_candidates,
-        }
-    }
-
-    /// Get sampling points
-    pub fn sampling_points(&self) -> &[usize] {
-        &self.sampling_points
-    }
-
-    /// Record forward neighbors for a sample at a sampling point index
-    pub fn add_fwd_neighbors(&mut self, sample: usize, point_idx: usize, neighbors: Vec<u32>) {
-        if sample < self.n_samples && point_idx < self.sampling_points.len() {
-            self.fwd_neighbors[sample][point_idx] = neighbors;
-        }
-    }
-
-    /// Record backward neighbors for a sample at a sampling point index
-    pub fn add_bwd_neighbors(&mut self, sample: usize, point_idx: usize, neighbors: Vec<u32>) {
-        if sample < self.n_samples && point_idx < self.sampling_points.len() {
-            self.bwd_neighbors[sample][point_idx] = neighbors;
-        }
-    }
-
-    /// Get all collected neighbors for a sample (combines forward and backward)
-    ///
-    /// Returns (marker_indices, neighbors_per_marker)
-    pub fn get_all_neighbors(&self, sample: usize) -> Vec<(usize, Vec<u32>)> {
-        let mut result = Vec::with_capacity(self.sampling_points.len());
-
-        for (point_idx, &marker) in self.sampling_points.iter().enumerate() {
-            let mut combined = Vec::new();
-
-            // Add forward neighbors
-            if sample < self.fwd_neighbors.len() && point_idx < self.fwd_neighbors[sample].len() {
-                combined.extend_from_slice(&self.fwd_neighbors[sample][point_idx]);
-            }
-
-            // Add backward neighbors
-            if sample < self.bwd_neighbors.len() && point_idx < self.bwd_neighbors[sample].len() {
-                combined.extend_from_slice(&self.bwd_neighbors[sample][point_idx]);
-            }
-
-            result.push((marker, combined));
-        }
-
-        result
-    }
-
-    /// Number of candidates per query
-    pub fn n_candidates(&self) -> usize {
-        self.n_candidates
-    }
 }
 
 #[cfg(test)]
@@ -640,8 +329,9 @@ mod tests {
             wavefront.advance_forward(&alleles, 2);
         }
 
-        // Find neighbors for haplotype 0
-        let neighbors = wavefront.find_fwd_neighbors(0, 10);
+        // Find neighbors for haplotype 0 using read-only method
+        wavefront.prepare_fwd_queries();
+        let neighbors = wavefront.find_fwd_neighbors_readonly(0, 10);
         assert!(!neighbors.is_empty());
         assert!(neighbors.iter().all(|&h| h != 0));
     }
@@ -662,14 +352,16 @@ mod tests {
         for m in 0..n_markers {
             wavefront.advance_forward(&alleles[m], 2);
         }
-        let fwd_neighbors = wavefront.find_fwd_neighbors(5, 10);
+        wavefront.prepare_fwd_queries();
+        let fwd_neighbors = wavefront.find_fwd_neighbors_readonly(5, 10);
 
         // Backward pass
         wavefront.reset_backward();
         for m in (0..n_markers).rev() {
             wavefront.advance_backward(&alleles[m], 2);
         }
-        let bwd_neighbors = wavefront.find_bwd_neighbors(5, 10);
+        wavefront.prepare_bwd_queries();
+        let bwd_neighbors = wavefront.find_bwd_neighbors_readonly(5, 10);
 
         // Both should return valid neighbors
         assert!(!fwd_neighbors.is_empty());

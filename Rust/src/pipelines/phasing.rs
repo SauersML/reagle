@@ -35,6 +35,7 @@ use crate::model::hmm::BeagleHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::phase_states::PhaseStates;
+use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::pipelines::imputation::MarkerAlignment;
 use mini_mcmc::core::{MarkovChain, Trace};
 
@@ -1339,6 +1340,148 @@ impl PhasingPipeline {
         )
     }
 
+    /// Build composite haplotypes for all samples using streaming PBWT
+    ///
+    /// This streaming approach uses O(N) memory instead of O(M*N) for the PBWT index.
+    /// It processes markers sequentially, updating PhaseStates at sampling points.
+    ///
+    /// # Algorithm
+    /// 1. Forward pass (markers 0->M): collect forward PBWT neighbors at sampling points
+    /// 2. Backward pass (markers M->0): collect backward PBWT neighbors at sampling points
+    /// 3. Finalize: build ThreadedHaps for each sample
+    ///
+    /// # Returns
+    /// Vector of ThreadedHaps, one per sample
+    fn build_composite_haps_streaming<F>(
+        &self,
+        get_allele: F,
+        n_markers: usize,
+        n_total_haps: usize,
+        n_samples: usize,
+        ibs2: &Ibs2,
+        n_candidates: usize,
+        max_states: usize,
+    ) -> Vec<crate::model::states::ThreadedHaps>
+    where
+        F: Fn(usize, usize) -> u8 + Sync,
+    {
+        // Compute sampling points (sparse, ~64 points like PhaseStates)
+        const MAX_SAMPLE_POINTS: usize = 64;
+        let step = (n_markers / MAX_SAMPLE_POINTS).max(1);
+        let sampling_points: Vec<usize> = (0..n_markers).step_by(step).collect();
+
+        // Create PhaseStates for all samples
+        let mut phase_states: Vec<PhaseStates> = (0..n_samples)
+            .map(|_| {
+                let mut ps = PhaseStates::new(max_states, n_markers);
+                ps.reset_for_streaming();
+                ps
+            })
+            .collect();
+
+        // Create wavefront
+        let mut wavefront = PbwtWavefront::new(n_total_haps, n_markers);
+
+        // Temporary allele buffer (reused across markers)
+        let mut alleles = vec![0u8; n_total_haps];
+
+        // Forward pass
+        wavefront.reset_forward();
+        for m in 0..n_markers {
+            // Extract alleles for this marker
+            for h in 0..n_total_haps {
+                alleles[h] = get_allele(m, h);
+            }
+
+            // Count distinct alleles (biallelic optimization)
+            let n_alleles = if alleles.iter().all(|&a| a < 2 || a == 255) { 2 } else { 256 };
+
+            // Advance wavefront
+            wavefront.advance_forward(&alleles, n_alleles);
+
+            // At sampling points, collect forward neighbors for all samples
+            if sampling_points.contains(&m) {
+                wavefront.prepare_fwd_queries();
+
+                // Parallel: collect neighbors for each sample
+                // Note: wavefront is immutable here after prepare_fwd_queries
+                let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
+                    .map(|s| {
+                        let h1 = (s * 2) as u32;
+                        let h2 = h1 + 1;
+                        let n1 = wavefront.find_fwd_neighbors_readonly(h1, n_candidates);
+                        let n2 = wavefront.find_fwd_neighbors_readonly(h2, n_candidates);
+                        (n1, n2)
+                    })
+                    .collect();
+
+                // Add neighbors to PhaseStates
+                for (s, (n1, n2)) in neighbors_per_sample.into_iter().enumerate() {
+                    phase_states[s].add_neighbors_at_marker(s as u32, m, &n1, &n2);
+                }
+
+                // Also add IBS2 neighbors
+                for s in 0..n_samples {
+                    let sample = SampleIdx::new(s as u32);
+                    for seg in ibs2.segments(sample) {
+                        if seg.contains(m) {
+                            let other_s = seg.other_sample;
+                            if other_s != sample {
+                                let neighbors = vec![other_s.hap1().0, other_s.hap2().0];
+                                phase_states[s].add_neighbors_at_marker(
+                                    s as u32,
+                                    m,
+                                    &neighbors,
+                                    &[],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Backward pass
+        wavefront.reset_backward();
+        for m in (0..n_markers).rev() {
+            // Extract alleles for this marker
+            for h in 0..n_total_haps {
+                alleles[h] = get_allele(m, h);
+            }
+
+            let n_alleles = if alleles.iter().all(|&a| a < 2 || a == 255) { 2 } else { 256 };
+
+            // Advance wavefront (backward)
+            wavefront.advance_backward(&alleles, n_alleles);
+
+            // At sampling points, collect backward neighbors
+            if sampling_points.contains(&m) {
+                wavefront.prepare_bwd_queries();
+
+                let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
+                    .map(|s| {
+                        let h1 = (s * 2) as u32;
+                        let h2 = h1 + 1;
+                        let n1 = wavefront.find_bwd_neighbors_readonly(h1, n_candidates);
+                        let n2 = wavefront.find_bwd_neighbors_readonly(h2, n_candidates);
+                        (n1, n2)
+                    })
+                    .collect();
+
+                for (s, (n1, n2)) in neighbors_per_sample.into_iter().enumerate() {
+                    phase_states[s].add_neighbors_at_marker(s as u32, m, &n1, &n2);
+                }
+            }
+        }
+
+        // Finalize: convert PhaseStates to ThreadedHaps
+        phase_states
+            .into_iter()
+            .enumerate()
+            .map(|(s, mut ps)| ps.finalize_streaming(s as u32, n_total_haps))
+            .collect()
+    }
+
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
     ///
     /// This uses the full Forward-Backward algorithm to compute posterior probabilities
@@ -1385,42 +1528,54 @@ impl PhasingPipeline {
             GenotypeView::from((&ref_geno, markers))
         };
 
-        // Build PBWT over combined haplotype space when reference is available
-        // Filter low-confidence target markers to prevent bad hard calls from
-        // excluding correct reference haplotypes during state selection.
-        let phase_ibs = tracing::info_span!("build_pbwt").in_scope(|| {
+        // Build composite haplotypes for all samples using streaming PBWT
+        // This uses O(N) memory instead of O(M*N) for the PBWT index
+        let n_candidates = self.params.n_states.min(n_total_haps).max(20);
+        let threaded_haps_vec: Vec<crate::model::states::ThreadedHaps> = tracing::info_span!("streaming_pbwt").in_scope(|| {
             if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                self.build_bidirectional_pbwt_combined(
-                |m, h| {
-                    if h < n_haps {
-                        // Target haplotype: check confidence before using
-                        let sample = h / 2;
-                        let conf = confidence_by_sample.get(sample)
-                            .and_then(|c| c.get(m))
-                            .copied()
-                            .unwrap_or(1.0);
-                        if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                            255 // Treat low-confidence calls as missing for IBS
+                self.build_composite_haps_streaming(
+                    |m, h| {
+                        if h < n_haps {
+                            // Target haplotype: check confidence before using
+                            let sample = h / 2;
+                            let conf = confidence_by_sample.get(sample)
+                                .and_then(|c| c.get(m))
+                                .copied()
+                                .unwrap_or(1.0);
+                            if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
+                                255 // Treat low-confidence calls as missing for IBS
+                            } else {
+                                ref_geno.get(m, HapIdx::new(h as u32))
+                            }
                         } else {
-                            ref_geno.get(m, HapIdx::new(h as u32))
+                            // Reference haplotype: always use actual allele
+                            let ref_h = h - n_haps;
+                            if let Some(ref_m) = alignment.target_to_ref(m) {
+                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                // Map reference allele to target encoding (handles strand flips)
+                                alignment.reverse_map_allele(m, ref_allele)
+                            } else {
+                                255 // Missing - marker not in reference
+                            }
                         }
-                    } else {
-                        // Reference haplotype: always use actual allele
-                        let ref_h = h - n_haps;
-                        if let Some(ref_m) = alignment.target_to_ref(m) {
-                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                            // Map reference allele to target encoding (handles strand flips)
-                            alignment.reverse_map_allele(m, ref_allele)
-                        } else {
-                            255 // Missing - marker not in reference
-                        }
-                    }
-                },
-                n_markers,
-                n_total_haps,
-            )
+                    },
+                    n_markers,
+                    n_total_haps,
+                    n_samples,
+                    ibs2,
+                    n_candidates,
+                    self.params.n_states,
+                )
             } else {
-                self.build_bidirectional_pbwt(&ref_geno, n_markers, n_haps)
+                self.build_composite_haps_streaming(
+                    |m, h| ref_geno.get(m, HapIdx::new(h as u32)),
+                    n_markers,
+                    n_haps,
+                    n_samples,
+                    ibs2,
+                    n_candidates,
+                    self.params.n_states,
+                )
             }
         });
 
@@ -1434,18 +1589,9 @@ impl PhasingPipeline {
                 .wrapping_add(s as u64)
                 .wrapping_add(0xA5A5_5A5A_D00Du64);
 
-            // Build dynamic composite haplotypes using PhaseStates
-            // This iterates through all markers and builds mosaic haplotypes
-            // that provide local IBS matches everywhere, not just at midpoint.
-            let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
-            let n_candidates = self.params.n_states.min(n_total_haps).max(20);
-            let threaded_haps = phase_states.build_composite_haps(
-                s as u32,
-                &phase_ibs,
-                ibs2,
-                n_candidates,
-            );
-            let n_states = phase_states.n_states();
+            // Use pre-built composite haplotypes from streaming PBWT
+            let threaded_haps = threaded_haps_vec[s].clone();
+            let n_states = threaded_haps.n_states();
 
             // 2. Extract current alleles for H1 and H2
             let seq1 = ref_geno.haplotype(hap1);
