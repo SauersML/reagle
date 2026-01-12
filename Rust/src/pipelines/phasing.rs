@@ -1553,7 +1553,7 @@ impl PhasingPipeline {
             let n_alleles = if is_biallelic { 2 } else { 256 };
 
             // Advance wavefront
-            wavefront.advance_forward(marker_alleles, n_alleles);
+            wavefront.advance_forward(&marker_alleles, n_alleles);
 
             // At sampling points, collect forward neighbors
             if sampling_points.contains(&m) {
@@ -1596,7 +1596,7 @@ impl PhasingPipeline {
             let is_biallelic = marker_alleles.iter().all(|&a| a < 2 || a == 255);
             let n_alleles = if is_biallelic { 2 } else { 256 };
 
-            wavefront.advance_backward(marker_alleles, n_alleles);
+            wavefront.advance_backward(&marker_alleles, n_alleles);
 
             if sampling_points.contains(&m) {
                 wavefront.prepare_bwd_queries();
