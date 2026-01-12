@@ -202,6 +202,46 @@ impl ThreadedHaps {
 
         result
     }
+
+    /// Fill an allele array directly from segment data without intermediate allocation.
+    ///
+    /// This is more efficient than `materialize_all()` followed by allele lookup
+    /// because it avoids the O(n_markers × n_states × 4) temporary allocation.
+    ///
+    /// The output array layout is `out[m * n_states + k]` for marker m, state k.
+    ///
+    /// # Arguments
+    /// * `out` - Output allele array of size n_markers * n_states
+    /// * `to_allele` - Callback that converts (marker_idx, hap_idx) -> allele
+    #[inline]
+    pub fn fill_alleles<F>(&self, out: &mut [u8], to_allele: F)
+    where
+        F: Fn(usize, u32) -> u8,
+    {
+        let n_states = self.state_heads.len();
+        let n_markers = self.n_markers;
+
+        // For each state, walk its segment list once
+        for state_idx in 0..n_states {
+            let mut cur = self.state_heads[state_idx] as usize;
+            let mut seg_end = self.segments_end[cur] as usize;
+            let mut hap = self.segments_hap[cur];
+
+            for m in 0..n_markers {
+                // Advance to next segment if needed
+                while m >= seg_end {
+                    let next = self.segments_next[cur];
+                    if next == Self::NIL {
+                        break;
+                    }
+                    cur = next as usize;
+                    seg_end = self.segments_end[cur] as usize;
+                    hap = self.segments_hap[cur];
+                }
+                out[m * n_states + state_idx] = to_allele(m, hap);
+            }
+        }
+    }
 }
 
 // ============================================================================

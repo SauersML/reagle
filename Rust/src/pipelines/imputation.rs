@@ -1726,114 +1726,61 @@ impl ImputationPipeline {
                 None
             };
 
-            // Process markers in chunks for efficient transpose
-            // Larger chunks = fewer seeks = faster (50k markers × 818 samples × 14 bytes = ~570 MB)
-            const CHUNK_SIZE: usize = 50_000;
-            let n_chunks = (n_ref_markers + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            // Use memory-mapped files for zero-copy random access during transpose
+            // This avoids allocating large buffers - the OS handles paging efficiently
+            let dosage_mmap = unsafe { memmap2::Mmap::map(&dosage_file)? };
+            let gt_mmap = unsafe { memmap2::Mmap::map(&gt_file)? };
+            let post_mmap: Option<memmap2::Mmap> = if let Some(ref pf) = post_file {
+                Some(unsafe { memmap2::Mmap::map(pf)? })
+            } else {
+                None
+            };
 
-            // Buffers for chunked reading: chunk_data[m_local][s]
-            let mut chunk_dosages = vec![vec![0.0f32; n_target_samples]; CHUNK_SIZE];
-            let mut chunk_gt = vec![vec![(0u8, 0u8); n_target_samples]; CHUNK_SIZE];
-            let mut chunk_post = vec![vec![(0.0f32, 0.0f32); n_target_samples]; CHUNK_SIZE];
+            // Direct mmap access - closures reference the mmaps
+            let get_dosage = |m: usize, s: usize| -> f32 {
+                let offset = (s * n_ref_markers + m) * 4;
+                f32::from_le_bytes(dosage_mmap[offset..offset+4].try_into().unwrap())
+            };
+            let get_best_gt = |m: usize, s: usize| -> (u8, u8) {
+                let offset = (s * n_ref_markers + m) * 2;
+                (gt_mmap[offset], gt_mmap[offset + 1])
+            };
 
-            // Bulk read buffers (avoid per-byte reads)
-            let mut dosage_buf = vec![0u8; CHUNK_SIZE * 4];
-            let mut gt_buf = vec![0u8; CHUNK_SIZE * 2];
-            let mut post_buf = vec![0u8; CHUNK_SIZE * 8];
+            type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
+            let get_posteriors: Option<GetPosteriorsFn> = if need_allele_probs {
+                let pm = post_mmap.as_ref().unwrap();
+                // Clone mmap reference into closure
+                let pm_slice: &[u8] = pm;
+                let pm_ptr = pm_slice.as_ptr();
+                let n_ref = n_ref_markers;
+                Some(Box::new(move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
+                    let offset = (s * n_ref + m) * 8;
+                    let p1 = f32::from_le_bytes(unsafe {
+                        std::slice::from_raw_parts(pm_ptr.add(offset), 4)
+                    }.try_into().unwrap());
+                    let p2 = f32::from_le_bytes(unsafe {
+                        std::slice::from_raw_parts(pm_ptr.add(offset + 4), 4)
+                    }.try_into().unwrap());
+                    (AllelePosteriors::Biallelic(p1), AllelePosteriors::Biallelic(p2))
+                }))
+            } else {
+                None
+            };
 
-            for chunk_idx in 0..n_chunks {
-                let chunk_start = chunk_idx * CHUNK_SIZE;
-                let chunk_end = (chunk_start + CHUNK_SIZE).min(n_ref_markers);
-                let chunk_len = chunk_end - chunk_start;
+            // Write all markers in one call - no chunking needed with mmap
+            writer.write_imputed_streaming(
+                &ref_gt,
+                get_dosage,
+                get_best_gt,
+                get_posteriors,
+                &quality,
+                0,
+                n_ref_markers,
+                self.config.gp,
+                self.config.ap,
+            )?;
 
-                // Read all samples' data for this marker chunk with bulk reads
-                for s in 0..n_target_samples {
-                    // Bulk read dosages for sample s, markers [chunk_start..chunk_end]
-                    let dosage_pos = (s * n_ref_markers + chunk_start) as u64 * 4;
-                    dosage_file.seek(SeekFrom::Start(dosage_pos))?;
-                    dosage_file.read_exact(&mut dosage_buf[..chunk_len * 4])?;
-                    for m_local in 0..chunk_len {
-                        let offset = m_local * 4;
-                        chunk_dosages[m_local][s] = f32::from_le_bytes([
-                            dosage_buf[offset], dosage_buf[offset + 1],
-                            dosage_buf[offset + 2], dosage_buf[offset + 3]
-                        ]);
-                    }
-
-                    // Bulk read GTs
-                    let gt_pos = (s * n_ref_markers + chunk_start) as u64 * 2;
-                    gt_file.seek(SeekFrom::Start(gt_pos))?;
-                    gt_file.read_exact(&mut gt_buf[..chunk_len * 2])?;
-                    for m_local in 0..chunk_len {
-                        let offset = m_local * 2;
-                        chunk_gt[m_local][s] = (gt_buf[offset], gt_buf[offset + 1]);
-                    }
-
-                    // Bulk read posteriors
-                    if let Some(ref mut pf) = post_file {
-                        let post_pos = (s * n_ref_markers + chunk_start) as u64 * 8;
-                        pf.seek(SeekFrom::Start(post_pos))?;
-                        pf.read_exact(&mut post_buf[..chunk_len * 8])?;
-                        for m_local in 0..chunk_len {
-                            let offset = m_local * 8;
-                            let p1 = f32::from_le_bytes([
-                                post_buf[offset], post_buf[offset + 1],
-                                post_buf[offset + 2], post_buf[offset + 3]
-                            ]);
-                            let p2 = f32::from_le_bytes([
-                                post_buf[offset + 4], post_buf[offset + 5],
-                                post_buf[offset + 6], post_buf[offset + 7]
-                            ]);
-                            chunk_post[m_local][s] = (p1, p2);
-                        }
-                    }
-                }
-
-                // Write VCF lines for entire chunk at once
-                // Clone chunk_post slice for the closure (only the portion we need)
-                let chunk_post_for_closure: Vec<Vec<(f32, f32)>> = if need_allele_probs {
-                    chunk_post[..chunk_len].to_vec()
-                } else {
-                    Vec::new()
-                };
-
-                let get_dosage = |m: usize, s: usize| -> f32 {
-                    let m_local = m - chunk_start;
-                    chunk_dosages[m_local][s]
-                };
-                let get_best_gt = |m: usize, s: usize| -> (u8, u8) {
-                    let m_local = m - chunk_start;
-                    chunk_gt[m_local][s]
-                };
-
-                type GetPosteriorsFn = Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors)>;
-                let get_posteriors: Option<GetPosteriorsFn> = if need_allele_probs {
-                    let chunk_start_copy = chunk_start;
-                    Some(Box::new(move |m: usize, s: usize| -> (AllelePosteriors, AllelePosteriors) {
-                        let m_local = m - chunk_start_copy;
-                        let (p1, p2) = chunk_post_for_closure[m_local][s];
-                        (AllelePosteriors::Biallelic(p1), AllelePosteriors::Biallelic(p2))
-                    }))
-                } else {
-                    None
-                };
-
-                writer.write_imputed_streaming(
-                    &ref_gt,
-                    get_dosage,
-                    get_best_gt,
-                    get_posteriors,
-                    &quality,
-                    chunk_start,
-                    chunk_end,
-                    self.config.gp,
-                    self.config.ap,
-                )?;
-
-                if chunk_idx % 10 == 0 || chunk_idx == n_chunks - 1 {
-                    eprintln!("  Written {} / {} markers", chunk_end, n_ref_markers);
-                }
-            }
+            eprintln!("  Written {} markers", n_ref_markers);
 
             writer.flush()?;
 
@@ -2125,22 +2072,27 @@ pub fn run_hmm_forward_backward_clusters_counts(
             last_sum = sum.max(1e-30);
         } else {
             // SIMD-optimized: compute emissions on-the-fly in chunks of 8
+            // Pre-slice emission data to avoid bounds checks (but not fwd - borrow conflict)
+            let n_emit = n_states.min(mismatches.len()).min(non_missing.len());
+            let mism_slice = &mismatches[..n_emit];
+            let nobs_slice = &non_missing[..n_emit];
+
             let shift_vec = f32x8::splat(shift);
             let scale_vec = f32x8::splat(scale);
             let mut sum_vec = f32x8::splat(0.0);
 
             let mut k = 0;
-            while k + 8 <= n_states {
-                // Compute 8 emissions on-the-fly (no storage)
+            while k + 8 <= n_emit {
+                // Compute 8 emissions on-the-fly using direct slice access
                 let emit_arr = [
-                    compute_emit(mismatches.get(k).copied().unwrap_or(0.0), non_missing.get(k).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
-                    compute_emit(mismatches.get(k+1).copied().unwrap_or(0.0), non_missing.get(k+1).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
-                    compute_emit(mismatches.get(k+2).copied().unwrap_or(0.0), non_missing.get(k+2).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
-                    compute_emit(mismatches.get(k+3).copied().unwrap_or(0.0), non_missing.get(k+3).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
-                    compute_emit(mismatches.get(k+4).copied().unwrap_or(0.0), non_missing.get(k+4).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
-                    compute_emit(mismatches.get(k+5).copied().unwrap_or(0.0), non_missing.get(k+5).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
-                    compute_emit(mismatches.get(k+6).copied().unwrap_or(0.0), non_missing.get(k+6).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
-                    compute_emit(mismatches.get(k+7).copied().unwrap_or(0.0), non_missing.get(k+7).copied().unwrap_or(0.0), log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
                 ];
                 let emit_vec = f32x8::from(emit_arr);
 
@@ -2158,10 +2110,8 @@ pub fn run_hmm_forward_backward_clusters_counts(
 
             let mut sum = sum_vec.reduce_add();
             // Scalar tail
-            for i in k..n_states {
-                let mism = mismatches.get(i).copied().unwrap_or(0.0);
-                let n_obs = non_missing.get(i).copied().unwrap_or(0.0);
-                let em = compute_emit(mism, n_obs, log_p_no_err, log_p_err);
+            for i in k..n_emit {
+                let em = compute_emit(mism_slice[i], nobs_slice[i], log_p_no_err, log_p_err);
                 let val = em * (scale * fwd[prev_offset + i] + shift);
                 fwd[row_offset + i] = val;
                 sum += val;
@@ -2181,15 +2131,15 @@ pub fn run_hmm_forward_backward_clusters_counts(
             let shift = p_rec / n_states as f32;
 
             let mut emitted_sum = 0.0f32;
+            // Pre-slice to avoid bounds checks in hot loop
             let mismatches = &cluster_mismatches[m + 1];
-            for k in 0..n_states {
-                let mism = mismatches.get(k).copied().unwrap_or(0.0);
-                let n_obs = cluster_non_missing
-                    .get(m + 1)
-                    .and_then(|row| row.get(k))
-                    .copied()
-                    .unwrap_or(0.0);
-                let mism = mism.min(n_obs);
+            let non_missing = &cluster_non_missing[m + 1];
+            let mism_slice = &mismatches[..n_states.min(mismatches.len())];
+            let nobs_slice = &non_missing[..n_states.min(non_missing.len())];
+
+            for k in 0..mism_slice.len() {
+                let mism = mism_slice[k].min(nobs_slice[k]);
+                let n_obs = nobs_slice[k];
                 let match_count = (n_obs - mism).max(0.0);
                 // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
                 let log_em = match_count * log_p_no_err + mism * log_p_err;

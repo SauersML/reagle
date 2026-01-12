@@ -63,9 +63,11 @@ struct RefAlleleLookup {
 }
 
 impl RefAlleleLookup {
-    /// Create a new lookup by pre-computing all alleles upfront
-    fn new(
-        state_haps: &[Vec<u32>],
+    /// Create a new lookup directly from ThreadedHaps without intermediate allocation.
+    ///
+    /// This avoids the O(n_markers × n_states × 4) temporary from materialize_all().
+    fn new_from_threaded(
+        threaded_haps: &crate::model::states::ThreadedHaps,
         n_markers: usize,
         n_states: usize,
         n_target_haps: usize,
@@ -76,30 +78,25 @@ impl RefAlleleLookup {
     ) -> Self {
         let mut alleles = vec![0u8; n_markers * n_states];
 
-        for m in 0..n_markers {
+        threaded_haps.fill_alleles(&mut alleles, |m, hap| {
             let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
-            let base = m * n_states;
-
-            for k in 0..n_states {
-                let hap = state_haps[m][k] as usize;
-                let allele = if hap < n_target_haps {
-                    ref_geno.get(orig_m, HapIdx::new(hap as u32))
-                } else {
-                    let ref_h = (hap - n_target_haps) as u32;
-                    if let (Some(ref_gt), Some(align)) = (reference_gt, alignment) {
-                        if let Some(ref_m) = align.target_to_ref(orig_m) {
-                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
-                            align.reverse_map_allele(orig_m, ref_allele)
-                        } else {
-                            255
-                        }
+            let hap = hap as usize;
+            if hap < n_target_haps {
+                ref_geno.get(orig_m, HapIdx::new(hap as u32))
+            } else {
+                let ref_h = (hap - n_target_haps) as u32;
+                if let (Some(ref_gt), Some(align)) = (reference_gt, alignment) {
+                    if let Some(ref_m) = align.target_to_ref(orig_m) {
+                        let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
+                        align.reverse_map_allele(orig_m, ref_allele)
                     } else {
                         255
                     }
-                };
-                alleles[base + k] = allele;
+                } else {
+                    255
+                }
             }
-        }
+        });
 
         Self {
             alleles,
@@ -1499,11 +1496,9 @@ impl PhasingPipeline {
             let p_no_err = 1.0 - p_err;
 
             // Pre-compute state->hap mapping for all (marker, state) pairs
-            // Uses immutable materialize_all() to avoid clone() overhead
-            let state_haps = threaded_haps.materialize_all();
-
-            let lookup = RefAlleleLookup::new(
-                &state_haps,
+            // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
+            let lookup = RefAlleleLookup::new_from_threaded(
+                &threaded_haps,
                 n_markers,
                 n_states,
                 n_haps,
@@ -1691,11 +1686,9 @@ impl PhasingPipeline {
                 let p_no_err = 1.0 - p_err;
 
                 // Pre-compute state->hap mapping for all (marker, state) pairs
-                // Uses immutable materialize_all() to avoid clone() overhead
-                let state_haps = threaded_haps.materialize_all();
-
-                let lookup = RefAlleleLookup::new(
-                    &state_haps,
+                // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
+                let lookup = RefAlleleLookup::new_from_threaded(
+                    &threaded_haps,
                     n_markers,
                     n_states,
                     n_haps,
@@ -1900,11 +1893,9 @@ impl PhasingPipeline {
                 let p_no_err = 1.0 - p_err;
 
                 // Pre-compute state->hap mapping for all (hi_freq_idx, state) pairs
-                // Uses immutable materialize_all() to avoid clone() overhead
-                let state_haps = threaded_haps.materialize_all();
-
-                let lookup = RefAlleleLookup::new(
-                    &state_haps,
+                // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
+                let lookup = RefAlleleLookup::new_from_threaded(
+                    &threaded_haps,
                     n_hi_freq,
                     n_states,
                     n_haps,
