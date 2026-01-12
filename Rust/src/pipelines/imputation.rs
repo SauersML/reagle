@@ -2596,7 +2596,7 @@ pub fn run_hmm_forward_backward_to_sparse(
                 let val = missing_ref_vals[i];
                 if col < n_states {
                      let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
-                        1.0 / pow_no_err[val as usize]
+                        missing_ref_pow[val as usize]
                     } else {
                         (-val * log_p_no_err).exp()
                     };
@@ -2701,13 +2701,13 @@ pub fn run_hmm_forward_backward_to_sparse(
                 curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
             }
         }
-         // Apply Sparse Missing Ref Penalties
+        // Apply Sparse Missing Ref Penalties
         for i in mis_ref_start..mis_ref_end {
             let col = missing_ref_cols[i] as usize;
             let val = missing_ref_vals[i];
             if col < n_states {
-                 let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
-                    1.0 / pow_no_err[val as usize]
+                let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                     missing_ref_pow[val as usize]
                 } else {
                     (-val * log_p_no_err).exp()
                 };
