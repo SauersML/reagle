@@ -1439,7 +1439,8 @@ impl PhasingPipeline {
                         if seg.contains(m) {
                             let other_s = seg.other_sample;
                             if other_s != sample {
-                                let neighbors = vec![other_s.hap1().0, other_s.hap2().0];
+                                // Use stack-allocated array instead of Vec
+                                let neighbors: [u32; 2] = [other_s.hap1().0, other_s.hap2().0];
                                 phase_states[s].add_neighbors_at_marker(
                                     s as u32,
                                     m,
@@ -1576,7 +1577,8 @@ impl PhasingPipeline {
                     let sample = SampleIdx::new(s as u32);
                     for seg in ibs2.segments(sample) {
                         if seg.contains(m) {
-                            let neighbors = vec![seg.other_sample.hap1().0, seg.other_sample.hap2().0];
+                            // Use stack-allocated array instead of Vec for IBS2 neighbors
+                            let neighbors: [u32; 2] = [seg.other_sample.hap1().0, seg.other_sample.hap2().0];
                             phase_states[s].add_neighbors_at_marker(s as u32, m, &neighbors, &neighbors);
                         }
                     }
