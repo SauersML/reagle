@@ -2664,7 +2664,7 @@ mod tests {
         let mut workspace = ImpWorkspace::with_ref_size(n_states);
 
         let non_missing_equal = vec![vec![2.0f32, 2.0f32]];
-        let post_equal = run_hmm_forward_backward_clusters_counts(
+        let post_equal = run_hmm_forward_backward_clusters(
             &mismatches,
             &non_missing_equal,
             &p_recomb,
@@ -2674,7 +2674,7 @@ mod tests {
         );
 
         let non_missing_unequal = vec![vec![2.0f32, 0.0f32]];
-        let post_unequal = run_hmm_forward_backward_clusters_counts(
+        let post_unequal = run_hmm_forward_backward_clusters(
             &mismatches,
             &non_missing_unequal,
             &p_recomb,

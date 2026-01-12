@@ -337,6 +337,17 @@ impl MosaicCursor {
             }
         }
     }
+
+    /// Reset cursor to the initial state (marker 0).
+    #[cfg(test)]
+    pub fn reset(&mut self, th: &ThreadedHaps) {
+        for state in 0..th.n_states() {
+            let head = th.state_heads[state] as usize;
+            self.active_haps[state] = th.segments_hap[head];
+            self.next_switch[state] = th.segments_end[head] as usize;
+            self.cursor_indices[state] = th.state_heads[state];
+        }
+    }
 }
 
 /// Scratch buffer for Phase B: allele materialization
