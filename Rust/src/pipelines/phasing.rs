@@ -79,22 +79,26 @@ impl RefAlleleLookup {
     ) -> Self {
         let mut alleles = vec![0u8; n_markers * n_states];
 
-        threaded_haps.fill_alleles(&mut alleles, |m, hap| {
+        // Use marker-major iteration to hoist per-marker alignment computation
+        threaded_haps.fill_alleles_marker_major(&mut alleles, |m| {
+            // Per-marker setup (hoisted outside state loop)
             let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
-            let hap = hap as usize;
-            if hap < n_target_haps {
-                ref_geno.get(orig_m, HapIdx::new(hap as u32))
-            } else {
-                let ref_h = (hap - n_target_haps) as u32;
-                if let (Some(ref_gt), Some(align)) = (reference_gt, alignment) {
-                    if let Some(ref_m) = align.target_to_ref(orig_m) {
+            // Pre-compute ref marker index once per marker
+            let ref_m_opt = alignment.and_then(|a| a.target_to_ref(orig_m));
+
+            // Return closure for hap lookups at this marker
+            move |hap: u32| {
+                let hap = hap as usize;
+                if hap < n_target_haps {
+                    ref_geno.get(orig_m, HapIdx::new(hap as u32))
+                } else {
+                    let ref_h = (hap - n_target_haps) as u32;
+                    if let (Some(ref_gt), Some(ref_m)) = (reference_gt, ref_m_opt) {
                         let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
-                        align.reverse_map_allele(orig_m, ref_allele)
+                        alignment.unwrap().reverse_map_allele(orig_m, ref_allele)
                     } else {
                         255
                     }
-                } else {
-                    255
                 }
             }
         });

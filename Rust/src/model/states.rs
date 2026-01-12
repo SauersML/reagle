@@ -164,42 +164,52 @@ impl ThreadedHaps {
         }
     }
 
-    /// Fill an allele array directly from segment data without intermediate allocation.
+    /// Fill allele array with marker-major iteration order.
     ///
-    /// This is more efficient than `materialize_all()` followed by allele lookup
-    /// because it avoids the O(n_markers × n_states × 4) temporary allocation.
-    ///
-    /// The output array layout is `out[m * n_states + k]` for marker m, state k.
+    /// This variant processes markers in the outer loop, allowing the caller
+    /// to hoist per-marker computations (like alignment lookups) outside
+    /// the state loop for better performance.
     ///
     /// # Arguments
     /// * `out` - Output allele array of size n_markers * n_states
-    /// * `to_allele` - Callback that converts (marker_idx, hap_idx) -> allele
+    /// * `per_marker` - Called once per marker, returns a closure that maps hap_idx -> allele
     #[inline]
-    pub fn fill_alleles<F>(&self, out: &mut [u8], to_allele: F)
+    pub fn fill_alleles_marker_major<F, G>(&self, out: &mut [u8], mut per_marker: F)
     where
-        F: Fn(usize, u32) -> u8,
+        F: FnMut(usize) -> G,
+        G: Fn(u32) -> u8,
     {
         let n_states = self.state_heads.len();
         let n_markers = self.n_markers;
 
-        // For each state, walk its segment list once
-        for state_idx in 0..n_states {
-            let mut cur = self.state_heads[state_idx] as usize;
-            let mut seg_end = self.segments_end[cur] as usize;
-            let mut hap = self.segments_hap[cur];
+        // Initialize cursors for all states
+        let mut cursors: Vec<usize> = (0..n_states)
+            .map(|s| self.state_heads[s] as usize)
+            .collect();
+        let mut seg_ends: Vec<usize> = cursors.iter()
+            .map(|&c| self.segments_end[c] as usize)
+            .collect();
+        let mut haps: Vec<u32> = cursors.iter()
+            .map(|&c| self.segments_hap[c])
+            .collect();
 
-            for m in 0..n_markers {
-                // Advance to next segment if needed
-                while m >= seg_end {
-                    let next = self.segments_next[cur];
+        for m in 0..n_markers {
+            // Get the hap-to-allele function for this marker (allows hoisting per-marker work)
+            let to_allele = per_marker(m);
+
+            let base = m * n_states;
+            for state_idx in 0..n_states {
+                // Advance cursor if needed
+                while m >= seg_ends[state_idx] {
+                    let next = self.segments_next[cursors[state_idx]];
                     if next == Self::NIL {
                         break;
                     }
-                    cur = next as usize;
-                    seg_end = self.segments_end[cur] as usize;
-                    hap = self.segments_hap[cur];
+                    cursors[state_idx] = next as usize;
+                    seg_ends[state_idx] = self.segments_end[cursors[state_idx]] as usize;
+                    haps[state_idx] = self.segments_hap[cursors[state_idx]];
                 }
-                out[m * n_states + state_idx] = to_allele(m, hap);
+                out[base + state_idx] = to_allele(haps[state_idx]);
             }
         }
     }
