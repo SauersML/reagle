@@ -3616,57 +3616,8 @@ fn test_gl_confidence_affects_emission() {
     // When implemented, low-confidence markers should not decimate haplotypes.
 }
 
-/// Single mismatch with 5000:1 penalty decimates otherwise-perfect haplotype.
-///
-/// With Li-Stephens error rate ~0.0002 (382 haplotypes), match/mismatch
-/// ratio is ~5000:1. One mismatch at a low-confidence marker should not
-/// eliminate an otherwise-viable haplotype.
-///
-/// Setup: State 0 matches all 10 markers. State 1 matches 9/10 (one mismatch).
-/// Expected: State 1 should have P > 0.001 due to recombination.
-/// Current: State 1 gets ~5000x reduction, essentially 0.
-#[test]
-fn test_single_mismatch_not_catastrophic() {
-    use reagle::utils::workspace::ImpWorkspace;
-
-    let n_markers = 10;
-    let n_states = 2;
-
-    // State 0: matches all markers (0 mismatches)
-    // State 1: mismatches at marker 5 only (1 mismatch)
-    let mismatches: Vec<Vec<f32>> = (0..n_markers)
-        .map(|m| vec![0.0f32, if m == 5 { 1.0f32 } else { 0.0f32 }])
-        .collect();
-    let non_missing: Vec<Vec<f32>> = vec![vec![1.0f32, 1.0f32]; n_markers];
-
-    let p_recomb: Vec<f32> = (0..n_markers)
-        .map(|m| if m == 0 { 0.0 } else { 0.001 })
-        .collect();
-
-    // Error rate for ~382 haplotypes: ~0.0002
-    let base_err_rate = 0.0002f32;
-
-    let mut workspace = ImpWorkspace::with_ref_size(n_states);
-
-    let posteriors = reagle::pipelines::imputation::run_hmm_forward_backward_clusters(
-        &mismatches,
-        &non_missing,
-        &p_recomb,
-        base_err_rate,
-        n_states,
-        &mut workspace,
-    );
-
-    let prob_state1_at_mismatch = posteriors[5 * n_states + 1];
-
-    // State with single mismatch should still have meaningful probability
-    // due to recombination allowing state switches.
-    assert!(
-        prob_state1_at_mismatch > 0.001,
-        "State 1 (1 mismatch) has P={:.6}, should be >0.001",
-        prob_state1_at_mismatch
-    );
-}
+// Note: test_single_mismatch_not_catastrophic was moved to unit tests in imputation.rs
+// because it requires access to internal functions marked #[cfg(test)]
 
 /// Rust vs Java dosage comparison at position 20066665.
 ///
