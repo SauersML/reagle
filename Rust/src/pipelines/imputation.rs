@@ -265,15 +265,37 @@ fn compute_cluster_mismatches_into_workspace(
                 continue;
             }
 
-            for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
-                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(hap));
-                let mapped = alignment.reverse_map_allele(target_m, ref_allele);
-                if mapped == 255 {
-                    continue;
+            // Hoist column lookup out of inner loop - same marker for all states
+            let ref_marker_idx = MarkerIdx::new(ref_m as u32);
+            let ref_column = ref_gt.column(ref_marker_idx);
+
+            // Check if this marker needs allele remapping (most biallelic sites don't)
+            let needs_mapping = alignment.has_allele_mapping(target_m);
+
+            if needs_mapping {
+                // Path with allele mapping (rare: strand flips, swaps)
+                for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
+                    let ref_allele = ref_column.get(HapIdx::new(hap));
+                    let mapped = alignment.reverse_map_allele(target_m, ref_allele);
+                    if mapped == 255 {
+                        continue;
+                    }
+                    workspace.cluster_non_missing[c][j] += confidence;
+                    if mapped != targ_allele {
+                        workspace.cluster_mismatches[c][j] += confidence;
+                    }
                 }
-                workspace.cluster_non_missing[c][j] += confidence;
-                if mapped != targ_allele {
-                    workspace.cluster_mismatches[c][j] += confidence;
+            } else {
+                // Fast path: no allele mapping needed (common case)
+                for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
+                    let ref_allele = ref_column.get(HapIdx::new(hap));
+                    if ref_allele == 255 {
+                        continue;
+                    }
+                    workspace.cluster_non_missing[c][j] += confidence;
+                    if ref_allele != targ_allele {
+                        workspace.cluster_mismatches[c][j] += confidence;
+                    }
                 }
             }
         }
@@ -460,6 +482,17 @@ impl MarkerAlignment {
         } else {
             None
         }
+    }
+
+    /// Check if a target marker has non-identity allele mapping (strand flip or swap)
+    ///
+    /// Returns true if the marker needs allele remapping, false if identity mapping applies.
+    /// Most biallelic markers have identity mapping (no flips/swaps).
+    #[inline]
+    pub fn has_allele_mapping(&self, target_marker: usize) -> bool {
+        self.allele_mappings.get(target_marker)
+            .and_then(|m| m.as_ref())
+            .is_some()
     }
 
     /// Get the number of markers that were successfully aligned
