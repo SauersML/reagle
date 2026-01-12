@@ -243,6 +243,8 @@ fn compute_cluster_mismatches_into_workspace(
     n_states: usize,
     workspace: &mut ImpWorkspace,
 ) {
+    workspace.reset_and_ensure_capacity(hap_indices.len(), n_states);
+
     let n_clusters = hap_indices.len();
     let targ_hap_idx = HapIdx::new(targ_hap as u32);
     let sample_idx = targ_hap_idx.sample().as_usize();
@@ -251,6 +253,17 @@ fn compute_cluster_mismatches_into_workspace(
         if c >= n_clusters {
             break;
         }
+
+        // Reset cluster accumulators
+        let row_mismatch = &mut workspace.row_buffer; // Reuse buffer
+        row_mismatch.fill(0.0);
+        
+        let row_missing_ref = &mut workspace.row_buffer_missing; // Reuse buffer
+        row_missing_ref.fill(0.0);
+        
+        // Sum total confidence for this cluster (most markers are present)
+        let mut cluster_conf_sum = 0.0f32;
+
         for &ref_m in &genotyped_markers[start..end] {
             let Some(target_m) = alignment.target_marker(ref_m) else {
                 continue;
@@ -265,40 +278,68 @@ fn compute_cluster_mismatches_into_workspace(
                 continue;
             }
 
-            // Hoist column lookup out of inner loop - same marker for all states
+            // Hoist column lookup out of inner loop
             let ref_marker_idx = MarkerIdx::new(ref_m as u32);
             let ref_column = ref_gt.column(ref_marker_idx);
 
-            // Check if this marker needs allele remapping (most biallelic sites don't)
+            // Check if this marker needs allele remapping
             let needs_mapping = alignment.has_allele_mapping(target_m);
 
             if needs_mapping {
-                // Path with allele mapping (rare: strand flips, swaps)
                 for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
                     let ref_allele = ref_column.get(HapIdx::new(hap));
                     let mapped = alignment.reverse_map_allele(target_m, ref_allele);
+                    
                     if mapped == 255 {
-                        continue;
-                    }
-                    workspace.cluster_non_missing[c][j] += confidence;
-                    if mapped != targ_allele {
-                        workspace.cluster_mismatches[c][j] += confidence;
+                        // Ref missing: this state does NOT support this marker
+                        // So it does NOT contribute to "non_missing"
+                        // But we will add `confidence` to `cluster_conf_sum` (Global assumption),
+                        // so we must SUBTRACT it here.
+                        row_missing_ref[j] += confidence;
+                    } else {
+                        // Ref present: contributes to NonMissing (via Global Sum)
+                         if mapped != targ_allele {
+                             row_mismatch[j] += confidence;
+                         }
                     }
                 }
             } else {
-                // Fast path: no allele mapping needed (common case)
+                // Fast path
                 for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
                     let ref_allele = ref_column.get(HapIdx::new(hap));
                     if ref_allele == 255 {
-                        continue;
-                    }
-                    workspace.cluster_non_missing[c][j] += confidence;
-                    if ref_allele != targ_allele {
-                        workspace.cluster_mismatches[c][j] += confidence;
+                        row_missing_ref[j] += confidence;
+                    } else {
+                        if ref_allele != targ_allele {
+                            row_mismatch[j] += confidence;
+                        }
                     }
                 }
             }
+            
+            // Assume globally that all states participate, unless subtracted above
+            cluster_conf_sum += confidence;
         }
+        
+        workspace.cluster_total_conf.push(cluster_conf_sum);
+
+        // Compress Mismatches -> CSR
+        for (j, &val) in row_mismatch.iter().enumerate().take(n_states) {
+            if val > 0.0 {
+                workspace.mismatch_vals.push(val);
+                workspace.mismatch_cols.push(j as u16);
+            }
+        }
+        workspace.mismatch_row_offsets.push(workspace.mismatch_vals.len());
+
+        // Compress Missing Ref -> CSR
+        for (j, &val) in row_missing_ref.iter().enumerate().take(n_states) {
+            if val > 0.0 {
+                workspace.missing_ref_vals.push(val);
+                workspace.missing_ref_cols.push(j as u16);
+            }
+        }
+        workspace.missing_ref_row_offsets.push(workspace.missing_ref_vals.len());
     }
 }
 
@@ -1574,7 +1615,7 @@ impl ImputationPipeline {
                                 let actual_n_states = imp_states.ibs_states_cluster(local_h, &mut hap_indices);
 
                                 // Reuse workspace buffers for cluster mismatches (avoids allocation)
-                                workspace.ensure_cluster_buffers(n_clusters, actual_n_states);
+                                workspace.reset_and_ensure_capacity(n_clusters, actual_n_states);
                                 compute_cluster_mismatches_into_workspace(
                                     &hap_indices,
                                     &cluster_bounds,
@@ -1595,8 +1636,13 @@ impl ImputationPipeline {
                                 };
                                 let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) =
                                     run_hmm_forward_backward_to_sparse(
-                                        &workspace.cluster_mismatches[..n_clusters],
-                                        &workspace.cluster_non_missing[..n_clusters],
+                                        &workspace.mismatch_vals,
+                                        &workspace.mismatch_cols,
+                                        &workspace.mismatch_row_offsets,
+                                        &workspace.missing_ref_vals,
+                                        &workspace.missing_ref_cols,
+                                        &workspace.missing_ref_row_offsets,
+                                        &workspace.cluster_total_conf,
                                         &cluster_p_recomb,
                                         base_err_rate,
                                         actual_n_states,
@@ -2154,8 +2200,13 @@ pub fn run_hmm_forward_backward_clusters(
 /// * `fwd_buffer` - Pre-allocated forward probabilities buffer (will be resized)
 /// * `bwd_buffer` - Pre-allocated backward probabilities buffer (will be resized)
 pub fn run_hmm_forward_backward_to_sparse(
-    cluster_mismatches: &[Vec<f32>],
-    cluster_non_missing: &[Vec<f32>],
+    mismatch_vals: &[f32],
+    mismatch_cols: &[u16],
+    mismatch_row_offsets: &[usize],
+    missing_ref_vals: &[f32],
+    missing_ref_cols: &[u16],
+    missing_ref_row_offsets: &[usize],
+    cluster_total_conf: &[f32],
     p_recomb: &[f32],
     base_err_rate: f32,
     n_states: usize,
@@ -2164,15 +2215,15 @@ pub fn run_hmm_forward_backward_to_sparse(
     fwd_buffer: &mut Vec<f32>,
     bwd_buffer: &mut Vec<f32>,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
-    use wide::f32x8;
+    // use wide::f32x8;
 
-    let n_clusters = cluster_mismatches.len();
+    let n_clusters = cluster_total_conf.len();
     if n_clusters == 0 {
         return (vec![0], Vec::new(), Vec::new(), Vec::new());
     }
 
     // Checkpoint interval for memory efficiency
-    const CHECKPOINT_INTERVAL: usize = 64;
+    const CHECKPOINT_INTERVAL: usize = 10000;
     let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
 
     let p_err = base_err_rate.clamp(1e-8, 0.5);
@@ -2181,9 +2232,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     let log_p_no_err = p_no_err.ln();
 
     // Precompute emission table for integer counts (confidence = 1.0 case)
-    // emit = p_no_err^matches * p_err^mismatches = p_no_err^n_obs * (p_err/p_no_err)^mism
-    // This eliminates exp() calls for the common case where confidence is 1.0
-    const MAX_TABLE_SIZE: usize = 64; // Covers typical cluster sizes
+    const MAX_TABLE_SIZE: usize = 64;
     let err_ratio = p_err / p_no_err;
     let mut pow_no_err = [0.0f32; MAX_TABLE_SIZE];
     let mut err_ratio_pow = [0.0f32; MAX_TABLE_SIZE];
@@ -2194,44 +2243,6 @@ pub fn run_hmm_forward_backward_to_sparse(
         err_ratio_pow[i] = err_ratio_pow[i - 1] * err_ratio;
     }
 
-    // Fast emission computation using precomputed table when counts are integers
-    #[inline(always)]
-    fn compute_emit_fast(
-        mism: f32,
-        n_obs: f32,
-        pow_no_err: &[f32; MAX_TABLE_SIZE],
-        err_ratio_pow: &[f32; MAX_TABLE_SIZE],
-        log_p_no_err: f32,
-        log_p_err: f32,
-    ) -> f32 {
-        if n_obs <= 0.0 {
-            return 1.0;
-        }
-        let mism = mism.min(n_obs);
-
-        // Check if counts are close to integers (confidence = 1.0 case)
-        let n_obs_i = n_obs.round() as usize;
-        let mism_i = mism.round() as usize;
-        if n_obs_i < MAX_TABLE_SIZE
-            && mism_i < MAX_TABLE_SIZE
-            && (n_obs - n_obs_i as f32).abs() < 0.01
-            && (mism - mism_i as f32).abs() < 0.01
-        {
-            // Fast path: table lookup, no exp()
-            pow_no_err[n_obs_i] * err_ratio_pow[mism_i]
-        } else {
-            // Slow path: fractional counts, need exp()
-            let match_count = (n_obs - mism).max(0.0);
-            let log_em = match_count * log_p_no_err + mism * log_p_err;
-            log_em.max(-80.0).exp()
-        }
-    }
-
-    // Wrapper for the compute_emit_fast that captures the tables
-    let compute_emit = |mism: f32, n_obs: f32| -> f32 {
-        compute_emit_fast(mism, n_obs, &pow_no_err, &err_ratio_pow, log_p_no_err, log_p_err)
-    };
-
     // Allocate checkpoint storage + working buffers
     // Layout: [checkpoints...][curr_row][prev_row]
     let fwd = fwd_buffer;
@@ -2239,7 +2250,11 @@ pub fn run_hmm_forward_backward_to_sparse(
     let curr_base = n_checkpoints * n_states;
     let prev_base = curr_base + n_states;
 
-    // Store forward sums for recomputation during backward pass
+    // Reuse bwd buffer for backwards pass, but we handle it later.
+    // We need a temporary buffer for emissions if we want to vectorize?
+    // Actually we apply emissions in-place to the transition result.
+
+    // Store forward sums
     let mut fwd_sums = vec![1.0f32; n_clusters];
 
     // ========== FORWARD PASS: compute and checkpoint ==========
@@ -2250,109 +2265,129 @@ pub fn run_hmm_forward_backward_to_sparse(
         let shift = p_rec / n_states as f32;
         let scale = (1.0 - p_rec) / last_sum.max(1e-30);
 
-        let mismatches = &cluster_mismatches[m];
-        let non_missing = &cluster_non_missing[m];
-
-        // Swap curr/prev (conceptually - we use indices)
-        let (curr_off, prev_off) = if m % 2 == 0 {
+        // Swap curr/prev concept
+        let (curr_off, _) = if m % 2 == 0 {
             (curr_base, prev_base)
         } else {
             (prev_base, curr_base)
         };
 
+        // Initialize transition values
         if m == 0 {
-            // First marker: emit * prior, SIMD optimized
-            let prior = 1.0 / n_states as f32;
-            let n_emit = n_states.min(mismatches.len()).min(non_missing.len());
-            let mism_slice = &mismatches[..n_emit];
-            let nobs_slice = &non_missing[..n_emit];
-
-            let prior_vec = f32x8::splat(prior);
-            let mut sum_vec = f32x8::splat(0.0);
-
-            let mut k = 0;
-            while k + 8 <= n_emit {
-                let emit_arr = [
-                    compute_emit(mism_slice[k], nobs_slice[k]),
-                    compute_emit(mism_slice[k+1], nobs_slice[k+1]),
-                    compute_emit(mism_slice[k+2], nobs_slice[k+2]),
-                    compute_emit(mism_slice[k+3], nobs_slice[k+3]),
-                    compute_emit(mism_slice[k+4], nobs_slice[k+4]),
-                    compute_emit(mism_slice[k+5], nobs_slice[k+5]),
-                    compute_emit(mism_slice[k+6], nobs_slice[k+6]),
-                    compute_emit(mism_slice[k+7], nobs_slice[k+7]),
-                ];
-                let emit_vec = f32x8::from(emit_arr);
-                let res = emit_vec * prior_vec;
-                let res_arr: [f32; 8] = res.into();
-                fwd[curr_off + k..curr_off + k + 8].copy_from_slice(&res_arr);
-                sum_vec += res;
-                k += 8;
-            }
-
-            let mut sum = sum_vec.reduce_add();
-            for i in k..n_emit {
-                let em = compute_emit(mism_slice[i], nobs_slice[i]);
-                let val = em * prior;
-                fwd[curr_off + i] = val;
-                sum += val;
-            }
-            last_sum = sum.max(1e-30);
+            // First step: uniform prior (implicit transition from start)
+            // But we must apply Emission(0).
+            // Emission(0) = BaseEmit * Penaltys.
+            // BaseEmit = P(NoErr)^TotalConf
+            let total_conf = cluster_total_conf[m];
+            
+            // Calculate Base Emission
+            let base_emit = if total_conf < MAX_TABLE_SIZE as f32 && (total_conf - total_conf.round()).abs() < 0.01 {
+                pow_no_err[total_conf as usize]
+            } else {
+                (total_conf * log_p_no_err).exp()
+            };
+            
+            // Distribute Base Uniformly
+            let val = base_emit / n_states as f32;
+            fwd[curr_off..curr_off+n_states].fill(val);
         } else {
-            let n_emit = n_states.min(mismatches.len()).min(non_missing.len());
-            let mism_slice = &mismatches[..n_emit];
-            let nobs_slice = &non_missing[..n_emit];
+            // Standard transition: emit * (scale * prev + shift)
+            // We apply (scale * prev + shift) first using SIMD
+            // Transition + Base Emission
+            // Calculate base emission for this cluster
+            let total_conf = cluster_total_conf[m];
+            let base_emit = if total_conf < MAX_TABLE_SIZE as f32 && (total_conf - total_conf.round()).abs() < 0.01 {
+                pow_no_err[total_conf as usize]
+            } else {
+                (total_conf * log_p_no_err).exp()
+            };
 
-            let shift_vec = f32x8::splat(shift);
-            let scale_vec = f32x8::splat(scale);
-            let mut sum_vec = f32x8::splat(0.0);
+            let (lower, upper) = fwd.split_at_mut(prev_base);
+            // lower: [0..prev_base], upper: [prev_base..]
+            // curr_base is inside lower. prev_base is start of upper.
+            
+            let (curr_slice, prev_slice) = if m % 2 == 0 {
+                // curr at curr_base (in lower), prev at prev_base (in upper)
+                (&mut lower[curr_base..curr_base+n_states], &upper[..n_states])
+            } else {
+                // curr at prev_base (in upper), prev at curr_base (in lower)
+                (&mut upper[..n_states], &lower[curr_base..curr_base+n_states])
+            };
 
-            let mut k = 0;
-            while k + 8 <= n_emit {
-                let emit_arr = [
-                    compute_emit(mism_slice[k], nobs_slice[k]),
-                    compute_emit(mism_slice[k+1], nobs_slice[k+1]),
-                    compute_emit(mism_slice[k+2], nobs_slice[k+2]),
-                    compute_emit(mism_slice[k+3], nobs_slice[k+3]),
-                    compute_emit(mism_slice[k+4], nobs_slice[k+4]),
-                    compute_emit(mism_slice[k+5], nobs_slice[k+5]),
-                    compute_emit(mism_slice[k+6], nobs_slice[k+6]),
-                    compute_emit(mism_slice[k+7], nobs_slice[k+7]),
-                ];
-                let emit_vec = f32x8::from(emit_arr);
-                let prev_arr: [f32; 8] = fwd[prev_off + k..prev_off + k + 8].try_into().unwrap();
-                let prev_vec = f32x8::from(prev_arr);
-                let res = emit_vec * (scale_vec * prev_vec + shift_vec);
-                let res_arr: [f32; 8] = res.into();
-                fwd[curr_off + k..curr_off + k + 8].copy_from_slice(&res_arr);
-                sum_vec += res;
-                k += 8;
+            for (p, c) in prev_slice.iter().zip(curr_slice.iter_mut()) {
+                *c = base_emit * (scale * p + shift);
             }
+        }
+        
+        // Improve slice access for next steps to avoid borrow conflict
+        // We only need curr_slice mutably now.
+        // We can just re-borrow from fwd using the calculated offset.
+        let curr_slice = &mut fwd[curr_off..curr_off+n_states];
 
-            let mut sum = sum_vec.reduce_add();
-            for i in k..n_emit {
-                let em = compute_emit(mism_slice[i], nobs_slice[i]);
-                let val = em * (scale * fwd[prev_off + i] + shift);
-                fwd[curr_off + i] = val;
-                sum += val;
+        // Apply Sparse Mismatch Penalties: * (P(Err)/P(NoErr))^Count
+        let start_mismatch = mismatch_row_offsets[m];
+        let end_mismatch = mismatch_row_offsets[m+1];
+        for i in start_mismatch..end_mismatch {
+            let col = mismatch_cols[i] as usize;
+            let val = mismatch_vals[i];
+            if col < n_states {
+                let penalty = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                    err_ratio_pow[val as usize]
+                } else {
+                    (val * (log_p_err - log_p_no_err)).exp()
+                };
+                curr_slice[col] *= penalty;
             }
-            last_sum = sum.max(1e-30);
         }
 
-        fwd_sums[m] = last_sum;
+        // Apply Sparse Missing Ref Penalties: * (1/P(NoErr))^Count
+        // Correction: We assumed base_emit includes P(NoErr)^Total.
+        // If ref is missing, effective n_obs is Total-Missing.
+        // Currently we have P(NoErr)^Total. We need P(NoErr)^(Total-Missing).
+        // So we multiply by P(NoErr)^(-Missing) = 1 / P(NoErr)^Missing.
+        let start_missing = missing_ref_row_offsets[m];
+        let end_missing = missing_ref_row_offsets[m+1];
+        for i in start_missing..end_missing {
+            let col = missing_ref_cols[i] as usize;
+            let val = missing_ref_vals[i];
+            if col < n_states {
+                let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                    1.0 / pow_no_err[val as usize]
+                } else {
+                    (-val * log_p_no_err).exp()
+                };
+                curr_slice[col] *= correction;
+            }
+        }
 
-        // Save checkpoint at interval boundaries
-        if m % CHECKPOINT_INTERVAL == 0 {
-            let checkpoint_idx = m / CHECKPOINT_INTERVAL;
-            let checkpoint_off = checkpoint_idx * n_states;
-            let curr_off = if m % 2 == 0 { curr_base } else { prev_base };
-            // Use split_at_mut to get non-overlapping slices (checkpoints vs working buffers)
-            let (checkpoint_region, working_region) = fwd.split_at_mut(curr_base);
-            let src_off = curr_off - curr_base;
-            checkpoint_region[checkpoint_off..checkpoint_off + n_states]
-                .copy_from_slice(&working_region[src_off..src_off + n_states]);
+        // Sum and Checkpoint
+        let mut new_sum = 0.0f32;
+        for &x in &curr_slice[..n_states] {
+            new_sum += x;
+        }
+        fwd_sums[m] = new_sum;
+        last_sum = new_sum;
+
+        if (m + 1) % CHECKPOINT_INTERVAL == 0 {
+            // Save normalized checkpoint
+            let cp_idx = ((m + 1) / CHECKPOINT_INTERVAL - 1) * n_states;
+            let inv_sum = if new_sum > 1e-30 { 1.0 / new_sum } else { 0.0 };
+            
+            // Avoid conflicting borrow: split check pointers vs working area
+            let (checkpoints, working) = fwd.split_at_mut(curr_base);
+            
+            // Determine source within working area
+            // If m%2==0, curr is at curr_base (index 0 relative to working)
+            // If m%2!=0, curr is at prev_base (index n_states relative to working)
+            let src_off = if m % 2 == 0 { 0 } else { n_states };
+            let src = &working[src_off..src_off+n_states];
+            
+            for (i, &x) in src.iter().enumerate() {
+                checkpoints[cp_idx + i] = x * inv_sum;
+            }
         }
     }
+
 
     // ========== BACKWARD PASS: recompute forward and build sparse output ==========
     let bwd = bwd_buffer;
@@ -2379,60 +2414,67 @@ pub fn run_hmm_forward_backward_to_sparse(
             let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
             let shift = p_rec / n_states as f32;
 
-            let mismatches = &cluster_mismatches[m + 1];
-            let non_missing = &cluster_non_missing[m + 1];
-            let mism_slice = &mismatches[..n_states.min(mismatches.len())];
-            let nobs_slice = &non_missing[..n_states.min(non_missing.len())];
+            // Base Emissions for m+1
+            let total_conf = cluster_total_conf[m + 1];
+            let base_emit = if total_conf < MAX_TABLE_SIZE as f32 && (total_conf - total_conf.round()).abs() < 0.01 {
+                pow_no_err[total_conf as usize]
+            } else {
+                (total_conf * log_p_no_err).exp()
+            };
 
-            // SIMD-optimized emission multiplication
-            let n_emit = mism_slice.len();
-            let mut sum_vec = f32x8::splat(0.0);
-            let mut k = 0;
-            while k + 8 <= n_emit {
-                let emit_arr = [
-                    compute_emit(mism_slice[k], nobs_slice[k]),
-                    compute_emit(mism_slice[k+1], nobs_slice[k+1]),
-                    compute_emit(mism_slice[k+2], nobs_slice[k+2]),
-                    compute_emit(mism_slice[k+3], nobs_slice[k+3]),
-                    compute_emit(mism_slice[k+4], nobs_slice[k+4]),
-                    compute_emit(mism_slice[k+5], nobs_slice[k+5]),
-                    compute_emit(mism_slice[k+6], nobs_slice[k+6]),
-                    compute_emit(mism_slice[k+7], nobs_slice[k+7]),
-                ];
-                let emit_vec = f32x8::from(emit_arr);
-                let bwd_arr: [f32; 8] = bwd[k..k+8].try_into().unwrap();
-                let bwd_chunk = f32x8::from(bwd_arr);
-                let res = bwd_chunk * emit_vec;
-                let res_arr: [f32; 8] = res.into();
-                bwd[k..k+8].copy_from_slice(&res_arr);
-                sum_vec += res;
-                k += 8;
+            // Apply base emission to bwd
+            for x in bwd.iter_mut() {
+                *x *= base_emit;
             }
-            let mut emitted_sum = sum_vec.reduce_add();
-            for i in k..n_emit {
-                let em = compute_emit(mism_slice[i], nobs_slice[i]);
-                bwd[i] *= em;
-                emitted_sum += bwd[i];
+
+            // Apply Sparse Mismatch to bwd
+            let mism_start = mismatch_row_offsets[m+1];
+            let mism_end = mismatch_row_offsets[m+2];
+            for i in mism_start..mism_end {
+                let col = mismatch_cols[i] as usize;
+                let val = mismatch_vals[i];
+                if col < n_states {
+                     let penalty = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                        err_ratio_pow[val as usize]
+                    } else {
+                        (val * (log_p_err - log_p_no_err)).exp()
+                    };
+                    bwd[col] *= penalty;
+                }
+            }
+
+            // Apply Sparse Missing Ref to bwd
+            let mis_ref_start = missing_ref_row_offsets[m+1];
+            let mis_ref_end = missing_ref_row_offsets[m+2];
+            for i in mis_ref_start..mis_ref_end {
+                let col = missing_ref_cols[i] as usize;
+                let val = missing_ref_vals[i];
+                if col < n_states {
+                     let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                        1.0 / pow_no_err[val as usize]
+                    } else {
+                        (-val * log_p_no_err).exp()
+                    };
+                    bwd[col] *= correction;
+                }
+            }
+
+            let mut emitted_sum = 0.0f32;
+            for &x in bwd.iter() {
+                emitted_sum += x;
             }
 
             if emitted_sum > 0.0 {
                 let scale_v = (1.0 - p_rec) / emitted_sum;
-                let shift_vec = f32x8::splat(shift);
-                let scale_vec = f32x8::splat(scale_v);
-                let mut k = 0;
-                while k + 8 <= n_states {
-                    let bwd_arr: [f32; 8] = bwd[k..k+8].try_into().unwrap();
-                    let bwd_chunk = f32x8::from(bwd_arr);
-                    let res = scale_vec * bwd_chunk + shift_vec;
-                    let res_arr: [f32; 8] = res.into();
-                    bwd[k..k+8].copy_from_slice(&res_arr);
-                    k += 8;
-                }
-                for i in k..n_states {
-                    bwd[i] = scale_v * bwd[i] + shift;
+                // Transition logic: NewBwd[i] = Scale * Bwd[i] + Shift
+                // Note: Emitted Bwd[i] is effectively P(obs|next) * Beta(next)
+                // We just computed that in-place in bwd.
+                // Now apply transition backward.
+                for x in bwd.iter_mut() {
+                    *x = scale_v * *x + shift;
                 }
             } else {
-                bwd[..n_states].fill(1.0 / n_states as f32);
+                bwd.fill(1.0 / n_states as f32);
             }
         }
 
@@ -2440,67 +2482,170 @@ pub fn run_hmm_forward_backward_to_sparse(
         let checkpoint_idx = m / CHECKPOINT_INTERVAL;
         let checkpoint_start = checkpoint_idx * CHECKPOINT_INTERVAL;
         let checkpoint_off = checkpoint_idx * n_states;
+        let mut recomp_sum;
+        let loop_start_m;
 
-        // Load checkpoint into prev buffer (using split_at_mut to avoid aliasing)
-        let prev_off = prev_base;
-        {
-            let (checkpoint_region, working_region) = fwd.split_at_mut(curr_base);
-            let dst_off = prev_base - curr_base;
-            working_region[dst_off..dst_off + n_states]
-                .copy_from_slice(&checkpoint_region[checkpoint_off..checkpoint_off + n_states]);
-        }
-        let mut recomp_sum = fwd_sums[checkpoint_start];
-
-        // Recompute forward from checkpoint to m
-        for recomp_m in (checkpoint_start + 1)..=m {
-            let p_rec = p_recomb.get(recomp_m).copied().unwrap_or(0.0);
-            let shift = p_rec / n_states as f32;
-            let scale = (1.0 - p_rec) / recomp_sum.max(1e-30);
-
-            let mismatches = &cluster_mismatches[recomp_m];
-            let non_missing = &cluster_non_missing[recomp_m];
-            let n_emit = n_states.min(mismatches.len()).min(non_missing.len());
-
-            // SIMD-optimized forward recomputation
-            let mism_slice = &mismatches[..n_emit];
-            let nobs_slice = &non_missing[..n_emit];
-            let shift_vec = f32x8::splat(shift);
-            let scale_vec = f32x8::splat(scale);
-            let mut sum_vec = f32x8::splat(0.0);
-            let mut k = 0;
-            while k + 8 <= n_emit {
-                let emit_arr = [
-                    compute_emit(mism_slice[k], nobs_slice[k]),
-                    compute_emit(mism_slice[k+1], nobs_slice[k+1]),
-                    compute_emit(mism_slice[k+2], nobs_slice[k+2]),
-                    compute_emit(mism_slice[k+3], nobs_slice[k+3]),
-                    compute_emit(mism_slice[k+4], nobs_slice[k+4]),
-                    compute_emit(mism_slice[k+5], nobs_slice[k+5]),
-                    compute_emit(mism_slice[k+6], nobs_slice[k+6]),
-                    compute_emit(mism_slice[k+7], nobs_slice[k+7]),
-                ];
-                let emit_vec = f32x8::from(emit_arr);
-                let prev_arr: [f32; 8] = fwd[prev_off + k..prev_off + k + 8].try_into().unwrap();
-                let prev_vec = f32x8::from(prev_arr);
-                let res = emit_vec * (scale_vec * prev_vec + shift_vec);
-                let res_arr: [f32; 8] = res.into();
-                fwd[curr_base + k..curr_base + k + 8].copy_from_slice(&res_arr);
-                sum_vec += res;
-                k += 8;
+        if checkpoint_idx == 0 {
+            // First interval: Re-initialize m=0 from Prior
+            let total_conf = cluster_total_conf[0];
+            let base_emit = if total_conf < MAX_TABLE_SIZE as f32 && (total_conf - total_conf.round()).abs() < 0.01 {
+                pow_no_err[total_conf as usize]
+            } else {
+                (total_conf * log_p_no_err).exp()
+            };
+            
+            // Initialize at prev_base (which acts as "curr" for m=0 in this context, 
+            // because loop expects "prev" to be ready for m=1)
+            // Wait, loop uses prev_base -> curr_base.
+            // If we want to simulate m=0 done, we need result at prev_base?
+            // "Copy curr to prev for next iteration" copies curr_base -> prev_base.
+            // So we want result of m=0 at prev_base.
+            
+            let (_, upper) = fwd.split_at_mut(prev_base);
+            // upper is [prev_base..]
+            let curr_slice = &mut upper[..n_states];
+            
+            let val = base_emit / n_states as f32;
+            curr_slice.fill(val);
+            
+            // Apply CSR Mismatch m=0
+             let mism_start = mismatch_row_offsets[0];
+            let mism_end = mismatch_row_offsets[1];
+            for i in mism_start..mism_end {
+                let col = mismatch_cols[i] as usize;
+                let val = mismatch_vals[i];
+                if col < n_states {
+                     let penalty = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                        err_ratio_pow[val as usize]
+                    } else {
+                        (val * (log_p_err - log_p_no_err)).exp()
+                    };
+                    curr_slice[col] *= penalty;
+                }
             }
-            let mut sum = sum_vec.reduce_add();
-            for i in k..n_emit {
-                let em = compute_emit(mism_slice[i], nobs_slice[i]);
-                let val = em * (scale * fwd[prev_off + i] + shift);
-                fwd[curr_base + i] = val;
-                sum += val;
+             // Apply CSR Missing Ref m=0
+             let mis_ref_start = missing_ref_row_offsets[0];
+            let mis_ref_end = missing_ref_row_offsets[1];
+            for i in mis_ref_start..mis_ref_end {
+                let col = missing_ref_cols[i] as usize;
+                let val = missing_ref_vals[i];
+                if col < n_states {
+                     let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                        1.0 / pow_no_err[val as usize]
+                    } else {
+                        (-val * log_p_no_err).exp()
+                    };
+                    curr_slice[col] *= correction;
+                }
+            }
+            
+            // Sum m=0
+             let mut sum = 0.0f32;
+            for &x in curr_slice.iter() {
+                sum += x;
             }
             recomp_sum = sum.max(1e-30);
+            
+            loop_start_m = 1;
+        } else {
+             // Load checkpoint
+            let checkpoint_off = checkpoint_idx * n_states;
+            {
+                let (checkpoint_region, working_region) = fwd.split_at_mut(curr_base);
+                let dst_off = prev_base - curr_base;
+                working_region[dst_off..dst_off + n_states]
+                    .copy_from_slice(&checkpoint_region[checkpoint_off..checkpoint_off + n_states]);
+            }
+            recomp_sum = fwd_sums[checkpoint_start];
+            loop_start_m = checkpoint_start;
+        }
 
-            // Copy curr to prev for next iteration (using split_at_mut to avoid aliasing)
+        // Recompute forward from checkpoint to m
+        for recomp_m in loop_start_m..=m {
+            let p_rec = p_recomb.get(recomp_m).copied().unwrap_or(0.0);
+            let shift = p_rec / n_states as f32;
+            
+            // Adjust scale: if loading from normalized checkpoint, do NOT divide by sum
+            let adjust_scale = if recomp_m == checkpoint_start && checkpoint_idx > 0 {
+                1.0
+            } else {
+                1.0 / recomp_sum.max(1e-30)
+            };
+            let scale = (1.0 - p_rec) * adjust_scale;
+
+            let mism_start = mismatch_row_offsets[recomp_m];
+            let mism_end = mismatch_row_offsets[recomp_m + 1];
+            let mis_ref_start = missing_ref_row_offsets[recomp_m];
+            let mis_ref_end = missing_ref_row_offsets[recomp_m + 1];
+
+           // Base Emission
+            let total_conf = cluster_total_conf[recomp_m];
+            let base_emit = if total_conf < MAX_TABLE_SIZE as f32 && (total_conf - total_conf.round()).abs() < 0.01 {
+                pow_no_err[total_conf as usize]
+            } else {
+                (total_conf * log_p_no_err).exp()
+            };
+
+            let (lower, upper) = fwd.split_at_mut(prev_base);
+            let (curr_slice, prev_slice) = if recomp_m % 2 == 0 {
+                 (&mut lower[curr_base..curr_base+n_states], &upper[..n_states])
+            } else {
+                 (&mut upper[..n_states], &lower[curr_base..curr_base+n_states])
+            };
+
+            // Transition + Base Emission
+            for (p, c) in prev_slice.iter().zip(curr_slice.iter_mut()) {
+                *c = base_emit * (scale * p + shift);
+            }
+
+            // Apply Sparse Mismatch Penalties
+            for i in mism_start..mism_end {
+                let col = mismatch_cols[i] as usize;
+                let val = mismatch_vals[i];
+                if col < n_states {
+                     let penalty = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                        err_ratio_pow[val as usize]
+                    } else {
+                        (val * (log_p_err - log_p_no_err)).exp()
+                    };
+                    curr_slice[col] *= penalty;
+                }
+            }
+             // Apply Sparse Missing Ref Penalties
+            for i in mis_ref_start..mis_ref_end {
+                let col = missing_ref_cols[i] as usize;
+                let val = missing_ref_vals[i];
+                if col < n_states {
+                     let correction = if val < MAX_TABLE_SIZE as f32 && (val - val.round()).abs() < 0.01 {
+                        1.0 / pow_no_err[val as usize]
+                    } else {
+                        (-val * log_p_no_err).exp()
+                    };
+                    curr_slice[col] *= correction;
+                }
+            }
+
+             let mut new_sum = 0.0f32;
+            for &x in &curr_slice[..n_states] {
+                new_sum += x;
+            }
+            recomp_sum = new_sum.max(1e-30);
+
+            // Copy curr to prev for next iteration
             if recomp_m < m {
+                // We just computed into curr_base. Next iter needs it in prev_off
                 let (first, second) = fwd.split_at_mut(prev_base);
-                second[..n_states].copy_from_slice(&first[curr_base..curr_base + n_states]);
+                // prev_base > curr_base usually
+                if prev_base > curr_base {
+                     // fwd layout: [checkpoints][curr][prev]
+                     // copy curr -> prev
+                     let src = &first[curr_base..curr_base+n_states];
+                     second[0..n_states].copy_from_slice(src);
+                } else {
+                    // unexpected layout, but let's trust offsets
+                     let (left, right) = fwd.split_at_mut(curr_base);
+                     left[prev_base..prev_base+n_states].copy_from_slice(&right[0..n_states]);
+                }
             }
         }
 
@@ -2599,9 +2744,7 @@ mod tests {
         (mismatches, non_missing)
     }
 
-    // =========================================================================
-    // AllelePosteriors Tests - RIGOROUS
-    // =========================================================================
+    // AllelePosteriors Tests 
 
     #[test]
     fn test_biallelic_prob_exact_math() {
