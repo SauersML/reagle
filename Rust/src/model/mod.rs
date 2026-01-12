@@ -48,6 +48,7 @@ pub mod imp_ibs;
 pub mod imp_states_cluster;
 pub mod parameters;
 pub mod pbwt;
+pub mod pbwt_streaming;
 pub mod phase_ibs;
 pub mod phase_states;
 pub mod states;
