@@ -31,6 +31,9 @@ pub struct PbwtDivUpdater {
     scratch_a: Vec<u32>,
     /// Scratch divergence array for double buffering
     scratch_d: Vec<i32>,
+    /// Pre-permuted alleles: permuted_alleles[i] = alleles[prefix[i]]
+    /// Converts random-access gather to sequential access for counting and scatter
+    permuted_alleles: Vec<u8>,
     /// Propagation array for tracking max/min divergence across alleles
     p: Vec<i32>,
     /// Helper for counting sort: counts per allele
@@ -49,6 +52,7 @@ impl PbwtDivUpdater {
             d: Vec::new(),
             scratch_a: Vec::new(),
             scratch_d: Vec::new(),
+            permuted_alleles: Vec::new(),
             p: vec![0; max_alleles],
             counts: vec![0; max_alleles],
             offsets: vec![0; max_alleles + 1],
@@ -61,10 +65,11 @@ impl PbwtDivUpdater {
             self.counts.resize(n_alleles, 0);
             self.offsets.resize(n_alleles + 1, 0);
         }
-        
+
         if self.scratch_a.len() < self.n_haps {
              self.scratch_a.resize(self.n_haps, 0);
              self.scratch_d.resize(self.n_haps, 0);
+             self.permuted_alleles.resize(self.n_haps, 0);
              // Also initialize 'a' and 'd' if empty (lazy init)
              if self.a.is_empty() {
                  self.a.resize(self.n_haps, 0);
@@ -117,12 +122,18 @@ impl PbwtDivUpdater {
         let n_bins = n_alleles + 1;
         self.ensure_capacity(n_bins);
 
-        // 1. Count frequencies of each allele (Counting Sort Phase 1)
+        // 0. Pre-permute alleles: gather alleles[prefix[i]] into contiguous buffer.
+        // This converts subsequent random-access patterns to sequential access.
+        // Single gather pass here enables two sequential passes below.
+        for i in 0..self.n_haps {
+            self.permuted_alleles[i] = alleles[prefix[i] as usize];
+        }
+
+        // 1. Count frequencies of each allele (Counting Sort Phase 1) - now sequential access
         self.counts[..n_bins].fill(0);
 
         for i in 0..self.n_haps {
-            let hap = prefix[i];
-            let allele = alleles[hap as usize] as usize;
+            let allele = self.permuted_alleles[i] as usize;
             // Map missing/invalid alleles to the dedicated missing bin
             let bin = if allele >= n_alleles { n_alleles } else { allele };
             self.counts[bin] += 1;
@@ -145,8 +156,7 @@ impl PbwtDivUpdater {
         self.p[..n_bins].fill(init_value);
 
         // 5. Scatter to scratch buffers with p propagation (Counting Sort Phase 3)
-        // This single pass matches Java's loop exactly:
-        //   propagate p -> store -> reset p[allele]
+        // Now uses permuted_alleles for sequential access instead of random gather
         if n_alleles == 2 && !has_missing {
             // Fast biallelic path when no missing data - only 2 bins needed
             // This is the common case and avoids the 3rd comparison per haplotype
@@ -160,7 +170,7 @@ impl PbwtDivUpdater {
             for i in 0..self.n_haps {
                 let hap = prefix[i];
                 let div = divergence[i];
-                let allele = alleles[hap as usize];
+                let allele = self.permuted_alleles[i]; // Sequential access
 
                 // Propagate max to both bins
                 if div > p0 { p0 = div; }
@@ -195,7 +205,7 @@ impl PbwtDivUpdater {
             for i in 0..self.n_haps {
                 let hap = prefix[i];
                 let div = divergence[i];
-                let allele = alleles[hap as usize];
+                let allele = self.permuted_alleles[i]; // Sequential access
 
                 // Propagate max to all bins - this is essential for correctness
                 // The divergence must propagate through all allele bins
@@ -233,7 +243,7 @@ impl PbwtDivUpdater {
             for i in 0..self.n_haps {
                 let hap = prefix[i];
                 let div = divergence[i];
-                let allele = alleles[hap as usize] as usize;
+                let allele = self.permuted_alleles[i] as usize; // Sequential access
                 // Map missing/invalid alleles to the dedicated missing bin
                 let bin = if allele >= n_alleles { n_alleles } else { allele };
 
@@ -258,7 +268,7 @@ impl PbwtDivUpdater {
             }
         }
 
-        // 5. Copy back
+        // 6. Copy back
         prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
         divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
     }
@@ -302,6 +312,12 @@ impl PbwtDivUpdater {
         let n_bins = n_alleles + 1;
         self.ensure_capacity(n_bins);
 
+        // 0. Pre-permute alleles: gather alleles[prefix[i]] into contiguous buffer.
+        // This converts subsequent random-access patterns to sequential access.
+        for i in 0..self.n_haps {
+            self.permuted_alleles[i] = alleles[prefix[i] as usize];
+        }
+
         // 1. Initialize p array for backward PBWT
         //
         // Java uses marker-1 for initialization. This correctly handles allele boundaries:
@@ -310,11 +326,10 @@ impl PbwtDivUpdater {
         // suggest they match indefinitely.
         let init_value = (marker as i32) - 1;
 
-        // 2. Count frequencies
+        // 2. Count frequencies - now sequential access via permuted_alleles
         self.counts[..n_bins].fill(0);
         for i in 0..self.n_haps {
-            let hap = prefix[i];
-            let allele = alleles[hap as usize] as usize;
+            let allele = self.permuted_alleles[i] as usize;
             // Map missing/invalid alleles to the dedicated missing bin
             let bin = if allele >= n_alleles { n_alleles } else { allele };
             self.counts[bin] += 1;
@@ -332,6 +347,7 @@ impl PbwtDivUpdater {
 
         // 5. Scatter with MIN propagation for backward PBWT
         // p[j] tracks the minimum divergence seen since last output for allele j
+        // Now uses permuted_alleles for sequential access
         self.counts[..n_bins].fill(0);
         self.p[..n_bins].fill(init_value);
 
@@ -347,7 +363,7 @@ impl PbwtDivUpdater {
             for i in 0..self.n_haps {
                 let hap = prefix[i];
                 let div = divergence[i];
-                let allele = alleles[hap as usize];
+                let allele = self.permuted_alleles[i]; // Sequential access
 
                 // Propagate min to both bins (backward PBWT)
                 if div < p0 { p0 = div; }
@@ -382,7 +398,7 @@ impl PbwtDivUpdater {
             for i in 0..self.n_haps {
                 let hap = prefix[i];
                 let div = divergence[i];
-                let allele = alleles[hap as usize];
+                let allele = self.permuted_alleles[i]; // Sequential access
 
                 // Propagate min to all bins (backward PBWT)
                 if div < p0 { p0 = div; }
@@ -419,7 +435,7 @@ impl PbwtDivUpdater {
             for i in 0..self.n_haps {
                 let hap = prefix[i];
                 let div = divergence[i];
-                let allele = alleles[hap as usize] as usize;
+                let allele = self.permuted_alleles[i] as usize; // Sequential access
                 // Map missing/invalid alleles to the dedicated missing bin
                 let bin = if allele >= n_alleles { n_alleles } else { allele };
 
@@ -445,7 +461,7 @@ impl PbwtDivUpdater {
             }
         }
 
-        // 5. Copy back
+        // 6. Copy back
         prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
         divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
     }
