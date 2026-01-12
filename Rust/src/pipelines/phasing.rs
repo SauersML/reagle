@@ -1738,9 +1738,8 @@ impl PhasingPipeline {
             // 2. Extract current alleles for H1 and H2
             let seq1 = ref_geno.haplotype(hap1);
             let seq2 = ref_geno.haplotype(hap2);
-            let sample_conf: Vec<f32> = (0..n_markers)
-                .map(|m| target_gt.sample_confidence_f32(MarkerIdx::new(m as u32), s))
-                .collect();
+            // Use pre-computed confidence instead of recomputing
+            let sample_conf = &confidence_by_sample[s];
 
             // 3. Run HMM with per-heterozygote swap probabilities
             // Following Java PhaseBaum2.java: interleave phase decisions in the forward pass.
