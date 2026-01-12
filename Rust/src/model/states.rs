@@ -274,6 +274,21 @@ impl MosaicCursor {
         &self.active_haps
     }
 
+    /// Reset cursor to initial state (marker 0)
+    pub fn reset(&mut self, th: &ThreadedHaps) {
+        let n = th.n_states();
+        self.active_haps.resize(n, 0);
+        self.next_switch.resize(n, 0);
+        self.cursor_indices.resize(n, 0);
+
+        for state in 0..n {
+            let head = th.state_heads[state] as usize;
+            self.active_haps[state] = th.segments_hap[head];
+            self.next_switch[state] = th.segments_end[head] as usize;
+            self.cursor_indices[state] = th.state_heads[state];
+        }
+    }
+
     fn advance_state(&mut self, state: usize, marker: usize, th: &ThreadedHaps) {
         let mut cur = self.cursor_indices[state] as usize;
 
