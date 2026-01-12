@@ -1257,13 +1257,11 @@ impl PhasingPipeline {
         n_markers: usize,
         n_haps: usize,
     ) -> BidirectionalPhaseIbs {
+        // Use bulk slice access instead of per-haplotype get() calls
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_markers);
         for m in 0..n_markers {
-            let mut alleles = Vec::with_capacity(n_haps);
-            for h in 0..n_haps {
-                alleles.push(geno.get(m, HapIdx::new(h as u32)));
-            }
-            alleles_by_marker.push(alleles);
+            let marker_slice = geno.marker_alleles(m);
+            alleles_by_marker.push(marker_slice[..n_haps].to_vec());
         }
         BidirectionalPhaseIbs::build(alleles_by_marker, n_haps, n_markers)
     }
@@ -1276,14 +1274,12 @@ impl PhasingPipeline {
         n_haps: usize,
     ) -> BidirectionalPhaseIbs {
         let n_subset = marker_indices.len();
+        // Use bulk slice access instead of per-haplotype get() calls
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
 
         for &orig_m in marker_indices {
-            let mut alleles = Vec::with_capacity(n_haps);
-            for h in 0..n_haps {
-                alleles.push(geno.get(orig_m, HapIdx::new(h as u32)));
-            }
-            alleles_by_marker.push(alleles);
+            let marker_slice = geno.marker_alleles(orig_m);
+            alleles_by_marker.push(marker_slice[..n_haps].to_vec());
         }
 
         BidirectionalPhaseIbs::build_for_subset(
