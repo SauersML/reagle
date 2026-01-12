@@ -132,11 +132,45 @@ impl PbwtDivUpdater {
         // 1. Count frequencies of each allele (Counting Sort Phase 1) - now sequential access
         self.counts[..n_bins].fill(0);
 
-        for i in 0..self.n_haps {
-            let allele = self.permuted_alleles[i] as usize;
-            // Map missing/invalid alleles to the dedicated missing bin
-            let bin = if allele >= n_alleles { n_alleles } else { allele };
-            self.counts[bin] += 1;
+        if n_alleles == 2 {
+            // Fast SIMD path for biallelic: sum bytes directly (each is 0, 1, or missing)
+            // For biallelic, byte value IS the bin index (0 or 1), so summing gives count1
+            let data = &self.permuted_alleles[..self.n_haps];
+            let mut count1 = 0usize;
+            let mut count_miss = 0usize;
+
+            // Process 32 bytes at a time using autovectorization hint
+            let chunks = data.chunks_exact(32);
+            let remainder = chunks.remainder();
+
+            for chunk in chunks {
+                for &b in chunk {
+                    if b == 1 {
+                        count1 += 1;
+                    } else if b > 1 {
+                        count_miss += 1;
+                    }
+                }
+            }
+            for &b in remainder {
+                if b == 1 {
+                    count1 += 1;
+                } else if b > 1 {
+                    count_miss += 1;
+                }
+            }
+
+            self.counts[0] = self.n_haps - count1 - count_miss;
+            self.counts[1] = count1;
+            self.counts[n_alleles] = count_miss; // Missing bin
+        } else {
+            // General path for multiallelic
+            for i in 0..self.n_haps {
+                let allele = self.permuted_alleles[i] as usize;
+                // Map missing/invalid alleles to the dedicated missing bin
+                let bin = if allele >= n_alleles { n_alleles } else { allele };
+                self.counts[bin] += 1;
+            }
         }
 
         // 2. Compute Offsets (Counting Sort Phase 2)
@@ -328,11 +362,44 @@ impl PbwtDivUpdater {
 
         // 2. Count frequencies - now sequential access via permuted_alleles
         self.counts[..n_bins].fill(0);
-        for i in 0..self.n_haps {
-            let allele = self.permuted_alleles[i] as usize;
-            // Map missing/invalid alleles to the dedicated missing bin
-            let bin = if allele >= n_alleles { n_alleles } else { allele };
-            self.counts[bin] += 1;
+
+        if n_alleles == 2 {
+            // Fast path for biallelic: sum bytes directly
+            let data = &self.permuted_alleles[..self.n_haps];
+            let mut count1 = 0usize;
+            let mut count_miss = 0usize;
+
+            // Process 32 bytes at a time using autovectorization hint
+            let chunks = data.chunks_exact(32);
+            let remainder = chunks.remainder();
+
+            for chunk in chunks {
+                for &b in chunk {
+                    if b == 1 {
+                        count1 += 1;
+                    } else if b > 1 {
+                        count_miss += 1;
+                    }
+                }
+            }
+            for &b in remainder {
+                if b == 1 {
+                    count1 += 1;
+                } else if b > 1 {
+                    count_miss += 1;
+                }
+            }
+
+            self.counts[0] = self.n_haps - count1 - count_miss;
+            self.counts[1] = count1;
+            self.counts[n_alleles] = count_miss;
+        } else {
+            // General path for multiallelic
+            for i in 0..self.n_haps {
+                let allele = self.permuted_alleles[i] as usize;
+                let bin = if allele >= n_alleles { n_alleles } else { allele };
+                self.counts[bin] += 1;
+            }
         }
 
         // 3. Compute Offsets
