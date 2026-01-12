@@ -1349,7 +1349,11 @@ def stage_impute5():
     if not impute5_out.exists():
         print("Running IMPUTE5...")
         try:
-            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r chr22 --buffer-region chr22 --o {impute5_out} --threads 4")
+            # IMPUTE5 requires specific region format chr:start-end
+            contig_len = get_contig_length(paths['ref_vcf'], "22")
+            region_arg = f"chr22:1-{contig_len}" if contig_len else "chr22"
+            
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r {region_arg} --buffer-region {region_arg} --o {impute5_out} --threads 4")
             run(f"bcftools index -f {impute5_out}")
         except Exception as e:
             print(f"IMPUTE5 failed: {e}")
@@ -1383,7 +1387,10 @@ def stage_minimac():
     if not minimac_out.exists():
         print("Running Minimac4...")
         try:
-            run(f"{minimac_bin} {paths['ref_vcf']} {paths['input_vcf']} --output {data_dir}/minimac_imputed.dose.vcf.gz --threads 4 --format GT,DS --region chr22")
+            contig_len = get_contig_length(paths['ref_vcf'], "22")
+            region_arg = f"chr22:1-{contig_len}" if contig_len else "chr22"
+            
+            run(f"{minimac_bin} {paths['ref_vcf']} {paths['input_vcf']} --output {data_dir}/minimac_imputed.dose.vcf.gz --threads 4 --format GT,DS --region {region_arg}")
             # Minimac outputs to .dose.vcf.gz
             if (data_dir / "minimac_imputed.dose.vcf.gz").exists():
                 run(f"mv {data_dir}/minimac_imputed.dose.vcf.gz {minimac_out}")
@@ -1415,7 +1422,7 @@ def stage_glimpse():
     if not glimpse_out.exists():
         print("Running GLIMPSE...")
         try:
-            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region chr22 --output {data_dir}/glimpse_imputed.bcf --threads 4")
+            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region chr22 --output-region chr22 --output {data_dir}/glimpse_imputed.bcf --threads 4")
             run(f"bcftools view {data_dir}/glimpse_imputed.bcf -O z -o {glimpse_out}")
             run(f"bcftools index -f {glimpse_out}")
         except Exception as e:
@@ -1444,6 +1451,24 @@ def get_chr_paths(chrom):
         'input_vcf': data_dir / "input.vcf.gz",
         'reagle_bin': project_dir / "target" / "release" / "reagle",
     }
+
+
+def get_contig_length(vcf_path, chrom):
+    """Get the length of a chromosome from a VCF index."""
+    try:
+        # bcftools index -s returns: chrom length ...
+        result = run(f"bcftools index -s {vcf_path}", capture=True)
+        for line in result.stdout.strip().split('\n'):
+            parts = line.split('\t')
+            if parts[0] == f"chr{chrom}" or parts[0] == str(chrom):
+                return int(parts[1])
+        # Fallback if not found in index, try query (slower)
+        # Or just return a safe large number if strictly needed, but better to fail
+        print(f"Warning: Could not find length for chr{chrom} in {vcf_path} index")
+        return None
+    except Exception as e:
+        print(f"Warning: Error getting contig length: {e}")
+        return None
 
 
 def stage_prepare_chr(chrom):
@@ -1602,7 +1627,10 @@ def run_impute5_chr(chrom, paths):
         try:
             # IMPUTE5 requires an indexed reference and map file usually, but minimal example:
             # --h reference --g input --r region --o output
-            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r chr{chrom} --buffer-region chr{chrom} --o {out} --threads 4")
+            contig_len = get_contig_length(paths['ref_vcf'], chrom)
+            region_arg = f"chr{chrom}:1-{contig_len}" if contig_len else f"chr{chrom}"
+            
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
             run(f"bcftools index -f {out}")
         except Exception as e:
             print(f"IMPUTE5 failed on chr{chrom}: {e}")
@@ -1656,7 +1684,10 @@ def run_minimac_chr(chrom, paths):
         try:
             prefix = data_dir / "minimac_imputed"
             # Minimac4: --refHaps ref.vcf --haps input.vcf --prefix out --region chr
-            run(f"{minimac_bin} {paths['ref_vcf']} {paths['input_vcf']} --output {prefix}.dose.vcf.gz --threads 4 --format GT,DS --region chr{chrom}")
+            contig_len = get_contig_length(paths['ref_vcf'], chrom)
+            region_arg = f"chr{chrom}:1-{contig_len}" if contig_len else f"chr{chrom}"
+            
+            run(f"{minimac_bin} {paths['ref_vcf']} {paths['input_vcf']} --output {prefix}.dose.vcf.gz --threads 4 --format GT,DS --region {region_arg}")
             
             # Helper to move output
             dose_out = data_dir / "minimac_imputed.dose.vcf.gz"
@@ -1690,7 +1721,7 @@ def run_glimpse_chr(chrom, paths):
         try:
             # GLIMPSE2_phase: --input-gl input.vcf --reference ref.vcf --input-region chr --output out.bcf
             bcf_out = data_dir / "glimpse_imputed.bcf"
-            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region chr{chrom} --output {bcf_out} --threads 4")
+            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region chr{chrom} --output-region chr{chrom} --output {bcf_out} --threads 4")
             run(f"bcftools view {bcf_out} -O z -o {out}")
             run(f"bcftools index -f {out}")
         except Exception as e:
