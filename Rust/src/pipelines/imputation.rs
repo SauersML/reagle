@@ -2180,13 +2180,57 @@ pub fn run_hmm_forward_backward_to_sparse(
     let log_p_err = p_err.ln();
     let log_p_no_err = p_no_err.ln();
 
-    #[inline(always)]
-    fn compute_emit(mism: f32, n_obs: f32, log_p_no_err: f32, log_p_err: f32) -> f32 {
-        let mism = mism.min(n_obs);
-        let match_count = (n_obs - mism).max(0.0);
-        let log_em = match_count * log_p_no_err + mism * log_p_err;
-        if n_obs > 0.0 { log_em.max(-80.0).exp() } else { 1.0 }
+    // Precompute emission table for integer counts (confidence = 1.0 case)
+    // emit = p_no_err^matches * p_err^mismatches = p_no_err^n_obs * (p_err/p_no_err)^mism
+    // This eliminates exp() calls for the common case where confidence is 1.0
+    const MAX_TABLE_SIZE: usize = 64; // Covers typical cluster sizes
+    let err_ratio = p_err / p_no_err;
+    let mut pow_no_err = [0.0f32; MAX_TABLE_SIZE];
+    let mut err_ratio_pow = [0.0f32; MAX_TABLE_SIZE];
+    pow_no_err[0] = 1.0;
+    err_ratio_pow[0] = 1.0;
+    for i in 1..MAX_TABLE_SIZE {
+        pow_no_err[i] = pow_no_err[i - 1] * p_no_err;
+        err_ratio_pow[i] = err_ratio_pow[i - 1] * err_ratio;
     }
+
+    // Fast emission computation using precomputed table when counts are integers
+    #[inline(always)]
+    fn compute_emit_fast(
+        mism: f32,
+        n_obs: f32,
+        pow_no_err: &[f32; MAX_TABLE_SIZE],
+        err_ratio_pow: &[f32; MAX_TABLE_SIZE],
+        log_p_no_err: f32,
+        log_p_err: f32,
+    ) -> f32 {
+        if n_obs <= 0.0 {
+            return 1.0;
+        }
+        let mism = mism.min(n_obs);
+
+        // Check if counts are close to integers (confidence = 1.0 case)
+        let n_obs_i = n_obs.round() as usize;
+        let mism_i = mism.round() as usize;
+        if n_obs_i < MAX_TABLE_SIZE
+            && mism_i < MAX_TABLE_SIZE
+            && (n_obs - n_obs_i as f32).abs() < 0.01
+            && (mism - mism_i as f32).abs() < 0.01
+        {
+            // Fast path: table lookup, no exp()
+            pow_no_err[n_obs_i] * err_ratio_pow[mism_i]
+        } else {
+            // Slow path: fractional counts, need exp()
+            let match_count = (n_obs - mism).max(0.0);
+            let log_em = match_count * log_p_no_err + mism * log_p_err;
+            log_em.max(-80.0).exp()
+        }
+    }
+
+    // Wrapper for the compute_emit_fast that captures the tables
+    let compute_emit = |mism: f32, n_obs: f32| -> f32 {
+        compute_emit_fast(mism, n_obs, &pow_no_err, &err_ratio_pow, log_p_no_err, log_p_err)
+    };
 
     // Allocate checkpoint storage + working buffers
     // Layout: [checkpoints...][curr_row][prev_row]
@@ -2229,14 +2273,14 @@ pub fn run_hmm_forward_backward_to_sparse(
             let mut k = 0;
             while k + 8 <= n_emit {
                 let emit_arr = [
-                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k], nobs_slice[k]),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1]),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2]),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3]),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4]),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5]),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6]),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7]),
                 ];
                 let emit_vec = f32x8::from(emit_arr);
                 let res = emit_vec * prior_vec;
@@ -2248,7 +2292,7 @@ pub fn run_hmm_forward_backward_to_sparse(
 
             let mut sum = sum_vec.reduce_add();
             for i in k..n_emit {
-                let em = compute_emit(mism_slice[i], nobs_slice[i], log_p_no_err, log_p_err);
+                let em = compute_emit(mism_slice[i], nobs_slice[i]);
                 let val = em * prior;
                 fwd[curr_off + i] = val;
                 sum += val;
@@ -2266,14 +2310,14 @@ pub fn run_hmm_forward_backward_to_sparse(
             let mut k = 0;
             while k + 8 <= n_emit {
                 let emit_arr = [
-                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k], nobs_slice[k]),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1]),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2]),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3]),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4]),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5]),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6]),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7]),
                 ];
                 let emit_vec = f32x8::from(emit_arr);
                 let prev_arr: [f32; 8] = fwd[prev_off + k..prev_off + k + 8].try_into().unwrap();
@@ -2287,7 +2331,7 @@ pub fn run_hmm_forward_backward_to_sparse(
 
             let mut sum = sum_vec.reduce_add();
             for i in k..n_emit {
-                let em = compute_emit(mism_slice[i], nobs_slice[i], log_p_no_err, log_p_err);
+                let em = compute_emit(mism_slice[i], nobs_slice[i]);
                 let val = em * (scale * fwd[prev_off + i] + shift);
                 fwd[curr_off + i] = val;
                 sum += val;
@@ -2346,14 +2390,14 @@ pub fn run_hmm_forward_backward_to_sparse(
             let mut k = 0;
             while k + 8 <= n_emit {
                 let emit_arr = [
-                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k], nobs_slice[k]),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1]),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2]),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3]),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4]),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5]),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6]),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7]),
                 ];
                 let emit_vec = f32x8::from(emit_arr);
                 let bwd_arr: [f32; 8] = bwd[k..k+8].try_into().unwrap();
@@ -2366,11 +2410,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             }
             let mut emitted_sum = sum_vec.reduce_add();
             for i in k..n_emit {
-                let mism = mism_slice[i].min(nobs_slice[i]);
-                let n_obs = nobs_slice[i];
-                let match_count = (n_obs - mism).max(0.0);
-                let log_em = match_count * log_p_no_err + mism * log_p_err;
-                let em = if n_obs > 0.0 { log_em.max(-80.0).exp() } else { 1.0 };
+                let em = compute_emit(mism_slice[i], nobs_slice[i]);
                 bwd[i] *= em;
                 emitted_sum += bwd[i];
             }
@@ -2430,14 +2470,14 @@ pub fn run_hmm_forward_backward_to_sparse(
             let mut k = 0;
             while k + 8 <= n_emit {
                 let emit_arr = [
-                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
-                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k], nobs_slice[k]),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1]),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2]),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3]),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4]),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5]),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6]),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7]),
                 ];
                 let emit_vec = f32x8::from(emit_arr);
                 let prev_arr: [f32; 8] = fwd[prev_off + k..prev_off + k + 8].try_into().unwrap();
@@ -2450,7 +2490,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             }
             let mut sum = sum_vec.reduce_add();
             for i in k..n_emit {
-                let em = compute_emit(mism_slice[i], nobs_slice[i], log_p_no_err, log_p_err);
+                let em = compute_emit(mism_slice[i], nobs_slice[i]);
                 let val = em * (scale * fwd[prev_off + i] + shift);
                 fwd[curr_base + i] = val;
                 sum += val;
