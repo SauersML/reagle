@@ -2016,7 +2016,317 @@ fn run_hmm_forward_backward_clusters(
     fwd
 }
 
+/// Forward-backward HMM directly to sparse CSR format.
+///
+/// This fuses HMM computation with sparse output building, avoiding the
+/// O(n_clusters × n_states) dense intermediate allocation.
+///
+/// Uses checkpointing: stores forward values every CHECKPOINT_INTERVAL markers,
+/// then recomputes from checkpoints during backward pass.
+///
+/// Memory: O(n_clusters/64 × n_states + n_clusters + n_states) instead of O(n_clusters × n_states)
+pub fn run_hmm_forward_backward_to_sparse(
+    cluster_mismatches: &[Vec<f32>],
+    cluster_non_missing: &[Vec<f32>],
+    p_recomb: &[f32],
+    base_err_rate: f32,
+    n_states: usize,
+    hap_indices_input: &[Vec<u32>],
+    threshold: f32,
+    workspace: &mut ImpWorkspace,
+) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
+    use wide::f32x8;
+
+    let n_clusters = cluster_mismatches.len();
+    if n_clusters == 0 {
+        return (vec![0], Vec::new(), Vec::new(), Vec::new());
+    }
+
+    // Checkpoint interval for memory efficiency
+    const CHECKPOINT_INTERVAL: usize = 64;
+    let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
+
+    let p_err = base_err_rate.clamp(1e-8, 0.5);
+    let p_no_err = 1.0 - p_err;
+    let log_p_err = p_err.ln();
+    let log_p_no_err = p_no_err.ln();
+
+    #[inline(always)]
+    fn compute_emit(mism: f32, n_obs: f32, log_p_no_err: f32, log_p_err: f32) -> f32 {
+        let mism = mism.min(n_obs);
+        let match_count = (n_obs - mism).max(0.0);
+        let log_em = match_count * log_p_no_err + mism * log_p_err;
+        if n_obs > 0.0 { log_em.max(-80.0).exp() } else { 1.0 }
+    }
+
+    // Allocate checkpoint storage + working buffers
+    // Layout: [checkpoints...][curr_row][prev_row]
+    let fwd = &mut workspace.fwd;
+    fwd.resize(n_checkpoints * n_states + 2 * n_states, 0.0);
+    let curr_base = n_checkpoints * n_states;
+    let prev_base = curr_base + n_states;
+
+    // Store forward sums for recomputation during backward pass
+    let mut fwd_sums = vec![1.0f32; n_clusters];
+
+    // ========== FORWARD PASS: compute and checkpoint ==========
+    let mut last_sum = 1.0f32;
+
+    for m in 0..n_clusters {
+        let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
+        let shift = p_rec / n_states as f32;
+        let scale = (1.0 - p_rec) / last_sum.max(1e-30);
+
+        let mismatches = &cluster_mismatches[m];
+        let non_missing = &cluster_non_missing[m];
+
+        // Swap curr/prev (conceptually - we use indices)
+        let (curr_off, prev_off) = if m % 2 == 0 {
+            (curr_base, prev_base)
+        } else {
+            (prev_base, curr_base)
+        };
+
+        if m == 0 {
+            let prior = 1.0 / n_states as f32;
+            let mut sum = 0.0f32;
+            for k in 0..n_states {
+                let mism = mismatches.get(k).copied().unwrap_or(0.0);
+                let n_obs = non_missing.get(k).copied().unwrap_or(0.0);
+                let em = compute_emit(mism, n_obs, log_p_no_err, log_p_err);
+                let val = em * prior;
+                fwd[curr_off + k] = val;
+                sum += val;
+            }
+            last_sum = sum.max(1e-30);
+        } else {
+            let n_emit = n_states.min(mismatches.len()).min(non_missing.len());
+            let mism_slice = &mismatches[..n_emit];
+            let nobs_slice = &non_missing[..n_emit];
+
+            let shift_vec = f32x8::splat(shift);
+            let scale_vec = f32x8::splat(scale);
+            let mut sum_vec = f32x8::splat(0.0);
+
+            let mut k = 0;
+            while k + 8 <= n_emit {
+                let emit_arr = [
+                    compute_emit(mism_slice[k], nobs_slice[k], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+1], nobs_slice[k+1], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+2], nobs_slice[k+2], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+3], nobs_slice[k+3], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+4], nobs_slice[k+4], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+5], nobs_slice[k+5], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+6], nobs_slice[k+6], log_p_no_err, log_p_err),
+                    compute_emit(mism_slice[k+7], nobs_slice[k+7], log_p_no_err, log_p_err),
+                ];
+                let emit_vec = f32x8::from(emit_arr);
+                let prev_arr: [f32; 8] = fwd[prev_off + k..prev_off + k + 8].try_into().unwrap();
+                let prev_vec = f32x8::from(prev_arr);
+                let res = emit_vec * (scale_vec * prev_vec + shift_vec);
+                let res_arr: [f32; 8] = res.into();
+                fwd[curr_off + k..curr_off + k + 8].copy_from_slice(&res_arr);
+                sum_vec += res;
+                k += 8;
+            }
+
+            let mut sum = sum_vec.reduce_add();
+            for i in k..n_emit {
+                let em = compute_emit(mism_slice[i], nobs_slice[i], log_p_no_err, log_p_err);
+                let val = em * (scale * fwd[prev_off + i] + shift);
+                fwd[curr_off + i] = val;
+                sum += val;
+            }
+            last_sum = sum.max(1e-30);
+        }
+
+        fwd_sums[m] = last_sum;
+
+        // Save checkpoint at interval boundaries
+        if m % CHECKPOINT_INTERVAL == 0 {
+            let checkpoint_idx = m / CHECKPOINT_INTERVAL;
+            let checkpoint_off = checkpoint_idx * n_states;
+            let curr_off = if m % 2 == 0 { curr_base } else { prev_base };
+            fwd[checkpoint_off..checkpoint_off + n_states].copy_from_slice(&fwd[curr_off..curr_off + n_states]);
+        }
+    }
+
+    // ========== BACKWARD PASS: recompute forward and build sparse output ==========
+    let bwd = &mut workspace.bwd;
+    bwd.resize(n_states, 0.0);
+    bwd.fill(1.0 / n_states as f32);
+
+    // Sparse output buffers
+    let estimated_nnz = n_clusters * 50;
+    let mut hap_indices = Vec::with_capacity(estimated_nnz);
+    let mut probs = Vec::with_capacity(estimated_nnz);
+    let mut probs_p1 = Vec::with_capacity(estimated_nnz);
+
+    // Track entry count per cluster (in reverse order during loop)
+    let mut entry_counts = Vec::with_capacity(n_clusters);
+
+    // Temporary storage for current and next cluster posteriors
+    let mut curr_posteriors = vec![0.0f32; n_states];
+    let mut next_posteriors = vec![0.0f32; n_states];
+
+    // Process clusters in reverse order
+    for m in (0..n_clusters).rev() {
+        // Update backward values using emissions at m+1
+        if m + 1 < n_clusters {
+            let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
+            let shift = p_rec / n_states as f32;
+
+            let mut emitted_sum = 0.0f32;
+            let mismatches = &cluster_mismatches[m + 1];
+            let non_missing = &cluster_non_missing[m + 1];
+            let mism_slice = &mismatches[..n_states.min(mismatches.len())];
+            let nobs_slice = &non_missing[..n_states.min(non_missing.len())];
+
+            for k in 0..mism_slice.len() {
+                let mism = mism_slice[k].min(nobs_slice[k]);
+                let n_obs = nobs_slice[k];
+                let match_count = (n_obs - mism).max(0.0);
+                let log_em = match_count * log_p_no_err + mism * log_p_err;
+                let em = if n_obs > 0.0 { log_em.max(-80.0).exp() } else { 1.0 };
+                bwd[k] *= em;
+                emitted_sum += bwd[k];
+            }
+
+            if emitted_sum > 0.0 {
+                let scale_v = (1.0 - p_rec) / emitted_sum;
+                let shift_vec = f32x8::splat(shift);
+                let scale_vec = f32x8::splat(scale_v);
+                let mut k = 0;
+                while k + 8 <= n_states {
+                    let bwd_arr: [f32; 8] = bwd[k..k+8].try_into().unwrap();
+                    let bwd_chunk = f32x8::from(bwd_arr);
+                    let res = scale_vec * bwd_chunk + shift_vec;
+                    let res_arr: [f32; 8] = res.into();
+                    bwd[k..k+8].copy_from_slice(&res_arr);
+                    k += 8;
+                }
+                for i in k..n_states {
+                    bwd[i] = scale_v * bwd[i] + shift;
+                }
+            } else {
+                bwd[..n_states].fill(1.0 / n_states as f32);
+            }
+        }
+
+        // Recompute forward values for cluster m from nearest checkpoint
+        let checkpoint_idx = m / CHECKPOINT_INTERVAL;
+        let checkpoint_start = checkpoint_idx * CHECKPOINT_INTERVAL;
+        let checkpoint_off = checkpoint_idx * n_states;
+
+        // Load checkpoint into prev buffer
+        let prev_off = prev_base;
+        fwd[prev_off..prev_off + n_states].copy_from_slice(&fwd[checkpoint_off..checkpoint_off + n_states]);
+        let mut recomp_sum = fwd_sums[checkpoint_start];
+
+        // Recompute forward from checkpoint to m
+        for recomp_m in (checkpoint_start + 1)..=m {
+            let p_rec = p_recomb.get(recomp_m).copied().unwrap_or(0.0);
+            let shift = p_rec / n_states as f32;
+            let scale = (1.0 - p_rec) / recomp_sum.max(1e-30);
+
+            let mismatches = &cluster_mismatches[recomp_m];
+            let non_missing = &cluster_non_missing[recomp_m];
+            let n_emit = n_states.min(mismatches.len()).min(non_missing.len());
+
+            let mut sum = 0.0f32;
+            for k in 0..n_emit {
+                let mism = mismatches.get(k).copied().unwrap_or(0.0);
+                let n_obs = non_missing.get(k).copied().unwrap_or(0.0);
+                let em = compute_emit(mism, n_obs, log_p_no_err, log_p_err);
+                let val = em * (scale * fwd[prev_off + k] + shift);
+                fwd[curr_base + k] = val;
+                sum += val;
+            }
+            recomp_sum = sum.max(1e-30);
+
+            // Copy curr to prev for next iteration
+            if recomp_m < m {
+                fwd[prev_off..prev_off + n_states].copy_from_slice(&fwd[curr_base..curr_base + n_states]);
+            }
+        }
+
+        // Now fwd[curr_base..] has forward values for cluster m
+        // Compute posteriors: fwd * bwd, normalized
+        let fwd_row = if m == checkpoint_start {
+            &fwd[checkpoint_off..checkpoint_off + n_states]
+        } else {
+            &fwd[curr_base..curr_base + n_states]
+        };
+
+        let mut state_sum = 0.0f32;
+        for k in 0..n_states {
+            curr_posteriors[k] = fwd_row[k] * bwd[k];
+            state_sum += curr_posteriors[k];
+        }
+        if state_sum > 0.0 {
+            let inv = 1.0 / state_sum;
+            for k in 0..n_states {
+                curr_posteriors[k] *= inv;
+            }
+        }
+
+        // Build sparse entry for this cluster using curr (this cluster) and next (next cluster)
+        // Note: we're processing in reverse order, so at cluster m we have:
+        // - curr_posteriors = posteriors for cluster m
+        // - next_posteriors = posteriors for cluster m+1 (or m if m is last)
+        // We build sparse entries in reverse order, then flip at the end
+
+        let entries_before = hap_indices.len();
+
+        if m == n_clusters - 1 {
+            // Last cluster: next = self
+            for k in 0..n_states {
+                let prob = curr_posteriors[k];
+                if prob > threshold {
+                    hap_indices.push(hap_indices_input[m][k]);
+                    probs.push(prob);
+                    probs_p1.push(prob); // next = self for last cluster
+                }
+            }
+        } else {
+            // Normal case: next_posteriors has cluster m+1
+            for k in 0..n_states {
+                let prob = curr_posteriors[k];
+                let prob_next = next_posteriors[k];
+                if prob > threshold || prob_next > threshold {
+                    hap_indices.push(hap_indices_input[m][k]);
+                    probs.push(prob);
+                    probs_p1.push(prob_next);
+                }
+            }
+        }
+
+        entry_counts.push(hap_indices.len() - entries_before);
+
+        // Swap curr and next posteriors for next iteration
+        std::mem::swap(&mut curr_posteriors, &mut next_posteriors);
+    }
+
+    // Reverse all output arrays since we built them in reverse order
+    entry_counts.reverse(); // Now entry_counts[c] = count for cluster c
+    hap_indices.reverse();
+    probs.reverse();
+    probs_p1.reverse();
+
+    // Build offsets from entry counts
+    let mut offsets = Vec::with_capacity(n_clusters + 1);
+    offsets.push(0);
+    let mut cumsum = 0;
+    for &count in &entry_counts {
+        cumsum += count;
+        offsets.push(cumsum);
+    }
+
+    (offsets, hap_indices, probs, probs_p1)
+}
+
 /// Forward-backward HMM on cluster-coded observations (Java ImpLSBaum model).
+/// Returns dense posteriors. For memory-efficient version, use run_hmm_forward_backward_to_sparse.
 pub fn run_hmm_forward_backward_clusters_counts(
     cluster_mismatches: &[Vec<f32>],
     cluster_non_missing: &[Vec<f32>],
