@@ -992,92 +992,147 @@ impl VcfWriter {
         G: Fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors),
     {
         let n_samples = self.samples.len();
-        let format_prob = |val: f32| -> String {
-            if !val.is_finite() {
-                return "0.0000".to_string();
-            }
-            format!("{:.4}", val)
+
+        // Pre-compute format string (same for all markers)
+        let format_str = {
+            let mut parts = vec!["GT", "DS"];
+            if include_gp { parts.push("GP"); }
+            if include_ap { parts.push("AP1"); parts.push("AP2"); }
+            parts.join(":")
         };
 
+        // Pre-allocate line buffer (estimate ~50 bytes per sample)
+        let mut line_buf = String::with_capacity(n_samples * 50 + 200);
+        // Buffer for ryu float formatting
+        let mut ryu_buf = ryu::Buffer::new();
+
+        // Helper to format float with 4 decimal places using ryu
+        #[inline(always)]
+        fn format_f32_4dp(val: f32, ryu_buf: &mut ryu::Buffer) -> &str {
+            if !val.is_finite() {
+                return "0.0000";
+            }
+            // ryu formats with full precision, we need to truncate
+            let s = ryu_buf.format(val);
+            // Find decimal point and truncate after 4 digits
+            if let Some(dot_pos) = s.find('.') {
+                let end = (dot_pos + 5).min(s.len());
+                &s[..end]
+            } else {
+                s
+            }
+        }
+
         for m in start..end {
+            line_buf.clear();
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = matrix.marker(marker_idx);
             let n_alleles = 1 + marker.alt_alleles.len();
 
-            let format_str = {
-                let mut parts = vec!["GT", "DS"];
-                if include_gp { parts.push("GP"); }
-                if include_ap { parts.push("AP1"); parts.push("AP2"); }
-                parts.join(":")
-            };
-
+            // Build INFO field
             let stats = quality.get(m);
             let info_field = if let Some(stats) = stats {
-                let mut info_parts = Vec::new();
+                let mut info_str = String::with_capacity(64);
                 if n_alleles > 1 {
-                    let dr2_values: Vec<String> = (1..n_alleles)
-                        .map(|a| format!("{:.4}", stats.dr2(a)))
-                        .collect();
-                    info_parts.push(format!("DR2={}", dr2_values.join(",")));
-                    let af_values: Vec<String> = (1..n_alleles).map(|a| format!("{:.4}", stats.allele_freq(a))).collect();
-                    info_parts.push(format!("AF={}", af_values.join(",")));
+                    info_str.push_str("DR2=");
+                    for a in 1..n_alleles {
+                        if a > 1 { info_str.push(','); }
+                        info_str.push_str(format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf));
+                    }
+                    info_str.push_str(";AF=");
+                    for a in 1..n_alleles {
+                        if a > 1 { info_str.push(','); }
+                        info_str.push_str(format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf));
+                    }
                 }
-                if stats.is_imputed { info_parts.push("IMP".to_string()); }
-                if info_parts.is_empty() { ".".to_string() } else { info_parts.join(";") }
+                if stats.is_imputed {
+                    if !info_str.is_empty() { info_str.push(';'); }
+                    info_str.push_str("IMP");
+                }
+                if info_str.is_empty() { ".".to_string() } else { info_str }
             } else { ".".to_string() };
 
-            write!(self.writer, "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
+            // Write fixed fields using line buffer
+            use std::fmt::Write;
+            write!(line_buf, "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
                 matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
                 marker.pos,
                 marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
                 marker.ref_allele,
                 marker.alt_alleles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","),
-                info_field, format_str)?;
+                info_field, format_str).unwrap();
 
             for s in 0..n_samples {
                 let ds = get_dosage(m, s);
                 let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
-                // Use best-guess GT from HMM (preserves phase info), fallback to posteriors max_allele
                 let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
                     (p1.max_allele(), p2.max_allele())
                 } else { get_best_gt(m, s) };
 
-                write!(self.writer, "\t{}|{}:{}", a1, a2, format_prob(ds))?;
+                // Format: \t{a1}|{a2}:{ds}
+                line_buf.push('\t');
+                line_buf.push((b'0' + a1) as char);
+                line_buf.push('|');
+                line_buf.push((b'0' + a2) as char);
+                line_buf.push(':');
+                line_buf.push_str(format_f32_4dp(ds, &mut ryu_buf));
 
                 if include_gp {
+                    line_buf.push(':');
                     if let Some((ref p1, ref p2)) = posteriors {
-                        write!(self.writer, ":")?;
                         let mut first = true;
                         for i2 in 0..n_alleles {
                             for i1 in 0..=i2 {
-                                if !first { write!(self.writer, ",")?; }
+                                if !first { line_buf.push(','); }
                                 first = false;
                                 let prob = if i1 == i2 { p1.prob(i1) * p2.prob(i2) }
                                     else { p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1) };
-                                write!(self.writer, "{}", format_prob(prob))?;
+                                line_buf.push_str(format_f32_4dp(prob, &mut ryu_buf));
                             }
                         }
                     } else {
-                        write!(self.writer, ":{}", vec!["0.00"; n_alleles * (n_alleles + 1) / 2].join(","))?;
+                        // n_alleles * (n_alleles + 1) / 2 zeros
+                        let n_gp = n_alleles * (n_alleles + 1) / 2;
+                        for i in 0..n_gp {
+                            if i > 0 { line_buf.push(','); }
+                            line_buf.push_str("0.00");
+                        }
                     }
                 }
 
                 if include_ap {
                     if let Some((ref p1, ref p2)) = posteriors {
-                        write!(self.writer, ":")?;
-                        let ap1: Vec<String> = (1..n_alleles).map(|a| format_prob(p1.prob(a))).collect();
-                        write!(self.writer, "{}", if ap1.is_empty() { "0.00".to_string() } else { ap1.join(",") })?;
-                        write!(self.writer, ":")?;
-                        let ap2: Vec<String> = (1..n_alleles).map(|a| format_prob(p2.prob(a))).collect();
-                        write!(self.writer, "{}", if ap2.is_empty() { "0.00".to_string() } else { ap2.join(",") })?;
+                        line_buf.push(':');
+                        for a in 1..n_alleles {
+                            if a > 1 { line_buf.push(','); }
+                            line_buf.push_str(format_f32_4dp(p1.prob(a), &mut ryu_buf));
+                        }
+                        if n_alleles <= 1 { line_buf.push_str("0.00"); }
+                        line_buf.push(':');
+                        for a in 1..n_alleles {
+                            if a > 1 { line_buf.push(','); }
+                            line_buf.push_str(format_f32_4dp(p2.prob(a), &mut ryu_buf));
+                        }
+                        if n_alleles <= 1 { line_buf.push_str("0.00"); }
                     } else {
                         let n_ap = n_alleles.saturating_sub(1).max(1);
-                        write!(self.writer, ":{}", vec!["0.00"; n_ap].join(","))?;
-                        write!(self.writer, ":{}", vec!["0.00"; n_ap].join(","))?;
+                        line_buf.push(':');
+                        for i in 0..n_ap {
+                            if i > 0 { line_buf.push(','); }
+                            line_buf.push_str("0.00");
+                        }
+                        line_buf.push(':');
+                        for i in 0..n_ap {
+                            if i > 0 { line_buf.push(','); }
+                            line_buf.push_str("0.00");
+                        }
                     }
                 }
             }
-            writeln!(self.writer)?;
+            line_buf.push('\n');
+
+            // Single write for entire line
+            self.writer.write_all(line_buf.as_bytes())?;
         }
         Ok(())
     }

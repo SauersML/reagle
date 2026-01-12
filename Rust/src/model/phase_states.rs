@@ -96,8 +96,11 @@ impl PhaseStates {
 
     /// Build composite haplotypes for a sample's two haplotypes
     ///
-    /// This iterates through all markers and dynamically updates the composite
-    /// haplotypes based on local IBS matches, similar to Java's `BasicPhaseStates`.
+    /// This samples at SPARSE positions (not all markers) to find IBS neighbors,
+    /// providing dynamic state selection without the O(n_markers) overhead.
+    ///
+    /// Samples at ~64 evenly-spaced positions instead of all markers, reducing
+    /// overhead by ~100x for typical datasets (8000 markers -> 64 samples).
     ///
     /// # Arguments
     /// * `sample` - Sample index (hap1 = sample * 2, hap2 = sample * 2 + 1)
@@ -119,8 +122,13 @@ impl PhaseStates {
         let h1 = sample * 2;
         let h2 = h1 + 1;
 
-        // Iterate through all markers and update composite haplotypes
-        for marker in 0..self.n_markers {
+        // Sample at sparse positions instead of all markers
+        // This provides good coverage while being O(1) per sample instead of O(n_markers)
+        const MAX_SAMPLE_POINTS: usize = 64;
+        let step = (self.n_markers / MAX_SAMPLE_POINTS).max(1);
+
+        let mut marker = 0usize;
+        while marker < self.n_markers {
             // Get IBS neighbors for both haplotypes at this marker
             let neighbors1 = phase_ibs.find_neighbors(h1, marker, ibs2, n_candidates);
             let neighbors2 = phase_ibs.find_neighbors(h2, marker, ibs2, n_candidates);
@@ -134,6 +142,25 @@ impl PhaseStates {
             for &ibs_hap in &neighbors2 {
                 if ibs_hap / 2 != sample {
                     self.add_ibs_hap(ibs_hap, marker as i32);
+                }
+            }
+
+            marker += step;
+        }
+
+        // Also sample the last marker if not already covered
+        if self.n_markers > 0 {
+            let last_marker = self.n_markers - 1;
+            let neighbors1 = phase_ibs.find_neighbors(h1, last_marker, ibs2, n_candidates);
+            let neighbors2 = phase_ibs.find_neighbors(h2, last_marker, ibs2, n_candidates);
+            for &ibs_hap in &neighbors1 {
+                if ibs_hap / 2 != sample {
+                    self.add_ibs_hap(ibs_hap, last_marker as i32);
+                }
+            }
+            for &ibs_hap in &neighbors2 {
+                if ibs_hap / 2 != sample {
+                    self.add_ibs_hap(ibs_hap, last_marker as i32);
                 }
             }
         }
