@@ -408,6 +408,7 @@ impl<'a> BeagleHmm<'a> {
     }
 
     /// Collect statistics for EM parameter estimation
+    /// Uses checkpointing to reduce memory from O(n_markers × n_states) to O(n_markers/64 × n_states)
     pub fn collect_stats(
         &self,
         target_alleles: &[u8],
@@ -425,82 +426,146 @@ impl<'a> BeagleHmm<'a> {
         let p_no_err = 1.0 - p_err;
         let emit_probs = [p_no_err, p_err];
 
+        // Checkpoint interval - balance memory vs recomputation
+        const CHECKPOINT_INTERVAL: usize = 64;
+        let n_checkpoints = (n_markers + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
+
         // Create cursor and record history during forward traversal
         let mut cursor = MosaicCursor::from_threaded(threaded_haps);
         let mut history: Vec<StateSwitch> = Vec::with_capacity(n_markers);
-        
-        // First pass: advance cursor to end while recording history
-        for m in 0..n_markers {
-            cursor.advance_with_history(m, threaded_haps, &mut history);
-        }
 
-        // 1. Backward pass: compute all backward values using cursor rewind
-        let mut saved_bwd = vec![0.0f32; n_markers * n_states];
-        let mut bwd = vec![1.0f32; n_states];
-        let mut mismatches = vec![0u8; n_states];
-        
-        let last_row_start = (n_markers - 1) * n_states;
-        saved_bwd[last_row_start..last_row_start + n_states].fill(1.0);
-
-        // Cursor is at end; rewind it as we go backwards
-        for m in (0..n_markers - 1).rev() {
-            let m_next = m + 1;
-            let marker_next_idx = MarkerIdx::new(m_next as u32);
-            let targ_al_next = target_alleles[m_next];
-            let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
-            
-            // Rewind to m_next to get correct haplotypes
-            cursor.rewind(m_next, &mut history);
-            
-            for k in 0..n_states {
-                let h = cursor.active_haps()[k];
-                let r = self.ref_gt.allele(marker_next_idx, HapIdx::new(h));
-                mismatches[k] = if r == targ_al_next { 0 } else { 1 };
-            }
-
-            HmmUpdater::bwd_update(&mut bwd, p_recomb, &emit_probs, &mismatches, n_states);
-            let row_start = m * n_states;
-            saved_bwd[row_start..row_start + n_states].copy_from_slice(&bwd);
-        }
-
-        // 2. Forward pass and accumulate stats
-        // Reset cursor and history for forward traversal
-        cursor.reset(threaded_haps);
-        history.clear();
-        
-        let h_factor = n_states as f32 / (n_states - 1) as f32;
+        // First pass: advance cursor to end while recording history AND storing checkpoints
+        let mut fwd_checkpoints = vec![0.0f32; n_checkpoints * n_states];
         let mut fwd = vec![1.0f32 / n_states as f32; n_states];
+        let mut fwd_sums = vec![1.0f32; n_markers];
         let mut last_fwd_sum = 1.0f32;
 
         for m in 0..n_markers {
+            cursor.advance_with_history(m, threaded_haps, &mut history);
+
             let marker_idx = MarkerIdx::new(m as u32);
             let targ_al = target_alleles[m];
             let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0);
-            let shift = p_switch / n_states as f32;
-            let scale = (1.0 - p_switch) / last_fwd_sum;
-            let no_switch_scale = ((1.0 - p_switch) + shift) / last_fwd_sum;
 
-            // Advance cursor to this marker
-            cursor.advance_with_history(m, threaded_haps, &mut history);
-            
+            if m > 0 {
+                let shift = p_switch / n_states as f32;
+                let scale = (1.0 - p_switch) / last_fwd_sum;
+
+                let mut sum = 0.0f32;
+                for k in 0..n_states {
+                    let ref_al = self.ref_gt.allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                    let is_mismatch = ref_al != targ_al;
+                    let em = if is_mismatch { p_err } else { p_no_err };
+                    fwd[k] = em * (scale * fwd[k] + shift);
+                    sum += fwd[k];
+                }
+                last_fwd_sum = sum.max(1e-30);
+            } else {
+                // First marker: uniform prior * emission
+                let prior = 1.0 / n_states as f32;
+                let mut sum = 0.0f32;
+                for k in 0..n_states {
+                    let ref_al = self.ref_gt.allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                    let is_mismatch = ref_al != targ_al;
+                    let em = if is_mismatch { p_err } else { p_no_err };
+                    fwd[k] = em * prior;
+                    sum += fwd[k];
+                }
+                last_fwd_sum = sum.max(1e-30);
+            }
+
+            fwd_sums[m] = last_fwd_sum;
+
+            // Store checkpoint at interval boundaries
+            if m % CHECKPOINT_INTERVAL == 0 {
+                let checkpoint_idx = m / CHECKPOINT_INTERVAL;
+                let checkpoint_off = checkpoint_idx * n_states;
+                fwd_checkpoints[checkpoint_off..checkpoint_off + n_states].copy_from_slice(&fwd);
+            }
+        }
+
+        // 2. Combined backward pass with forward recomputation and stats accumulation
+        // Process in reverse order, recomputing forward from checkpoints as needed
+        let mut bwd = vec![1.0f32; n_states];
+        let mut mismatches = vec![0u8; n_states];
+        let mut fwd_recomp = vec![0.0f32; n_states];
+
+        let h_factor = n_states as f32 / (n_states - 1) as f32;
+
+        for m in (0..n_markers).rev() {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let targ_al = target_alleles[m];
+
+            // Rewind cursor to this marker
+            cursor.rewind(m, &mut history);
+
+            // Recompute forward values from nearest checkpoint
+            let checkpoint_idx = m / CHECKPOINT_INTERVAL;
+            let checkpoint_start = checkpoint_idx * CHECKPOINT_INTERVAL;
+            let checkpoint_off = checkpoint_idx * n_states;
+
+            // Load checkpoint
+            fwd_recomp.copy_from_slice(&fwd_checkpoints[checkpoint_off..checkpoint_off + n_states]);
+            let mut recomp_sum = fwd_sums[checkpoint_start];
+
+            // Recompute forward from checkpoint to m
+            // Need a separate cursor for recomputation
+            let mut recomp_cursor = MosaicCursor::from_threaded(threaded_haps);
+            let mut recomp_history: Vec<StateSwitch> = Vec::with_capacity(m + 1);
+
+            // Advance recomp cursor to checkpoint_start
+            for recomp_m in 0..=checkpoint_start {
+                recomp_cursor.advance_with_history(recomp_m, threaded_haps, &mut recomp_history);
+            }
+
+            // Now advance from checkpoint_start+1 to m while recomputing forward
+            for recomp_m in (checkpoint_start + 1)..=m {
+                recomp_cursor.advance_with_history(recomp_m, threaded_haps, &mut recomp_history);
+
+                let recomp_marker_idx = MarkerIdx::new(recomp_m as u32);
+                let recomp_targ_al = target_alleles[recomp_m];
+                let p_switch = self.p_recomb.get(recomp_m).copied().unwrap_or(0.0);
+                let shift = p_switch / n_states as f32;
+                let scale = (1.0 - p_switch) / recomp_sum.max(1e-30);
+
+                let mut sum = 0.0f32;
+                for k in 0..n_states {
+                    let ref_al = self.ref_gt.allele(recomp_marker_idx, HapIdx::new(recomp_cursor.active_haps()[k]));
+                    let is_mismatch = ref_al != recomp_targ_al;
+                    let em = if is_mismatch { p_err } else { p_no_err };
+                    fwd_recomp[k] = em * (scale * fwd_recomp[k] + shift);
+                    sum += fwd_recomp[k];
+                }
+                recomp_sum = sum.max(1e-30);
+            }
+
+            // Now fwd_recomp contains forward values at marker m
+            // Compute stats using fwd_recomp and bwd
+            let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0);
+            let last_sum = if m > 0 { fwd_sums[m - 1] } else { 1.0 };
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) / last_sum;
+            let no_switch_scale = ((1.0 - p_switch) + shift) / last_sum;
+
             let mut joint_state_sum = 0.0f32;
             let mut state_sum = 0.0f32;
             let mut mismatch_sum = 0.0f32;
-            let mut next_fwd_sum = 0.0f32;
-
-            let bwd_m = &saved_bwd[m * n_states .. (m + 1) * n_states];
 
             for k in 0..n_states {
                 let ref_al = self.ref_gt.allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
                 let is_mismatch = ref_al != targ_al;
                 let em = if is_mismatch { p_err } else { p_no_err };
-                
-                joint_state_sum += bwd_m[k] * em * no_switch_scale * fwd[k];
-                
-                fwd[k] = em * (scale * fwd[k] + shift);
-                next_fwd_sum += fwd[k];
-                
-                let state_prob = fwd[k] * bwd_m[k];
+
+                // Use fwd values from before emission update for joint probability
+                let fwd_prior_k = if m > 0 {
+                    scale * fwd_recomp[k] / em + shift / em  // Reverse the emission to get prior
+                } else {
+                    1.0 / n_states as f32
+                };
+
+                joint_state_sum += bwd[k] * em * no_switch_scale * fwd_prior_k.max(0.0);
+
+                let state_prob = fwd_recomp[k] * bwd[k];
                 state_sum += state_prob;
                 if is_mismatch {
                     mismatch_sum += state_prob;
@@ -517,15 +582,25 @@ impl<'a> BeagleHmm<'a> {
             if m > 0 && state_sum > 0.0 {
                 let switch_prob = h_factor * (1.0 - joint_state_sum / state_sum);
                 if switch_prob > 0.0 {
-                    // The transition at marker m corresponds to the interval from m-1 to m
-                    // gen_dists[i] = distance from marker i to marker i+1
-                    // So for transition at m, we need gen_dists[m-1]
                     let gen_dist = gen_dists.get(m - 1).copied().unwrap_or(0.0);
                     estimates.add_switch(gen_dist, switch_prob as f64);
                 }
             }
 
-            last_fwd_sum = next_fwd_sum;
+            // Update backward values for next iteration (moving to m-1)
+            if m > 0 {
+                let m_next = m;  // We're about to move to m-1, so m is the "next" marker from m-1's perspective
+                let targ_al_next = target_alleles[m_next];
+                let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
+
+                for k in 0..n_states {
+                    let h = cursor.active_haps()[k];
+                    let r = self.ref_gt.allele(marker_idx, HapIdx::new(h));
+                    mismatches[k] = if r == targ_al_next { 0 } else { 1 };
+                }
+
+                HmmUpdater::bwd_update(&mut bwd, p_recomb, &emit_probs, &mismatches, n_states);
+            }
         }
     }
 }
