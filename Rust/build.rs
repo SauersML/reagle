@@ -1684,10 +1684,9 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
             // This is more portable and robust.
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok()) // Ignore any errors during directory traversal.
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories.
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
-            // Keep only .rs files.
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1749,9 +1748,9 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1794,9 +1793,9 @@ fn scan_for_tuple_wildcard_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1856,10 +1855,10 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.file_name() != "build.rs")
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1890,10 +1889,10 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.file_name() != "build.rs")
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1925,10 +1924,10 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.file_name() != "build.rs")
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1997,10 +1996,10 @@ fn scan_for_allow_dead_code() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.file_name() != "build.rs")
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -2055,10 +2054,10 @@ fn scan_for_ignored_tests() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.file_name() != "build.rs")
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -2200,9 +2199,9 @@ fn scan_for_drop_usage() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -2240,9 +2239,9 @@ fn scan_for_empty_control_blocks() -> Vec<String> {
 
     for entry in WalkDir::new(".")
         .into_iter()
-        .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-        .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-        .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
     {
         let path = entry.path();
         let source = match std::fs::read_to_string(path) {
@@ -2272,9 +2271,9 @@ fn scan_for_debug_assert_usage() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -2319,9 +2318,9 @@ fn scan_for_meaningless_conditionals() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(Result::ok)
+                .filter(|e| !is_in_ignored_directory(e.path()))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
