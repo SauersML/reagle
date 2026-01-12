@@ -1507,6 +1507,125 @@ impl PhasingPipeline {
             .collect()
     }
 
+    /// Build composite haplotypes using direct MutableGenotypes access (no reference panel).
+    ///
+    /// This is an optimized version of build_composite_haps_streaming for the case where
+    /// there is no reference panel. It uses bulk slice access instead of per-allele closures,
+    /// reducing overhead from O(n_markers × n_haps) function calls to O(n_markers) slice copies.
+    fn build_composite_haps_streaming_direct(
+        &self,
+        geno: &MutableGenotypes,
+        n_markers: usize,
+        n_samples: usize,
+        ibs2: &Ibs2,
+        n_candidates: usize,
+        max_states: usize,
+    ) -> Vec<crate::model::states::ThreadedHaps> {
+        use std::collections::HashSet;
+
+        let n_haps = geno.n_haps();
+
+        // Compute sampling points
+        const MAX_SAMPLE_POINTS: usize = 64;
+        let step = (n_markers / MAX_SAMPLE_POINTS).max(1);
+        let sampling_points_vec: Vec<usize> = (0..n_markers).step_by(step).collect();
+        let sampling_points: HashSet<usize> = sampling_points_vec.iter().copied().collect();
+
+        // Create PhaseStates for all samples
+        let mut phase_states: Vec<PhaseStates> = (0..n_samples)
+            .map(|_| {
+                let mut ps = PhaseStates::new(max_states, n_markers);
+                ps.reset_for_streaming();
+                ps
+            })
+            .collect();
+
+        // Create wavefront
+        let mut wavefront = PbwtWavefront::new(n_haps, n_markers);
+
+        // Forward pass - use direct slice access
+        wavefront.reset_forward();
+        for m in 0..n_markers {
+            // Direct slice access instead of per-haplotype closure calls
+            let marker_alleles = geno.marker_alleles(m);
+
+            // Biallelic check with SIMD-friendly iteration
+            let is_biallelic = marker_alleles.iter().all(|&a| a < 2 || a == 255);
+            let n_alleles = if is_biallelic { 2 } else { 256 };
+
+            // Advance wavefront
+            wavefront.advance_forward(marker_alleles, n_alleles);
+
+            // At sampling points, collect forward neighbors
+            if sampling_points.contains(&m) {
+                wavefront.prepare_fwd_queries();
+
+                let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
+                    .into_par_iter()
+                    .map(|s| {
+                        let h1 = (s * 2) as u32;
+                        let h2 = h1 + 1;
+                        let n1 = wavefront.find_fwd_neighbors_readonly(h1, n_candidates);
+                        let n2 = wavefront.find_fwd_neighbors_readonly(h2, n_candidates);
+                        (n1, n2)
+                    })
+                    .collect();
+
+                for (s, (n1, n2)) in neighbors_per_sample.into_iter().enumerate() {
+                    phase_states[s].add_neighbors_at_marker(s as u32, m, &n1, &n2);
+                }
+
+                // Add IBS2 neighbors
+                for s in 0..n_samples {
+                    let sample = SampleIdx::new(s as u32);
+                    for seg in ibs2.segments(sample) {
+                        if seg.contains(m) {
+                            let neighbors = vec![seg.other_sample.hap1().0, seg.other_sample.hap2().0];
+                            phase_states[s].add_neighbors_at_marker(s as u32, m, &neighbors, &neighbors);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Backward pass - use direct slice access
+        wavefront.reset_backward();
+        for m in (0..n_markers).rev() {
+            let marker_alleles = geno.marker_alleles(m);
+
+            let is_biallelic = marker_alleles.iter().all(|&a| a < 2 || a == 255);
+            let n_alleles = if is_biallelic { 2 } else { 256 };
+
+            wavefront.advance_backward(marker_alleles, n_alleles);
+
+            if sampling_points.contains(&m) {
+                wavefront.prepare_bwd_queries();
+
+                let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
+                    .into_par_iter()
+                    .map(|s| {
+                        let h1 = (s * 2) as u32;
+                        let h2 = h1 + 1;
+                        let n1 = wavefront.find_bwd_neighbors_readonly(h1, n_candidates);
+                        let n2 = wavefront.find_bwd_neighbors_readonly(h2, n_candidates);
+                        (n1, n2)
+                    })
+                    .collect();
+
+                for (s, (n1, n2)) in neighbors_per_sample.into_iter().enumerate() {
+                    phase_states[s].add_neighbors_at_marker(s as u32, m, &n1, &n2);
+                }
+            }
+        }
+
+        // Finalize
+        phase_states
+            .into_par_iter()
+            .enumerate()
+            .map(|(s, mut ps)| ps.finalize_streaming(s as u32, n_haps))
+            .collect()
+    }
+
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
     ///
     /// This uses the full Forward-Backward algorithm to compute posterior probabilities
@@ -1592,10 +1711,10 @@ impl PhasingPipeline {
                     self.params.n_states,
                 )
             } else {
-                self.build_composite_haps_streaming(
-                    |m, h| ref_geno.get(m, HapIdx::new(h as u32)),
+                // Use optimized direct access version for no-reference case
+                self.build_composite_haps_streaming_direct(
+                    &ref_geno,
                     n_markers,
-                    n_haps,
                     n_samples,
                     ibs2,
                     n_candidates,
