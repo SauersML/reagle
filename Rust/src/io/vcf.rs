@@ -535,15 +535,11 @@ impl VcfReader {
         let info_field = fields[7];
         let end_pos: Option<u32> = if info_field != "." {
             // Parse INFO field looking for END=value
+            // Avoid Vec allocation by using iterator directly
             info_field
                 .split(';')
                 .filter_map(|kv| {
-                    let parts: Vec<&str> = kv.splitn(2, '=').collect();
-                    if parts.len() == 2 && parts[0] == "END" {
-                        parts[1].parse().ok()
-                    } else {
-                        None
-                    }
+                    kv.strip_prefix("END=").and_then(|v| v.parse().ok())
                 })
                 .next()
         } else {
@@ -551,13 +547,12 @@ impl VcfReader {
         };
 
         // Parse FORMAT to find GT position and optionally GL position
+        // Avoid Vec allocation by using position() directly on iterator
         let format = fields[8];
-        let format_fields: Vec<&str> = format.split(':').collect();
-        let gt_idx = format_fields
-            .iter()
-            .position(|&f| f == "GT")
+        let gt_idx = format.split(':')
+            .position(|f| f == "GT")
             .ok_or_else(|| ReagleError::parse(line_num, "No GT field in FORMAT"))?;
-        let gl_idx = format_fields.iter().position(|&f| f == "GL");
+        let gl_idx = format.split(':').position(|f| f == "GL");
 
         // Parse genotypes
         let n_samples = self.samples.len();
@@ -576,8 +571,9 @@ impl VcfReader {
                 break;
             }
 
-            let sample_parts: Vec<&str> = sample_field.split(':').collect();
-            let gt_field = sample_parts.get(gt_idx).copied().unwrap_or("./.");
+            // Avoid Vec allocation: use nth() to get specific field directly
+            // This is O(n) but n is small (typically ~2-4 fields) and avoids allocation
+            let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
 
             // Parse genotype (handle both phased | and unphased /)
             let (a1, a2, phased, is_haploid) = parse_genotype(gt_field)?;
@@ -599,8 +595,8 @@ impl VcfReader {
             // Parse GL field if present and compute confidence
             if let Some(gl_i) = gl_idx {
                 if let Some(conf_vec) = confidences.as_mut() {
-                    let confidence = sample_parts
-                        .get(gl_i)
+                    let confidence = sample_field.split(':')
+                        .nth(gl_i)
                         .and_then(|gl_str| compute_gl_confidence(gl_str, a1, a2))
                         .unwrap_or(255); // Default to full confidence if GL missing/unparseable
                     conf_vec.push(confidence);
