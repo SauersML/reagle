@@ -1743,17 +1743,15 @@ impl ImputationPipeline {
 
         // Output with chunked transpose: read sample-major, write marker-major
         info_span!("write_output").in_scope(move || {
-            use std::io::{Read as IoRead, Seek, SeekFrom};
-
             let output_path = self.config.out.with_extension("vcf.gz");
             eprintln!("Writing output to {:?}...", output_path);
             let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
             writer.write_header_extended(ref_gt.markers(), true, self.config.gp, self.config.ap)?;
 
             // Open temp files for reading
-            let mut dosage_file = std::fs::File::open(&dosage_path)?;
-            let mut gt_file = std::fs::File::open(&best_gt_path)?;
-            let mut post_file: Option<std::fs::File> = if need_allele_probs {
+            let dosage_file = std::fs::File::open(&dosage_path)?;
+            let gt_file = std::fs::File::open(&best_gt_path)?;
+            let post_file: Option<std::fs::File> = if need_allele_probs {
                 Some(std::fs::File::open(&posteriors_path)?)
             } else {
                 None
@@ -2180,7 +2178,11 @@ pub fn run_hmm_forward_backward_to_sparse(
             let checkpoint_idx = m / CHECKPOINT_INTERVAL;
             let checkpoint_off = checkpoint_idx * n_states;
             let curr_off = if m % 2 == 0 { curr_base } else { prev_base };
-            fwd[checkpoint_off..checkpoint_off + n_states].copy_from_slice(&fwd[curr_off..curr_off + n_states]);
+            // Use split_at_mut to get non-overlapping slices (checkpoints vs working buffers)
+            let (checkpoint_region, working_region) = fwd.split_at_mut(curr_base);
+            let src_off = curr_off - curr_base;
+            checkpoint_region[checkpoint_off..checkpoint_off + n_states]
+                .copy_from_slice(&working_region[src_off..src_off + n_states]);
         }
     }
 
@@ -2251,9 +2253,14 @@ pub fn run_hmm_forward_backward_to_sparse(
         let checkpoint_start = checkpoint_idx * CHECKPOINT_INTERVAL;
         let checkpoint_off = checkpoint_idx * n_states;
 
-        // Load checkpoint into prev buffer
+        // Load checkpoint into prev buffer (using split_at_mut to avoid aliasing)
         let prev_off = prev_base;
-        fwd[prev_off..prev_off + n_states].copy_from_slice(&fwd[checkpoint_off..checkpoint_off + n_states]);
+        {
+            let (checkpoint_region, working_region) = fwd.split_at_mut(curr_base);
+            let dst_off = prev_base - curr_base;
+            working_region[dst_off..dst_off + n_states]
+                .copy_from_slice(&checkpoint_region[checkpoint_off..checkpoint_off + n_states]);
+        }
         let mut recomp_sum = fwd_sums[checkpoint_start];
 
         // Recompute forward from checkpoint to m
@@ -2277,9 +2284,10 @@ pub fn run_hmm_forward_backward_to_sparse(
             }
             recomp_sum = sum.max(1e-30);
 
-            // Copy curr to prev for next iteration
+            // Copy curr to prev for next iteration (using split_at_mut to avoid aliasing)
             if recomp_m < m {
-                fwd[prev_off..prev_off + n_states].copy_from_slice(&fwd[curr_base..curr_base + n_states]);
+                let (first, second) = fwd.split_at_mut(prev_base);
+                second[..n_states].copy_from_slice(&first[curr_base..curr_base + n_states]);
             }
         }
 
