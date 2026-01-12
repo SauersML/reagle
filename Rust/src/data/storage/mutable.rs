@@ -94,15 +94,20 @@ impl MutableGenotypes {
     #[inline]
     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
         let h = hap.as_usize();
-        let key = Self::pack_key(marker, h);
+        let idx = marker * self.n_haps + h;
 
-        // Check exception map first (for missing/multiallelic)
+        // Fast path: if no exceptions exist, skip HashMap lookup entirely
+        if self.exceptions.is_empty() {
+            return self.bits[idx] as u8;
+        }
+
+        // Check exception map (for missing/multiallelic)
+        let key = Self::pack_key(marker, h);
         if let Some(&val) = self.exceptions.get(&key) {
             return val;
         }
 
         // Otherwise read from bit vector
-        let idx = marker * self.n_haps + h;
         self.bits[idx] as u8
     }
 
@@ -142,17 +147,33 @@ impl MutableGenotypes {
     /// Get all alleles at a marker as a Vec
     ///
     /// Note: Returns owned Vec since bit-packed data cannot be returned as slice
+    ///
+    /// Optimized: avoids per-haplotype HashMap lookups by using a two-pass approach.
     #[inline]
     pub fn marker_alleles(&self, marker: usize) -> Vec<u8> {
         let base = marker * self.n_haps;
         let mut result = Vec::with_capacity(self.n_haps);
 
-        for h in 0..self.n_haps {
-            let key = Self::pack_key(marker, h);
-            if let Some(&val) = self.exceptions.get(&key) {
-                result.push(val);
-            } else {
+        // Fast path: if no exceptions, just extract bits directly
+        if self.exceptions.is_empty() {
+            for h in 0..self.n_haps {
                 result.push(self.bits[base + h] as u8);
+            }
+            return result;
+        }
+
+        // Two-pass approach for sparse exceptions:
+        // Pass 1: Extract all bits (no HashMap lookups)
+        for h in 0..self.n_haps {
+            result.push(self.bits[base + h] as u8);
+        }
+
+        // Pass 2: Fix up exceptions for this marker
+        // Only iterate exceptions, not all haplotypes
+        for (&key, &val) in &self.exceptions {
+            if (key >> 32) as usize == marker {
+                let exc_h = (key & 0xFFFFFFFF) as usize;
+                result[exc_h] = val;
             }
         }
 
@@ -162,16 +183,35 @@ impl MutableGenotypes {
     /// Get all alleles for a haplotype
     ///
     /// Returns a vector with values: 0 (REF), 1-254 (ALT), or 255 (missing)
+    ///
+    /// Optimized: avoids per-marker HashMap lookups by using a two-pass approach:
+    /// 1. Extract all bits directly (fast, cache-friendly)
+    /// 2. Fix up exceptions for this haplotype (sparse, typically <1%)
     pub fn haplotype(&self, hap: HapIdx) -> Vec<u8> {
         let h = hap.as_usize();
         let mut result = Vec::with_capacity(self.n_markers);
 
-        for m in 0..self.n_markers {
-            let key = Self::pack_key(m, h);
-            if let Some(&val) = self.exceptions.get(&key) {
-                result.push(val);
-            } else {
+        // Fast path: if no exceptions, just extract bits directly
+        if self.exceptions.is_empty() {
+            for m in 0..self.n_markers {
                 result.push(self.bits[m * self.n_haps + h] as u8);
+            }
+            return result;
+        }
+
+        // Two-pass approach for sparse exceptions:
+        // Pass 1: Extract all bits (no HashMap lookups)
+        for m in 0..self.n_markers {
+            result.push(self.bits[m * self.n_haps + h] as u8);
+        }
+
+        // Pass 2: Fix up exceptions for this haplotype
+        // Only iterate exceptions, not all positions
+        for (&key, &val) in &self.exceptions {
+            let exc_h = (key & 0xFFFFFFFF) as usize;
+            if exc_h == h {
+                let exc_m = (key >> 32) as usize;
+                result[exc_m] = val;
             }
         }
 
