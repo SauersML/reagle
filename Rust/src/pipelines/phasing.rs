@@ -1365,10 +1365,14 @@ impl PhasingPipeline {
     where
         F: Fn(usize, usize) -> u8 + Sync,
     {
+        use std::collections::HashSet;
+
         // Compute sampling points (sparse, ~64 points like PhaseStates)
         const MAX_SAMPLE_POINTS: usize = 64;
         let step = (n_markers / MAX_SAMPLE_POINTS).max(1);
-        let sampling_points: Vec<usize> = (0..n_markers).step_by(step).collect();
+        let sampling_points_vec: Vec<usize> = (0..n_markers).step_by(step).collect();
+        // Use HashSet for O(1) lookup instead of Vec O(n) contains
+        let sampling_points: HashSet<usize> = sampling_points_vec.iter().copied().collect();
 
         // Create PhaseStates for all samples
         let mut phase_states: Vec<PhaseStates> = (0..n_samples)
@@ -1393,8 +1397,16 @@ impl PhasingPipeline {
                 alleles[h] = get_allele(m, h);
             }
 
-            // Count distinct alleles (biallelic optimization)
-            let n_alleles = if alleles.iter().all(|&a| a < 2 || a == 255) { 2 } else { 256 };
+            // Biallelic optimization: check if all alleles are 0, 1, or 255 (missing)
+            // Use early-exit loop instead of .all() for speed
+            let mut is_biallelic = true;
+            for &a in &alleles {
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+            let n_alleles = if is_biallelic { 2 } else { 256 };
 
             // Advance wavefront
             wavefront.advance_forward(&alleles, n_alleles);
@@ -1403,9 +1415,9 @@ impl PhasingPipeline {
             if sampling_points.contains(&m) {
                 wavefront.prepare_fwd_queries();
 
-                // Parallel: collect neighbors for each sample
-                // Note: wavefront is immutable here after prepare_fwd_queries
+                // Parallel neighbor collection using rayon
                 let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
+                    .into_par_iter()
                     .map(|s| {
                         let h1 = (s * 2) as u32;
                         let h2 = h1 + 1;
@@ -1415,7 +1427,7 @@ impl PhasingPipeline {
                     })
                     .collect();
 
-                // Add neighbors to PhaseStates
+                // Add neighbors to PhaseStates (sequential - PhaseStates not thread-safe)
                 for (s, (n1, n2)) in neighbors_per_sample.into_iter().enumerate() {
                     phase_states[s].add_neighbors_at_marker(s as u32, m, &n1, &n2);
                 }
@@ -1449,7 +1461,14 @@ impl PhasingPipeline {
                 alleles[h] = get_allele(m, h);
             }
 
-            let n_alleles = if alleles.iter().all(|&a| a < 2 || a == 255) { 2 } else { 256 };
+            let mut is_biallelic = true;
+            for &a in &alleles {
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+            let n_alleles = if is_biallelic { 2 } else { 256 };
 
             // Advance wavefront (backward)
             wavefront.advance_backward(&alleles, n_alleles);
@@ -1458,7 +1477,9 @@ impl PhasingPipeline {
             if sampling_points.contains(&m) {
                 wavefront.prepare_bwd_queries();
 
+                // Parallel neighbor collection
                 let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
+                    .into_par_iter()
                     .map(|s| {
                         let h1 = (s * 2) as u32;
                         let h2 = h1 + 1;
@@ -1474,9 +1495,9 @@ impl PhasingPipeline {
             }
         }
 
-        // Finalize: convert PhaseStates to ThreadedHaps
+        // Finalize: convert PhaseStates to ThreadedHaps (parallel)
         phase_states
-            .into_iter()
+            .into_par_iter()
             .enumerate()
             .map(|(s, mut ps)| ps.finalize_streaming(s as u32, n_total_haps))
             .collect()
