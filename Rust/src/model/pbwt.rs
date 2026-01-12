@@ -133,36 +133,50 @@ impl PbwtDivUpdater {
         self.counts[..n_bins].fill(0);
 
         if n_alleles == 2 {
-            // Fast SIMD path for biallelic: sum bytes directly (each is 0, 1, or missing)
-            // For biallelic, byte value IS the bin index (0 or 1), so summing gives count1
+            // Fast path for biallelic sites
             let data = &self.permuted_alleles[..self.n_haps];
-            let mut count1 = 0usize;
-            let mut count_miss = 0usize;
 
-            // Process 32 bytes at a time using autovectorization hint
-            let chunks = data.chunks_exact(32);
-            let remainder = chunks.remainder();
+            // Check if we can use ultra-fast sum-only path (no missing data)
+            // For biallelic 0/1 data, sum of bytes equals count of 1s
+            let has_any_missing = data.iter().any(|&b| b > 1);
 
-            for chunk in chunks {
-                for &b in chunk {
+            if !has_any_missing {
+                // Ultra-fast: just sum bytes (each is 0 or 1)
+                // This vectorizes very well as it's just a horizontal sum
+                let count1: usize = data.iter().map(|&b| b as usize).sum();
+                self.counts[0] = self.n_haps - count1;
+                self.counts[1] = count1;
+                self.counts[n_alleles] = 0;
+            } else {
+                // Path with missing data
+                let mut count1 = 0usize;
+                let mut count_miss = 0usize;
+
+                // Process 32 bytes at a time using autovectorization hint
+                let chunks = data.chunks_exact(32);
+                let remainder = chunks.remainder();
+
+                for chunk in chunks {
+                    for &b in chunk {
+                        if b == 1 {
+                            count1 += 1;
+                        } else if b > 1 {
+                            count_miss += 1;
+                        }
+                    }
+                }
+                for &b in remainder {
                     if b == 1 {
                         count1 += 1;
                     } else if b > 1 {
                         count_miss += 1;
                     }
                 }
-            }
-            for &b in remainder {
-                if b == 1 {
-                    count1 += 1;
-                } else if b > 1 {
-                    count_miss += 1;
-                }
-            }
 
-            self.counts[0] = self.n_haps - count1 - count_miss;
-            self.counts[1] = count1;
-            self.counts[n_alleles] = count_miss; // Missing bin
+                self.counts[0] = self.n_haps - count1 - count_miss;
+                self.counts[1] = count1;
+                self.counts[n_alleles] = count_miss; // Missing bin
+            }
         } else {
             // General path for multiallelic
             for i in 0..self.n_haps {
@@ -364,35 +378,47 @@ impl PbwtDivUpdater {
         self.counts[..n_bins].fill(0);
 
         if n_alleles == 2 {
-            // Fast path for biallelic: sum bytes directly
+            // Fast path for biallelic sites
             let data = &self.permuted_alleles[..self.n_haps];
-            let mut count1 = 0usize;
-            let mut count_miss = 0usize;
 
-            // Process 32 bytes at a time using autovectorization hint
-            let chunks = data.chunks_exact(32);
-            let remainder = chunks.remainder();
+            // Check if we can use ultra-fast sum-only path (no missing data)
+            let has_any_missing = data.iter().any(|&b| b > 1);
 
-            for chunk in chunks {
-                for &b in chunk {
+            if !has_any_missing {
+                // Ultra-fast: just sum bytes (each is 0 or 1)
+                let count1: usize = data.iter().map(|&b| b as usize).sum();
+                self.counts[0] = self.n_haps - count1;
+                self.counts[1] = count1;
+                self.counts[n_alleles] = 0;
+            } else {
+                // Path with missing data
+                let mut count1 = 0usize;
+                let mut count_miss = 0usize;
+
+                let chunks = data.chunks_exact(32);
+                let remainder = chunks.remainder();
+
+                for chunk in chunks {
+                    for &b in chunk {
+                        if b == 1 {
+                            count1 += 1;
+                        } else if b > 1 {
+                            count_miss += 1;
+                        }
+                    }
+                }
+                for &b in remainder {
                     if b == 1 {
                         count1 += 1;
                     } else if b > 1 {
                         count_miss += 1;
                     }
                 }
-            }
-            for &b in remainder {
-                if b == 1 {
-                    count1 += 1;
-                } else if b > 1 {
-                    count_miss += 1;
-                }
-            }
 
-            self.counts[0] = self.n_haps - count1 - count_miss;
-            self.counts[1] = count1;
-            self.counts[n_alleles] = count_miss;
+                self.counts[0] = self.n_haps - count1 - count_miss;
+                self.counts[1] = count1;
+                self.counts[n_alleles] = count_miss;
+            }
         } else {
             // General path for multiallelic
             for i in 0..self.n_haps {
