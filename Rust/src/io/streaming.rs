@@ -422,7 +422,14 @@ impl StreamingVcfReader {
 
         for i in 0..window_end {
             let bm = &self.buffer[i];
-            markers.push(bm.marker.clone());
+            let chrom_name = self
+                .markers_meta
+                .chrom_name(bm.marker.chrom)
+                .unwrap_or("UNKNOWN");
+            let window_chrom_idx = markers.add_chrom(chrom_name);
+            let mut marker = bm.marker.clone();
+            marker.chrom = window_chrom_idx;
+            markers.push(marker);
             columns.push(bm.column.clone());
         }
 
