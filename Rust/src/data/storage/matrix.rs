@@ -212,7 +212,7 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     }
 
     /// Create a zero-copy view of a marker range
-    pub fn get_window_view(&self, range: std::ops::Range<usize>) -> GenotypeView<State> {
+    pub fn get_window_view(&self, range: std::ops::Range<usize>) -> GenotypeView<'_, S> {
         assert!(range.start <= range.end && range.end <= self.n_markers());
         GenotypeView {
             matrix: self,

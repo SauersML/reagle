@@ -10,11 +10,27 @@ use std::sync::Arc;
 
 use noodles::bgzf::io as bgzf_io;
 use noodles::vcf::Header;
+use tracing::info_span;
 
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
 use crate::error::{ReagleError, Result};
+
+/// Helper to format float with 4 decimal places using ryu
+#[inline(always)]
+fn format_f32_4dp(val: f32, ryu_buf: &mut ryu::Buffer) -> &str {
+    if !val.is_finite() {
+        return "0.0000";
+    }
+    let s = ryu_buf.format(val);
+    if let Some(dot_pos) = s.find('.') {
+        let end = (dot_pos + 5).min(s.len());
+        &s[..end]
+    } else {
+        s
+    }
+}
 
 /// Imputation quality statistics for a single marker
 ///
@@ -943,7 +959,7 @@ impl VcfWriter {
         end_marker: usize,
     ) -> Result<()> {
         info_span!("vcf_write_phased", n_markers = end_marker - start_marker).in_scope(|| {
-        for m in start..end {
+        for m in start_marker..end_marker {
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = matrix.marker(marker_idx);
             let column = matrix.column(marker_idx);
@@ -1336,7 +1352,7 @@ impl VcfWriter {
             } else { ".".to_string() };
 
             use std::fmt::Write;
-            write!(line_buf, "{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
+            write!(line_buf, "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
                 matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
                 marker.pos,
                 marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),

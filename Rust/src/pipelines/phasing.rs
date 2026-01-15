@@ -17,7 +17,7 @@ use std::sync::Arc;
 use bitvec::prelude::*;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use tracing::instrument;
+use tracing::{info_span, instrument};
 
 use crate::config::Config;
 use crate::data::genetic_map::{GeneticMaps, MarkerMap};
@@ -2013,9 +2013,9 @@ impl PhasingPipeline {
                 geno.swap_haplotypes(hap1, hap2, &mask);
             });
         });
-                    assert!(swap_lr.len() <= changeable_positions.len());
-                    let mut swap_mask = bitbox![u64, Lsb0; 0; n_markers];
-                    let mut current_phase = 0u8;
+
+        Ok(())
+    }
 
     /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only using FB HMM
     ///

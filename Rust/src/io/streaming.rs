@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use noodles::bgzf::io as bgzf_io;
+use tracing::info_span;
 
 use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;

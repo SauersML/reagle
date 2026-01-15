@@ -20,6 +20,8 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
+use tracing::info_span;
+
 use crate::model::ibs2::Ibs2;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::states::ThreadedHaps;

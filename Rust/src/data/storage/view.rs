@@ -4,10 +4,10 @@
 //! This provides a unified interface for algorithms (like HMM)
 //! to operate on both immutable `GenotypeMatrix` and `MutableGenotypes`.
 
+use crate::data::alignment::MarkerAlignment;
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::{MarkerIdx, Markers};
 use crate::data::storage::{GenotypeMatrix, MutableGenotypes, phase_state};
-use crate::pipelines::imputation::MarkerAlignment;
 
 /// A read-only view of genotype data - allows HMM to work with either
 /// GenotypeMatrix or MutableGenotypes without caring about concrete type

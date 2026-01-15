@@ -13,6 +13,8 @@
 //!
 //! This implementation follows the Beagle Java code (HmmUpdater.java) closely.
 
+use tracing::info_span;
+
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
 use crate::model::parameters::ModelParams;

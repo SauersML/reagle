@@ -34,11 +34,11 @@ const JAVA_RNG_MULT: u64 = 0x5DEECE66D;
 const JAVA_RNG_ADD: u64 = 0xB;
 const JAVA_RNG_MASK: u64 = (1u64 << 48) - 1;
 
+use crate::data::alignment::MarkerAlignment;
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::GenotypeMatrix;
-use crate::pipelines::imputation::MarkerAlignment;
 
 /// Per-cluster haplotype sequence IDs.
 ///

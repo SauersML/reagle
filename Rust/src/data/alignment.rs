@@ -1,7 +1,7 @@
 //! Marker alignment between target and reference panels.
 
 use std::collections::HashMap;
-use crate::data::marker::{AlleleMapping, Marker, MarkerIdx};
+use crate::data::marker::{AlleleMapping, MarkerIdx};
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
 use crate::error::Result;
