@@ -971,20 +971,22 @@ impl VcfWriter {
         // Buffer for ryu float formatting
         let mut ryu_buf = ryu::Buffer::new();
 
-        // Helper to format float with 4 decimal places using ryu
+        // Helper to format float with 4 decimal places using ryu when possible.
+        // Falls back to fixed-format for scientific notation to avoid exponent truncation.
         #[inline(always)]
-        fn format_f32_4dp(val: f32, ryu_buf: &mut ryu::Buffer) -> &str {
+        fn format_f32_4dp<'a>(val: f32, ryu_buf: &'a mut ryu::Buffer) -> std::borrow::Cow<'a, str> {
             if !val.is_finite() {
-                return "0.0000";
+                return std::borrow::Cow::Borrowed("0.0000");
             }
-            // ryu formats with full precision, we need to truncate
             let s = ryu_buf.format(val);
-            // Find decimal point and truncate after 4 digits
+            if s.contains('e') || s.contains('E') {
+                return std::borrow::Cow::Owned(format!("{:.4}", val));
+            }
             if let Some(dot_pos) = s.find('.') {
                 let end = (dot_pos + 5).min(s.len());
-                &s[..end]
+                std::borrow::Cow::Borrowed(&s[..end])
             } else {
-                s
+                std::borrow::Cow::Borrowed(s)
             }
         }
 
@@ -1002,12 +1004,14 @@ impl VcfWriter {
                     info_str.push_str("DR2=");
                     for a in 1..n_alleles {
                         if a > 1 { info_str.push(','); }
-                        info_str.push_str(format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf));
+                        let v = format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf);
+                        info_str.push_str(&v);
                     }
                     info_str.push_str(";AF=");
                     for a in 1..n_alleles {
                         if a > 1 { info_str.push(','); }
-                        info_str.push_str(format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf));
+                        let v = format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf);
+                        info_str.push_str(&v);
                     }
                 }
                 if stats.is_imputed {
@@ -1040,7 +1044,8 @@ impl VcfWriter {
                 line_buf.push('|');
                 line_buf.push((b'0' + a2) as char);
                 line_buf.push(':');
-                line_buf.push_str(format_f32_4dp(ds, &mut ryu_buf));
+                let v = format_f32_4dp(ds, &mut ryu_buf);
+                line_buf.push_str(&v);
 
                 if include_gp {
                     line_buf.push(':');
@@ -1052,7 +1057,8 @@ impl VcfWriter {
                                 first = false;
                                 let prob = if i1 == i2 { p1.prob(i1) * p2.prob(i2) }
                                     else { p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1) };
-                                line_buf.push_str(format_f32_4dp(prob, &mut ryu_buf));
+                                let v = format_f32_4dp(prob, &mut ryu_buf);
+                                line_buf.push_str(&v);
                             }
                         }
                     } else {
@@ -1070,13 +1076,15 @@ impl VcfWriter {
                         line_buf.push(':');
                         for a in 1..n_alleles {
                             if a > 1 { line_buf.push(','); }
-                            line_buf.push_str(format_f32_4dp(p1.prob(a), &mut ryu_buf));
+                            let v = format_f32_4dp(p1.prob(a), &mut ryu_buf);
+                            line_buf.push_str(&v);
                         }
                         if n_alleles <= 1 { line_buf.push_str("0.00"); }
                         line_buf.push(':');
                         for a in 1..n_alleles {
                             if a > 1 { line_buf.push(','); }
-                            line_buf.push_str(format_f32_4dp(p2.prob(a), &mut ryu_buf));
+                            let v = format_f32_4dp(p2.prob(a), &mut ryu_buf);
+                            line_buf.push_str(&v);
                         }
                         if n_alleles <= 1 { line_buf.push_str("0.00"); }
                     } else {

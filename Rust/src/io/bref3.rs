@@ -715,6 +715,8 @@ impl WindowedBref3Reader {
         }
 
         let n_markers = markers.len();
+        let output_start = first_idx - start_idx;
+        let output_end = output_start + (last_idx + 1 - first_idx);
         let global_start = self.global_offset;
         let global_end = global_start + n_markers;
 
@@ -734,8 +736,8 @@ impl WindowedBref3Reader {
             genotypes,
             global_start,
             global_end,
-            output_start: 0,
-            output_end: n_markers,
+            output_start,
+            output_end,
             is_first,
             is_last,
         }))
