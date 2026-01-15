@@ -50,6 +50,7 @@ struct SampleImputationResult {
     best_gt: Vec<(u8, u8)>,
     priors: Option<(HaplotypePriors, HaplotypePriors)>,
     state_probs: Option<(Arc<ClusterStateProbs>, Arc<ClusterStateProbs>)>,
+    hap_alt_probs: Option<(Vec<f32>, Vec<f32>)>,
 }
 
 impl crate::pipelines::ImputationPipeline {
@@ -218,14 +219,18 @@ impl crate::pipelines::ImputationPipeline {
                     ),
                 };
 
-                let phased = pipeline.phase_window_streaming(
-                    &target_window.genotypes,
-                    &ref_window_gt,
-                    &alignment,
-                    &producer_maps,
-                    phased_overlap.as_ref(),
-                    pbwt_state.as_ref(),
-                )?;
+                let phased = if target_reader.was_all_phased() {
+                    target_window.genotypes.clone().into_phased()
+                } else {
+                    pipeline.phase_window_streaming(
+                        &target_window.genotypes,
+                        &ref_window_gt,
+                        &alignment,
+                        &producer_maps,
+                        phased_overlap.as_ref(),
+                        pbwt_state.as_ref(),
+                    )?
+                };
 
                 // Extract state for next window BEFORE moving phased to channel
                 phased_overlap = Some(pipeline.extract_overlap_streaming(&phased, n_markers, target_window.output_end));
@@ -499,6 +504,7 @@ impl crate::pipelines::ImputationPipeline {
                             best_gt: vec![(0u8, 0u8); markers_to_process.len()],
                             priors: None,
                             state_probs: None,
+                            hap_alt_probs: None,
                         };
                     }
 
@@ -543,7 +549,8 @@ impl crate::pipelines::ImputationPipeline {
                     let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
                     let cluster_weights = Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
 
-                    let (dosages, best_gt, priors, state_probs_pair) = LOCAL_WORKSPACE.with(|cell| {
+                    let (dosages, best_gt, priors, state_probs_pair, hap_alt_probs) =
+                        LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() { *ws_opt = Some(ImpWorkspace::new(n_ref_haps)); }
                         let ws = ws_opt.as_mut().unwrap();
@@ -643,7 +650,13 @@ impl crate::pipelines::ImputationPipeline {
                             None
                         };
 
-                        (combined_dosages, combined_best_gt, priors, state_probs_pair)
+                        let hap_alt_probs = if hap_results.len() == 2 {
+                            Some((hap_results[0].0.clone(), hap_results[1].0.clone()))
+                        } else {
+                            None
+                        };
+
+                        (combined_dosages, combined_best_gt, priors, state_probs_pair, hap_alt_probs)
                     });
                     SampleImputationResult {
                         sample_idx: s,
@@ -651,6 +664,7 @@ impl crate::pipelines::ImputationPipeline {
                         best_gt,
                         priors,
                         state_probs: state_probs_pair,
+                        hap_alt_probs,
                     }
                 }).collect();
             
@@ -659,6 +673,23 @@ impl crate::pipelines::ImputationPipeline {
         
         // Sort all results by sample index for writing
         all_results.sort_by_key(|result| result.sample_idx);
+
+        let is_biallelic: Vec<bool> = (0..n_ref_markers)
+            .map(|m| ref_win.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
+            .collect();
+
+        for result in &all_results {
+            if let Some((ref p1, ref p2)) = result.hap_alt_probs {
+                for (local_m, (&p1_alt, &p2_alt)) in p1.iter().zip(p2.iter()).enumerate() {
+                    let ref_m = markers_to_process.start + local_m;
+                    if ref_m < n_ref_markers && is_biallelic[ref_m] {
+                        if let Some(stats) = window_quality.get_mut(ref_m) {
+                            stats.add_sample_biallelic(p1_alt, p2_alt);
+                        }
+                    }
+                }
+            }
+        }
 
         let mut next_priors = if output_end > 0 && n_ref_markers > 0 {
             Some(vec![HaplotypePriors::new(); n_target_samples * 2])

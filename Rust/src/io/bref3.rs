@@ -349,8 +349,6 @@ pub struct Bref3Block {
     pub markers: Markers,
     /// Genotype columns for each marker
     pub columns: Vec<GenotypeColumn>,
-    /// Start position (bp) of this block
-    pub start_pos: u32,
     /// End position (bp) of this block
     pub end_pos: u32,
     /// Chromosome name
@@ -407,11 +405,6 @@ impl StreamingBref3Reader {
         })
     }
 
-    /// Get the samples
-    pub fn samples(&self) -> &Samples {
-        &self.samples
-    }
-
     /// Get the samples as Arc (for sharing without cloning)
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)
@@ -459,12 +452,10 @@ impl StreamingBref3Reader {
         let mut columns: Vec<GenotypeColumn> = Vec::with_capacity(n_recs);
         let block_start_idx = 0;
 
-        let mut start_pos = u32::MAX;
         let mut end_pos = 0u32;
 
         for _ in 0..n_recs {
             let marker = self.read_marker(chrom_idx)?;
-            start_pos = start_pos.min(marker.pos);
             end_pos = end_pos.max(marker.pos);
 
             let flag = read_byte(&mut self.reader)?;
@@ -503,7 +494,6 @@ impl StreamingBref3Reader {
         Ok(Some(Bref3Block {
             markers,
             columns,
-            start_pos,
             end_pos,
             chrom: chrom_name,
         }))
@@ -590,18 +580,11 @@ impl StreamingBref3Reader {
 /// Configuration for windowed reference loading
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
-    /// Window size in base pairs
-    pub window_bp: u32,
-    /// Overlap size in base pairs (for HMM boundary handling)
-    pub overlap_bp: u32,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
-        Self {
-            window_bp: 5_000_000,  // 5 Mb windows
-            overlap_bp: 500_000,   // 500 kb overlap
-        }
+        Self {}
     }
 }
 
@@ -626,7 +609,6 @@ pub struct RefWindow {
 /// Windowed reference panel reader that accumulates blocks into windows
 pub struct WindowedBref3Reader {
     inner: StreamingBref3Reader,
-    config: WindowConfig,
     /// Buffer of blocks for the next window
     block_buffer: VecDeque<Bref3Block>,
     /// Current window number
@@ -638,23 +620,13 @@ pub struct WindowedBref3Reader {
 impl WindowedBref3Reader {
     /// Create a windowed reader with given configuration
     pub fn new(inner: StreamingBref3Reader, config: WindowConfig) -> Self {
+        let _ = config;
         Self {
             inner,
-            config,
             block_buffer: VecDeque::new(),
             window_num: 0,
             global_offset: 0,
         }
-    }
-
-    /// Get the samples
-    pub fn samples(&self) -> &Samples {
-        self.inner.samples()
-    }
-
-    /// Get number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        self.inner.n_haps()
     }
 
     /// Load reference window for a specific genomic region
@@ -779,119 +751,6 @@ impl WindowedBref3Reader {
         }))
     }
 
-    /// Read the next window of reference data
-    pub fn next_window(&mut self) -> Result<Option<RefWindow>> {
-        // Fill buffer until we have enough for a window
-        let target_end = if self.block_buffer.is_empty() {
-            0
-        } else {
-            self.block_buffer[0].start_pos + self.config.window_bp
-        };
-
-        while !self.inner.is_eof() {
-            if let Some(last_block) = self.block_buffer.back() {
-                if last_block.end_pos >= target_end {
-                    break;
-                }
-            }
-            if let Some(block) = self.inner.next_block()? {
-                self.block_buffer.push_back(block);
-            } else {
-                break;
-            }
-        }
-
-        if self.block_buffer.is_empty() {
-            return Ok(None);
-        }
-
-        // Determine window boundaries
-        let is_first = self.window_num == 0;
-        let is_last = self.inner.is_eof();
-
-        // Merge blocks into a single window
-        let mut markers = Markers::new();
-        let mut columns: Vec<GenotypeColumn> = Vec::new();
-
-        // Track which blocks are fully consumed
-        let window_start_pos = self.block_buffer[0].start_pos;
-        let window_end_pos = window_start_pos + self.config.window_bp;
-
-        let mut blocks_consumed: usize = 0;
-        for block in &self.block_buffer {
-            // Add chromosome if needed
-            if markers.chrom_names().is_empty() || markers.chrom_names().last().map(|s| s.as_ref()) != Some(&block.chrom) {
-                markers.add_chrom(&block.chrom);
-            }
-
-            // Add markers and columns
-            for m in 0..block.n_markers() {
-                let marker = block.markers.marker(crate::data::marker::MarkerIdx::new(m as u32));
-                markers.push(marker.clone());
-                columns.push(block.columns[m].clone());
-            }
-
-            if block.end_pos <= window_end_pos {
-                blocks_consumed += 1;
-            } else {
-                break;
-            }
-        }
-
-        let n_markers = markers.len();
-        let global_start = self.global_offset;
-        let global_end = global_start + n_markers;
-
-        // Calculate output region (excluding overlap)
-        let output_start = 0; // Overlap handled via block buffering
-        let output_end = n_markers;
-
-        // Remove fully consumed blocks, keeping overlap
-        let overlap_start_pos = if is_last {
-            u32::MAX
-        } else {
-            window_end_pos.saturating_sub(self.config.overlap_bp)
-        };
-
-        let mut keep_from = 0;
-        for (i, block) in self.block_buffer.iter().enumerate() {
-            if block.start_pos >= overlap_start_pos {
-                keep_from = i;
-                break;
-            }
-            if i == blocks_consumed.saturating_sub(1) {
-                keep_from = i;
-                break;
-            }
-        }
-
-        // Update global offset with markers we're done with
-        let markers_consumed: usize = self
-            .block_buffer
-            .iter()
-            .take(keep_from)
-            .map(|b| b.n_markers())
-            .sum();
-        self.global_offset += markers_consumed;
-
-        // Remove consumed blocks
-        self.block_buffer.drain(..keep_from);
-        self.window_num += 1;
-
-        // Create GenotypeMatrix from markers and columns
-        let samples = self.inner.samples_arc();
-        let genotypes = GenotypeMatrix::new_phased(markers, columns, samples);
-
-        Ok(Some(RefWindow {
-            genotypes,
-            global_start,
-            global_end,
-            output_start,
-            output_end,
-            is_first,
-            is_last,
-        }))
-    }
 }
 
 /// Unified reference panel reader that supports both BREF3 (streaming) and VCF (in-memory)
@@ -905,33 +764,6 @@ pub enum RefPanelReader {
 }
 
 impl RefPanelReader {
-    /// Get the samples
-    pub fn samples(&self) -> &Samples {
-        match self {
-            RefPanelReader::Bref3(r) => r.samples(),
-            RefPanelReader::InMemory(r) => r.samples(),
-            RefPanelReader::StreamingVcf(r) => r.samples(),
-        }
-    }
-
-    /// Get the samples as Arc
-    pub fn samples_arc(&self) -> Arc<Samples> {
-        match self {
-            RefPanelReader::Bref3(r) => r.inner.samples_arc(),
-            RefPanelReader::InMemory(r) => r.samples_arc(),
-            RefPanelReader::StreamingVcf(r) => r.samples_arc(),
-        }
-    }
-
-    /// Get number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        match self {
-            RefPanelReader::Bref3(r) => r.n_haps(),
-            RefPanelReader::InMemory(r) => r.n_haps(),
-            RefPanelReader::StreamingVcf(r) => r.n_haps(),
-        }
-    }
-
     /// Load reference window for a specific genomic region
     pub fn load_window_for_region(&mut self, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         match self {
@@ -958,21 +790,6 @@ impl InMemoryRefReader {
             genotypes,
             window_num: 0,
         }
-    }
-
-    /// Get the samples
-    pub fn samples(&self) -> &Samples {
-        self.genotypes.samples()
-    }
-
-    /// Get the samples as Arc
-    pub fn samples_arc(&self) -> Arc<Samples> {
-        self.genotypes.samples_arc()
-    }
-
-    /// Get number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        self.genotypes.n_haplotypes()
     }
 
     /// Load reference window for a specific genomic region
@@ -1096,9 +913,6 @@ impl StreamingRefVcfReader {
         })
     }
 
-    pub fn samples(&self) -> &Samples { &self.samples }
-    pub fn samples_arc(&self) -> Arc<Samples> { Arc::clone(&self.samples) }
-    pub fn n_haps(&self) -> usize { self.samples.len() * 2 }
 
     /// Load reference window for a specific genomic region
     pub fn load_window_for_region(&mut self, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {

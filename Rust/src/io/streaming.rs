@@ -144,11 +144,6 @@ impl HaplotypePriors {
     pub fn is_empty(&self) -> bool {
         self.hap_ids.is_empty()
     }
-    
-    /// Number of stored priors
-    pub fn len(&self) -> usize {
-        self.hap_ids.len()
-    }
 }
 
 impl Default for HaplotypePriors {
@@ -225,6 +220,7 @@ pub struct StreamWindow {
     /// Genotype data for this window
     pub genotypes: GenotypeMatrix,
     /// Window number (0-indexed)
+    #[allow(dead_code)]
     pub window_num: usize,
     /// Start marker index in full chromosome
     pub global_start: usize,
@@ -279,6 +275,8 @@ pub struct StreamingVcfReader {
     eof: bool,
     /// Current line buffer
     line_buf: String,
+    /// Whether all genotypes seen so far were phased
+    all_phased: bool,
 }
 
 impl StreamingVcfReader {
@@ -352,6 +350,7 @@ impl StreamingVcfReader {
             global_marker_idx: 0,
             eof: false,
             line_buf: String::new(),
+            all_phased: true,
         })
         })
     }
@@ -359,6 +358,11 @@ impl StreamingVcfReader {
     /// Get samples Arc
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)
+    }
+
+    /// Returns true if all genotypes seen so far were phased (used '|' separator).
+    pub fn was_all_phased(&self) -> bool {
+        self.all_phased
     }
 
     /// Read the next window of data
@@ -567,6 +571,10 @@ impl StreamingVcfReader {
 
         for sample_field in fields[9..].iter().take(n_samples) {
             let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
+
+            if gt_field.contains('/') {
+                self.all_phased = false;
+            }
 
             let (a1, a2) = parse_gt(gt_field);
             alleles.push(a1);

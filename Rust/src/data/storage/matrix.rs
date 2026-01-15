@@ -76,9 +76,6 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     }
 
     /// Get samples reference
-    pub fn samples(&self) -> &Arc<Samples> {
-        &self.samples
-    }
 
     /// Get samples Arc (cloned)
     pub fn samples_arc(&self) -> Arc<Samples> {
@@ -106,9 +103,6 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     }
 
     /// Check if confidence scores are available
-    pub fn has_confidence(&self) -> bool {
-        self.confidence.is_some()
-    }
 
     /// Get confidence score for a sample at a marker (0-255 representing 0.0-1.0).
     /// Returns 255 (full confidence) if confidence data is not available.
