@@ -837,7 +837,7 @@ impl PhasingPipeline {
         while let Some(mut window) = next_window_opt {
             let window_idx = window_count;
             window_count += 1;
-            info_span!("process_window", window_idx = window_idx).in_scope(|| {
+
             let n_markers = window.genotypes.n_markers();
 
             eprintln!(
@@ -914,7 +914,7 @@ impl PhasingPipeline {
             window_count, total_markers
         );
         Ok(())
-            });
+
         }
         Ok(())
     }
@@ -2019,49 +2019,6 @@ impl PhasingPipeline {
                     assert!(swap_lr.len() <= changeable_positions.len());
                     let mut swap_mask = bitbox![u64, Lsb0; 0; n_markers];
                     let mut current_phase = 0u8;
-                    let mut phase_idx = 0usize;
-                    for m in overlap_markers..n_markers {
-                        if phase_idx < changeable_positions.len() && changeable_positions[phase_idx] == m {
-                            current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
-                            phase_idx += 1;
-                        }
-                        if current_phase == 1 {
-                            swap_mask.set(m, true);
-                        }
-                    }
-
-                    swap_mask
-                })
-                .collect()
-        };  // ref_geno borrow ends here
-
-        // Apply Swaps
-        let mut total_switches = 0;
-        for s in 0..n_samples {
-            let mask = &swap_masks[s];
-            if mask.any() {
-                let hap1 = HapIdx::new((s * 2) as u32);
-                let hap2 = HapIdx::new((s * 2 + 1) as u32);
-
-                for m in mask.iter_ones() {
-                    geno.swap(m, hap1, hap2);
-                    total_switches += 1;
-                }
-            }
-        }
-
-        // Update sample_phases to match
-        for (s, sp) in sample_phases.iter_mut().enumerate() {
-            for m in overlap_markers..n_markers {
-                if swap_masks[s][m] {
-                    sp.swap_alleles(m);
-                }
-            }
-        }
-
-        eprintln!("Applied {} phase switches (with {} overlap markers locked)", total_switches, overlap_markers);
-        Ok(())
-    }
 
     /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only using FB HMM
     ///
@@ -3881,7 +3838,7 @@ fn sample_swap_bits_mosaic(
     }
 
     // Resize workspace if needed for this window
-    workspace.resize_for_window(n_markers, n_states);
+    workspace.resize_for_states(n_states);
 
     let mut combined_checkpoints = FwdCheckpoints::new(n_markers, n_states, MOSAIC_BLOCK_SIZE);
     let dummy_allele = vec![255u8; n_markers];
@@ -4096,7 +4053,7 @@ impl Stage2Phaser {
     ) -> [f32; 2]
     where
         F: Fn(usize, usize) -> u8, // (marker, hap_index) -> allele
-    {
+
         let mut al_probs = [0.0f32; 2];
 
         let mkr_a = self.prev_stage1_marker[marker];
@@ -4353,12 +4310,6 @@ impl Stage2Phaser {
                 // Update the result matrix
                 result.set_allele(MarkerIdx::new(marker as u32), hap1_idx, new_a1);
                 result.set_allele(MarkerIdx::new(marker as u32), hap2_idx, new_a2);
-            }
-        }
-
-        Ok(result)
-    }
-}
 
 #[cfg(test)]
 mod tests {
