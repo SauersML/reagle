@@ -672,6 +672,37 @@ impl ClusterStateProbs {
             AllelePosteriors::Multiallelic(al_probs)
         }
     }
+
+    /// Extract state probabilities from the final cluster for soft-handoff to next window.
+    /// Returns (haplotype_ids, probabilities) for states with significant probability.
+    pub fn extract_final_priors(&self) -> (Vec<u32>, Vec<f32>) {
+        let n_clusters = self.offsets.len().saturating_sub(1);
+        if n_clusters == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        
+        // Get the last cluster's data
+        let last_cluster = n_clusters - 1;
+        let start = self.offsets.get(last_cluster).copied().unwrap_or(0);
+        let end = self.offsets.get(last_cluster + 1).copied().unwrap_or(start);
+        
+        let haps = &self.hap_indices[start..end];
+        // Use probs_p1 (probability at next marker) as it represents the "exit" state
+        let probs = &self.probs_p1[start..end];
+        
+        // Filter to significant probabilities (>0.001) to save memory
+        let mut out_haps = Vec::new();
+        let mut out_probs = Vec::new();
+        for (i, &hap) in haps.iter().enumerate() {
+            let prob = probs.get(i).copied().unwrap_or(0.0);
+            if prob > 0.001 {
+                out_haps.push(hap);
+                out_probs.push(prob);
+            }
+        }
+        
+        (out_haps, out_probs)
+    }
 }
 
 impl ImputationPipeline {

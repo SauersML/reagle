@@ -3989,26 +3989,121 @@ impl PhasingPipeline {
         current_phased: &GenotypeMatrix<Phased>,
         next_phased: &GenotypeMatrix<Phased>,
     ) -> Result<GenotypeMatrix<Phased>> {
-        // Verify boundary consistency between windows
-        // The overlap region should have consistent phasing
+        use crate::data::storage::GenotypeColumn;
+        
         let current_markers = current_phased.n_markers();
         let next_markers = next_phased.n_markers();
+        let n_samples = current_phased.n_samples();
 
-        // Log cross-window phasing info for diagnostics
-        if current_markers > 0 && next_markers > 0 {
-            let last_current = current_phased.marker(MarkerIdx::new((current_markers - 1) as u32));
-            let first_next = next_phased.marker(MarkerIdx::new(0));
+        if current_markers == 0 || next_markers == 0 || n_samples == 0 {
+            return Ok(current_phased.clone());
+        }
 
+        // Find overlap region: markers in current window that also appear in next window
+        // Build position map for next window
+        let mut next_pos_map: std::collections::HashMap<(u16, u32), usize> = std::collections::HashMap::new();
+        for m in 0..next_markers {
+            let marker = next_phased.marker(MarkerIdx::new(m as u32));
+            next_pos_map.insert((marker.chrom.0, marker.pos), m);
+        }
+
+        // Find rare markers in the overlap region (last ~2cM or last 1000 markers)
+        let overlap_start = current_markers.saturating_sub(1000);
+        let rare_threshold = self.config.rare;
+        
+        // Collect markers that need re-phasing: rare hets in overlap that exist in next window
+        let mut markers_to_fix: Vec<(usize, usize)> = Vec::new(); // (current_idx, next_idx)
+        
+        for m in overlap_start..current_markers {
+            let marker = current_phased.marker(MarkerIdx::new(m as u32));
+            
+            // Check if this marker exists in next window
+            if let Some(&next_m) = next_pos_map.get(&(marker.chrom.0, marker.pos)) {
+                // Check if it's a rare variant (simplified: check if any sample has het)
+                let n_alleles = 1 + marker.alt_alleles.len();
+                if n_alleles == 2 {
+                    // For biallelic, check MAF
+                    let mut alt_count = 0u32;
+                    let n_haps = current_phased.n_haplotypes();
+                    for h in 0..n_haps {
+                        if current_phased.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32)) == 1 {
+                            alt_count += 1;
+                        }
+                    }
+                    let maf = (alt_count as f32 / n_haps as f32).min(1.0 - alt_count as f32 / n_haps as f32);
+                    if maf < rare_threshold && maf > 0.0 {
+                        markers_to_fix.push((m, next_m));
+                    }
+                }
+            }
+        }
+
+        if markers_to_fix.is_empty() {
+            tracing::debug!("Stage 2 finalization: no rare markers in overlap need fixing");
+            return Ok(current_phased.clone());
+        }
+
+        tracing::debug!(
+            "Stage 2 finalization: checking {} rare markers in overlap region",
+            markers_to_fix.len()
+        );
+
+        // Clone columns for modification
+        let mut new_columns: Vec<GenotypeColumn> = (0..current_markers)
+            .map(|m| current_phased.column(MarkerIdx::new(m as u32)).clone())
+            .collect();
+
+        let mut fixes_applied = 0;
+
+        // For each rare marker, check if next window has different phasing
+        // If so, adopt the next window's phasing (it has more context)
+        for (current_m, next_m) in markers_to_fix {
+            for s in 0..n_samples {
+                let hap1 = HapIdx::new((s * 2) as u32);
+                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+                let curr_a1 = current_phased.allele(MarkerIdx::new(current_m as u32), hap1);
+                let curr_a2 = current_phased.allele(MarkerIdx::new(current_m as u32), hap2);
+                
+                // Only fix heterozygotes
+                if curr_a1 == curr_a2 || curr_a1 == 255 || curr_a2 == 255 {
+                    continue;
+                }
+
+                let next_a1 = next_phased.allele(MarkerIdx::new(next_m as u32), hap1);
+                let next_a2 = next_phased.allele(MarkerIdx::new(next_m as u32), hap2);
+
+                // Check if next window has opposite phasing
+                if next_a1 == curr_a2 && next_a2 == curr_a1 {
+                    // Next window has swapped phase - adopt it
+                    // We need to swap in the current window
+                    new_columns[current_m].swap(hap1.as_usize(), hap2.as_usize());
+                    fixes_applied += 1;
+                }
+            }
+        }
+
+        if fixes_applied > 0 {
             tracing::debug!(
-                "Stage 2 finalization: current window ends at pos {}, next starts at pos {}",
-                last_current.pos_cm,
-                first_next.pos_cm
+                "Stage 2 finalization: applied {} phase corrections from forward context",
+                fixes_applied
             );
         }
 
-        // GenotypeMatrix is immutable - rare variant phasing was done in-window
-        // Return the current phased result
-        Ok(current_phased.clone())
+        // Build new matrix with corrected columns
+        let mut new_markers = crate::data::marker::Markers::new();
+        for name in current_phased.markers().chrom_names() {
+            new_markers.add_chrom(name);
+        }
+        for m in 0..current_markers {
+            new_markers.push(current_phased.marker(MarkerIdx::new(m as u32)).clone());
+        }
+
+        Ok(GenotypeMatrix::new_phased(
+            new_markers,
+            new_columns,
+            current_phased.samples_arc(),
+        ))
     }
 }
 

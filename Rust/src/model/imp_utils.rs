@@ -282,6 +282,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+    initial_priors: Option<&crate::io::streaming::HaplotypePriors>,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
     use wide::f32x8;
 
@@ -315,8 +316,36 @@ pub fn run_hmm_forward_backward_to_sparse(
         let base_emit = cluster_base_scores[m].exp();
 
         if m == 0 {
-            let val = base_emit / n_states as f32;
-            fwd[curr_off..curr_off+n_states].fill(val);
+            // Initialize with priors if available (soft-handoff from previous window)
+            // Otherwise use uniform prior (1/n_states)
+            if let Some(priors) = initial_priors {
+                let haps = hap_indices_input.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
+                let mut sum = 0.0f32;
+                for (k, &hap_id) in haps.iter().enumerate().take(n_states) {
+                    let prior = priors.prior(hap_id, n_states);
+                    let val = prior * base_emit;
+                    fwd[curr_off + k] = val;
+                    sum += val;
+                }
+                // Fill remaining states with uniform if haps < n_states
+                if haps.len() < n_states {
+                    let uniform = base_emit / n_states as f32;
+                    for k in haps.len()..n_states {
+                        fwd[curr_off + k] = uniform;
+                        sum += uniform;
+                    }
+                }
+                // Normalize to prevent numerical issues
+                if sum > 1e-30 {
+                    let inv_sum = 1.0 / sum;
+                    for k in 0..n_states {
+                        fwd[curr_off + k] *= inv_sum;
+                    }
+                }
+            } else {
+                let val = base_emit / n_states as f32;
+                fwd[curr_off..curr_off+n_states].fill(val);
+            }
         } else {
             let (lower, upper) = fwd.split_at_mut(prev_base);
             let (curr_slice, prev_slice) = if m % 2 == 0 {
@@ -626,6 +655,7 @@ pub fn compute_state_probs(
     marker_cluster: Arc<Vec<usize>>,
     ref_cluster_end: Arc<Vec<usize>>,
     cluster_weights: Arc<Vec<f32>>,
+    initial_priors: Option<&crate::io::streaming::HaplotypePriors>,
 ) -> Arc<ClusterStateProbs> {
     let n_clusters = cluster_bounds.len();
     workspace.reset_and_ensure_capacity(n_clusters, n_states);
@@ -662,6 +692,7 @@ pub fn compute_state_probs(
             &mut workspace.fwd,
             &mut workspace.bwd,
             &mut workspace.block_fwd,
+            initial_priors,
         );
 
     Arc::new(ClusterStateProbs::from_sparse(

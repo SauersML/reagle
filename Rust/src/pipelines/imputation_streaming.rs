@@ -4,11 +4,17 @@
 //! Uses a producer-consumer model with MPSC channel to pipe phased matrices
 //! directly to imputation in-memory.
 
+use std::cell::RefCell;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
 use rayon::prelude::*;
 use tracing::instrument;
+
+// Thread-local storage for final HMM priors (soft-handoff between windows)
+thread_local! {
+    static FINAL_PRIORS: RefCell<Option<Vec<crate::io::streaming::HaplotypePriors>>> = RefCell::new(None);
+}
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
@@ -130,12 +136,17 @@ impl crate::pipelines::ImputationPipeline {
                 streaming_config.clone(),
             )?;
             
+            let use_streaming_vcf = pipeline.config.streaming.unwrap_or(false);
             let mut ref_reader: RefPanelReader = if is_bref3 {
                 let stream_reader = crate::io::bref3::StreamingBref3Reader::open(&ref_path_clone)?;
                 let window_config = crate::io::bref3::WindowConfig::default();
                 let windowed = crate::io::bref3::WindowedBref3Reader::new(stream_reader, window_config);
                 RefPanelReader::Bref3(windowed)
+            } else if use_streaming_vcf {
+                // Streaming VCF for memory-constrained environments
+                RefPanelReader::StreamingVcf(crate::io::bref3::StreamingRefVcfReader::open(&ref_path_clone)?)
             } else {
+                // In-memory VCF (default, safer for correctness)
                 let (mut vcf_reader, vcf_file) = crate::io::vcf::VcfReader::open(&ref_path_clone)?;
                 let ref_gt = Arc::new(vcf_reader.read_all(vcf_file)?.into_phased());
                 RefPanelReader::InMemory(crate::io::bref3::InMemoryRefReader::new(ref_gt))
@@ -451,17 +462,21 @@ impl crate::pipelines::ImputationPipeline {
             })
             .collect();
 
+        // Extract haplotype priors for soft-handoff (if available from previous window)
+        let hap_priors: Option<&[crate::io::streaming::HaplotypePriors]> = imp_overlap
+            .and_then(|o| o.hap_priors());
+
         const BATCH_SIZE: usize = 50;
         let n_batches = (n_target_samples + BATCH_SIZE - 1) / BATCH_SIZE;
         
-        let mut all_results = Vec::new();
+        let mut all_results: Vec<(usize, Vec<f32>, Vec<(u8, u8)>, Vec<(usize, Vec<u32>, Vec<f32>)>)> = Vec::new();
 
         for batch_idx in 0..n_batches {
             let batch_start = batch_idx * BATCH_SIZE;
             let batch_end = (batch_start + BATCH_SIZE).min(n_target_samples);
             let batch_samples: Vec<usize> = (batch_start..batch_end).collect();
 
-            let batch_results: Vec<(usize, Vec<f32>, Vec<(u8, u8)> )> = batch_samples
+            let batch_results: Vec<(usize, Vec<f32>, Vec<(u8, u8)>, Vec<(usize, Vec<u32>, Vec<f32>)>)> = batch_samples
                 .par_iter()
                 .map(|&s| {
                     let hap1_idx = HapIdx::new((s * 2) as u32);
@@ -470,7 +485,7 @@ impl crate::pipelines::ImputationPipeline {
                     let sample_genotyped = &sample_genotyped_vec[s];
 
                     if sample_genotyped.is_empty() {
-                        return (s, vec![0.0f32; markers_to_process.len()], vec![(0u8, 0u8); markers_to_process.len()]);
+                        return (s, vec![0.0f32; markers_to_process.len()], vec![(0u8, 0u8); markers_to_process.len()], Vec::new());
                     }
 
                     let clusters = compute_marker_clusters_with_blocks(
@@ -514,23 +529,30 @@ impl crate::pipelines::ImputationPipeline {
                     let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
                     let cluster_weights = Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
 
-                    let (dosages, best_gt) = LOCAL_WORKSPACE.with(|cell| {
+                    // Returns: (dosages, best_gt, final_priors_per_hap)
+                    // final_priors_per_hap: Vec of (hap_idx, (hap_ids, probs)) for soft-handoff
+                    let (dosages, best_gt, final_priors) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() { *ws_opt = Some(ImpWorkspace::new(n_ref_haps)); }
                         let ws = ws_opt.as_mut().unwrap();
                         ws.clear();
 
                         let mut hap_results: Vec<(Vec<f32>, Vec<(u8, u8)>)> = Vec::new();
+                        let mut hap_final_priors: Vec<(usize, Vec<u32>, Vec<f32>)> = Vec::new();
 
                         for (local_h, &global_h) in target_haps.iter().enumerate() {
                             let mut imp_states = ImpStatesCluster::new(&imp_ibs, n_clusters, n_ref_haps, self.params.n_states);
                             let mut hap_indices: Vec<Vec<u32>> = Vec::new();
                             let actual_n_states = imp_states.ibs_states_cluster(local_h, &mut hap_indices);
 
+                            // Get prior for this target haplotype (soft-handoff from previous window)
+                            let hap_prior = hap_priors.and_then(|priors| priors.get(global_h.as_usize()));
+
                             let state_probs = compute_state_probs(
                                 &hap_indices, &cluster_bounds, sample_genotyped, target_win, ref_win,
                                 alignment, global_h.as_usize(), actual_n_states, ws, self.params.p_mismatch,
-                                &cluster_p_recomb, marker_cluster.clone(), ref_cluster_end.clone(), cluster_weights.clone()
+                                &cluster_p_recomb, marker_cluster.clone(), ref_cluster_end.clone(), cluster_weights.clone(),
+                                hap_prior,
                             );
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
@@ -540,6 +562,10 @@ impl crate::pipelines::ImputationPipeline {
                                 hap_dosages.push(p.prob(1));
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
+
+                            // Extract final state priors for soft-handoff to next window
+                            let (final_haps, final_probs) = state_probs.extract_final_priors();
+                            hap_final_priors.push((global_h.as_usize(), final_haps, final_probs));
 
                             hap_results.push((hap_dosages, hap_best_gt));
                         }
@@ -552,23 +578,52 @@ impl crate::pipelines::ImputationPipeline {
                             combined_best_gt.push((hap_results[0].1[m].0, hap_results[1].1[m].0));
                         }
 
-                        (combined_dosages, combined_best_gt)
+                        (combined_dosages, combined_best_gt, hap_final_priors)
                     });
-                    (s, dosages, best_gt)
+                    (s, dosages, best_gt, final_priors)
                 }).collect();
             
             all_results.extend(batch_results);
         }
         
         // Sort all results by sample index for writing
-        all_results.sort_by_key(|(s, _, _)| *s);
+        all_results.sort_by_key(|(s, _, _, _)| *s);
+
+        // Aggregate final priors for soft-handoff to next window
+        let final_hap_priors = self.aggregate_final_priors(&all_results, n_target_haps);
 
         self.write_imputed_window_streaming(
             ref_win, final_writer, window_quality, output_start, output_end,
             markers_to_process.start, &all_results,
         )?;
         
+        // Store the aggregated priors for return (will be used by caller)
+        // Note: We store them in thread-local for now, caller will retrieve via extract_imputed_overlap_streaming
+        FINAL_PRIORS.with(|cell| {
+            *cell.borrow_mut() = Some(final_hap_priors);
+        });
+        
         Ok(())
+    }
+
+    /// Aggregate final state priors from all samples into Vec<HaplotypePriors>
+    fn aggregate_final_priors(
+        &self,
+        all_results: &[(usize, Vec<f32>, Vec<(u8, u8)>, Vec<(usize, Vec<u32>, Vec<f32>)>)],
+        n_target_haps: usize,
+    ) -> Vec<crate::io::streaming::HaplotypePriors> {
+        let mut hap_priors = vec![crate::io::streaming::HaplotypePriors::new(); n_target_haps];
+        
+        for (_sample_idx, _dosages, _best_gt, final_priors) in all_results {
+            for (hap_idx, hap_ids, probs) in final_priors {
+                if *hap_idx < n_target_haps {
+                    // Use set_from_posteriors to populate the priors
+                    hap_priors[*hap_idx].set_from_posteriors(hap_ids, probs, 0.0, 0);
+                }
+            }
+        }
+        
+        hap_priors
     }
     
     fn extract_imputed_overlap_streaming(
@@ -587,7 +642,16 @@ impl crate::pipelines::ImputationPipeline {
                 alleles[h * overlap_size + local_m] = target_win.allele(MarkerIdx::new(global_m as u32), HapIdx::new(h as u32));
             }
         }
-        PhasedOverlap::new(overlap_size, n_haps, alleles)
+        let mut overlap = PhasedOverlap::new(overlap_size, n_haps, alleles);
+        
+        // Retrieve and attach the final priors computed during imputation
+        FINAL_PRIORS.with(|cell| {
+            if let Some(priors) = cell.borrow_mut().take() {
+                overlap.set_hap_priors(priors);
+            }
+        });
+        
+        overlap
     }
 
     /// Write imputed window results to VCF
@@ -599,7 +663,7 @@ impl crate::pipelines::ImputationPipeline {
         output_start: usize,
         output_end: usize,
         markers_to_process_start: usize,
-        all_results: &[(usize, Vec<f32>, Vec<(u8, u8)>)],
+        all_results: &[(usize, Vec<f32>, Vec<(u8, u8)>, Vec<(usize, Vec<u32>, Vec<f32>)>)],
     ) -> Result<()> {
         let markers_range = output_start..output_end;
         let n_markers = markers_range.len();
@@ -610,7 +674,7 @@ impl crate::pipelines::ImputationPipeline {
 
         // Build lookup maps for sample -> (dosages, best_gt)
         let sample_data: std::collections::HashMap<usize, (&Vec<f32>, &Vec<(u8, u8)>)> =
-            all_results.iter().map(|(s, d, g)| (*s, (d, g))).collect();
+            all_results.iter().map(|(s, d, g, _)| (*s, (d, g))).collect();
 
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at markers_to_process_start
