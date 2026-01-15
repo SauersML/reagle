@@ -2656,6 +2656,7 @@ fn scan_for_no_effect_allow() -> Vec<String> {
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
@@ -2703,6 +2704,7 @@ fn scan_for_omitted_for_brevity() -> Vec<String> {
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
@@ -2748,6 +2750,7 @@ fn scan_for_deprecated() -> Vec<String> {
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
@@ -2795,6 +2798,7 @@ fn scan_for_placeholder_stubs() -> Vec<String> {
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
