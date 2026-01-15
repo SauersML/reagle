@@ -669,15 +669,10 @@ impl WindowedBref3Reader {
         // Add buffer zone to prevent reference bias at boundaries
         // Use 500 markers to ensure HMM has context to stabilize at boundaries
         const BUFFER_MARKERS: usize = 500;
-
-        // Calculate buffered region
-        // For simplicity, use fixed marker buffer since we don't have genetic map here
-        let buffer_size = BUFFER_MARKERS.min((end_pos - start_pos) as usize / 2);
-        let buffered_start = start_pos.saturating_sub(buffer_size as u32);
-        let buffered_end = end_pos + buffer_size as u32;
-        // First, drain any blocks that are entirely before start_pos
-        while let Some(first_block) = self.block_buffer.front() {
-            if first_block.end_pos < start_pos {
+        // First, drain blocks well before start_pos, but keep one block for pre-buffer context.
+        while self.block_buffer.len() > 1 {
+            let second = self.block_buffer.get(1);
+            if second.map(|b| b.end_pos < start_pos).unwrap_or(false) {
                 self.block_buffer.pop_front();
             } else {
                 break;
@@ -694,13 +689,15 @@ impl WindowedBref3Reader {
             }
 
             if let Some(block) = self.inner.next_block()? {
-                // Skip blocks entirely before start_pos
-                if block.end_pos < start_pos {
-                    continue;
-                }
                 self.block_buffer.push_back(block);
             } else {
                 break;
+            }
+        }
+        // Load one extra block beyond end_pos for trailing buffer, if available.
+        if !self.inner.is_eof() {
+            if let Some(block) = self.inner.next_block()? {
+                self.block_buffer.push_back(block);
             }
         }
 
@@ -708,35 +705,51 @@ impl WindowedBref3Reader {
             return Ok(None);
         }
 
-        // Merge blocks that overlap with [start_pos, end_pos]
-        let mut markers = Markers::new();
-        let mut columns: Vec<GenotypeColumn> = Vec::new();
+        // Merge blocks in buffer and then apply marker-count buffering
+        let mut all_markers = Markers::new();
+        let mut all_columns: Vec<GenotypeColumn> = Vec::new();
+        let mut in_range_indices: Vec<usize> = Vec::new();
         let is_first = self.window_num == 0;
         let is_last = self.inner.is_eof();
 
         for block in &self.block_buffer {
-            // Skip blocks entirely outside our range
-            if block.end_pos < start_pos || block.start_pos > end_pos {
-                continue;
-            }
-
             // Add chromosome if needed
-            if markers.chrom_names().is_empty() || markers.chrom_names().last().map(|s| s.as_ref()) != Some(&block.chrom) {
-                markers.add_chrom(&block.chrom);
+            if all_markers.chrom_names().is_empty()
+                || all_markers.chrom_names().last().map(|s| s.as_ref()) != Some(&block.chrom)
+            {
+                all_markers.add_chrom(&block.chrom);
             }
 
-            // Add markers within the buffered position range
             for m in 0..block.n_markers() {
                 let marker = block.markers.marker(crate::data::marker::MarkerIdx::new(m as u32));
-                if marker.pos >= buffered_start && marker.pos <= buffered_end {
-                    markers.push(marker.clone());
-                    columns.push(block.columns[m].clone());
+                let idx = all_markers.len();
+                all_markers.push(marker.clone());
+                all_columns.push(block.columns[m].clone());
+                if marker.pos >= start_pos && marker.pos <= end_pos {
+                    in_range_indices.push(idx);
                 }
             }
         }
 
-        if markers.is_empty() {
+        if all_markers.is_empty() || in_range_indices.is_empty() {
             return Ok(None);
+        }
+
+        let first_idx = *in_range_indices.first().unwrap_or(&0);
+        let last_idx = *in_range_indices.last().unwrap_or(&0);
+        let start_idx = first_idx.saturating_sub(BUFFER_MARKERS);
+        let end_idx = (last_idx + 1 + BUFFER_MARKERS).min(all_markers.len());
+
+        let mut markers = Markers::new();
+        let mut columns: Vec<GenotypeColumn> = Vec::new();
+        for idx in start_idx..end_idx {
+            let marker = all_markers.marker(crate::data::marker::MarkerIdx::new(idx as u32));
+            let chrom_name = all_markers.chrom_name(marker.chrom).unwrap_or(".");
+            let chrom_idx = markers.add_chrom(chrom_name);
+            let mut m = marker.clone();
+            m.chrom = chrom_idx;
+            markers.push(m);
+            columns.push(all_columns[idx].clone());
         }
 
         let n_markers = markers.len();
@@ -1194,6 +1207,10 @@ impl StreamingRefVcfReader {
         let format = fields[8];
         let gt_idx = format.split(':').position(|f| f == "GT")
              .ok_or_else(|| anyhow::anyhow!("No GT field in FORMAT"))?;
+
+        if fields.len() < 9 + n_samples {
+            bail!("VCF line has fewer samples than header");
+        }
 
         for sample_field in fields[9..].iter().take(n_samples) {
             let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
