@@ -70,6 +70,67 @@ impl StateProbs {
     }
 }
 
+/// Haplotype-indexed state probabilities for soft-information handoff between windows.
+///
+/// Unlike `StateProbs` which uses state indices (that can differ between windows),
+/// this maps by **haplotype ID** which is stable across windows. This is critical
+/// for correct soft-information handoff:
+/// - If Window A selects haplotypes {1, 5, 10} and Window B selects {2, 5, 12}
+/// - The probability for haplotype 5 can be correctly transferred
+/// - Haplotypes not in the new window get uniform prior (1/K)
+#[derive(Clone, Debug)]
+pub struct HaplotypePriors {
+    /// Map from reference haplotype ID to prior probability
+    pub priors: std::collections::HashMap<u32, f32>,
+    /// Genetic position where these priors were computed
+    pub gen_position: f64,
+    /// Window index these priors came from
+    pub source_window: usize,
+}
+
+impl HaplotypePriors {
+    /// Create empty priors
+    pub fn new() -> Self {
+        Self {
+            priors: std::collections::HashMap::new(),
+            gen_position: 0.0,
+            source_window: 0,
+        }
+    }
+
+    /// Get prior probability for a haplotype.
+    /// Returns uniform prior (1/n_states) if haplotype not seen in previous window.
+    #[inline]
+    pub fn prior(&self, hap_id: u32, n_states: usize) -> f32 {
+        self.priors.get(&hap_id).copied()
+            .unwrap_or(1.0 / n_states.max(1) as f32)
+    }
+
+    /// Set priors from HMM state posteriors at window boundary.
+    /// Only stores significant probabilities (>0.001) to save memory.
+    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32], gen_position: f64, window: usize) {
+        self.priors.clear();
+        self.gen_position = gen_position;
+        self.source_window = window;
+        for (&hap, &prob) in hap_indices.iter().zip(probs.iter()) {
+            if prob > 0.001 {
+                self.priors.insert(hap, prob);
+            }
+        }
+    }
+
+    /// Check if we have any priors
+    pub fn is_empty(&self) -> bool {
+        self.priors.is_empty()
+    }
+}
+
+impl Default for HaplotypePriors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Phased genotypes from overlap region to seed next window
 ///
 /// This carries the phased alleles from the overlap region of the previous window
@@ -87,6 +148,9 @@ pub struct PhasedOverlap {
     /// Posterior state probabilities for Stage 1 markers in the overlap
     /// Used for soft-information handoff to prevent stair-step artifacts
     pub state_probs: Option<StateProbs>,
+    /// Per-target-haplotype priors indexed by reference haplotype ID
+    /// This enables proper soft-information handoff when HMM states differ between windows
+    pub hap_priors: Option<Vec<HaplotypePriors>>,
 }
 
 impl PhasedOverlap {
@@ -103,12 +167,23 @@ impl PhasedOverlap {
             alleles,
             n_haps,
             state_probs: None,
+            hap_priors: None,
         }
     }
 
-    /// Set state probabilities
+    /// Set state probabilities (legacy format)
     pub fn set_state_probs(&mut self, state_probs: StateProbs) {
         self.state_probs = Some(state_probs);
+    }
+
+    /// Set haplotype-indexed priors for soft-information handoff
+    pub fn set_hap_priors(&mut self, priors: Vec<HaplotypePriors>) {
+        self.hap_priors = Some(priors);
+    }
+
+    /// Get haplotype priors if available
+    pub fn hap_priors(&self) -> Option<&[HaplotypePriors]> {
+        self.hap_priors.as_deref()
     }
 
     /// Get the allele for a specific haplotype at a specific marker

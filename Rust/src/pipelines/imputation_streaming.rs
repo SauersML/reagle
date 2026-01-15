@@ -511,7 +511,8 @@ impl crate::pipelines::ImputationPipeline {
         all_results.sort_by_key(|(s, _, _)| *s);
 
         self.write_imputed_window_streaming(
-            ref_win, final_writer, window_quality, output_start, output_end, &all_results,
+            ref_win, final_writer, window_quality, output_start, output_end,
+            markers_to_process.start, &all_results,
         )?;
         
         Ok(())
@@ -544,6 +545,7 @@ impl crate::pipelines::ImputationPipeline {
         quality: &ImputationQuality,
         output_start: usize,
         output_end: usize,
+        markers_to_process_start: usize,
         all_results: &[(usize, Vec<f32>, Vec<(u8, u8)>)],
     ) -> Result<()> {
         let markers_range = output_start..output_end;
@@ -557,9 +559,10 @@ impl crate::pipelines::ImputationPipeline {
         let sample_data: std::collections::HashMap<usize, (&Vec<f32>, &Vec<(u8, u8)>)> =
             all_results.iter().map(|(s, d, g)| (*s, (d, g))).collect();
 
-        // Closure to get dosage: marker_idx is global ref marker index
+        // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
+        // Dosages array is indexed from 0 for markers starting at markers_to_process_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            let local_m = marker_idx.saturating_sub(output_start);
+            let local_m = marker_idx.saturating_sub(markers_to_process_start);
             if let Some((dosages, _)) = sample_data.get(&sample_idx) {
                 dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
@@ -569,7 +572,7 @@ impl crate::pipelines::ImputationPipeline {
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
-            let local_m = marker_idx.saturating_sub(output_start);
+            let local_m = marker_idx.saturating_sub(markers_to_process_start);
             if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
                 best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
