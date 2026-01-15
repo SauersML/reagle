@@ -61,19 +61,6 @@ impl AllelePosteriors {
         }
     }
 
-    /// Get expected ALT allele count (dosage)
-    /// For biallelic: P(ALT)
-    /// For multiallelic: sum of i * P(allele i) for i >= 1
-    #[cfg(test)]
-    #[inline]
-    pub fn dosage(&self) -> f32 {
-        match self {
-            AllelePosteriors::Biallelic(p_alt) => *p_alt,
-            AllelePosteriors::Multiallelic(probs) => {
-                probs.iter().enumerate().skip(1).map(|(i, &p)| i as f32 * p).sum()
-            }
-        }
-    }
 }
 
 /// Cluster-based state probabilities with Beagle-style interpolation weights.

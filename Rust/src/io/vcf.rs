@@ -1162,11 +1162,11 @@ mod tests {
 
         // 5 samples with ref/ref (p=0 for alt)
         for _ in 0..5 {
-            stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]);
+            stats.add_sample_biallelic(0.0, 0.0);
         }
         // 5 samples with alt/alt (p=1 for alt)
         for _ in 0..5 {
-            stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
+            stats.add_sample_biallelic(1.0, 1.0);
         }
 
         // DR2 should be 1.0
@@ -1186,7 +1186,7 @@ mod tests {
 
         // Add 10 samples, all uncertain
         for _ in 0..10 {
-            stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]);
+            stats.add_sample_biallelic(0.5, 0.5);
         }
 
         // DR2 should be 0 (no variance in p)
@@ -1205,9 +1205,9 @@ mod tests {
         stats.is_imputed = true;
 
         // Some certain, some uncertain
-        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]); // Certain alt/alt (p=1)
-        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]); // Certain ref/ref (p=0)
-        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]); // Uncertain (p=0.5)
+        stats.add_sample_biallelic(1.0, 1.0); // Certain alt/alt (p=1)
+        stats.add_sample_biallelic(0.0, 0.0); // Certain ref/ref (p=0)
+        stats.add_sample_biallelic(0.5, 0.5); // Uncertain (p=0.5)
 
         let dr2 = stats.dr2(1);
         assert!(
@@ -1225,9 +1225,9 @@ mod tests {
         // 1. alt/alt (p=1, p=1) -> 2 alt
         // 2. ref/alt (p=0.5, p=0.5) -> 1 alt equivalent
         // 3. ref/ref (p=0, p=0) -> 0 alt
-        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
-        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]);
-        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]);
+        stats.add_sample_biallelic(1.0, 1.0);
+        stats.add_sample_biallelic(0.5, 0.5);
+        stats.add_sample_biallelic(0.0, 0.0);
 
         // Total prob mass = 1 + 1 + 0.5 + 0.5 + 0 + 0 = 3.0
         // Total haplotypes = 6
@@ -1246,7 +1246,7 @@ mod tests {
 
         // Test mutability
         if let Some(stats) = quality.get_mut(2) {
-            stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
+            stats.add_sample_biallelic(1.0, 1.0);
             stats.is_imputed = true;
         }
 

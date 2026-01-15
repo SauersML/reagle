@@ -2529,37 +2529,10 @@ impl PhasingPipeline {
                             let prob = wt * prob_a + (1.0 - wt) * prob_b;
 
                             let b1 = get_allele(m, hap as usize);
-                            let b2 = get_allele(m, (hap ^ 1) as usize);
 
-                            if b1 != 255 && b2 != 255 {
-                                if b1 == b2 || (hap as usize) >= n_haps {
-                                    if (b1 as usize) < n_alleles {
-                                        al_probs[b1 as usize] += prob;
-                                    }
-                                } else {
-                                    let is_rare1 = maf[m] < rare_threshold && b1 > 0;
-                                    let is_rare2 = maf[m] < rare_threshold && b2 > 0;
-                                    if is_rare1 != is_rare2 {
-                                        if is_rare1 && (b1 as usize) < n_alleles {
-                                            al_probs[b1 as usize] += 0.55 * prob;
-                                        }
-                                        if !is_rare1 && (b1 as usize) < n_alleles {
-                                            al_probs[b1 as usize] += 0.45 * prob;
-                                        }
-                                        if is_rare2 && (b2 as usize) < n_alleles {
-                                            al_probs[b2 as usize] += 0.55 * prob;
-                                        }
-                                        if !is_rare2 && (b2 as usize) < n_alleles {
-                                            al_probs[b2 as usize] += 0.45 * prob;
-                                        }
-                                    } else {
-                                        if (b1 as usize) < n_alleles {
-                                            al_probs[b1 as usize] += 0.5 * prob;
-                                        }
-                                        if (b2 as usize) < n_alleles {
-                                            al_probs[b2 as usize] += 0.5 * prob;
-                                        }
-                                    }
+                            if b1 != 255 {
+                                if (b1 as usize) < n_alleles {
+                                    al_probs[b1 as usize] += prob;
                                 }
                             }
                         }
@@ -3396,8 +3369,8 @@ fn ffbs_haploid_constrained(
     let mut fwd_curr = vec![0.0f32; actual_n_states];
     let mut fwd_prev = vec![0.0f32; actual_n_states];
 
-    // Store forward probs at each marker for backward sampling
-    let mut fwd_at_marker: Vec<Vec<f32>> = Vec::with_capacity(n_markers);
+    // Store forward probs at each marker for backward sampling (flat buffer)
+    let mut fwd_at_marker: Vec<f32> = vec![0.0f32; n_markers * actual_n_states];
 
     // Initialize at marker 0
     let init = 1.0f32 / actual_n_states as f32;
@@ -3411,7 +3384,7 @@ fn ffbs_haploid_constrained(
     }
     let mut fwd_sum: f32 = fwd_curr.iter().sum();
     fwd_sum = fwd_sum.max(1e-30);
-    fwd_at_marker.push(fwd_curr.clone());
+    fwd_at_marker[0..actual_n_states].copy_from_slice(&fwd_curr);
 
     // Forward pass
     for m in 1..n_markers {
@@ -3465,11 +3438,13 @@ fn ffbs_haploid_constrained(
         }
         fwd_sum = fwd_sum.max(1e-30);
 
-        fwd_at_marker.push(fwd_curr.clone());
+        let start = m * actual_n_states;
+        fwd_at_marker[start..start + actual_n_states].copy_from_slice(&fwd_curr);
     }
 
     // Backward sampling
-    let last_fwd = &fwd_at_marker[n_markers - 1];
+    let last_start = (n_markers - 1) * actual_n_states;
+    let last_fwd = &fwd_at_marker[last_start..last_start + actual_n_states];
     path[n_markers - 1] = sample_from_weights(last_fwd, rng) as u32;
 
     let mut weights = vec![0.0f32; actual_n_states];
@@ -3479,7 +3454,8 @@ fn ffbs_haploid_constrained(
         let shift = r / actual_n_states as f32;
         let stay = (1.0 - r) + shift;
 
-        let prev_fwd = &fwd_at_marker[m - 1];
+        let prev_start = (m - 1) * actual_n_states;
+        let prev_fwd = &fwd_at_marker[prev_start..prev_start + actual_n_states];
 
         for k in 0..actual_n_states {
             weights[k] = prev_fwd[k] * shift;
@@ -4177,15 +4153,10 @@ impl PhasingPipeline {
             markers_to_fix.len()
         );
 
-        // Create mutable copy for targeted swaps
-        let mut geno = MutableGenotypes::from_fn(current_markers, current_phased.n_haplotypes(), |m, h| {
-            current_phased.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
-        });
+        let mut mismatches = 0usize;
 
-        let mut fixes_applied = 0;
-
-        // For each rare marker, check if next window has different phasing
-        // If so, adopt the next window's phasing (it has more context)
+        // For each rare marker, check if next window has different phasing.
+        // We avoid swapping single markers to preserve local LD structure.
         for (current_m, next_m) in markers_to_fix {
             for s in 0..n_samples {
                 let hap1 = HapIdx::new((s * 2) as u32);
@@ -4204,35 +4175,18 @@ impl PhasingPipeline {
 
                 // Check if next window has opposite phasing
                 if next_a1 == curr_a2 && next_a2 == curr_a1 {
-                    // Next window has swapped phase - adopt it
-                    // We need to swap in the current window
-                    geno.swap(current_m, hap1, hap2);
-                    fixes_applied += 1;
+                    mismatches += 1;
                 }
             }
         }
 
-        if fixes_applied > 0 {
+        if mismatches > 0 {
             tracing::debug!(
-                "Stage 2 finalization: applied {} phase corrections from forward context",
-                fixes_applied
+                "Stage 2 finalization: detected {} phase mismatches from forward context",
+                mismatches
             );
         }
-
-        let markers = current_phased.markers().clone();
-        let samples = current_phased.samples_arc();
-        let columns: Vec<crate::data::storage::GenotypeColumn> = (0..current_markers)
-            .map(|m| {
-                let alleles = geno.marker_alleles(m);
-                crate::data::storage::GenotypeColumn::from_alleles(&alleles, 2)
-            })
-            .collect();
-
-        if let Some(confidence) = current_phased.confidence_clone() {
-            Ok(GenotypeMatrix::new_phased_with_confidence(markers, columns, samples, confidence))
-        } else {
-            Ok(GenotypeMatrix::new_phased(markers, columns, samples))
-        }
+        Ok(current_phased.clone())
     }
 }
 

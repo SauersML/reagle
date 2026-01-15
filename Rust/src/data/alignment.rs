@@ -30,11 +30,16 @@ impl MarkerAlignment {
         let n_ref_markers = ref_gt.n_markers();
         let n_target_markers = target_gt.n_markers();
 
-        // Build position -> target index map
-        let mut target_pos_map: HashMap<(u16, u32), usize> = HashMap::new();
+        // Build position -> target index map (keyed by chrom name for stability)
+        let mut target_pos_map: HashMap<(String, u32), usize> = HashMap::new();
         for m in 0..n_target_markers {
             let marker = target_gt.marker(MarkerIdx::new(m as u32));
-            target_pos_map.insert((marker.chrom.0, marker.pos), m);
+            let chrom_name = target_gt
+                .markers()
+                .chrom_name(marker.chrom)
+                .unwrap_or("")
+                .to_string();
+            target_pos_map.insert((chrom_name, marker.pos), m);
         }
 
         // Map reference markers to target markers
@@ -48,7 +53,12 @@ impl MarkerAlignment {
 
         for m in 0..n_ref_markers {
             let ref_marker = ref_gt.marker(MarkerIdx::new(m as u32));
-            if let Some(&target_idx) = target_pos_map.get(&(ref_marker.chrom.0, ref_marker.pos)) {
+            let ref_chrom = ref_gt
+                .markers()
+                .chrom_name(ref_marker.chrom)
+                .unwrap_or("")
+                .to_string();
+            if let Some(&target_idx) = target_pos_map.get(&(ref_chrom, ref_marker.pos)) {
                 let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
 
                 // Compute allele mapping (handles strand flips)
@@ -101,11 +111,16 @@ impl MarkerAlignment {
         let n_ref_markers = ref_win.n_markers();
         let n_target_markers = target_win.n_markers();
 
-        // Build position -> target index map for the window
-        let mut target_pos_map: HashMap<(u32, u32), usize> = HashMap::new();
+        // Build position -> target index map for the window (keyed by chrom name)
+        let mut target_pos_map: HashMap<(String, u32), usize> = HashMap::new();
         for m in 0..n_target_markers {
             let marker = target_win.marker(MarkerIdx::new(m as u32));
-            target_pos_map.insert((marker.chrom.0 as u32, marker.pos), m);
+            let chrom_name = target_win
+                .markers()
+                .chrom_name(marker.chrom)
+                .unwrap_or("")
+                .to_string();
+            target_pos_map.insert((chrom_name, marker.pos), m);
         }
 
         // Map reference markers to target markers
@@ -116,10 +131,14 @@ impl MarkerAlignment {
 
         for ref_m in 0..n_ref_markers {
             let ref_marker = ref_win.marker(MarkerIdx::new(ref_m as u32));
-            let ref_pos_global = (ref_marker.chrom.0 as u32, ref_marker.pos);
+            let ref_chrom = ref_win
+                .markers()
+                .chrom_name(ref_marker.chrom)
+                .unwrap_or("")
+                .to_string();
 
             // Check if this reference marker is genotyped in target window
-            if let Some(&target_idx) = target_pos_map.get(&ref_pos_global) {
+            if let Some(&target_idx) = target_pos_map.get(&(ref_chrom, ref_marker.pos)) {
                 let target_marker = target_win.marker(MarkerIdx::new(target_idx as u32));
 
                 // Compute allele mapping

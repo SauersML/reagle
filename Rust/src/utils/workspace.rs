@@ -59,21 +59,6 @@ impl ImpWorkspace {
         self.cluster_base_scores.clear();
     }
 
-    /// Resize buffers (used by test HMM functions)
-    #[cfg(test)]
-    pub fn resize(&mut self, n_states: usize) {
-        if self.fwd.len() < n_states {
-            self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
-            self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
-            self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
-        } else {
-             // Reallocate to ensure clean state for tests
-             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
-             self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
-             self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
-        }
-    }
-
     /// Ensure cluster buffers are ready for accumulation
     pub fn reset_and_ensure_capacity(&mut self, n_clusters_hint: usize, n_states: usize) {
         const CHECKPOINT_INTERVAL: usize = 64;

@@ -360,7 +360,7 @@ mod tests {
             confidence,
         );
 
-        assert!(matrix.has_confidence());
+        assert!(matrix.confidence_clone().is_some());
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), 255);
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 0), 128);
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 1), 255);
@@ -371,7 +371,7 @@ mod tests {
 
         // Verify confidence survives phase transition
         let phased = matrix.into_phased();
-        assert!(phased.has_confidence());
+        assert!(phased.confidence_clone().is_some());
         assert_eq!(phased.sample_confidence(MarkerIdx::new(1), 0), 128);
     }
 
@@ -380,7 +380,7 @@ mod tests {
         let matrix = make_test_matrix_unphased();
 
         // Without confidence data, has_confidence returns false
-        assert!(!matrix.has_confidence());
+        assert!(matrix.confidence_clone().is_none());
 
         // But sample_confidence defaults to 255 (full confidence)
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), 255);

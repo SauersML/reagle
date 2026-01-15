@@ -326,6 +326,7 @@ impl crate::pipelines::ImputationPipeline {
             let mut next_overlap = self.extract_imputed_overlap_streaming(
                 &phased_target,
                 &ref_window,
+                &alignment,
                 ref_output_end,
             );
             if let Some(priors) = next_priors {
@@ -613,7 +614,9 @@ impl crate::pipelines::ImputationPipeline {
                             }
 
                             if output_end > 0 && n_ref_markers > 0 {
-                                let prior_marker = output_end.saturating_sub(1).min(n_ref_markers.saturating_sub(1));
+                                let overlap_size = 1000.min(n_ref_markers);
+                                let overlap_start = output_end.saturating_sub(overlap_size);
+                                let prior_marker = overlap_start.min(n_ref_markers.saturating_sub(1));
                                 let (hap_ids, probs) = state_probs.haplotype_priors_at(prior_marker);
                                 let gen_pos = gen_maps.gen_pos(
                                     chrom,
@@ -719,6 +722,7 @@ impl crate::pipelines::ImputationPipeline {
         &self,
         target_win: &GenotypeMatrix<Phased>,
         ref_win: &GenotypeMatrix<Phased>,
+        alignment: &MarkerAlignment,
         output_end: usize,
     ) -> PhasedOverlap {
         let overlap_size = 1000.min(ref_win.n_markers());
@@ -727,8 +731,13 @@ impl crate::pipelines::ImputationPipeline {
         let n_haps = target_win.n_haplotypes();
         let mut alleles = vec![255u8; overlap_size * n_haps];
         for h in 0..n_haps {
-            for (local_m, global_m) in (start..end).enumerate() {
-                alleles[h * overlap_size + local_m] = target_win.allele(MarkerIdx::new(global_m as u32), HapIdx::new(h as u32));
+            for (local_m, ref_m) in (start..end).enumerate() {
+                if let Some(target_m) = alignment.target_marker(ref_m) {
+                    alleles[h * overlap_size + local_m] = target_win.allele(
+                        MarkerIdx::new(target_m as u32),
+                        HapIdx::new(h as u32),
+                    );
+                }
             }
         }
         PhasedOverlap::new(overlap_size, n_haps, alleles)
