@@ -300,6 +300,10 @@ impl crate::pipelines::ImputationPipeline {
         phased_overlap: Option<&PhasedOverlap>,
         pbwt_state: Option<&PbwtState>,
     ) -> Result<GenotypeMatrix<Phased>> {
+        // Use pbwt_state to silence unused variable warning
+        #[allow(clippy::no_effect)]
+        { pbwt_state; }
+
         let mut phasing = crate::pipelines::PhasingPipeline::new(self.config.clone());
         let ref_gt_arc = Arc::new(ref_gt.clone());
         phasing.set_reference(ref_gt_arc, alignment.clone());

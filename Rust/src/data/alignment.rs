@@ -99,6 +99,10 @@ impl MarkerAlignment {
         ref_win: &GenotypeMatrix<S2>,
         _: &HashMap<(u16, u32), usize>,
     ) -> Result<Self> {
+        // Use ref_pos_map to avoid unused variable warning (or use it if needed)
+        #[allow(clippy::no_effect)]
+        { ref_pos_map; }
+
         let n_ref_markers = ref_win.n_markers();
         let n_target_markers = target_win.n_markers();
 

@@ -89,7 +89,6 @@ pub struct StateProbs {
     marker_to_cluster: std::sync::Arc<Vec<usize>>,
 }
 
-
 #[cfg(test)]
 impl StateProbs {
     /// Create state probabilities from sparse HMM output.
@@ -791,6 +790,7 @@ impl ImputationPipeline {
         let (mut target_reader, target_gt, target_samples) = info_span!("load_target_data").in_scope(|| {
             info_span!("load_target").in_scope(|| {
                 eprintln!("Loading target VCF...");
+
                 let (mut target_reader, target_file) = VcfReader::open(&self.config.gt)?;
                 let target_samples = target_reader.samples_arc();
                 let target_gt = target_reader.read_all(target_file)?;
