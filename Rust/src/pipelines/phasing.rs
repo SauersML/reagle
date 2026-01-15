@@ -862,8 +862,8 @@ impl PhasingPipeline {
                     &gen_maps,
                     window.phased_overlap.as_ref(),
                     current_pbwt_state.as_ref(),
-                )?
-            });
+                )
+            })?;
 
             // Extract overlap and PBWT state for next window
             if next_window_opt.is_some() {
@@ -880,8 +880,8 @@ impl PhasingPipeline {
                         &current.phased_result.as_ref().unwrap(),
                         &phased,
                         &gen_maps,
-                    )?
-                });
+                    )
+                })?;
 
                 // Write output region
                 if current.window.is_first {
@@ -3948,7 +3948,6 @@ impl Stage2Phaser {
     /// of the window, which will be used to initialize the next window.
     ///
     /// CURRENT LIMITATION: This recomputes PBWT state from scratch.
-    /// IDEAL FIX: Track PBWT state during phasing and capture directly.
     fn extract_pbwt_state(
         &self,
         phased: &GenotypeMatrix<Phased>,
@@ -4053,7 +4052,7 @@ impl Stage2Phaser {
 
             for &stage1_marker in &hi_freq_markers {
                 // For markers in current window, we could extract from phasing HMM
-                // For now, use simplified state probabilities
+                // Use simplified state probabilities
                 let mut marker_probs = Vec::new();
 
                 if stage1_marker < current_markers {

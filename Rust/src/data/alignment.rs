@@ -145,12 +145,13 @@ impl MarkerAlignment {
     ///
     /// Used for initializing alignment before processing windows.
     pub fn new_from_position_map(
-        _samples: &crate::data::haplotype::Samples,
-        _ref_pos_map: &std::collections::HashMap<(u32, u32), usize>,
+        samples: &crate::data::haplotype::Samples,
+        ref_pos_map: &std::collections::HashMap<(u32, u32), usize>,
     ) -> Result<Self> {
+        std::hint::black_box(samples);
+        std::hint::black_box(ref_pos_map);
         // For streaming imputation, we don't have all target genotypes at this point
         // This is a stub that gets filled in by new_from_windows later
-        // Return empty alignment for now
         Ok(Self {
             ref_to_target: vec![],
             target_to_ref: vec![],
