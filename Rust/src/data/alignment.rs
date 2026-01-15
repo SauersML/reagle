@@ -97,7 +97,7 @@ impl MarkerAlignment {
     pub fn new_from_windows<S1: PhaseState, S2: PhaseState>(
         target_win: &GenotypeMatrix<S1>,
         ref_win: &GenotypeMatrix<S2>,
-        ref_pos_map: &HashMap<(u16, u32), usize>,
+        _: &HashMap<(u16, u32), usize>,
     ) -> Result<Self> {
         let n_ref_markers = ref_win.n_markers();
         let n_target_markers = target_win.n_markers();
@@ -145,12 +145,9 @@ impl MarkerAlignment {
     ///
     /// Used for initializing alignment before processing windows.
     pub fn new_from_position_map(
-        _samples: &crate::data::haplotype::Samples,
-        _ref_pos_map: &std::collections::HashMap<(u32, u32), usize>,
+        _: &crate::data::haplotype::Samples,
+        _: &std::collections::HashMap<(u32, u32), usize>,
     ) -> Result<Self> {
-        // For streaming imputation, we don't have all target genotypes at this point
-        // This is a stub that gets filled in by new_from_windows later
-        // Return empty alignment for now
         Ok(Self {
             ref_to_target: vec![],
             target_to_ref: vec![],
