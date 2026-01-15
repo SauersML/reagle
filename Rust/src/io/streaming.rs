@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use noodles::bgzf::io as bgzf_io;
+use tracing::info_span;
 
 use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
@@ -47,6 +48,110 @@ impl Default for StreamingConfig {
     }
 }
 
+/// Posterior state probabilities for soft-information handoff
+#[derive(Clone, Debug)]
+pub struct StateProbs {
+    /// State probabilities for each haplotype at each Stage 1 marker
+    /// Layout: [hap][marker_idx][state]
+    pub data: Vec<Vec<Vec<f32>>>,
+    /// Indices of these markers (relative to the window start)
+    pub marker_indices: Vec<usize>,
+    /// Number of states
+    pub n_states: usize,
+}
+
+impl StateProbs {
+    pub fn new(data: Vec<Vec<Vec<f32>>>, marker_indices: Vec<usize>, n_states: usize) -> Self {
+        Self {
+            data,
+            marker_indices,
+            n_states,
+        }
+    }
+}
+
+/// Haplotype-indexed state probabilities for soft-information handoff between windows.
+///
+/// Uses sorted dense arrays instead of HashMap for O(log K) lookup with good cache locality.
+/// This is critical for HMM performance since prior lookup happens for every state at window start.
+///
+/// Design: Store (hap_id, prob) pairs sorted by hap_id for binary search.
+/// Only significant probabilities (>0.001) are stored to save memory.
+#[derive(Clone, Debug)]
+pub struct HaplotypePriors {
+    /// Sorted haplotype IDs (for binary search)
+    hap_ids: Vec<u32>,
+    /// Corresponding probabilities (same order as hap_ids)
+    probs: Vec<f32>,
+}
+
+impl HaplotypePriors {
+    /// Create empty priors
+    pub fn new() -> Self {
+        Self {
+            hap_ids: Vec::new(),
+            probs: Vec::new(),
+        }
+    }
+
+    /// Get prior probability for a haplotype.
+    /// Returns uniform prior (1/n_states) if haplotype not seen in previous window.
+    /// Uses binary search for O(log K) lookup with good cache locality.
+    #[inline]
+    pub fn prior(&self, hap_id: u32, n_states: usize) -> f32 {
+        match self.hap_ids.binary_search(&hap_id) {
+            Ok(idx) => self.probs[idx],
+            Err(_) => 1.0 / n_states.max(1) as f32,
+        }
+    }
+
+    /// Set priors from HMM state posteriors at window boundary.
+    /// Uses an adaptive threshold to avoid discarding most mass at high state counts.
+    /// Sorts by hap_id for efficient binary search lookup.
+    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32], gen_position: f64, window: usize) {
+        self.hap_ids.clear();
+        self.probs.clear();
+
+        let _ = (gen_position, window);
+
+        let adaptive_min = (1.0 / hap_indices.len().max(1) as f32) * 0.5;
+        let min_prob = adaptive_min.min(0.001).max(1e-6);
+
+        // Collect significant probabilities
+        let mut pairs: Vec<(u32, f32)> = hap_indices
+            .iter()
+            .zip(probs.iter())
+            .filter(|(_, p)| **p > min_prob)
+            .map(|(&h, &p)| (h, p))
+            .collect();
+        
+        // Sort by hap_id for binary search
+        pairs.sort_unstable_by_key(|(h, _)| *h);
+        
+        // Split into parallel arrays
+        self.hap_ids.reserve(pairs.len());
+        self.probs.reserve(pairs.len());
+        let total: f32 = pairs.iter().map(|(_, p)| *p).sum();
+        if total > 0.0 {
+            for (h, p) in pairs {
+                self.hap_ids.push(h);
+                self.probs.push(p / total);
+            }
+        }
+    }
+
+    /// Check if we have any priors
+    pub fn is_empty(&self) -> bool {
+        self.hap_ids.is_empty()
+    }
+}
+
+impl Default for HaplotypePriors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Phased genotypes from overlap region to seed next window
 ///
 /// This carries the phased alleles from the overlap region of the previous window
@@ -61,6 +166,12 @@ pub struct PhasedOverlap {
     pub alleles: Vec<u8>,
     /// Number of haplotypes
     pub n_haps: usize,
+    /// Posterior state probabilities for Stage 1 markers in the overlap
+    /// Used for soft-information handoff to prevent stair-step artifacts
+    pub state_probs: Option<StateProbs>,
+    /// Per-target-haplotype priors indexed by reference haplotype ID
+    /// This enables proper soft-information handoff when HMM states differ between windows
+    pub hap_priors: Option<Vec<HaplotypePriors>>,
 }
 
 impl PhasedOverlap {
@@ -76,7 +187,24 @@ impl PhasedOverlap {
             n_markers,
             alleles,
             n_haps,
+            state_probs: None,
+            hap_priors: None,
         }
+    }
+
+    /// Set state probabilities (legacy format)
+    pub fn set_state_probs(&mut self, state_probs: StateProbs) {
+        self.state_probs = Some(state_probs);
+    }
+
+    /// Set haplotype-indexed priors for soft-information handoff
+    pub fn set_hap_priors(&mut self, priors: Vec<HaplotypePriors>) {
+        self.hap_priors = Some(priors);
+    }
+
+    /// Get haplotype priors if available
+    pub fn hap_priors(&self) -> Option<&[HaplotypePriors]> {
+        self.hap_priors.as_deref()
     }
 
     /// Get the allele for a specific haplotype at a specific marker
@@ -91,8 +219,6 @@ impl PhasedOverlap {
 pub struct StreamWindow {
     /// Genotype data for this window
     pub genotypes: GenotypeMatrix,
-    /// Window number (0-indexed)
-    pub window_num: usize,
     /// Start marker index in full chromosome
     pub global_start: usize,
     /// End marker index in full chromosome (exclusive)
@@ -146,6 +272,8 @@ pub struct StreamingVcfReader {
     eof: bool,
     /// Current line buffer
     line_buf: String,
+    /// Whether all genotypes seen so far were phased
+    all_phased: bool,
 }
 
 impl StreamingVcfReader {
@@ -173,6 +301,7 @@ impl StreamingVcfReader {
         gen_maps: GeneticMaps,
         config: StreamingConfig,
     ) -> Result<Self> {
+        info_span!("streaming_vcf_from_reader").in_scope(|| {
         // Read header
         let mut header_str = String::new();
         let mut line = String::new();
@@ -218,6 +347,8 @@ impl StreamingVcfReader {
             global_marker_idx: 0,
             eof: false,
             line_buf: String::new(),
+            all_phased: true,
+        })
         })
     }
 
@@ -226,16 +357,22 @@ impl StreamingVcfReader {
         Arc::clone(&self.samples)
     }
 
+    /// Returns true if all genotypes seen so far were phased (used '|' separator).
+    pub fn was_all_phased(&self) -> bool {
+        self.all_phased
+    }
+
     /// Read the next window of data
     ///
     /// Returns None when all data has been processed
     pub fn next_window(&mut self) -> Result<Option<StreamWindow>> {
-        if self.eof && self.buffer.is_empty() {
-            return Ok(None);
-        }
+        info_span!("streaming_next_window").in_scope(|| {
+            if self.eof && self.buffer.is_empty() {
+                return Ok(None);
+            }
 
-        // Fill buffer until we have a complete window
-        self.fill_buffer_to_window()?;
+            // Fill buffer until we have a complete window
+            self.fill_buffer_to_window()?;
 
         if self.buffer.is_empty() {
             return Ok(None);
@@ -273,14 +410,10 @@ impl StreamingVcfReader {
                 .map(|m| m.gen_pos - self.config.overlap_cm as f64)
                 .unwrap_or(0.0);
 
-            let mut splice = window_end;
-            for i in (0..window_end).rev() {
-                if self.buffer[i].gen_pos <= overlap_gen {
-                    splice = i + 1;
-                    break;
-                }
-            }
-            splice
+            // Find splice index: keep markers > overlap_gen
+            // Markers <= overlap_gen are discarded (overlap buffer for next window)
+            // We want the index of the first marker that is > overlap_gen
+            self.find_overlap_splice_index(window_end, overlap_gen)
         };
 
         // Build GenotypeMatrix for this window
@@ -289,7 +422,14 @@ impl StreamingVcfReader {
 
         for i in 0..window_end {
             let bm = &self.buffer[i];
-            markers.push(bm.marker.clone());
+            let chrom_name = self
+                .markers_meta
+                .chrom_name(bm.marker.chrom)
+                .unwrap_or("UNKNOWN");
+            let window_chrom_idx = markers.add_chrom(chrom_name);
+            let mut marker = bm.marker.clone();
+            marker.chrom = window_chrom_idx;
+            markers.push(marker);
             columns.push(bm.column.clone());
         }
 
@@ -297,7 +437,6 @@ impl StreamingVcfReader {
 
         let window = StreamWindow {
             genotypes,
-            window_num: self.window_num,
             global_start: self.global_marker_idx,
             global_end: self.global_marker_idx + window_end,
             output_start,
@@ -316,6 +455,7 @@ impl StreamingVcfReader {
         self.window_num += 1;
 
         Ok(Some(window))
+        })
     }
 
     /// Fill buffer until we have enough data for a window
@@ -363,6 +503,29 @@ impl StreamingVcfReader {
             // Parse the VCF line
             return self.parse_vcf_line(&line).map(Some);
         }
+    }
+
+    /// Find the splice index for overlap using binary search
+    /// Returns the index such that markers[..index] are <= overlap_gen
+    /// and markers[index..] are > overlap_gen.
+    fn find_overlap_splice_index(&self, window_end: usize, overlap_gen: f64) -> usize {
+        if let Some(front) = self.buffer.front() {
+            if front.gen_pos > overlap_gen {
+                return window_end;
+            }
+        }
+        let mut low = 0;
+        let mut high = window_end;
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.buffer[mid].gen_pos <= overlap_gen {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
     }
 
     /// Parse a single VCF line
@@ -416,6 +579,10 @@ impl StreamingVcfReader {
 
         for sample_field in fields[9..].iter().take(n_samples) {
             let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
+
+            if gt_field.contains('/') {
+                self.all_phased = false;
+            }
 
             let (a1, a2) = parse_gt(gt_field);
             alleles.push(a1);

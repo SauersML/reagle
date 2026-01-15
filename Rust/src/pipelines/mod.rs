@@ -4,6 +4,7 @@
 //! Coordinates I/O, windowing, and algorithm execution.
 
 pub mod imputation;
+pub mod imputation_streaming;
 pub mod phasing;
 
 pub use imputation::ImputationPipeline;

@@ -10,6 +10,7 @@
 //! - `Enum-based polymorphism`: `GenotypeColumn` variants (Dense/Sparse/Dictionary)
 //!   replace Java's class hierarchy with a single stack-allocated enum.
 
+pub mod alignment;
 pub mod genetic_map;
 pub mod haplotype;
 pub mod marker;

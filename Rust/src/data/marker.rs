@@ -123,6 +123,10 @@ impl std::fmt::Display for Allele {
 }
 
 /// A genomic marker (variant site)
+///
+/// Note: Genetic position (cM) and MAF are NOT stored here to keep the struct
+/// cache-friendly. Use MarkerMap for genetic positions and GenotypeColumn::maf()
+/// for allele frequencies. This follows Beagle's SoA (Structure of Arrays) design.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Marker {
     /// Chromosome index
@@ -232,14 +236,6 @@ impl AlleleMapping {
             strand_flipped,
             alleles_swapped,
         }
-    }
-
-    /// Map a target allele to reference allele
-    /// Returns None if the allele cannot be mapped
-    pub fn map_allele(&self, targ_allele: u8) -> Option<u8> {
-        self.targ_to_ref
-            .get(targ_allele as usize)
-            .and_then(|&r| if r >= 0 { Some(r as u8) } else { None })
     }
 
     /// Map a reference allele to target allele (reverse mapping)
@@ -435,6 +431,11 @@ impl Markers {
     /// Number of markers
     pub fn len(&self) -> usize {
         self.markers.len()
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.markers.is_empty()
     }
 
     /// Get marker by index

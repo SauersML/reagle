@@ -84,6 +84,31 @@ struct MeaninglessConditionalCollector {
     file_path: PathBuf,
 }
 
+// A custom collector for #[allow(clippy::no_effect)] with no-op variable access
+struct NoEffectCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
+// A custom collector for "omitted for brevity" comments
+struct OmittedForBrevityCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
+// A custom collector for #[deprecated] attributes
+struct DeprecatedCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
+// A custom collector for placeholder stub functions
+struct PlaceholderStubCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+    file_content: String,
+}
+
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn warnings_enabled() -> bool {
@@ -650,6 +675,165 @@ impl MeaninglessConditionalCollector {
         error_msg.push_str("   Either remove the conditional entirely or ensure branches differ.\n");
         error_msg.push_str(
             "   If-else with same result is an anti-pattern to make unused variables appear used.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
+impl NoEffectCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} #[allow(clippy::no_effect)] attributes in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ #[allow(clippy::no_effect)] IS STRICTLY FORBIDDEN IN THIS PROJECT!\n",
+        );
+        error_msg.push_str(
+            "   This is used to suppress warnings about no-op variable access like { variable_name; }\n",
+        );
+        error_msg.push_str(
+            "   If a parameter is truly unused, delete it and refactor the function signature.\n",
+        );
+        error_msg.push_str(
+            "   Do NOT use no-op statements to pretend variables are being used.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
+impl OmittedForBrevityCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} \"omitted for brevity\" comments in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ \"OMITTED FOR BREVITY\" COMMENTS ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n",
+        );
+        error_msg.push_str(
+            "   These comments hide incomplete implementations or deleted code.\n",
+        );
+        error_msg.push_str(
+            "   DO NOT omit anything. Include all code, tests, and implementations.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
+impl DeprecatedCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} #[deprecated] attributes in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ #[deprecated] ATTRIBUTES ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n",
+        );
+        error_msg.push_str(
+            "   Deprecated code keeps dead API surface area alive unnecessarily.\n",
+        );
+        error_msg.push_str(
+            "   If code is no longer needed, DELETE it completely. Do not deprecate it.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
+impl PlaceholderStubCollector {
+    fn new(file_path: &Path, content: &str) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+            file_content: content.to_string(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} placeholder stub functions in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ PLACEHOLDER STUB FUNCTIONS ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n",
+        );
+        error_msg.push_str(
+            "   Functions that return Ok(Self { ... }) with all empty vectors/hashmaps are placeholders.\n",
+        );
+        error_msg.push_str(
+            "   These exist solely to satisfy the compiler without doing actual work.\n",
+        );
+        error_msg.push_str(
+            "   Implement the function properly instead of using empty placeholders.\n",
         );
 
         Some(error_msg)
@@ -1224,6 +1408,72 @@ fn extract_if_else_branches(line: &str) -> Option<(String, String)> {
     Some((branch1.to_string(), branch2.to_string()))
 }
 
+impl Sink for NoEffectCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+        self.violations.push(format!("{line_number}:{line_text}"));
+        Ok(true)
+    }
+}
+
+impl Sink for OmittedForBrevityCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+        self.violations.push(format!("{line_number}:{line_text}"));
+        Ok(true)
+    }
+}
+
+impl Sink for DeprecatedCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+        self.violations.push(format!("{line_number}:{line_text}"));
+        Ok(true)
+    }
+}
+
+impl Sink for PlaceholderStubCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        // Check if this is actually a placeholder stub by examining surrounding context
+        let lines: Vec<&str> = self.file_content.lines().collect();
+        let line_idx = line_number as usize;
+        if line_idx > 0 && line_idx <= lines.len() {
+            let start_idx = line_idx - 1;
+            let end_idx = (start_idx + 10).min(lines.len());
+            let context = lines[start_idx..end_idx].join("\n");
+
+            // Check if this looks like a placeholder with multiple empty collections
+            let empty_count = context.matches("vec![]").count()
+                + context.matches("Vec::new()").count()
+                + context.matches("HashMap::new()").count()
+                + context.matches("BTreeMap::new()").count()
+                + context.matches("BTreeSet::new()").count()
+                + context.matches("HashSet::new()").count();
+
+            // If there are 2+ empty collections, it's likely a placeholder
+            if empty_count >= 2 {
+                self.violations.push(format!("{line_number}:{line_text}"));
+            }
+        }
+
+        Ok(true)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum EmptyBlockTokenKind {
     Ident(String),
@@ -1402,6 +1652,45 @@ fn main() {
     );
     emit_stage_detail(&fake_usage_report);
     all_violations.extend(fake_usage_violations);
+    // Scan for #[allow(clippy::no_effect)] attributes
+    update_stage("scan #[allow(clippy::no_effect)] attributes");
+    let no_effect_violations = scan_for_no_effect_allow();
+    let no_effect_report = format!(
+        "no_effect allow scan identified {} violation groups",
+        no_effect_violations.len()
+    );
+    emit_stage_detail(&no_effect_report);
+    all_violations.extend(no_effect_violations);
+
+    // Scan for "omitted for brevity" and similar comments
+    update_stage("scan omitted for brevity comments");
+    let omitted_violations = scan_for_omitted_for_brevity();
+    let omitted_report = format!(
+        "omitted for brevity scan identified {} violation groups",
+        omitted_violations.len()
+    );
+    emit_stage_detail(&omitted_report);
+    all_violations.extend(omitted_violations);
+
+    // Scan for #[deprecated] attributes
+    update_stage("scan #[deprecated] attributes");
+    let deprecated_violations = scan_for_deprecated();
+    let deprecated_report = format!(
+        "deprecated attribute scan identified {} violation groups",
+        deprecated_violations.len()
+    );
+    emit_stage_detail(&deprecated_report);
+    all_violations.extend(deprecated_violations);
+
+    // Scan for placeholder stub functions
+    update_stage("scan placeholder stub functions");
+    let placeholder_violations = scan_for_placeholder_stubs();
+    let placeholder_report = format!(
+        "placeholder stub scan identified {} violation groups",
+        placeholder_violations.len()
+    );
+    emit_stage_detail(&placeholder_report);
+    all_violations.extend(placeholder_violations);
 
     // If any violations were found, print them all and exit with error
     if !all_violations.is_empty() {
@@ -2356,6 +2645,197 @@ fn scan_for_meaningless_conditionals() -> Vec<String> {
         Err(e) => {
             all_violations.push(format!(
                 "Error creating meaningless conditional regex matcher: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_no_effect_allow() -> Vec<String> {
+    let pattern = r"#\s*\[\s*allow\s*\(\s*clippy\s*::\s*no_effect\s*\)\s*\]";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = NoEffectCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating no_effect allow regex matcher: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_omitted_for_brevity() -> Vec<String> {
+    // Match various forms of "omitted for brevity" and similar placeholders
+    // Pattern includes: "omitted for brevity", "not shown", "elided", "truncated", "abbreviated", etc.
+    let pattern = r"(omitted\s+for\s+brevity|not\s+shown|elided\s+for|truncated\s+for|abbreviated\s+for|removed\s+for\s+brevity|excluded\s+for\s+brevity|skipped\s+for\s+brevity|hidden\s+for\s+brevity)";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = OmittedForBrevityCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating omitted for brevity regex matcher: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_deprecated() -> Vec<String> {
+    let pattern = r"#\s*\[\s*deprecated";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = DeprecatedCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating deprecated attribute regex matcher: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_placeholder_stubs() -> Vec<String> {
+    // Match functions returning Ok(Self { with empty collections
+    // Pattern: Ok(Self { followed by lines with vec![], HashMap::new(), etc., and closing })
+    let pattern = r"Ok\(Self\s*\{";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                // Find all Ok(Self { matches
+                let mut collector = PlaceholderStubCollector::new(path, &content);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                // Check if the collector found any violations
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating placeholder stub regex matcher: {}",
                 e
             ));
         }

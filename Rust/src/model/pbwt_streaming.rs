@@ -60,9 +60,25 @@ pub struct PbwtWavefront {
 impl PbwtWavefront {
     /// Create a new streaming PBWT wavefront
     pub fn new(n_haps: usize, n_markers: usize) -> Self {
+        Self::with_state(n_haps, n_markers, None)
+    }
+
+    /// Create a new streaming PBWT wavefront with optional initial state
+    pub fn with_state(
+        n_haps: usize,
+        n_markers: usize,
+        initial_state: Option<&crate::model::pbwt::PbwtState>
+    ) -> Self {
+        let (fwd_ppa, fwd_div) = if let Some(state) = initial_state {
+            assert_eq!(state.ppa.len(), n_haps, "Initial state hap count mismatch");
+            (state.ppa.clone(), state.div.clone())
+        } else {
+            ((0..n_haps as u32).collect(), vec![0; n_haps])
+        };
+
         Self {
-            fwd_ppa: (0..n_haps as u32).collect(),
-            fwd_div: vec![0; n_haps],
+            fwd_ppa,
+            fwd_div,
             bwd_ppa: (0..n_haps as u32).collect(),
             bwd_div: vec![n_markers as i32; n_haps],
             fwd_inverse: vec![0; n_haps],
@@ -75,6 +91,15 @@ impl PbwtWavefront {
             fwd_inverse_valid: false,
             bwd_inverse_valid: false,
         }
+    }
+
+    /// Get the current PBWT state (PPA and divergence) for handoff
+    pub fn get_state(&self) -> crate::model::pbwt::PbwtState {
+        crate::model::pbwt::PbwtState::new(
+            self.fwd_ppa.clone(),
+            self.fwd_div.clone(),
+            self.fwd_marker
+        )
     }
 
     /// Reset for a new forward pass (starts at marker 0)

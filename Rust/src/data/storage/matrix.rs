@@ -75,7 +75,9 @@ impl<S: PhaseState> GenotypeMatrix<S> {
         &self.markers
     }
 
-    /// Get samples Arc
+    /// Get samples reference
+
+    /// Get samples Arc (cloned)
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)
     }
@@ -101,9 +103,6 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     }
 
     /// Check if confidence scores are available
-    pub fn has_confidence(&self) -> bool {
-        self.confidence.is_some()
-    }
 
     /// Get confidence score for a sample at a marker (0-255 representing 0.0-1.0).
     /// Returns 255 (full confidence) if confidence data is not available.
@@ -126,6 +125,7 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     pub fn confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
         self.confidence.clone()
     }
+
 }
 
 // ============================================================================
@@ -360,7 +360,7 @@ mod tests {
             confidence,
         );
 
-        assert!(matrix.has_confidence());
+        assert!(matrix.confidence_clone().is_some());
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), 255);
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 0), 128);
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 1), 255);
@@ -371,7 +371,7 @@ mod tests {
 
         // Verify confidence survives phase transition
         let phased = matrix.into_phased();
-        assert!(phased.has_confidence());
+        assert!(phased.confidence_clone().is_some());
         assert_eq!(phased.sample_confidence(MarkerIdx::new(1), 0), 128);
     }
 
@@ -380,7 +380,7 @@ mod tests {
         let matrix = make_test_matrix_unphased();
 
         // Without confidence data, has_confidence returns false
-        assert!(!matrix.has_confidence());
+        assert!(matrix.confidence_clone().is_none());
 
         // But sample_confidence defaults to 255 (full confidence)
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), 255);
