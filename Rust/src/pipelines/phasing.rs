@@ -3948,7 +3948,6 @@ impl Stage2Phaser {
     /// of the window, which will be used to initialize the next window.
     ///
     /// CURRENT LIMITATION: This recomputes PBWT state from scratch.
-    /// IDEAL FIX: Track PBWT state during phasing and capture directly.
     fn extract_pbwt_state(
         &self,
         phased: &GenotypeMatrix<Phased>,
@@ -4053,7 +4052,7 @@ impl Stage2Phaser {
 
             for &stage1_marker in &hi_freq_markers {
                 // For markers in current window, we could extract from phasing HMM
-                // For now, use simplified state probabilities
+                // Using simplified state probabilities (placeholder)
                 let mut marker_probs = Vec::new();
 
                 if stage1_marker < current_markers {

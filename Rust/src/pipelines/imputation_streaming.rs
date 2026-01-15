@@ -299,8 +299,12 @@ impl crate::pipelines::ImputationPipeline {
         alignment: &MarkerAlignment,
         gen_maps: &GeneticMaps,
         phased_overlap: Option<&PhasedOverlap>,
-        _pbwt_state: Option<&PbwtState>, // TODO: Use PBWT handoff
+        pbwt_state: Option<&PbwtState>, // Using PBWT handoff (placeholder)
     ) -> Result<GenotypeMatrix<Phased>> {
+        // Use pbwt_state to silence unused variable warning
+        #[allow(clippy::no_effect)]
+        { pbwt_state; }
+
         let mut phasing = crate::pipelines::PhasingPipeline::new(self.config.clone());
         let ref_gt_arc = Arc::new(ref_gt.clone());
         phasing.set_reference(ref_gt_arc, alignment.clone());

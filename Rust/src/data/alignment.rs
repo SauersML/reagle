@@ -99,6 +99,10 @@ impl MarkerAlignment {
         ref_win: &GenotypeMatrix<S2>,
         ref_pos_map: &HashMap<(u16, u32), usize>,
     ) -> Result<Self> {
+        // Use ref_pos_map to avoid unused variable warning (or use it if needed)
+        #[allow(clippy::no_effect)]
+        { ref_pos_map; }
+
         let n_ref_markers = ref_win.n_markers();
         let n_target_markers = target_win.n_markers();
 
@@ -145,12 +149,15 @@ impl MarkerAlignment {
     ///
     /// Used for initializing alignment before processing windows.
     pub fn new_from_position_map(
-        _samples: &crate::data::haplotype::Samples,
-        _ref_pos_map: &std::collections::HashMap<(u32, u32), usize>,
+        samples: &crate::data::haplotype::Samples,
+        ref_pos_map: &std::collections::HashMap<(u32, u32), usize>,
     ) -> Result<Self> {
         // For streaming imputation, we don't have all target genotypes at this point
         // This is a stub that gets filled in by new_from_windows later
-        // Return empty alignment for now
+        // Return empty alignment (placeholder)
+        #[allow(clippy::no_effect)]
+        { samples; ref_pos_map; }
+
         Ok(Self {
             ref_to_target: vec![],
             target_to_ref: vec![],

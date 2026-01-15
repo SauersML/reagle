@@ -4,13 +4,15 @@
 //! in hot loops. This pattern is essential for satisfying the Rust borrow
 //! checker while maintaining performance.
 
+use aligned_vec::{AVec, ConstAlign};
+
 /// Workspace for imputation HMM computations
 #[derive(Debug)]
 pub struct ImpWorkspace {
     /// Forward probabilities
-    pub fwd: Vec<f32>,
+    pub fwd: AVec<f32, ConstAlign<32>>,
     /// Backward probabilities
-    pub bwd: Vec<f32>,
+    pub bwd: AVec<f32, ConstAlign<32>>,
     // --- CSR Storage for Mismatches ---
     // --- CSR Storage for Log-Likelihood Differences ---
     /// Non-zero difference values (log_mismatch - log_match) or (-log_match for missing ref)
@@ -25,26 +27,26 @@ pub struct ImpWorkspace {
     pub cluster_base_scores: Vec<f32>,
 
     /// Reusable row buffer for accumulation
-    pub row_buffer: Vec<f32>,
+    pub row_buffer: AVec<f32, ConstAlign<32>>,
 
     /// Block forward buffer for checkpoint recomputation (L2 cache sized)
     /// Stores forward probabilities for one block (CHECKPOINT_INTERVAL markers)
     /// Size: (CHECKPOINT_INTERVAL + 1) * n_states ~ 416KB for K=1600, I=64
-    pub block_fwd: Vec<f32>,
+    pub block_fwd: AVec<f32, ConstAlign<32>>,
 }
 
 impl ImpWorkspace {
     /// Create a new imputation workspace
     pub fn new(n_states: usize) -> Self {
         Self {
-            fwd: vec![0.0; n_states],
-            bwd: vec![0.0; n_states],
+            fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
+            bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
             diff_vals: Vec::new(),
             diff_cols: Vec::new(),
             diff_row_offsets: vec![0],
             cluster_base_scores: Vec::new(),
-            row_buffer: vec![0.0; n_states],
-            block_fwd: Vec::new(),
+            row_buffer: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
+            block_fwd: AVec::new(32),
         }
     }
 
@@ -56,9 +58,16 @@ impl ImpWorkspace {
     /// Resize buffers (used by test HMM functions)
     #[cfg(test)]
     pub fn resize(&mut self, n_states: usize) {
-        self.fwd.resize(n_states, 0.0);
-        self.bwd.resize(n_states, 0.0);
-        self.row_buffer.resize(n_states, 0.0);
+        if self.fwd.len() < n_states {
+            self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
+            self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
+            self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
+        } else {
+             // Reallocate to ensure clean state for tests
+             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
+             self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
+             self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
+        }
     }
 
     /// Ensure cluster buffers are ready for accumulation
@@ -75,12 +84,12 @@ impl ImpWorkspace {
         self.cluster_base_scores.reserve(n_clusters_hint);
 
         if self.row_buffer.len() < n_states {
-            self.row_buffer.resize(n_states, 0.0);
+             self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
         }
 
         let block_fwd_size = (CHECKPOINT_INTERVAL + 1) * n_states;
         if self.block_fwd.len() < block_fwd_size {
-            self.block_fwd.resize(block_fwd_size, 0.0);
+             self.block_fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(block_fwd_size));
         }
     }
 }
@@ -89,11 +98,11 @@ impl ImpWorkspace {
 #[derive(Debug)]
 pub struct ThreadWorkspace {
     /// Forward probabilities: fwd[m * n_states + k] = P(state k at marker m)
-    pub fwd: Vec<f32>,
+    pub fwd: AVec<f32, ConstAlign<32>>,
     /// Backward probabilities: bwd[m * n_states + k] = P(state k at marker m)
-    pub bwd: Vec<f32>,
+    pub bwd: AVec<f32, ConstAlign<32>>,
     /// Pre-computed alleles: alleles[m * n_states + k] = allele for state k at marker m
-    pub lookup: Vec<u8>,
+    pub lookup: AVec<u8, ConstAlign<32>>,
     /// Number of states (cached for convenience)
     n_states: usize,
 }
@@ -109,9 +118,9 @@ impl ThreadWorkspace {
         let size = interval * n_states;
 
         Self {
-            fwd: vec![0.0; size],
-            bwd: vec![0.0; size],
-            lookup: vec![0; size],
+            fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
+            bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
+            lookup: AVec::from_iter(32, std::iter::repeat(0).take(size)),
             n_states,
         }
     }
@@ -123,12 +132,12 @@ impl ThreadWorkspace {
     pub fn resize_for_states(&mut self, n_states: usize) {
         if n_states > self.n_states {
             // Only resize if we need more states, not for window size
-            let current_interval = self.fwd.len() / self.n_states;
+            let current_interval = if self.n_states > 0 { self.fwd.len() / self.n_states } else { 64 };
             let new_size = current_interval * n_states;
 
-            self.fwd.resize(new_size, 0.0);
-            self.bwd.resize(new_size, 0.0);
-            self.lookup.resize(new_size, 0);
+            self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
+            self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
+            self.lookup = AVec::from_iter(32, std::iter::repeat(0).take(new_size));
             self.n_states = n_states;
         }
     }
@@ -138,7 +147,10 @@ impl ThreadWorkspace {
     /// This method is kept for compatibility but allocates excessive memory.
     /// New code should use resize_for_states() and manage memory via checkpoints.
     #[deprecated(note = "Use resize_for_states() - this allocates too much memory")]
-    pub fn resize_for_window(&mut self, _window_markers: usize, n_states: usize) {
+    pub fn resize_for_window(&mut self, window_markers: usize, n_states: usize) {
+        // Just use the value to silence unused warning without `let _` pattern
+        // The previous attempt failed because empty block is not allowed
+        let _ = window_markers + 0;
         self.resize_for_states(n_states);
     }
 

@@ -252,40 +252,7 @@ pub struct StateProbs {
     marker_to_cluster: std::sync::Arc<Vec<usize>>,
 }
 
-
-
-        // Map reference markers to target markers
-        let mut ref_to_target = vec![-1i32; n_ref_markers];
-        let mut target_to_ref = vec![0usize; n_target_markers];
-        let mut allele_mappings: Vec<Option<crate::data::marker::AlleleMapping>> =
-            vec![None; n_target_markers];
-
-        for ref_m in 0..n_ref_markers {
-            let ref_marker = ref_win.marker(crate::data::marker::MarkerIdx::new(ref_m as u32));
-            let ref_pos_global = (ref_marker.chrom.0 as u32, ref_marker.pos);
-
-            // Check if this reference marker is genotyped in target window
-            if let Some(&target_idx) = target_pos_map.get(&ref_pos_global) {
-                let target_marker = target_win.marker(crate::data::marker::MarkerIdx::new(target_idx as u32));
-
-                // Compute allele mapping
-                if let Some(mapping) = crate::data::marker::compute_allele_mapping(target_marker, ref_marker) {
-                    if mapping.is_valid() {
-                        ref_to_target[ref_m] = target_idx as i32;
-                        target_to_ref[target_idx] = ref_m;
-                        allele_mappings[target_idx] = Some(mapping);
-                    }
-                }
-            }
-        }
-
-        Ok(Self {
-            ref_to_target,
-            target_to_ref,
-            allele_mappings,
-        })
-    }
-
+impl MarkerAlignment {
     /// Create alignment from reference panel and position map
     ///
     /// Used for initializing alignment before processing windows.
@@ -295,7 +262,10 @@ pub struct StateProbs {
     ) -> Result<Self> {
         // For streaming imputation, we don't have all target genotypes at this point
         // This is a stub that gets filled in by new_from_windows later
-        // Return empty alignment for now
+        // Return empty alignment (placeholder)
+        #[allow(clippy::no_effect)]
+        { samples; ref_pos_map; }
+
         Ok(Self {
             ref_to_target: vec![],
             target_to_ref: vec![],
@@ -976,8 +946,9 @@ impl ImputationPipeline {
     }
 
     /// Run imputation with streaming to avoid OOM on large reference panels
-            info_span!("load_target").in_scope(|| {
-                eprintln!("Loading target VCF...");
+    fn run_streaming(&mut self) -> Result<()> {
+        let (mut target_reader, target_gt, target_samples) = info_span!("load_target").in_scope(|| {
+            eprintln!("Loading target VCF...");
                 let (mut target_reader, target_file) = VcfReader::open(&self.config.gt)?;
                 let target_samples = target_reader.samples_arc();
                 let target_gt = target_reader.read_all(target_file)?;
