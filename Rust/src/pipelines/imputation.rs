@@ -620,6 +620,58 @@ pub struct StateProbs {
     marker_to_cluster: std::sync::Arc<Vec<usize>>,
 }
 
+
+
+        // Map reference markers to target markers
+        let mut ref_to_target = vec![-1i32; n_ref_markers];
+        let mut target_to_ref = vec![0usize; n_target_markers];
+        let mut allele_mappings: Vec<Option<crate::data::marker::AlleleMapping>> =
+            vec![None; n_target_markers];
+
+        for ref_m in 0..n_ref_markers {
+            let ref_marker = ref_win.marker(crate::data::marker::MarkerIdx::new(ref_m as u32));
+            let ref_pos_global = (ref_marker.chrom.0 as u32, ref_marker.pos);
+
+            // Check if this reference marker is genotyped in target window
+            if let Some(&target_idx) = target_pos_map.get(&ref_pos_global) {
+                let target_marker = target_win.marker(crate::data::marker::MarkerIdx::new(target_idx as u32));
+
+                // Compute allele mapping
+                if let Some(mapping) = crate::data::marker::compute_allele_mapping(target_marker, ref_marker) {
+                    if mapping.is_valid() {
+                        ref_to_target[ref_m] = target_idx as i32;
+                        target_to_ref[target_idx] = ref_m;
+                        allele_mappings[target_idx] = Some(mapping);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            ref_to_target,
+            target_to_ref,
+            allele_mappings,
+        })
+    }
+
+    /// Create alignment from reference panel and position map
+    ///
+    /// Used for initializing alignment before processing windows.
+    pub fn new_from_position_map(
+        samples: &crate::data::haplotype::Samples,
+        ref_pos_map: &std::collections::HashMap<(u32, u32), usize>,
+    ) -> Result<Self> {
+        // For streaming imputation, we don't have all target genotypes at this point
+        // This is a stub that gets filled in by new_from_windows later
+        // Return empty alignment for now
+        Ok(Self {
+            ref_to_target: vec![],
+            target_to_ref: vec![],
+            allele_mappings: vec![],
+        })
+    }
+}
+
 #[cfg(test)]
 impl StateProbs {
     /// Create state probabilities from sparse HMM output.
@@ -1287,7 +1339,11 @@ impl ImputationPipeline {
     /// Run the imputation pipeline
     #[instrument(name = "imputation", skip(self))]
     pub fn run(&mut self) -> Result<()> {
-        let (target_reader, target_gt, target_samples) = info_span!("load_target").in_scope(|| {
+        // Use streaming approach to avoid OOM on large reference panels
+        self.run_streaming()
+    }
+
+    /// Run imputation with streaming to avoid OOM on large reference panels
             eprintln!("Loading target VCF...");
             let (mut target_reader, target_file) = VcfReader::open(&self.config.gt)?;
             let target_samples = target_reader.samples_arc();
@@ -1380,7 +1436,7 @@ impl ImputationPipeline {
                     GeneticMaps::new()
                 };
 
-                phasing.phase_in_memory(&target_gt, &gen_maps)
+                phasing.phase_in_memory_with_overlap(&target_gt, &gen_maps, None)
             })
         };
         let target_gt = Arc::new(phased_target_gt_res?);
@@ -1422,8 +1478,6 @@ impl ImputationPipeline {
 
         let chrom = ref_gt.marker(MarkerIdx::new(0)).chrom;
 
-        // Note: gen_positions and steps_config removed - ImpStates now uses ref_panel step boundaries directly
-
         // Build target-aligned marker list (Java uses all target markers, regardless of missingness).
         let genotyped_markers_vec: Vec<usize> = (0..n_ref_markers)
             .filter(|&ref_m| alignment.target_marker(ref_m).is_some())
@@ -1450,8 +1504,6 @@ impl ImputationPipeline {
                 .max(1)
                 .min(n_ref_haps)
         };
-
-        // Cluster-coded haplotype sequences and recursive IBS matching (Java ImpIbs)
 
         eprintln!("Running imputation with dynamic state selection...");
         let n_states = self.params.n_states;
@@ -1684,6 +1736,7 @@ impl ImputationPipeline {
                                         threshold,
                                         &mut workspace.fwd,
                                         &mut workspace.bwd,
+                                        &mut workspace.block_fwd,
                                     );
 
                                 out.push(Arc::new(ClusterStateProbs::from_sparse(
@@ -1999,80 +2052,6 @@ impl ImputationPipeline {
         eprintln!("Imputation complete!");
         Ok(())
     }
-
-    /// Load reference panel using streaming/windowed approach
-    ///
-    /// This method uses the StreamingBref3Reader to load reference data in windows,
-    /// reducing peak memory usage for very large reference panels. The windows are
-    /// then merged into a single GenotypeMatrix for processing.
-    ///
-    /// For truly windowed imputation (processing each window separately), see the
-    /// WindowedBref3Reader which provides window iteration with HMM overlap handling.
-    pub fn load_reference_streaming(
-        path: &std::path::Path,
-        window_config: Option<WindowConfig>,
-    ) -> Result<GenotypeMatrix<Phased>> {
-        use crate::data::storage::GenotypeColumn;
-
-        let config = window_config.unwrap_or_default();
-        let streaming_reader = StreamingBref3Reader::open(path)?;
-        let n_haps = streaming_reader.n_haps();
-        eprintln!("    Reference panel: {} haplotypes", n_haps);
-
-        let mut windowed = WindowedBref3Reader::new(streaming_reader, config);
-
-        let samples = Arc::new(windowed.samples().clone());
-        let mut all_markers = crate::data::marker::Markers::new();
-        let mut all_columns: Vec<GenotypeColumn> = Vec::new();
-
-        let n_haps_check = windowed.n_haps();
-        debug_assert_eq!(n_haps, n_haps_check);
-
-        let mut window_num = 0;
-        // Read all windows and merge
-        while let Some(window) = windowed.next_window()? {
-            window_num += 1;
-            let window_type = if window.is_first && window.is_last {
-                "only"
-            } else if window.is_first {
-                "first"
-            } else if window.is_last {
-                "last"
-            } else {
-                "middle"
-            };
-            eprintln!(
-                "    Window {}: markers {}..{} (output {}..{}), {} window",
-                window_num,
-                window.global_start,
-                window.global_end,
-                window.output_start,
-                window.output_end,
-                window_type
-            );
-
-            // Merge chromosome names
-            for chrom in window.markers.chrom_names() {
-                if !all_markers.chrom_names().iter().any(|c| c.as_ref() == chrom.as_ref()) {
-                    all_markers.add_chrom(chrom);
-                }
-            }
-
-            // Add markers and columns
-            for m in 0..window.markers.len() {
-                let marker = window.markers.marker(MarkerIdx::new(m as u32));
-                all_markers.push(marker.clone());
-            }
-            all_columns.extend(window.columns);
-        }
-
-        eprintln!("    Loaded {} markers in {} windows", all_markers.len(), window_num);
-        Ok(GenotypeMatrix::new_phased(all_markers, all_columns, samples))
-    }
-}
-
-/// Run forward-backward HMM on CLUSTERS (matches Java ImpLSBaum exactly)
-///
 /// This is the cluster-aggregated version that:
 /// 1. Operates on C clusters instead of M markers (10-50x faster)
 /// 2. Uses per-marker mismatch probability applied across all observed markers
@@ -2246,6 +2225,7 @@ pub fn run_hmm_forward_backward_clusters(
 /// # Arguments
 /// * `fwd_buffer` - Pre-allocated forward probabilities buffer (will be resized)
 /// * `bwd_buffer` - Pre-allocated backward probabilities buffer (will be resized)
+/// * `block_fwd_buffer` - Pre-allocated block forward buffer for block-wise recomputation
 pub fn run_hmm_forward_backward_to_sparse(
     diff_vals: &[f32],
     diff_cols: &[u16],
@@ -2258,6 +2238,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     threshold: f32,
     fwd_buffer: &mut Vec<f32>,
     bwd_buffer: &mut Vec<f32>,
+    block_fwd_buffer: &mut Vec<f32>,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
     use wide::f32x8;
 
@@ -2406,205 +2387,98 @@ pub fn run_hmm_forward_backward_to_sparse(
     }
 
 
-    // ========== BACKWARD PASS: recompute forward and build sparse output ==========
+    let block_fwd = block_fwd_buffer;
+    block_fwd.resize((CHECKPOINT_INTERVAL + 1) * n_states, 0.0);
+
     let bwd = bwd_buffer;
     bwd.resize(n_states, 0.0);
-    // Initialize bwd with 1.0/K (matches Java)
     bwd.fill(1.0 / n_states as f32);
 
-    // Sparse output buffers
     let estimated_nnz = n_clusters * 50;
     let mut hap_indices = Vec::with_capacity(estimated_nnz);
     let mut probs = Vec::with_capacity(estimated_nnz);
     let mut probs_p1 = Vec::with_capacity(estimated_nnz);
-
-    // Track entry count per cluster (in reverse order during loop)
     let mut entry_counts = Vec::with_capacity(n_clusters);
-
-    // Temporary storage for current and next cluster posteriors
     let mut curr_posteriors = vec![0.0f32; n_states];
     let mut next_posteriors = vec![0.0f32; n_states];
 
-    // Process clusters in reverse order
-    for m in (0..n_clusters).rev() {
-        // Update backward values using emissions at m+1
-        if m + 1 < n_clusters {
-            let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
-            let shift = p_rec / n_states as f32;
+    for block_idx in (0..n_checkpoints).rev() {
+        let block_start = block_idx * CHECKPOINT_INTERVAL;
+        let block_end = ((block_idx + 1) * CHECKPOINT_INTERVAL).min(n_clusters);
 
-            // Base Emissions for m+1
-            let base_emit = cluster_base_scores[m + 1].exp();
-
-            // Apply base emission to bwd (Vectorized)
-            let mut k = 0;
-            let base_emit_vec = f32x8::splat(base_emit);
-            while k + 8 <= n_states {
-                let initial_chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
-                let initial_chunk = f32x8::from(*initial_chunk_arr);
-                let res = initial_chunk * base_emit_vec;
-                let res_arr: [f32; 8] = res.into();
-                bwd[k..k+8].copy_from_slice(&res_arr);
-                k += 8;
-            }
-            for x in bwd[k..].iter_mut() {
-                *x *= base_emit;
-            }
-
-            // Apply Sparse Penalties to bwd (using emissions of m+1)
-            let start = diff_row_offsets[m+1];
-            let end = diff_row_offsets[m+2];
-            for i in start..end {
-                let col = diff_cols[i] as usize;
-                let val = diff_vals[i];
-                if col < n_states {
-                    let penalty = val.exp();
-                    let trans_prob = bwd[col] / base_emit;
-                    bwd[col] = (bwd[col] * penalty).max(trans_prob * 1e-20);
-                }
-            }
-
-            // Compute Sum for Scaling
-            let mut emitted_sum = 0.0f32;
-            let mut sum_vec = f32x8::splat(0.0);
-            k = 0;
-            while k + 8 <= n_states {
-                let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
-                let chunk = f32x8::from(*chunk_arr);
-                sum_vec += chunk;
-                k += 8;
-            }
-            emitted_sum += sum_vec.reduce_add();
-            for &x in bwd[k..].iter() {
-                emitted_sum += x;
-            }
-
-            if emitted_sum > 0.0 {
-                let scale_v = (1.0 - p_rec) / emitted_sum;
-                // Transition logic: NewBwd[i] = Scale * Bwd[i] + Shift
-                let scale_vec = f32x8::splat(scale_v);
-                let shift_vec = f32x8::splat(shift);
-                
-                k = 0;
-                while k + 8 <= n_states {
-                     let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
-                     let chunk = f32x8::from(*chunk_arr);
-                     // chunk * scale + shift
-                     let res = chunk.mul_add(scale_vec, shift_vec);
-                     let res_arr: [f32; 8] = res.into();
-                     bwd[k..k+8].copy_from_slice(&res_arr);
-                     k += 8;
-                }
-                for x in bwd[k..].iter_mut() {
-                    *x = scale_v * *x + shift;
-                }
-            } else {
-                bwd.fill(1.0 / n_states as f32);
-            }
+        if block_start >= n_clusters {
+            continue;
         }
 
-        // Recompute forward values for cluster m from nearest checkpoint
-        let checkpoint_idx = m / CHECKPOINT_INTERVAL;
-        let checkpoint_start = checkpoint_idx * CHECKPOINT_INTERVAL;
-        let checkpoint_off = checkpoint_idx * n_states;
         let mut recomp_sum;
-        let loop_start_m;
+        let mut curr_off;
 
-        if checkpoint_idx == 0 {
-            // First interval: Re-initialize m=0 from Prior
+        if block_idx == 0 {
             let base_emit = cluster_base_scores[0].exp();
-            
-            // Initialize at prev_base (which acts as "curr" for m=0 in this context)
-            let (_, upper) = fwd.split_at_mut(prev_base);
-            let curr_slice = &mut upper[..n_states];
-            
             let val = base_emit / n_states as f32;
-            curr_slice.fill(val);
+            block_fwd[0..n_states].fill(val);
 
-            // Apply CSR Penalties m=0
-             let start = diff_row_offsets[0];
+            let start = diff_row_offsets[0];
             let end = diff_row_offsets[1];
             for i in start..end {
                 let col = diff_cols[i] as usize;
                 let val = diff_vals[i];
                 if col < n_states {
                     let penalty = val.exp();
-                    let trans_prob = curr_slice[col] / base_emit;
-                    curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
+                    let trans_prob = block_fwd[col] / base_emit;
+                    block_fwd[col] = (block_fwd[col] * penalty).max(trans_prob * 1e-20);
                 }
             }
-            
-            // Sum m=0
-             let mut sum = 0.0f32;
-            for &x in curr_slice.iter() {
+
+            let mut sum = 0.0f32;
+            for &x in &block_fwd[0..n_states] {
                 sum += x;
             }
             recomp_sum = sum.max(1e-30);
-            
-            loop_start_m = 1;
+            curr_off = 0;
         } else {
-             // Load checkpoint
-             // Critical Fix: Load PREVIOUS checkpoint (m=checksum_start-1)
-             let load_idx = checkpoint_idx - 1;
+            let load_idx = block_idx - 1;
             let checkpoint_off = load_idx * n_states;
-            {
-                let (checkpoint_region, working_region) = fwd.split_at_mut(curr_base);
-                let dst_off = prev_base - curr_base;
-                working_region[dst_off..dst_off + n_states]
-                    .copy_from_slice(&checkpoint_region[checkpoint_off..checkpoint_off + n_states]);
-            }
-            // Checkpoints are normalized. Recomputing from them acts as if previous sum was 1.0.
-            recomp_sum = 1.0; 
-            loop_start_m = checkpoint_start;
+            block_fwd[0..n_states].copy_from_slice(&fwd[checkpoint_off..checkpoint_off + n_states]);
+            recomp_sum = 1.0;
+            curr_off = 0;
         }
 
-        // Recompute forward from checkpoint to m
-        for recomp_m in loop_start_m..=m {
-            let p_rec = p_recomb.get(recomp_m).copied().unwrap_or(0.0);
+        // For block_idx == 0, fwd[0] is already initialized at offset 0, so start from m=1
+        // For block_idx > 0, we need to compute fwd[block_start] from checkpoint
+        let loop_start = if block_idx == 0 { block_start + 1 } else { block_start };
+        for local_m in loop_start..block_end {
+            let p_rec = p_recomb.get(local_m).copied().unwrap_or(0.0);
             let shift = p_rec / n_states as f32;
-            
-            // Recompute sum is correctly initialized to 1.0 (if checkpoint) or actual sum (if m=0)
             let scale = (1.0 - p_rec) / recomp_sum.max(1e-30);
+            let base_emit = cluster_base_scores[local_m].exp();
 
-            // Base Emission
-            let base_emit = cluster_base_scores[recomp_m].exp();
+            let next_off = curr_off + n_states;
+            let prev_slice = &block_fwd[curr_off..curr_off + n_states];
+            let curr_slice = &mut block_fwd[next_off..next_off + n_states];
 
-            let (lower, upper) = fwd.split_at_mut(prev_base);
-            let (curr_slice, prev_slice) = if recomp_m % 2 == 0 {
-                 (&mut lower[curr_base..curr_base+n_states], &upper[..n_states])
-            } else {
-                 (&mut upper[..n_states], &lower[curr_base..curr_base+n_states])
-            };
-
-            // Vectorized Transition
             let shift_vec = f32x8::splat(shift);
             let scale_vec = f32x8::splat(scale);
             let emit_vec = f32x8::splat(base_emit);
-            
+
             let mut k = 0;
             while k + 8 <= n_states {
-                // Safe slice conversion to arrayRef for f32x8
                 let prev_chunk_arr: &[f32; 8] = prev_slice[k..k+8].try_into().unwrap();
                 let prev_vec = f32x8::from(*prev_chunk_arr);
-                
-                // (prev * scale + shift) * emit
                 let trans = prev_vec.mul_add(scale_vec, shift_vec);
                 let res = trans * emit_vec;
-                
                 let res_arr: [f32; 8] = res.into();
                 curr_slice[k..k+8].copy_from_slice(&res_arr);
-                
                 k += 8;
             }
-            
-            // Scalar Tail
+
             for i in k..n_states {
                 let p = prev_slice[i];
                 curr_slice[i] = base_emit * (scale * p + shift);
             }
 
-            // Apply Sparse Penalties
-            let start = diff_row_offsets[recomp_m];
-            let end = diff_row_offsets[recomp_m + 1];
+            let start = diff_row_offsets[local_m];
+            let end = diff_row_offsets[local_m + 1];
             for i in start..end {
                 let col = diff_cols[i] as usize;
                 let val = diff_vals[i];
@@ -2615,77 +2489,128 @@ pub fn run_hmm_forward_backward_to_sparse(
                 }
             }
 
-             let mut new_sum = 0.0f32;
-            for &x in &curr_slice[..n_states] {
+            let mut new_sum = 0.0f32;
+            for &x in curr_slice {
                 new_sum += x;
             }
             recomp_sum = new_sum.max(1e-30);
+            curr_off = next_off;
+        }
 
-            // Copy curr to prev for next iteration
-            if recomp_m < m {
-                // We just computed into curr_base. Next iter needs it in prev_off
-                let (first, second) = fwd.split_at_mut(prev_base);
-                // prev_base > curr_base usually
-                if prev_base > curr_base {
-                     // fwd layout: [checkpoints][curr][prev]
-                     // copy curr -> prev
-                     let src = &first[curr_base..curr_base+n_states];
-                     second[0..n_states].copy_from_slice(src);
+        for m in (block_start..block_end).rev() {
+            if m + 1 < n_clusters {
+                let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
+                let shift = p_rec / n_states as f32;
+                let base_emit = cluster_base_scores[m + 1].exp();
+
+                let mut k = 0;
+                let base_emit_vec = f32x8::splat(base_emit);
+                while k + 8 <= n_states {
+                    let initial_chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
+                    let initial_chunk = f32x8::from(*initial_chunk_arr);
+                    let res = initial_chunk * base_emit_vec;
+                    let res_arr: [f32; 8] = res.into();
+                    bwd[k..k+8].copy_from_slice(&res_arr);
+                    k += 8;
+                }
+                for x in bwd[k..].iter_mut() {
+                    *x *= base_emit;
+                }
+
+                let start = diff_row_offsets[m+1];
+                let end = diff_row_offsets[m+2];
+                for i in start..end {
+                    let col = diff_cols[i] as usize;
+                    let val = diff_vals[i];
+                    if col < n_states {
+                        let penalty = val.exp();
+                        let trans_prob = bwd[col] / base_emit;
+                        bwd[col] = (bwd[col] * penalty).max(trans_prob * 1e-20);
+                    }
+                }
+
+                let mut emitted_sum = 0.0f32;
+                let mut sum_vec = f32x8::splat(0.0);
+                k = 0;
+                while k + 8 <= n_states {
+                    let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
+                    let chunk = f32x8::from(*chunk_arr);
+                    sum_vec += chunk;
+                    k += 8;
+                }
+                emitted_sum += sum_vec.reduce_add();
+                for &x in bwd[k..].iter() {
+                    emitted_sum += x;
+                }
+
+                if emitted_sum > 0.0 {
+                    let scale_v = (1.0 - p_rec) / emitted_sum;
+                    let scale_vec = f32x8::splat(scale_v);
+                    let shift_vec = f32x8::splat(shift);
+                    
+                    k = 0;
+                    while k + 8 <= n_states {
+                         let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
+                         let chunk = f32x8::from(*chunk_arr);
+                         let res = chunk.mul_add(scale_vec, shift_vec);
+                         let res_arr: [f32; 8] = res.into();
+                         bwd[k..k+8].copy_from_slice(&res_arr);
+                         k += 8;
+                    }
+                    for x in bwd[k..].iter_mut() {
+                        *x = scale_v * *x + shift;
+                    }
                 } else {
-                    // unexpected layout, but let's trust offsets
-                     let (left, right) = fwd.split_at_mut(curr_base);
-                     left[prev_base..prev_base+n_states].copy_from_slice(&right[0..n_states]);
+                    bwd.fill(1.0 / n_states as f32);
                 }
             }
-        }
 
-        // Now fwd[curr_base..] has forward values for cluster m
-        // Compute posteriors: fwd * bwd, normalized
-        let fwd_row = if m == checkpoint_start {
-            &fwd[checkpoint_off..checkpoint_off + n_states]
-        } else {
-            &fwd[curr_base..curr_base + n_states]
-        };
+            // For block_idx == 0: fwd[m] is at offset m*n_states (m=0 from init, m=1+ from loop)
+            // For block_idx > 0: checkpoint at offset 0, fwd[block_start] at offset n_states
+            let local_offset = if block_idx == 0 {
+                (m - block_start) * n_states
+            } else {
+                (m - block_start + 1) * n_states
+            };
+            let fwd_row = &block_fwd[local_offset..local_offset + n_states];
 
-        let mut state_sum = 0.0f32;
-        for k in 0..n_states {
-            curr_posteriors[k] = fwd_row[k] * bwd[k];
-            state_sum += curr_posteriors[k];
-        }
-        if state_sum > 0.0 {
-            let inv = 1.0 / state_sum;
+            let mut state_sum = 0.0f32;
             for k in 0..n_states {
-                curr_posteriors[k] *= inv;
+                curr_posteriors[k] = fwd_row[k] * bwd[k];
+                state_sum += curr_posteriors[k];
             }
-        }
-
-        // Build sparse entry for this cluster using curr (this cluster) and next (next cluster)
-        // ... (Sparse building logic remains same, but we must construct tuples)
-        
-        let entries_before = hap_indices.len();
-        if m == n_clusters - 1 {
-            for k in 0..n_states {
-                let prob = curr_posteriors[k];
-                if prob > threshold {
-                    hap_indices.push(hap_indices_input[m][k]);
-                    probs.push(prob);
-                    probs_p1.push(prob);
+            if state_sum > 0.0 {
+                let inv = 1.0 / state_sum;
+                for k in 0..n_states {
+                    curr_posteriors[k] *= inv;
                 }
             }
-        } else {
-            for k in 0..n_states {
-                let prob = curr_posteriors[k];
-                let prob_next = next_posteriors[k];
-                if prob > threshold || prob_next > threshold {
-                    hap_indices.push(hap_indices_input[m][k]);
-                    probs.push(prob);
-                    probs_p1.push(prob_next);
+
+            let entries_before = hap_indices.len();
+            if m == n_clusters - 1 {
+                for k in 0..n_states {
+                    let prob = curr_posteriors[k];
+                    if prob > threshold {
+                        hap_indices.push(hap_indices_input[m][k]);
+                        probs.push(prob);
+                        probs_p1.push(prob);
+                    }
+                }
+            } else {
+                for k in 0..n_states {
+                    let prob = curr_posteriors[k];
+                    let prob_next = next_posteriors[k];
+                    if prob > threshold || prob_next > threshold {
+                        hap_indices.push(hap_indices_input[m][k]);
+                        probs.push(prob);
+                        probs_p1.push(prob_next);
+                    }
                 }
             }
+            
+            entry_counts.push(hap_indices.len() - entries_before);
+            std::mem::swap(&mut curr_posteriors, &mut next_posteriors);
         }
-        
-        entry_counts.push(hap_indices.len() - entries_before);
-        std::mem::swap(&mut curr_posteriors, &mut next_posteriors);
     }
 
     // Finalize outputs (Reverse)

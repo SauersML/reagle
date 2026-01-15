@@ -26,6 +26,11 @@ pub struct ImpWorkspace {
 
     /// Reusable row buffer for accumulation
     pub row_buffer: Vec<f32>,
+
+    /// Block forward buffer for checkpoint recomputation (L2 cache sized)
+    /// Stores forward probabilities for one block (CHECKPOINT_INTERVAL markers)
+    /// Size: (CHECKPOINT_INTERVAL + 1) * n_states ~ 416KB for K=1600, I=64
+    pub block_fwd: Vec<f32>,
 }
 
 impl ImpWorkspace {
@@ -39,6 +44,7 @@ impl ImpWorkspace {
             diff_row_offsets: vec![0],
             cluster_base_scores: Vec::new(),
             row_buffer: vec![0.0; n_states],
+            block_fwd: Vec::new(),
         }
     }
 
@@ -57,7 +63,8 @@ impl ImpWorkspace {
 
     /// Ensure cluster buffers are ready for accumulation
     pub fn reset_and_ensure_capacity(&mut self, n_clusters_hint: usize, n_states: usize) {
-        // Clear CSR but keep capacity
+        const CHECKPOINT_INTERVAL: usize = 64;
+
         self.diff_vals.clear();
         self.diff_cols.clear();
         self.diff_row_offsets.clear();
@@ -67,10 +74,99 @@ impl ImpWorkspace {
         self.cluster_base_scores.clear();
         self.cluster_base_scores.reserve(n_clusters_hint);
 
-        // Resize scratch buffers
         if self.row_buffer.len() < n_states {
             self.row_buffer.resize(n_states, 0.0);
         }
+
+        let block_fwd_size = (CHECKPOINT_INTERVAL + 1) * n_states;
+        if self.block_fwd.len() < block_fwd_size {
+            self.block_fwd.resize(block_fwd_size, 0.0);
+        }
+    }
+}
+
+/// Workspace for phasing HMM computations
+#[derive(Debug)]
+pub struct ThreadWorkspace {
+    /// Forward probabilities: fwd[m * n_states + k] = P(state k at marker m)
+    pub fwd: Vec<f32>,
+    /// Backward probabilities: bwd[m * n_states + k] = P(state k at marker m)
+    pub bwd: Vec<f32>,
+    /// Pre-computed alleles: alleles[m * n_states + k] = allele for state k at marker m
+    pub lookup: Vec<u8>,
+    /// Number of states (cached for convenience)
+    n_states: usize,
+}
+
+impl ThreadWorkspace {
+    /// Create a new workspace with bounded memory usage
+    ///
+    /// Uses checkpoint-based approach: only stores active HMM state blocks,
+    /// not the entire window. Memory usage is O(checkpoint_interval * n_states).
+    pub fn new(checkpoint_interval: usize, n_states: usize) -> Self {
+        const DEFAULT_CHECKPOINT_INTERVAL: usize = 64; // L2 cache friendly
+        let interval = checkpoint_interval.max(1).min(DEFAULT_CHECKPOINT_INTERVAL);
+        let size = interval * n_states;
+
+        Self {
+            fwd: vec![0.0; size],
+            bwd: vec![0.0; size],
+            lookup: vec![0; size],
+            n_states,
+        }
+    }
+
+    /// Resize workspace for a new number of states (keeps memory bounded)
+    ///
+    /// Only resizes if needed - doesn't allocate per window size.
+    /// The workspace maintains constant memory regardless of window size.
+    pub fn resize_for_states(&mut self, n_states: usize) {
+        if n_states > self.n_states {
+            // Only resize if we need more states, not for window size
+            let current_interval = self.fwd.len() / self.n_states;
+            let new_size = current_interval * n_states;
+
+            self.fwd.resize(new_size, 0.0);
+            self.bwd.resize(new_size, 0.0);
+            self.lookup.resize(new_size, 0);
+            self.n_states = n_states;
+        }
+    }
+
+    /// DEPRECATED: Use resize_for_states instead
+    ///
+    /// This method is kept for compatibility but allocates excessive memory.
+    /// New code should use resize_for_states() and manage memory via checkpoints.
+    #[deprecated(note = "Use resize_for_states() - this allocates too much memory")]
+    pub fn resize_for_window(&mut self, _window_markers: usize, n_states: usize) {
+        self.resize_for_states(n_states);
+    }
+
+    /// Clear workspace contents without deallocating
+    pub fn clear(&mut self) {
+        // No need to zero out, as we'll overwrite during fill
+    }
+
+    /// Get mutable slices for a specific marker
+    pub fn fwd_marker_mut(&mut self, marker: usize) -> &mut [f32] {
+        let start = marker * self.n_states;
+        &mut self.fwd[start..start + self.n_states]
+    }
+
+    pub fn bwd_marker_mut(&mut self, marker: usize) -> &mut [f32] {
+        let start = marker * self.n_states;
+        &mut self.bwd[start..start + self.n_states]
+    }
+
+    /// Get lookup slice for a specific marker
+    pub fn lookup_marker(&self, marker: usize) -> &[u8] {
+        let start = marker * self.n_states;
+        &self.lookup[start..start + self.n_states]
+    }
+
+    pub fn lookup_marker_mut(&mut self, marker: usize) -> &mut [u8] {
+        let start = marker * self.n_states;
+        &mut self.lookup[start..start + self.n_states]
     }
 }
 

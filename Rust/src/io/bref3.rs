@@ -365,7 +365,7 @@ impl Bref3Block {
 /// discard data as needed.
 pub struct StreamingBref3Reader {
     reader: BufReader<File>,
-    samples: Samples,
+    samples: Arc<Samples>,
     n_haps: usize,
     chrom_map: std::collections::HashMap<String, ChromIdx>,
     /// Whether we've reached end of data
@@ -390,7 +390,7 @@ impl StreamingBref3Reader {
         read_utf8_string(&mut reader)?; // program string (unused)
         let sample_ids = read_string_array(&mut reader)?;
         let n_haps = sample_ids.len() * 2;
-        let samples = Samples::from_ids(sample_ids);
+        let samples = Arc::new(Samples::from_ids(sample_ids));
 
         Ok(Self {
             reader,
@@ -404,6 +404,11 @@ impl StreamingBref3Reader {
     /// Get the samples
     pub fn samples(&self) -> &Samples {
         &self.samples
+    }
+
+    /// Get the samples as Arc (for sharing without cloning)
+    pub fn samples_arc(&self) -> Arc<Samples> {
+        Arc::clone(&self.samples)
     }
 
     /// Get number of haplotypes
@@ -596,10 +601,8 @@ impl Default for WindowConfig {
 
 /// A window of reference data accumulated from multiple blocks
 pub struct RefWindow {
-    /// All markers in this window
-    pub markers: Markers,
-    /// All genotype columns
-    pub columns: Vec<GenotypeColumn>,
+    /// Genotype matrix for this window (phased reference data)
+    pub genotypes: GenotypeMatrix<crate::data::storage::phase_state::Phased>,
     /// Global start marker index
     pub global_start: usize,
     /// Global end marker index (exclusive)
@@ -646,6 +649,116 @@ impl WindowedBref3Reader {
     /// Get number of haplotypes
     pub fn n_haps(&self) -> usize {
         self.inner.n_haps()
+    }
+
+    /// Load reference window for a specific genomic region
+    ///
+    /// This method loads all reference markers within [start_pos, end_pos] plus flanking markers.
+    /// Used to synchronize with target windows based on genomic coordinates
+    /// rather than independent window boundaries.
+    ///
+    /// Includes flanking markers outside the region to prevent reference bias
+    /// at window boundaries (HMM needs context to stabilize).
+    pub fn load_window_for_region(&mut self, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+        // Add buffer zone to prevent reference bias at boundaries
+        // Use 1.0 cM or 500 markers, whichever is smaller
+        const BUFFER_CM: f64 = 1.0;
+        const BUFFER_MARKERS: usize = 500;
+
+        // Calculate buffered region
+        // For simplicity, use fixed marker buffer since we don't have genetic map here
+        let buffer_size = BUFFER_MARKERS.min((end_pos - start_pos) as usize / 2);
+        let buffered_start = start_pos.saturating_sub(buffer_size as u32);
+        let buffered_end = end_pos + buffer_size as u32;
+        // First, drain any blocks that are entirely before start_pos
+        while let Some(first_block) = self.block_buffer.first() {
+            if first_block.end_pos < start_pos {
+                self.block_buffer.remove(0);
+            } else {
+                break;
+            }
+        }
+
+        // Load blocks until we cover end_pos
+        while !self.inner.is_eof() {
+            let need_more = self.block_buffer.is_empty()
+                || self.block_buffer.last().map(|b| b.end_pos < end_pos).unwrap_or(true);
+
+            if !need_more {
+                break;
+            }
+
+            if let Some(block) = self.inner.next_block()? {
+                // Skip blocks entirely before start_pos
+                if block.end_pos < start_pos {
+                    continue;
+                }
+                self.block_buffer.push(block);
+            } else {
+                break;
+            }
+        }
+
+        if self.block_buffer.is_empty() {
+            return Ok(None);
+        }
+
+        // Merge blocks that overlap with [start_pos, end_pos]
+        let mut markers = Markers::new();
+        let mut columns: Vec<GenotypeColumn> = Vec::new();
+        let is_first = self.window_num == 0;
+        let is_last = self.inner.is_eof();
+
+        for block in &self.block_buffer {
+            // Skip blocks entirely outside our range
+            if block.end_pos < start_pos || block.start_pos > end_pos {
+                continue;
+            }
+
+            // Add chromosome if needed
+            if markers.chrom_names().is_empty() || markers.chrom_names().last().map(|s| s.as_ref()) != Some(&block.chrom) {
+                markers.add_chrom(&block.chrom);
+            }
+
+            // Add markers within the buffered position range
+            for m in 0..block.n_markers() {
+                let marker = block.markers.marker(crate::data::marker::MarkerIdx::new(m as u32));
+                if marker.pos >= buffered_start && marker.pos <= buffered_end {
+                    markers.push(marker.clone());
+                    columns.push(block.columns[m].clone());
+                }
+            }
+        }
+
+        if markers.is_empty() {
+            return Ok(None);
+        }
+
+        let n_markers = markers.len();
+        let global_start = self.global_offset;
+        let global_end = global_start + n_markers;
+
+        self.global_offset = global_end;
+        self.window_num += 1;
+
+        // Clear blocks we've processed (keep last one for potential overlap)
+        while self.block_buffer.len() > 1 && self.block_buffer[0].end_pos < end_pos {
+            self.block_buffer.remove(0);
+        }
+
+        // Create GenotypeMatrix from markers and columns
+        let samples = self.inner.samples_arc();
+        let genotypes = GenotypeMatrix::new_phased(markers, columns, samples);
+
+        Ok(Some(RefWindow {
+            genotypes,
+            global_start,
+            global_end,
+            output_start: 0,
+            output_end: n_markers,
+            is_first,
+            is_last,
+        }))
     }
 
     /// Read the next window of reference data
@@ -745,15 +858,155 @@ impl WindowedBref3Reader {
         self.block_buffer.drain(..keep_from);
         self.window_num += 1;
 
+        // Create GenotypeMatrix from markers and columns
+        let samples = self.inner.samples_arc();
+        let genotypes = GenotypeMatrix::new_phased(markers, columns, samples);
+
         Ok(Some(RefWindow {
-            markers,
-            columns,
+            genotypes,
             global_start,
             global_end,
             output_start,
             output_end,
             is_first,
             is_last,
+        }))
+    }
+}
+
+/// Unified reference panel reader that supports both BREF3 (streaming) and VCF (in-memory)
+pub enum RefPanelReader {
+    /// Streaming BREF3 reader
+    Bref3(WindowedBref3Reader),
+    /// In-memory VCF reader
+    InMemory(InMemoryRefReader),
+}
+
+impl RefPanelReader {
+    /// Get the samples
+    pub fn samples(&self) -> &Samples {
+        match self {
+            RefPanelReader::Bref3(r) => r.samples(),
+            RefPanelReader::InMemory(r) => r.samples(),
+        }
+    }
+
+    /// Get the samples as Arc
+    pub fn samples_arc(&self) -> Arc<Samples> {
+        match self {
+            RefPanelReader::Bref3(r) => r.inner.samples_arc(),
+            RefPanelReader::InMemory(r) => r.samples_arc(),
+        }
+    }
+
+    /// Get number of haplotypes
+    pub fn n_haps(&self) -> usize {
+        match self {
+            RefPanelReader::Bref3(r) => r.n_haps(),
+            RefPanelReader::InMemory(r) => r.n_haps(),
+        }
+    }
+
+    /// Load reference window for a specific genomic region
+    pub fn load_window_for_region(&mut self, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+        match self {
+            RefPanelReader::Bref3(r) => r.load_window_for_region(start_pos, end_pos),
+            RefPanelReader::InMemory(r) => r.load_window_for_region(start_pos, end_pos),
+        }
+    }
+}
+
+/// In-memory reference panel reader for VCF files
+///
+/// Provides the same interface as WindowedBref3Reader but backed by
+/// an in-memory GenotypeMatrix. Used for VCF reference panels.
+pub struct InMemoryRefReader {
+    genotypes: Arc<GenotypeMatrix<crate::data::storage::phase_state::Phased>>,
+    window_num: usize,
+}
+
+impl InMemoryRefReader {
+    /// Create a new in-memory reader from a loaded reference panel
+    pub fn new(genotypes: Arc<GenotypeMatrix<crate::data::storage::phase_state::Phased>>) -> Self {
+        Self {
+            genotypes,
+            window_num: 0,
+        }
+    }
+
+    /// Get the samples
+    pub fn samples(&self) -> &Samples {
+        self.genotypes.samples()
+    }
+
+    /// Get the samples as Arc
+    pub fn samples_arc(&self) -> Arc<Samples> {
+        self.genotypes.samples_arc()
+    }
+
+    /// Get number of haplotypes
+    pub fn n_haps(&self) -> usize {
+        self.genotypes.n_haplotypes()
+    }
+
+    /// Load reference window for a specific genomic region
+    pub fn load_window_for_region(&mut self, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+        use crate::data::marker::MarkerIdx;
+
+        let n_markers = self.genotypes.n_markers();
+        if n_markers == 0 {
+            return Ok(None);
+        }
+
+        // Find markers within the position range
+        let mut start_idx = None;
+        let mut end_idx = None;
+
+        for m in 0..n_markers {
+            let marker = self.genotypes.marker(MarkerIdx::new(m as u32));
+            if marker.pos >= start_pos && marker.pos <= end_pos {
+                if start_idx.is_none() {
+                    start_idx = Some(m);
+                }
+                end_idx = Some(m + 1);
+            } else if marker.pos > end_pos {
+                break;
+            }
+        }
+
+        let (start_idx, end_idx) = match (start_idx, end_idx) {
+            (Some(s), Some(e)) => (s, e),
+            _ => return Ok(None),
+        };
+
+        // Extract markers and columns for this range
+        let mut markers = crate::data::marker::Markers::new();
+        let mut columns = Vec::new();
+
+        // Add chromosome
+        let first_marker = self.genotypes.marker(MarkerIdx::new(start_idx as u32));
+        let chrom_name = self.genotypes.markers().chrom_name(first_marker.chrom);
+        markers.add_chrom(chrom_name);
+
+        for m in start_idx..end_idx {
+            markers.push(self.genotypes.marker(MarkerIdx::new(m as u32)).clone());
+            columns.push(self.genotypes.column(m).clone());
+        }
+
+        let n_window_markers = end_idx - start_idx;
+        let is_first = self.window_num == 0;
+        self.window_num += 1;
+
+        let genotypes = GenotypeMatrix::new_phased(markers, columns, self.genotypes.samples_arc());
+
+        Ok(Some(RefWindow {
+            genotypes,
+            global_start: start_idx,
+            global_end: end_idx,
+            output_start: 0,
+            output_end: n_window_markers,
+            is_first,
+            is_last: false, // Can't know without looking ahead
         }))
     }
 }
