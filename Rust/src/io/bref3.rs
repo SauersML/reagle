@@ -667,8 +667,7 @@ impl WindowedBref3Reader {
     /// at window boundaries (HMM needs context to stabilize).
     pub fn load_window_for_region(&mut self, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         // Add buffer zone to prevent reference bias at boundaries
-        // Use 1.0 cM or 500 markers, whichever is smaller
-        const BUFFER_CM: f64 = 1.0;
+        // Use 500 markers to ensure HMM has context to stabilize at boundaries
         const BUFFER_MARKERS: usize = 500;
 
         // Calculate buffered region

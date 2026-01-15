@@ -821,9 +821,8 @@ impl PhasingPipeline {
         let mut total_markers = 0;
 
         // Track phased overlap from previous window for phase continuity
+        // PhasedOverlap contains state probabilities used for PBWT state handoff
         let mut phased_overlap: Option<PhasedOverlap> = None;
-        // Track PBWT state for handoff between windows
-        let mut pbwt_state: Option<crate::model::pbwt::PbwtState> = None;
 
         // Double-buffered windows
         let mut current_window: Option<StreamWindowWithResult> = None;
@@ -860,11 +859,9 @@ impl PhasingPipeline {
                 Some(window.output_end)
             )?;
 
-            // Extract overlap and PBWT state for next window
+            // Extract overlap for next window (contains state probabilities for PBWT handoff)
             if !window.is_last() {
                 phased_overlap = Some(self.extract_overlap(&phased, window.output_end, n_markers, next_state_probs));
-                // Extract PBWT state at the splice point (output_end), where the next window starts
-                pbwt_state = Some(self.extract_pbwt_state(&phased, window.output_end));
             }
 
             // If we have a current window to finalize Stage 2
@@ -1405,22 +1402,6 @@ impl PhasingPipeline {
         }
     }
 
-    /// Build bidirectional PBWT for full chromosome phasing
-    fn build_bidirectional_pbwt(
-        &self,
-        geno: &MutableGenotypes,
-        n_markers: usize,
-        n_haps: usize,
-    ) -> BidirectionalPhaseIbs {
-        // Use bulk slice access instead of per-haplotype get() calls
-        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_markers);
-        for m in 0..n_markers {
-            let marker_slice = geno.marker_alleles(m);
-            alleles_by_marker.push(marker_slice[..n_haps].to_vec());
-        }
-        BidirectionalPhaseIbs::build(alleles_by_marker, n_haps, n_markers)
-    }
-
     /// Build bidirectional PBWT for a subset of markers (e.g., high-frequency only)
     fn build_bidirectional_pbwt_subset(
         &self,
@@ -1443,27 +1424,6 @@ impl PhasingPipeline {
             n_subset,
             marker_indices,
         )
-    }
-
-    /// Build bidirectional PBWT for combined target + reference haplotype space
-    fn build_bidirectional_pbwt_combined<F>(
-        &self,
-        get_allele: F,
-        n_markers: usize,
-        n_total_haps: usize,
-    ) -> BidirectionalPhaseIbs
-    where
-        F: Fn(usize, usize) -> u8,
-    {
-        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_markers);
-        for m in 0..n_markers {
-            let mut alleles = Vec::with_capacity(n_total_haps);
-            for h in 0..n_total_haps {
-                alleles.push(get_allele(m, h));
-            }
-            alleles_by_marker.push(alleles);
-        }
-        BidirectionalPhaseIbs::build(alleles_by_marker, n_total_haps, n_markers)
     }
 
     /// Build bidirectional PBWT for combined haplotype space on a marker subset
@@ -4114,38 +4074,6 @@ impl PhasingPipeline {
         }
         self.phase_in_memory_with_overlap(target_gt, gen_maps, phased_overlap, None)
             .map(|(result, ..)| result)
-    }
-
-    /// Extract PBWT state at the end of a window for handoff
-    ///
-    /// Returns the PPA and divergence arrays at the final marker
-    /// of the window, which will be used to initialize the next window.
-    ///
-    /// CURRENT LIMITATION: This recomputes PBWT state from scratch.
-    fn extract_pbwt_state(
-        &self,
-        phased: &GenotypeMatrix<Phased>,
-        n_markers: usize,
-    ) -> crate::model::pbwt::PbwtState {
-        use crate::model::pbwt::PbwtDivUpdater;
-
-        let n_haps = phased.n_haplotypes();
-        let mut updater = PbwtDivUpdater::new(n_haps);
-
-        // Initialize with sorted haplotype order
-        let mut prefix: Vec<u32> = (0..n_haps as u32).collect();
-        let mut divergence: Vec<i32> = vec![0; n_haps];
-
-        // Process markers to build final PBWT state
-        // This is still O(N*M) but at least uses the optimized PBWT updater
-        for m in 0..n_markers {
-            let alleles: Vec<u8> = (0..n_haps)
-                .map(|h| phased.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32)))
-                .collect();
-            updater.fwd_update(&alleles, 2, m, &mut prefix, &mut divergence);
-        }
-
-        crate::model::pbwt::PbwtState::new(prefix, divergence, n_markers)
     }
 
     /// Finalize Stage 2 phasing using context from next window
