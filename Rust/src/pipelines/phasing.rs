@@ -76,7 +76,7 @@ const MOSAIC_BLOCK_SIZE: usize = 128;  // Smaller = less memory per sample
 /// This eliminates per-lookup overhead from alignment mapping and reference genotype access.
 struct RefAlleleLookup {
     /// Pre-computed alleles: alleles[m * n_states + k] = allele for state k at marker m
-    alleles: Vec<u8>,
+    alleles: aligned_vec::AVec<u8, aligned_vec::ConstAlign<32>>,
     /// Number of HMM states
     n_states: usize,
 }
@@ -85,7 +85,7 @@ impl RefAlleleLookup {
     /// Create a new lookup directly from ThreadedHaps without intermediate allocation.
     ///
     /// This avoids the O(n_markers × n_states × 4) temporary from materialize_all().
-    fn new_from_threaded(
+    fn new_from_threaded_with_buffer(
         threaded_haps: &crate::model::states::ThreadedHaps,
         n_markers: usize,
         n_states: usize,
@@ -94,8 +94,14 @@ impl RefAlleleLookup {
         reference_gt: Option<&GenotypeMatrix<Phased>>,
         alignment: Option<&MarkerAlignment>,
         marker_map: Option<&[usize]>,
+        mut alleles: aligned_vec::AVec<u8, aligned_vec::ConstAlign<32>>,
     ) -> Self {
-        let mut alleles = vec![0u8; n_markers * n_states];
+        let required = n_markers * n_states;
+        if alleles.len() < required {
+            alleles = aligned_vec::AVec::from_iter(32, std::iter::repeat(0u8).take(required));
+        } else {
+            alleles[..required].fill(0);
+        }
 
         // Use marker-major iteration to hoist per-marker alignment computation
         threaded_haps.fill_alleles_marker_major(&mut alleles, |m| {
@@ -121,16 +127,17 @@ impl RefAlleleLookup {
             }
         });
 
-        Self {
-            alleles,
-            n_states,
-        }
+        Self { alleles, n_states }
     }
 
     #[inline(always)]
     fn allele(&self, m: usize, state: usize) -> u8 {
         // Direct array access - no branching, no indirection
         self.alleles[m * self.n_states + state]
+    }
+
+    fn into_buffer(self) -> aligned_vec::AVec<u8, aligned_vec::ConstAlign<32>> {
+        self.alleles
     }
 }
 
@@ -142,15 +149,25 @@ struct FwdCheckpoints {
 }
 
 impl FwdCheckpoints {
-    fn new(n_markers: usize, n_states: usize, block_size: usize) -> Self {
+    fn from_buffer(n_markers: usize, n_states: usize, block_size: usize, mut data: Vec<f32>) -> Self {
         let block_size = block_size.max(1).min(n_markers.max(1));
         let n_blocks = (n_markers + block_size - 1) / block_size;
+        let required = n_blocks * n_states;
+        if data.len() < required {
+            data.resize(required, 0.0);
+        } else {
+            data[..required].fill(0.0);
+        }
         Self {
             block_size,
             n_blocks,
             n_states,
-            data: vec![0.0f32; n_blocks * n_states],
+            data,
         }
+    }
+
+    fn into_buffer(self) -> Vec<f32> {
+        self.data
     }
 
     fn block_slice(&self, block_idx: usize) -> &[f32] {
@@ -177,6 +194,21 @@ impl Trace for MosaicTrace {
     }
 }
 
+struct MosaicBuffers {
+    fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
+    fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
+    ref_alleles: Vec<u8>,
+    hap1_checkpoints: FwdCheckpoints,
+    hap2_checkpoints: FwdCheckpoints,
+    hap1_allele: Vec<u8>,
+    hap1_use_combined: Vec<bool>,
+    hap2_allele: Vec<u8>,
+    hap2_use_combined: Vec<bool>,
+    path1: Vec<u32>,
+    path2: Vec<u32>,
+    fwd_block: Vec<f32>,
+}
+
 struct MosaicChain<'a> {
     rng: rand::rngs::SmallRng,
     n_markers: usize,
@@ -186,7 +218,10 @@ struct MosaicChain<'a> {
     seq2: &'a [u8],
     conf: &'a [f32],
     lookup: &'a RefAlleleLookup,
-    combined_checkpoints: Arc<FwdCheckpoints>,
+    combined_checkpoints: &'a FwdCheckpoints,
+    fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
+    fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
+    ref_alleles: Vec<u8>,
     hap1_checkpoints: FwdCheckpoints,
     hap1_allele: Vec<u8>,
     hap1_use_combined: Vec<bool>,
@@ -203,7 +238,7 @@ struct MosaicChain<'a> {
 }
 
 impl<'a> MosaicChain<'a> {
-    fn new(
+    fn new_with_buffers(
         seed: u64,
         n_markers: usize,
         n_states: usize,
@@ -212,7 +247,8 @@ impl<'a> MosaicChain<'a> {
         seq2: &'a [u8],
         conf: &'a [f32],
         lookup: &'a RefAlleleLookup,
-        combined_checkpoints: Arc<FwdCheckpoints>,
+        combined_checkpoints: &'a FwdCheckpoints,
+        buffers: MosaicBuffers,
         p_no_err: f32,
         p_err: f32,
     ) -> Self {
@@ -226,15 +262,18 @@ impl<'a> MosaicChain<'a> {
             conf,
             lookup,
             combined_checkpoints,
-            hap1_checkpoints: FwdCheckpoints::new(n_markers, n_states, MOSAIC_BLOCK_SIZE),
-            hap1_allele: vec![255u8; n_markers],
-            hap1_use_combined: vec![true; n_markers],
-            hap2_checkpoints: FwdCheckpoints::new(n_markers, n_states, MOSAIC_BLOCK_SIZE),
-            hap2_allele: vec![255u8; n_markers],
-            hap2_use_combined: vec![true; n_markers],
-            path1: vec![0u32; n_markers],
-            path2: vec![0u32; n_markers],
-            fwd_block: vec![0.0f32; n_states * MOSAIC_BLOCK_SIZE],
+            fwd: buffers.fwd,
+            fwd_prior: buffers.fwd_prior,
+            ref_alleles: buffers.ref_alleles,
+            hap1_checkpoints: buffers.hap1_checkpoints,
+            hap1_allele: buffers.hap1_allele,
+            hap1_use_combined: buffers.hap1_use_combined,
+            hap2_checkpoints: buffers.hap2_checkpoints,
+            hap2_allele: buffers.hap2_allele,
+            hap2_use_combined: buffers.hap2_use_combined,
+            path1: buffers.path1,
+            path2: buffers.path2,
+            fwd_block: buffers.fwd_block,
             trace: MosaicTrace {
                 mean_state: 0.0,
                 switch_rate: 0.0,
@@ -249,6 +288,23 @@ impl<'a> MosaicChain<'a> {
 
     fn paths(&self) -> (&[u32], &[u32]) {
         (&self.path1, &self.path2)
+    }
+
+    fn into_buffers(self) -> MosaicBuffers {
+        MosaicBuffers {
+            fwd: self.fwd,
+            fwd_prior: self.fwd_prior,
+            ref_alleles: self.ref_alleles,
+            hap1_checkpoints: self.hap1_checkpoints,
+            hap2_checkpoints: self.hap2_checkpoints,
+            hap1_allele: self.hap1_allele,
+            hap1_use_combined: self.hap1_use_combined,
+            hap2_allele: self.hap2_allele,
+            hap2_use_combined: self.hap2_use_combined,
+            path1: self.path1,
+            path2: self.path2,
+            fwd_block: self.fwd_block,
+        }
     }
 
     fn update_trace(&mut self) {
@@ -387,6 +443,9 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
             // Gibbs step: sample H1 | H2
             // Build hap1 constraints based on current path2
             self.build_hap1_inputs();
+            let fwd = &mut self.fwd[..self.n_states];
+            let fwd_prior = &mut self.fwd_prior[..self.n_states];
+            let ref_alleles = &mut self.ref_alleles[..self.n_states];
             build_fwd_checkpoints(
                 &mut self.hap1_checkpoints,
                 self.n_markers,
@@ -398,6 +457,9 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                 &self.hap1_allele,
                 &self.hap1_use_combined,
                 self.lookup,
+                fwd,
+                fwd_prior,
+                ref_alleles,
                 self.p_no_err,
                 self.p_err,
                 EmissionMode::Hap,
@@ -424,6 +486,9 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
 
         // Gibbs step: sample H2 | H1
         self.build_hap2_inputs();
+        let fwd = &mut self.fwd[..self.n_states];
+        let fwd_prior = &mut self.fwd_prior[..self.n_states];
+        let ref_alleles = &mut self.ref_alleles[..self.n_states];
         build_fwd_checkpoints(
             &mut self.hap2_checkpoints,
             self.n_markers,
@@ -435,6 +500,9 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
             &self.hap2_allele,
             &self.hap2_use_combined,
             self.lookup,
+            fwd,
+            fwd_prior,
+            ref_alleles,
             self.p_no_err,
             self.p_err,
             EmissionMode::Hap,
@@ -1799,19 +1867,6 @@ impl PhasingPipeline {
                 let p_err = self.params.p_mismatch;
                 let p_no_err = 1.0 - p_err;
 
-                // Pre-compute state->hap mapping for all (marker, state) pairs
-                // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
-                let lookup = RefAlleleLookup::new_from_threaded(
-                    &threaded_haps,
-                    n_markers,
-                    n_states,
-                    n_haps,
-                    ref_geno,
-                    self.reference_gt.as_deref(),
-                    self.alignment.as_ref(),
-                    None,
-                );
-
                 let (swap_bits, swap_lr) = THREAD_WORKSPACE.with(|ws| {
                     let mut workspace = ws.borrow_mut();
                     if workspace.is_none() {
@@ -1819,7 +1874,18 @@ impl PhasingPipeline {
                     }
                     let ws = workspace.as_mut().unwrap();
                     ws.clear(); // Explicit reset between samples to prevent state contamination
-                    sample_swap_bits_mosaic(
+                    let lookup = RefAlleleLookup::new_from_threaded_with_buffer(
+                        &threaded_haps,
+                        n_markers,
+                        n_states,
+                        n_haps,
+                        ref_geno,
+                        self.reference_gt.as_deref(),
+                        self.alignment.as_ref(),
+                        None,
+                        std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
+                    );
+                    let result = sample_swap_bits_mosaic(
                         n_markers,
                         n_states,
                         p_recomb,
@@ -1833,7 +1899,9 @@ impl PhasingPipeline {
                         p_no_err,
                         p_err,
                         ws,
-                    )
+                    );
+                    ws.lookup = lookup.into_buffer();
+                    result
                 });
                 assert!(swap_lr.len() <= n_markers);
                 let mut swapped = false;
@@ -2006,19 +2074,6 @@ impl PhasingPipeline {
                     let p_err = self.params.p_mismatch;
                     let p_no_err = 1.0 - p_err;
 
-                    // Pre-compute state->hap mapping for all (hi_freq_idx, state) pairs
-                    // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
-                    let lookup = RefAlleleLookup::new_from_threaded(
-                        &threaded_haps,
-                        n_hi_freq,
-                        n_states,
-                        n_haps,
-                        ref_geno,
-                        self.reference_gt.as_deref(),
-                        self.alignment.as_ref(),
-                        Some(hi_freq_to_orig),
-                    );
-
                     let (swap_bits, swap_lr) = if self.config.dynamic_mcmc {
                         // SHAPEIT5-style dynamic MCMC: re-select states each step
                         // Note: Dynamic MCMC doesn't use ThreadWorkspace yet
@@ -2047,7 +2102,18 @@ impl PhasingPipeline {
                             }
                             let ws = workspace.as_mut().unwrap();
                             ws.clear(); // Explicit reset between samples
-                            sample_swap_bits_mosaic(
+                            let lookup = RefAlleleLookup::new_from_threaded_with_buffer(
+                                &threaded_haps,
+                                n_hi_freq,
+                                n_states,
+                                n_haps,
+                                ref_geno,
+                                self.reference_gt.as_deref(),
+                                self.alignment.as_ref(),
+                                Some(hi_freq_to_orig),
+                                std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
+                            );
+                            let result = sample_swap_bits_mosaic(
                                 n_hi_freq,
                                 n_states,
                                 stage1_p_recomb,
@@ -2061,7 +2127,9 @@ impl PhasingPipeline {
                                 p_no_err,
                                 p_err,
                                 ws,
-                            )
+                            );
+                            ws.lookup = lookup.into_buffer();
+                            result
                         })
                     };
 
@@ -2959,6 +3027,9 @@ fn build_fwd_checkpoints(
     hap2_allele: &[u8],
     hap2_use_combined: &[bool],
     lookup: &RefAlleleLookup,
+    fwd: &mut [f32],
+    fwd_prior: &mut [f32],
+    ref_alleles: &mut [u8],
     p_no_err: f32,
     p_err: f32,
     mode: EmissionMode,
@@ -2970,9 +3041,9 @@ fn build_fwd_checkpoints(
     }
 
     let init = 1.0f32 / n_states as f32;
-    let mut fwd = vec![init; n_states];
-    let mut fwd_prior = vec![0.0f32; n_states];
-    let mut ref_alleles = vec![0u8; n_states];  // Pre-compute alleles per marker
+    fwd[..n_states].fill(init);
+    fwd_prior[..n_states].fill(0.0);
+    ref_alleles[..n_states].fill(0);
     let mut fwd_sum = 1.0f32;
 
     for m in 0..n_markers {
@@ -3685,11 +3756,16 @@ fn sample_swap_bits_mosaic(
     }
 
     // Resize workspace if needed for this window
-    workspace.resize_for_states(n_states);
+    workspace.ensure_for_window(n_markers, n_states, MOSAIC_BLOCK_SIZE);
 
-    let mut combined_checkpoints = FwdCheckpoints::new(n_markers, n_states, MOSAIC_BLOCK_SIZE);
+    let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
+    let mut combined_checkpoints =
+        FwdCheckpoints::from_buffer(n_markers, n_states, MOSAIC_BLOCK_SIZE, combined_data);
     let dummy_allele = vec![255u8; n_markers];
     let dummy_combined = vec![true; n_markers];
+    let fwd = &mut workspace.fwd[..n_states];
+    let fwd_prior = &mut workspace.fwd_prior[..n_states];
+    let ref_alleles = &mut workspace.ref_alleles[..n_states];
     build_fwd_checkpoints(
         &mut combined_checkpoints,
         n_markers,
@@ -3701,17 +3777,45 @@ fn sample_swap_bits_mosaic(
         &dummy_allele,
         &dummy_combined,
         lookup,
+        fwd,
+        fwd_prior,
+        ref_alleles,
         p_no_err,
         p_err,
         EmissionMode::Combined,
     );
 
-    let combined_checkpoints = Arc::new(combined_checkpoints);
+    let combined_checkpoints_ref = &combined_checkpoints;
 
     // Pure Stochastic EM: single chain, take the final sample after burn-in.
     // No averaging, no counting - just sample once from the posterior.
     let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
-    let mut chain = MosaicChain::new(
+    let buffers = MosaicBuffers {
+        fwd: std::mem::replace(&mut workspace.fwd, aligned_vec::AVec::new(32)),
+        fwd_prior: std::mem::replace(&mut workspace.fwd_prior, aligned_vec::AVec::new(32)),
+        ref_alleles: std::mem::take(&mut workspace.ref_alleles),
+        hap1_checkpoints: FwdCheckpoints::from_buffer(
+            n_markers,
+            n_states,
+            MOSAIC_BLOCK_SIZE,
+            std::mem::take(&mut workspace.hap1_checkpoint_data),
+        ),
+        hap2_checkpoints: FwdCheckpoints::from_buffer(
+            n_markers,
+            n_states,
+            MOSAIC_BLOCK_SIZE,
+            std::mem::take(&mut workspace.hap2_checkpoint_data),
+        ),
+        hap1_allele: std::mem::take(&mut workspace.hap1_allele),
+        hap1_use_combined: std::mem::take(&mut workspace.hap1_use_combined),
+        hap2_allele: std::mem::take(&mut workspace.hap2_allele),
+        hap2_use_combined: std::mem::take(&mut workspace.hap2_use_combined),
+        path1: std::mem::take(&mut workspace.path1),
+        path2: std::mem::take(&mut workspace.path2),
+        fwd_block: std::mem::take(&mut workspace.fwd_block),
+    };
+
+    let mut chain = MosaicChain::new_with_buffers(
         chain_seed,
         n_markers,
         n_states,
@@ -3720,7 +3824,8 @@ fn sample_swap_bits_mosaic(
         seq2,
         conf,
         lookup,
-        Arc::clone(&combined_checkpoints),
+        combined_checkpoints_ref,
+        buffers,
         p_no_err,
         p_err,
     );
@@ -3781,6 +3886,22 @@ fn sample_swap_bits_mosaic(
         let lr = compute_phase_lr(a1, a2, ref1, ref2, conf[m], p_no_err, p_err);
         swap_lr.push(lr);
     }
+
+    // Return buffers to workspace for reuse
+    let returned = chain.into_buffers();
+    workspace.fwd = returned.fwd;
+    workspace.fwd_prior = returned.fwd_prior;
+    workspace.ref_alleles = returned.ref_alleles;
+    workspace.hap1_checkpoint_data = returned.hap1_checkpoints.into_buffer();
+    workspace.hap2_checkpoint_data = returned.hap2_checkpoints.into_buffer();
+    workspace.hap1_allele = returned.hap1_allele;
+    workspace.hap1_use_combined = returned.hap1_use_combined;
+    workspace.hap2_allele = returned.hap2_allele;
+    workspace.hap2_use_combined = returned.hap2_use_combined;
+    workspace.path1 = returned.path1;
+    workspace.path2 = returned.path2;
+    workspace.fwd_block = returned.fwd_block;
+    workspace.combined_checkpoint_data = combined_checkpoints.into_buffer();
 
     (swap_bits, swap_lr)
 }

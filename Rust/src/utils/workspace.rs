@@ -107,6 +107,26 @@ pub struct ThreadWorkspace {
     pub bwd: AVec<f32, ConstAlign<32>>,
     /// Pre-computed alleles: alleles[m * n_states + k] = allele for state k at marker m
     pub lookup: AVec<u8, ConstAlign<32>>,
+    /// Forward prior buffer (same length as fwd)
+    pub fwd_prior: AVec<f32, ConstAlign<32>>,
+    /// Per-marker ref alleles buffer (n_states)
+    pub ref_alleles: Vec<u8>,
+    /// MCMC path buffers
+    pub path1: Vec<u32>,
+    pub path2: Vec<u32>,
+    /// Per-marker haplotype alleles and flags
+    pub hap1_allele: Vec<u8>,
+    pub hap2_allele: Vec<u8>,
+    pub hap1_use_combined: Vec<bool>,
+    pub hap2_use_combined: Vec<bool>,
+    /// Forward block buffer for checkpoint recompute
+    pub fwd_block: Vec<f32>,
+    /// Checkpoint storage buffers (reused between samples)
+    pub combined_checkpoint_data: Vec<f32>,
+    pub hap1_checkpoint_data: Vec<f32>,
+    pub hap2_checkpoint_data: Vec<f32>,
+    /// Cached marker count
+    n_markers: usize,
     /// Number of states (cached for convenience)
     n_states: usize,
 }
@@ -125,6 +145,19 @@ impl ThreadWorkspace {
             fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
             bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
             lookup: AVec::from_iter(32, std::iter::repeat(0).take(size)),
+            fwd_prior: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
+            ref_alleles: Vec::new(),
+            path1: Vec::new(),
+            path2: Vec::new(),
+            hap1_allele: Vec::new(),
+            hap2_allele: Vec::new(),
+            hap1_use_combined: Vec::new(),
+            hap2_use_combined: Vec::new(),
+            fwd_block: Vec::new(),
+            combined_checkpoint_data: Vec::new(),
+            hap1_checkpoint_data: Vec::new(),
+            hap2_checkpoint_data: Vec::new(),
+            n_markers: 0,
             n_states,
         }
     }
@@ -142,7 +175,44 @@ impl ThreadWorkspace {
             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
             self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
             self.lookup = AVec::from_iter(32, std::iter::repeat(0).take(new_size));
+            self.fwd_prior = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
             self.n_states = n_states;
+        }
+    }
+
+    /// Ensure buffers are sized for the current window and state count.
+    pub fn ensure_for_window(&mut self, n_markers: usize, n_states: usize, block_size: usize) {
+        self.resize_for_states(n_states);
+        self.n_markers = n_markers;
+
+        if self.ref_alleles.len() < n_states {
+            self.ref_alleles.resize(n_states, 0);
+        }
+
+        if self.path1.len() < n_markers {
+            self.path1.resize(n_markers, 0);
+            self.path2.resize(n_markers, 0);
+            self.hap1_allele.resize(n_markers, 255);
+            self.hap2_allele.resize(n_markers, 255);
+            self.hap1_use_combined.resize(n_markers, true);
+            self.hap2_use_combined.resize(n_markers, true);
+        }
+
+        let block_len = n_states * block_size;
+        if self.fwd_block.len() < block_len {
+            self.fwd_block.resize(block_len, 0.0);
+        }
+
+        let n_blocks = (n_markers + block_size - 1) / block_size;
+        let checkpoints_len = n_blocks * n_states;
+        if self.combined_checkpoint_data.len() < checkpoints_len {
+            self.combined_checkpoint_data.resize(checkpoints_len, 0.0);
+        }
+        if self.hap1_checkpoint_data.len() < checkpoints_len {
+            self.hap1_checkpoint_data.resize(checkpoints_len, 0.0);
+        }
+        if self.hap2_checkpoint_data.len() < checkpoints_len {
+            self.hap2_checkpoint_data.resize(checkpoints_len, 0.0);
         }
     }
 
