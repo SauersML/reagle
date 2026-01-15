@@ -1,7 +1,7 @@
 use grep::regex::RegexMatcher;
 use grep::searcher::{Searcher, Sink, SinkMatch};
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
@@ -1643,6 +1643,15 @@ fn main() {
     emit_stage_detail(&meaningless_cond_report);
     all_violations.extend(meaningless_cond_violations);
 
+    // Scan for fake usage patterns (dummy checks masking unused variables)
+    update_stage("scan fake usage patterns");
+    let fake_usage_violations = scan_for_fake_usage();
+    let fake_usage_report = format!(
+        "fake usage scan identified {} violation groups",
+        fake_usage_violations.len()
+    );
+    emit_stage_detail(&fake_usage_report);
+    all_violations.extend(fake_usage_violations);
     // Scan for #[allow(clippy::no_effect)] attributes
     update_stage("scan #[allow(clippy::no_effect)] attributes");
     let no_effect_violations = scan_for_no_effect_allow();
@@ -3372,4 +3381,140 @@ fn is_in_target_directory(path: impl AsRef<Path>) -> bool {
 
 fn is_in_ignored_directory(path: impl AsRef<Path>) -> bool {
     is_in_target_directory(path.as_ref()) || is_in_hidden_directory(path.as_ref())
+}
+
+fn scan_for_fake_usage() -> Vec<String> {
+    // Check for "if var.len() ... { return; }" pattern where var is otherwise unused
+    let pattern = r"if\s+(!?\s*[a-zA-Z_]\w*)\.(?:len|is_empty)\(\)\s*(?:[!=<>]+[^\{]+)?\{\s*return\s*;?\s*\}";
+    let matcher = match RegexMatcher::new_line_matcher(pattern) {
+        Ok(m) => m,
+        Err(e) => return vec![format!("Error creating fake usage regex: {}", e)],
+    };
+
+    let mut all_violations = Vec::new();
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !is_in_ignored_directory(e.path()))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Sanitize to avoid matching in comments/strings, and for accurate counting
+        let sanitized_bytes = strip_comments_and_strings_for_content(&content);
+        let sanitized = String::from_utf8_lossy(&sanitized_bytes);
+
+        let mut collector = FakeUsageCandidateCollector::new();
+        if Searcher::new()
+            .search_reader(
+                &matcher,
+                Cursor::new(&sanitized_bytes),
+                &mut collector,
+            )
+            .is_err()
+        {
+            continue;
+        }
+
+        for (var_raw, line_num, line_text) in collector.candidates {
+            // Clean up var name (remove !, whitespace)
+            let var = var_raw.trim_start_matches('!').trim();
+
+            // Count occurrences in the WHOLE file (sanitized)
+            // We use word boundary check
+            let count = count_variable_occurrences(&sanitized, var);
+
+            // If count is low (<= 2), it means it's likely only used in signature/let and this check
+            // We use a threshold of 2: One for definition/signature, one for the check itself.
+            // If it's used anywhere else, count would be >= 3.
+            if count <= 2 {
+                let file_name = path.to_str().unwrap_or("?");
+                let mut msg = format!(
+                    "\n❌ ERROR: Found fake usage of variable '{}' in {}:{}:\n",
+                    var, file_name, line_num
+                );
+                msg.push_str(&format!("   {}\n", line_text));
+                msg.push_str("\n⚠️ This looks like a dummy check to mask an unused variable.\n");
+                msg.push_str("   \"No-Op Variable Access\": The variable is checked but never referenced again.\n");
+                msg.push_str("   Remove the variable (or rename to _) and the check.\n");
+                all_violations.push(msg);
+            }
+        }
+    }
+    all_violations
+}
+
+struct FakeUsageCandidateCollector {
+    candidates: Vec<(String, u64, String)>, // var_raw, line_num, line_text
+}
+
+impl FakeUsageCandidateCollector {
+    fn new() -> Self {
+        Self {
+            candidates: Vec::new(),
+        }
+    }
+}
+
+impl Sink for FakeUsageCandidateCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim();
+
+        // Extract variable name manually since we can't get capture groups easily
+        // Pattern: if (!? var) . (len|is_empty)
+        if let Some(if_idx) = line_text.find("if") {
+            let after_if = &line_text[if_idx + 2..];
+            if let Some(dot_idx) = after_if.find('.') {
+                let var_part = &after_if[..dot_idx];
+                self.candidates.push((
+                    var_part.trim().to_string(),
+                    line_number,
+                    line_text.to_string(),
+                ));
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+fn count_variable_occurrences(text: &str, var: &str) -> usize {
+    let mut count = 0;
+    for (idx, _) in text.match_indices(var) {
+        if is_word_boundary(text, idx, var.len()) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn is_word_boundary(text: &str, idx: usize, len: usize) -> bool {
+    let before = if idx == 0 {
+        None
+    } else {
+        text[..idx].chars().last()
+    };
+    let after = text[idx + len..].chars().next();
+
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+
+    if let Some(c) = before {
+        if is_word_char(c) {
+            return false;
+        }
+    }
+    if let Some(c) = after {
+        if is_word_char(c) {
+            return false;
+        }
+    }
+    true
 }
