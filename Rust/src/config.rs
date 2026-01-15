@@ -5,6 +5,7 @@
 
 use clap::Parser;
 use std::path::PathBuf;
+use tracing::info_span;
 
 use crate::error::{ReagleError, Result};
 
@@ -183,20 +184,17 @@ impl Default for Config {
             seed: -99999,
             nthreads: None,
             profile: false,
-            }
         }
-
-        Ok(exclude_set)
-        })
     }
+}
 
 impl Config {
     /// Parse command line arguments and validate
     pub fn parse_and_validate() -> Result<Self> {
         info_span!("config_parse_and_validate").in_scope(|| {
-        let config = Self::parse();
-        config.validate()?;
-        Ok(config)
+            let config = Self::parse();
+            config.validate()?;
+            Ok(config)
         })
     }
 
@@ -210,19 +208,20 @@ impl Config {
 
             let mut exclude_set = std::collections::HashSet::new();
 
-        if let Some(ref path) = self.excludesamples {
-            let file = File::open(path)?;
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let line = line?;
-                let id = line.trim();
-                if !id.is_empty() && !id.starts_with('#') {
-                    exclude_set.insert(id.to_string());
+            if let Some(ref path) = self.excludesamples {
+                let file = File::open(path)?;
+                let reader = BufReader::new(file);
+                for line in reader.lines() {
+                    let line = line?;
+                    let id = line.trim();
+                    if !id.is_empty() && !id.starts_with('#') {
+                        exclude_set.insert(id.to_string());
+                    }
                 }
             }
-        }
 
-        Ok(exclude_set)
+            Ok(exclude_set)
+        })
     }
 
     /// Load marker IDs to exclude from the exclusion file
@@ -235,19 +234,20 @@ impl Config {
 
             let mut exclude_set = std::collections::HashSet::new();
 
-        if let Some(ref path) = self.excludemarkers {
-            let file = File::open(path)?;
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let line = line?;
-                let id = line.trim();
-                if !id.is_empty() && !id.starts_with('#') {
-                    exclude_set.insert(id.to_string());
+            if let Some(ref path) = self.excludemarkers {
+                let file = File::open(path)?;
+                let reader = BufReader::new(file);
+                for line in reader.lines() {
+                    let line = line?;
+                    let id = line.trim();
+                    if !id.is_empty() && !id.starts_with('#') {
+                        exclude_set.insert(id.to_string());
+                    }
                 }
             }
-        }
 
-        Ok(exclude_set)
+            Ok(exclude_set)
+        })
     }
 
     /// Validate configuration parameters

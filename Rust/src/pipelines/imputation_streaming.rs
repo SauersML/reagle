@@ -107,7 +107,7 @@ impl crate::pipelines::ImputationPipeline {
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
 
         // Channel for streaming data
-        let (tx, rx) = mpsc::sync_channel::<StreamingPayload>(2);
+        let (tx, rx) = mpsc::sync_channel::<StreamingPayload>(8);
 
         // Clone config/params for producer
         let producer_config = self.config.clone();

@@ -230,6 +230,17 @@ impl MutableGenotypes {
         self.set(marker, hap2, v1);
     }
 
+    /// Swap alleles between two haplotypes for markers indicated by mask
+    ///
+    /// Efficiently swaps alleles where the mask bit is set.
+    pub fn swap_haplotypes(&mut self, hap1: HapIdx, hap2: HapIdx, mask: &BitSlice<u8, Lsb0>) {
+        assert_eq!(mask.len(), self.n_markers, "Swap mask length mismatch");
+        
+        for m in mask.iter_ones() {
+            self.swap(m, hap1, hap2);
+        }
+    }
+
 }
 
 // Test-only diagnostic methods
