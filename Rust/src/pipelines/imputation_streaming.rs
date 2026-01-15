@@ -6,7 +6,6 @@
 
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::thread::LocalKey;
 
 use rayon::prelude::*;
 use tracing::instrument;
@@ -58,7 +57,7 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         // Open streaming target reader
-        let mut target_reader = StreamingVcfReader::open(
+        let target_reader = StreamingVcfReader::open(
             &self.config.gt,
             gen_maps.clone(),
             streaming_config.clone(),
@@ -113,7 +112,7 @@ impl crate::pipelines::ImputationPipeline {
 
         // Spawn Producer (Phasing)
         let producer_handle = thread::spawn(move || -> Result<()> {
-            let mut pipeline = crate::pipelines::ImputationPipeline {
+            let pipeline = crate::pipelines::ImputationPipeline {
                 config: producer_config,
                 params: producer_params,
             };
@@ -142,7 +141,7 @@ impl crate::pipelines::ImputationPipeline {
 
             eprintln!("Phase 1: Streaming phasing of target data...");
             
-            while let Some(mut target_window) = target_reader.next_window()? {
+            while let Some(target_window) = target_reader.next_window()? {
                 window_count += 1;
                 let n_markers = target_window.genotypes.n_markers();
 
@@ -215,12 +214,6 @@ impl crate::pipelines::ImputationPipeline {
         // Consumer (Imputation)
         eprintln!("Phase 2: Streaming imputation...");
         
-        // Thread-local workspace for parallel HMM
-        thread_local! {
-            static IMP_WORKSPACE: std::cell::RefCell<Option<ImpWorkspace>> =
-                std::cell::RefCell::new(None);
-        }
-
         let mut imp_overlap: Option<PhasedOverlap> = None;
         let mut total_markers = 0;
 
@@ -264,7 +257,6 @@ impl crate::pipelines::ImputationPipeline {
                 &mut writer,
                 output_start,
                 output_end,
-                &IMP_WORKSPACE,
             )?;
 
             total_markers += output_end - output_start;
@@ -272,7 +264,6 @@ impl crate::pipelines::ImputationPipeline {
             imp_overlap = Some(self.extract_imputed_overlap_streaming(
                 &phased_target,
                 &ref_window,
-                &alignment,
                 output_end,
             ));
         }
@@ -355,12 +346,16 @@ impl crate::pipelines::ImputationPipeline {
         final_writer: &mut VcfWriter,
         output_start: usize,
         output_end: usize,
-        workspace: &LocalKey<std::cell::RefCell<Option<ImpWorkspace>>>,
     ) -> Result<()> {
+        // Thread-local workspace - must be defined inside the parallel context
+        thread_local! {
+            static LOCAL_WORKSPACE: std::cell::RefCell<Option<ImpWorkspace>> =
+                std::cell::RefCell::new(None);
+        }
+
         let n_ref_markers = ref_win.n_markers();
         let n_target_samples = target_win.n_samples();
         let n_ref_haps = ref_win.n_haplotypes();
-        let n_target_haps = target_win.n_haplotypes();
 
         let markers_to_process = if let Some(overlap) = imp_overlap {
             let start = overlap.n_markers;
@@ -466,13 +461,13 @@ impl crate::pipelines::ImputationPipeline {
                     let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
                     let cluster_weights = Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
 
-                    let (dosages, best_gt, dr2_data) = workspace.with(|ws| {
-                        let mut workspace = ws.borrow_mut();
-                        if workspace.is_none() { *workspace = Some(ImpWorkspace::new(n_ref_haps)); }
-                        let ws = workspace.as_mut().unwrap();
+                    let (dosages, best_gt) = LOCAL_WORKSPACE.with(|cell| {
+                        let mut ws_opt = cell.borrow_mut();
+                        if ws_opt.is_none() { *ws_opt = Some(ImpWorkspace::new(n_ref_haps)); }
+                        let ws = ws_opt.as_mut().unwrap();
                         ws.clear();
 
-                        let mut hap_results: Vec<(Vec<f32>, Vec<(u8, u8)>, Vec<CompactDr2Entry>)> = Vec::new();
+                        let mut hap_results: Vec<(Vec<f32>, Vec<(u8, u8)>)> = Vec::new();
 
                         for (local_h, &global_h) in target_haps.iter().enumerate() {
                             let mut imp_states = ImpStatesCluster::new(&imp_ibs, n_clusters, n_ref_haps, self.params.n_states);
@@ -493,37 +488,18 @@ impl crate::pipelines::ImputationPipeline {
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
 
-                            let mut dr2_vec = Vec::new();
-                            for &ref_m in sample_genotyped.iter() {
-                                if ref_m >= markers_to_process.start && ref_m < markers_to_process.end {
-                                    let p = state_probs.allele_posteriors(ref_m, 2, &|_, h| ref_win.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32)));
-                                    dr2_vec.push(CompactDr2Entry::Biallelic {
-                                        marker: ref_m as u32,
-                                        p1: p.prob(1), p2: 0.0, skip: false, true_gt: Some((p.max_allele(), 0))
-                                    });
-                                }
-                            }
-                            hap_results.push((hap_dosages, hap_best_gt, dr2_vec));
+                            hap_results.push((hap_dosages, hap_best_gt));
                         }
-                        
+
                         let mut combined_dosages = Vec::new();
                         let mut combined_best_gt = Vec::new();
-                        let mut combined_dr2 = Vec::new();
-                        
+
                         for m in 0..markers_to_process.len() {
                             combined_dosages.push(hap_results[0].0[m] + hap_results[1].0[m]);
                             combined_best_gt.push((hap_results[0].1[m].0, hap_results[1].1[m].0));
                         }
-                        for i in 0..hap_results[0].2.len() {
-                             if let (CompactDr2Entry::Biallelic { marker, p1, .. }, CompactDr2Entry::Biallelic { p1: p2, .. }) 
-                                = (&hap_results[0].2[i], &hap_results[1].2[i]) {
-                                 combined_dr2.push(CompactDr2Entry::Biallelic {
-                                     marker: *marker, p1: *p1, p2: *p2, skip: false, true_gt: None
-                                 });
-                             }
-                        }
 
-                        (combined_dosages, combined_best_gt, combined_dr2)
+                        (combined_dosages, combined_best_gt)
                     });
                     (s, dosages, best_gt)
                 }).collect();
@@ -545,7 +521,6 @@ impl crate::pipelines::ImputationPipeline {
         &self,
         target_win: &GenotypeMatrix<Phased>,
         ref_win: &GenotypeMatrix<Phased>,
-        alignment: &MarkerAlignment,
         output_end: usize,
     ) -> PhasedOverlap {
         let overlap_size = 1000.min(ref_win.n_markers());
@@ -559,5 +534,59 @@ impl crate::pipelines::ImputationPipeline {
             }
         }
         PhasedOverlap::new(overlap_size, n_haps, alleles)
+    }
+
+    /// Write imputed window results to VCF
+    fn write_imputed_window_streaming(
+        &self,
+        ref_win: &GenotypeMatrix<Phased>,
+        writer: &mut VcfWriter,
+        quality: &ImputationQuality,
+        output_start: usize,
+        output_end: usize,
+        all_results: &[(usize, Vec<f32>, Vec<(u8, u8)>)],
+    ) -> Result<()> {
+        let markers_range = output_start..output_end;
+        let n_markers = markers_range.len();
+
+        if n_markers == 0 || all_results.is_empty() {
+            return Ok(());
+        }
+
+        // Build lookup maps for sample -> (dosages, best_gt)
+        let sample_data: std::collections::HashMap<usize, (&Vec<f32>, &Vec<(u8, u8)>)> =
+            all_results.iter().map(|(s, d, g)| (*s, (d, g))).collect();
+
+        // Closure to get dosage: marker_idx is global ref marker index
+        let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            let local_m = marker_idx.saturating_sub(output_start);
+            if let Some((dosages, _)) = sample_data.get(&sample_idx) {
+                dosages.get(local_m).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        };
+
+        // Closure to get best genotype
+        let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            let local_m = marker_idx.saturating_sub(output_start);
+            if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
+                best_gt.get(local_m).copied().unwrap_or((0, 0))
+            } else {
+                (0, 0)
+            }
+        };
+
+        writer.write_imputed_streaming(
+            ref_win,
+            get_dosage,
+            get_best_gt,
+            None::<fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors)>,
+            quality,
+            output_start,
+            output_end,
+            false, // include_gp
+            false, // include_ap
+        )
     }
 }

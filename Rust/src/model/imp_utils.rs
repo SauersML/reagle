@@ -508,8 +508,10 @@ pub fn run_hmm_forward_backward_to_sparse(
             let base_emit = cluster_base_scores[local_m].exp();
 
             let next_off = curr_off + n_states;
-            let prev_slice = &block_fwd[curr_off..curr_off + n_states];
-            let curr_slice = &mut block_fwd[next_off..next_off + n_states];
+            // Use split_at_mut to satisfy the borrow checker for non-overlapping slices
+            let (before, after) = block_fwd.split_at_mut(next_off);
+            let prev_slice = &before[curr_off..curr_off + n_states];
+            let curr_slice = &mut after[0..n_states];
 
             let shift_vec = f32x8::splat(shift);
             let scale_vec = f32x8::splat(scale);

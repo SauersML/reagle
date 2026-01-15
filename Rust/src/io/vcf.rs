@@ -1218,6 +1218,11 @@ impl VcfWriter {
                 self.field_count = 0;
             }
 
+            /// Add a tab separator (between samples)
+            fn add_tab(&mut self) {
+                self.buf.push('\t');
+            }
+
             /// Add a field separator (:)
             fn field_sep(&mut self) {
                 if self.field_count > 0 {
@@ -1319,9 +1324,8 @@ impl VcfWriter {
             }
         }
 
-        let mut format_buf = VcfFormatBuffer::new(&mut line_buf, &mut ryu_buf);
-
-
+        // Use separate ryu buffer for INFO field to avoid borrow conflicts
+        let mut info_ryu_buf = ryu::Buffer::new();
 
         for m in start..end {
             line_buf.clear();
@@ -1329,19 +1333,19 @@ impl VcfWriter {
             let marker = matrix.marker(marker_idx);
             let n_alleles = 1 + marker.alt_alleles.len();
 
-            // Build INFO field
+            // Build INFO field using separate ryu buffer
             let info_field = if let Some(stats) = quality.get(m) {
                 let mut info_str = String::with_capacity(64);
                 if n_alleles > 1 {
                     info_str.push_str("DR2=");
                     for a in 1..n_alleles {
                         if a > 1 { info_str.push(','); }
-                        info_str.push_str(format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf));
+                        info_str.push_str(format_f32_4dp(stats.dr2(a) as f32, &mut info_ryu_buf));
                     }
                     info_str.push_str(";AF=");
                     for a in 1..n_alleles {
                         if a > 1 { info_str.push(','); }
-                        info_str.push_str(format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf));
+                        info_str.push_str(format_f32_4dp(stats.allele_freq(a) as f32, &mut info_ryu_buf));
                     }
                 }
                 if stats.is_imputed {
@@ -1360,26 +1364,31 @@ impl VcfWriter {
                 marker.alt_alleles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","),
                 info_field, format_str).unwrap();
 
-            for s in 0..n_samples {
-                let ds = get_dosage(m, s);
-                let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
-                let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
-                    (p1.max_allele(), p2.max_allele())
-                } else { get_best_gt(m, s) };
+            // Write sample fields using format buffer
+            {
+                let mut format_buf = VcfFormatBuffer::new(&mut line_buf, &mut ryu_buf);
 
-                line_buf.push('\t');
-                format_buf.start_sample();
-                format_buf.add_gt(a1, a2);
-                format_buf.add_ds(ds);
+                for s in 0..n_samples {
+                    let ds = get_dosage(m, s);
+                    let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
+                    let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
+                        (p1.max_allele(), p2.max_allele())
+                    } else { get_best_gt(m, s) };
 
-                if include_gp {
-                    format_buf.add_gp(n_alleles, posteriors.as_ref().map(|(p1, _)| p1), posteriors.as_ref().map(|(_, p2)| p2));
+                    format_buf.add_tab();
+                    format_buf.start_sample();
+                    format_buf.add_gt(a1, a2);
+                    format_buf.add_ds(ds);
+
+                    if include_gp {
+                        format_buf.add_gp(n_alleles, posteriors.as_ref().map(|(p1, _)| p1), posteriors.as_ref().map(|(_, p2)| p2));
+                    }
+
+                    if include_ap {
+                        format_buf.add_ap(n_alleles, posteriors.as_ref().map(|(p1, _)| p1), posteriors.as_ref().map(|(_, p2)| p2));
+                    }
                 }
-
-                if include_ap {
-                    format_buf.add_ap(n_alleles, posteriors.as_ref().map(|(p1, _)| p1), posteriors.as_ref().map(|(_, p2)| p2));
-                }
-            }
+            } // format_buf dropped here, releasing borrows
 
             line_buf.push('\n');
             self.writer.write_all(line_buf.as_bytes())?;

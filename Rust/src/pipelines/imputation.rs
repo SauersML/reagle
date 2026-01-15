@@ -419,26 +419,12 @@ impl StateProbs {
 
                 let hap = haps[j];
                 let allele = get_ref_allele(ref_marker, hap);
+                // Use the same haplotype for both left and right contributions
+                // (matches Java Beagle: interpolate probabilities, not haplotype selection)
                 if allele == 1 {
-                    p_alt += weight_left * prob;
+                    p_alt += weight_left * prob + (1.0 - weight_left) * prob_p1;
                 } else if allele == 0 {
-                    p_ref += weight_left * prob;
-                }
-
-                if let Some(haps_p1) = haps_p1 {
-                    let hap_p1 = haps_p1.get(j).copied().unwrap_or(hap);
-                    let allele_p1 = get_ref_allele(ref_marker, hap_p1);
-                    if allele_p1 == 1 {
-                        p_alt += (1.0 - weight_left) * prob_p1;
-                    } else if allele_p1 == 0 {
-                        p_ref += (1.0 - weight_left) * prob_p1;
-                    }
-                } else {
-                     if allele == 1 {
-                        p_alt += (1.0 - weight_left) * prob_p1;
-                    } else if allele == 0 {
-                        p_ref += (1.0 - weight_left) * prob_p1;
-                    }
+                    p_ref += weight_left * prob + (1.0 - weight_left) * prob_p1;
                 }
             }
             let total = p_ref + p_alt;
@@ -458,18 +444,10 @@ impl StateProbs {
 
                 let hap = haps[j];
                 let allele = get_ref_allele(ref_marker, hap);
+                // Use the same haplotype for both left and right contributions
+                // (matches Java Beagle: interpolate probabilities, not haplotype selection)
                 if allele != 255 && (allele as usize) < n_alleles {
-                    al_probs[allele as usize] += weight_left * prob;
-                }
-
-                if let Some(haps_p1) = haps_p1 {
-                    let hap_p1 = haps_p1.get(j).copied().unwrap_or(hap);
-                    let allele_p1 = get_ref_allele(ref_marker, hap_p1);
-                    if allele_p1 != 255 && (allele_p1 as usize) < n_alleles {
-                        al_probs[allele_p1 as usize] += (1.0 - weight_left) * prob_p1;
-                    }
-                } else if allele != 255 && (allele as usize) < n_alleles {
-                    al_probs[allele as usize] += (1.0 - weight_left) * prob_p1;
+                    al_probs[allele as usize] += weight_left * prob + (1.0 - weight_left) * prob_p1;
                 }
             }
 
@@ -784,7 +762,7 @@ impl ImputationPipeline {
 
     /// Run imputation loading all data into memory (original implementation)
     fn run_in_memory(&mut self) -> Result<()> {
-        let (mut target_reader, target_gt, target_samples) = info_span!("load_target_data").in_scope(|| {
+        let (target_reader, target_gt, target_samples) = info_span!("load_target_data").in_scope(|| {
             info_span!("load_target").in_scope(|| {
                 eprintln!("Loading target VCF...");
 
@@ -1205,7 +1183,6 @@ impl ImputationPipeline {
                                 probs2[a] = 0.0;
                             }
 
-                            let mut skip_sample = false;
                             let mut use_observed_a1 = false;
                             let mut use_observed_a2 = false;
                             let mut observed_a1: u8 = 255;
@@ -1224,7 +1201,6 @@ impl ImputationPipeline {
                                         use_observed_a1 = true;
                                         observed_a1 = a1_mapped;
                                     } else {
-                                        skip_sample = true;
                                         let post1 = sp1.allele_posteriors(m, n_alleles, &get_ref_allele);
                                         for a in 0..n_alleles { probs1[a] = post1.prob(a); }
                                     }
@@ -1234,7 +1210,6 @@ impl ImputationPipeline {
                                         use_observed_a2 = true;
                                         observed_a2 = a2_mapped;
                                     } else {
-                                        skip_sample = true;
                                         let post2 = sp2.allele_posteriors(m, n_alleles, &get_ref_allele);
                                         for a in 0..n_alleles { probs2[a] = post2.prob(a); }
                                     }
@@ -1476,7 +1451,7 @@ impl ImputationPipeline {
         // Currently falling back to standard loading.
         // Tricky because we need to read the whole file to get markers
         if path.extension().map(|e| e == "bref3").unwrap_or(false) {
-            let mut bref_reader = crate::io::bref3::Bref3Reader::open(path)?;
+            let bref_reader = crate::io::bref3::Bref3Reader::open(path)?;
             Ok(bref_reader.read_all()?)
         } else {
             let (mut reader, file) = VcfReader::open(path)?;
@@ -1488,6 +1463,7 @@ impl ImputationPipeline {
 // ... existing tests ...
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     // Tests for imputation pipeline
