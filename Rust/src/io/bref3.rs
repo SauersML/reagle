@@ -882,6 +882,8 @@ pub enum RefPanelReader {
     Bref3(WindowedBref3Reader),
     /// In-memory VCF reader
     InMemory(InMemoryRefReader),
+    /// Streaming VCF reader
+    StreamingVcf(StreamingRefVcfReader),
 }
 
 impl RefPanelReader {
@@ -890,6 +892,7 @@ impl RefPanelReader {
         match self {
             RefPanelReader::Bref3(r) => r.samples(),
             RefPanelReader::InMemory(r) => r.samples(),
+            RefPanelReader::StreamingVcf(r) => r.samples(),
         }
     }
 
@@ -898,6 +901,7 @@ impl RefPanelReader {
         match self {
             RefPanelReader::Bref3(r) => r.inner.samples_arc(),
             RefPanelReader::InMemory(r) => r.samples_arc(),
+            RefPanelReader::StreamingVcf(r) => r.samples_arc(),
         }
     }
 
@@ -906,6 +910,7 @@ impl RefPanelReader {
         match self {
             RefPanelReader::Bref3(r) => r.n_haps(),
             RefPanelReader::InMemory(r) => r.n_haps(),
+            RefPanelReader::StreamingVcf(r) => r.n_haps(),
         }
     }
 
@@ -914,6 +919,7 @@ impl RefPanelReader {
         match self {
             RefPanelReader::Bref3(r) => r.load_window_for_region(start_pos, end_pos),
             RefPanelReader::InMemory(r) => r.load_window_for_region(start_pos, end_pos),
+            RefPanelReader::StreamingVcf(r) => r.load_window_for_region(start_pos, end_pos),
         }
     }
 }
@@ -987,12 +993,12 @@ impl InMemoryRefReader {
 
         // Add chromosome
         let first_marker = self.genotypes.marker(MarkerIdx::new(start_idx as u32));
-        let chrom_name = self.genotypes.markers().chrom_name(first_marker.chrom);
+        let chrom_name = self.genotypes.markers().chrom_name(first_marker.chrom).expect("Invalid chromosome");
         markers.add_chrom(chrom_name);
 
         for m in start_idx..end_idx {
             markers.push(self.genotypes.marker(MarkerIdx::new(m as u32)).clone());
-            columns.push(self.genotypes.column(m).clone());
+            columns.push(self.genotypes.column(MarkerIdx::new(m as u32)).clone());
         }
 
         let n_window_markers = end_idx - start_idx;
@@ -1010,6 +1016,211 @@ impl InMemoryRefReader {
             is_first,
             is_last: false, // Can't know without looking ahead
         }))
+    }
+}
+
+/// A marker buffered for streaming VCF reading
+struct RefPanelMarker {
+    marker: Marker,
+    column: GenotypeColumn,
+}
+
+/// Streaming VCF reader for reference panels
+pub struct StreamingRefVcfReader {
+    reader: Box<dyn BufRead + Send>,
+    samples: Arc<Samples>,
+    markers: Markers,
+    buffer: VecDeque<RefPanelMarker>,
+    line_buf: String,
+    eof: bool,
+}
+
+impl StreamingRefVcfReader {
+    /// Open a VCF file for streaming
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let is_gzipped = path.extension().map(|e| e == "gz" || e == "bgz").unwrap_or(false);
+        let reader: Box<dyn BufRead + Send> = if is_gzipped {
+            Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+        } else {
+            Box::new(BufReader::new(file))
+        };
+        Self::from_reader(reader)
+    }
+
+    /// Create from a reader
+    pub fn from_reader(mut reader: Box<dyn BufRead + Send>) -> Result<Self> {
+        // Read header
+        let mut header_str = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 { break; }
+            if line.starts_with('#') {
+                header_str.push_str(&line);
+                if line.starts_with("#CHROM") { break; }
+            } else { break; }
+        }
+
+        // Parse samples
+        let sample_names: Vec<String> = if let Some(header_line) = header_str.lines().last() {
+             header_line.split('\t').skip(9).map(|s| s.to_string()).collect()
+        } else { Vec::new() };
+        let samples = Arc::new(Samples::from_ids(sample_names));
+
+        Ok(Self {
+            reader,
+            samples,
+            markers: Markers::new(),
+            buffer: VecDeque::new(),
+            line_buf: String::new(),
+            eof: false,
+        })
+    }
+
+    pub fn samples(&self) -> &Samples { &self.samples }
+    pub fn samples_arc(&self) -> Arc<Samples> { Arc::clone(&self.samples) }
+    pub fn n_haps(&self) -> usize { self.samples.len() * 2 }
+
+    /// Load reference window for a specific genomic region
+    pub fn load_window_for_region(&mut self, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+        const BUFFER_MARKERS: usize = 500;
+        let buffer_size = BUFFER_MARKERS.min((end_pos - start_pos) as usize / 2);
+        let buffered_start = start_pos.saturating_sub(buffer_size as u32);
+        let buffered_end = end_pos + buffer_size as u32;
+
+        // Discard markers before buffered_start
+        while let Some(front) = self.buffer.front() {
+             if front.marker.pos < buffered_start {
+                 self.buffer.pop_front();
+             } else {
+                 break;
+             }
+        }
+
+        // Read until we cover buffered_end
+        while !self.eof {
+            let need_more = self.buffer.is_empty()
+                 || self.buffer.back().map(|m| m.marker.pos < buffered_end).unwrap_or(true);
+            if !need_more { break; }
+            if let Some(marker) = self.read_next_marker()? {
+                self.buffer.push_back(marker);
+            }
+        }
+
+        if self.buffer.is_empty() { return Ok(None); }
+
+        let mut markers = Markers::new();
+        let mut columns = Vec::new();
+        let mut found_any = false;
+
+        for bm in &self.buffer {
+            if bm.marker.pos >= buffered_start && bm.marker.pos <= buffered_end {
+                 let chrom_name = self.markers.chrom_name(bm.marker.chrom).expect("Invalid chromosome");
+                 let window_chrom_idx = markers.add_chrom(chrom_name);
+
+                 let mut m = bm.marker.clone();
+                 m.chrom = window_chrom_idx;
+                 markers.push(m);
+                 columns.push(bm.column.clone());
+                 found_any = true;
+            }
+        }
+
+        if !found_any { return Ok(None); }
+
+        let n_markers = markers.len();
+        let genotypes = GenotypeMatrix::new_phased(markers, columns, self.samples_arc());
+
+        Ok(Some(RefWindow {
+            genotypes,
+            global_start: 0,
+            global_end: n_markers,
+            output_start: 0,
+            output_end: n_markers,
+            is_first: false,
+            is_last: self.eof && self.buffer.is_empty(),
+        }))
+    }
+
+    fn read_next_marker(&mut self) -> Result<Option<RefPanelMarker>> {
+        loop {
+            self.line_buf.clear();
+            if self.reader.read_line(&mut self.line_buf)? == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
+            let line = self.line_buf.trim().to_string();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            return self.parse_vcf_line(&line).map(Some);
+        }
+    }
+
+    fn parse_vcf_line(&mut self, line: &str) -> Result<RefPanelMarker> {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 10 {
+             bail!("VCF line has too few fields");
+        }
+
+        // Parse CHROM
+        let chrom_name = fields[0];
+        let chrom_idx = self.markers.add_chrom(chrom_name);
+
+        // Parse POS
+        let pos: u32 = fields[1].parse().context("Invalid POS")?;
+
+        // Parse ID
+        let id = if fields[2] == "." { None } else { Some(fields[2].into()) };
+
+        // Parse REF
+        let ref_allele = Allele::from_str(fields[3]);
+
+        // Parse ALT
+        let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
+
+        let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles.clone());
+        let n_alleles = 1 + alt_alleles.len();
+
+        // Parse genotypes
+        let n_samples = self.samples.len();
+        let mut alleles = Vec::with_capacity(n_samples * 2);
+
+        // Find GT index
+        let format = fields[8];
+        let gt_idx = format.split(':').position(|f| f == "GT")
+             .ok_or_else(|| anyhow::anyhow!("No GT field in FORMAT"))?;
+
+        for sample_field in fields[9..].iter().take(n_samples) {
+            let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
+            let (a1, a2) = self.parse_gt_local(gt_field);
+            alleles.push(a1);
+            alleles.push(a2);
+        }
+
+        let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
+
+        Ok(RefPanelMarker { marker, column })
+    }
+
+    fn parse_gt_local(&self, gt: &str) -> (u8, u8) {
+        if gt == "." || gt == "./." || gt == ".|." { return (255, 255); }
+        let sep = if gt.contains('|') { '|' } else { '/' };
+        let parts: Vec<&str> = gt.split(sep).collect();
+        if parts.len() == 1 {
+            let a = self.parse_allele_local(parts[0]);
+            return (a, a);
+        }
+        if parts.len() != 2 { return (255, 255); }
+        (self.parse_allele_local(parts[0]), self.parse_allele_local(parts[1]))
+    }
+
+    fn parse_allele_local(&self, s: &str) -> u8 {
+         if s == "." || s.is_empty() { return 255; }
+         if s.len() == 1 {
+             let c = s.as_bytes()[0];
+             if c >= b'0' && c <= b'9' { return c - b'0'; }
+         }
+         s.parse().unwrap_or(255)
     }
 }
 

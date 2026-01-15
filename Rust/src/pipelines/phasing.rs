@@ -880,8 +880,8 @@ impl PhasingPipeline {
                         &current.phased_result.as_ref().unwrap(),
                         &phased,
                         &gen_maps,
-                    )?
-                });
+                    )
+                })?;
 
                 // Write output region
                 if current.window.is_first {

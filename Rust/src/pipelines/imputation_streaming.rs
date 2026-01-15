@@ -67,7 +67,7 @@ impl crate::pipelines::ImputationPipeline {
             streaming_config.clone(),
         )?;
         let target_samples = target_reader.samples_arc();
-        let n_target_samples = target_samples.n_samples();
+        let n_target_samples = target_samples.len();
         let n_target_haps = n_target_samples * 2;
 
         // Load reference panel
@@ -194,7 +194,6 @@ impl crate::pipelines::ImputationPipeline {
                     &alignment,
                     &producer_maps,
                     phased_overlap.as_ref(),
-                    pbwt_state.as_ref(),
                 )?;
 
                 // Extract state for next window BEFORE moving phased to channel
@@ -468,7 +467,7 @@ impl crate::pipelines::ImputationPipeline {
 
                     let (ref_cluster_start, ref_cluster_end) = compute_ref_cluster_bounds(sample_genotyped, &clusters);
                     let marker_cluster = Arc::new(build_marker_cluster_index(&ref_cluster_start, n_ref_markers));
-                    let ref_cluster_end = Arc::new(ref_cluster_end);
+                    let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
                     let cluster_weights = Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
 
                     let (dosages, best_gt, dr2_data) = workspace.with(|ws| {
