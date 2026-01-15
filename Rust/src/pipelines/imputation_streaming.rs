@@ -190,6 +190,7 @@ impl crate::pipelines::ImputationPipeline {
                     &alignment,
                     &producer_maps,
                     phased_overlap.as_ref(),
+                    pbwt_state.as_ref(),
                 )?;
 
                 // Extract state for next window BEFORE moving phased to channel
@@ -486,18 +487,18 @@ impl crate::pipelines::ImputationPipeline {
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
-                            for &ref_m in sample_genotyped.iter().skip_while(|&&m| *m < markers_to_process.start) {
+                            for &ref_m in sample_genotyped.iter().skip_while(|&m| *m < markers_to_process.start) {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &|_, h| ref_win.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32)));
                                 hap_dosages.push(p.prob(1));
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
-                            
+
                             let mut dr2_vec = Vec::new();
-                            for (i, &ref_m) in sample_genotyped.iter().enumerate() {
-                                if *ref_m >= markers_to_process.start && *ref_m < markers_to_process.end {
-                                    let p = state_probs.allele_posteriors(*ref_m, 2, &|_, h| ref_win.allele(MarkerIdx::new(*ref_m as u32), HapIdx::new(h as u32)));
+                            for &ref_m in sample_genotyped.iter() {
+                                if ref_m >= markers_to_process.start && ref_m < markers_to_process.end {
+                                    let p = state_probs.allele_posteriors(ref_m, 2, &|_, h| ref_win.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32)));
                                     dr2_vec.push(CompactDr2Entry::Biallelic {
-                                        marker: *ref_m as u32,
+                                        marker: ref_m as u32,
                                         p1: p.prob(1), p2: 0.0, skip: false, true_gt: Some((p.max_allele(), 0))
                                     });
                                 }

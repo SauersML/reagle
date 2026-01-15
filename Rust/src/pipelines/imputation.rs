@@ -1299,6 +1299,7 @@ impl ImputationPipeline {
                                     p1: probs1[1],
                                     p2: probs2[1],
                                     skip: false,
+                                    true_gt: None,
                                 });
                             } else {
                                 dr2_data.push(CompactDr2Entry::Multiallelic {
@@ -1306,6 +1307,7 @@ impl ImputationPipeline {
                                     probs1: probs1[..n_alleles].to_vec(),
                                     probs2: probs2[..n_alleles].to_vec(),
                                     skip: false,
+                                    true_gt: None,
                                 });
                              }
                          }
@@ -1345,7 +1347,7 @@ impl ImputationPipeline {
                     // Accumulate DR2 quality stats
                     for entry in dr2_data {
                         match entry {
-                            CompactDr2Entry::Biallelic { marker, p1, p2, skip } => {
+                            CompactDr2Entry::Biallelic { marker, p1, p2, skip, .. } => {
                                 if !skip {
                                     if let Some(stats) = quality.get_mut(marker as usize) {
                                         if is_diploid {
@@ -1356,7 +1358,7 @@ impl ImputationPipeline {
                                     }
                                 }
                             }
-                            CompactDr2Entry::Multiallelic { marker, probs1, probs2, skip } => {
+                            CompactDr2Entry::Multiallelic { marker, probs1, probs2, skip, .. } => {
                                 if !skip {
                                     if let Some(stats) = quality.get_mut(marker as usize) {
                                         if is_diploid {
