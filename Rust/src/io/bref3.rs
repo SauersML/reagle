@@ -915,59 +915,105 @@ impl StreamingRefVcfReader {
     /// Load reference window for a specific genomic region
     pub fn load_window_for_region(&mut self, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         const BUFFER_MARKERS: usize = 500;
-        let buffer_size = BUFFER_MARKERS.min((end_pos - start_pos) as usize / 2);
-        let buffered_start = start_pos.saturating_sub(buffer_size as u32);
-        let buffered_end = end_pos + buffer_size as u32;
+        // Ensure buffer spans the window and includes BUFFER_MARKERS after end_pos.
+        loop {
+            while !self.eof {
+                let need_more = self.buffer.is_empty()
+                    || self.buffer.back().map(|m| m.marker.pos < end_pos).unwrap_or(true);
+                if !need_more {
+                    break;
+                }
+                if let Some(marker) = self.read_next_marker()? {
+                    self.buffer.push_back(marker);
+                }
+            }
 
-        // Discard markers before buffered_start
-        while let Some(front) = self.buffer.front() {
-             if front.marker.pos < buffered_start {
-                 self.buffer.pop_front();
-             } else {
-                 break;
-             }
+            if self.buffer.is_empty() {
+                return Ok(None);
+            }
+
+            let mut last_idx = None;
+            for (i, bm) in self.buffer.iter().enumerate() {
+                if bm.marker.pos >= start_pos && bm.marker.pos <= end_pos {
+                    last_idx = Some(i);
+                }
+            }
+
+            let last_idx = match last_idx {
+                Some(e) => e,
+                None => return Ok(None),
+            };
+
+            let after = self.buffer.len().saturating_sub(last_idx + 1);
+            if after < BUFFER_MARKERS && !self.eof {
+                if let Some(marker) = self.read_next_marker()? {
+                    self.buffer.push_back(marker);
+                }
+                continue;
+            }
+
+            break;
         }
 
-        // Read until we cover buffered_end
-        while !self.eof {
-            let need_more = self.buffer.is_empty()
-                 || self.buffer.back().map(|m| m.marker.pos < buffered_end).unwrap_or(true);
-            if !need_more { break; }
-            if let Some(marker) = self.read_next_marker()? {
-                self.buffer.push_back(marker);
+        let mut first_idx = None;
+        let mut last_idx = None;
+        for (i, bm) in self.buffer.iter().enumerate() {
+            if bm.marker.pos >= start_pos && bm.marker.pos <= end_pos {
+                if first_idx.is_none() {
+                    first_idx = Some(i);
+                }
+                last_idx = Some(i);
             }
         }
 
-        if self.buffer.is_empty() { return Ok(None); }
+        let (mut first_idx, mut last_idx) = match (first_idx, last_idx) {
+            (Some(s), Some(e)) => (s, e),
+            _ => return Ok(None),
+        };
+
+        let buffered_start_idx = first_idx.saturating_sub(BUFFER_MARKERS);
+        let mut buffered_end_idx = (last_idx + 1 + BUFFER_MARKERS).min(self.buffer.len());
+
+        if buffered_start_idx > 0 {
+            for _ in 0..buffered_start_idx {
+                self.buffer.pop_front();
+            }
+            first_idx -= buffered_start_idx;
+            last_idx -= buffered_start_idx;
+            buffered_end_idx -= buffered_start_idx;
+        }
 
         let mut markers = Markers::new();
         let mut columns = Vec::new();
         let mut found_any = false;
 
-        for bm in &self.buffer {
-            if bm.marker.pos >= buffered_start && bm.marker.pos <= buffered_end {
-                 let chrom_name = self.markers.chrom_name(bm.marker.chrom).expect("Invalid chromosome");
-                 let window_chrom_idx = markers.add_chrom(chrom_name);
-
-                 let mut m = bm.marker.clone();
-                 m.chrom = window_chrom_idx;
-                 markers.push(m);
-                 columns.push(bm.column.clone());
-                 found_any = true;
+        for (i, bm) in self.buffer.iter().enumerate() {
+            if i >= buffered_end_idx {
+                break;
             }
+            let chrom_name = self.markers.chrom_name(bm.marker.chrom).expect("Invalid chromosome");
+            let window_chrom_idx = markers.add_chrom(chrom_name);
+
+            let mut m = bm.marker.clone();
+            m.chrom = window_chrom_idx;
+            markers.push(m);
+            columns.push(bm.column.clone());
+            found_any = true;
         }
 
         if !found_any { return Ok(None); }
 
         let n_markers = markers.len();
         let genotypes = GenotypeMatrix::new_phased(markers, columns, Arc::clone(&self.samples));
+        let output_start = first_idx;
+        let output_end = last_idx + 1;
 
         Ok(Some(RefWindow {
             genotypes,
             global_start: 0,
             global_end: n_markers,
-            output_start: 0,
-            output_end: n_markers,
+            output_start,
+            output_end,
             is_first: false,
             is_last: self.eof && self.buffer.is_empty(),
         }))
