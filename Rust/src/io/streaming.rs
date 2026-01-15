@@ -276,14 +276,10 @@ impl StreamingVcfReader {
                 .map(|m| m.gen_pos - self.config.overlap_cm as f64)
                 .unwrap_or(0.0);
 
-            let mut splice = window_end;
-            for i in (0..window_end).rev() {
-                if self.buffer[i].gen_pos <= overlap_gen {
-                    splice = i + 1;
-                    break;
-                }
-            }
-            splice
+            // Find splice index: keep markers > overlap_gen
+            // Markers <= overlap_gen are discarded (overlap buffer for next window)
+            // We want the index of the first marker that is > overlap_gen
+            self.find_overlap_splice_index(window_end, overlap_gen)
         };
 
         // Build GenotypeMatrix for this window
@@ -367,6 +363,24 @@ impl StreamingVcfReader {
             // Parse the VCF line
             return self.parse_vcf_line(&line).map(Some);
         }
+    }
+
+    /// Find the splice index for overlap using binary search
+    /// Returns the index such that markers[..index] are <= overlap_gen
+    /// and markers[index..] are > overlap_gen.
+    fn find_overlap_splice_index(&self, window_end: usize, overlap_gen: f64) -> usize {
+        let mut low = 0;
+        let mut high = window_end;
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.buffer[mid].gen_pos <= overlap_gen {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
     }
 
     /// Parse a single VCF line

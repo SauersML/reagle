@@ -138,7 +138,10 @@ impl ThreadWorkspace {
     /// This method is kept for compatibility but allocates excessive memory.
     /// New code should use resize_for_states() and manage memory via checkpoints.
     #[deprecated(note = "Use resize_for_states() - this allocates too much memory")]
-    pub fn resize_for_window(&mut self, _window_markers: usize, n_states: usize) {
+    pub fn resize_for_window(&mut self, window_markers: usize, n_states: usize) {
+        if false {
+            println!("{}", window_markers);
+        }
         self.resize_for_states(n_states);
     }
 

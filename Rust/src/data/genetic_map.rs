@@ -326,7 +326,6 @@ impl GeneticMaps {
             Ok(Self { maps })
         })
     }
-    }
 
     /// Get genetic map for a chromosome
     pub fn get(&self, chrom: ChromIdx) -> Option<&GeneticMap> {

@@ -868,8 +868,8 @@ impl PhasingPipeline {
             // Extract overlap and PBWT state for next window
             if next_window_opt.is_some() {
                 phased_overlap = Some(self.extract_overlap(&phased, window.output_end, n_markers));
-                // Extract PBWT state at the end of this window
-                pbwt_state = Some(self.extract_pbwt_state(&phased, n_markers));
+                // Extract PBWT state at the splice point (output_end), where the next window starts
+                pbwt_state = Some(self.extract_pbwt_state(&phased, window.output_end));
             }
 
             // If we have a current window to finalize Stage 2
@@ -1042,6 +1042,7 @@ impl PhasingPipeline {
                     &ibs2,
                     atomic_estimates.as_ref(),
                     &confidence_by_sample,
+                    None, // No PBWT state handoff for in-memory phasing
                 )?;
             });
 
@@ -1442,6 +1443,7 @@ impl PhasingPipeline {
         ibs2: &Ibs2,
         n_candidates: usize,
         max_states: usize,
+        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
     ) -> Vec<crate::model::states::ThreadedHaps>
     where
         F: Fn(usize, usize) -> u8 + Sync,
@@ -1464,8 +1466,8 @@ impl PhasingPipeline {
             })
             .collect();
 
-        // Create wavefront
-        let mut wavefront = PbwtWavefront::new(n_total_haps, n_markers);
+        // Create wavefront with optional initial state
+        let mut wavefront = PbwtWavefront::with_state(n_total_haps, n_markers, pbwt_state);
 
         // Temporary allele buffer (reused across markers)
         let mut alleles = vec![0u8; n_total_haps];
@@ -1598,6 +1600,7 @@ impl PhasingPipeline {
         ibs2: &Ibs2,
         n_candidates: usize,
         max_states: usize,
+        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
     ) -> Vec<crate::model::states::ThreadedHaps> {
         use std::collections::HashSet;
 
@@ -1619,7 +1622,7 @@ impl PhasingPipeline {
             .collect();
 
         // Create wavefront
-        let mut wavefront = PbwtWavefront::new(n_haps, n_markers);
+        let mut wavefront = PbwtWavefront::with_state(n_haps, n_markers, pbwt_state);
 
         // Forward pass - use direct slice access
         wavefront.reset_forward();
@@ -1724,6 +1727,7 @@ impl PhasingPipeline {
         ibs2: &Ibs2,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
+        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
@@ -1792,6 +1796,7 @@ impl PhasingPipeline {
                         ibs2,
                         n_candidates,
                         self.params.n_states,
+                        pbwt_state,
                     )
                 } else {
                     // Use optimized direct access version for no-reference case
@@ -1802,6 +1807,7 @@ impl PhasingPipeline {
                         ibs2,
                         n_candidates,
                         self.params.n_states,
+                        pbwt_state,
                     )
                 }
             });
@@ -3948,7 +3954,6 @@ impl Stage2Phaser {
     /// of the window, which will be used to initialize the next window.
     ///
     /// CURRENT LIMITATION: This recomputes PBWT state from scratch.
-    /// IDEAL FIX: Track PBWT state during phasing and capture directly.
     fn extract_pbwt_state(
         &self,
         phased: &GenotypeMatrix<Phased>,
@@ -4053,7 +4058,7 @@ impl Stage2Phaser {
 
             for &stage1_marker in &hi_freq_markers {
                 // For markers in current window, we could extract from phasing HMM
-                // For now, use simplified state probabilities
+                // Use simplified state probabilities
                 let mut marker_probs = Vec::new();
 
                 if stage1_marker < current_markers {

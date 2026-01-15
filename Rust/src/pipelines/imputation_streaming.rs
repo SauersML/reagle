@@ -299,12 +299,13 @@ impl crate::pipelines::ImputationPipeline {
         alignment: &MarkerAlignment,
         gen_maps: &GeneticMaps,
         phased_overlap: Option<&PhasedOverlap>,
-        _pbwt_state: Option<&PbwtState>, // TODO: Use PBWT handoff
+        pbwt_state: Option<&PbwtState>,
     ) -> Result<GenotypeMatrix<Phased>> {
         let mut phasing = crate::pipelines::PhasingPipeline::new(self.config.clone());
         let ref_gt_arc = Arc::new(ref_gt.clone());
         phasing.set_reference(ref_gt_arc, alignment.clone());
-        phasing.phase_in_memory_with_overlap(target_gt, gen_maps, phased_overlap)
+        // Pass PBWT state to phasing pipeline
+        phasing.phase_window_with_pbwt_handoff(target_gt, gen_maps, phased_overlap, pbwt_state)
     }
 
     fn extract_overlap_streaming(

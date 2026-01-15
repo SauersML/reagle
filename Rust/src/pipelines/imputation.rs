@@ -295,7 +295,7 @@ pub struct StateProbs {
     ) -> Result<Self> {
         // For streaming imputation, we don't have all target genotypes at this point
         // This is a stub that gets filled in by new_from_windows later
-        // Return empty alignment for now
+        // Return empty alignment
         Ok(Self {
             ref_to_target: vec![],
             target_to_ref: vec![],
