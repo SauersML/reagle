@@ -579,15 +579,6 @@ impl StreamingBref3Reader {
 
 /// Configuration for windowed reference loading
 #[derive(Clone, Debug)]
-pub struct WindowConfig {
-}
-
-impl Default for WindowConfig {
-    fn default() -> Self {
-        Self {}
-    }
-}
-
 /// A window of reference data accumulated from multiple blocks
 pub struct RefWindow {
     /// Genotype matrix for this window (phased reference data)
@@ -619,8 +610,7 @@ pub struct WindowedBref3Reader {
 
 impl WindowedBref3Reader {
     /// Create a windowed reader with given configuration
-    pub fn new(inner: StreamingBref3Reader, config: WindowConfig) -> Self {
-        let _ = config;
+    pub fn new(inner: StreamingBref3Reader) -> Self {
         Self {
             inner,
             block_buffer: VecDeque::new(),
@@ -843,7 +833,6 @@ impl InMemoryRefReader {
             columns.push(self.genotypes.column(MarkerIdx::new(m as u32)).clone());
         }
 
-        let n_window_markers = buffered_end_idx - buffered_start_idx;
         let output_start = start_idx - buffered_start_idx;
         let output_end = output_start + (end_idx - start_idx);
         let is_first = self.window_num == 0;
@@ -971,7 +960,7 @@ impl StreamingRefVcfReader {
         if !found_any { return Ok(None); }
 
         let n_markers = markers.len();
-        let genotypes = GenotypeMatrix::new_phased(markers, columns, self.samples_arc());
+        let genotypes = GenotypeMatrix::new_phased(markers, columns, Arc::clone(&self.samples));
 
         Ok(Some(RefWindow {
             genotypes,

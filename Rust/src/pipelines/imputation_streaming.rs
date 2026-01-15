@@ -144,8 +144,7 @@ impl crate::pipelines::ImputationPipeline {
             let use_streaming_vcf = pipeline.config.streaming.unwrap_or(false);
             let mut ref_reader: RefPanelReader = if is_bref3 {
                 let stream_reader = crate::io::bref3::StreamingBref3Reader::open(&ref_path_clone)?;
-                let window_config = crate::io::bref3::WindowConfig::default();
-                let windowed = crate::io::bref3::WindowedBref3Reader::new(stream_reader, window_config);
+                let windowed = crate::io::bref3::WindowedBref3Reader::new(stream_reader);
                 RefPanelReader::Bref3(windowed)
             } else if use_streaming_vcf {
                 // Streaming VCF for memory-constrained environments

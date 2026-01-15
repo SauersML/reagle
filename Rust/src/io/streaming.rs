@@ -219,9 +219,6 @@ impl PhasedOverlap {
 pub struct StreamWindow {
     /// Genotype data for this window
     pub genotypes: GenotypeMatrix,
-    /// Window number (0-indexed)
-    #[allow(dead_code)]
-    pub window_num: usize,
     /// Start marker index in full chromosome
     pub global_start: usize,
     /// End marker index in full chromosome (exclusive)
@@ -433,7 +430,6 @@ impl StreamingVcfReader {
 
         let window = StreamWindow {
             genotypes,
-            window_num: self.window_num,
             global_start: self.global_marker_idx,
             global_end: self.global_marker_idx + window_end,
             output_start,

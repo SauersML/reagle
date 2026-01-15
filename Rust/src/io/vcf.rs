@@ -46,35 +46,6 @@ impl MarkerImputationStats {
         }
     }
 
-    /// Add a sample's data (two haplotypes).
-    ///
-    /// # Arguments
-    /// * `probs1` - HMM posterior probabilities for haplotype 1.
-    /// * `probs2` - HMM posterior probabilities for haplotype 2.
-    pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
-        self.n_haps += 2;
-        for a in 1..self.sum_p.len() {
-            let p1 = probs1.get(a).copied().unwrap_or(0.0);
-            let p2 = probs2.get(a).copied().unwrap_or(0.0);
-
-            // Accumulate statistics per haplotype
-            let p_sum = p1 + p2;
-            let p_sq_sum = p1 * p1 + p2 * p2;
-
-            self.sum_p[a] += p_sum;
-            self.sum_p_sq[a] += p_sq_sum;
-        }
-    }
-
-    /// Add dosage contribution from a haploid sample
-    pub fn add_haploid(&mut self, probs: &[f32]) {
-        self.n_haps += 1;
-        for a in 1..self.sum_p.len() {
-            let p = probs.get(a).copied().unwrap_or(0.0);
-            self.sum_p[a] += p;
-            self.sum_p_sq[a] += p * p;
-        }
-    }
 
     /// Add a biallelic sample's data with compact representation (no heap allocation).
     /// p1 = P(ALT) for haplotype 1, p2 = P(ALT) for haplotype 2.
@@ -88,15 +59,6 @@ impl MarkerImputationStats {
 
         self.sum_p[1] += p_sum;
         self.sum_p_sq[1] += p_sq_sum;
-    }
-
-    /// Add haploid biallelic sample (compact, no heap allocation).
-    #[inline]
-    pub fn add_haploid_biallelic(&mut self, p_alt: f32) {
-        assert!(self.sum_p.len() == 2, "add_haploid_biallelic requires biallelic marker");
-        self.n_haps += 1;
-        self.sum_p[1] += p_alt;
-        self.sum_p_sq[1] += p_alt * p_alt;
     }
 
     /// Calculate DR2 (dosage R-squared) matching Java Beagle's implementation.
@@ -633,14 +595,6 @@ impl VcfReader {
         }
     }
 
-    /// Check if all genotypes read were phased
-    ///
-    /// Returns true if every genotype in the VCF used the "|" separator,
-    /// indicating the data is already phased and doesn't need re-phasing.
-    /// Must be called after read_all().
-    pub fn was_all_phased(&self) -> bool {
-        self.all_phased
-    }
 }
 
 /// Parse a genotype field (e.g., "0|1", "0/1", ".")

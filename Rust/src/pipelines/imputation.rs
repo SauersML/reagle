@@ -13,8 +13,6 @@
 
 use tracing::instrument;
 
-use std::sync::Arc;
-
 use crate::config::Config;
 use crate::error::Result;
 use crate::model::parameters::ModelParams;
@@ -231,7 +229,14 @@ impl ClusterStateProbs {
             AllelePosteriors::Multiallelic(al_probs)
         }
     }
+}
 
+impl ImputationPipeline {
+    /// Create a new imputation pipeline
+    pub fn new(config: Config) -> Self {
+        let params = ModelParams::new();
+        Self { config, params }
+    }
 
     /// Run the imputation pipeline
     #[instrument(name = "imputation", skip(self))]
