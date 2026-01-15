@@ -47,6 +47,28 @@ impl Default for StreamingConfig {
     }
 }
 
+/// Posterior state probabilities for soft-information handoff
+#[derive(Clone, Debug)]
+pub struct StateProbs {
+    /// State probabilities for each haplotype at each Stage 1 marker
+    /// Layout: [hap][marker_idx][state]
+    pub data: Vec<Vec<Vec<f32>>>,
+    /// Indices of these markers (relative to the window start)
+    pub marker_indices: Vec<usize>,
+    /// Number of states
+    pub n_states: usize,
+}
+
+impl StateProbs {
+    pub fn new(data: Vec<Vec<Vec<f32>>>, marker_indices: Vec<usize>, n_states: usize) -> Self {
+        Self {
+            data,
+            marker_indices,
+            n_states,
+        }
+    }
+}
+
 /// Phased genotypes from overlap region to seed next window
 ///
 /// This carries the phased alleles from the overlap region of the previous window
@@ -61,6 +83,9 @@ pub struct PhasedOverlap {
     pub alleles: Vec<u8>,
     /// Number of haplotypes
     pub n_haps: usize,
+    /// Posterior state probabilities for Stage 1 markers in the overlap
+    /// Used for soft-information handoff to prevent stair-step artifacts
+    pub state_probs: Option<StateProbs>,
 }
 
 impl PhasedOverlap {
@@ -76,7 +101,13 @@ impl PhasedOverlap {
             n_markers,
             alleles,
             n_haps,
+            state_probs: None,
         }
+    }
+
+    /// Set state probabilities
+    pub fn set_state_probs(&mut self, state_probs: StateProbs) {
+        self.state_probs = Some(state_probs);
     }
 
     /// Get the allele for a specific haplotype at a specific marker

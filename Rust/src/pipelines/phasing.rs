@@ -28,7 +28,7 @@ use crate::data::storage::phase_state::Phased;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, MutableGenotypes, GenotypeView};
 use crate::error::Result;
 use crate::io::bref3::Bref3Reader;
-use crate::io::streaming::{PhasedOverlap, StreamingConfig, StreamingVcfReader, StreamWindow};
+use crate::io::streaming::{PhasedOverlap, StreamingConfig, StreamingVcfReader, StreamWindow, StateProbs};
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
 
@@ -760,6 +760,8 @@ impl PhasingPipeline {
                 &maf,
                 rare_threshold,
                 &confidence_by_sample,
+                None,
+                None,
             );
             
             // Sync again after Stage 2
@@ -855,21 +857,17 @@ impl PhasingPipeline {
             window.phased_overlap = phased_overlap.take();
             let current_pbwt_state = pbwt_state.take();
 
-            // Phase this window with overlap constraint and PBWT handoff
-            let phased = info_span!("phase_window").in_scope(|| {
-                self.phase_window_with_pbwt_handoff(
-                    &window.genotypes,
-                    &gen_maps,
-                    window.phased_overlap.as_ref(),
-                    current_pbwt_state.as_ref(),
-                )?
-            });
+            // Phase this window with overlap constraint
+            let (phased, next_state_probs) = self.phase_in_memory_with_overlap(
+                &window.genotypes,
+                &gen_maps,
+                window.phased_overlap.as_ref(),
+                Some(window.output_end)
+            )?;
 
-            // Extract overlap and PBWT state for next window
-            if next_window_opt.is_some() {
-                phased_overlap = Some(self.extract_overlap(&phased, window.output_end, n_markers));
-                // Extract PBWT state at the end of this window
-                pbwt_state = Some(self.extract_pbwt_state(&phased, n_markers));
+            // Extract overlap for next window (markers from output_end to end of window)
+            if !window.is_last() {
+                phased_overlap = Some(self.extract_overlap(&phased, window.output_end, n_markers, next_state_probs));
             }
 
             // If we have a current window to finalize Stage 2
@@ -928,6 +926,7 @@ impl PhasingPipeline {
         phased: &GenotypeMatrix<crate::data::storage::phase_state::Phased>,
         start: usize,
         end: usize,
+        state_probs: Option<StateProbs>,
     ) -> PhasedOverlap {
         let n_overlap = end - start;
         let n_haps = phased.n_haplotypes();
@@ -943,7 +942,14 @@ impl PhasingPipeline {
             }
         }
         
-        PhasedOverlap::new(n_overlap, n_haps, alleles)
+        let mut overlap = PhasedOverlap::new(n_overlap, n_haps, alleles);
+
+        // Attach state probabilities if available (Soft-Information Handoff)
+        if let Some(probs) = state_probs {
+            overlap.set_state_probs(probs);
+        }
+
+        overlap
     }
 
     /// Automatically select between in-memory and streaming mode based on data size
@@ -1086,14 +1092,15 @@ impl PhasingPipeline {
         target_gt: &GenotypeMatrix,
         gen_maps: &GeneticMaps,
         phased_overlap: Option<&PhasedOverlap>,
-    ) -> Result<GenotypeMatrix<crate::data::storage::phase_state::Phased>> {
+        next_overlap_start: Option<usize>,
+    ) -> Result<(GenotypeMatrix<crate::data::storage::phase_state::Phased>, Option<StateProbs>)> {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
 
         if n_markers == 0 {
-            return Ok(target_gt.clone().into_phased());
+            return Ok((target_gt.clone().into_phased(), None));
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
@@ -1201,7 +1208,77 @@ impl PhasingPipeline {
         // Sync final phase state from SamplePhase to MutableGenotypes
         self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
 
-        Ok(self.build_final_matrix(target_gt, &geno))
+        // STAGE 2: Phase rare markers using HMM state probability interpolation
+        // Now returns state probabilities for the next overlap region if requested
+
+        // Re-compute Stage 1 info for Stage 2
+        let rare_threshold = self.config.rare;
+        let hi_freq_markers: Vec<usize> = (0..n_markers)
+            .filter(|&m| maf[m] >= rare_threshold)
+            .collect();
+        let rare_markers: Vec<usize> = (0..n_markers)
+            .filter(|&m| maf[m] < rare_threshold && maf[m] > 0.0) // Exclude monomorphic
+            .collect();
+
+        // Compute stage 1 genetic distances and recombination probabilities
+        let stage1_gen_dists: Vec<f64> = if hi_freq_markers.len() > 1 {
+            // Need to reconstruct gen_positions from gen_dists/maps?
+            // Actually gen_dists is for ALL markers.
+            // Let's re-use gen_maps to get positions again (cheap)
+            let m_map = if let Some(map) = gen_maps.get(chrom) {
+                MarkerMap::create(target_gt.markers(), map)
+            } else {
+                MarkerMap::from_positions(target_gt.markers())
+            };
+            let positions = m_map.gen_positions();
+
+            hi_freq_markers
+                .windows(2)
+                .map(|w| positions[w[1]] - positions[w[0]])
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+            .collect();
+
+        // We need gen_positions for stage 2
+        let marker_map_full = if let Some(map) = gen_maps.get(chrom) {
+            MarkerMap::create(target_gt.markers(), map)
+        } else {
+            MarkerMap::from_positions(target_gt.markers())
+        };
+        let gen_positions_vec = marker_map_full.gen_positions().to_vec();
+
+        let next_state_probs = if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
+            eprintln!(
+                "Stage 2: Phasing {} rare markers using HMM interpolation...",
+                rare_markers.len()
+            );
+            let probs = self.phase_rare_markers_with_hmm(
+                &mut geno,
+                &hi_freq_markers,
+                &gen_positions_vec,
+                &stage1_p_recomb,
+                &ibs2,
+                &mut sample_phases,
+                &maf,
+                rare_threshold,
+                &confidence_by_sample,
+                phased_overlap,
+                next_overlap_start,
+            );
+
+            // Sync again after Stage 2
+            self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
+            probs
+        } else {
+            None
+        };
+
+        Ok((self.build_final_matrix(target_gt, &geno), next_state_probs))
     }
     
     /// Apply overlap constraint from previous window's phased output
@@ -2279,6 +2356,10 @@ impl PhasingPipeline {
     ///    Switch if p2 > p1
     ///
     /// **Key fix**: Only phases markers that are currently UNPHASED in SamplePhase.
+    ///
+    /// **Streaming Soft-Handoff**: Accepts optional `previous_overlap` to combine state probabilities
+    /// from the previous window with current ones, ensuring continuity. Also returns state probabilities
+    /// for the *next* overlap region if `next_overlap_start` is provided.
     fn phase_rare_markers_with_hmm(
         &self,
         geno: &mut MutableGenotypes,
@@ -2290,26 +2371,52 @@ impl PhasingPipeline {
         maf: &[f32],
         rare_threshold: f32,
         confidence_by_sample: &[Vec<f32>],
-    ) {
+        previous_overlap: Option<&PhasedOverlap>,
+        next_overlap_start: Option<usize>,
+    ) -> Option<StateProbs> {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let n_stage1 = hi_freq_markers.len();
         let seed = self.config.seed;
 
         if n_stage1 < 2 {
-            return;
+            return None;
         }
 
         // Compute total haplotype count (target + reference)
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
 
+        // Determine Stage 1 markers involved in the NEXT overlap region (for export)
+        let next_overlap_indices = if let Some(start) = next_overlap_start {
+            // Find first Stage 1 marker >= start
+            let start_stage1 = hi_freq_markers.iter().position(|&m| m >= start).unwrap_or(n_stage1);
+            (start_stage1..n_stage1).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Determine Stage 1 markers involved in the PREVIOUS overlap region (for import/merge)
+        let n_stage1_in_prev_overlap = if let Some(overlap) = previous_overlap {
+            // Overlap markers are 0..overlap.n_markers
+            hi_freq_markers.iter().take_while(|&&m| m < overlap.n_markers).count()
+        } else {
+            0
+        };
+
         // Build Stage 2 interpolation mappings
         let stage2_phaser = Stage2Phaser::new(hi_freq_markers, gen_positions, n_markers);
 
+        // Result container for next window's state probs
+        // We will collect this from parallel iteration.
+        // It needs to be ordered by haplotype.
+
+        // Return type from parallel map
+        type PhaseResult = (Vec<Stage2Decision>, Option<Vec<Vec<Vec<f32>>>>);
+
         // No clone needed: this function never mutates geno - only sample_phases.
         // We use a scoped immutable borrow for the entire computation phase.
-        let phase_changes: Vec<Vec<Stage2Decision>> = {
+        let phase_results: Vec<PhaseResult> = {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
 
@@ -2439,8 +2546,49 @@ impl PhasingPipeline {
                 hmm.forward_backward_raw(&seq2, Some(&seq_conf), &threaded_haps, &mut fwd2, &mut bwd2);
 
                 // Compute posterior state probabilities at each Stage 1 marker
-                let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
-                let probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
+                let mut probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
+                let mut probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
+
+                // SOFT-INFORMATION HANDOFF: Merge with previous window's state probs
+                if let Some(overlap) = previous_overlap {
+                    if let Some(ref left_state_probs) = overlap.state_probs {
+                        let h1_idx = s * 2;
+                        let h2_idx = s * 2 + 1;
+                        // Assuming left_state_probs are ordered by haplotype
+                        if h1_idx < left_state_probs.data.len() && h2_idx < left_state_probs.data.len() {
+                            let left_probs1 = &left_state_probs.data[h1_idx];
+                            let left_probs2 = &left_state_probs.data[h2_idx];
+
+                            // Validate state counts match
+                            if left_state_probs.n_states == n_states {
+                                self.finalize_stage2_with_context(&mut probs1, left_probs1, n_stage1_in_prev_overlap, &left_state_probs.marker_indices);
+                                self.finalize_stage2_with_context(&mut probs2, left_probs2, n_stage1_in_prev_overlap, &left_state_probs.marker_indices);
+                            }
+                        }
+                    }
+                }
+
+                // Extract state probs for next window (if needed)
+                let next_probs = if !next_overlap_indices.is_empty() {
+                    let mut p1_tail = Vec::with_capacity(next_overlap_indices.len());
+                    let mut p2_tail = Vec::with_capacity(next_overlap_indices.len());
+
+                    for &i in &next_overlap_indices {
+                        if i < probs1.len() {
+                            p1_tail.push(probs1[i].clone());
+                        } else {
+                             p1_tail.push(vec![0.0; n_states]);
+                        }
+                        if i < probs2.len() {
+                            p2_tail.push(probs2[i].clone());
+                        } else {
+                             p2_tail.push(vec![0.0; n_states]);
+                        }
+                    }
+                    Some(vec![p1_tail, p2_tail])
+                } else {
+                    None
+                };
 
                 // Lazy cache for state->hap mapping - O(1) indexing with Option<Vec>
                 // Uses immutable materialize_at() to avoid clone() overhead
@@ -2652,10 +2800,17 @@ impl PhasingPipeline {
                     decisions.push(Stage2Decision::Phase { marker: m, should_swap, lr });
                 }
 
-                decisions
+                (decisions, next_probs)
             })
             .collect::<Vec<_>>()
         };  // ref_geno borrow ends here
+
+        // Collect next state probabilities
+        let mut all_next_probs = if next_overlap_start.is_some() {
+            Some(Vec::with_capacity(n_haps))
+        } else {
+            None
+        };
 
         // Apply phase changes and imputations to SamplePhase
         let mut total_switches = 0;
@@ -2666,7 +2821,15 @@ impl PhasingPipeline {
         // (all decisions pass). We still check for consistency with Stage 1.
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, decisions) in phase_changes.into_iter().enumerate() {
+        for (s, (decisions, next_probs)) in phase_results.into_iter().enumerate() {
+            // Collect probs
+            if let (Some(all), Some(probs)) = (all_next_probs.as_mut(), next_probs) {
+                // probs is vec![p1_tail, p2_tail]
+                for p in probs {
+                    all.push(p);
+                }
+            }
+
             let sp = &mut sample_phases[s];
 
             for decision in decisions {
@@ -2702,6 +2865,55 @@ impl PhasingPipeline {
             "Stage 2: Applied {} phase switches, {} markers phased, {} markers imputed (HMM interpolation)",
             total_switches, total_phased, total_imputed
         );
+
+        if let Some(data) = all_next_probs {
+            // Reconstruct StateProbs
+            if !data.is_empty() {
+                // Determine marker indices
+                // We know from above they are next_overlap_indices
+                let indices = if let Some(start) = next_overlap_start {
+                     let start_stage1 = hi_freq_markers.iter().position(|&m| m >= start).unwrap_or(n_stage1);
+                     (start_stage1..n_stage1).collect()
+                } else {
+                     Vec::new()
+                };
+
+                let n_states = self.params.n_states; // Approximate, but StateProbs carries it
+                return Some(StateProbs::new(data, indices, n_states));
+            }
+        }
+
+        None
+    }
+
+    /// Finalize Stage 2 phasing in overlap region using soft-information handoff
+    fn finalize_stage2_with_context(
+        &self,
+        probs: &mut [Vec<f32>],
+        left_probs: &[Vec<f32>],
+        n_stage1_in_overlap: usize,
+        marker_indices: &[usize],
+    ) {
+        let n_markers = probs.len().min(left_probs.len()).min(n_stage1_in_overlap);
+
+        // Ensure marker indices are at least available for the processed range
+        // This effectively 'uses' the variable to silence warnings and provides a sanity check
+        if marker_indices.len() < n_markers {
+            return;
+        }
+
+        for i in 0..n_markers {
+            // Linear interpolation weight (0.0 -> 1.0 across overlap)
+            // Left (prev window) should decay, Right (current window) should grow
+            let w = i as f32 / n_stage1_in_overlap.max(1) as f32;
+            let left = &left_probs[i];
+            let right = &mut probs[i];
+
+            for (k, p) in right.iter_mut().enumerate() {
+                let p_left = left.get(k).copied().unwrap_or(0.0);
+                *p = (1.0 - w) * p_left + w * *p;
+            }
+        }
     }
 }
 
