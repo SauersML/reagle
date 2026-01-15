@@ -371,8 +371,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             let val = diff_vals[i];
             if col < n_states {
                 let penalty = val.exp();
-                let trans_prob = curr_slice[col] / base_emit;
-                curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
+                curr_slice[col] = curr_slice[col] * penalty;
             }
         }
 
@@ -441,8 +440,7 @@ pub fn run_hmm_forward_backward_to_sparse(
                 let val = diff_vals[i];
                 if col < n_states {
                     let penalty = val.exp();
-                    let trans_prob = block_fwd[col] / base_emit;
-                    block_fwd[col] = (block_fwd[col] * penalty).max(trans_prob * 1e-20);
+                    block_fwd[col] = block_fwd[col] * penalty;
                 }
             }
 
@@ -498,8 +496,7 @@ pub fn run_hmm_forward_backward_to_sparse(
                 let val = diff_vals[i];
                 if col < n_states {
                     let penalty = val.exp();
-                    let trans_prob = curr_slice[col] / base_emit;
-                    curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
+                    curr_slice[col] = curr_slice[col] * penalty;
                 }
             }
 
@@ -534,8 +531,7 @@ pub fn run_hmm_forward_backward_to_sparse(
                     let val = diff_vals[i];
                     if col < n_states {
                         let penalty = val.exp();
-                        let trans_prob = bwd[col] / base_emit;
-                        bwd[col] = (bwd[col] * penalty).max(trans_prob * 1e-20);
+                        bwd[col] = bwd[col] * penalty;
                     }
                 }
 
