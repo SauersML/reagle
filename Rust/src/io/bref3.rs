@@ -801,6 +801,8 @@ impl InMemoryRefReader {
             return Ok(None);
         }
 
+        const BUFFER_MARKERS: usize = 500;
+
         // Find markers within the position range
         let mut start_idx = None;
         let mut end_idx = None;
@@ -822,6 +824,9 @@ impl InMemoryRefReader {
             _ => return Ok(None),
         };
 
+        let buffered_start_idx = start_idx.saturating_sub(BUFFER_MARKERS);
+        let buffered_end_idx = (end_idx + BUFFER_MARKERS).min(n_markers);
+
         // Extract markers and columns for this range
         let mut markers = crate::data::marker::Markers::new();
         let mut columns = Vec::new();
@@ -829,14 +834,18 @@ impl InMemoryRefReader {
         // Add chromosome
         let first_marker = self.genotypes.marker(MarkerIdx::new(start_idx as u32));
         let chrom_name = self.genotypes.markers().chrom_name(first_marker.chrom).expect("Invalid chromosome");
-        markers.add_chrom(chrom_name);
+        let window_chrom_idx = markers.add_chrom(chrom_name);
 
-        for m in start_idx..end_idx {
-            markers.push(self.genotypes.marker(MarkerIdx::new(m as u32)).clone());
+        for m in buffered_start_idx..buffered_end_idx {
+            let mut marker = self.genotypes.marker(MarkerIdx::new(m as u32)).clone();
+            marker.chrom = window_chrom_idx;
+            markers.push(marker);
             columns.push(self.genotypes.column(MarkerIdx::new(m as u32)).clone());
         }
 
-        let n_window_markers = end_idx - start_idx;
+        let n_window_markers = buffered_end_idx - buffered_start_idx;
+        let output_start = start_idx - buffered_start_idx;
+        let output_end = output_start + (end_idx - start_idx);
         let is_first = self.window_num == 0;
         self.window_num += 1;
 
@@ -844,10 +853,10 @@ impl InMemoryRefReader {
 
         Ok(Some(RefWindow {
             genotypes,
-            global_start: start_idx,
-            global_end: end_idx,
-            output_start: 0,
-            output_end: n_window_markers,
+            global_start: buffered_start_idx,
+            global_end: buffered_end_idx,
+            output_start,
+            output_end,
             is_first,
             is_last: false, // Can't know without looking ahead
         }))

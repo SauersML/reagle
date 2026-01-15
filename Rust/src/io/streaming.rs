@@ -506,6 +506,11 @@ impl StreamingVcfReader {
     /// Returns the index such that markers[..index] are <= overlap_gen
     /// and markers[index..] are > overlap_gen.
     fn find_overlap_splice_index(&self, window_end: usize, overlap_gen: f64) -> usize {
+        if let Some(front) = self.buffer.front() {
+            if front.gen_pos > overlap_gen {
+                return window_end;
+            }
+        }
         let mut low = 0;
         let mut high = window_end;
 
