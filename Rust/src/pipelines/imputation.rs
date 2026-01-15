@@ -13,15 +13,17 @@
 
 use rayon::prelude::*;
 use std::sync::Arc;
-use tracing::instrument;
+use tracing::{info_span, instrument};
 
+use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
-use crate::data::haplotype::HapIdx;
+use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
 use crate::error::Result;
-use crate::io::vcf::{VcfReader, VcfWriter};
+use crate::io::vcf::{ImputationQuality, VcfReader, VcfWriter};
+use crate::utils::workspace::ImpWorkspace;
 
 use crate::model::imp_ibs::{build_cluster_hap_sequences_for_targets, ClusterCodedSteps, ImpIbs};
 use crate::model::imp_states_cluster::ImpStatesCluster;
