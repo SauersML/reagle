@@ -46,7 +46,7 @@ impl HmmUpdater {
         n_states: usize,
     ) -> f32 {
         let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / fwd_sum;
+        let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
 
         let shift_vec = f32x8::splat(shift);
         let scale_vec = f32x8::splat(scale);
@@ -163,7 +163,7 @@ impl HmmUpdater {
 
         // Then: apply transition
         let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / sum;
+        let scale = (1.0 - p_switch) / sum.max(1e-30);
         
         let shift_vec = f32x8::splat(shift);
         let scale_vec = f32x8::splat(scale);

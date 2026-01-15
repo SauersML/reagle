@@ -20,6 +20,8 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
+use tracing::info_span;
+
 use crate::model::ibs2::Ibs2;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::states::ThreadedHaps;
@@ -358,6 +360,7 @@ impl PhaseStates {
     /// * `sample` - Sample index (for fallback random fill)
     /// * `n_total_haps` - Total number of haplotypes (for random fill)
     pub fn finalize_streaming(&mut self, sample: u32, n_total_haps: usize) -> ThreadedHaps {
+        info_span!("finalize_streaming", sample = sample, n_total_haps = n_total_haps).in_scope(|| {
         // Fill with random haps if no IBS matches found
         if self.queue.is_empty() {
             self.fill_with_random(sample, n_total_haps);
@@ -368,6 +371,7 @@ impl PhaseStates {
 
         // Return owned copy
         self.threaded_haps.clone()
+        })
     }
 }
 

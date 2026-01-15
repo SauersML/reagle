@@ -15,6 +15,34 @@
 //! Durbin, Richard (2014) Efficient haplotype matching and storage using the
 //! positional Burrows-Wheeler transform (PBWT).
 
+use tracing::info_span;
+
+/// Snapshot of PBWT state for window handoff
+///
+/// Contains the prefix array and divergence array at a specific marker position.
+/// Used to initialize PBWT in the next window without recomputation.
+#[derive(Debug, Clone)]
+pub struct PbwtState {
+    /// Prefix array (ppa): current haplotype sort order
+    pub ppa: Vec<u32>,
+    /// Divergence array: positions where haplotypes diverge
+    pub div: Vec<i32>,
+    /// Marker position this state corresponds to
+    pub marker_pos: usize,
+}
+
+impl PbwtState {
+    /// Create a new PBWT state snapshot
+    pub fn new(ppa: Vec<u32>, div: Vec<i32>, marker_pos: usize) -> Self {
+        Self {
+            ppa,
+            div,
+            marker_pos,
+        }
+    }
+
+}
+
 /// PBWT updater with divergence array tracking
 ///
 /// This optimized implementation uses flat arrays and Counting Sort
@@ -114,6 +142,7 @@ impl PbwtDivUpdater {
         prefix: &mut [u32],
         divergence: &mut [i32],
     ) {
+        info_span!("pbwt_fwd_update", n_haps = self.n_haps, n_alleles = n_alleles).in_scope(|| {
         assert_eq!(alleles.len(), self.n_haps);
         assert_eq!(prefix.len(), self.n_haps);
         assert!(divergence.len() >= self.n_haps);
@@ -330,6 +359,7 @@ impl PbwtDivUpdater {
         // 6. Copy back
         prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
         divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
+        })
     }
 
     /// Backward update of prefix and divergence arrays

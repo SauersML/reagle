@@ -46,6 +46,7 @@ pub mod hmm;
 pub mod ibs2;
 pub mod imp_ibs;
 pub mod imp_states_cluster;
+pub mod imp_utils;
 pub mod parameters;
 pub mod pbwt;
 pub mod pbwt_streaming;

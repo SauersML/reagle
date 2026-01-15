@@ -14,6 +14,7 @@ use std::path::Path;
 use crate::data::ChromIdx;
 use crate::data::marker::{MarkerIdx, Markers};
 use crate::error::{ReagleError, Result};
+use tracing::info_span;
 
 /// Default scale factor: 1 cM per Mb (1e-6 cM per bp)
 pub const DEFAULT_SCALE_FACTOR: f64 = 1e-6;
@@ -316,13 +317,15 @@ impl GeneticMaps {
 
     /// Load all chromosomes from a PLINK map file
     pub fn from_plink_file(path: &Path, chrom_names: &[&str]) -> Result<Self> {
-        let mut maps = Vec::with_capacity(chrom_names.len());
-        for (i, &name) in chrom_names.iter().enumerate() {
-            let mut map = GeneticMap::from_plink_file(path, name)?;
-            map.set_chrom(ChromIdx::new(i as u16));
-            maps.push(Some(map));
-        }
-        Ok(Self { maps })
+        info_span!("genetic_maps_from_plink_file", path = ?path).in_scope(|| {
+            let mut maps = Vec::with_capacity(chrom_names.len());
+            for (i, &name) in chrom_names.iter().enumerate() {
+                let mut map = GeneticMap::from_plink_file(path, name)?;
+                map.set_chrom(ChromIdx::new(i as u16));
+                maps.push(Some(map));
+            }
+            Ok(Self { maps })
+        })
     }
 
     /// Get genetic map for a chromosome
