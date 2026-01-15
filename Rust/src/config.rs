@@ -183,26 +183,32 @@ impl Default for Config {
             seed: -99999,
             nthreads: None,
             profile: false,
+            }
         }
+
+        Ok(exclude_set)
+        })
     }
-}
 
 impl Config {
     /// Parse command line arguments and validate
     pub fn parse_and_validate() -> Result<Self> {
+        info_span!("config_parse_and_validate").in_scope(|| {
         let config = Self::parse();
         config.validate()?;
         Ok(config)
+        })
     }
 
     /// Load sample IDs to exclude from the exclusion file
     ///
     /// Returns an empty set if no exclusion file is specified.
     pub fn load_exclude_samples(&self) -> Result<std::collections::HashSet<String>> {
-        use std::io::{BufRead, BufReader};
-        use std::fs::File;
+        info_span!("load_exclude_samples").in_scope(|| {
+            use std::io::{BufRead, BufReader};
+            use std::fs::File;
 
-        let mut exclude_set = std::collections::HashSet::new();
+            let mut exclude_set = std::collections::HashSet::new();
 
         if let Some(ref path) = self.excludesamples {
             let file = File::open(path)?;
@@ -223,10 +229,11 @@ impl Config {
     ///
     /// Returns an empty set if no exclusion file is specified.
     pub fn load_exclude_markers(&self) -> Result<std::collections::HashSet<String>> {
-        use std::io::{BufRead, BufReader};
-        use std::fs::File;
+        info_span!("load_exclude_markers").in_scope(|| {
+            use std::io::{BufRead, BufReader};
+            use std::fs::File;
 
-        let mut exclude_set = std::collections::HashSet::new();
+            let mut exclude_set = std::collections::HashSet::new();
 
         if let Some(ref path) = self.excludemarkers {
             let file = File::open(path)?;

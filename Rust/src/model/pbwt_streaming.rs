@@ -77,6 +77,15 @@ impl PbwtWavefront {
         }
     }
 
+    /// Get the current PBWT state (PPA and divergence) for handoff
+    pub fn get_state(&self) -> crate::model::pbwt::PbwtState {
+        crate::model::pbwt::PbwtState::new(
+            self.fwd_ppa.clone(),
+            self.fwd_div.clone(),
+            self.fwd_marker
+        )
+    }
+
     /// Reset for a new forward pass (starts at marker 0)
     pub fn reset_forward(&mut self) {
         for i in 0..self.n_haps {

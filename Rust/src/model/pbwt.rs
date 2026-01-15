@@ -45,9 +45,14 @@ impl PbwtState {
             ppa: updater.a.clone(),
             div: updater.d.clone(),
             marker_pos,
+            }
         }
+
+        // 6. Copy back
+        prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
+        divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
+        })
     }
-}
 
 /// PBWT updater with divergence array tracking
 ///
@@ -148,6 +153,7 @@ impl PbwtDivUpdater {
         prefix: &mut [u32],
         divergence: &mut [i32],
     ) {
+        info_span!("pbwt_fwd_update", n_haps = self.n_haps, n_alleles = n_alleles).in_scope(|| {
         assert_eq!(alleles.len(), self.n_haps);
         assert_eq!(prefix.len(), self.n_haps);
         assert!(divergence.len() >= self.n_haps);

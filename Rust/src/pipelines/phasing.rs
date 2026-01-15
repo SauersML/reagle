@@ -833,7 +833,9 @@ impl PhasingPipeline {
 
         // Process windows with double-buffering
         while let Some(mut window) = next_window_opt {
+            let window_idx = window_count;
             window_count += 1;
+            info_span!("process_window", window_idx = window_idx).in_scope(|| {
             let n_markers = window.genotypes.n_markers();
 
             eprintln!(
@@ -854,12 +856,14 @@ impl PhasingPipeline {
             let current_pbwt_state = pbwt_state.take();
 
             // Phase this window with overlap constraint and PBWT handoff
-            let phased = self.phase_window_with_pbwt_handoff(
-                &window.genotypes,
-                &gen_maps,
-                window.phased_overlap.as_ref(),
-                current_pbwt_state.as_ref(),
-            )?;
+            let phased = info_span!("phase_window").in_scope(|| {
+                self.phase_window_with_pbwt_handoff(
+                    &window.genotypes,
+                    &gen_maps,
+                    window.phased_overlap.as_ref(),
+                    current_pbwt_state.as_ref(),
+                )?
+            });
 
             // Extract overlap and PBWT state for next window
             if next_window_opt.is_some() {
@@ -871,11 +875,13 @@ impl PhasingPipeline {
             // If we have a current window to finalize Stage 2
             if let Some(current) = current_window.take() {
                 // Perform Stage 2 interpolation using phased markers from next window
-                let finalized = self.finalize_stage2_with_context(
-                    &current.phased_result.as_ref().unwrap(),
-                    &phased,
-                    &gen_maps,
-                )?;
+                let finalized = info_span!("finalize_stage2").in_scope(|| {
+                    self.finalize_stage2_with_context(
+                        &current.phased_result.as_ref().unwrap(),
+                        &phased,
+                        &gen_maps,
+                    )?
+                });
 
                 // Write output region
                 if current.window.is_first {
@@ -894,10 +900,12 @@ impl PhasingPipeline {
 
         // Finalize last window (no next window for Stage 2 context)
         if let Some(ref current) = current_window {
-            let finalized = current.phased_result.as_ref().unwrap().clone(); // No additional context
-            writer.write_header(finalized.markers())?;
-            writer.write_phased(&finalized, current.output_start, current.output_end)?;
-            total_markers += current.output_end - current.output_start;
+            info_span!("finalize_last_window").in_scope(|| {
+                let finalized = current.phased_result.as_ref().unwrap().clone(); // No additional context
+                writer.write_header(finalized.markers())?;
+                writer.write_phased(&finalized, current.output_start, current.output_end)?;
+                total_markers += current.output_end - current.output_start;
+            });
         }
 
         writer.flush()?;
@@ -905,6 +913,9 @@ impl PhasingPipeline {
             "Streaming phasing complete: {} windows, {} markers",
             window_count, total_markers
         );
+        Ok(())
+            });
+        }
         Ok(())
     }
     
@@ -966,6 +977,7 @@ impl PhasingPipeline {
         target_gt: &GenotypeMatrix,
         gen_maps: &GeneticMaps,
     ) -> Result<GenotypeMatrix<crate::data::storage::phase_state::Phased>> {
+        info_span!("phase_in_memory_setup").in_scope(|| {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
@@ -1014,47 +1026,54 @@ impl PhasingPipeline {
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
-            
+
             let atomic_estimates = if is_burnin && self.config.em {
                 Some(crate::model::parameters::AtomicParamEstimates::new())
             } else {
                 None
             };
 
-            self.run_phase_baum_iteration(
-                target_gt,
-                &mut geno,
-                &p_recomb,
-                &gen_dists,
-                &ibs2,
-                atomic_estimates.as_ref(),
-                &confidence_by_sample,
-            )?;
+            info_span!("phasing_iteration", iteration = it, is_burnin = is_burnin).in_scope(|| {
+                self.run_phase_baum_iteration(
+                    target_gt,
+                    &mut geno,
+                    &p_recomb,
+                    &gen_dists,
+                    &ibs2,
+                    atomic_estimates.as_ref(),
+                    &confidence_by_sample,
+                )?;
+            });
 
             // Update parameters from EM estimates and recompute recombination probabilities
             if let Some(ref atomic) = atomic_estimates {
-                let est = atomic.to_estimates();
-                let mut params_updated = false;
-                
-                if est.n_emit_obs() > 0 {
-                    self.params.update_p_mismatch(est.p_mismatch());
-                    params_updated = true;
-                }
-                if est.n_switch_obs() > 0 {
-                    self.params.update_recomb_intensity(est.recomb_intensity());
-                    params_updated = true;
-                }
-                
-                // Recompute recombination probabilities with updated intensity
-                if params_updated {
-                    p_recomb = std::iter::once(0.0f32)
-                        .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-                        .collect();
-                }
+                info_span!("em_parameter_update").in_scope(|| {
+                    let est = atomic.to_estimates();
+                    let mut params_updated = false;
+
+                    if est.n_emit_obs() > 0 {
+                        self.params.update_p_mismatch(est.p_mismatch());
+                        params_updated = true;
+                    }
+                    if est.n_switch_obs() > 0 {
+                        self.params.update_recomb_intensity(est.recomb_intensity());
+                        params_updated = true;
+                    }
+
+                    // Recompute recombination probabilities with updated intensity
+                    if params_updated {
+                        p_recomb = std::iter::once(0.0f32)
+                            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                            .collect();
+                    }
+                });
             }
         }
 
-        Ok(self.build_final_matrix(target_gt, &geno))
+        info_span!("build_final_matrix").in_scope(|| {
+            Ok(self.build_final_matrix(target_gt, &geno))
+        })
+        })
     }
     
     /// Phase a GenotypeMatrix in-memory with overlap constraint from previous window
@@ -1720,7 +1739,7 @@ impl PhasingPipeline {
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
         // We use a scoped immutable borrow that ends before the swap phase.
-        let swap_masks: Vec<BitVec<u8, Lsb0>> = {
+        let swap_masks: Vec<BitVec<u8, Lsb0>> = info_span!("build_composite_view").in_scope(|| {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
 
@@ -1899,198 +1918,19 @@ impl PhasingPipeline {
             }));
 
             swap_masks
-        };  // ref_geno borrow ends here
+        });  // ref_geno borrow ends here
 
         // Apply Swaps
-        let mut total_switches = 0;
-        for (s, mask) in swap_masks.iter().enumerate().take(n_samples) {
-            if mask.any() {
-                let hap1 = HapIdx::new((s * 2) as u32);
-                let hap2 = HapIdx::new((s * 2 + 1) as u32);
-                
-                // Iterate true bits
-                for m in mask.iter_ones() {
-                    geno.swap(m, hap1, hap2);
-                    total_switches += 1;
-                }
-            }
-        }
-        
-        eprintln!("Applied {} phase switches (Forward-Backward)", total_switches);
-        Ok(())
-    }
-    
-    /// Run a phasing iteration with overlap constraint for streaming mode
-    ///
-    /// Similar to `run_phase_baum_iteration` but respects the overlap constraint:
-    /// markers in the overlap region (0..overlap_markers) have their phase locked
-    /// from the previous window and will not be changed.
-    ///
-    /// Uses the same correct per-heterozygote decision algorithm as `run_phase_baum_iteration`:
-    /// - Sparse backward pass (O(N_hets × K) memory)
-    /// - Prior-first forward (no division)
-    /// - Match-any emission for combined track
-    fn run_phase_baum_iteration_with_overlap(
-        &mut self,
-        target_gt: &GenotypeMatrix,
-        geno: &mut MutableGenotypes,
-        p_recomb: &[f32],
-        gen_dists: &[f64],
-        ibs2: &Ibs2,
-        sample_phases: &mut [SamplePhase],
-        overlap_markers: usize,
-        atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
-        confidence_by_sample: &[Vec<f32>],
-    ) -> Result<()> {
-        let n_markers = geno.n_markers();
-        let n_haps = geno.n_haps();
-        let markers = target_gt.markers();
-
-        // Compute total haplotype count (target + reference)
-        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
-        let n_total_haps = n_haps + n_ref_haps;
-
-        // No clone needed: the HMM phase is read-only; mutations happen after.
-        // We use a scoped immutable borrow that ends before the swap phase.
-        let n_samples = n_haps / 2;
-        let swap_masks: Vec<BitBox<u64, Lsb0>> = {
-            // Immutable borrow of geno for the entire read phase
-            let ref_geno: &MutableGenotypes = geno;
-
-            let ref_view = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                GenotypeView::Composite {
-                    target: ref_geno,
-                    reference: ref_gt,
-                    alignment,
-                    n_target_haps: n_haps,
-                }
-            } else {
-                GenotypeView::from((ref_geno, markers))
-            };
-
-            // Build bidirectional PBWT for better state selection around recombination hotspots
-            // Filter low-confidence target markers to prevent bad hard calls from
-            // excluding correct reference haplotypes during state selection.
-            let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                self.build_bidirectional_pbwt_combined(
-                    |m, h| {
-                        if h < n_haps {
-                            // Target haplotype: check confidence before using
-                            let sample = h / 2;
-                            let conf = confidence_by_sample.get(sample)
-                                .and_then(|c| c.get(m))
-                                .copied()
-                                .unwrap_or(1.0);
-                            if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                                255 // Treat low-confidence calls as missing for IBS
-                            } else {
-                                ref_geno.get(m, HapIdx::new(h as u32))
-                            }
-                        } else {
-                            let ref_h = h - n_haps;
-                            if let Some(ref_m) = alignment.target_to_ref(m) {
-                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                                alignment.reverse_map_allele(m, ref_allele)
-                            } else {
-                                255
-                            }
-                        }
-                    },
-                    n_markers,
-                    n_total_haps,
-                )
-            } else {
-                self.build_bidirectional_pbwt(ref_geno, n_markers, n_haps)
-            };
-
-            // Collect swap masks per sample
-            sample_phases
-                .par_iter()
-                .enumerate()
-                .map(|(s, sp)| {
-                    // Build dynamic composite haplotypes using PhaseStates
-                    let mut phase_states = PhaseStates::new(self.params.n_states, n_markers);
-                    let threaded_haps = phase_states.build_composite_haps(
-                        s as u32,
-                        &phase_ibs,
-                        ibs2,
-                        20,
-                    );
-                    let n_states = phase_states.n_states();
-
-                    // Extract current alleles from SamplePhase
-                    let seq1: Vec<u8> = (0..n_markers).map(|m| sp.allele1(m)).collect();
-                    let seq2: Vec<u8> = (0..n_markers).map(|m| sp.allele2(m)).collect();
-                    let sample_conf: Vec<f32> = (0..n_markers).map(|m| sp.confidence(m)).collect();
-                    let sample_seed = (self.config.seed as u64)
-                        .wrapping_add(s as u64)
-                        .wrapping_add(0xBEEF_CAFE_55AAu64);
-
-                    // Collect EM statistics if requested
-                    if let Some(atomic) = atomic_estimates {
-                        let hmm = BeagleHmm::new(ref_view, &self.params, n_states, p_recomb.to_vec());
-                        let mut local_est = crate::model::parameters::ParamEstimates::new();
-                        hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
-                        hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
-                        atomic.add_estimation_data(&local_est);
-                    }
-
-                    // Identify heterozygote positions (ONLY after overlap region for decisions)
-                    // But we still need full het list for backward pass
-                    let het_positions: Vec<usize> = (0..n_markers)
-                        .filter(|&m| {
-                            let a1 = seq1[m];
-                            let a2 = seq2[m];
-                            a1 != 255 && a2 != 255 && a1 != a2
-                        })
-                        .collect();
-
-                    // Find first het index after overlap region
-                    let first_changeable_het = het_positions.iter().position(|&m| m >= overlap_markers).unwrap_or(het_positions.len());
-                    let changeable_positions: Vec<usize> = het_positions[first_changeable_het..].to_vec();
-                    if changeable_positions.is_empty() {
-                        return bitbox![u64, Lsb0; 0; n_markers];
-                    }
-
-                    let p_err = self.params.p_mismatch;
-                    let p_no_err = 1.0 - p_err;
-
-                    // Pre-compute state->hap mapping for all (marker, state) pairs
-                    // Build allele lookup directly from ThreadedHaps (avoids O(n_markers × n_states × 4) temp)
-                    let lookup = RefAlleleLookup::new_from_threaded(
-                        &threaded_haps,
-                        n_markers,
-                        n_states,
-                        n_haps,
-                        ref_geno,
-                        self.reference_gt.as_deref(),
-                        self.alignment.as_ref(),
-                        None,
-                    );
-
-                    let (swap_bits, swap_lr) = THREAD_WORKSPACE.with(|ws| {
-                        let mut workspace = ws.borrow_mut();
-                        if workspace.is_none() {
-                            *workspace = Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
-                        }
-                        let ws = workspace.as_mut().unwrap();
-                        ws.clear(); // Explicit reset between samples
-                        sample_swap_bits_mosaic(
-                            n_markers,
-                            n_states,
-                            p_recomb,
-                            &seq1,
-                            &seq2,
-                            &sample_conf,
-                            &lookup,
-                            &changeable_positions,
-                            sample_seed,
-                            self.config.mcmc_burnin,
-                            p_no_err,
-                            p_err,
-                            ws,
-                        )
-                    });
+        // After computing swap masks for all samples, apply them in parallel.
+        // This uses a parallel iterator to avoid false sharing between threads.
+        info_span!("apply_swaps").in_scope(|| {
+            swap_masks.into_par_iter().enumerate().for_each(|(s, mask)| {
+                let sample_idx = SampleIdx::new(s as u32);
+                let hap1 = sample_idx.hap1();
+                let hap2 = sample_idx.hap2();
+                geno.swap_haplotypes(hap1, hap2, &mask);
+            });
+        });
                     assert!(swap_lr.len() <= changeable_positions.len());
                     let mut swap_mask = bitbox![u64, Lsb0; 0; n_markers];
                     let mut current_phase = 0u8;

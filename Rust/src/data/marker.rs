@@ -137,6 +137,10 @@ pub struct Marker {
     pub ref_allele: Allele,
     /// Alternate allele(s)
     pub alt_alleles: Vec<Allele>,
+    /// Genetic position in cM (defaults to 0.0)
+    pub pos_cm: f64,
+    /// Minor Allele Frequency (defaults to 0.0)
+    pub maf: f32,
 }
 
 impl Marker {
@@ -155,6 +159,8 @@ impl Marker {
             id,
             ref_allele,
             alt_alleles,
+            pos_cm: 0.0,
+            maf: 0.0,
         }
     }
 
@@ -197,6 +203,8 @@ impl Marker {
             id,
             ref_allele,
             alt_alleles,
+            pos_cm: 0.0,
+            maf: 0.0,
         }
     }
 }

@@ -31,395 +31,27 @@ use crate::utils::workspace::ImpWorkspace;
 use crate::model::imp_ibs::{build_cluster_hap_sequences_for_targets, ClusterCodedSteps, ImpIbs};
 use crate::model::imp_states_cluster::ImpStatesCluster;
 use crate::model::parameters::ModelParams;
+use crate::data::alignment::MarkerAlignment;
+use crate::model::imp_utils::{
+    compute_marker_clusters_with_blocks, compute_ref_cluster_bounds, compute_cluster_weights,
+    build_marker_cluster_index, compute_targ_block_end, compute_state_probs,
+    MarkerCluster, CompactDr2Entry
+};
 
 /// Minimum genetic distance between markers (matches Java Beagle)
 const MIN_CM_DIST: f64 = 1e-7;
 
-/// Compact DR2 data entry to avoid heap allocation for biallelic sites.
-/// Biallelic sites (99%+ of markers) use inline f32s instead of Vec<f32>.
-/// This reduces memory from ~80 bytes/marker to ~20 bytes/marker.
-enum CompactDr2Entry {
-    /// Biallelic site: store P(ALT) for each haplotype (no heap allocation)
-    Biallelic {
-        marker: u32,
-        p1: f32,
-        p2: f32,
-        skip: bool,
-        true_gt: Option<(u8, u8)>,
-    },
-    /// Multiallelic site: store full probability vectors (rare)
-    Multiallelic {
-        marker: u32,
-        probs1: Vec<f32>,
-        probs2: Vec<f32>,
-        skip: bool,
-        true_gt: Option<(u8, u8)>,
-    },
-}
+
 
 /// Imputation pipeline
 pub struct ImputationPipeline {
-    config: Config,
-    params: ModelParams,
-}
-
-/// A cluster of nearby genotyped markers
-///
-/// Matches Java ImpData's targClustStartEnd concept.
-/// Markers within cluster_dist cM are grouped together.
-#[derive(Clone, Debug)]
-struct MarkerCluster {
-    /// Start index in the genotyped markers array (inclusive)
-    start: usize,
-    /// End index in the genotyped markers array (exclusive)
-    end: usize,
-}
-
-/// Compute marker clusters based on genetic distance
-///
-/// Matches Java ImpData.targClustStartEnd():
-/// - Groups markers that are within cluster_dist cM of each other
-/// - Each cluster contains one or more consecutive genotyped markers
-///
-/// # Arguments
-/// * `genotyped_markers` - Indices of genotyped markers in reference space
-/// * `gen_positions` - Cumulative genetic positions for ALL reference markers
-/// * `cluster_dist` - Maximum genetic distance within a cluster (cM)
-fn compute_marker_clusters(
-    genotyped_markers: &[usize],
-    gen_positions: &[f64],
-    cluster_dist: f64,
-) -> Vec<MarkerCluster> {
-    if genotyped_markers.is_empty() {
-        return Vec::new();
-    }
-
-    let mut clusters = Vec::new();
-    let mut cluster_start = 0;
-    let mut start_pos = gen_positions[genotyped_markers[0]];
-
-    for m in 1..genotyped_markers.len() {
-        let pos = gen_positions[genotyped_markers[m]];
-        if pos - start_pos > cluster_dist {
-            // Start new cluster
-            clusters.push(MarkerCluster {
-                start: cluster_start,
-                end: m,
-            });
-            cluster_start = m;
-            start_pos = pos;
-        }
-    }
-
-    // Add final cluster
-    clusters.push(MarkerCluster {
-        start: cluster_start,
-        end: genotyped_markers.len(),
-    });
-
-    clusters
-}
-
-fn compute_marker_clusters_with_blocks(
-    genotyped_markers: &[usize],
-    gen_positions: &[f64],
-    cluster_dist: f64,
-    block_end: &[usize],
-) -> Vec<MarkerCluster> {
-    if genotyped_markers.is_empty() {
-        return Vec::new();
-    }
-
-    let mut clusters = Vec::new();
-    let mut block_start = 0usize;
-    let mut block_end_iter = block_end.iter().copied().filter(|&v| v > 0);
-
-    while let Some(block_end_idx) = block_end_iter.next() {
-        if block_end_idx <= block_start {
-            continue;
-        }
-        let mut cluster_start = block_start;
-        let mut start_pos = gen_positions[genotyped_markers[cluster_start]];
-
-        for m in (cluster_start + 1)..block_end_idx {
-            let pos = gen_positions[genotyped_markers[m]];
-            if pos - start_pos > cluster_dist {
-                clusters.push(MarkerCluster {
-                    start: cluster_start,
-                    end: m,
-                });
-                cluster_start = m;
-                start_pos = pos;
-            }
-        }
-
-        clusters.push(MarkerCluster {
-            start: cluster_start,
-            end: block_end_idx,
-        });
-        block_start = block_end_idx;
-    }
-
-    if clusters.is_empty() {
-        compute_marker_clusters(genotyped_markers, gen_positions, cluster_dist)
-    } else {
-        clusters
-    }
-}
-
-fn compute_ref_cluster_bounds(
-    genotyped_markers: &[usize],
-    clusters: &[MarkerCluster],
-) -> (Vec<usize>, Vec<usize>) {
-    let mut starts = Vec::with_capacity(clusters.len());
-    let mut ends = Vec::with_capacity(clusters.len());
-    for cluster in clusters {
-        let start = genotyped_markers[cluster.start];
-        let end = genotyped_markers[cluster.end - 1] + 1;
-        starts.push(start);
-        ends.push(end);
-    }
-    (starts, ends)
-}
-
-fn compute_cluster_weights(
-    gen_positions: &[f64],
-    ref_cluster_start: &[usize],
-    ref_cluster_end: &[usize],
-) -> Vec<f32> {
-    let n_ref_markers = gen_positions.len();
-    let mut wts = vec![f32::NAN; n_ref_markers];
-    if ref_cluster_start.is_empty() {
-        return wts;
-    }
-
-    for c in 0..ref_cluster_start.len().saturating_sub(1) {
-        let end = ref_cluster_end[c];
-        let next_start = ref_cluster_start[c + 1];
-        if end == 0 || next_start <= end {
-            continue;
-        }
-        let next_start_pos = gen_positions[next_start];
-        let end_pos = gen_positions[end - 1];
-        let total_len = (next_start_pos - end_pos).max(1e-12);
-
-        for m in end..next_start {
-            let wt = (next_start_pos - gen_positions[m]) / total_len;
-            wts[m] = wt as f32;
-        }
-    }
-    wts
-}
-
-fn build_marker_cluster_index(
-    ref_cluster_start: &[usize],
-    n_ref_markers: usize,
-) -> Vec<usize> {
-    let mut marker_cluster = vec![0usize; n_ref_markers];
-    if ref_cluster_start.is_empty() {
-        return marker_cluster;
-    }
-    let mut c = 0usize;
-    for m in 0..n_ref_markers {
-        while c + 1 < ref_cluster_start.len() && m >= ref_cluster_start[c + 1] {
-            c += 1;
-        }
-        marker_cluster[m] = c;
-    }
-    marker_cluster
+    pub(crate) config: Config,
+    pub(crate) params: ModelParams,
 }
 
 
-// Helper to get (log_match, log_mismatch) probabilities
-#[inline]
-fn get_log_probs(conf: f32, p_err: f32) -> (f32, f32) {
-    let p_no_err = 1.0 - p_err;
-    // P(Match) = Conf * (1-e) + (1-Conf) * 0.5
-    // P(Mismatch) = Conf * e + (1-Conf) * 0.5
-    let half_compl = (1.0 - conf) * 0.5;
-    let match_prob = conf * p_no_err + half_compl;
-    let mismatch_prob = conf * p_err + half_compl;
-    
-    // We expect probabilities to be non-zero given the construction
-    // but safe_ln is good practice or just .ln() if we trust
-    (match_prob.ln(), mismatch_prob.ln())
-}
 
-/// Computes deviations from the "Best Match" score for CSR storage.
-///
-/// **Mathematical Logic**:
-/// We model the emission as:
-/// $P(Obs|State) = \prod_{m} P(Obs_m | State_m)$
-/// Log-Likelihood = $\sum_{m} \ln P(Obs_m | State_m)$
-///
-/// We decommission the "Base Score" to be $\sum \ln P(Match)$.
-/// Then we only store deviations $(\ln P(Mismatch) - \ln P(Match))$ for mismatches.
-/// If a reference is missing, we subtract $\ln P(Match)$ (effectively resetting to $\ln(1.0)=0$).
-///
-/// **Performance Score**:
-/// Hoists `GenotypeColumn` dispatch out of the inner loop to avoid virtual calls.
-#[allow(clippy::too_many_lines)]
-fn compute_cluster_mismatches_into_workspace(
-    hap_indices: &[Vec<u32>],
-    cluster_bounds: &[(usize, usize)],
-    genotyped_markers: &[usize],
-    target_gt: &GenotypeMatrix<Phased>,
-    ref_gt: &GenotypeMatrix<Phased>,
-    alignment: &MarkerAlignment,
-    targ_hap: usize,
-    n_states: usize,
-    workspace: &mut ImpWorkspace,
-    base_err_rate: f32, // Added parameter
-) {
-    workspace.reset_and_ensure_capacity(hap_indices.len(), n_states);
 
-    let n_clusters = hap_indices.len();
-    let targ_hap_idx = HapIdx::new(targ_hap as u32);
-    // Genotyped target is effectively dense/phased for these markers usually
-    let sample_idx = targ_hap_idx.sample().as_usize();
-
-    // Constant error rate parameter for LLR
-    let p_err = base_err_rate.clamp(1e-8, 0.5);
-
-    for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
-        if c >= n_clusters {
-            break;
-        }
-
-        // Reset cluster accumulators
-        let row_buffer = &mut workspace.row_buffer;
-        row_buffer.fill(0.0);
-        
-        // Base Score: Sum of All Matches
-        let mut cluster_base_score = 0.0f32;
-
-        for &ref_m in &genotyped_markers[start..end] {
-            let Some(target_m) = alignment.target_marker(ref_m) else {
-                continue;
-            };
-            let target_marker_idx = MarkerIdx::new(target_m as u32);
-            let targ_allele = target_gt.allele(target_marker_idx, targ_hap_idx);
-            if targ_allele == 255 {
-                continue;
-            }
-            let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
-            if confidence <= 0.0 {
-                continue;
-            }
-            
-            // Calculate LLR values
-            let (log_match, log_mism) = get_log_probs(confidence, p_err);
-            let log_diff = log_mism - log_match;
-            
-            // Assume match for everyone initially
-            cluster_base_score += log_match;
-
-            // Hoist column lookup out of inner loop
-            let ref_marker_idx = MarkerIdx::new(ref_m as u32);
-            let ref_column = ref_gt.column(ref_marker_idx);
-
-            // Inner Loop Macro to avoid duplication across enum variants
-            // Updates row_buffer with deviations
-            macro_rules! process_states {
-                ($col:expr, $get_fn:expr) => {
-                    for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
-                        let ref_allele = $get_fn($col, HapIdx::new(hap));
-                        // Remap if needed (hoisted check?)
-                        // To allow hoisting the map check, we would need 2 macros or check inside.
-                        // Checking alignment inside the enum match is fine.
-                        
-                        let final_ref = if alignment.has_allele_mapping(target_m) {
-                             alignment.reverse_map_allele(target_m, ref_allele)
-                        } else {
-                            ref_allele
-                        };
-
-                        if final_ref == 255 {
-                            // Ref missing: remove strict match assumption
-                            // Score -= log_match => 0 (neutral)
-                            row_buffer[j] -= log_match;
-                        } else if final_ref != targ_allele {
-                            // Mismatch: convert match score to mismatch score
-                            // Score += (log_mism - log_match)
-                            row_buffer[j] += log_diff;
-                        }
-                    }
-                }
-            }
-
-            // Enum Dispatch Hoisting
-            match ref_column {
-                GenotypeColumn::Dense(col) => {
-                     process_states!(col, |c: &crate::data::storage::dense::DenseColumn, h| c.get(h));
-                },
-                GenotypeColumn::Sparse(col) => {
-                     process_states!(col, |c: &crate::data::storage::sparse::SparseColumn, h| c.get(h));
-                },
-                GenotypeColumn::Dictionary(col, offset) => {
-                     process_states!(col, |c: &std::sync::Arc<crate::data::storage::dictionary::DictionaryColumn>, h| c.get(*offset, h));
-                },
-                GenotypeColumn::SeqCoded(col) => {
-                     process_states!(col, |c: &crate::data::storage::seq_coded::SeqCodedColumn, h| c.get(h));
-                }
-            }
-        }
-        
-        workspace.cluster_base_scores.push(cluster_base_score);
-
-        // Compress Diffs -> CSR
-        for (j, &val) in row_buffer.iter().enumerate().take(n_states) {
-            // Include mismatches AND missing ref corrections (both stored in row_buffer)
-            // Storing absolute value threshold > 1e-6 to avoid compression noise?
-            // Usually val != 0.0 is enough.
-            if val.abs() > 1e-9 {
-                workspace.diff_vals.push(val);
-                workspace.diff_cols.push(j as u16);
-            }
-        }
-        workspace.diff_row_offsets.push(workspace.diff_vals.len());
-    }
-}
-
-fn compute_targ_block_end<S: crate::data::storage::phase_state::PhaseState>(
-    ref_gt: &GenotypeMatrix<Phased>,
-    target_gt: &GenotypeMatrix<S>,
-    alignment: &MarkerAlignment,
-    genotyped_markers: &[usize],
-) -> Vec<usize> {
-    let n_ref_haps = ref_gt.n_haplotypes();
-    let mut block_end = Vec::new();
-    if genotyped_markers.is_empty() {
-        return block_end;
-    }
-
-    let mut last_hash: u64 = 0;
-    let mut initialized = false;
-    for (idx, &ref_m) in genotyped_markers.iter().enumerate() {
-        let Some(target_m) = alignment.target_marker(ref_m) else {
-            continue;
-        };
-        let target_marker_idx = MarkerIdx::new(target_m as u32);
-        let n_alleles = 1 + target_gt.marker(target_marker_idx).alt_alleles.len();
-        let missing_allele = n_alleles as u8;
-        let mut hash = 0xcbf29ce484222325u64;
-        for h in 0..n_ref_haps {
-            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32));
-            let mut allele = alignment.reverse_map_allele(target_m, ref_allele);
-            if allele == 255 {
-                allele = missing_allele;
-            }
-            hash ^= allele as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        if initialized && hash != last_hash {
-            block_end.push(idx);
-        }
-        last_hash = hash;
-        initialized = true;
-    }
-    block_end.push(genotyped_markers.len());
-    block_end
-}
 
 /// Marker alignment between target and reference panels
 #[derive(Clone, Debug)]
@@ -1344,11 +976,13 @@ impl ImputationPipeline {
     }
 
     /// Run imputation with streaming to avoid OOM on large reference panels
-            eprintln!("Loading target VCF...");
-            let (mut target_reader, target_file) = VcfReader::open(&self.config.gt)?;
-            let target_samples = target_reader.samples_arc();
-            let target_gt = target_reader.read_all(target_file)?;
-            Ok::<_, crate::error::ReagleError>((target_reader, target_gt, target_samples))
+            info_span!("load_target").in_scope(|| {
+                eprintln!("Loading target VCF...");
+                let (mut target_reader, target_file) = VcfReader::open(&self.config.gt)?;
+                let target_samples = target_reader.samples_arc();
+                let target_gt = target_reader.read_all(target_file)?;
+                Ok::<_, crate::error::ReagleError>((target_reader, target_gt, target_samples))
+            })
         })?;
 
         let ref_gt: Arc<GenotypeMatrix<Phased>> = info_span!("load_reference").in_scope(|| {
@@ -1510,7 +1144,7 @@ impl ImputationPipeline {
 
         // Compute cumulative genetic positions for ALL reference markers
         // Wrapped in Arc to share across all haplotypes without cloning
-        let gen_positions: std::sync::Arc<Vec<f64>> = {
+        let gen_positions: std::sync::Arc<Vec<f64>> = info_span!("compute_genetic_positions").in_scope(|| {
             let mut positions = Vec::with_capacity(n_ref_markers);
             let mut cumulative = 0.0f64;
             positions.push(0.0);
@@ -1522,11 +1156,15 @@ impl ImputationPipeline {
                 positions.push(cumulative);
             }
             std::sync::Arc::new(positions)
-        };
+        });
 
         // Compute marker clusters per sample to avoid cross-sample leakage.
         let cluster_dist = self.config.cluster as f64;
         let base_err_rate = self.params.p_mismatch;
+
+        info_span!("compute_marker_clusters").in_scope(|| {
+            eprintln!("Computing marker clusters for {} samples...", n_target_samples);
+        });
 
         eprintln!(
             "  HMM on per-sample clusters ({} genotyped markers), interpolating {} ungenotyped",
@@ -1600,9 +1238,11 @@ impl ImputationPipeline {
                 // Returns: Vec<(sample_idx, dosages, best_gt, posteriors, dr2_data)>
                 // CompactDr2Entry avoids heap allocation for biallelic sites (99%+)
                 type Dr2Data = Vec<CompactDr2Entry>;
-                let batch_results: Vec<(usize, Vec<f32>, Vec<(u8, u8)>, Option<Vec<(f32, f32)>>, Dr2Data)> = batch_samples
-                    .par_iter()
-                    .map(|&s| {
+                let batch_results: Vec<(usize, Vec<f32>, Vec<(u8, u8)>, Option<Vec<(f32, f32)>>, Dr2Data)> = info_span!("process_batch", batch_idx = batch_idx).in_scope(|| {
+                    batch_samples
+                        .par_iter()
+                        .map(|&s| {
+                            info_span!("process_sample", sample_idx = s).in_scope(|| {
                         let hap1_idx = HapIdx::new((s * 2) as u32);
                         let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
                         let target_haps = [hap1_idx, hap2_idx];
@@ -1633,6 +1273,7 @@ impl ImputationPipeline {
                             ));
                             (empty.clone(), empty)
                         } else {
+                            info_span!("compute_sample_clusters").in_scope(|| {
                             let targ_block_end = compute_targ_block_end(&ref_gt, &target_gt, &alignment, &sample_genotyped);
                             let clusters = compute_marker_clusters_with_blocks(
                                 &sample_genotyped,
@@ -1703,9 +1344,7 @@ impl ImputationPipeline {
                                 let mut hap_indices: Vec<Vec<u32>> = Vec::new();
                                 let actual_n_states = imp_states.ibs_states_cluster(local_h, &mut hap_indices);
 
-                                // Reuse workspace buffers for cluster mismatches (avoids allocation)
-                                workspace.reset_and_ensure_capacity(n_clusters, actual_n_states);
-                                compute_cluster_mismatches_into_workspace(
+                                let probs = compute_state_probs(
                                     &hap_indices,
                                     &cluster_bounds,
                                     &sample_genotyped,
@@ -1716,41 +1355,16 @@ impl ImputationPipeline {
                                     actual_n_states,
                                     &mut workspace,
                                     base_err_rate,
-                                );
-
-                                // Use memory-efficient checkpointed HMM that outputs sparse directly
-                                let threshold = if n_clusters <= 1000 {
-                                    0.0
-                                } else {
-                                    (0.9999f32 / actual_n_states as f32).min(0.005f32)
-                                };
-                                let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) =
-                                    run_hmm_forward_backward_to_sparse(
-                                        &workspace.diff_vals,
-                                        &workspace.diff_cols,
-                                        &workspace.diff_row_offsets,
-                                        &workspace.cluster_base_scores,
-                                        &cluster_p_recomb,
-                                        actual_n_states,
-                                        &hap_indices,
-                                        threshold,
-                                        &mut workspace.fwd,
-                                        &mut workspace.bwd,
-                                        &mut workspace.block_fwd,
-                                    );
-
-                                out.push(Arc::new(ClusterStateProbs::from_sparse(
+                                    &cluster_p_recomb,
                                     std::sync::Arc::clone(&marker_cluster),
                                     std::sync::Arc::clone(&ref_cluster_end),
                                     std::sync::Arc::clone(&cluster_weights),
-                                    offsets,
-                                    sparse_haps,
-                                    sparse_probs,
-                                    sparse_probs_p1,
-                                )));
-                            }
-                            (out[0].clone(), out[1].clone())
-                        };
+                                );
+                                out.push(probs);
+                             }
+                             (out[0].clone(), out[1].clone())
+                             })
+                         };
 
                         // Compute dosages and collect DR2 data for all markers
                         let get_ref_allele = |ref_m: usize, hap: u32| -> u8 {
@@ -1769,7 +1383,8 @@ impl ImputationPipeline {
                         let mut probs1 = vec![0.0f32; max_alleles];
                         let mut probs2 = vec![0.0f32; max_alleles];
 
-                        for m in 0..n_ref_markers {
+                        info_span!("compute_dosages").in_scope(|| {
+                            for m in 0..n_ref_markers {
                             let n_alleles = n_alleles_per_marker[m];
                             let is_genotyped = has_observed[m];
 
@@ -1894,13 +1509,16 @@ impl ImputationPipeline {
                                     skip,
                                     true_gt,
                                 });
-                            }
-                        }
+                             }
+                         }
+                        });
 
                         // sp1, sp2 are dropped here when returning
                         (s, dosages, best_gt_for_sample, posteriors_for_sample, dr2_data)
-                    })
-                    .collect();
+                            })
+                        })
+                    .collect()
+                });
 
                 // Sort results by sample index for sequential writes
                 let mut sorted_results = batch_results;
@@ -2052,583 +1670,7 @@ impl ImputationPipeline {
         eprintln!("Imputation complete!");
         Ok(())
     }
-/// This is the cluster-aggregated version that:
-/// 1. Operates on C clusters instead of M markers (10-50x faster)
-/// 2. Uses per-marker mismatch probability applied across all observed markers
-/// 3. Matches Java's exact mathematical model
-///
-/// # Arguments
-/// * `cluster_mismatches` - For each cluster, mismatch counts per state
-/// * `cluster_non_missing` - For each cluster, observed marker counts per state
-/// * `p_recomb` - Per-cluster recombination probabilities
-/// * `p_err` - Per-marker mismatch probability
-/// * `n_states` - Number of HMM states
-/// * `workspace` - Reusable workspace for temporary storage
-///
-/// # Returns
-/// Flat array of state probabilities: cluster_state_probs[c * n_states + k] = P(state k | cluster c)
-#[cfg(test)]
-pub fn run_hmm_forward_backward_clusters(
-    cluster_mismatches: &[Vec<f32>],
-    cluster_non_missing: &[Vec<f32>],
-    p_recomb: &[f32],
-    p_err: f32,
-    n_states: usize,
-    workspace: &mut ImpWorkspace,
-) -> Vec<f32> {
-    let n_clusters = cluster_mismatches.len();
-    if n_clusters == 0 || n_states == 0 {
-        return Vec::new();
-    }
 
-    // Ensure workspace is sized correctly
-    workspace.resize(n_states);
-
-    let p_err = p_err.clamp(1e-8, 0.5);
-    let p_no_err = 1.0 - p_err;
-    let log_p_err = p_err.ln();
-    let log_p_no_err = p_no_err.ln();
-
-    // Forward pass
-    let total_size = n_clusters * n_states;
-    let mut fwd: Vec<f32> = vec![0.0; total_size];
-    let mut fwd_sum = 1.0f32;
-
-    for (c, mismatches) in cluster_mismatches.iter().enumerate().take(n_clusters) {
-        let p_rec = p_recomb.get(c).copied().unwrap_or(0.0);
-        let shift = p_rec / n_states as f32;
-        let scale = (1.0 - p_rec) / fwd_sum;
-
-        let mut new_sum = 0.0f32;
-        let row_offset = c * n_states;
-        let prev_row_offset = if c > 0 { (c - 1) * n_states } else { 0 };
-
-        for k in 0..n_states.min(mismatches.len()) {
-            let n_obs = cluster_non_missing
-                .get(c)
-                .and_then(|row| row.get(k))
-                .copied()
-                .unwrap_or(0.0);
-            let mismatch_count = mismatches[k].min(n_obs);
-            let match_count = (n_obs - mismatch_count).max(0.0);
-            // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
-            // Floor at -80 to prevent f32 underflow (exp(-80) ≈ 1.8e-35)
-            let log_emit = match_count * log_p_no_err + mismatch_count * log_p_err;
-            let emit = if n_obs > 0.0 {
-                log_emit.max(-80.0).exp()
-            } else {
-                1.0
-            };
-
-            let val = if c == 0 {
-                emit / n_states as f32
-            } else {
-                emit * (scale * fwd[prev_row_offset + k] + shift)
-            };
-
-            fwd[row_offset + k] = val;
-            new_sum += val;
-        }
-        fwd_sum = new_sum;
-    }
-
-    // Backward pass
-    let bwd = &mut workspace.bwd;
-    bwd.resize(n_states, 0.0);
-    bwd.fill(1.0 / n_states as f32);
-
-    for c in (0..n_clusters).rev() {
-        // Update bwd to correspond to cluster c using emissions at c+1 and transition
-        if c < n_clusters - 1 {
-            let p_rec = p_recomb.get(c + 1).copied().unwrap_or(0.0);
-            let shift = p_rec / n_states as f32;
-
-            let mismatches = &cluster_mismatches[c + 1];
-
-            let mut emitted_sum = 0.0f32;
-            for k in 0..n_states.min(mismatches.len()) {
-                let n_obs = cluster_non_missing
-                    .get(c + 1)
-                    .and_then(|row| row.get(k))
-                    .copied()
-                    .unwrap_or(0.0);
-                let mismatch_count = mismatches[k].min(n_obs);
-                let match_count = (n_obs - mismatch_count).max(0.0);
-                // Product emission: P(obs|state) = (1-ε)^matches * ε^mismatches
-                let log_emit = match_count * log_p_no_err + mismatch_count * log_p_err;
-                let emit = if n_obs > 0.0 {
-                    log_emit.max(-80.0).exp()
-                } else {
-                    1.0
-                };
-                bwd[k] *= emit;
-                emitted_sum += bwd[k];
-            }
-
-            if emitted_sum > 0.0 {
-                let scale = (1.0 - p_rec) / emitted_sum;
-                for k in 0..n_states {
-                    bwd[k] = scale * bwd[k] + shift;
-                }
-            } else {
-                let uniform = 1.0 / n_states as f32;
-                for k in 0..n_states {
-                    bwd[k] = uniform;
-                }
-            }
-        }
-
-        // Compute posterior: fwd * bwd for cluster c
-        let row_offset = c * n_states;
-        let mut state_sum = 0.0f32;
-        for (k, val) in bwd.iter().enumerate().take(n_states) {
-            let idx = row_offset + k;
-            fwd[idx] *= val;
-            state_sum += fwd[idx];
-        }
-
-        // Normalize
-        if state_sum > 0.0 {
-            let inv_sum = 1.0 / state_sum;
-            for k in 0..n_states {
-                fwd[row_offset + k] *= inv_sum;
-            }
-        }
-    }
-
-    fwd
-}
-
-/// Forward-backward HMM directly to sparse CSR format.
-///
-/// This fuses HMM computation with sparse output building, avoiding the
-/// O(n_clusters × n_states) dense intermediate allocation.
-///
-/// Uses checkpointing: stores forward values every CHECKPOINT_INTERVAL markers,
-/// then recomputes from checkpoints during backward pass.
-///
-/// Memory: O(n_clusters/64 × n_states + n_clusters + n_states) instead of O(n_clusters × n_states)
-///
-/// # Arguments
-/// * `fwd_buffer` - Pre-allocated forward probabilities buffer (will be resized)
-/// * `bwd_buffer` - Pre-allocated backward probabilities buffer (will be resized)
-/// Forward-backward HMM directly to sparse CSR format.
-///
-/// This fuses HMM computation with sparse output building, avoiding the
-/// O(n_clusters × n_states) dense intermediate allocation.
-///
-/// Uses checkpointing: stores forward values every CHECKPOINT_INTERVAL markers,
-/// then recomputes from checkpoints during backward pass.
-///
-/// Memory: O(n_clusters/64 × n_states + n_clusters + n_states) instead of O(n_clusters × n_states)
-///
-/// # Arguments
-/// * `fwd_buffer` - Pre-allocated forward probabilities buffer (will be resized)
-/// * `bwd_buffer` - Pre-allocated backward probabilities buffer (will be resized)
-/// * `block_fwd_buffer` - Pre-allocated block forward buffer for block-wise recomputation
-pub fn run_hmm_forward_backward_to_sparse(
-    diff_vals: &[f32],
-    diff_cols: &[u16],
-    diff_row_offsets: &[usize],
-    cluster_base_scores: &[f32],
-    p_recomb: &[f32],
-
-    n_states: usize,
-    hap_indices_input: &[Vec<u32>],
-    threshold: f32,
-    fwd_buffer: &mut Vec<f32>,
-    bwd_buffer: &mut Vec<f32>,
-    block_fwd_buffer: &mut Vec<f32>,
-) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
-    use wide::f32x8;
-
-    let n_clusters = cluster_base_scores.len();
-    if n_clusters == 0 {
-        return (vec![0], Vec::new(), Vec::new(), Vec::new());
-    }
-
-    // Checkpoint interval for memory efficiency
-    const CHECKPOINT_INTERVAL: usize = 64;
-    let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
-
-    // Allocate checkpoint storage + working buffers
-    // Layout: [checkpoints...][curr_row][prev_row]
-    let fwd = fwd_buffer;
-    fwd.resize(n_checkpoints * n_states + 2 * n_states, 0.0);
-    let curr_base = n_checkpoints * n_states;
-    let prev_base = curr_base + n_states;
-
-    // Store forward sums
-    let mut fwd_sums = vec![1.0f32; n_clusters];
-
-    // ========== FORWARD PASS: compute and checkpoint ==========
-    let mut last_sum = 1.0f32;
-
-    for m in 0..n_clusters {
-        let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
-        let shift = p_rec / n_states as f32;
-        let scale = (1.0 - p_rec) / last_sum.max(1e-30);
-
-        // Swap curr/prev concept
-        let (curr_off, _) = if m % 2 == 0 {
-            (curr_base, prev_base)
-        } else {
-            (prev_base, curr_base)
-        };
-
-        // Calculate base emission for this cluster: exp(sum(ln_match))
-        // We perform the exp here to convert back to probability space for the linear transition
-        let base_emit = cluster_base_scores[m].exp();
-
-        // Initialize transition values
-        if m == 0 {
-            // First step: uniform prior (implicit transition from start)
-            // But we must apply Emission(0).
-            // Emission(0) = BaseEmit * Penaltys.
-            
-            // Distribute Base Uniformly
-            let val = base_emit / n_states as f32;
-            fwd[curr_off..curr_off+n_states].fill(val);
-        } else {
-            // Standard transition: emit * (scale * prev + shift)
-            // We apply (scale * prev + shift) first using SIMD
-            
-            let (lower, upper) = fwd.split_at_mut(prev_base);
-            // lower: [0..prev_base], upper: [prev_base..]
-            
-            let (curr_slice, prev_slice) = if m % 2 == 0 {
-                // curr at curr_base (in lower), prev at prev_base (in upper)
-                (&mut lower[curr_base..curr_base+n_states], &upper[..n_states])
-            } else {
-                // curr at prev_base (in upper), prev at curr_base (in lower)
-                (&mut upper[..n_states], &lower[curr_base..curr_base+n_states])
-            };
-
-            // Vectorized Transition
-            let shift_vec = f32x8::splat(shift);
-            let scale_vec = f32x8::splat(scale);
-            let emit_vec = f32x8::splat(base_emit);
-            
-            let mut k = 0;
-            while k + 8 <= n_states {
-                // Safe slice conversion to arrayRef for f32x8
-                let prev_chunk_arr: &[f32; 8] = prev_slice[k..k+8].try_into().unwrap();
-                let prev_vec = f32x8::from(*prev_chunk_arr);
-                
-                // (prev * scale + shift) * emit
-                // mul_add(a, b, c) -> a * b + c
-                let trans = prev_vec.mul_add(scale_vec, shift_vec);
-                let res = trans * emit_vec;
-                
-                let res_arr: [f32; 8] = res.into();
-                curr_slice[k..k+8].copy_from_slice(&res_arr);
-                
-                k += 8;
-            }
-            
-            // Scalar Tail
-            for i in k..n_states {
-                let p = prev_slice[i];
-                curr_slice[i] = base_emit * (scale * p + shift);
-            }
-        }
-        
-        // Improve slice access for next steps to avoid borrow conflict
-        let curr_slice = &mut fwd[curr_off..curr_off+n_states];
-
-        // Apply Sparse Penalties (Mismatch + Missing Ref)
-        // penalty = exp(diff_val)
-        let start = diff_row_offsets[m];
-        let end = diff_row_offsets[m+1];
-        for i in start..end {
-            let col = diff_cols[i] as usize;
-            let val = diff_vals[i];
-            if col < n_states {
-                let penalty = val.exp();
-                // Ensure min probability 1e-20 relative to base
-                // trans_prob is estimated as current / base_emit
-                let trans_prob = curr_slice[col] / base_emit;
-                curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
-            }
-        }
-
-        // Sum and Checkpoint (Vectorized)
-        let mut new_sum = 0.0f32;
-        let mut k = 0;
-        let mut sum_vec = f32x8::splat(0.0);
-        while k + 8 <= n_states {
-             let chunk_arr: &[f32; 8] = curr_slice[k..k+8].try_into().unwrap();
-             let chunk = f32x8::from(*chunk_arr);
-             sum_vec += chunk;
-             k += 8;
-        }
-        new_sum += sum_vec.reduce_add();
-        for &x in &curr_slice[k..n_states] {
-            new_sum += x;
-        }
-
-        fwd_sums[m] = new_sum;
-        last_sum = new_sum;
-
-        if (m + 1) % CHECKPOINT_INTERVAL == 0 {
-            // Save normalized checkpoint
-            let cp_idx = ((m + 1) / CHECKPOINT_INTERVAL - 1) * n_states;
-            let inv_sum = if new_sum > 1e-30 { 1.0 / new_sum } else { 0.0 };
-            
-            let (checkpoints, working) = fwd.split_at_mut(curr_base);
-            
-            let src_off = if m % 2 == 0 { 0 } else { n_states };
-            let src = &working[src_off..src_off+n_states];
-            
-            for (i, &x) in src.iter().enumerate() {
-                checkpoints[cp_idx + i] = x * inv_sum;
-            }
-        }
-    }
-
-
-    let block_fwd = block_fwd_buffer;
-    block_fwd.resize((CHECKPOINT_INTERVAL + 1) * n_states, 0.0);
-
-    let bwd = bwd_buffer;
-    bwd.resize(n_states, 0.0);
-    bwd.fill(1.0 / n_states as f32);
-
-    let estimated_nnz = n_clusters * 50;
-    let mut hap_indices = Vec::with_capacity(estimated_nnz);
-    let mut probs = Vec::with_capacity(estimated_nnz);
-    let mut probs_p1 = Vec::with_capacity(estimated_nnz);
-    let mut entry_counts = Vec::with_capacity(n_clusters);
-    let mut curr_posteriors = vec![0.0f32; n_states];
-    let mut next_posteriors = vec![0.0f32; n_states];
-
-    for block_idx in (0..n_checkpoints).rev() {
-        let block_start = block_idx * CHECKPOINT_INTERVAL;
-        let block_end = ((block_idx + 1) * CHECKPOINT_INTERVAL).min(n_clusters);
-
-        if block_start >= n_clusters {
-            continue;
-        }
-
-        let mut recomp_sum;
-        let mut curr_off;
-
-        if block_idx == 0 {
-            let base_emit = cluster_base_scores[0].exp();
-            let val = base_emit / n_states as f32;
-            block_fwd[0..n_states].fill(val);
-
-            let start = diff_row_offsets[0];
-            let end = diff_row_offsets[1];
-            for i in start..end {
-                let col = diff_cols[i] as usize;
-                let val = diff_vals[i];
-                if col < n_states {
-                    let penalty = val.exp();
-                    let trans_prob = block_fwd[col] / base_emit;
-                    block_fwd[col] = (block_fwd[col] * penalty).max(trans_prob * 1e-20);
-                }
-            }
-
-            let mut sum = 0.0f32;
-            for &x in &block_fwd[0..n_states] {
-                sum += x;
-            }
-            recomp_sum = sum.max(1e-30);
-            curr_off = 0;
-        } else {
-            let load_idx = block_idx - 1;
-            let checkpoint_off = load_idx * n_states;
-            block_fwd[0..n_states].copy_from_slice(&fwd[checkpoint_off..checkpoint_off + n_states]);
-            recomp_sum = 1.0;
-            curr_off = 0;
-        }
-
-        // For block_idx == 0, fwd[0] is already initialized at offset 0, so start from m=1
-        // For block_idx > 0, we need to compute fwd[block_start] from checkpoint
-        let loop_start = if block_idx == 0 { block_start + 1 } else { block_start };
-        for local_m in loop_start..block_end {
-            let p_rec = p_recomb.get(local_m).copied().unwrap_or(0.0);
-            let shift = p_rec / n_states as f32;
-            let scale = (1.0 - p_rec) / recomp_sum.max(1e-30);
-            let base_emit = cluster_base_scores[local_m].exp();
-
-            let next_off = curr_off + n_states;
-            let prev_slice = &block_fwd[curr_off..curr_off + n_states];
-            let curr_slice = &mut block_fwd[next_off..next_off + n_states];
-
-            let shift_vec = f32x8::splat(shift);
-            let scale_vec = f32x8::splat(scale);
-            let emit_vec = f32x8::splat(base_emit);
-
-            let mut k = 0;
-            while k + 8 <= n_states {
-                let prev_chunk_arr: &[f32; 8] = prev_slice[k..k+8].try_into().unwrap();
-                let prev_vec = f32x8::from(*prev_chunk_arr);
-                let trans = prev_vec.mul_add(scale_vec, shift_vec);
-                let res = trans * emit_vec;
-                let res_arr: [f32; 8] = res.into();
-                curr_slice[k..k+8].copy_from_slice(&res_arr);
-                k += 8;
-            }
-
-            for i in k..n_states {
-                let p = prev_slice[i];
-                curr_slice[i] = base_emit * (scale * p + shift);
-            }
-
-            let start = diff_row_offsets[local_m];
-            let end = diff_row_offsets[local_m + 1];
-            for i in start..end {
-                let col = diff_cols[i] as usize;
-                let val = diff_vals[i];
-                if col < n_states {
-                    let penalty = val.exp();
-                    let trans_prob = curr_slice[col] / base_emit;
-                    curr_slice[col] = (curr_slice[col] * penalty).max(trans_prob * 1e-20);
-                }
-            }
-
-            let mut new_sum = 0.0f32;
-            for &x in curr_slice {
-                new_sum += x;
-            }
-            recomp_sum = new_sum.max(1e-30);
-            curr_off = next_off;
-        }
-
-        for m in (block_start..block_end).rev() {
-            if m + 1 < n_clusters {
-                let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
-                let shift = p_rec / n_states as f32;
-                let base_emit = cluster_base_scores[m + 1].exp();
-
-                let mut k = 0;
-                let base_emit_vec = f32x8::splat(base_emit);
-                while k + 8 <= n_states {
-                    let initial_chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
-                    let initial_chunk = f32x8::from(*initial_chunk_arr);
-                    let res = initial_chunk * base_emit_vec;
-                    let res_arr: [f32; 8] = res.into();
-                    bwd[k..k+8].copy_from_slice(&res_arr);
-                    k += 8;
-                }
-                for x in bwd[k..].iter_mut() {
-                    *x *= base_emit;
-                }
-
-                let start = diff_row_offsets[m+1];
-                let end = diff_row_offsets[m+2];
-                for i in start..end {
-                    let col = diff_cols[i] as usize;
-                    let val = diff_vals[i];
-                    if col < n_states {
-                        let penalty = val.exp();
-                        let trans_prob = bwd[col] / base_emit;
-                        bwd[col] = (bwd[col] * penalty).max(trans_prob * 1e-20);
-                    }
-                }
-
-                let mut emitted_sum = 0.0f32;
-                let mut sum_vec = f32x8::splat(0.0);
-                k = 0;
-                while k + 8 <= n_states {
-                    let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
-                    let chunk = f32x8::from(*chunk_arr);
-                    sum_vec += chunk;
-                    k += 8;
-                }
-                emitted_sum += sum_vec.reduce_add();
-                for &x in bwd[k..].iter() {
-                    emitted_sum += x;
-                }
-
-                if emitted_sum > 0.0 {
-                    let scale_v = (1.0 - p_rec) / emitted_sum;
-                    let scale_vec = f32x8::splat(scale_v);
-                    let shift_vec = f32x8::splat(shift);
-                    
-                    k = 0;
-                    while k + 8 <= n_states {
-                         let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
-                         let chunk = f32x8::from(*chunk_arr);
-                         let res = chunk.mul_add(scale_vec, shift_vec);
-                         let res_arr: [f32; 8] = res.into();
-                         bwd[k..k+8].copy_from_slice(&res_arr);
-                         k += 8;
-                    }
-                    for x in bwd[k..].iter_mut() {
-                        *x = scale_v * *x + shift;
-                    }
-                } else {
-                    bwd.fill(1.0 / n_states as f32);
-                }
-            }
-
-            // For block_idx == 0: fwd[m] is at offset m*n_states (m=0 from init, m=1+ from loop)
-            // For block_idx > 0: checkpoint at offset 0, fwd[block_start] at offset n_states
-            let local_offset = if block_idx == 0 {
-                (m - block_start) * n_states
-            } else {
-                (m - block_start + 1) * n_states
-            };
-            let fwd_row = &block_fwd[local_offset..local_offset + n_states];
-
-            let mut state_sum = 0.0f32;
-            for k in 0..n_states {
-                curr_posteriors[k] = fwd_row[k] * bwd[k];
-                state_sum += curr_posteriors[k];
-            }
-            if state_sum > 0.0 {
-                let inv = 1.0 / state_sum;
-                for k in 0..n_states {
-                    curr_posteriors[k] *= inv;
-                }
-            }
-
-            let entries_before = hap_indices.len();
-            if m == n_clusters - 1 {
-                for k in 0..n_states {
-                    let prob = curr_posteriors[k];
-                    if prob > threshold {
-                        hap_indices.push(hap_indices_input[m][k]);
-                        probs.push(prob);
-                        probs_p1.push(prob);
-                    }
-                }
-            } else {
-                for k in 0..n_states {
-                    let prob = curr_posteriors[k];
-                    let prob_next = next_posteriors[k];
-                    if prob > threshold || prob_next > threshold {
-                        hap_indices.push(hap_indices_input[m][k]);
-                        probs.push(prob);
-                        probs_p1.push(prob_next);
-                    }
-                }
-            }
-            
-            entry_counts.push(hap_indices.len() - entries_before);
-            std::mem::swap(&mut curr_posteriors, &mut next_posteriors);
-        }
-    }
-
-    // Finalize outputs (Reverse)
-    entry_counts.reverse();
-    hap_indices.reverse();
-    probs.reverse();
-    probs_p1.reverse();
-
-    let mut offsets = Vec::with_capacity(n_clusters + 1);
-    offsets.push(0);
-    let mut cumsum = 0;
-    for &count in &entry_counts {
-        cumsum += count;
-        offsets.push(cumsum);
-    }
-
-    (offsets, hap_indices, probs, probs_p1)
-}
 
 #[cfg(test)]
 mod tests {

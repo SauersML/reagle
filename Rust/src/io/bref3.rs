@@ -112,7 +112,8 @@ impl Bref3Reader {
 
     /// Read all genotypes into a GenotypeMatrix (phased reference data)
     pub fn read_all(mut self) -> Result<GenotypeMatrix<Phased>> {
-        let mut columns: Vec<GenotypeColumn> = Vec::new();
+        info_span!("bref3_read_all").in_scope(|| {
+            let mut columns: Vec<GenotypeColumn> = Vec::new();
 
         loop {
             let n_recs = read_be_i32(&mut self.reader)?;
@@ -125,6 +126,7 @@ impl Bref3Reader {
 
         let samples = Arc::new(self.samples);
         Ok(GenotypeMatrix::new_phased(self.markers, columns, samples))
+        })
     }
 
     /// Read a single block of records

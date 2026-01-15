@@ -316,13 +316,16 @@ impl GeneticMaps {
 
     /// Load all chromosomes from a PLINK map file
     pub fn from_plink_file(path: &Path, chrom_names: &[&str]) -> Result<Self> {
-        let mut maps = Vec::with_capacity(chrom_names.len());
-        for (i, &name) in chrom_names.iter().enumerate() {
-            let mut map = GeneticMap::from_plink_file(path, name)?;
-            map.set_chrom(ChromIdx::new(i as u16));
-            maps.push(Some(map));
-        }
-        Ok(Self { maps })
+        info_span!("genetic_maps_from_plink_file", path = ?path).in_scope(|| {
+            let mut maps = Vec::with_capacity(chrom_names.len());
+            for (i, &name) in chrom_names.iter().enumerate() {
+                let mut map = GeneticMap::from_plink_file(path, name)?;
+                map.set_chrom(ChromIdx::new(i as u16));
+                maps.push(Some(map));
+            }
+            Ok(Self { maps })
+        })
+    }
     }
 
     /// Get genetic map for a chromosome

@@ -246,6 +246,7 @@ pub struct VcfReader {
 impl VcfReader {
     /// Open a VCF file and read the header
     pub fn open(path: &Path) -> Result<(Self, Box<dyn BufRead + Send>)> {
+        info_span!("vcf_open", path = ?path).in_scope(|| {
         let file = File::open(path)?;
 
         // Check if gzipped
@@ -261,13 +262,15 @@ impl VcfReader {
         };
 
         Self::from_reader(reader)
+        })
     }
 
     /// Create from a reader
     pub fn from_reader(
         mut reader: Box<dyn BufRead + Send>,
     ) -> Result<(Self, Box<dyn BufRead + Send>)> {
-        // Read header
+        info_span!("vcf_from_reader").in_scope(|| {
+            // Read header
         let mut header_str = String::new();
         loop {
             let mut line = String::new();
@@ -305,6 +308,7 @@ impl VcfReader {
             sample_ploidy: None,
             all_phased: true,
         }, reader))
+        })
     }
 
     /// Set sample exclusion filter
@@ -355,6 +359,7 @@ impl VcfReader {
 
     /// Read all records into a GenotypeMatrix
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
+        info_span!("vcf_read_all").in_scope(|| {
         let mut markers = Markers::new();
         let mut columns = Vec::new();
         // Accumulate per-marker confidence scores (one Vec<u8> per marker, indexed by sample)
@@ -484,6 +489,7 @@ impl VcfReader {
             GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
         };
         Ok(matrix)
+        })
     }
 
     /// Flush a batch of markers, attempting dictionary compression
@@ -896,7 +902,9 @@ impl VcfWriter {
 
     /// Write VCF header for phased output
     pub fn write_header(&mut self, markers: &Markers) -> Result<()> {
+        info_span!("vcf_write_header").in_scope(|| {
         self.write_header_extended(markers, false, false, false)
+        })
     }
 
     /// Write VCF header with optional GP/AP fields
@@ -982,9 +990,10 @@ impl VcfWriter {
     pub fn write_phased<S: PhaseState>(
         &mut self,
         matrix: &GenotypeMatrix<S>,
-        start: usize,
-        end: usize,
+        start_marker: usize,
+        end_marker: usize,
     ) -> Result<()> {
+        info_span!("vcf_write_phased", n_markers = end_marker - start_marker).in_scope(|| {
         for m in start..end {
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = matrix.marker(marker_idx);
@@ -1018,6 +1027,7 @@ impl VcfWriter {
         }
 
         Ok(())
+        })
     }
 
     /// Write imputed genotypes with STREAMING access - no pre-allocation

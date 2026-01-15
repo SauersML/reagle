@@ -173,6 +173,7 @@ impl StreamingVcfReader {
         gen_maps: GeneticMaps,
         config: StreamingConfig,
     ) -> Result<Self> {
+        info_span!("streaming_vcf_from_reader").in_scope(|| {
         // Read header
         let mut header_str = String::new();
         let mut line = String::new();
@@ -219,6 +220,7 @@ impl StreamingVcfReader {
             eof: false,
             line_buf: String::new(),
         })
+        })
     }
 
     /// Get samples Arc
@@ -230,12 +232,13 @@ impl StreamingVcfReader {
     ///
     /// Returns None when all data has been processed
     pub fn next_window(&mut self) -> Result<Option<StreamWindow>> {
-        if self.eof && self.buffer.is_empty() {
-            return Ok(None);
-        }
+        info_span!("streaming_next_window").in_scope(|| {
+            if self.eof && self.buffer.is_empty() {
+                return Ok(None);
+            }
 
-        // Fill buffer until we have a complete window
-        self.fill_buffer_to_window()?;
+            // Fill buffer until we have a complete window
+            self.fill_buffer_to_window()?;
 
         if self.buffer.is_empty() {
             return Ok(None);
@@ -316,6 +319,7 @@ impl StreamingVcfReader {
         self.window_num += 1;
 
         Ok(Some(window))
+        })
     }
 
     /// Fill buffer until we have enough data for a window

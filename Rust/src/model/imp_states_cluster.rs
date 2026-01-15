@@ -222,37 +222,4 @@ impl<'a> ImpStatesCluster<'a> {
             }
         }
     }
-
-    /// Compute state probabilities for imputation
-    ///
-    /// This method orchestrates the complete imputation process for a single haplotype:
-    /// 1. IBS-based state selection
-    /// 2. HMM forward-backward algorithm
-    /// 3. Extraction of state probabilities
-    ///
-    /// Returns state probabilities for each marker in the window.
-    ///
-    /// NOTE: This is a simplified implementation for compilation.
-    /// The full implementation requires integration with the main imputation pipeline.
-    pub fn compute_state_probs(
-        &mut self,
-        seq1: &[u8],
-        seq2: &[u8],
-        workspace: &mut ImpWorkspace,
-        params: &crate::model::parameters::ModelParams,
-    ) -> Vec<Vec<f32>> {
-        // This method is called from the streaming imputation code,
-        // but the proper implementation is in the main imputation pipeline.
-        // For now, return dummy probabilities to allow compilation.
-
-        // In the proper implementation, this would:
-        // 1. Call ibs_states_cluster() to select reference haplotypes
-        // 2. Compute cluster mismatches using compute_cluster_mismatches_into_workspace()
-        // 3. Run HMM forward-backward using run_hmm_forward_backward_to_sparse()
-        // 4. Extract allele probabilities from ClusterStateProbs
-
-        // Return dummy probabilities - this will be replaced by proper HMM computation
-        // when the streaming code is properly integrated
-        vec![vec![0.5f32; self.max_states]; self.n_clusters]
-    }
 }
