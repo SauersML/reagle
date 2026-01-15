@@ -13,24 +13,6 @@ use crate::pipelines::imputation::ClusterStateProbs; // Assuming we keep it ther
 /// Minimum genetic distance between markers
 pub const MIN_CM_DIST: f64 = 1e-7;
 
-/// Compact DR2 data entry
-pub enum CompactDr2Entry {
-    Biallelic {
-        marker: u32,
-        p1: f32,
-        p2: f32,
-        skip: bool,
-        true_gt: Option<(u8, u8)>,
-    },
-    Multiallelic {
-        marker: u32,
-        probs1: Vec<f32>,
-        probs2: Vec<f32>,
-        skip: bool,
-        true_gt: Option<(u8, u8)>,
-    },
-}
-
 #[derive(Clone, Debug)]
 pub struct MarkerCluster {
     pub start: usize,
@@ -286,48 +268,6 @@ pub fn compute_cluster_mismatches_into_workspace(
         }
         workspace.diff_row_offsets.push(workspace.diff_vals.len());
     }
-}
-
-pub fn compute_targ_block_end<S: crate::data::storage::phase_state::PhaseState>(
-    ref_gt: &GenotypeMatrix<Phased>,
-    target_gt: &GenotypeMatrix<S>,
-    alignment: &MarkerAlignment,
-    genotyped_markers: &[usize],
-) -> Vec<usize> {
-    let n_ref_haps = ref_gt.n_haplotypes();
-    let mut block_end = Vec::new();
-    if genotyped_markers.is_empty() {
-        return block_end;
-    }
-
-    let mut last_hash: u64 = 0;
-    let mut initialized = false;
-    for (idx, &ref_m) in genotyped_markers.iter().enumerate() {
-        let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
-        if target_m_idx < 0 { continue; }
-        let target_m = target_m_idx as usize;
-
-        let target_marker_idx = MarkerIdx::new(target_m as u32);
-        let n_alleles = 1 + target_gt.marker(target_marker_idx).alt_alleles.len();
-        let missing_allele = n_alleles as u8;
-        let mut hash = 0xcbf29ce484222325u64;
-        for h in 0..n_ref_haps {
-            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32));
-            let mut allele = alignment.reverse_map_allele(target_m, ref_allele);
-            if allele == 255 {
-                allele = missing_allele;
-            }
-            hash ^= allele as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        if initialized && hash != last_hash {
-            block_end.push(idx);
-        }
-        last_hash = hash;
-        initialized = true;
-    }
-    block_end.push(genotyped_markers.len());
-    block_end
 }
 
 pub fn run_hmm_forward_backward_to_sparse(

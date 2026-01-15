@@ -148,24 +148,6 @@ impl MarkerAlignment {
         if idx >= 0 { Some(idx as usize) } else { None }
     }
 
-    /// Map a target allele to reference allele space
-    ///
-    /// Returns the reference allele index for a given target allele,
-    /// handling strand flips and swaps automatically.
-    /// Returns 255 (missing) if no valid mapping exists.
-    pub fn map_allele(&self, target_marker: usize, target_allele: u8) -> u8 {
-        if target_allele == 255 {
-            return 255; // Missing stays missing
-        }
-
-        if let Some(Some(mapping)) = self.allele_mappings.get(target_marker) {
-            mapping.map_allele(target_allele).unwrap_or(255)
-        } else {
-            // No mapping means identity (direct match assumed)
-            target_allele
-        }
-    }
-
     /// Map a reference allele to target allele space (reverse mapping)
     ///
     /// Returns the target allele index for a given reference allele,

@@ -50,11 +50,6 @@ impl ImpWorkspace {
         }
     }
 
-    /// Create workspace with reference panel size (kept for call-site compatibility)
-    pub fn with_ref_size(n_states: usize) -> Self {
-        Self::new(n_states)
-    }
-
     /// Clear all buffers for reuse
     pub fn clear(&mut self) {
         self.diff_vals.clear();
@@ -151,36 +146,9 @@ impl ThreadWorkspace {
         }
     }
 
-    /// Resize workspace for a window (forwards to resize_for_states)
-    pub fn resize_for_window(&mut self, _: usize, n_states: usize) {
-        self.resize_for_states(n_states);
-    }
-
     /// Clear workspace contents without deallocating
     pub fn clear(&mut self) {
         // No need to zero out, as we'll overwrite during fill
-    }
-
-    /// Get mutable slices for a specific marker
-    pub fn fwd_marker_mut(&mut self, marker: usize) -> &mut [f32] {
-        let start = marker * self.n_states;
-        &mut self.fwd[start..start + self.n_states]
-    }
-
-    pub fn bwd_marker_mut(&mut self, marker: usize) -> &mut [f32] {
-        let start = marker * self.n_states;
-        &mut self.bwd[start..start + self.n_states]
-    }
-
-    /// Get lookup slice for a specific marker
-    pub fn lookup_marker(&self, marker: usize) -> &[u8] {
-        let start = marker * self.n_states;
-        &self.lookup[start..start + self.n_states]
-    }
-
-    pub fn lookup_marker_mut(&mut self, marker: usize) -> &mut [u8] {
-        let start = marker * self.n_states;
-        &mut self.lookup[start..start + self.n_states]
     }
 }
 

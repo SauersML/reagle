@@ -17,90 +17,6 @@ use crate::data::marker::{Marker, MarkerIdx, Markers};
 use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
 use crate::data::storage::GenotypeColumn;
 
-/// A view into a subset of markers in a GenotypeMatrix
-///
-/// Provides zero-copy access to a range of markers without cloning the underlying data.
-/// Marker indices in the view are relative (0-based), but global positions are preserved.
-#[derive(Debug)]
-pub struct GenotypeView<'a, State: PhaseState> {
-    /// Reference to the full matrix
-    matrix: &'a GenotypeMatrix<State>,
-    /// Start marker index in the full matrix
-    start: usize,
-    /// End marker index (exclusive) in the full matrix
-    end: usize,
-}
-
-impl<'a, State: PhaseState> GenotypeView<'a, State> {
-    /// Get the number of markers in this view
-    pub fn n_markers(&self) -> usize {
-        self.end - self.start
-    }
-
-    /// Get the number of haplotypes
-    pub fn n_haplotypes(&self) -> usize {
-        self.matrix.n_haplotypes()
-    }
-
-    /// Get allele for a marker/haplotype pair (relative indices)
-    pub fn allele(&self, marker: MarkerIdx, hap: HapIdx) -> u8 {
-        let global_marker = MarkerIdx::new((self.start + marker.as_usize()) as u32);
-        self.matrix.allele(global_marker, hap)
-    }
-
-    /// Get marker metadata (relative indices within this view)
-    pub fn marker(&self, marker: MarkerIdx) -> &Marker {
-        let global_marker = MarkerIdx::new((self.start + marker.as_usize()) as u32);
-        self.matrix.marker(global_marker)
-    }
-
-    /// Get genetic distance between two markers within this view
-    ///
-    /// Returns the genetic distance in cM between view-relative marker indices.
-    /// Panics if indices are out of bounds.
-    pub fn genetic_distance(&self, marker_a: usize, marker_b: usize) -> f64 {
-        assert!(marker_a < self.n_markers() && marker_b < self.n_markers());
-        let pos_a = self.marker(MarkerIdx::new(marker_a as u32)).pos_cm;
-        let pos_b = self.marker(MarkerIdx::new(marker_b as u32)).pos_cm;
-        (pos_a - pos_b).abs()
-    }
-
-    /// Get physical distance between two markers within this view
-    ///
-    /// Returns the physical distance in base pairs between view-relative marker indices.
-    /// Panics if indices are out of bounds.
-    pub fn physical_distance(&self, marker_a: usize, marker_b: usize) -> u32 {
-        assert!(marker_a < self.n_markers() && marker_b < self.n_markers());
-        let pos_a = self.marker(MarkerIdx::new(marker_a as u32)).pos;
-        let pos_b = self.marker(MarkerIdx::new(marker_b as u32)).pos;
-        pos_a.max(pos_b) - pos_a.min(pos_b)
-    }
-
-    /// Get the marker offset (index of first marker in the full matrix)
-    ///
-    /// When using markers() to get metadata, add this offset to convert
-    /// from view-relative indices to matrix-global indices.
-    pub fn marker_offset(&self) -> usize {
-        self.start
-    }
-
-    /// Get markers metadata from the full matrix
-    ///
-    /// WARNING: This returns the full matrix's markers, not a subset for this view.
-    /// Only use this when you need access to the full chromosome markers for cross-window operations.
-    ///
-    /// For view-relative access, use `marker(idx)` instead, which handles index translation automatically.
-    /// If you find yourself using `view.markers().len()`, you probably want `view.n_markers()` instead.
-    pub fn markers(&self) -> &Markers {
-        self.matrix.markers()
-    }
-
-    /// Get samples metadata
-    pub fn samples(&self) -> &Arc<Samples> {
-        self.matrix.samples()
-    }
-}
-
 /// The main genotype matrix structure.
 ///
 /// Type parameter `State` encodes whether data is phased at compile time,
@@ -216,15 +132,6 @@ impl<S: PhaseState> GenotypeMatrix<S> {
         self.confidence.clone()
     }
 
-    /// Create a zero-copy view of a marker range
-    pub fn get_window_view(&self, range: std::ops::Range<usize>) -> GenotypeView<'_, S> {
-        assert!(range.start <= range.end && range.end <= self.n_markers());
-        GenotypeView {
-            matrix: self,
-            start: range.start,
-            end: range.end,
-        }
-    }
 }
 
 // ============================================================================

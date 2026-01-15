@@ -41,14 +41,6 @@ impl PbwtState {
         }
     }
 
-    /// Extract state from a PbwtDivUpdater at a given marker
-    pub fn from_updater(updater: &PbwtDivUpdater, marker_pos: usize) -> Self {
-        Self {
-            ppa: updater.a.clone(),
-            div: updater.d.clone(),
-            marker_pos,
-        }
-    }
 }
 
 /// PBWT updater with divergence array tracking

@@ -17,7 +17,6 @@ pub mod marker;
 pub mod storage;
 
 // Re-export commonly used types
-pub use alignment::MarkerAlignment;
 pub use haplotype::{HapIdx, SampleIdx};
 pub use marker::MarkerIdx;
 

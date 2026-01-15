@@ -13,11 +13,11 @@
 
 use tracing::instrument;
 
+#[cfg(test)]
+use std::sync::Arc;
+
 use crate::config::Config;
-use crate::data::storage::GenotypeMatrix;
-use crate::data::storage::phase_state::Phased;
 use crate::error::Result;
-use crate::io::vcf::VcfReader;
 use crate::model::parameters::ModelParams;
 
 /// Imputation pipeline
@@ -573,60 +573,6 @@ pub struct ClusterStateProbs {
 }
 
 impl ClusterStateProbs {
-    pub fn new(
-        marker_cluster: std::sync::Arc<Vec<usize>>,
-        ref_cluster_end: std::sync::Arc<Vec<usize>>,
-        weight: std::sync::Arc<Vec<f32>>,
-        n_states: usize,
-        hap_indices_input: Vec<Vec<u32>>,
-        cluster_probs: Vec<f32>,
-    ) -> Self {
-        let n_clusters = hap_indices_input.len();
-        let threshold = if n_clusters <= 1000 {
-            0.0
-        } else {
-            (0.9999f32 / n_states as f32).min(0.005f32)
-        };
-
-        // Build CSR format: flat arrays with offsets
-        // Estimate capacity: ~50 states per cluster on average
-        let estimated_nnz = n_clusters * 50;
-        let mut offsets = Vec::with_capacity(n_clusters + 1);
-        let mut hap_indices = Vec::with_capacity(estimated_nnz);
-        let mut probs = Vec::with_capacity(estimated_nnz);
-        let mut probs_p1 = Vec::with_capacity(estimated_nnz);
-
-        offsets.push(0);
-
-        for c in 0..n_clusters {
-            let next = if c + 1 < n_clusters { c + 1 } else { c };
-            let row_offset = c * n_states;
-            let next_offset = next * n_states;
-
-            for k in 0..n_states {
-                let prob = cluster_probs.get(row_offset + k).copied().unwrap_or(0.0);
-                let prob_next = cluster_probs.get(next_offset + k).copied().unwrap_or(0.0);
-                if prob > threshold || prob_next > threshold {
-                    hap_indices.push(hap_indices_input[c][k]);
-                    probs.push(prob);
-                    probs_p1.push(prob_next);
-                }
-            }
-
-            offsets.push(hap_indices.len());
-        }
-
-        Self {
-            marker_cluster,
-            ref_cluster_end,
-            weight,
-            offsets,
-            hap_indices,
-            probs,
-            probs_p1,
-        }
-    }
-
     /// Create from pre-computed sparse CSR data (from run_hmm_forward_backward_to_sparse).
     /// This avoids the O(n_clusters × n_states) dense intermediate allocation.
     pub fn from_sparse(
@@ -740,19 +686,6 @@ impl ImputationPipeline {
     pub fn run(&mut self) -> Result<()> {
         // Use streaming approach to avoid OOM on large reference panels
         self.run_streaming()
-    }
-
-    /// Load reference panel from file (VCF or BREF3)
-    pub fn load_reference_streaming(path: &std::path::Path) -> Result<GenotypeMatrix<Phased>> {
-        // Currently falling back to standard loading.
-        // Tricky because we need to read the whole file to get markers
-        if path.extension().map(|e| e == "bref3").unwrap_or(false) {
-            let bref_reader = crate::io::bref3::Bref3Reader::open(path)?;
-            Ok(bref_reader.read_all()?)
-        } else {
-            let (mut reader, file) = VcfReader::open(path)?;
-            Ok(reader.read_all(file)?.into_phased())
-        }
     }
 }
 

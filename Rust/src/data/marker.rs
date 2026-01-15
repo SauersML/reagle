@@ -242,14 +242,6 @@ impl AlleleMapping {
         }
     }
 
-    /// Map a target allele to reference allele
-    /// Returns None if the allele cannot be mapped
-    pub fn map_allele(&self, targ_allele: u8) -> Option<u8> {
-        self.targ_to_ref
-            .get(targ_allele as usize)
-            .and_then(|&r| if r >= 0 { Some(r as u8) } else { None })
-    }
-
     /// Map a reference allele to target allele (reverse mapping)
     /// Returns None if the allele cannot be mapped
     pub fn reverse_map_allele(&self, ref_allele: u8) -> Option<u8> {

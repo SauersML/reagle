@@ -966,113 +966,6 @@ impl PhasingPipeline {
         }
     }
 
-    /// Phase a GenotypeMatrix in-memory and return the phased result
-    #[instrument(name = "phase_in_memory", skip(self, target_gt, gen_maps))]
-    pub fn phase_in_memory(
-        &mut self,
-        target_gt: &GenotypeMatrix,
-        gen_maps: &GeneticMaps,
-    ) -> Result<GenotypeMatrix<crate::data::storage::phase_state::Phased>> {
-        info_span!("phase_in_memory_setup").in_scope(|| {
-        let n_markers = target_gt.n_markers();
-        let n_haps = target_gt.n_haplotypes();
-        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
-        let n_total_haps = n_haps + n_ref_haps;
-
-        if n_markers == 0 {
-            return Ok(target_gt.clone().into_phased());
-        }
-
-        self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
-
-        // Initialize genotypes preserving actual allele values including missing (255)
-        let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
-            target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
-        });
-
-        let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
-        let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
-            .map(|m| {
-                let pos1 = target_gt.marker(MarkerIdx::new(m as u32)).pos;
-                let pos2 = target_gt.marker(MarkerIdx::new((m + 1) as u32)).pos;
-                gen_maps.gen_dist(chrom, pos1, pos2)
-            })
-            .collect();
-
-        let maf: Vec<f32> = (0..n_markers)
-            .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
-            .collect();
-
-        let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
-
-        let n_burnin = self.config.burnin.min(3);
-        let n_iterations = self.config.iterations.min(6);
-        let total_iterations = n_burnin + n_iterations;
-
-        // Recombination probabilities - mutable so EM can update them
-        let mut p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-            .collect();
-
-        // Build confidence data for PBWT filtering
-        let confidence_by_sample = build_sample_confidence(target_gt);
-
-        for it in 0..total_iterations {
-            let is_burnin = it < n_burnin;
-            self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
-
-            let atomic_estimates = if is_burnin && self.config.em {
-                Some(crate::model::parameters::AtomicParamEstimates::new())
-            } else {
-                None
-            };
-
-            info_span!("phasing_iteration", iteration = it, is_burnin = is_burnin).in_scope(|| {
-                self.run_phase_baum_iteration(
-                    target_gt,
-                    &mut geno,
-                    &p_recomb,
-                    &gen_dists,
-                    &ibs2,
-                    atomic_estimates.as_ref(),
-                    &confidence_by_sample,
-                    None, // No PBWT state handoff for in-memory phasing
-                )
-            })?;
-
-            // Update parameters from EM estimates and recompute recombination probabilities
-            if let Some(ref atomic) = atomic_estimates {
-                info_span!("em_parameter_update").in_scope(|| {
-                    let est = atomic.to_estimates();
-                    let mut params_updated = false;
-
-                    if est.n_emit_obs() > 0 {
-                        self.params.update_p_mismatch(est.p_mismatch());
-                        params_updated = true;
-                    }
-                    if est.n_switch_obs() > 0 {
-                        self.params.update_recomb_intensity(est.recomb_intensity());
-                        params_updated = true;
-                    }
-
-                    // Recompute recombination probabilities with updated intensity
-                    if params_updated {
-                        p_recomb = std::iter::once(0.0f32)
-                            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-                            .collect();
-                    }
-                });
-            }
-        }
-
-        info_span!("build_final_matrix").in_scope(|| {
-            Ok(self.build_final_matrix(target_gt, &geno))
-        })
-        })
-    }
-    
     /// Phase a GenotypeMatrix in-memory with overlap constraint from previous window
     ///
     /// This is like `phase_in_memory` but seeds the phasing with alleles from the
@@ -4253,11 +4146,11 @@ mod tests {
 
         let mut pipeline = PhasingPipeline::new(config);
 
-        // Run phasing
-        let result = pipeline.phase_in_memory(&gt, &gen_maps);
-        
+        // Run phasing (with no overlap from previous window)
+        let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None);
+
         assert!(result.is_ok());
-        let phased = result.unwrap();
+        let (phased, _) = result.unwrap();
         assert_eq!(phased.n_markers(), n_markers);
         assert_eq!(phased.n_haplotypes(), n_samples * 2);
     }

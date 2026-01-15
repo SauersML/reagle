@@ -413,7 +413,7 @@ fn bench_imputation_e2e(c: &mut Criterion) {
             |b, (ref_gt, target_gt)| {
                 b.iter(|| {
                     // Measure alignment creation (lightweight operation)
-                    let alignment = reagle::pipelines::imputation::MarkerAlignment::new(
+                    let alignment = reagle::data::MarkerAlignment::new(
                         target_gt,
                         ref_gt,
                     );
