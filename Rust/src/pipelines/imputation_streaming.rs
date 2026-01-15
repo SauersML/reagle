@@ -9,17 +9,15 @@ use std::thread;
 use std::thread::LocalKey;
 
 use rayon::prelude::*;
-use tracing::{instrument, info_span};
-
-use crate::config::Config;
+use tracing::instrument;
 use crate::data::genetic_map::GeneticMaps;
-use crate::data::haplotype::{HapIdx, SampleIdx};
+use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::phase_state::{Phased, Unphased};
-use crate::data::storage::{GenotypeMatrix, MutableGenotypes};
+use crate::data::storage::GenotypeMatrix;
 use crate::data::alignment::MarkerAlignment;
 use crate::error::{Result, ReagleError};
-use crate::io::bref3::{RefPanelReader, RefWindow};
+use crate::io::bref3::RefPanelReader;
 use crate::io::streaming::{PhasedOverlap, StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfWriter, ImputationQuality};
 use crate::model::imp_ibs::{ClusterCodedSteps, ImpIbs};
@@ -28,8 +26,6 @@ use crate::model::imp_utils::*;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::pbwt::PbwtState;
-use crate::model::states::ThreadedHaps;
-use crate::utils::workspace::ImpWorkspace;
 
 /// Payload passed from Phasing (Producer) to Imputation (Consumer)
 struct StreamingPayload {

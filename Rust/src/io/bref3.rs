@@ -19,10 +19,13 @@
 //!
 //! Reference: Java's bref/Bref3Reader.java, bref/AsIsBref3Writer.java
 
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
+
+use tracing::info_span;
 
 use anyhow::{Context, Result, bail};
 

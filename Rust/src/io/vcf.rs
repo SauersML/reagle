@@ -1173,7 +1173,7 @@ impl VcfWriter {
         get_dosage: F,
         get_best_gt: B,
         get_posteriors: Option<Box<dyn Fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors)>>,
-        quality: &crate::pipelines::imputation::ImputationQuality,
+        quality: &ImputationQuality,
         start: usize,
         end: usize,
         include_gp: bool,

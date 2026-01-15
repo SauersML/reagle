@@ -12,21 +12,16 @@
 //! This matches Java `imp/ImpLS.java`, `imp/ImpLSBaum.java`, and related classes.
 
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info_span, instrument};
+use tracing::instrument;
 
-use crate::config::Config;
 use crate::data::genetic_map::GeneticMaps;
-use crate::data::haplotype::{HapIdx, SampleIdx};
+use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
-use crate::data::storage::GenotypeColumn;
-use crate::data::storage::phase_state::{PhaseState, Phased};
+use crate::data::storage::phase_state::Phased;
 use crate::error::Result;
-use crate::io::bref3::{StreamingBref3Reader, WindowConfig, WindowedBref3Reader};
-use crate::io::vcf::{ImputationQuality, VcfReader, VcfWriter};
-use crate::utils::workspace::ImpWorkspace;
+use crate::io::vcf::{VcfReader, VcfWriter};
 
 use crate::model::imp_ibs::{build_cluster_hap_sequences_for_targets, ClusterCodedSteps, ImpIbs};
 use crate::model::imp_states_cluster::ImpStatesCluster;
@@ -35,7 +30,7 @@ use crate::data::alignment::MarkerAlignment;
 use crate::model::imp_utils::{
     compute_marker_clusters_with_blocks, compute_ref_cluster_bounds, compute_cluster_weights,
     build_marker_cluster_index, compute_targ_block_end, compute_state_probs,
-    MarkerCluster, CompactDr2Entry
+    CompactDr2Entry
 };
 
 /// Minimum genetic distance between markers (matches Java Beagle)

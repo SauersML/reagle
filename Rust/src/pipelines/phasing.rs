@@ -32,10 +32,6 @@ use crate::io::streaming::{PhasedOverlap, StreamingConfig, StreamingVcfReader, S
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
 
-/// Thread-local workspace for HMM computations
-///
-/// Reuses allocated buffers across windows to avoid repeated allocations
-/// in parallel processing. Each Rayon thread gets its own workspace instance.
 thread_local! {
     static THREAD_WORKSPACE: std::cell::RefCell<Option<crate::utils::workspace::ThreadWorkspace>> =
         std::cell::RefCell::new(None);

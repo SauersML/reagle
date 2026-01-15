@@ -7,7 +7,6 @@ use std::collections::BinaryHeap;
 
 use crate::model::imp_ibs::ImpIbs;
 use crate::model::states::ThreadedHaps;
-use crate::utils::workspace::ImpWorkspace;
 
 const IBS_NIL: i32 = i32::MIN;
 const JAVA_RNG_MULT: u64 = 0x5DEECE66D;
