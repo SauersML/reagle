@@ -72,56 +72,73 @@ impl StateProbs {
 
 /// Haplotype-indexed state probabilities for soft-information handoff between windows.
 ///
-/// Unlike `StateProbs` which uses state indices (that can differ between windows),
-/// this maps by **haplotype ID** which is stable across windows. This is critical
-/// for correct soft-information handoff:
-/// - If Window A selects haplotypes {1, 5, 10} and Window B selects {2, 5, 12}
-/// - The probability for haplotype 5 can be correctly transferred
-/// - Haplotypes not in the new window get uniform prior (1/K)
+/// Uses sorted dense arrays instead of HashMap for O(log K) lookup with good cache locality.
+/// This is critical for HMM performance since prior lookup happens for every state at window start.
+///
+/// Design: Store (hap_id, prob) pairs sorted by hap_id for binary search.
+/// Only significant probabilities (>0.001) are stored to save memory.
 #[derive(Clone, Debug)]
 pub struct HaplotypePriors {
-    /// Map from reference haplotype ID to prior probability
-    pub priors: std::collections::HashMap<u32, f32>,
-    /// Genetic position where these priors were computed
-    pub gen_position: f64,
-    /// Window index these priors came from
-    pub source_window: usize,
+    /// Sorted haplotype IDs (for binary search)
+    hap_ids: Vec<u32>,
+    /// Corresponding probabilities (same order as hap_ids)
+    probs: Vec<f32>,
 }
 
 impl HaplotypePriors {
     /// Create empty priors
     pub fn new() -> Self {
         Self {
-            priors: std::collections::HashMap::new(),
-            gen_position: 0.0,
-            source_window: 0,
+            hap_ids: Vec::new(),
+            probs: Vec::new(),
         }
     }
 
     /// Get prior probability for a haplotype.
     /// Returns uniform prior (1/n_states) if haplotype not seen in previous window.
+    /// Uses binary search for O(log K) lookup with good cache locality.
     #[inline]
     pub fn prior(&self, hap_id: u32, n_states: usize) -> f32 {
-        self.priors.get(&hap_id).copied()
-            .unwrap_or(1.0 / n_states.max(1) as f32)
+        match self.hap_ids.binary_search(&hap_id) {
+            Ok(idx) => self.probs[idx],
+            Err(_) => 1.0 / n_states.max(1) as f32,
+        }
     }
 
     /// Set priors from HMM state posteriors at window boundary.
     /// Only stores significant probabilities (>0.001) to save memory.
-    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32], gen_position: f64, window: usize) {
-        self.priors.clear();
-        self.gen_position = gen_position;
-        self.source_window = window;
-        for (&hap, &prob) in hap_indices.iter().zip(probs.iter()) {
-            if prob > 0.001 {
-                self.priors.insert(hap, prob);
-            }
+    /// Sorts by hap_id for efficient binary search lookup.
+    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32], _gen_position: f64, _window: usize) {
+        self.hap_ids.clear();
+        self.probs.clear();
+        
+        // Collect significant probabilities
+        let mut pairs: Vec<(u32, f32)> = hap_indices.iter()
+            .zip(probs.iter())
+            .filter(|(_, &p)| p > 0.001)
+            .map(|(&h, &p)| (h, p))
+            .collect();
+        
+        // Sort by hap_id for binary search
+        pairs.sort_unstable_by_key(|(h, _)| *h);
+        
+        // Split into parallel arrays
+        self.hap_ids.reserve(pairs.len());
+        self.probs.reserve(pairs.len());
+        for (h, p) in pairs {
+            self.hap_ids.push(h);
+            self.probs.push(p);
         }
     }
 
     /// Check if we have any priors
     pub fn is_empty(&self) -> bool {
-        self.priors.is_empty()
+        self.hap_ids.is_empty()
+    }
+    
+    /// Number of stored priors
+    pub fn len(&self) -> usize {
+        self.hap_ids.len()
     }
 }
 
