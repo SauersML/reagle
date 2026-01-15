@@ -872,7 +872,7 @@ impl PhasingPipeline {
             if let Some(current) = current_window.take() {
                 // Perform Stage 2 interpolation using phased markers from next window
                 let finalized = info_span!("finalize_stage2").in_scope(|| {
-                    self.finalize_stage2_with_context(
+                    self.finalize_stage2_with_forward_context(
                         &current.phased_result.as_ref().unwrap(),
                         &phased,
                         &gen_maps,
@@ -4111,7 +4111,8 @@ impl PhasingPipeline {
                 "PBWT state handoff from previous window"
             );
         }
-        self.phase_in_memory_with_overlap(target_gt, gen_maps, phased_overlap)
+        self.phase_in_memory_with_overlap(target_gt, gen_maps, phased_overlap, None)
+            .map(|(result, ..)| result)
     }
 
     /// Extract PBWT state at the end of a window for handoff
@@ -4155,7 +4156,7 @@ impl PhasingPipeline {
     ///
     /// Stage 1 handles all common variants. Stage 2 interpolates rare variants
     /// between high-frequency markers using HMM state probabilities.
-    fn finalize_stage2_with_context(
+    fn finalize_stage2_with_forward_context(
         &self,
         current_phased: &GenotypeMatrix<Phased>,
         next_phased: &GenotypeMatrix<Phased>,
@@ -4190,7 +4191,7 @@ impl PhasingPipeline {
         // Current window high-frequency markers
         for m in 0..current_markers {
             let marker = current_phased.marker(MarkerIdx::new(m as u32));
-            if marker.maf() >= maf_threshold {
+            if marker.maf >= maf_threshold {
                 hi_freq_markers.push(m);
             }
         }
@@ -4198,7 +4199,7 @@ impl PhasingPipeline {
         // Next window high-frequency markers (offset indices)
         for m in 0..next_markers {
             let marker = next_phased.marker(MarkerIdx::new(m as u32));
-            if marker.maf() >= maf_threshold {
+            if marker.maf >= maf_threshold {
                 hi_freq_markers.push(current_markers + m);
             }
         }
@@ -4247,7 +4248,7 @@ impl PhasingPipeline {
 
             // Apply Stage 2 interpolation to rare variants in current window
             for marker in 0..current_markers {
-                let marker_maf = current_phased.marker(MarkerIdx::new(marker as u32)).maf();
+                let marker_maf = current_phased.marker(MarkerIdx::new(marker as u32)).maf;
                 if marker_maf >= maf_threshold {
                     continue; // Already handled in Stage 1
                 }

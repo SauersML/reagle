@@ -26,6 +26,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tracing::info_span;
+use noodles::bgzf::io as bgzf_io;
 
 use anyhow::{Context, Result, bail};
 

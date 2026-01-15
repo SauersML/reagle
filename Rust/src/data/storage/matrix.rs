@@ -159,7 +159,12 @@ impl<S: PhaseState> GenotypeMatrix<S> {
         &self.markers
     }
 
-    /// Get samples Arc
+    /// Get samples reference
+    pub fn samples(&self) -> &Arc<Samples> {
+        &self.samples
+    }
+
+    /// Get samples Arc (cloned)
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)
     }

@@ -26,6 +26,7 @@ use crate::model::imp_utils::*;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::pbwt::PbwtState;
+use crate::utils::workspace::ImpWorkspace;
 
 /// Payload passed from Phasing (Producer) to Imputation (Consumer)
 struct StreamingPayload {

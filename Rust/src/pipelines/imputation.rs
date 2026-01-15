@@ -782,8 +782,8 @@ impl ImputationPipeline {
         self.run_streaming()
     }
 
-    /// Run imputation with streaming to avoid OOM on large reference panels
-    pub fn run_streaming(&mut self) -> Result<()> {
+    /// Run imputation loading all data into memory (original implementation)
+    fn run_in_memory(&mut self) -> Result<()> {
         let (mut target_reader, target_gt, target_samples) = info_span!("load_target_data").in_scope(|| {
             info_span!("load_target").in_scope(|| {
                 eprintln!("Loading target VCF...");
@@ -805,7 +805,7 @@ impl ImputationPipeline {
             Ok::<_, crate::error::ReagleError>(Arc::new(if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
                 eprintln!("  Detected BREF3 format (streaming)");
                 // Use streaming loader for memory-efficient loading
-                Self::load_reference_streaming(ref_path, None)?
+                Self::load_reference_streaming(ref_path)?
             } else {
                 eprintln!("  Detected VCF format");
                 let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
@@ -1469,19 +1469,17 @@ impl ImputationPipeline {
     }
 
     /// Load reference panel from file (VCF or BREF3)
-    pub fn load_reference_streaming(path: &std::path::Path, map_path: Option<&std::path::Path>) -> Result<GenotypeMatrix<Phased>> {
+    pub fn load_reference_streaming(path: &std::path::Path) -> Result<GenotypeMatrix<Phased>> {
         // Currently falling back to standard loading.
         // Tricky because we need to read the whole file to get markers
-
-
         if path.extension().map(|e| e == "bref3").unwrap_or(false) {
             let file = std::fs::File::open(path)?;
-            let mut reader = std::io::BufReader::new(file);
+            let reader = std::io::BufReader::new(file);
             let mut bref_reader = crate::io::bref3::Bref3Reader::open(reader)?;
-            bref_reader.read_all()
+            Ok(bref_reader.read_all()?)
         } else {
             let (mut reader, file) = VcfReader::open(path)?;
-            reader.read_all(file)?.into_phased()
+            Ok(reader.read_all(file)?.into_phased())
         }
     }
 }

@@ -445,6 +445,11 @@ impl Markers {
         self.markers.len()
     }
 
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.markers.is_empty()
+    }
+
     /// Get marker by index
     pub fn get(&self, idx: MarkerIdx) -> Option<&Marker> {
         self.markers.get(idx.as_usize())

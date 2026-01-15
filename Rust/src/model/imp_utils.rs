@@ -334,9 +334,9 @@ pub fn run_hmm_forward_backward_to_sparse(
     n_states: usize,
     hap_indices_input: &[Vec<u32>],
     threshold: f32,
-    fwd_buffer: &mut Vec<f32>,
-    bwd_buffer: &mut Vec<f32>,
-    block_fwd_buffer: &mut Vec<f32>,
+    fwd_buffer: &mut [f32],
+    bwd_buffer: &mut [f32],
+    block_fwd_buffer: &mut [f32],
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
     use wide::f32x8;
 
@@ -539,7 +539,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             }
 
             let mut new_sum = 0.0f32;
-            for &x in curr_slice { new_sum += x; }
+            for x in curr_slice.iter() { new_sum += *x; }
             recomp_sum = new_sum.max(1e-30);
             curr_off = next_off;
         }
