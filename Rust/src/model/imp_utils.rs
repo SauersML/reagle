@@ -278,6 +278,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     p_recomb: &[f32],
     n_states: usize,
     hap_indices_input: &[Vec<u32>],
+    prior_probs: Option<&[f32]>,
     threshold: f32,
     fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
@@ -290,6 +291,9 @@ pub fn run_hmm_forward_backward_to_sparse(
     if n_clusters == 0 {
         return (vec![0], Vec::new(), Vec::new(), Vec::new());
     }
+
+    // Prevent exp underflow in long windows (matches legacy -80.0 log-floor)
+    const LOG_EMIT_FLOOR: f32 = -80.0;
 
     const CHECKPOINT_INTERVAL: usize = 64;
     let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
@@ -313,34 +317,20 @@ pub fn run_hmm_forward_backward_to_sparse(
             (prev_base, curr_base)
         };
 
-        let base_emit = cluster_base_scores[m].exp();
+        let base_emit = cluster_base_scores[m].max(LOG_EMIT_FLOOR).exp();
 
         if m == 0 {
-            // Initialize with priors if available (soft-handoff from previous window)
-            // Otherwise use uniform prior (1/n_states)
-            if let Some(priors) = initial_priors {
-                let haps = hap_indices_input.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
+            if let Some(priors) = prior_probs {
                 let mut sum = 0.0f32;
-                for (k, &hap_id) in haps.iter().enumerate().take(n_states) {
-                    let prior = priors.prior(hap_id, n_states);
-                    let val = prior * base_emit;
+                for k in 0..n_states {
+                    let prior = priors.get(k).copied().unwrap_or(1.0 / n_states as f32);
+                    let val = base_emit * prior;
                     fwd[curr_off + k] = val;
                     sum += val;
                 }
-                // Fill remaining states with uniform if haps < n_states
-                if haps.len() < n_states {
-                    let uniform = base_emit / n_states as f32;
-                    for k in haps.len()..n_states {
-                        fwd[curr_off + k] = uniform;
-                        sum += uniform;
-                    }
-                }
-                // Normalize to prevent numerical issues
-                if sum > 1e-30 {
-                    let inv_sum = 1.0 / sum;
-                    for k in 0..n_states {
-                        fwd[curr_off + k] *= inv_sum;
-                    }
+                if sum <= 0.0 {
+                    let val = base_emit / n_states as f32;
+                    fwd[curr_off..curr_off+n_states].fill(val);
                 }
             } else {
                 let val = base_emit / n_states as f32;
@@ -441,7 +431,7 @@ pub fn run_hmm_forward_backward_to_sparse(
         let mut curr_off;
 
         if block_idx == 0 {
-            let base_emit = cluster_base_scores[0].exp();
+            let base_emit = cluster_base_scores[0].max(LOG_EMIT_FLOOR).exp();
             let val = base_emit / n_states as f32;
             block_fwd[0..n_states].fill(val);
 
@@ -474,7 +464,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             let p_rec = p_recomb.get(local_m).copied().unwrap_or(0.0);
             let shift = p_rec / n_states as f32;
             let scale = (1.0 - p_rec) / recomp_sum.max(1e-30);
-            let base_emit = cluster_base_scores[local_m].exp();
+            let base_emit = cluster_base_scores[local_m].max(LOG_EMIT_FLOOR).exp();
 
             let next_off = curr_off + n_states;
             // Use split_at_mut to satisfy the borrow checker for non-overlapping slices
@@ -524,7 +514,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             if m + 1 < n_clusters {
                 let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
                 let shift = p_rec / n_states as f32;
-                let base_emit = cluster_base_scores[m + 1].exp();
+                let base_emit = cluster_base_scores[m + 1].max(LOG_EMIT_FLOOR).exp();
 
                 let mut k = 0;
                 let base_emit_vec = f32x8::splat(base_emit);
@@ -655,7 +645,7 @@ pub fn compute_state_probs(
     marker_cluster: Arc<Vec<usize>>,
     ref_cluster_end: Arc<Vec<usize>>,
     cluster_weights: Arc<Vec<f32>>,
-    initial_priors: Option<&crate::io::streaming::HaplotypePriors>,
+    prior_probs: Option<&[f32]>,
 ) -> Arc<ClusterStateProbs> {
     let n_clusters = cluster_bounds.len();
     workspace.reset_and_ensure_capacity(n_clusters, n_states);
@@ -688,11 +678,11 @@ pub fn compute_state_probs(
             cluster_p_recomb,
             n_states,
             hap_indices,
+            prior_probs,
             threshold,
             &mut workspace.fwd,
             &mut workspace.bwd,
             &mut workspace.block_fwd,
-            initial_priors,
         );
 
     Arc::new(ClusterStateProbs::from_sparse(

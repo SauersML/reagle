@@ -46,7 +46,6 @@ pub struct ImputationPipeline {
 /// - hapIndices[m][j] = haplotype for state j at marker m
 /// - probs[m][j] = P(state j) at marker m
 /// - probsP1[m][j] = P(state j) at marker m+1
-#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct StateProbs {
     /// Indices of genotyped markers in reference space
@@ -68,7 +67,6 @@ pub struct StateProbs {
     marker_to_cluster: std::sync::Arc<Vec<usize>>,
 }
 
-#[cfg(test)]
 impl StateProbs {
     /// Create state probabilities from sparse HMM output.
     ///
@@ -181,7 +179,6 @@ impl StateProbs {
     /// which provides O(1) lookup via linear scanning instead of O(log N) binary search.
     ///
     /// This method is primarily used in tests for random-access interpolation verification.
-    #[cfg(test)]
     #[inline]
     pub fn allele_posteriors<F>(&self, ref_marker: usize, n_alleles: usize, get_ref_allele: F) -> AllelePosteriors
     where
@@ -506,14 +503,12 @@ impl AllelePosteriors {
 /// For 818 samples × 2 haps × 1.1M markers = 1.8 billion marker lookups:
 /// - Binary search: 1.8B × 20 comparisons = 36 billion comparisons
 /// - Cursor: 1.8B × ~1 comparison = ~1.8 billion comparisons (20x faster)
-#[cfg(test)]
 pub struct StateProbsCursor {
     state_probs: Arc<StateProbs>,
     /// Current position in genotyped_markers (the sparse index)
     sparse_idx: usize,
 }
 
-#[cfg(test)]
 impl StateProbsCursor {
     /// Create a new cursor starting at position 0
     #[inline]
@@ -593,6 +588,45 @@ impl ClusterStateProbs {
             probs,
             probs_p1,
         }
+    }
+
+    /// Return haplotype-indexed priors at a reference marker.
+    /// Probabilities are interpolated between clusters to match allele posterior logic.
+    pub fn haplotype_priors_at(&self, ref_marker: usize) -> (Vec<u32>, Vec<f32>) {
+        let cluster = *self.marker_cluster.get(ref_marker).unwrap_or(&0);
+        let mut in_cluster = ref_marker < *self.ref_cluster_end.get(cluster).unwrap_or(&0);
+        let mut weight = self.weight.get(ref_marker).copied().unwrap_or(0.5);
+        if !weight.is_finite() {
+            in_cluster = true;
+            weight = 0.5;
+        }
+
+        let start = self.offsets.get(cluster).copied().unwrap_or(0);
+        let end = self.offsets.get(cluster + 1).copied().unwrap_or(start);
+        let haps = &self.hap_indices[start..end];
+        let probs = &self.probs[start..end];
+        let probs_p1 = &self.probs_p1[start..end];
+
+        let mut out_probs = Vec::with_capacity(haps.len());
+        for (j, _) in haps.iter().enumerate() {
+            let prob = probs[j];
+            let prob_p1 = probs_p1[j];
+            let interp = if in_cluster {
+                prob
+            } else {
+                weight * prob + (1.0 - weight) * prob_p1
+            };
+            out_probs.push(interp.max(0.0));
+        }
+
+        let sum: f32 = out_probs.iter().sum();
+        if sum > 1e-10 {
+            for p in &mut out_probs {
+                *p /= sum;
+            }
+        }
+
+        (haps.to_vec(), out_probs)
     }
 
     #[inline]
