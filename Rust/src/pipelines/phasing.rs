@@ -773,7 +773,6 @@ impl PhasingPipeline {
                 &mut sample_phases,
                 atomic_estimates.as_ref(),
                 it,
-                &confidence_by_sample,
             )?;
 
             // Update parameters from EM estimates and recompute recombination probabilities
@@ -823,7 +822,6 @@ impl PhasingPipeline {
                 &mut sample_phases,
                 &maf,
                 rare_threshold,
-                &confidence_by_sample,
                 None,
                 None,
             );
@@ -1221,7 +1219,6 @@ impl PhasingPipeline {
                 &mut sample_phases,
                 &maf,
                 rare_threshold,
-                &confidence_by_sample,
                 phased_overlap,
                 next_overlap_start,
             );
@@ -1707,10 +1704,6 @@ impl PhasingPipeline {
     /// This uses the full Forward-Backward algorithm to compute posterior probabilities
     /// of the phase, ensuring that phasing decisions are informed by both upstream
     /// and downstream data.
-    /// Confidence threshold for PBWT state selection.
-    /// Markers with confidence below this are treated as missing in IBS matching.
-    const PBWT_CONFIDENCE_THRESHOLD: f32 = 0.9;
-
     #[instrument(skip_all, fields(n_samples, n_markers))]
     fn run_phase_baum_iteration(
         &mut self,
@@ -1761,17 +1754,7 @@ impl PhasingPipeline {
                     self.build_composite_haps_streaming(
                         |m, h| {
                             if h < n_haps {
-                                // Target haplotype: check confidence before using
-                                let sample = h / 2;
-                                let conf = confidence_by_sample.get(sample)
-                                    .and_then(|c| c.get(m))
-                                    .copied()
-                                    .unwrap_or(1.0);
-                                if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                                    255 // Treat low-confidence calls as missing for IBS
-                                } else {
-                                    ref_geno.get(m, HapIdx::new(h as u32))
-                                }
+                                ref_geno.get(m, HapIdx::new(h as u32))
                             } else {
                                 // Reference haplotype: always use actual allele
                                 let ref_h = h - n_haps;
@@ -1948,7 +1931,6 @@ impl PhasingPipeline {
         sample_phases: &mut [SamplePhase],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
-        confidence_by_sample: &[Vec<f32>],
     ) -> Result<()> {
         let n_haps = geno.n_haps();
 
@@ -1989,17 +1971,7 @@ impl PhasingPipeline {
                 self.build_bidirectional_pbwt_combined_subset(
                     |orig_m, h| {
                         if h < n_haps {
-                            // Target haplotype: check confidence before using
-                            let sample = h / 2;
-                            let conf = confidence_by_sample.get(sample)
-                                .and_then(|c| c.get(orig_m))
-                                .copied()
-                                .unwrap_or(1.0);
-                            if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                                255 // Treat low-confidence calls as missing for IBS
-                            } else {
-                                ref_geno.get(orig_m, HapIdx::new(h as u32))
-                            }
+                            ref_geno.get(orig_m, HapIdx::new(h as u32))
                         } else {
                             let ref_h = h - n_haps;
                             if let Some(ref_m) = alignment.target_to_ref(orig_m) {
@@ -2250,7 +2222,6 @@ impl PhasingPipeline {
         sample_phases: &mut [SamplePhase],
         maf: &[f32],
         rare_threshold: f32,
-        confidence_by_sample: &[Vec<f32>],
         previous_overlap: Option<&PhasedOverlap>,
         next_overlap_start: Option<usize>,
     ) -> Option<StateProbs> {
@@ -2285,7 +2256,12 @@ impl PhasingPipeline {
         };
 
         // Build Stage 2 interpolation mappings
-        let stage2_phaser = Stage2Phaser::new(hi_freq_markers, gen_positions, n_markers);
+            let stage2_phaser = Stage2Phaser::new(
+                hi_freq_markers,
+                gen_positions,
+                n_markers,
+                self.params.recomb_intensity,
+            );
 
         // Result container for next window's state probs
         // We will collect this from parallel iteration.
@@ -2358,17 +2334,7 @@ impl PhasingPipeline {
                 self.build_bidirectional_pbwt_combined_subset(
                     |orig_m, h| {
                         if h < n_haps {
-                            // Target haplotype: check confidence before using
-                            let sample = h / 2;
-                            let conf = confidence_by_sample.get(sample)
-                                .and_then(|c| c.get(orig_m))
-                                .copied()
-                                .unwrap_or(1.0);
-                            if conf < Self::PBWT_CONFIDENCE_THRESHOLD {
-                                255 // Treat low-confidence calls as missing for IBS
-                            } else {
-                                ref_geno.get(orig_m, HapIdx::new(h as u32))
-                            }
+                            ref_geno.get(orig_m, HapIdx::new(h as u32))
                         } else {
                             let ref_h = h - n_haps;
                             if let Some(ref_m) = alignment.target_to_ref(orig_m) {
@@ -2472,7 +2438,7 @@ impl PhasingPipeline {
 
                 // Lazy cache for state->hap mapping - O(1) indexing with Option<Vec>
                 // Uses immutable materialize_at() to avoid clone() overhead
-                let mut hap_cache: Vec<Option<Vec<u32>>> = vec![None; n_stage1];
+                let mut hap_cache: Vec<Option<Vec<u32>>> = vec![None; n_markers];
 
                 macro_rules! get_haps {
                     ($marker:expr) => {{
@@ -2519,15 +2485,12 @@ impl PhasingPipeline {
                         let mut al_probs = [0.0f32; 4];
 
                         let mkr_a = stage2_phaser.prev_stage1_marker[m];
-                        let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
-                        let wt = stage2_phaser.prev_stage1_wt[m];
                         let state_haps = get_haps!(mkr_a);
+                        let n_states = state_haps.len();
+                        let bridge_probs = stage2_phaser.bridge_state_probs(m, probs, n_states);
 
                         for (j, &hap) in state_haps.iter().enumerate() {
-                            let prob_a = probs[mkr_a].get(j).copied().unwrap_or(0.0);
-                            let prob_b = probs[mkr_b].get(j).copied().unwrap_or(0.0);
-                            let prob = wt * prob_a + (1.0 - wt) * prob_b;
-
+                            let prob = bridge_probs.get(j).copied().unwrap_or(0.0);
                             let b1 = get_allele(m, hap as usize);
 
                             if b1 != 255 {
@@ -2552,15 +2515,12 @@ impl PhasingPipeline {
                         let m = $m;
                         let probs = $probs;
                         let carrier_set = $carrier_set;
-                        let mkr_a = stage2_phaser.prev_stage1_marker[m];
-                        let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
-                        let wt = stage2_phaser.prev_stage1_wt[m];
-                        let state_haps = get_haps!(mkr_a);
+                        let state_haps = get_haps!(m);
+                        let n_states = state_haps.len();
+                        let bridge_probs = stage2_phaser.bridge_state_probs(m, probs, n_states);
                         let mut score = 0.0f32;
                         for (j, &hap) in state_haps.iter().enumerate() {
-                            let prob_a = probs[mkr_a].get(j).copied().unwrap_or(0.0);
-                            let prob_b = probs[mkr_b].get(j).copied().unwrap_or(0.0);
-                            let prob = wt * prob_a + (1.0 - wt) * prob_b;
+                            let prob = bridge_probs.get(j).copied().unwrap_or(0.0);
                             if carrier_set.contains(&hap) {
                                 score += prob;
                             }
@@ -3899,11 +3859,14 @@ enum Stage2Decision {
 struct Stage2Phaser {
     /// For each Stage 2 marker, the index of the preceding Stage 1 marker
     prev_stage1_marker: Vec<usize>,
-    /// For each Stage 2 marker, the interpolation weight (0.0 to 1.0)
-    /// wt = 1.0 means use prev marker fully, wt = 0.0 means use next marker fully
-    prev_stage1_wt: Vec<f32>,
     /// Number of Stage 1 markers
     n_stage1: usize,
+    /// Stage 1 marker indices in original marker space
+    stage1_markers: Vec<usize>,
+    /// Genetic positions (cM) for all markers
+    gen_positions: Vec<f64>,
+    /// Recombination intensity for bridge interpolation
+    recomb_intensity: f32,
 }
 
 impl Stage2Phaser {
@@ -3913,7 +3876,12 @@ impl Stage2Phaser {
     /// * `hi_freq_markers` - Indices of high-frequency (Stage 1) markers in original space
     /// * `gen_positions` - Genetic positions (cM) for all markers
     /// * `n_total_markers` - Total number of markers
-    fn new(hi_freq_markers: &[usize], gen_positions: &[f64], n_total_markers: usize) -> Self {
+    fn new(
+        hi_freq_markers: &[usize],
+        gen_positions: &[f64],
+        n_total_markers: usize,
+        recomb_intensity: f32,
+    ) -> Self {
         let n_stage1 = hi_freq_markers.len();
 
         // Build prevStage1Marker: for each marker, which Stage 1 marker precedes it
@@ -3936,43 +3904,12 @@ impl Stage2Phaser {
             prev_stage1_marker[(last_hf + 1)..].fill(n_stage1 - 1);
         }
 
-        // Build prevStage1Wt: interpolation weight based on genetic position
-        // wt = (posB - pos) / (posB - posA) where posA is prev Stage1, posB is next Stage1
-        let mut prev_stage1_wt = vec![1.0f32; n_total_markers];
-
-        if n_stage1 >= 2 {
-            // Markers before first Stage 1 marker: wt = 1.0 (use first marker)
-            // Already initialized to 1.0
-
-            // Between Stage 1 markers: interpolate
-            for j in 0..(n_stage1 - 1) {
-                let start = hi_freq_markers[j];
-                let end = hi_freq_markers[j + 1];
-                let pos_a = gen_positions[start];
-                let pos_b = gen_positions[end];
-                let d = pos_b - pos_a;
-
-                prev_stage1_wt[start] = 1.0;
-
-                if d > 1e-10 {
-                    for (m, wt) in prev_stage1_wt.iter_mut().enumerate().take(end).skip(start + 1) {
-                        *wt = ((pos_b - gen_positions[m]) / d) as f32;
-                    }
-                } else {
-                    // Zero distance, use equal weight
-                    prev_stage1_wt[(start + 1)..end].fill(0.5);
-                }
-            }
-
-            // Markers at and after last Stage 1 marker: wt = 1.0
-            let last_hf = hi_freq_markers[n_stage1 - 1];
-            prev_stage1_wt[last_hf..].fill(1.0);
-        }
-
         Self {
             prev_stage1_marker,
-            prev_stage1_wt,
             n_stage1,
+            stage1_markers: hi_freq_markers.to_vec(),
+            gen_positions: gen_positions.to_vec(),
+            recomb_intensity,
         }
     }
 
@@ -4000,14 +3937,8 @@ impl Stage2Phaser {
     {
         let mut al_probs = [0.0f32; 2];
 
-        let mkr_a = self.prev_stage1_marker[marker];
-        let mkr_b = (mkr_a + 1).min(self.n_stage1 - 1);
-        let wt = self.prev_stage1_wt[marker];
-
-        let probs_a = &state_probs[mkr_a];
-        let probs_b = &state_probs[mkr_b];
-
         let n_states = haps_at_mkr_a.len();
+        let bridge_probs = self.bridge_state_probs(marker, state_probs, n_states);
 
         for j in 0..n_states {
             let hap = haps_at_mkr_a[j] as usize;
@@ -4023,9 +3954,7 @@ impl Stage2Phaser {
                 continue;
             }
 
-            // Interpolate state probability
-            let prob = wt * probs_a.get(j).copied().unwrap_or(0.0)
-                + (1.0 - wt) * probs_b.get(j).copied().unwrap_or(0.0);
+            let prob = bridge_probs.get(j).copied().unwrap_or(0.0);
 
             // Simple haploid emission: if this reference haplotype carries a1, add
             // probability to a1; if it carries a2, add to a2.
@@ -4038,6 +3967,74 @@ impl Stage2Phaser {
         }
 
         al_probs
+    }
+
+    fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
+        let c = -(self.recomb_intensity as f64);
+        (-f64::exp_m1(c * gen_dist_cm)) as f32
+    }
+
+    fn bridge_state_probs(
+        &self,
+        marker: usize,
+        state_probs: &[Vec<f32>],
+        n_states: usize,
+    ) -> Vec<f32> {
+        let mkr_a = self.prev_stage1_marker[marker];
+        let mkr_b = (mkr_a + 1).min(self.n_stage1 - 1);
+
+        let probs_a = &state_probs[mkr_a];
+        let probs_b = &state_probs[mkr_b];
+
+        if mkr_a == mkr_b || self.stage1_markers.is_empty() {
+            return probs_a.clone();
+        }
+
+        let pos_a_idx = self.stage1_markers[mkr_a];
+        let pos_b_idx = self.stage1_markers[mkr_b];
+
+        let pos_a = *self.gen_positions.get(pos_a_idx).unwrap_or(&0.0);
+        let pos_b = *self.gen_positions.get(pos_b_idx).unwrap_or(&pos_a);
+        let pos_m = *self.gen_positions.get(marker).unwrap_or(&pos_a);
+
+        if pos_b <= pos_a {
+            return probs_a.clone();
+        }
+        if pos_m <= pos_a {
+            return probs_a.clone();
+        }
+        if pos_m >= pos_b {
+            return probs_b.clone();
+        }
+
+        let d1 = (pos_m - pos_a).max(0.0);
+        let d2 = (pos_b - pos_m).max(0.0);
+        let r1 = self.p_recomb(d1);
+        let r2 = self.p_recomb(d2);
+
+        let shift1 = r1 / n_states.max(1) as f32;
+        let shift2 = r2 / n_states.max(1) as f32;
+        let scale1 = 1.0 - r1;
+        let scale2 = 1.0 - r2;
+
+        let mut weights = vec![0.0f32; n_states];
+        let mut sum = 0.0f32;
+        for k in 0..n_states {
+            let a = scale1 * probs_a.get(k).copied().unwrap_or(0.0) + shift1;
+            let b = scale2 * probs_b.get(k).copied().unwrap_or(0.0) + shift2;
+            let w = a * b;
+            weights[k] = w;
+            sum += w;
+        }
+
+        if sum > 0.0 {
+            for w in &mut weights {
+                *w /= sum;
+            }
+            weights
+        } else {
+            probs_a.clone()
+        }
     }
 }
 

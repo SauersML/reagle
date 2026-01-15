@@ -332,8 +332,13 @@ impl<'a> BeagleHmm<'a> {
                 //
                 // The fwd_update function expects p_switch = ρ (raw recombination prob)
                 // and internally computes: shift = ρ/K, scale = (1-ρ)/fwd_sum
+                let prev_row_offset = (m - 1) * n_states;
+                let (before, curr_and_after) = fwd.split_at_mut(row_offset);
+                let prev_row = &before[prev_row_offset..prev_row_offset + n_states];
+                let curr_row = &mut curr_and_after[..n_states];
+                curr_row.copy_from_slice(prev_row);
                 fwd_sum = HmmUpdater::fwd_update(
-                    &mut fwd[row_offset..row_offset + n_states],
+                    curr_row,
                     fwd_sum,
                     p_recomb_m, // Pass raw recombination probability
                     &emit_probs,
