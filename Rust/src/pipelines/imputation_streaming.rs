@@ -727,7 +727,7 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         self.write_imputed_window_streaming(
-            ref_win, alignment, final_writer, window_quality, output_start, output_end,
+            ref_win, target_win, alignment, final_writer, window_quality, output_start, output_end,
             markers_to_process.start, &all_results, self.config.gp, self.config.ap,
         )?;
         Ok(next_priors)
@@ -762,6 +762,7 @@ impl crate::pipelines::ImputationPipeline {
     fn write_imputed_window_streaming(
         &self,
         ref_win: &GenotypeMatrix<Phased>,
+        target_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
         writer: &mut VcfWriter,
         quality: &ImputationQuality,
@@ -840,21 +841,45 @@ impl crate::pipelines::ImputationPipeline {
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at markers_to_process_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            let local_m = marker_idx.saturating_sub(markers_to_process_start);
-            if let Some((dosages, _)) = sample_data.get(&sample_idx) {
-                dosages.get(local_m).copied().unwrap_or(0.0)
+            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                let h1 = HapIdx::new((sample_idx * 2) as u32);
+                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+                if a1 == 255 || a2 == 255 {
+                    0.0
+                } else {
+                    (a1 as f32) + (a2 as f32)
+                }
             } else {
-                0.0
+                let local_m = marker_idx.saturating_sub(markers_to_process_start);
+                if let Some((dosages, _)) = sample_data.get(&sample_idx) {
+                    dosages.get(local_m).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                }
             }
         };
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
-            let local_m = marker_idx.saturating_sub(markers_to_process_start);
-            if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
-                best_gt.get(local_m).copied().unwrap_or((0, 0))
+            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                let h1 = HapIdx::new((sample_idx * 2) as u32);
+                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+                if a1 == 255 || a2 == 255 {
+                    (0, 0)
+                } else {
+                    (a1, a2)
+                }
             } else {
-                (0, 0)
+                let local_m = marker_idx.saturating_sub(markers_to_process_start);
+                if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
+                    best_gt.get(local_m).copied().unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                }
             }
         };
 
