@@ -14,6 +14,7 @@ use std::path::Path;
 use crate::data::ChromIdx;
 use crate::data::marker::{MarkerIdx, Markers};
 use crate::error::{ReagleError, Result};
+use tracing::info_span;
 
 /// Default scale factor: 1 cM per Mb (1e-6 cM per bp)
 pub const DEFAULT_SCALE_FACTOR: f64 = 1e-6;
@@ -325,7 +326,6 @@ impl GeneticMaps {
             }
             Ok(Self { maps })
         })
-    }
     }
 
     /// Get genetic map for a chromosome

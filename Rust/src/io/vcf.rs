@@ -12,30 +12,24 @@ use noodles::bgzf::io as bgzf_io;
 use noodles::vcf::Header;
 
 use crate::data::haplotype::Samples;
-use crate::pipelines::imputation::ImputationQuality;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
 use crate::error::{ReagleError, Result};
 
 /// Imputation quality statistics for a single marker
 ///
-/// Calculates Dosage R-squared (DR2) as Var(d) / Var(X), where:
-/// - `d` is the estimated dosage from HMM posteriors.
-/// - `X` is the true allele count. For genotyped markers, `X` is the known
-///   hard-called genotype. For imputed markers, `X` is estimated from a
-///   hard call on the HMM posteriors.
+/// Calculates Dosage R-squared (DR2) using the Beagle formula:
+/// R² = (Σp² - (Σp)²/N) / (Σp - (Σp)²/N)
+/// where p is the posterior probability of the ALT allele for each haplotype,
+/// and N is the total number of haplotypes.
 #[derive(Clone, Debug, Default)]
 pub struct MarkerImputationStats {
-    /// Sum of estimated dosages (d) for each ALT allele.
-    sum_d: Vec<f32>,
-    /// Sum of squared estimated dosages (d^2) for each ALT allele.
-    sum_d_sq: Vec<f32>,
-    /// Sum of true allele counts (X) for each ALT allele.
-    sum_x: Vec<f32>,
-    /// Sum of squared true allele counts (X^2) for each ALT allele.
-    sum_x_sq: Vec<f32>,
-    /// Number of SAMPLES processed.
-    n_samples: usize,
+    /// Sum of probabilities (p) for each allele across all haplotypes.
+    sum_p: Vec<f32>,
+    /// Sum of squared probabilities (p²) for each allele across all haplotypes.
+    sum_p_sq: Vec<f32>,
+    /// Number of HAPLOTYPES processed.
+    n_haps: usize,
     /// Whether this marker was imputed.
     pub is_imputed: bool,
 }
@@ -44,136 +38,107 @@ impl MarkerImputationStats {
     /// Create new stats for a marker with the given number of alleles.
     pub fn new(n_alleles: usize) -> Self {
         Self {
-            sum_d: vec![0.0; n_alleles],
-            sum_d_sq: vec![0.0; n_alleles],
-            sum_x: vec![0.0; n_alleles],
-            sum_x_sq: vec![0.0; n_alleles],
-            n_samples: 0,
+            sum_p: vec![0.0; n_alleles],
+            sum_p_sq: vec![0.0; n_alleles],
+            n_haps: 0,
             is_imputed: false,
         }
     }
 
-    /// Add a sample's data with optional known true genotype.
+    /// Add a sample's data (two haplotypes).
     ///
     /// # Arguments
     /// * `probs1` - HMM posterior probabilities for haplotype 1.
     /// * `probs2` - HMM posterior probabilities for haplotype 2.
-    /// * `true_gt` - Known true genotype `(a1, a2)`, if available.
-    pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32], true_gt: Option<(u8, u8)>) {
-        self.n_samples += 1;
-        for a in 1..self.sum_d.len() {
-            // Estimated dosage (d) is ALWAYS from HMM posteriors.
-            let d_a = probs1.get(a).copied().unwrap_or(0.0) + probs2.get(a).copied().unwrap_or(0.0);
-            self.sum_d[a] += d_a;
-            self.sum_d_sq[a] += d_a * d_a;
+    pub fn add_sample(&mut self, probs1: &[f32], probs2: &[f32]) {
+        self.n_haps += 2;
+        for a in 1..self.sum_p.len() {
+            let p1 = probs1.get(a).copied().unwrap_or(0.0);
+            let p2 = probs2.get(a).copied().unwrap_or(0.0);
 
-            // True allele count (X) depends on whether the marker is genotyped.
-            let x_a = if let Some((a1, a2)) = true_gt {
-                // For genotyped markers, use the known hard-called alleles.
-                (a1 as usize == a) as i32 as f32 + (a2 as usize == a) as i32 as f32
-            } else {
-                // For imputed markers, estimate X from a hard call on posteriors.
-                self.get_hard_call(probs1, probs2, a)
-            };
-            self.sum_x[a] += x_a;
-            self.sum_x_sq[a] += x_a * x_a;
+            // Accumulate statistics per haplotype
+            let p_sum = p1 + p2;
+            let p_sq_sum = p1 * p1 + p2 * p2;
+
+            self.sum_p[a] += p_sum;
+            self.sum_p_sq[a] += p_sq_sum;
         }
-    }
-
-    /// Hard-call genotype from posteriors (for estimating true allele count `X`).
-    fn get_hard_call(&self, probs1: &[f32], probs2: &[f32], allele: usize) -> f32 {
-        let max_a1 = probs1.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(0);
-        let max_a2 = probs2.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(0);
-        (max_a1 == allele) as i32 as f32 + (max_a2 == allele) as i32 as f32
     }
 
     /// Add dosage contribution from a haploid sample
     pub fn add_haploid(&mut self, probs: &[f32]) {
-        // For haploid, true_gt would be single allele - use hard call from posteriors
-        for a in 1..self.sum_d.len() {
-            let d_a = probs.get(a).copied().unwrap_or(0.0);
-            self.sum_d[a] += d_a;
-            self.sum_d_sq[a] += d_a * d_a;
-
-            let max_a = probs.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(0);
-            let x_a = (max_a == a) as i32 as f32;
-            self.sum_x[a] += x_a;
-            self.sum_x_sq[a] += x_a * x_a;
+        self.n_haps += 1;
+        for a in 1..self.sum_p.len() {
+            let p = probs.get(a).copied().unwrap_or(0.0);
+            self.sum_p[a] += p;
+            self.sum_p_sq[a] += p * p;
         }
     }
 
     /// Add a biallelic sample's data with compact representation (no heap allocation).
     /// p1 = P(ALT) for haplotype 1, p2 = P(ALT) for haplotype 2.
     #[inline]
-    pub fn add_sample_biallelic(&mut self, p1: f32, p2: f32, true_gt: Option<(u8, u8)>) {
-        assert!(self.sum_d.len() == 2, "add_sample_biallelic requires biallelic marker");
-        self.n_samples += 1;
+    pub fn add_sample_biallelic(&mut self, p1: f32, p2: f32) {
+        assert!(self.sum_p.len() == 2, "add_sample_biallelic requires biallelic marker");
+        self.n_haps += 2;
 
-        // Dosage for ALT allele (index 1)
-        let d_alt = p1 + p2;
-        self.sum_d[1] += d_alt;
-        self.sum_d_sq[1] += d_alt * d_alt;
+        let p_sum = p1 + p2;
+        let p_sq_sum = p1 * p1 + p2 * p2;
 
-        // True allele count
-        let x_alt = if let Some((a1, a2)) = true_gt {
-            // For genotyped markers, use known alleles
-            (a1 == 1) as i32 as f32 + (a2 == 1) as i32 as f32
-        } else {
-            // For imputed markers, hard call: if p > 0.5, call ALT
-            let call1 = if p1 > 0.5 { 1.0 } else { 0.0 };
-            let call2 = if p2 > 0.5 { 1.0 } else { 0.0 };
-            call1 + call2
-        };
-        self.sum_x[1] += x_alt;
-        self.sum_x_sq[1] += x_alt * x_alt;
+        self.sum_p[1] += p_sum;
+        self.sum_p_sq[1] += p_sq_sum;
     }
 
     /// Add haploid biallelic sample (compact, no heap allocation).
     #[inline]
     pub fn add_haploid_biallelic(&mut self, p_alt: f32) {
-        assert!(self.sum_d.len() == 2, "add_haploid_biallelic requires biallelic marker");
-        self.sum_d[1] += p_alt;
-        self.sum_d_sq[1] += p_alt * p_alt;
-
-        let x_alt = if p_alt > 0.5 { 1.0 } else { 0.0 };
-        self.sum_x[1] += x_alt;
-        self.sum_x_sq[1] += x_alt * x_alt;
+        assert!(self.sum_p.len() == 2, "add_haploid_biallelic requires biallelic marker");
+        self.n_haps += 1;
+        self.sum_p[1] += p_alt;
+        self.sum_p_sq[1] += p_alt * p_alt;
     }
 
-    /// Calculate DR2 (dosage R-squared) = Var(d) / Var_expected.
-    /// Uses expected variance 2*p*(1-p) from allele frequency, not hard-call variance.
+    /// Calculate DR2 (dosage R-squared) matching Java Beagle's implementation.
+    /// Formula: (Σp² - (Σp)²/N) / (Σp - (Σp)²/N)
     pub fn dr2(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_d.len() || self.n_samples == 0 {
+        if allele == 0 || allele >= self.sum_p.len() || self.n_haps == 0 {
             return 0.0;
         }
 
-        let n = self.n_samples as f32;
-        // Variance = E[X²] - E[X]² = (Σx²/n) - (Σx/n)²
-        // Previous bug: calculated SSD (N*Var) instead of Var by not dividing by n
-        let mean_d = self.sum_d[allele] / n;
-        let var_d = (self.sum_d_sq[allele] / n) - (mean_d * mean_d);
+        let sum = self.sum_p[allele];
+        if sum == 0.0 {
+            return 0.0;
+        }
 
-        // Use expected variance under HWE: 2*p*(1-p) where p is allele frequency
-        // AF = mean_dosage / 2 = (sum_d / n) / 2
-        let p = mean_d / 2.0;
-        let var_expected = 2.0 * p * (1.0 - p);
+        let sum_sq = self.sum_p_sq[allele];
+        let n = self.n_haps as f32;
 
-        if var_d <= 0.0 || var_expected <= 0.0 {
-            // For genotyped markers, zero variance means perfect quality
-            // For imputed markers, zero variance means no information
-            if self.is_imputed { 0.0 } else { 1.0 }
+        // Java: float meanTerm = sum*sum/(nInputTargHaps);
+        let mean_term = sum * sum / n;
+
+        // Java: float num = (sum2 - meanTerm);
+        let num = sum_sq - mean_term;
+
+        // Java: float den = (sum - meanTerm);
+        let den = sum - mean_term;
+
+        // Java: return num <= 0 ? 0f : num/den;
+        if num <= 0.0 {
+            0.0
+        } else if den == 0.0 {
+            0.0
         } else {
-            (var_d / var_expected).clamp(0.0, 1.0)
+            (num / den).clamp(0.0, 1.0)
         }
     }
 
     /// Calculate estimated allele frequency for the specified ALT allele
     pub fn allele_freq(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_d.len() || self.n_samples == 0 {
+        if allele == 0 || allele >= self.sum_p.len() || self.n_haps == 0 {
             return 0.0;
         }
-        // AF = Mean dosage / 2 = (sum of sample dosages / n_samples) / 2
-        (self.sum_d[allele] / self.n_samples as f32) / 2.0
+        // AF = Total Prob Mass / Total Haplotypes
+        self.sum_p[allele] / self.n_haps as f32
     }
 }
 
@@ -208,22 +173,6 @@ impl ImputationQuality {
     pub fn set_imputed(&mut self, marker: usize, imputed: bool) {
         if let Some(stats) = self.marker_stats.get_mut(marker) {
             stats.is_imputed = imputed;
-        }
-    }
-
-    /// Record imputation accuracy for a sample at a marker
-    ///
-    /// This is used to accumulate quality statistics for validation.
-    /// For biallelic markers, this records whether the imputed alleles match the true alleles.
-    pub fn record_imputed(&mut self, marker: usize, hap1_correct: bool, hap2_correct: bool) {
-        if let Some(stats) = self.marker_stats.get_mut(marker) {
-            // For biallelic markers, we can estimate accuracy from correctness
-            // This is a simplified version - full implementation would use posterior probabilities
-            let p1_correct = if hap1_correct { 1.0 } else { 0.0 };
-            let p2_correct = if hap2_correct { 1.0 } else { 0.0 };
-
-            // Add as biallelic sample with estimated posterior probabilities
-            stats.add_sample_biallelic(p1_correct, p2_correct, None);
         }
     }
 }
@@ -1369,12 +1318,12 @@ impl VcfWriter {
                 let mut info_str = String::with_capacity(64);
                 if n_alleles > 1 {
                     info_str.push_str("DR2=");
-                    for a in1..n_alleles {
+                    for a in 1..n_alleles {
                         if a > 1 { info_str.push(','); }
                         info_str.push_str(format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf));
                     }
                     info_str.push_str(";AF=");
-                    for a in1..n_alleles {
+                    for a in 1..n_alleles {
                         if a > 1 { info_str.push(','); }
                         info_str.push_str(format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf));
                     }
@@ -1468,29 +1417,28 @@ mod tests {
     #[test]
     fn test_marker_imputation_stats_new() {
         let stats = MarkerImputationStats::new(3);
-        assert_eq!(stats.sum_d.len(), 3);
-        assert_eq!(stats.sum_d_sq.len(), 3);
-        assert_eq!(stats.n_samples, 0);
+        assert_eq!(stats.sum_p.len(), 3);
+        assert_eq!(stats.sum_p_sq.len(), 3);
+        assert_eq!(stats.n_haps, 0);
         assert!(!stats.is_imputed);
     }
 
     #[test]
     fn test_dr2_perfect_imputation() {
-        // Perfect imputation with variation: mix of 0 and 1 dosages, all certain
+        // Perfect imputation with variation: mix of 0 and 1 probabilities
         let mut stats = MarkerImputationStats::new(2);
         stats.is_imputed = true;
 
-        // Add samples with different certain values to create variance
-        // 5 samples with ref/ref (dosage 0 for alt)
+        // 5 samples with ref/ref (p=0 for alt)
         for _ in 0..5 {
-            stats.add_sample(&[1.0, 0.0], &[1.0, 0.0], None);
+            stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]);
         }
-        // 5 samples with alt/alt (dosage 1 for alt)
+        // 5 samples with alt/alt (p=1 for alt)
         for _ in 0..5 {
-            stats.add_sample(&[0.0, 1.0], &[0.0, 1.0], None);
+            stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
         }
 
-        // DR2 should be high when there's variance and certainty
+        // DR2 should be 1.0
         let dr2 = stats.dr2(1);
         assert!(
             dr2 >= 0.99,
@@ -1507,15 +1455,14 @@ mod tests {
 
         // Add 10 samples, all uncertain
         for _ in 0..10 {
-            stats.add_sample(&[0.5, 0.5], &[0.5, 0.5], None);
+            stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]);
         }
 
-        // DR2 should be low for uncertain calls
-        // Here Var(d) = 0 because everyone has same dosage, so DR2=0
+        // DR2 should be 0 (no variance in p)
         let dr2 = stats.dr2(1);
         assert!(
-            dr2 < 0.1,
-            "DR2 should be low (0) for uncertain calls with no dosage variance, got {}",
+            dr2 < 0.001,
+            "DR2 should be 0 for uncertain calls with no dosage variance, got {}",
             dr2
         );
     }
@@ -1527,9 +1474,9 @@ mod tests {
         stats.is_imputed = true;
 
         // Some certain, some uncertain
-        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0], None); // Certain alt/alt (dose=2)
-        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0], None); // Certain ref/ref (dose=0)
-        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5], None); // Uncertain (dose=1)
+        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]); // Certain alt/alt (p=1)
+        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]); // Certain ref/ref (p=0)
+        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]); // Uncertain (p=0.5)
 
         let dr2 = stats.dr2(1);
         assert!(
@@ -1543,10 +1490,17 @@ mod tests {
     fn test_allele_frequency() {
         let mut stats = MarkerImputationStats::new(2);
 
-        // 3 samples with dosages 2, 1, 0 (total 3 out of 6 alleles)
-        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0], None); // Dosage = 2
-        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5], None); // Dosage = 1
-        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0], None); // Dosage = 0
+        // 3 samples (6 haplotypes):
+        // 1. alt/alt (p=1, p=1) -> 2 alt
+        // 2. ref/alt (p=0.5, p=0.5) -> 1 alt equivalent
+        // 3. ref/ref (p=0, p=0) -> 0 alt
+        stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
+        stats.add_sample(&[0.5, 0.5], &[0.5, 0.5]);
+        stats.add_sample(&[1.0, 0.0], &[1.0, 0.0]);
+
+        // Total prob mass = 1 + 1 + 0.5 + 0.5 + 0 + 0 = 3.0
+        // Total haplotypes = 6
+        // AF = 3.0 / 6 = 0.5
 
         let af = stats.allele_freq(1);
         assert!((af - 0.5).abs() < 0.01, "AF should be 0.5, got {}", af);
@@ -1561,12 +1515,12 @@ mod tests {
 
         // Test mutability
         if let Some(stats) = quality.get_mut(2) {
-            stats.add_sample(&[0.0, 1.0], &[0.0, 1.0], None);
+            stats.add_sample(&[0.0, 1.0], &[0.0, 1.0]);
             stats.is_imputed = true;
         }
 
         assert!(quality.get(2).unwrap().is_imputed);
-        assert_eq!(quality.get(2).unwrap().n_samples, 1);
+        assert_eq!(quality.get(2).unwrap().n_haps, 2);
     }
 }
 #[test]

@@ -199,7 +199,7 @@ impl crate::pipelines::ImputationPipeline {
 
                 // Extract state for next window BEFORE moving phased to channel
                 phased_overlap = Some(pipeline.extract_overlap_streaming(&phased, n_markers, target_window.output_end));
-                pbwt_state = Some(pipeline.extract_pbwt_state_streaming(&phased, n_markers));
+                pbwt_state = Some(pipeline.extractpbwt_state_streaming(&phased, n_markers));
 
                 // Send to consumer
                 if let Err(_) = tx.send(StreamingPayload {
@@ -299,7 +299,7 @@ impl crate::pipelines::ImputationPipeline {
         alignment: &MarkerAlignment,
         gen_maps: &GeneticMaps,
         phased_overlap: Option<&PhasedOverlap>,
-        _pbwt_state: Option<&PbwtState>, // TODO: Use PBWT handoff
+        pbwt_state: Option<&PbwtState>,
     ) -> Result<GenotypeMatrix<Phased>> {
         let mut phasing = crate::pipelines::PhasingPipeline::new(self.config.clone());
         let ref_gt_arc = Arc::new(ref_gt.clone());
@@ -329,7 +329,7 @@ impl crate::pipelines::ImputationPipeline {
         PhasedOverlap::new(overlap_size, n_haps, alleles)
     }
 
-    fn extract_pbwt_state_streaming(
+    fn extractpbwt_state_streaming(
         &self,
         phased: &GenotypeMatrix<Phased>,
         n_markers: usize,

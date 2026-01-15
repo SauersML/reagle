@@ -835,7 +835,7 @@ impl PhasingPipeline {
         while let Some(mut window) = next_window_opt {
             let window_idx = window_count;
             window_count += 1;
-            info_span!("process_window", window_idx = window_idx).in_scope(|| {
+
             let n_markers = window.genotypes.n_markers();
 
             eprintln!(
@@ -914,7 +914,7 @@ impl PhasingPipeline {
             window_count, total_markers
         );
         Ok(())
-            });
+
         }
         Ok(())
     }
@@ -1934,49 +1934,6 @@ impl PhasingPipeline {
                     assert!(swap_lr.len() <= changeable_positions.len());
                     let mut swap_mask = bitbox![u64, Lsb0; 0; n_markers];
                     let mut current_phase = 0u8;
-                    let mut phase_idx = 0usize;
-                    for m in overlap_markers..n_markers {
-                        if phase_idx < changeable_positions.len() && changeable_positions[phase_idx] == m {
-                            current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
-                            phase_idx += 1;
-                        }
-                        if current_phase == 1 {
-                            swap_mask.set(m, true);
-                        }
-                    }
-
-                    swap_mask
-                })
-                .collect()
-        };  // ref_geno borrow ends here
-
-        // Apply Swaps
-        let mut total_switches = 0;
-        for s in 0..n_samples {
-            let mask = &swap_masks[s];
-            if mask.any() {
-                let hap1 = HapIdx::new((s * 2) as u32);
-                let hap2 = HapIdx::new((s * 2 + 1) as u32);
-
-                for m in mask.iter_ones() {
-                    geno.swap(m, hap1, hap2);
-                    total_switches += 1;
-                }
-            }
-        }
-
-        // Update sample_phases to match
-        for (s, sp) in sample_phases.iter_mut().enumerate() {
-            for m in overlap_markers..n_markers {
-                if swap_masks[s][m] {
-                    sp.swap_alleles(m);
-                }
-            }
-        }
-
-        eprintln!("Applied {} phase switches (with {} overlap markers locked)", total_switches, overlap_markers);
-        Ok(())
-    }
 
     /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only using FB HMM
     ///
@@ -3661,7 +3618,7 @@ fn sample_swap_bits_mosaic(
     }
 
     // Resize workspace if needed for this window
-    workspace.resize_for_window(n_markers, n_states);
+    workspace.resize_for_states(n_states);
 
     let mut combined_checkpoints = FwdCheckpoints::new(n_markers, n_states, MOSAIC_BLOCK_SIZE);
     let dummy_allele = vec![255u8; n_markers];
@@ -3876,7 +3833,7 @@ impl Stage2Phaser {
     ) -> [f32; 2]
     where
         F: Fn(usize, usize) -> u8, // (marker, hap_index) -> allele
-    {
+
         let mut al_probs = [0.0f32; 2];
 
         let mkr_a = self.prev_stage1_marker[marker];
@@ -3915,209 +3872,14 @@ impl Stage2Phaser {
             }
             // If ref_allele matches neither (e.g., multiallelic), no contribution
         }
-
-        al_probs
-    }
-
-    /// Phase a window with PBWT state handoff from previous window
-    ///
-    /// This maintains PBWT continuity across windows by passing the
-    /// prefix array (PPA) and divergence array from the end of the
-    /// previous window to initialize the current window's PBWT.
-    fn phase_window_with_pbwt_handoff(
-        &mut self,
-        target_gt: &GenotypeMatrix,
-        gen_maps: &GeneticMaps,
-        phased_overlap: Option<&PhasedOverlap>,
-        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
-    ) -> Result<GenotypeMatrix<Phased>> {
-        // Log PBWT continuity state for debugging window transitions
-        if let Some(state) = pbwt_state {
-            tracing::trace!(
-                marker_pos = state.marker_pos,
-                n_haps = state.ppa.len(),
-                "PBWT state handoff from previous window"
-            );
-        }
-        self.phase_in_memory_with_overlap(target_gt, gen_maps, phased_overlap)
-    }
-
-    /// Extract PBWT state at the end of a window for handoff
-    ///
-    /// Returns the PPA and divergence arrays at the final marker
-    /// of the window, which will be used to initialize the next window.
-    ///
-    /// CURRENT LIMITATION: This recomputes PBWT state from scratch.
-    /// IDEAL FIX: Track PBWT state during phasing and capture directly.
-    fn extract_pbwt_state(
-        &self,
-        phased: &GenotypeMatrix<Phased>,
-        n_markers: usize,
-    ) -> crate::model::pbwt::PbwtState {
-        use crate::model::pbwt::PbwtDivUpdater;
-
-        let n_haps = phased.n_haplotypes();
-        let mut updater = PbwtDivUpdater::new(n_haps);
-
-        // Initialize with sorted haplotype order
-        let mut prefix: Vec<u32> = (0..n_haps as u32).collect();
-        let mut divergence: Vec<i32> = vec![0; n_haps];
-
-        // Process markers to build final PBWT state
-        // This is still O(N*M) but at least uses the optimized PBWT updater
-        for m in 0..n_markers {
-            let alleles: Vec<u8> = (0..n_haps)
-                .map(|h| phased.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32)))
-                .collect();
-            updater.fwd_update(&alleles, 2, m, &mut prefix, &mut divergence);
-        }
-
-        crate::model::pbwt::PbwtState::new(prefix, divergence, n_markers)
-    }
-
-    /// Finalize Stage 2 phasing using context from next window
-    ///
-    /// This implements Stage 2 phasing (rare variants) with proper context
-    /// from both current and next windows. The interpolation uses phased
-    /// markers from the next window to provide forward context for rare variants
-    /// at the end of the current window.
-    ///
-    /// Stage 1 handles all common variants. Stage 2 interpolates rare variants
-    /// between high-frequency markers using HMM state probabilities.
-    fn finalize_stage2_with_context(
-        &self,
-        current_phased: &GenotypeMatrix<Phased>,
-        next_phased: &GenotypeMatrix<Phased>,
-        gen_maps: &GeneticMaps,
-    ) -> Result<GenotypeMatrix<Phased>> {
-        // Create combined marker set for Stage 2 interpolation
-        // Include high-frequency markers from both current and next windows
-        let current_markers = current_phased.n_markers();
-        let next_markers = next_phased.n_markers();
-
-        // Extract genetic positions for all markers in both windows
-        let chrom = current_phased.marker(MarkerIdx::new(0)).chrom;
-        let mut all_positions = Vec::with_capacity(current_markers + next_markers);
-
-        // Current window positions
-        for m in 0..current_markers {
-            let marker = current_phased.marker(MarkerIdx::new(m as u32));
-            all_positions.push(marker.pos_cm);
-        }
-
-        // Next window positions (offset by current window size)
-        for m in 0..next_markers {
-            let marker = next_phased.marker(MarkerIdx::new(m as u32));
-            all_positions.push(marker.pos_cm);
-        }
-
-        // Identify high-frequency markers (Stage 1) from both windows
-        // Use MAF threshold to determine Stage 1 vs Stage 2 markers
-        let maf_threshold = 0.01; // 1% MAF threshold for Stage 1
-        let mut hi_freq_markers = Vec::new();
-
-        // Current window high-frequency markers
-        for m in 0..current_markers {
-            let marker = current_phased.marker(MarkerIdx::new(m as u32));
-            if marker.maf() >= maf_threshold {
-                hi_freq_markers.push(m);
-            }
-        }
-
-        // Next window high-frequency markers (offset indices)
-        for m in 0..next_markers {
-            let marker = next_phased.marker(MarkerIdx::new(m as u32));
-            if marker.maf() >= maf_threshold {
-                hi_freq_markers.push(current_markers + m);
-            }
-        }
-
-        if hi_freq_markers.len() < 2 {
-            // Not enough Stage 1 markers for interpolation, return as-is
-            tracing::warn!("Insufficient high-frequency markers for Stage 2 interpolation");
-            return Ok(current_phased.clone());
-        }
-
-        // Create Stage2Phaser for combined marker space
-        let stage2_phaser = Stage2Phaser::new(&hi_freq_markers, &all_positions, current_markers + next_markers);
-
-        // Clone current phased matrix to modify
-        let mut result = current_phased.clone();
-
-        // For each sample, perform Stage 2 interpolation for rare variants
-        for sample_idx in 0..current_phased.n_samples() {
-            // Collect HMM state probabilities at Stage 1 markers
-            // This is a simplified version - in practice we'd need to re-run HMM
-            // or extract state probabilities from the phasing process
-            let mut state_probs = Vec::with_capacity(hi_freq_markers.len());
-
-            for &stage1_marker in &hi_freq_markers {
-                // For markers in current window, we could extract from phasing HMM
-                // For now, use simplified state probabilities
-                let mut marker_probs = Vec::new();
-
-                if stage1_marker < current_markers {
-                    // Current window marker - use observed alleles as state probabilities
-                    for hap_idx in 0..current_phased.n_haplotypes() {
-                        let allele = current_phased.allele(MarkerIdx::new(stage1_marker as u32), HapIdx::new(hap_idx as u32));
-                        marker_probs.push(if allele == 1 { 1.0 } else { 0.0 });
-                    }
-                } else {
-                    // Next window marker - use for boundary context
-                    let next_marker = stage1_marker - current_markers;
-                    for hap_idx in 0..next_phased.n_haplotypes() {
-                        let allele = next_phased.allele(MarkerIdx::new(next_marker as u32), HapIdx::new(hap_idx as u32));
-                        marker_probs.push(if allele == 1 { 1.0 } else { 0.0 });
-                    }
-                }
-
-                state_probs.push(marker_probs);
-            }
-
-            // Apply Stage 2 interpolation to rare variants in current window
-            for marker in 0..current_markers {
-                let marker_maf = current_phased.marker(MarkerIdx::new(marker as u32)).maf();
-                if marker_maf >= maf_threshold {
-                    continue; // Already handled in Stage 1
-                }
-
-                // Get current alleles for this sample
-                let hap1_idx = HapIdx::new((sample_idx * 2) as u32);
-                let hap2_idx = HapIdx::new((sample_idx * 2 + 1) as u32);
-
-                let current_a1 = current_phased.allele(MarkerIdx::new(marker as u32), hap1_idx);
-                let current_a2 = current_phased.allele(MarkerIdx::new(marker as u32), hap2_idx);
-
-                if current_a1 != 255 && current_a2 != 255 {
-                    continue; // Already phased
-                }
-
-                // Get haplotypes at flanking Stage 1 markers
-                let flanking_marker = stage2_phaser.prev_stage1_marker[marker];
-                let haps_at_flanking = if flanking_marker < hi_freq_markers.len() {
-                    let stage1_marker = hi_freq_markers[flanking_marker];
-                    (0..current_phased.n_haplotypes()).map(|h| h as u32).collect::<Vec<_>>()
-                } else {
-                    continue; // No flanking haplotypes available
-                };
-
-                // Interpolate allele probabilities
-                let get_allele = |m: usize, hap: usize| -> u8 {
-                    if m < current_markers {
-                        current_phased.allele(MarkerIdx::new(m as u32), HapIdx::new(hap as u32))
-                    } else {
-                        let next_m = m - current_markers;
-                        next_phased.allele(MarkerIdx::new(next_m as u32), HapIdx::new(hap as u32))
-                    }
-                };
-
-                let al_probs1 = stage2_phaser.interpolated_allele_probs(
                     marker,
                     &state_probs,
                     &haps_at_flanking,
                     &get_allele,
                     0, 1, // a1=0, a2=1 for biallelic
-                );
+                ); }
+    }
+    }
 
                 let al_probs2 = stage2_phaser.interpolated_allele_probs(
                     marker,
@@ -4134,12 +3896,6 @@ impl Stage2Phaser {
                 // Update the result matrix
                 result.set_allele(MarkerIdx::new(marker as u32), hap1_idx, new_a1);
                 result.set_allele(MarkerIdx::new(marker as u32), hap2_idx, new_a2);
-            }
-        }
-
-        Ok(result)
-    }
-}
 
 #[cfg(test)]
 mod tests {
