@@ -2270,13 +2270,6 @@ impl PhasingPipeline {
         // Return type from parallel map
         type PhaseResult = (Vec<Stage2Decision>, Option<Vec<Vec<Vec<f32>>>>);
 
-        // Result container for next window's state probs
-        // We will collect this from parallel iteration.
-        // It needs to be ordered by haplotype.
-
-        // Return type from parallel map
-        type PhaseResult = (Vec<Stage2Decision>, Option<Vec<Vec<Vec<f32>>>>);
-
         // No clone needed: this function never mutates geno - only sample_phases.
         // We use a scoped immutable borrow for the entire computation phase.
         let phase_results: Vec<PhaseResult> = {
@@ -4158,6 +4151,7 @@ impl PhasingPipeline {
         );
 
         let mut mismatches = 0usize;
+        let mut matches = 0usize;
 
         // For each rare marker, check if next window has different phasing.
         // We avoid swapping single markers to preserve local LD structure.
@@ -4180,166 +4174,69 @@ impl PhasingPipeline {
                 // Check if next window has opposite phasing
                 if next_a1 == curr_a2 && next_a2 == curr_a1 {
                     mismatches += 1;
+                } else if next_a1 == curr_a1 && next_a2 == curr_a2 {
+                    matches += 1;
                 }
             }
         }
 
-        if mismatches > 0 {
-            tracing::debug!(
-                "Stage 2 finalization: detected {} phase mismatches from forward context",
-                mismatches
-            );
-        }
-        Ok(current_phased.clone())
-    }
-}
-
-impl PhasingPipeline {
-    /// Phase a window with PBWT state handoff from previous window
-    ///
-    /// This maintains PBWT continuity across windows by passing the
-    /// prefix array (PPA) and divergence array from the end of the
-    /// previous window to initialize the current window's PBWT.
-    pub fn phase_window_with_pbwt_handoff(
-        &mut self,
-        target_gt: &GenotypeMatrix,
-        gen_maps: &GeneticMaps,
-        phased_overlap: Option<&PhasedOverlap>,
-        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
-    ) -> Result<GenotypeMatrix<Phased>> {
-        // Log PBWT continuity state for debugging window transitions
-        if let Some(state) = pbwt_state {
-            tracing::trace!(
-                marker_pos = state.marker_pos,
-                n_haps = state.ppa.len(),
-                "PBWT state handoff from previous window"
-            );
-        }
-        self.phase_in_memory_with_overlap(target_gt, gen_maps, phased_overlap, None)
-            .map(|(result, ..)| result)
-    }
-
-    /// Finalize Stage 2 phasing using context from next window
-    ///
-    /// Finalize Stage 2 phasing with forward context from the next window.
-    ///
-    /// Stage 1 phasing handles common variants in-window. Stage 2 handles rare variants
-    /// using HMM state probabilities interpolated between Stage 1 markers.
-    ///
-    /// Cross-window context enables better rare variant phasing at window boundaries
-    /// by providing forward context from the next window's phased markers. However,
-    /// since GenotypeMatrix is immutable by design, the actual rare variant phasing
-    /// is performed in-window by phase_rare_markers_with_hmm. This function validates
-    /// the cross-window boundary continuity.
-    ///
-    /// The next_phased parameter provides forward context - markers from the next
-    /// window that help verify phasing consistency at window boundaries.
-    fn finalize_stage2_with_forward_context(
-        &self,
-        current_phased: &GenotypeMatrix<Phased>,
-        next_phased: &GenotypeMatrix<Phased>,
-    ) -> Result<GenotypeMatrix<Phased>> {
-        let current_markers = current_phased.n_markers();
-        let next_markers = next_phased.n_markers();
-        let n_samples = current_phased.n_samples();
-
-        if current_markers == 0 || next_markers == 0 || n_samples == 0 {
-            return Ok(current_phased.clone());
-        }
-
-        // Find rare markers in the overlap region (last ~2cM or last 1000 markers)
-        let overlap_start = current_markers.saturating_sub(1000);
-        let rare_threshold = self.config.rare;
-        
-        // Collect markers that need re-phasing: rare hets in overlap that exist in next window
-        let mut markers_to_fix: Vec<(usize, usize)> = Vec::new(); // (current_idx, next_idx)
-        
-        let mut next_idx = 0usize;
-        for m in overlap_start..current_markers {
-            let marker = current_phased.marker(MarkerIdx::new(m as u32));
-            let key = (marker.chrom.0, marker.pos);
-
-            // Advance next_idx until we reach or pass current marker (linear merge on sorted markers)
-            while next_idx < next_markers {
-                let next_marker = next_phased.marker(MarkerIdx::new(next_idx as u32));
-                let next_key = (next_marker.chrom.0, next_marker.pos);
-                if next_key < key {
-                    next_idx += 1;
-                } else {
-                    break;
-                }
+        if mismatches == 0 || mismatches <= matches {
+            if mismatches > 0 {
+                tracing::debug!(
+                    "Stage 2 finalization: detected {} phase mismatches from forward context",
+                    mismatches
+                );
             }
-
-            // Check if this marker exists in next window
-            if next_idx < next_markers {
-                let next_marker = next_phased.marker(MarkerIdx::new(next_idx as u32));
-                if (next_marker.chrom.0, next_marker.pos) != key {
-                    continue;
-                }
-                let next_m = next_idx;
-                // Check if it's a rare variant (simplified: check if any sample has het)
-                let n_alleles = 1 + marker.alt_alleles.len();
-                if n_alleles == 2 {
-                    // For biallelic, check MAF
-                    let mut alt_count = 0u32;
-                    let n_haps = current_phased.n_haplotypes();
-                    for h in 0..n_haps {
-                        if current_phased.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32)) == 1 {
-                            alt_count += 1;
-                        }
-                    }
-                    let maf = (alt_count as f32 / n_haps as f32).min(1.0 - alt_count as f32 / n_haps as f32);
-                    if maf < rare_threshold && maf > 0.0 {
-                        markers_to_fix.push((m, next_m));
-                    }
-                }
-            }
-        }
-
-        if markers_to_fix.is_empty() {
-            tracing::debug!("Stage 2 finalization: no rare markers in overlap need fixing");
             return Ok(current_phased.clone());
         }
 
         tracing::debug!(
-            "Stage 2 finalization: checking {} rare markers in overlap region",
-            markers_to_fix.len()
+            "Stage 2 finalization: applying phase flip ({} mismatches vs {} matches)",
+            mismatches,
+            matches
         );
 
-        let mut mismatches = 0usize;
+        let n_markers = current_phased.n_markers();
+        let n_haps = current_phased.n_haplotypes();
+        let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
+            current_phased.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
 
-        // For each rare marker, check if next window has different phasing.
-        // We avoid swapping single markers to preserve local LD structure.
-        for (current_m, next_m) in markers_to_fix {
-            for s in 0..n_samples {
-                let hap1 = HapIdx::new((s * 2) as u32);
-                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+        for s in 0..n_samples {
+            let hap1 = HapIdx::new((s * 2) as u32);
+            let hap2 = HapIdx::new((s * 2 + 1) as u32);
 
-                let curr_a1 = current_phased.allele(MarkerIdx::new(current_m as u32), hap1);
-                let curr_a2 = current_phased.allele(MarkerIdx::new(current_m as u32), hap2);
-                
-                // Only fix heterozygotes
-                if curr_a1 == curr_a2 || curr_a1 == 255 || curr_a2 == 255 {
-                    continue;
-                }
-
-                let next_a1 = next_phased.allele(MarkerIdx::new(next_m as u32), hap1);
-                let next_a2 = next_phased.allele(MarkerIdx::new(next_m as u32), hap2);
-
-                // Check if next window has opposite phasing
-                if next_a1 == curr_a2 && next_a2 == curr_a1 {
-                    mismatches += 1;
+            let mut mask = BitVec::repeat(false, n_markers);
+            for m in 0..n_markers {
+                let a1 = current_phased.allele(MarkerIdx::new(m as u32), hap1);
+                let a2 = current_phased.allele(MarkerIdx::new(m as u32), hap2);
+                if a1 != a2 && a1 != 255 && a2 != 255 {
+                    mask.set(m, true);
                 }
             }
+            geno.swap_haplotypes(hap1, hap2, &mask);
         }
 
-        if mismatches > 0 {
-            tracing::debug!(
-                "Stage 2 finalization: detected {} phase mismatches from forward context",
-                mismatches
-            );
+        let markers = current_phased.markers().clone();
+        let samples = current_phased.samples_arc();
+        let columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|m| {
+                let alleles = geno.marker_alleles(m);
+                let bytes: Vec<u8> = alleles.to_vec();
+                GenotypeColumn::from_alleles(&bytes, 2)
+            })
+            .collect();
+
+        if let Some(confidence) = current_phased.confidence_clone() {
+            Ok(GenotypeMatrix::new_phased_with_confidence(
+                markers,
+                columns,
+                samples,
+                confidence,
+            ))
+        } else {
+            Ok(GenotypeMatrix::new_phased(markers, columns, samples))
         }
-        Ok(current_phased.clone())
     }
 }
 
