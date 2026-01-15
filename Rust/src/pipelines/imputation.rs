@@ -13,7 +13,6 @@
 
 use tracing::instrument;
 
-#[cfg(test)]
 use std::sync::Arc;
 
 use crate::config::Config;

@@ -3989,22 +3989,12 @@ impl PhasingPipeline {
         current_phased: &GenotypeMatrix<Phased>,
         next_phased: &GenotypeMatrix<Phased>,
     ) -> Result<GenotypeMatrix<Phased>> {
-        use crate::data::storage::GenotypeColumn;
-        
         let current_markers = current_phased.n_markers();
         let next_markers = next_phased.n_markers();
         let n_samples = current_phased.n_samples();
 
         if current_markers == 0 || next_markers == 0 || n_samples == 0 {
             return Ok(current_phased.clone());
-        }
-
-        // Find overlap region: markers in current window that also appear in next window
-        // Build position map for next window
-        let mut next_pos_map: std::collections::HashMap<(u16, u32), usize> = std::collections::HashMap::new();
-        for m in 0..next_markers {
-            let marker = next_phased.marker(MarkerIdx::new(m as u32));
-            next_pos_map.insert((marker.chrom.0, marker.pos), m);
         }
 
         // Find rare markers in the overlap region (last ~2cM or last 1000 markers)
@@ -4014,11 +4004,29 @@ impl PhasingPipeline {
         // Collect markers that need re-phasing: rare hets in overlap that exist in next window
         let mut markers_to_fix: Vec<(usize, usize)> = Vec::new(); // (current_idx, next_idx)
         
+        let mut next_idx = 0usize;
         for m in overlap_start..current_markers {
             let marker = current_phased.marker(MarkerIdx::new(m as u32));
-            
+            let key = (marker.chrom.0, marker.pos);
+
+            // Advance next_idx until we reach or pass current marker (linear merge on sorted markers)
+            while next_idx < next_markers {
+                let next_marker = next_phased.marker(MarkerIdx::new(next_idx as u32));
+                let next_key = (next_marker.chrom.0, next_marker.pos);
+                if next_key < key {
+                    next_idx += 1;
+                } else {
+                    break;
+                }
+            }
+
             // Check if this marker exists in next window
-            if let Some(&next_m) = next_pos_map.get(&(marker.chrom.0, marker.pos)) {
+            if next_idx < next_markers {
+                let next_marker = next_phased.marker(MarkerIdx::new(next_idx as u32));
+                if (next_marker.chrom.0, next_marker.pos) != key {
+                    continue;
+                }
+                let next_m = next_idx;
                 // Check if it's a rare variant (simplified: check if any sample has het)
                 let n_alleles = 1 + marker.alt_alleles.len();
                 if n_alleles == 2 {
@@ -4048,10 +4056,10 @@ impl PhasingPipeline {
             markers_to_fix.len()
         );
 
-        // Clone columns for modification
-        let mut new_columns: Vec<GenotypeColumn> = (0..current_markers)
-            .map(|m| current_phased.column(MarkerIdx::new(m as u32)).clone())
-            .collect();
+        // Create mutable copy for targeted swaps
+        let mut geno = MutableGenotypes::from_fn(current_markers, current_phased.n_haplotypes(), |m, h| {
+            current_phased.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
 
         let mut fixes_applied = 0;
 
@@ -4077,7 +4085,7 @@ impl PhasingPipeline {
                 if next_a1 == curr_a2 && next_a2 == curr_a1 {
                     // Next window has swapped phase - adopt it
                     // We need to swap in the current window
-                    new_columns[current_m].swap(hap1.as_usize(), hap2.as_usize());
+                    geno.swap(current_m, hap1, hap2);
                     fixes_applied += 1;
                 }
             }
@@ -4090,20 +4098,20 @@ impl PhasingPipeline {
             );
         }
 
-        // Build new matrix with corrected columns
-        let mut new_markers = crate::data::marker::Markers::new();
-        for name in current_phased.markers().chrom_names() {
-            new_markers.add_chrom(name);
-        }
-        for m in 0..current_markers {
-            new_markers.push(current_phased.marker(MarkerIdx::new(m as u32)).clone());
-        }
+        let markers = current_phased.markers().clone();
+        let samples = current_phased.samples_arc();
+        let columns: Vec<crate::data::storage::GenotypeColumn> = (0..current_markers)
+            .map(|m| {
+                let alleles = geno.marker_alleles(m);
+                crate::data::storage::GenotypeColumn::from_alleles(&alleles, 2)
+            })
+            .collect();
 
-        Ok(GenotypeMatrix::new_phased(
-            new_markers,
-            new_columns,
-            current_phased.samples_arc(),
-        ))
+        if let Some(confidence) = current_phased.confidence_clone() {
+            Ok(GenotypeMatrix::new_phased_with_confidence(markers, columns, samples, confidence))
+        } else {
+            Ok(GenotypeMatrix::new_phased(markers, columns, samples))
+        }
     }
 }
 

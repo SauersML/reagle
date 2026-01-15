@@ -628,7 +628,7 @@ pub struct WindowedBref3Reader {
     inner: StreamingBref3Reader,
     config: WindowConfig,
     /// Buffer of blocks for the next window
-    block_buffer: Vec<Bref3Block>,
+    block_buffer: VecDeque<Bref3Block>,
     /// Current window number
     window_num: usize,
     /// Global marker offset
@@ -641,7 +641,7 @@ impl WindowedBref3Reader {
         Self {
             inner,
             config,
-            block_buffer: Vec::new(),
+            block_buffer: VecDeque::new(),
             window_num: 0,
             global_offset: 0,
         }
@@ -676,9 +676,9 @@ impl WindowedBref3Reader {
         let buffered_start = start_pos.saturating_sub(buffer_size as u32);
         let buffered_end = end_pos + buffer_size as u32;
         // First, drain any blocks that are entirely before start_pos
-        while let Some(first_block) = self.block_buffer.first() {
+        while let Some(first_block) = self.block_buffer.front() {
             if first_block.end_pos < start_pos {
-                self.block_buffer.remove(0);
+                self.block_buffer.pop_front();
             } else {
                 break;
             }
@@ -687,7 +687,7 @@ impl WindowedBref3Reader {
         // Load blocks until we cover end_pos
         while !self.inner.is_eof() {
             let need_more = self.block_buffer.is_empty()
-                || self.block_buffer.last().map(|b| b.end_pos < end_pos).unwrap_or(true);
+                || self.block_buffer.back().map(|b| b.end_pos < end_pos).unwrap_or(true);
 
             if !need_more {
                 break;
@@ -698,7 +698,7 @@ impl WindowedBref3Reader {
                 if block.end_pos < start_pos {
                     continue;
                 }
-                self.block_buffer.push(block);
+                self.block_buffer.push_back(block);
             } else {
                 break;
             }
@@ -747,8 +747,8 @@ impl WindowedBref3Reader {
         self.window_num += 1;
 
         // Clear blocks we've processed (keep last one for potential overlap)
-        while self.block_buffer.len() > 1 && self.block_buffer[0].end_pos < end_pos {
-            self.block_buffer.remove(0);
+        while self.block_buffer.len() > 1 && self.block_buffer.front().map(|b| b.end_pos < end_pos).unwrap_or(false) {
+            self.block_buffer.pop_front();
         }
 
         // Create GenotypeMatrix from markers and columns
@@ -776,13 +776,13 @@ impl WindowedBref3Reader {
         };
 
         while !self.inner.is_eof() {
-            if let Some(last_block) = self.block_buffer.last() {
+            if let Some(last_block) = self.block_buffer.back() {
                 if last_block.end_pos >= target_end {
                     break;
                 }
             }
             if let Some(block) = self.inner.next_block()? {
-                self.block_buffer.push(block);
+                self.block_buffer.push_back(block);
             } else {
                 break;
             }
@@ -853,8 +853,10 @@ impl WindowedBref3Reader {
         }
 
         // Update global offset with markers we're done with
-        let markers_consumed: usize = self.block_buffer[..keep_from]
+        let markers_consumed: usize = self
+            .block_buffer
             .iter()
+            .take(keep_from)
             .map(|b| b.n_markers())
             .sum();
         self.global_offset += markers_consumed;

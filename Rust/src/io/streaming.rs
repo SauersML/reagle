@@ -106,16 +106,22 @@ impl HaplotypePriors {
     }
 
     /// Set priors from HMM state posteriors at window boundary.
-    /// Only stores significant probabilities (>0.001) to save memory.
+    /// Uses an adaptive threshold to avoid discarding most mass at high state counts.
     /// Sorts by hap_id for efficient binary search lookup.
-    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32], _gen_position: f64, _window: usize) {
+    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32], gen_position: f64, window: usize) {
         self.hap_ids.clear();
         self.probs.clear();
-        
+
+        let _ = (gen_position, window);
+
+        let adaptive_min = (1.0 / hap_indices.len().max(1) as f32) * 0.5;
+        let min_prob = adaptive_min.min(0.001).max(1e-6);
+
         // Collect significant probabilities
-        let mut pairs: Vec<(u32, f32)> = hap_indices.iter()
+        let mut pairs: Vec<(u32, f32)> = hap_indices
+            .iter()
             .zip(probs.iter())
-            .filter(|(_, &p)| p > 0.001)
+            .filter(|(_, p)| **p > min_prob)
             .map(|(&h, &p)| (h, p))
             .collect();
         
@@ -125,9 +131,12 @@ impl HaplotypePriors {
         // Split into parallel arrays
         self.hap_ids.reserve(pairs.len());
         self.probs.reserve(pairs.len());
-        for (h, p) in pairs {
-            self.hap_ids.push(h);
-            self.probs.push(p);
+        let total: f32 = pairs.iter().map(|(_, p)| *p).sum();
+        if total > 0.0 {
+            for (h, p) in pairs {
+                self.hap_ids.push(h);
+                self.probs.push(p / total);
+            }
         }
     }
 

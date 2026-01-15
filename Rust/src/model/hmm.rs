@@ -13,8 +13,6 @@
 //!
 //! This implementation follows the Beagle Java code (HmmUpdater.java) closely.
 
-use tracing::info_span;
-
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
 use crate::model::parameters::ModelParams;
@@ -47,9 +45,8 @@ impl HmmUpdater {
         mismatches: &[u8],
         n_states: usize,
     ) -> f32 {
-        info_span!("hmm_fwd_update", n_states = n_states).in_scope(|| {
         let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / fwd_sum;
+        let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
 
         let shift_vec = f32x8::splat(shift);
         let scale_vec = f32x8::splat(scale);
@@ -103,7 +100,6 @@ impl HmmUpdater {
             new_sum += fwd[i];
         }
         new_sum
-        })
     }
 
     /// Backward update matching Java HmmUpdater.bwdUpdate exactly.
@@ -124,7 +120,6 @@ impl HmmUpdater {
         mismatches: &[u8],
         n_states: usize,
     ) {
-        info_span!("hmm_bwd_update", n_states = n_states).in_scope(|| {
         // First: multiply by emission and compute sum
         let mut sum_vec = f32x8::splat(0.0);
         let p0 = emit_probs[0];
@@ -168,7 +163,7 @@ impl HmmUpdater {
 
         // Then: apply transition
         let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / sum;
+        let scale = (1.0 - p_switch) / sum.max(1e-30);
         
         let shift_vec = f32x8::splat(shift);
         let scale_vec = f32x8::splat(scale);
@@ -189,7 +184,6 @@ impl HmmUpdater {
         for i in k..n_states {
             bwd[i] = scale * bwd[i] + shift;
         }
-        })
     }
 }
 

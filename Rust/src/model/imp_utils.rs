@@ -283,7 +283,6 @@ pub fn run_hmm_forward_backward_to_sparse(
     fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
-    initial_priors: Option<&crate::io::streaming::HaplotypePriors>,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
     use wide::f32x8;
 
