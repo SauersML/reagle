@@ -510,7 +510,7 @@ impl crate::pipelines::ImputationPipeline {
 
                     let clusters = compute_marker_clusters_with_blocks(
                         sample_genotyped,
-                        &gen_positions[markers_to_process.start..markers_to_process.end],
+                        &gen_positions,
                         self.config.cluster as f64,
                         &[],
                     );
@@ -518,14 +518,18 @@ impl crate::pipelines::ImputationPipeline {
                     let n_clusters = clusters.len();
                     let cluster_bounds: Vec<(usize, usize)> = clusters.iter().map(|c| (c.start, c.end)).collect();
 
-                    let cluster_midpoints: Vec<f64> = clusters.iter().map(|c| {
+                    let cluster_midpoints: Vec<f64> = clusters
+                        .iter()
+                        .map(|c| {
                             if c.end > c.start {
-                                (gen_positions[markers_to_process.start + c.start]
-                                    + gen_positions[markers_to_process.start + c.end - 1]) / 2.0
+                                let start = sample_genotyped[c.start];
+                                let end = sample_genotyped[c.end - 1];
+                                (gen_positions[start] + gen_positions[end]) / 2.0
                             } else {
-                                gen_positions[markers_to_process.start + c.start]
+                                gen_positions[sample_genotyped[c.start]]
                             }
-                        }).collect();
+                        })
+                        .collect();
 
                     let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
                         .chain((1..n_clusters).map(|c| {
@@ -604,11 +608,22 @@ impl crate::pipelines::ImputationPipeline {
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(
-                                    ref_m,
-                                    2,
-                                    &|_, h| ref_win.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(h as u32)),
-                                );
+                                let get_ref = |marker: usize, h: u32| {
+                                    let ref_allele = ref_win.allele(
+                                        MarkerIdx::new(marker as u32),
+                                        HapIdx::new(h as u32),
+                                    );
+                                    if let Some(target_m) = alignment.target_marker(marker) {
+                                        if alignment.has_allele_mapping(target_m) {
+                                            alignment.reverse_map_allele(target_m, ref_allele)
+                                        } else {
+                                            ref_allele
+                                        }
+                                    } else {
+                                        ref_allele
+                                    }
+                                };
+                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
                                 hap_dosages.push(p.prob(1));
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
@@ -712,7 +727,7 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         self.write_imputed_window_streaming(
-            ref_win, final_writer, window_quality, output_start, output_end,
+            ref_win, alignment, final_writer, window_quality, output_start, output_end,
             markers_to_process.start, &all_results, self.config.gp, self.config.ap,
         )?;
         Ok(next_priors)
@@ -747,6 +762,7 @@ impl crate::pipelines::ImputationPipeline {
     fn write_imputed_window_streaming(
         &self,
         ref_win: &GenotypeMatrix<Phased>,
+        alignment: &MarkerAlignment,
         writer: &mut VcfWriter,
         quality: &ImputationQuality,
         output_start: usize,
@@ -795,8 +811,20 @@ impl crate::pipelines::ImputationPipeline {
                     AllelePosteriors::Multiallelic(vec![0.0f32; n_alleles])
                 };
                 if let Some((p1, p2)) = sample_posteriors.get(&sample_idx) {
-                    let get_ref = |_, h| {
-                        ref_win.allele(MarkerIdx::new(marker_idx as u32), HapIdx::new(h as u32))
+                    let get_ref = |marker: usize, h: u32| {
+                        let ref_allele = ref_win.allele(
+                            MarkerIdx::new(marker as u32),
+                            HapIdx::new(h as u32),
+                        );
+                        if let Some(target_m) = alignment.target_marker(marker) {
+                            if alignment.has_allele_mapping(target_m) {
+                                alignment.reverse_map_allele(target_m, ref_allele)
+                            } else {
+                                ref_allele
+                            }
+                        } else {
+                            ref_allele
+                        }
                     };
                     let post1 = p1.allele_posteriors(marker_idx, n_alleles, &get_ref);
                     let post2 = p2.allele_posteriors(marker_idx, n_alleles, &get_ref);
