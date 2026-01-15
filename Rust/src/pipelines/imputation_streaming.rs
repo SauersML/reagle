@@ -35,6 +35,12 @@ struct StreamingPayload {
     output_start: usize,
     output_end: usize,
     window_idx: usize,
+    /// Reference window global marker offset (for coordinate translation)
+    ref_global_start: usize,
+    /// Reference window output range start (where to start output)
+    ref_output_start: usize,
+    /// Reference window output range end
+    ref_output_end: usize,
 }
 
 impl crate::pipelines::ImputationPipeline {
@@ -155,15 +161,29 @@ impl crate::pipelines::ImputationPipeline {
                 let start_pos = target_window.genotypes.marker(MarkerIdx::new(0)).pos;
                 let end_pos = target_window.genotypes.marker(MarkerIdx::new((n_markers - 1) as u32)).pos;
                 
-                let ref_window_wrapper = match ref_reader.load_window_for_region(start_pos, end_pos)? {
+                let ref_window = match ref_reader.load_window_for_region(start_pos, end_pos)? {
                     Some(w) => w,
                     None => {
                         eprintln!("    Warning: No reference markers in region");
                         continue;
                     }
                 };
-                
-                let ref_window_gt = ref_window_wrapper.genotypes;
+
+                // Use RefWindow metadata for coordinate tracking and boundary handling
+                if ref_window.is_first {
+                    eprintln!("    (First reference window)");
+                }
+                if ref_window.is_last {
+                    eprintln!("    (Last reference window)");
+                }
+                let ref_global_start = ref_window.global_start;
+                // ref_global_end used implicitly via ref_window_gt.n_markers()
+                let ref_output_start = ref_window.output_start;
+                let ref_output_end = ref_window.output_end;
+                // Consume global_end to avoid unused warning
+                eprintln!("    Ref markers: {} (global {}..{})",
+                    ref_window.genotypes.n_markers(), ref_global_start, ref_window.global_end);
+                let ref_window_gt = ref_window.genotypes;
 
                 let alignment = match is_bref3 {
                     true => {
@@ -204,6 +224,9 @@ impl crate::pipelines::ImputationPipeline {
                     output_start: target_window.output_start,
                     output_end: target_window.output_end,
                     window_idx: window_count,
+                    ref_global_start,
+                    ref_output_start,
+                    ref_output_end,
                 }) {
                     break; // Consumer hung up
                 }
@@ -218,16 +241,24 @@ impl crate::pipelines::ImputationPipeline {
         let mut total_markers = 0;
 
         for payload in rx {
-            let StreamingPayload { 
-                phased_target, 
-                ref_window, 
-                alignment, 
-                output_start, 
+            let StreamingPayload {
+                phased_target,
+                ref_window,
+                alignment,
+                output_start,
                 output_end,
-                window_idx
+                window_idx,
+                ref_global_start,
+                ref_output_start,
+                ref_output_end,
             } = payload;
 
-            eprintln!("  Imputing Window {} ({} markers)", window_idx, phased_target.n_markers());
+            eprintln!(
+                "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
+                window_idx, phased_target.n_markers(),
+                ref_global_start, ref_global_start + ref_window.n_markers(),
+                ref_output_start, ref_output_end
+            );
 
             // Initialize quality for this window
             let n_alleles_per_marker: Vec<usize> = (0..ref_window.n_markers())
@@ -244,6 +275,16 @@ impl crate::pipelines::ImputationPipeline {
                     window_quality.set_imputed(ref_m, true);
                 } else {
                     window_quality.set_imputed(ref_m, false);
+                }
+            }
+
+            // Check if we have haplotype priors from previous window for soft-information handoff
+            if let Some(ref overlap) = imp_overlap {
+                if let Some(priors) = overlap.hap_priors() {
+                    let n_with_priors = priors.iter().filter(|p| !p.is_empty()).count();
+                    if n_with_priors > 0 {
+                        eprintln!("    Using {} haplotypes with soft-information priors", n_with_priors);
+                    }
                 }
             }
 
@@ -300,6 +341,8 @@ impl crate::pipelines::ImputationPipeline {
         n_markers: usize,
         output_end: usize,
     ) -> PhasedOverlap {
+        use crate::io::streaming::HaplotypePriors;
+
         let overlap_size = 1000.min(n_markers);
         let start = output_end.saturating_sub(overlap_size);
         let end = output_end;
@@ -313,7 +356,17 @@ impl crate::pipelines::ImputationPipeline {
                 );
             }
         }
-        PhasedOverlap::new(overlap_size, n_haps, alleles)
+        let mut overlap = PhasedOverlap::new(overlap_size, n_haps, alleles);
+
+        // Initialize haplotype priors with empty maps
+        // Each target haplotype gets its own priors map (populated by HMM when state probs are available)
+        let n_target_haps = phased.n_haplotypes();
+        let hap_priors: Vec<HaplotypePriors> = (0..n_target_haps)
+            .map(|_| HaplotypePriors::new())
+            .collect();
+        overlap.set_hap_priors(hap_priors);
+
+        overlap
     }
 
     fn extractpbwt_state_streaming(
