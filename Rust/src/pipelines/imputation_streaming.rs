@@ -179,7 +179,6 @@ impl crate::pipelines::ImputationPipeline {
                         MarkerAlignment::new_from_windows(
                             &target_window.genotypes,
                             &ref_window_gt,
-                            &ref_pos_map,
                         )?
                     }
                     false => MarkerAlignment::new(

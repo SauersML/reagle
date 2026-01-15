@@ -142,11 +142,7 @@ impl ThreadWorkspace {
         }
     }
 
-    /// DEPRECATED: Use resize_for_states instead
-    ///
-    /// This method is kept for compatibility but allocates excessive memory.
-    /// New code should use resize_for_states() and manage memory via checkpoints.
-    #[deprecated(note = "Use resize_for_states() - this allocates too much memory")]
+    /// Resize workspace for a window (forwards to resize_for_states)
     pub fn resize_for_window(&mut self, _: usize, n_states: usize) {
         self.resize_for_states(n_states);
     }

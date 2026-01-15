@@ -1450,8 +1450,9 @@ impl Sink for PlaceholderStubCollector {
 
         // Check if this is actually a placeholder stub by examining surrounding context
         let lines: Vec<&str> = self.file_content.lines().collect();
-        if line_number > 0 && line_number <= lines.len() {
-            let start_idx = line_number - 1;
+        let line_idx = line_number as usize;
+        if line_idx > 0 && line_idx <= lines.len() {
+            let start_idx = line_idx - 1;
             let end_idx = (start_idx + 10).min(lines.len());
             let context = lines[start_idx..end_idx].join("\n");
 
