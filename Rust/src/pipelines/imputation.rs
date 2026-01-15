@@ -690,7 +690,7 @@ impl ClusterStateProbs {
     }
 
     #[inline]
-    fn allele_posteriors<F>(
+    pub fn allele_posteriors<F>(
         &self,
         ref_marker: usize,
         n_alleles: usize,
@@ -1474,9 +1474,7 @@ impl ImputationPipeline {
         // Currently falling back to standard loading.
         // Tricky because we need to read the whole file to get markers
         if path.extension().map(|e| e == "bref3").unwrap_or(false) {
-            let file = std::fs::File::open(path)?;
-            let reader = std::io::BufReader::new(file);
-            let mut bref_reader = crate::io::bref3::Bref3Reader::open(reader)?;
+            let mut bref_reader = crate::io::bref3::Bref3Reader::open(path)?;
             Ok(bref_reader.read_all()?)
         } else {
             let (mut reader, file) = VcfReader::open(path)?;

@@ -19,11 +19,15 @@ pub enum CompactDr2Entry {
         marker: u32,
         p1: f32,
         p2: f32,
+        skip: bool,
+        true_gt: Option<(u8, u8)>,
     },
     Multiallelic {
         marker: u32,
         probs1: Vec<f32>,
         probs2: Vec<f32>,
+        skip: bool,
+        true_gt: Option<(u8, u8)>,
     },
 }
 

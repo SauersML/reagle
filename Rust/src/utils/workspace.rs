@@ -55,6 +55,15 @@ impl ImpWorkspace {
         Self::new(n_states)
     }
 
+    /// Clear all buffers for reuse
+    pub fn clear(&mut self) {
+        self.diff_vals.clear();
+        self.diff_cols.clear();
+        self.diff_row_offsets.clear();
+        self.diff_row_offsets.push(0);
+        self.cluster_base_scores.clear();
+    }
+
     /// Resize buffers (used by test HMM functions)
     #[cfg(test)]
     pub fn resize(&mut self, n_states: usize) {

@@ -4096,7 +4096,7 @@ impl PhasingPipeline {
     /// This maintains PBWT continuity across windows by passing the
     /// prefix array (PPA) and divergence array from the end of the
     /// previous window to initialize the current window's PBWT.
-    fn phase_window_with_pbwt_handoff(
+    pub fn phase_window_with_pbwt_handoff(
         &mut self,
         target_gt: &GenotypeMatrix,
         gen_maps: &GeneticMaps,
