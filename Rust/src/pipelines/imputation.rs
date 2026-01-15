@@ -880,7 +880,8 @@ impl ImputationPipeline {
                     GeneticMaps::new()
                 };
 
-                phasing.phase_in_memory_with_overlap(&target_gt, &gen_maps, None)
+                phasing.phase_in_memory_with_overlap(&target_gt, &gen_maps, None, None)
+                    .map(|(result, ..)| result)
             })
         };
         let target_gt = Arc::new(phased_target_gt_res?);

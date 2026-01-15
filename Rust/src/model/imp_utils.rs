@@ -1,6 +1,7 @@
 //! Imputation utilities and HMM logic.
 
 use std::sync::Arc;
+use aligned_vec::{AVec, ConstAlign};
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
@@ -334,9 +335,9 @@ pub fn run_hmm_forward_backward_to_sparse(
     n_states: usize,
     hap_indices_input: &[Vec<u32>],
     threshold: f32,
-    fwd_buffer: &mut [f32],
-    bwd_buffer: &mut [f32],
-    block_fwd_buffer: &mut [f32],
+    fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+    bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+    block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
     use wide::f32x8;
 
