@@ -1369,12 +1369,12 @@ impl VcfWriter {
                 let mut info_str = String::with_capacity(64);
                 if n_alleles > 1 {
                     info_str.push_str("DR2=");
-                    for a in1..n_alleles {
+                    for a in 1..n_alleles {
                         if a > 1 { info_str.push(','); }
                         info_str.push_str(format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf));
                     }
                     info_str.push_str(";AF=");
-                    for a in1..n_alleles {
+                    for a in 1..n_alleles {
                         if a > 1 { info_str.push(','); }
                         info_str.push_str(format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf));
                     }

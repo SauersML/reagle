@@ -45,14 +45,9 @@ impl PbwtState {
             ppa: updater.a.clone(),
             div: updater.d.clone(),
             marker_pos,
-            }
         }
-
-        // 6. Copy back
-        prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
-        divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
-        })
     }
+}
 
 /// PBWT updater with divergence array tracking
 ///
@@ -370,6 +365,7 @@ impl PbwtDivUpdater {
         // 6. Copy back
         prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
         divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
+        })
     }
 
     /// Backward update of prefix and divergence arrays

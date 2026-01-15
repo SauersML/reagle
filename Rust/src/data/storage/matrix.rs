@@ -59,7 +59,7 @@ impl<'a, State: PhaseState> GenotypeView<'a, State> {
     /// Returns the genetic distance in cM between view-relative marker indices.
     /// Panics if indices are out of bounds.
     pub fn genetic_distance(&self, marker_a: usize, marker_b: usize) -> f64 {
-        debug_assert!(marker_a < self.n_markers() && marker_b < self.n_markers());
+        assert!(marker_a < self.n_markers() && marker_b < self.n_markers());
         let pos_a = self.marker(MarkerIdx::new(marker_a as u32)).pos_cm;
         let pos_b = self.marker(MarkerIdx::new(marker_b as u32)).pos_cm;
         (pos_a - pos_b).abs()
@@ -70,7 +70,7 @@ impl<'a, State: PhaseState> GenotypeView<'a, State> {
     /// Returns the physical distance in base pairs between view-relative marker indices.
     /// Panics if indices are out of bounds.
     pub fn physical_distance(&self, marker_a: usize, marker_b: usize) -> u32 {
-        debug_assert!(marker_a < self.n_markers() && marker_b < self.n_markers());
+        assert!(marker_a < self.n_markers() && marker_b < self.n_markers());
         let pos_a = self.marker(MarkerIdx::new(marker_a as u32)).pos;
         let pos_b = self.marker(MarkerIdx::new(marker_b as u32)).pos;
         pos_a.max(pos_b) - pos_a.min(pos_b)
