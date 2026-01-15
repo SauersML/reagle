@@ -58,7 +58,7 @@ use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::phase_states::PhaseStates;
 use crate::model::pbwt_streaming::PbwtWavefront;
-use crate::pipelines::imputation::MarkerAlignment;
+use crate::data::alignment::MarkerAlignment;
 use mini_mcmc::core::{MarkovChain, Trace};
 
 /// Phasing pipeline
@@ -4314,6 +4314,7 @@ impl PhasingPipeline {
 
         Ok(result)
     }
+}
 
 #[cfg(test)]
 mod tests {

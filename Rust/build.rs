@@ -106,6 +106,7 @@ struct DeprecatedCollector {
 struct PlaceholderStubCollector {
     violations: Vec<String>,
     file_path: PathBuf,
+    file_content: String,
 }
 
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
@@ -798,10 +799,11 @@ impl DeprecatedCollector {
 }
 
 impl PlaceholderStubCollector {
-    fn new(file_path: &Path) -> Self {
+    fn new(file_path: &Path, content: &str) -> Self {
         Self {
             violations: Vec::new(),
             file_path: file_path.to_path_buf(),
+            file_content: content.to_string(),
         }
     }
 
@@ -1445,8 +1447,28 @@ impl Sink for PlaceholderStubCollector {
     fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
-        // We want to collect context around these matches
-        self.violations.push(format!("{line_number}:{line_text}"));
+
+        // Check if this is actually a placeholder stub by examining surrounding context
+        let lines: Vec<&str> = self.file_content.lines().collect();
+        if line_number > 0 && line_number <= lines.len() {
+            let start_idx = line_number - 1;
+            let end_idx = (start_idx + 10).min(lines.len());
+            let context = lines[start_idx..end_idx].join("\n");
+
+            // Check if this looks like a placeholder with multiple empty collections
+            let empty_count = context.matches("vec![]").count()
+                + context.matches("Vec::new()").count()
+                + context.matches("HashMap::new()").count()
+                + context.matches("BTreeMap::new()").count()
+                + context.matches("BTreeSet::new()").count()
+                + context.matches("HashSet::new()").count();
+
+            // If there are 2+ empty collections, it's likely a placeholder
+            if empty_count >= 2 {
+                self.violations.push(format!("{line_number}:{line_text}"));
+            }
+        }
+
         Ok(true)
     }
 }
@@ -1619,6 +1641,46 @@ fn main() {
     );
     emit_stage_detail(&meaningless_cond_report);
     all_violations.extend(meaningless_cond_violations);
+
+    // Scan for #[allow(clippy::no_effect)] attributes
+    update_stage("scan #[allow(clippy::no_effect)] attributes");
+    let no_effect_violations = scan_for_no_effect_allow();
+    let no_effect_report = format!(
+        "no_effect allow scan identified {} violation groups",
+        no_effect_violations.len()
+    );
+    emit_stage_detail(&no_effect_report);
+    all_violations.extend(no_effect_violations);
+
+    // Scan for "omitted for brevity" and similar comments
+    update_stage("scan omitted for brevity comments");
+    let omitted_violations = scan_for_omitted_for_brevity();
+    let omitted_report = format!(
+        "omitted for brevity scan identified {} violation groups",
+        omitted_violations.len()
+    );
+    emit_stage_detail(&omitted_report);
+    all_violations.extend(omitted_violations);
+
+    // Scan for #[deprecated] attributes
+    update_stage("scan #[deprecated] attributes");
+    let deprecated_violations = scan_for_deprecated();
+    let deprecated_report = format!(
+        "deprecated attribute scan identified {} violation groups",
+        deprecated_violations.len()
+    );
+    emit_stage_detail(&deprecated_report);
+    all_violations.extend(deprecated_violations);
+
+    // Scan for placeholder stub functions
+    update_stage("scan placeholder stub functions");
+    let placeholder_violations = scan_for_placeholder_stubs();
+    let placeholder_report = format!(
+        "placeholder stub scan identified {} violation groups",
+        placeholder_violations.len()
+    );
+    emit_stage_detail(&placeholder_report);
+    all_violations.extend(placeholder_violations);
 
     // If any violations were found, print them all and exit with error
     if !all_violations.is_empty() {
@@ -2742,7 +2804,7 @@ fn scan_for_placeholder_stubs() -> Vec<String> {
                 };
 
                 // Find all Ok(Self { matches
-                let mut collector = PlaceholderStubCollector::new(path);
+                let mut collector = PlaceholderStubCollector::new(path, &content);
 
                 if searcher
                     .search_path(&matcher, path, &mut collector)
@@ -2751,70 +2813,9 @@ fn scan_for_placeholder_stubs() -> Vec<String> {
                     continue;
                 }
 
-                // Now we need to check if these are actually placeholder stubs
-                // by examining the content between Ok(Self { and })
-                let mut filtered_violations = Vec::new();
-
-                for violation in &collector.violations {
-                    if let Some(colon_pos) = violation.find(':') {
-                        if let Ok(line_num) = violation[..colon_pos].parse::<usize>() {
-                            // Get the content starting from this line
-                            let lines: Vec<&str> = content.lines().collect();
-                            if line_num > 0 && line_num <= lines.len() {
-                                // Check the next few lines to see if all fields are empty
-                                let start_idx = line_num - 1;
-                                let end_idx = (start_idx + 10).min(lines.len());
-                                let context = lines[start_idx..end_idx].join("\n");
-
-                                // Check if this looks like a placeholder:
-                                // - Contains vec![] or Vec::new() or HashMap::new() or similar
-                                // - Multiple empty collections
-                                let has_empty_vec = context.contains("vec![]") || context.contains("Vec::new()");
-                                let has_empty_hashmap = context.contains("HashMap::new()") || context.contains("BTreeMap::new()");
-
-                                if has_empty_vec || has_empty_hashmap {
-                                    // Count how many empty collections there are
-                                    let empty_count = context.matches("vec![]").count()
-                                        + context.matches("Vec::new()").count()
-                                        + context.matches("HashMap::new()").count()
-                                        + context.matches("BTreeMap::new()").count();
-
-                                    // If there are 2+ empty collections, it's likely a placeholder
-                                    if empty_count >= 2 {
-                                        filtered_violations.push(violation.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !filtered_violations.is_empty() {
-                    let file_name = path.to_str().unwrap_or("?");
-                    let mut error_msg = format!(
-                        "\n❌ ERROR: Found {} placeholder stub functions in {}:\n",
-                        filtered_violations.len(),
-                        file_name
-                    );
-
-                    for violation in &filtered_violations {
-                        error_msg.push_str(&format!("   {violation}\n"));
-                    }
-
-                    error_msg.push_str(
-                        "\n⚠️ PLACEHOLDER STUB FUNCTIONS ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n",
-                    );
-                    error_msg.push_str(
-                        "   Functions that return Ok(Self { ... }) with all empty vectors/hashmaps are placeholders.\n",
-                    );
-                    error_msg.push_str(
-                        "   These exist solely to satisfy the compiler without doing actual work.\n",
-                    );
-                    error_msg.push_str(
-                        "   Implement the function properly instead of using empty placeholders.\n",
-                    );
-
-                    all_violations.push(error_msg);
+                // Check if the collector found any violations
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
                 }
             }
         }
