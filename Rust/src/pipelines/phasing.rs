@@ -914,11 +914,8 @@ impl PhasingPipeline {
             window_count, total_markers
         );
         Ok(())
-
-        }
-        Ok(())
     }
-    
+
     /// Extract phased overlap region from a phased genotype matrix
     ///
     /// This extracts the overlap region (markers from `start` to `end`) to be used
@@ -4053,7 +4050,7 @@ impl Stage2Phaser {
     ) -> [f32; 2]
     where
         F: Fn(usize, usize) -> u8, // (marker, hap_index) -> allele
-
+    {
         let mut al_probs = [0.0f32; 2];
 
         let mkr_a = self.prev_stage1_marker[marker];
@@ -4095,7 +4092,9 @@ impl Stage2Phaser {
 
         al_probs
     }
+}
 
+impl PhasingPipeline {
     /// Phase a window with PBWT state handoff from previous window
     ///
     /// This maintains PBWT continuity across windows by passing the
@@ -4310,6 +4309,11 @@ impl Stage2Phaser {
                 // Update the result matrix
                 result.set_allele(MarkerIdx::new(marker as u32), hap1_idx, new_a1);
                 result.set_allele(MarkerIdx::new(marker as u32), hap2_idx, new_a2);
+            }
+        }
+
+        Ok(result)
+    }
 
 #[cfg(test)]
 mod tests {
