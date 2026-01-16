@@ -1317,3 +1317,52 @@ fn test_dictionary_compression_integration() {
         panic!("Expected Dictionary column for marker 64");
     }
 }
+
+/// Scans a VCF to build a Markers object without loading genotypes.
+pub fn scan_vcf_markers(path: &std::path::Path) -> crate::error::Result<crate::data::marker::Markers> {
+    let file = std::fs::File::open(path)?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let mut reader: Box<dyn std::io::BufRead + Send> = match ext {
+        "bgz" | "bgzf" => Box::new(std::io::BufReader::new(noodles::bgzf::io::Reader::new(file))),
+        "gz" => Box::new(std::io::BufReader::new(flate2::read::GzDecoder::new(file))),
+        _ => Box::new(std::io::BufReader::new(file)),
+    };
+
+    let mut markers = crate::data::marker::Markers::new();
+    let mut line = String::new();
+    let mut line_num = 0usize;
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 { break; }
+        line_num += 1;
+
+        let line_trimmed = line.trim();
+        if line_trimmed.is_empty() || line_trimmed.starts_with('#') {
+            continue;
+        }
+
+        let fields: Vec<&str> = line_trimmed.split('\t').collect();
+        if fields.len() < 5 {
+            return Err(crate::error::ReagleError::parse(line_num, "Invalid VCF record for marker scanning"));
+        }
+
+        let chrom_name = fields[0];
+        let chrom_idx = markers.add_chrom(chrom_name);
+        let pos: u32 = fields[1].parse().map_err(|_| crate::error::ReagleError::parse(line_num, "Invalid POS"))?;
+        let id = if fields[2] == "." { None } else { Some(fields[2].into()) };
+        let ref_allele = crate::data::marker::Allele::from_str(fields[3]);
+        let alt_alleles: Vec<crate::data::marker::Allele> = fields[4].split(',').map(crate::data::marker::Allele::from_str).collect();
+
+        let end_pos: Option<u32> = if fields.len() > 7 && fields[7] != "." {
+            fields[7].split(';').find_map(|kv| kv.strip_prefix("END=").and_then(|v| v.parse().ok()))
+        } else {
+            None
+        };
+
+        let marker = crate::data::marker::Marker::with_end(chrom_idx, pos, end_pos, id, ref_allele, alt_alleles);
+        markers.push(marker);
+    }
+    Ok(markers)
+}

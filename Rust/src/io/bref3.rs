@@ -1235,3 +1235,16 @@ mod tests {
         assert_eq!(bytes[3], 0xF4);
     }
 }
+
+/// Scans a BREF3 to build a Markers object without loading genotypes.
+pub fn scan_bref3_markers(path: &std::path::Path) -> crate::error::Result<crate::data::marker::Markers> {
+    let mut reader = StreamingBref3Reader::open(path)?;
+    let mut markers = crate::data::marker::Markers::new();
+    while let Some(block) = reader.next_block()? {
+        for m in 0..block.markers.len() {
+            let marker = block.markers.marker(crate::data::marker::MarkerIdx::new(m as u32));
+            markers.push(marker.clone());
+        }
+    }
+    Ok(markers)
+}

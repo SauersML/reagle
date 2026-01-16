@@ -356,6 +356,17 @@ impl crate::pipelines::ImputationPipeline {
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
 
+        // Pre-scan for header
+        // Scan all reference markers to build a complete header before streaming.
+        // This is crucial for valid VCF output.
+        let ref_markers = if is_bref3 {
+            crate::io::bref3::scan_bref3_markers(ref_path)?
+        } else {
+            crate::io::vcf::scan_vcf_markers(ref_path)?
+        };
+        writer.write_header_extended(&ref_markers, true, self.config.gp, self.config.ap)?;
+        // --- END PRE-SCAN ---
+
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.
         let (tx, rx) = mpsc::sync_channel::<StreamingPayload>(2);
@@ -403,7 +414,7 @@ impl crate::pipelines::ImputationPipeline {
             
             loop {
                 let target_window = if pipeline.config.profile {
-                    let _span = info_span!("io_read_target").entered();
+                    let _ = info_span!("io_read_target").entered();
                     target_reader.next_window()?
                 } else {
                     target_reader.next_window()?
@@ -420,7 +431,7 @@ impl crate::pipelines::ImputationPipeline {
                     .genotypes
                     .marker(MarkerIdx::new((n_markers - 1) as u32))
                     .pos;
-                let _phase_span = if pipeline.config.profile {
+                let _ = if pipeline.config.profile {
                     Some(
                         info_span!(
                             "phasing_window",
@@ -446,7 +457,7 @@ impl crate::pipelines::ImputationPipeline {
                 let end_pos = window_end_pos;
                 
                 let ref_window = if pipeline.config.profile {
-                    let _span = info_span!("io_load_ref").entered();
+                    let _ = info_span!("io_load_ref").entered();
                     ref_reader.load_window_for_region(start_pos, end_pos)?
                 } else {
                     ref_reader.load_window_for_region(start_pos, end_pos)?
@@ -498,7 +509,7 @@ impl crate::pipelines::ImputationPipeline {
                 let phased = if target_reader.was_all_phased() {
                     target_window.genotypes.clone().into_phased()
                 } else {
-                    let _span = if pipeline.config.profile {
+                    let _ = if pipeline.config.profile {
                         Some(info_span!("compute_phasing").entered())
                     } else {
                         None
@@ -519,7 +530,7 @@ impl crate::pipelines::ImputationPipeline {
 
                 // Send to consumer
                 let send_result = if pipeline.config.profile {
-                    let _span = info_span!("channel_send_wait").entered();
+                    let _ = info_span!("channel_send_wait").entered();
                     tx.send(StreamingPayload {
                         phased_target: phased,
                         ref_window: ref_window_gt,
@@ -618,7 +629,7 @@ impl crate::pipelines::ImputationPipeline {
                 }
             }
 
-            let _window_span = if self.config.profile {
+            let _ = if self.config.profile {
                 Some(
                     info_span!(
                         "imputation_window",
@@ -636,7 +647,7 @@ impl crate::pipelines::ImputationPipeline {
             };
 
             let next_priors = if self.config.profile {
-                let _span = info_span!("compute_imputation", window = window_idx).entered();
+                let _ = info_span!("compute_imputation", window = window_idx).entered();
                 self.run_imputation_window_streaming(
                     &phased_target,
                     &ref_window,
@@ -778,7 +789,7 @@ impl crate::pipelines::ImputationPipeline {
         output_start: usize,
         output_end: usize,
     ) -> Result<Option<Vec<HaplotypePriors>>> {
-        let _window_span = if self.config.profile {
+        let _ = if self.config.profile {
             Some(
                 info_span!(
                     "imputation_window_compute",
@@ -902,7 +913,7 @@ impl crate::pipelines::ImputationPipeline {
 
             let pbwt_states = self.params.n_states.min(n_ref_haps);
             let batch_neighbors = {
-                let _pbwt_span = if self.config.profile {
+                let _ = if self.config.profile {
                     Some(
                         info_span!(
                             "pbwt_neighbor_batch",
@@ -1255,7 +1266,7 @@ impl crate::pipelines::ImputationPipeline {
             return Ok(());
         }
 
-        let _write_span = if self.config.profile {
+        let _ = if self.config.profile {
             Some(
                 info_span!(
                     "io_write_output",
