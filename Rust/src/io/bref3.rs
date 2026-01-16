@@ -634,18 +634,34 @@ impl WindowedBref3Reader {
     ///
     /// Includes flanking markers outside the region to prevent reference bias
     /// at window boundaries (HMM needs context to stabilize).
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(
+        &mut self,
+        candidates: &[String],
+        start_pos: u32,
+        end_pos: u32,
+    ) -> Result<Option<RefWindow>> {
         // Add buffer zone to prevent reference bias at boundaries
         // Use 500 markers to ensure HMM has context to stabilize at boundaries
         const BUFFER_MARKERS: usize = 500;
 
-        if self.current_chrom.as_deref() != Some(chrom) {
+        // Check if current_chrom is still valid (matches one of the candidates)
+        let mut chrom_changed = true;
+        if let Some(current) = &self.current_chrom {
+            if candidates.iter().any(|c| c.as_str() == current.as_ref()) {
+                chrom_changed = false;
+            }
+        }
+
+        if chrom_changed {
             self.block_buffer.clear();
-            self.current_chrom = Some(Arc::from(chrom));
+            self.current_chrom = None;
         }
 
         if let Some(pending) = self.pending_block.take() {
-            if pending.chrom == chrom {
+            if candidates.iter().any(|c| c == &pending.chrom) {
+                if self.current_chrom.is_none() {
+                    self.current_chrom = Some(Arc::from(pending.chrom.as_str()));
+                }
                 self.block_buffer.push_back(pending);
             } else {
                 self.pending_block = Some(pending);
@@ -665,7 +681,11 @@ impl WindowedBref3Reader {
         // Load blocks until we cover end_pos
         while !self.inner.is_eof() {
             let need_more = self.block_buffer.is_empty()
-                || self.block_buffer.back().map(|b| b.end_pos < end_pos).unwrap_or(true);
+                || self
+                    .block_buffer
+                    .back()
+                    .map(|b| b.end_pos < end_pos)
+                    .unwrap_or(true);
 
             if !need_more {
                 break;
@@ -679,36 +699,71 @@ impl WindowedBref3Reader {
                 break;
             };
 
-            if next_block.chrom != chrom {
-                if self.block_buffer.is_empty() {
-                    continue;
+            if let Some(current) = &self.current_chrom {
+                if next_block.chrom.as_str() != current.as_ref() {
+                    self.pending_block = Some(next_block);
+                    break;
                 }
-                self.pending_block = Some(next_block);
-                break;
+            } else {
+                // Determine if this block starts the chromosome we want
+                if candidates.iter().any(|c| c == &next_block.chrom) {
+                    self.current_chrom = Some(Arc::from(next_block.chrom.as_str()));
+                } else {
+                    // Not a match
+                    if self.block_buffer.is_empty() {
+                        // Crucially, if we haven't started buffering, we might need to skip
+                        // BUT since candidates list implies we are looking for a specific set,
+                        // if we hit something else, we should probably stop and let caller decide
+                        // (e.g. maybe we are looking for "22" and hit "X", so "22" is missing).
+                        // However, BREF3 is sequential. If we are at "21" and looking for "22", we should SKIP "21".
+                        // But wait, the previous implementation did `continue`.
+                        // If we are sure `candidates` covers all aliases for the *target*, then
+                        // anything else is a different chromosome.
+                        // The issue was "22" vs "chr22". If we pass both, we match either.
+                        // If we encounter "21", it won't match "22" or "chr22". We should skip it.
+                        // So `continue` is correct for skipping preceding chromosomes.
+                        // BUT we must be careful not to skip *candidates*.
+                        // Since we check `candidates` for match, skipping non-matches is safe
+                        // assuming the file is ordered and we haven't passed it.
+                        continue;
+                    }
+                    self.pending_block = Some(next_block);
+                    break;
+                }
             }
 
             self.block_buffer.push_back(next_block);
         }
         // Load one extra block beyond end_pos for trailing buffer, if available.
         if !self.inner.is_eof() {
-            let next_block = if let Some(pending) = self.pending_block.take() {
-                pending
-            } else if let Some(block) = self.inner.next_block()? {
-                block
+            let next_block_opt = if let Some(pending) = self.pending_block.take() {
+                Some(pending)
             } else {
-                return Ok(None);
+                self.inner.next_block()?
             };
 
-            if next_block.chrom == chrom {
-                self.block_buffer.push_back(next_block);
-            } else {
-                self.pending_block = Some(next_block);
+            if let Some(next_block) = next_block_opt {
+                if let Some(current) = &self.current_chrom {
+                    if next_block.chrom.as_str() == current.as_ref() {
+                        self.block_buffer.push_back(next_block);
+                    } else {
+                        self.pending_block = Some(next_block);
+                    }
+                } else if candidates.iter().any(|c| c == &next_block.chrom) {
+                    // This handles the edge case where the window size is small and fits entirely in the "extra" block check
+                    self.current_chrom = Some(Arc::from(next_block.chrom.as_str()));
+                    self.block_buffer.push_back(next_block);
+                } else {
+                    self.pending_block = Some(next_block);
+                }
             }
         }
 
         if self.block_buffer.is_empty() {
             return Ok(None);
         }
+
+        let current_chrom_str = self.current_chrom.as_deref().unwrap_or("");
 
         // Merge blocks in buffer and then apply marker-count buffering
         let mut all_markers = Markers::new();
@@ -718,7 +773,7 @@ impl WindowedBref3Reader {
         let is_last = self.inner.is_eof();
 
         for block in &self.block_buffer {
-            if block.chrom != chrom {
+            if block.chrom != current_chrom_str {
                 continue;
             }
             // Add chromosome if needed
@@ -816,11 +871,18 @@ impl RefPanelReader {
     }
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(
+        &mut self,
+        candidates: &[String],
+        start_pos: u32,
+        end_pos: u32,
+    ) -> Result<Option<RefWindow>> {
         match self {
-            RefPanelReader::Bref3(r) => r.load_window_for_region(chrom, start_pos, end_pos),
-            RefPanelReader::InMemory(r) => r.load_window_for_region(chrom, start_pos, end_pos),
-            RefPanelReader::StreamingVcf(r) => r.load_window_for_region(chrom, start_pos, end_pos),
+            RefPanelReader::Bref3(r) => r.load_window_for_region(candidates, start_pos, end_pos),
+            RefPanelReader::InMemory(r) => r.load_window_for_region(candidates, start_pos, end_pos),
+            RefPanelReader::StreamingVcf(r) => {
+                r.load_window_for_region(candidates, start_pos, end_pos)
+            }
         }
     }
 }
@@ -848,7 +910,12 @@ impl InMemoryRefReader {
     }
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(
+        &mut self,
+        candidates: &[String],
+        start_pos: u32,
+        end_pos: u32,
+    ) -> Result<Option<RefWindow>> {
         use crate::data::marker::MarkerIdx;
 
         let n_markers = self.genotypes.n_markers();
@@ -863,7 +930,7 @@ impl InMemoryRefReader {
             .markers()
             .chrom_names()
             .iter()
-            .position(|name| name.as_ref() == chrom)
+            .position(|name| candidates.iter().any(|c| c.as_str() == name.as_ref()))
             .map(|idx| ChromIdx::new(idx as u16));
         let Some(target_chrom_idx) = target_chrom_idx else {
             return Ok(None);
@@ -1065,16 +1132,32 @@ impl StreamingRefVcfReader {
 
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(
+        &mut self,
+        candidates: &[String],
+        start_pos: u32,
+        end_pos: u32,
+    ) -> Result<Option<RefWindow>> {
         const BUFFER_MARKERS: usize = 500;
-        if self.current_chrom.as_deref() != Some(chrom) {
+
+        let mut chrom_changed = true;
+        if let Some(current) = &self.current_chrom {
+            if candidates.iter().any(|c| c.as_str() == current.as_ref()) {
+                chrom_changed = false;
+            }
+        }
+
+        if chrom_changed {
             self.buffer.clear();
-            self.current_chrom = Some(Arc::from(chrom));
+            self.current_chrom = None;
         }
 
         if let Some(pending) = self.pending_marker.take() {
             let pending_chrom = self.markers.chrom_name(pending.marker.chrom).unwrap_or("");
-            if pending_chrom == chrom {
+            if candidates.iter().any(|c| c == pending_chrom) {
+                if self.current_chrom.is_none() {
+                    self.current_chrom = Some(Arc::from(pending_chrom));
+                }
                 self.buffer.push_back(pending);
             } else {
                 self.pending_marker = Some(pending);
@@ -1085,7 +1168,11 @@ impl StreamingRefVcfReader {
         loop {
             while !self.eof {
                 let need_more = self.buffer.is_empty()
-                    || self.buffer.back().map(|m| m.marker.pos < end_pos).unwrap_or(true);
+                    || self
+                        .buffer
+                        .back()
+                        .map(|m| m.marker.pos < end_pos)
+                        .unwrap_or(true);
                 if !need_more {
                     break;
                 }
@@ -1097,13 +1184,24 @@ impl StreamingRefVcfReader {
                     break;
                 };
                 let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
-                if marker_chrom != chrom {
-                    if self.buffer.is_empty() {
-                        continue;
+
+                if let Some(current) = &self.current_chrom {
+                    if marker_chrom != current.as_ref() {
+                        self.pending_marker = Some(next_marker);
+                        break;
                     }
-                    self.pending_marker = Some(next_marker);
-                    break;
+                } else {
+                    if candidates.iter().any(|c| c == marker_chrom) {
+                        self.current_chrom = Some(Arc::from(marker_chrom));
+                    } else {
+                        if self.buffer.is_empty() {
+                            continue;
+                        }
+                        self.pending_marker = Some(next_marker);
+                        break;
+                    }
                 }
+
                 self.buffer.push_back(next_marker);
             }
 
@@ -1133,10 +1231,19 @@ impl StreamingRefVcfReader {
                     break;
                 };
                 let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
-                if marker_chrom != chrom {
+
+                if let Some(current) = &self.current_chrom {
+                    if marker_chrom != current.as_ref() {
+                        self.pending_marker = Some(next_marker);
+                        break;
+                    }
+                } else if candidates.iter().any(|c| c == marker_chrom) {
+                    self.current_chrom = Some(Arc::from(marker_chrom));
+                } else {
                     self.pending_marker = Some(next_marker);
                     break;
                 }
+
                 self.buffer.push_back(next_marker);
                 continue;
             }
