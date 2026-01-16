@@ -284,24 +284,28 @@ impl StreamingVcfReader {
         fn detect_bgzf(file: &mut File) -> Result<bool> {
             use std::io::{Read, Seek, SeekFrom};
 
-            let mut header = [0u8; 18];
+            let mut header = [0u8; 12];
             let n = file.read(&mut header)?;
-            file.seek(SeekFrom::Start(0))?;
             if n < 10 {
+                file.seek(SeekFrom::Start(0))?;
                 return Ok(false);
             }
             if header[0] != 0x1f || header[1] != 0x8b || header[2] != 0x08 {
+                file.seek(SeekFrom::Start(0))?;
                 return Ok(false);
             }
             let flg = header[3];
             if flg & 0x04 == 0 {
+                file.seek(SeekFrom::Start(0))?;
                 return Ok(false);
             }
-            if n < 18 {
+            if n < 12 {
+                file.seek(SeekFrom::Start(0))?;
                 return Ok(false);
             }
             let xlen = u16::from_le_bytes([header[10], header[11]]) as usize;
             if xlen < 4 {
+                file.seek(SeekFrom::Start(0))?;
                 return Ok(false);
             }
             let mut extra = vec![0u8; xlen];
