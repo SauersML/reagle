@@ -3468,6 +3468,45 @@ fn sample_dynamic_mcmc(
 
     // Current set of neighbors (reused across markers within an MCMC step)
     let mut neighbors = initial_neighbors;
+    let n_haps = phase_ibs.n_haps() as u32;
+
+    fn mix_neighbors(
+        neighbors: &mut Vec<u32>,
+        n_states: usize,
+        n_haps: u32,
+        hap1_idx: u32,
+        rng: &mut impl rand::Rng,
+    ) {
+        let target = n_states.min((n_haps.saturating_sub(2)) as usize).max(1);
+        if neighbors.len() > target {
+            neighbors.truncate(target);
+        }
+
+        while neighbors.len() < target {
+            let h = rng.random_range(0..n_haps);
+            if h == hap1_idx || h == hap1_idx + 1 {
+                continue;
+            }
+            if !neighbors.contains(&h) {
+                neighbors.push(h);
+            }
+        }
+
+        let mix_count = (target / 10).max(4).min(target);
+        for _ in 0..mix_count {
+            let h = rng.random_range(0..n_haps);
+            if h == hap1_idx || h == hap1_idx + 1 {
+                continue;
+            }
+            if neighbors.contains(&h) {
+                continue;
+            }
+            let replace_idx = rng.random_range(0..neighbors.len());
+            neighbors[replace_idx] = h;
+        }
+    }
+
+    mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
 
     // MCMC loop: Gibbs sampling alternating between H1 and H2
     for step in 0..n_mcmc_steps {
@@ -3489,6 +3528,7 @@ fn sample_dynamic_mcmc(
         if neighbors.is_empty() {
             continue;
         }
+        mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
 
         // 2. Build constraint: at hets, H1 must produce genotype with H2
         for m in 0..n_markers {
@@ -3543,6 +3583,7 @@ fn sample_dynamic_mcmc(
         if neighbors.is_empty() {
             continue;
         }
+        mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
 
         // 2. Build constraint: at hets, H2 must produce genotype with H1
         for m in 0..n_markers {

@@ -61,11 +61,6 @@ pub struct BidirectionalPhaseIbs {
     bwd_div: Vec<Vec<i32>>,
     /// Backward prefix array at checkpoints
     bwd_ppa: Vec<Vec<u32>>,
-    /// Inverse index for forward PPA: fwd_pos[checkpoint_idx][h] = position of haplotype h in fwd_ppa
-    /// Enables O(1) position lookup instead of O(n_haps) linear search.
-    fwd_pos: Vec<Vec<u32>>,
-    /// Inverse index for backward PPA: bwd_pos[checkpoint_idx][h] = position of haplotype h in bwd_ppa
-    bwd_pos: Vec<Vec<u32>>,
     /// Total number of haplotypes in the PBWT
     n_haps: usize,
     /// Number of markers in the PBWT (may be subset of full chromosome)
@@ -102,10 +97,8 @@ impl BidirectionalPhaseIbs {
 
         let mut fwd_div = Vec::with_capacity(n_checkpoints);
         let mut fwd_ppa = Vec::with_capacity(n_checkpoints);
-        let mut fwd_pos = Vec::with_capacity(n_checkpoints);
         let mut bwd_div = vec![Vec::new(); n_checkpoints];
         let mut bwd_ppa = vec![Vec::new(); n_checkpoints];
-        let mut bwd_pos = vec![Vec::new(); n_checkpoints];
         let mut n_alleles_by_marker = vec![2usize; n_markers];
 
         let mut updater = PbwtDivUpdater::new(n_haps);
@@ -120,12 +113,6 @@ impl BidirectionalPhaseIbs {
 
             // Only store at checkpoint markers (every PBWT_CHECKPOINT_INTERVAL markers)
             if m % PBWT_CHECKPOINT_INTERVAL == 0 || m == n_markers - 1 {
-                // Build inverse index: fwd_pos[checkpoint][h] = position of haplotype h in fwd_ppa
-                let mut pos = vec![0u32; n_haps];
-                for (i, &h) in ppa.iter().enumerate() {
-                    pos[h as usize] = i as u32;
-                }
-                fwd_pos.push(pos);
                 fwd_ppa.push(ppa.clone());
                 fwd_div.push(div[..n_haps].to_vec());
             }
@@ -141,12 +128,6 @@ impl BidirectionalPhaseIbs {
             // Only store at checkpoint markers
             if m % PBWT_CHECKPOINT_INTERVAL == 0 {
                 let checkpoint_idx = m / PBWT_CHECKPOINT_INTERVAL;
-                // Build inverse index: bwd_pos[checkpoint][h] = position of haplotype h in bwd_ppa
-                let mut pos = vec![0u32; n_haps];
-                for (i, &h) in ppa.iter().enumerate() {
-                    pos[h as usize] = i as u32;
-                }
-                bwd_pos[checkpoint_idx] = pos;
                 bwd_ppa[checkpoint_idx] = ppa.clone();
                 bwd_div[checkpoint_idx] = div[..n_haps].to_vec();
             }
@@ -157,14 +138,54 @@ impl BidirectionalPhaseIbs {
             fwd_ppa,
             bwd_div,
             bwd_ppa,
-            fwd_pos,
-            bwd_pos,
             n_haps,
             n_markers,
             n_checkpoints,
             subset_to_global: None,
             alleles,
         }
+    }
+
+    fn with_fwd_pos<R>(&self, checkpoint_idx: usize, f: impl FnOnce(&[u32]) -> R) -> R {
+        thread_local! {
+            static FWD_POS_CACHE: std::cell::RefCell<(usize, Vec<u32>)> =
+                std::cell::RefCell::new((usize::MAX, Vec::new()));
+        }
+
+        let ppa = &self.fwd_ppa[checkpoint_idx];
+        FWD_POS_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache.0 != checkpoint_idx || cache.1.len() != ppa.len() {
+                cache.1.clear();
+                cache.1.resize(ppa.len(), 0u32);
+                for (i, &h) in ppa.iter().enumerate() {
+                    cache.1[h as usize] = i as u32;
+                }
+                cache.0 = checkpoint_idx;
+            }
+            f(&cache.1)
+        })
+    }
+
+    fn with_bwd_pos<R>(&self, checkpoint_idx: usize, f: impl FnOnce(&[u32]) -> R) -> R {
+        thread_local! {
+            static BWD_POS_CACHE: std::cell::RefCell<(usize, Vec<u32>)> =
+                std::cell::RefCell::new((usize::MAX, Vec::new()));
+        }
+
+        let ppa = &self.bwd_ppa[checkpoint_idx];
+        BWD_POS_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache.0 != checkpoint_idx || cache.1.len() != ppa.len() {
+                cache.1.clear();
+                cache.1.resize(ppa.len(), 0u32);
+                for (i, &h) in ppa.iter().enumerate() {
+                    cache.1[h as usize] = i as u32;
+                }
+                cache.0 = checkpoint_idx;
+            }
+            f(&cache.1)
+        })
     }
 
     /// Build bidirectional PBWT for a marker subset with global index mapping.
@@ -286,13 +307,13 @@ impl BidirectionalPhaseIbs {
 
         // Snap to nearest checkpoint for sparse storage
         let checkpoint_idx = self.marker_to_checkpoint(marker_idx);
-        if checkpoint_idx >= self.fwd_pos.len() || checkpoint_idx >= self.bwd_pos.len() {
+        if checkpoint_idx >= self.fwd_ppa.len() || checkpoint_idx >= self.bwd_ppa.len() {
             return 0;
         }
 
         // O(1) position lookup using inverse index at checkpoint
-        let pos_fwd = self.fwd_pos[checkpoint_idx][hap_idx as usize] as usize;
-        let pos_bwd = self.bwd_pos[checkpoint_idx][hap_idx as usize] as usize;
+        let pos_fwd = self.with_fwd_pos(checkpoint_idx, |pos| pos[hap_idx as usize] as usize);
+        let pos_bwd = self.with_bwd_pos(checkpoint_idx, |pos| pos[hap_idx as usize] as usize);
 
         let mut best_fwd = 0usize;
         for pos in [pos_fwd.wrapping_sub(1), pos_fwd + 1] {
@@ -342,7 +363,7 @@ impl BidirectionalPhaseIbs {
         let div = &self.fwd_div[checkpoint_idx];
 
         // O(1) position lookup using inverse index at checkpoint
-        let sorted_pos = self.fwd_pos[checkpoint_idx][hap_idx as usize] as usize;
+        let sorted_pos = self.with_fwd_pos(checkpoint_idx, |pos| pos[hap_idx as usize] as usize);
         let marker_i32 = marker_idx as i32;
 
         // For forward PBWT, div[i] = marker where match started (divergence point).
@@ -428,7 +449,7 @@ impl BidirectionalPhaseIbs {
         let div = &self.bwd_div[checkpoint_idx];
 
         // O(1) position lookup using inverse index at checkpoint
-        let sorted_pos = self.bwd_pos[checkpoint_idx][hap_idx as usize] as usize;
+        let sorted_pos = self.with_bwd_pos(checkpoint_idx, |pos| pos[hap_idx as usize] as usize);
         let marker_i32 = marker_idx as i32;
 
         // For backward PBWT, div[i] = marker where match ENDS (going backward).
@@ -548,7 +569,7 @@ impl BidirectionalPhaseIbs {
         let hap2 = sample_idx * 2 + 1;
 
         // O(1) position lookup: where is ref_state in the sorted PBWT at checkpoint?
-        let center_pos = self.fwd_pos[checkpoint_idx][ref_state as usize] as usize;
+        let center_pos = self.with_fwd_pos(checkpoint_idx, |pos| pos[ref_state as usize] as usize);
 
         let ppa = &self.fwd_ppa[checkpoint_idx];
         let div = &self.fwd_div[checkpoint_idx];

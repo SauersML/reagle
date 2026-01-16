@@ -5,14 +5,13 @@
 //!
 //! Memory model:
 //! - Primary storage: BitVec (1 bit per allele) for biallelic SNPs
-//! - Exception map: HashMap for multiallelic (2+) and missing (255)
+//! - Exception store: block-sparse vectors for multiallelic (2+) and missing (255)
 //!
 //! For typical datasets (99%+ biallelic, <1% missing), this provides
 //! ~8x memory reduction vs byte-per-allele storage.
 
 use crate::data::HapIdx;
 use bitvec::prelude::*;
-use std::collections::HashMap;
 
 /// Bit-packed mutable genotype storage for phasing
 ///
@@ -21,7 +20,7 @@ use std::collections::HashMap;
 ///
 /// Memory efficiency:
 /// - 1M markers × 6K haps biallelic: ~750 MB (vs ~6 GB byte-packed)
-/// - Exception map adds ~40 bytes per exception (typically <1%)
+/// - Exception blocks add ~9 bytes per exception (typically <1%)
 ///
 /// Allele values: 0 = REF, 1 = ALT1, 2+ = ALT2+, 255 = missing
 #[derive(Clone, Debug)]
@@ -30,10 +29,11 @@ pub struct MutableGenotypes {
     /// Layout: bits[marker * n_haps + hap]
     /// Value: 0 = REF or exception, 1 = ALT1 (biallelic)
     bits: BitVec<u64, Lsb0>,
-    /// Sparse exception map for non-biallelic values
-    /// Key: (marker << 32) | hap
-    /// Value: actual allele (2-254 for multiallelic, 255 for missing)
-    exceptions: HashMap<u64, u8>,
+    /// Sparse exception store for non-biallelic values (per block).
+    /// Each block holds sorted (key, allele) pairs, where key = offset * n_haps + hap.
+    exceptions: Vec<Vec<(u64, u8)>>,
+    /// Total number of exception entries
+    exc_count: usize,
     /// Number of markers
     n_markers: usize,
     /// Number of haplotypes (stride for indexing)
@@ -41,10 +41,27 @@ pub struct MutableGenotypes {
 }
 
 impl MutableGenotypes {
-    /// Pack (marker, hap) into a u64 key for the exception map
+    /// Exception block size in markers (keeps per-block scans cache-friendly).
+    const EXC_BLOCK_SIZE: usize = 256;
+
+    /// Pack (marker offset, hap) into a u64 key for the exception block
     #[inline(always)]
-    fn pack_key(marker: usize, hap: usize) -> u64 {
-        ((marker as u64) << 32) | (hap as u64)
+    fn pack_key(offset: usize, hap: usize, n_haps: usize) -> u64 {
+        (offset as u64) * (n_haps as u64) + (hap as u64)
+    }
+
+    #[inline(always)]
+    fn unpack_key(key: u64, n_haps: usize) -> (usize, usize) {
+        let hap = (key % n_haps as u64) as usize;
+        let offset = (key / n_haps as u64) as usize;
+        (offset, hap)
+    }
+
+    #[inline(always)]
+    fn block_index(marker: usize) -> (usize, usize) {
+        let block_idx = marker / Self::EXC_BLOCK_SIZE;
+        let offset = marker % Self::EXC_BLOCK_SIZE;
+        (block_idx, offset)
     }
 
     /// Create from a function that provides alleles
@@ -56,7 +73,9 @@ impl MutableGenotypes {
     {
         let total_bits = n_markers * n_haps;
         let mut bits = bitvec![u64, Lsb0; 0; total_bits];
-        let mut exceptions = HashMap::new();
+        let n_blocks = (n_markers + Self::EXC_BLOCK_SIZE - 1) / Self::EXC_BLOCK_SIZE;
+        let mut exceptions: Vec<Vec<(u64, u8)>> = vec![Vec::new(); n_blocks];
+        let mut exc_count = 0usize;
 
         for m in 0..n_markers {
             let base = m * n_haps;
@@ -66,14 +85,22 @@ impl MutableGenotypes {
                     0 => {} // bit already 0
                     1 => bits.set(base + h, true),
                     _ => {
-                        // Non-biallelic: store in exception map
-                        exceptions.insert(Self::pack_key(m, h), allele);
+                        let (block_idx, offset) = Self::block_index(m);
+                        let key = Self::pack_key(offset, h, n_haps);
+                        let block = &mut exceptions[block_idx];
+                        match block.binary_search_by_key(&key, |(k, _)| *k) {
+                            Ok(pos) => block[pos].1 = allele,
+                            Err(pos) => {
+                                block.insert(pos, (key, allele));
+                                exc_count += 1;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        Self { bits, exceptions, n_markers, n_haps }
+        Self { bits, exceptions, exc_count, n_markers, n_haps }
     }
 
     /// Number of markers
@@ -96,18 +123,20 @@ impl MutableGenotypes {
         let h = hap.as_usize();
         let idx = marker * self.n_haps + h;
 
-        // Fast path: if no exceptions exist, skip HashMap lookup entirely
-        if self.exceptions.is_empty() {
+        if self.exc_count == 0 {
             return self.bits[idx] as u8;
         }
 
-        // Check exception map (for missing/multiallelic)
-        let key = Self::pack_key(marker, h);
-        if let Some(&val) = self.exceptions.get(&key) {
-            return val;
+        let (block_idx, offset) = Self::block_index(marker);
+        if let Some(block) = self.exceptions.get(block_idx) {
+            if !block.is_empty() {
+                let key = Self::pack_key(offset, h, self.n_haps);
+                if let Ok(pos) = block.binary_search_by_key(&key, |(k, _)| *k) {
+                    return block[pos].1;
+                }
+            }
         }
 
-        // Otherwise read from bit vector
         self.bits[idx] as u8
     }
 
@@ -124,22 +153,47 @@ impl MutableGenotypes {
     pub fn set(&mut self, marker: usize, hap: HapIdx, allele: u8) {
         let h = hap.as_usize();
         let idx = marker * self.n_haps + h;
-        let key = Self::pack_key(marker, h);
-
         match allele {
             0 => {
                 self.bits.set(idx, false);
-                self.exceptions.remove(&key);
+                let (block_idx, offset) = Self::block_index(marker);
+                if let Some(block) = self.exceptions.get_mut(block_idx) {
+                    if !block.is_empty() {
+                        let key = Self::pack_key(offset, h, self.n_haps);
+                        if let Ok(pos) = block.binary_search_by_key(&key, |(k, _)| *k) {
+                            block.remove(pos);
+                            self.exc_count = self.exc_count.saturating_sub(1);
+                        }
+                    }
+                }
             }
             1 => {
                 self.bits.set(idx, true);
-                self.exceptions.remove(&key);
+                let (block_idx, offset) = Self::block_index(marker);
+                if let Some(block) = self.exceptions.get_mut(block_idx) {
+                    if !block.is_empty() {
+                        let key = Self::pack_key(offset, h, self.n_haps);
+                        if let Ok(pos) = block.binary_search_by_key(&key, |(k, _)| *k) {
+                            block.remove(pos);
+                            self.exc_count = self.exc_count.saturating_sub(1);
+                        }
+                    }
+                }
             }
             _ => {
                 // Non-biallelic: store in exception map
                 // Set bit to 0 as a sentinel (exception takes precedence)
                 self.bits.set(idx, false);
-                self.exceptions.insert(key, allele);
+                let (block_idx, offset) = Self::block_index(marker);
+                let key = Self::pack_key(offset, h, self.n_haps);
+                let block = &mut self.exceptions[block_idx];
+                match block.binary_search_by_key(&key, |(k, _)| *k) {
+                    Ok(pos) => block[pos].1 = allele,
+                    Err(pos) => {
+                        block.insert(pos, (key, allele));
+                        self.exc_count += 1;
+                    }
+                }
             }
         }
     }
@@ -155,7 +209,7 @@ impl MutableGenotypes {
         let mut result = Vec::with_capacity(self.n_haps);
 
         // Fast path: if no exceptions, just extract bits directly
-        if self.exceptions.is_empty() {
+        if self.exc_count == 0 {
             for h in 0..self.n_haps {
                 result.push(self.bits[base + h] as u8);
             }
@@ -168,12 +222,14 @@ impl MutableGenotypes {
             result.push(self.bits[base + h] as u8);
         }
 
-        // Pass 2: Fix up exceptions for this marker
-        // Only iterate exceptions, not all haplotypes
-        for (&key, &val) in &self.exceptions {
-            if (key >> 32) as usize == marker {
-                let exc_h = (key & 0xFFFFFFFF) as usize;
-                result[exc_h] = val;
+        // Pass 2: Fix up exceptions for this marker (only block-local entries)
+        let (block_idx, offset) = Self::block_index(marker);
+        if let Some(block) = self.exceptions.get(block_idx) {
+            for &(key, val) in block {
+                let (exc_offset, exc_h) = Self::unpack_key(key, self.n_haps);
+                if exc_offset == offset {
+                    result[exc_h] = val;
+                }
             }
         }
 
@@ -192,7 +248,7 @@ impl MutableGenotypes {
         let mut result = Vec::with_capacity(self.n_markers);
 
         // Fast path: if no exceptions, just extract bits directly
-        if self.exceptions.is_empty() {
+        if self.exc_count == 0 {
             for m in 0..self.n_markers {
                 result.push(self.bits[m * self.n_haps + h] as u8);
             }
@@ -205,13 +261,17 @@ impl MutableGenotypes {
             result.push(self.bits[m * self.n_haps + h] as u8);
         }
 
-        // Pass 2: Fix up exceptions for this haplotype
-        // Only iterate exceptions, not all positions
-        for (&key, &val) in &self.exceptions {
-            let exc_h = (key & 0xFFFFFFFF) as usize;
-            if exc_h == h {
-                let exc_m = (key >> 32) as usize;
-                result[exc_m] = val;
+        // Pass 2: Fix up exceptions for this haplotype (sparse, typically <1%)
+        for (block_idx, block) in self.exceptions.iter().enumerate() {
+            let block_start = block_idx * Self::EXC_BLOCK_SIZE;
+            for &(key, val) in block {
+                let (offset, exc_h) = Self::unpack_key(key, self.n_haps);
+                if exc_h == h {
+                    let marker = block_start + offset;
+                    if marker < self.n_markers {
+                        result[marker] = val;
+                    }
+                }
             }
         }
 
@@ -248,15 +308,15 @@ impl MutableGenotypes {
 impl MutableGenotypes {
     /// Get number of exceptions (for diagnostics)
     fn n_exceptions(&self) -> usize {
-        self.exceptions.len()
+        self.exc_count
     }
 
     /// Get approximate memory usage in bytes
     fn memory_bytes(&self) -> usize {
         // BitVec: bits / 8 bytes
         let bits_bytes = (self.bits.len() + 7) / 8;
-        // Exception map: ~40 bytes per entry (key + value + HashMap overhead)
-        let exceptions_bytes = self.exceptions.len() * 40;
+        // Exception blocks: key/value pairs (u64 + u8) plus Vec overhead
+        let exceptions_bytes: usize = self.exceptions.iter().map(|b| b.len() * (8 + 1)).sum();
         // Struct overhead
         let struct_bytes = std::mem::size_of::<Self>();
 
