@@ -323,15 +323,17 @@ impl StreamingVcfReader {
         }
 
         // Parse sample names from header
-        let sample_names: Vec<String> = if let Some(header_line) = header_str.lines().last() {
-            header_line
-                .split('\t')
-                .skip(9)
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let sample_names: Vec<String> = header_str
+            .lines()
+            .find(|line| line.starts_with("#CHROM"))
+            .map(|header_line| {
+                header_line
+                    .split('\t')
+                    .skip(9)
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_else(Vec::new);
 
         let samples = Arc::new(Samples::from_ids(sample_names));
 
