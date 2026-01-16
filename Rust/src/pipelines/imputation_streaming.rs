@@ -579,6 +579,7 @@ target_samples={} target_bytes={}",
         
         let mut imp_overlap: Option<PhasedOverlap> = None;
         let mut total_markers = 0;
+        let mut header_written = false;
 
         for payload in rx {
             let StreamingPayload {
@@ -593,6 +594,16 @@ target_samples={} target_bytes={}",
                 ref_output_end,
             } = payload;
             let _ = (output_start, output_end);
+
+            if !header_written {
+                writer.write_header_extended(
+                    ref_window.markers(),
+                    true,
+                    self.config.gp,
+                    self.config.ap,
+                )?;
+                header_written = true;
+            }
 
             eprintln!(
                 "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
