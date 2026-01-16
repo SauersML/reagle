@@ -17,6 +17,7 @@ Requirements:
 Usage:
   python integration_test.py              # Run all stages
   python integration_test.py prepare      # Download data and prepare VCFs
+  python integration_test.py prepare-profile  # Prepare first 5% of chr22 for profiling
   python integration_test.py beagle       # Run Beagle imputation only
   python integration_test.py reagle       # Run Reagle imputation only
   python integration_test.py metrics      # Calculate metrics only
@@ -62,7 +63,13 @@ def validate_vcf(path):
     if result.returncode != 0:
         return False
     stderr = result.stderr or ""
-    if "Failed to read BGZF block" in stderr:
+    # Treat truncated BGZF warnings as invalid so cached partial files get rebuilt.
+    if (
+        "Failed to read BGZF block" in stderr
+        or "No BGZF EOF marker" in stderr
+        or "EOF marker is absent" in stderr
+        or "input is probably truncated" in stderr
+    ):
         return False
     return True
 
@@ -143,6 +150,93 @@ def get_chrom_bounds(vcf_path, chrom):
     if min_pos is None or max_pos is None:
         return None
     return (min_pos, max_pos)
+
+def count_chrom_markers(vcf_path, chrom):
+    """Return number of markers for chrom in VCF/VCF.GZ."""
+    chrom_str = str(chrom)
+    chrom_options = {chrom_str, f"chr{chrom_str}"}
+    if chrom_str.startswith("chr"):
+        chrom_options.add(chrom_str[3:])
+    if str(vcf_path).endswith(".bcf"):
+        return None
+    n = 0
+    try:
+        with _open_maybe_gzip(vcf_path) as handle:
+            for line in handle:
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2:
+                    continue
+                if fields[0] in chrom_options:
+                    n += 1
+    except OSError:
+        return None
+    return n
+
+def find_chrom_label(vcf_path, chrom):
+    """Return the exact chromosome label found in the VCF for chrom."""
+    chrom_str = str(chrom)
+    chrom_options = {chrom_str, f"chr{chrom_str}"}
+    if chrom_str.startswith("chr"):
+        chrom_options.add(chrom_str[3:])
+    if str(vcf_path).endswith(".bcf"):
+        return None
+    try:
+        with _open_maybe_gzip(vcf_path) as handle:
+            for line in handle:
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2:
+                    continue
+                if fields[0] in chrom_options:
+                    return fields[0]
+    except OSError:
+        return None
+    return None
+
+def compute_profile_region(vcf_path, chrom, fraction=0.05):
+    """Return (region_str, min_pos, end_pos, chrom_label) for the first fraction of markers."""
+    chrom_label = find_chrom_label(vcf_path, chrom) or f"chr{chrom}"
+    total = count_chrom_markers(vcf_path, chrom)
+    if not total:
+        return None
+    cutoff = max(1, int(total * fraction))
+    chrom_str = str(chrom)
+    chrom_options = {chrom_str, f"chr{chrom_str}"}
+    if chrom_str.startswith("chr"):
+        chrom_options.add(chrom_str[3:])
+    if str(vcf_path).endswith(".bcf"):
+        return None
+    min_pos = None
+    end_pos = None
+    seen = 0
+    try:
+        with _open_maybe_gzip(vcf_path) as handle:
+            for line in handle:
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2:
+                    continue
+                if fields[0] not in chrom_options:
+                    continue
+                try:
+                    pos = int(fields[1])
+                except ValueError:
+                    continue
+                if min_pos is None:
+                    min_pos = pos
+                seen += 1
+                if seen >= cutoff:
+                    end_pos = pos
+                    break
+    except OSError:
+        return None
+    if min_pos is None or end_pos is None:
+        return None
+    return f"{chrom_label}:{min_pos}-{end_pos}", min_pos, end_pos, chrom_label
 
 
 def resolve_region_arg(paths, chrom):
@@ -1117,7 +1211,7 @@ def stage_prepare():
             str(paths['chr22_bcf']) + ".csi"
         )
 
-    if not validate_vcf(paths['chr22_vcf']) and not has_vcf_records(paths['chr22_vcf']):
+    if not validate_vcf(paths['chr22_vcf']) or not has_vcf_records(paths['chr22_vcf']):
         print("Converting BCF to VCF.gz...")
         paths['chr22_vcf'].unlink(missing_ok=True)
         Path(str(paths['chr22_vcf']) + ".csi").unlink(missing_ok=True)
@@ -1153,7 +1247,7 @@ def stage_prepare():
     )
 
     # Create reference panel (train samples)
-    if not validate_vcf(paths['ref_vcf']) and not has_vcf_records(paths['ref_vcf']):
+    if not validate_vcf(paths['ref_vcf']) or not has_vcf_records(paths['ref_vcf']):
         print("Creating reference panel...")
         paths['ref_vcf'].unlink(missing_ok=True)
         Path(str(paths['ref_vcf']) + ".csi").unlink(missing_ok=True)
@@ -1163,7 +1257,7 @@ def stage_prepare():
         ensure_index(paths['ref_vcf'], recreate_cmd=f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
 
     # Create truth (test samples, full density)
-    if not validate_vcf(paths['truth_vcf']) and not has_vcf_records(paths['truth_vcf']):
+    if not validate_vcf(paths['truth_vcf']) or not has_vcf_records(paths['truth_vcf']):
         print("Creating truth VCF...")
         paths['truth_vcf'].unlink(missing_ok=True)
         Path(str(paths['truth_vcf']) + ".csi").unlink(missing_ok=True)
@@ -1175,7 +1269,7 @@ def stage_prepare():
     # Create input (test samples, downsampled to GSA sites, UNPHASED)
     # We unphase the input so switch error rate measures TRUE phasing accuracy
     tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
-    if not validate_vcf(paths['input_vcf']) and not has_vcf_records(paths['input_vcf']):
+    if not validate_vcf(paths['input_vcf']) or not has_vcf_records(paths['input_vcf']):
         print("Downsampling to GSA sites and unphasing...")
         create_regions_file(gsa_sites, str(paths['gsa_regions']))
         # Two-step process: downsample, then unphase
@@ -1204,6 +1298,179 @@ def stage_prepare():
     print(f"Test samples: {len(test_samples)}")
 
     print("\nPrepare stage completed successfully.")
+
+
+def stage_prepare_profile():
+    """Prepare reduced data (first 5% of chr22) for profiling runs."""
+    print("=" * 60)
+    print("STAGE: PREPARE PROFILE - First 5% of chr22")
+    print("=" * 60)
+
+    paths = get_paths()
+
+    # Check dependencies
+    check_dependencies()
+
+    # Download HGDP+1kG chr22
+    print("\n" + "=" * 60)
+    print("Downloading HGDP+1kG chr22...")
+    print("=" * 60)
+
+    download_if_missing(
+        "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf",
+        str(paths['chr22_bcf'])
+    )
+    download_if_missing(
+        "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf.csi",
+        str(paths['chr22_bcf']) + ".csi"
+    )
+
+    # Convert BCF to VCF.gz for Java Beagle compatibility
+    if not validate_vcf(paths['chr22_bcf']):
+        print("ERROR: Cached BCF appears corrupted. Re-downloading...")
+        paths['chr22_bcf'].unlink(missing_ok=True)
+        Path(str(paths['chr22_bcf']) + ".csi").unlink(missing_ok=True)
+        download_if_missing(
+            "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf",
+            str(paths['chr22_bcf'])
+        )
+        download_if_missing(
+            "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf.csi",
+            str(paths['chr22_bcf']) + ".csi"
+        )
+
+    if not validate_vcf(paths['chr22_vcf']) or not has_vcf_records(paths['chr22_vcf']):
+        print("Converting BCF to VCF.gz...")
+        paths['chr22_vcf'].unlink(missing_ok=True)
+        Path(str(paths['chr22_vcf']) + ".csi").unlink(missing_ok=True)
+        run(f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
+    ensure_index(paths['chr22_vcf'], recreate_cmd=f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
+
+    # Compute first 5% region of chr22
+    region_info = compute_profile_region(paths['chr22_vcf'], "22", fraction=0.05)
+    if not region_info:
+        raise RuntimeError("Unable to determine chr22 bounds for profiling subset")
+    region, min_pos, end_pos, chrom_label = region_info
+    print(f"Profiling region: {region} (positions {min_pos}..{end_pos})")
+
+    # Create trimmed VCF
+    trimmed_vcf = paths['data_dir'] / "hgdp1kg_chr22.profile5.vcf.gz"
+    if not validate_vcf(trimmed_vcf) or not has_vcf_records(trimmed_vcf):
+        print("Creating trimmed VCF for profiling...")
+        trimmed_vcf.unlink(missing_ok=True)
+        Path(str(trimmed_vcf) + ".csi").unlink(missing_ok=True)
+        run(f"bcftools view -r {region} {paths['chr22_vcf']} -O z -o {trimmed_vcf}")
+        run(f"bcftools index -f {trimmed_vcf}")
+    if not has_index(trimmed_vcf):
+        ensure_index(trimmed_vcf, recreate_cmd=f"bcftools view -r {region} {paths['chr22_vcf']} -O z -o {trimmed_vcf}")
+
+    # Ensure profile outputs are regenerated even if cached full files exist
+    for path in [paths['ref_vcf'], paths['truth_vcf'], paths['input_vcf']]:
+        path.unlink(missing_ok=True)
+        Path(str(path) + ".csi").unlink(missing_ok=True)
+        Path(str(path) + ".tbi").unlink(missing_ok=True)
+
+    # Download GSA sites
+    print("\n" + "=" * 60)
+    print("Downloading GSA variant list...")
+    print("=" * 60)
+
+    download_if_missing(
+        "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv",
+        str(paths['gsa_file'])
+    )
+
+    # Load GSA sites for chr22 and filter to region
+    gsa_sites = load_gsa_sites(str(paths['gsa_file']), chrom="22")
+    filtered_sites = set()
+    for chrom, pos in gsa_sites:
+        if min_pos <= pos <= end_pos:
+            filtered_sites.add((chrom_label, pos))
+
+    # Intersect with markers present in trimmed VCF to guarantee overlap
+    present_sites = set()
+    with _open_maybe_gzip(trimmed_vcf) as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            present_sites.add((fields[0], pos))
+
+    filtered_sites = {site for site in filtered_sites if site in present_sites}
+    print(f"Filtered GSA sites in region (present in VCF): {len(filtered_sites)}")
+
+    # Download Beagle
+    download_if_missing(
+        "https://faculty.washington.edu/browning/beagle/beagle.22Jul22.46e.jar",
+        str(paths['beagle_jar'])
+    )
+
+    # Split samples using trimmed VCF
+    print("\n" + "=" * 60)
+    print("Splitting samples...")
+    print("=" * 60)
+
+    train_file, test_file, train_samples, test_samples = split_samples(
+        str(trimmed_vcf), str(paths['data_dir']), test_fraction=0.2, seed=42
+    )
+
+    # Create reference panel (train samples)
+    if not validate_vcf(paths['ref_vcf']) or not has_vcf_records(paths['ref_vcf']):
+        print("Creating reference panel...")
+        paths['ref_vcf'].unlink(missing_ok=True)
+        Path(str(paths['ref_vcf']) + ".csi").unlink(missing_ok=True)
+        run(f"bcftools view -S {train_file} {trimmed_vcf} -O z -o {paths['ref_vcf']}")
+        run(f"bcftools index -f {paths['ref_vcf']}")
+    if not has_index(paths['ref_vcf']):
+        ensure_index(paths['ref_vcf'], recreate_cmd=f"bcftools view -S {train_file} {trimmed_vcf} -O z -o {paths['ref_vcf']}")
+
+    # Create truth (test samples, full density)
+    if not validate_vcf(paths['truth_vcf']) or not has_vcf_records(paths['truth_vcf']):
+        print("Creating truth VCF...")
+        paths['truth_vcf'].unlink(missing_ok=True)
+        Path(str(paths['truth_vcf']) + ".csi").unlink(missing_ok=True)
+        run(f"bcftools view -S {test_file} {trimmed_vcf} -O z -o {paths['truth_vcf']}")
+        run(f"bcftools index -f {paths['truth_vcf']}")
+    if not has_index(paths['truth_vcf']):
+        ensure_index(paths['truth_vcf'], recreate_cmd=f"bcftools view -S {test_file} {trimmed_vcf} -O z -o {paths['truth_vcf']}")
+
+    # Create input (test samples, downsampled to GSA sites, UNPHASED)
+    tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
+    if not filtered_sites:
+        raise RuntimeError("Profiling region contains no GSA sites present in VCF; increase subset size.")
+    if not validate_vcf(paths['input_vcf']) or not has_vcf_records(paths['input_vcf']):
+        print("Downsampling to GSA sites and unphasing...")
+        create_regions_file(filtered_sites, str(paths['gsa_regions']))
+        tmp_phased = str(tmp_phased_path)
+        run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
+        run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
+        os.remove(tmp_phased)
+        run(f"bcftools index -f {paths['input_vcf']}")
+        if not has_vcf_records(paths['input_vcf']):
+            raise RuntimeError("Profiling input VCF is empty after downsampling; adjust subset size.")
+    if not has_index(paths['input_vcf']):
+        ensure_index(
+            paths['input_vcf'],
+            recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased_path} && bcftools +setGT {tmp_phased_path} -O z -o {paths['input_vcf']} -- -t a -n u",
+        )
+    if tmp_phased_path.exists():
+        os.remove(tmp_phased_path)
+
+    # Count variants
+    n_truth = run(f"bcftools view -H {paths['truth_vcf']} | wc -l", capture=True).stdout.strip()
+    n_input = run(f"bcftools view -H {paths['input_vcf']} | wc -l", capture=True).stdout.strip()
+    print(f"\nTruth variants: {n_truth}")
+    print(f"Input variants (GSA sites): {n_input}")
+    print(f"Reference samples: {len(train_samples)}")
+    print(f"Test samples: {len(test_samples)}")
+
+    print("\nPrepare profile stage completed successfully.")
 
 
 def stage_beagle():
@@ -1375,6 +1642,7 @@ def main():
         epilog="""
 Stages:
   prepare      Download data and prepare reference/truth/input VCFs
+  prepare-profile  Prepare first 5% of chr22 for profiling
   beagle       Run Java Beagle imputation
   reagle       Run Reagle imputation
   impute5      Run IMPUTE5 imputation
@@ -1392,6 +1660,7 @@ Full genome mode (for nightly CI):
 Examples:
   python integration_test.py                  # Run all stages (chr22 only)
   python integration_test.py prepare          # Just prepare data
+  python integration_test.py prepare-profile  # Prepare profiling subset
   python integration_test.py impute5          # Run IMPUTE5
   python integration_test.py prepare-chr 1    # Prepare chr1 for full genome
   python integration_test.py summary          # Aggregate all chromosome metrics
@@ -1401,7 +1670,7 @@ Examples:
         'stage',
         nargs='?',
         default='all',
-        choices=['all', 'prepare', 'beagle', 'reagle', 'impute5', 'minimac', 
+        choices=['all', 'prepare', 'prepare-profile', 'beagle', 'reagle', 'impute5', 'minimac', 
                  'glimpse', 'metrics', 'prepare-chr', 'impute-chr', 
                  'metrics-chr', 'summary'],
         help='Stage to run (default: all)'
@@ -1426,6 +1695,8 @@ Examples:
 
     if args.stage == 'prepare':
         stage_prepare()
+    elif args.stage == 'prepare-profile':
+        stage_prepare_profile()
     elif args.stage == 'beagle':
         stage_beagle()
     elif args.stage == 'reagle':
