@@ -9,7 +9,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use rayon::prelude::*;
-use tracing::instrument;
+use tracing::{info_span, instrument};
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::HapIdx;
 use crate::data::marker::MarkerIdx;
@@ -545,6 +545,23 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
             }
+
+            let _window_span = if self.config.profile {
+                Some(
+                    info_span!(
+                        "imputation_window",
+                        window = window_idx,
+                        ref_markers = ref_window.n_markers(),
+                        target_markers = phased_target.n_markers(),
+                        output_start = ref_output_start,
+                        output_end = ref_output_end,
+                        n_states = self.params.n_states
+                    )
+                    .entered(),
+                )
+            } else {
+                None
+            };
 
             let next_priors = self.run_imputation_window_streaming(
                 &phased_target,
