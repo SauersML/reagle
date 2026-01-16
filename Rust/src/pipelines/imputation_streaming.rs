@@ -461,8 +461,18 @@ impl crate::pipelines::ImputationPipeline {
                     Some(w) => w,
                     None => {
                         eprintln!("    Warning: No reference markers in region");
-                        skipped_ref_windows += 1;
-                        continue;
+                        if let RefPanelReader::InMemory(r) = &mut ref_reader {
+                            if let Some(full) = r.load_window_for_region(0, u32::MAX)? {
+                                eprintln!("    Falling back to full reference window");
+                                full
+                            } else {
+                                skipped_ref_windows += 1;
+                                continue;
+                            }
+                        } else {
+                            skipped_ref_windows += 1;
+                            continue;
+                        }
                     }
                 };
 
