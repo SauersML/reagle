@@ -449,6 +449,7 @@ impl crate::pipelines::ImputationPipeline {
                 
                 let ref_window = if pipeline.config.profile {
                     let span_guard = info_span!("io_load_ref").entered();
+                    let _ = &span_guard;
                     ref_reader.load_window_for_region(start_pos, end_pos)?
                 } else {
                     ref_reader.load_window_for_region(start_pos, end_pos)?
@@ -627,17 +628,18 @@ impl crate::pipelines::ImputationPipeline {
                 info_span!(
                     "imputation_window",
                     window = window_idx,
-                        ref_markers = ref_window.n_markers(),
-                        target_markers = phased_target.n_markers(),
-                        output_start = ref_output_start,
-                        output_end = ref_output_end,
-                        n_states = self.params.n_states
-                    )
-                    .entered(),
+                    ref_markers = ref_window.n_markers(),
+                    target_markers = phased_target.n_markers(),
+                    output_start = ref_output_start,
+                    output_end = ref_output_end,
+                    n_states = self.params.n_states
                 )
-            } else {
-                None
-            };
+                .entered(),
+            )
+        } else {
+            None
+        };
+        let _ = &window_span;
 
             let next_priors = if self.config.profile {
                 let span_guard = info_span!("compute_imputation", window = window_idx).entered();
