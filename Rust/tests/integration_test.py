@@ -43,7 +43,71 @@ def run(cmd, check=True, capture=False):
         if check and result.returncode != 0:
             print(f"STDERR: {result.stderr}")
             raise subprocess.CalledProcessError(result.returncode, cmd)
-        return result
+    return result
+
+
+def _open_maybe_gzip(path):
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
+    return open(path, "r", encoding="utf-8", errors="ignore")
+
+
+def get_chrom_bounds(vcf_path, chrom):
+    """Return (min_pos, max_pos) for chrom in VCF/VCF.GZ, or None if not found."""
+    chrom_str = str(chrom)
+    chrom_options = {chrom_str, f"chr{chrom_str}"}
+    if chrom_str.startswith("chr"):
+        chrom_options.add(chrom_str[3:])
+
+    min_pos = None
+    max_pos = None
+    if str(vcf_path).endswith(".bcf"):
+        return None
+
+    try:
+        with _open_maybe_gzip(vcf_path) as handle:
+            for line in handle:
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2:
+                    continue
+                if fields[0] not in chrom_options:
+                    continue
+                try:
+                    pos = int(fields[1])
+                except ValueError:
+                    continue
+                if min_pos is None or pos < min_pos:
+                    min_pos = pos
+                if max_pos is None or pos > max_pos:
+                    max_pos = pos
+    except OSError:
+        return None
+
+    if min_pos is None or max_pos is None:
+        return None
+    return (min_pos, max_pos)
+
+
+def resolve_region_arg(paths, chrom):
+    """Prefer ref bounds; fall back to input bounds; then chrom only."""
+    ref_bounds = get_chrom_bounds(paths["ref_vcf"], chrom)
+    if ref_bounds:
+        return f"chr{chrom}:{ref_bounds[0]}-{ref_bounds[1]}"
+    input_bounds = get_chrom_bounds(paths["input_vcf"], chrom)
+    if input_bounds:
+        return f"chr{chrom}:{input_bounds[0]}-{input_bounds[1]}"
+    return f"chr{chrom}"
+
+
+def print_tool_help(label, cmd):
+    try:
+        result = run(f"{cmd} --help 2>&1 | head -5", capture=True, check=False)
+        if result.stdout:
+            print(f"{label} --help output:\n{result.stdout.strip()}")
+    except Exception as e:
+        print(f"Warning: {label} --help check failed: {e}")
     else:
         subprocess.check_call(cmd, shell=True)
 
@@ -1627,9 +1691,11 @@ def run_impute5_chr(chrom, paths):
         try:
             # IMPUTE5 requires an indexed reference and map file usually, but minimal example:
             # --h reference --g input --r region --o output
-            contig_len = get_contig_length(paths['ref_vcf'], chrom)
-            region_arg = f"chr{chrom}:1-{contig_len}" if contig_len else f"chr{chrom}"
-            
+            region_arg = resolve_region_arg(paths, chrom)
+            print_tool_help("IMPUTE5", str(impute5_bin))
+            print(f"IMPUTE5 region: {region_arg}")
+            print(f"IMPUTE5 ref: {paths['ref_vcf']}")
+            print(f"IMPUTE5 input: {paths['input_vcf']}")
             run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
             run(f"bcftools index -f {out}")
         except Exception as e:
@@ -1684,9 +1750,11 @@ def run_minimac_chr(chrom, paths):
         try:
             prefix = data_dir / "minimac_imputed"
             # Minimac4: --refHaps ref.vcf --haps input.vcf --prefix out --region chr
-            contig_len = get_contig_length(paths['ref_vcf'], chrom)
-            region_arg = f"chr{chrom}:1-{contig_len}" if contig_len else f"chr{chrom}"
-            
+            region_arg = resolve_region_arg(paths, chrom)
+            print_tool_help("Minimac4", str(minimac_bin))
+            print(f"Minimac4 region: {region_arg}")
+            print(f"Minimac4 ref: {paths['ref_vcf']}")
+            print(f"Minimac4 input: {paths['input_vcf']}")
             run(f"{minimac_bin} {paths['ref_vcf']} {paths['input_vcf']} --output {prefix}.dose.vcf.gz --threads 4 --format GT,DS --region {region_arg}")
             
             # Helper to move output
@@ -1721,7 +1789,12 @@ def run_glimpse_chr(chrom, paths):
         try:
             # GLIMPSE2_phase: --input-gl input.vcf --reference ref.vcf --input-region chr --output out.bcf
             bcf_out = data_dir / "glimpse_imputed.bcf"
-            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region chr{chrom} --output-region chr{chrom} --output {bcf_out} --threads 4")
+            region_arg = resolve_region_arg(paths, chrom)
+            print_tool_help("GLIMPSE2", str(glimpse_bin))
+            print(f"GLIMPSE region: {region_arg}")
+            print(f"GLIMPSE ref: {paths['ref_vcf']}")
+            print(f"GLIMPSE input: {paths['input_vcf']}")
+            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region {region_arg} --output-region {region_arg} --output {bcf_out} --threads 4")
             run(f"bcftools view {bcf_out} -O z -o {out}")
             run(f"bcftools index -f {out}")
         except Exception as e:
@@ -2130,4 +2203,3 @@ def stage_summary():
 
 if __name__ == "__main__":
     main()
-
