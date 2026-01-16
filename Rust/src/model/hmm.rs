@@ -15,6 +15,7 @@
 
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
+use crate::model::allele_lookup::RefAlleleLookup;
 use crate::model::parameters::ModelParams;
 use wide::f32x8;
 
@@ -263,6 +264,28 @@ impl<'a> BeagleHmm<'a> {
         )
     }
 
+    /// Forward-backward using a pre-computed allele lookup for states.
+    ///
+    /// This avoids per-allele alignment indirection when the lookup is available.
+    pub fn forward_backward_with_lookup(
+        &self,
+        target_alleles: &[u8],
+        target_conf: Option<&[f32]>,
+        lookup: &RefAlleleLookup,
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> f64 {
+        self.conditioned_forward_backward_with_lookup(
+            target_alleles,
+            target_alleles,
+            target_alleles,
+            target_conf,
+            lookup,
+            fwd,
+            bwd,
+        )
+    }
+
     /// Forward-backward with a fixed partner haplotype constraint.
     ///
     /// The emission probability is conditioned on the partner allele such that
@@ -277,6 +300,8 @@ impl<'a> BeagleHmm<'a> {
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
     ) -> f64 {
+        const CONF_NEUTRAL_THRESHOLD: f32 = 0.05;
+
         let n_markers = self.n_markers();
         let n_states = self.n_states;
         let total_size = n_markers * n_states;
@@ -308,10 +333,16 @@ impl<'a> BeagleHmm<'a> {
                 self.ref_gt.allele(MarkerIdx::new(marker as u32), HapIdx::new(hap))
             });
 
+            let conf = target_conf
+                .and_then(|c| c.get(m).copied())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
             let geno1 = geno_a1[m];
             let geno2 = geno_a2[m];
             let partner = partner_alleles[m];
-            let required = if geno1 == 255 || geno2 == 255 {
+            let required = if conf < CONF_NEUTRAL_THRESHOLD {
+                None
+            } else if geno1 == 255 || geno2 == 255 {
                 None
             } else if geno1 == geno2 {
                 Some(geno1)
@@ -327,10 +358,6 @@ impl<'a> BeagleHmm<'a> {
                 for k in 0..n_states {
                     mismatches[k] = if scratch.alleles[k] == req { 0 } else { 1 };
                 }
-                let conf = target_conf
-                    .and_then(|c| c.get(m).copied())
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 1.0);
                 let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
                 let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
                 ([p_no_err, p_err], false)
@@ -387,10 +414,16 @@ impl<'a> BeagleHmm<'a> {
                 scratch.alleles[k] = self.ref_gt.allele(MarkerIdx::new(m_next as u32), HapIdx::new(hap));
             }
 
+            let conf = target_conf
+                .and_then(|c| c.get(m_next).copied())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
             let geno1 = geno_a1[m_next];
             let geno2 = geno_a2[m_next];
             let partner = partner_alleles[m_next];
-            let required = if geno1 == 255 || geno2 == 255 {
+            let required = if conf < CONF_NEUTRAL_THRESHOLD {
+                None
+            } else if geno1 == 255 || geno2 == 255 {
                 None
             } else if geno1 == geno2 {
                 Some(geno1)
@@ -406,10 +439,179 @@ impl<'a> BeagleHmm<'a> {
                 for k in 0..n_states {
                     mismatches[k] = if scratch.alleles[k] == req { 0 } else { 1 };
                 }
-                let conf = target_conf
-                    .and_then(|c| c.get(m_next).copied())
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 1.0);
+                let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+                let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+                ([p_no_err, p_err], false)
+            } else {
+                mismatches.fill(0);
+                ([1.0f32, 1.0f32], true)
+            };
+
+            let next_row = m_next * n_states;
+            let curr_row = m * n_states;
+            for k in 0..n_states {
+                bwd[curr_row + k] = bwd[next_row + k];
+            }
+
+            if use_neutral {
+                HmmUpdater::bwd_update(
+                    &mut bwd[curr_row..curr_row + n_states],
+                    p_recomb_next,
+                    &[1.0f32, 1.0f32],
+                    &mismatches,
+                    n_states,
+                );
+            } else {
+                HmmUpdater::bwd_update(
+                    &mut bwd[curr_row..curr_row + n_states],
+                    p_recomb_next,
+                    &emit_probs,
+                    &mismatches,
+                    n_states,
+                );
+            }
+        }
+
+        log_likelihood
+    }
+
+    /// Forward-backward with fixed partner using a pre-computed allele lookup.
+    ///
+    /// This skips per-state allele materialization in GenotypeView.
+    pub fn conditioned_forward_backward_with_lookup(
+        &self,
+        geno_a1: &[u8],
+        geno_a2: &[u8],
+        partner_alleles: &[u8],
+        target_conf: Option<&[f32]>,
+        lookup: &RefAlleleLookup,
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> f64 {
+        const CONF_NEUTRAL_THRESHOLD: f32 = 0.05;
+
+        let n_markers = self.n_markers();
+        let n_states = self.n_states;
+        let total_size = n_markers * n_states;
+
+        if n_markers == 0 || n_states == 0 {
+            return 0.0;
+        }
+        debug_assert_eq!(lookup.n_states(), n_states);
+
+        let p_err_base = self.params.p_mismatch;
+        let p_no_err_base = 1.0 - p_err_base;
+
+        fwd.resize(total_size, 0.0);
+        bwd.resize(total_size, 0.0);
+
+        let mut mismatches = vec![0u8; n_states];
+        let mut fwd_sum = 1.0f32;
+        let mut log_likelihood = 0.0f64;
+
+        for m in 0..n_markers {
+            let p_recomb_m = self.p_recomb.get(m).copied().unwrap_or(0.0);
+            let conf = target_conf
+                .and_then(|c| c.get(m).copied())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+
+            let geno1 = geno_a1[m];
+            let geno2 = geno_a2[m];
+            let partner = partner_alleles[m];
+            let required = if conf < CONF_NEUTRAL_THRESHOLD {
+                None
+            } else if geno1 == 255 || geno2 == 255 {
+                None
+            } else if geno1 == geno2 {
+                Some(geno1)
+            } else if partner == geno1 {
+                Some(geno2)
+            } else if partner == geno2 {
+                Some(geno1)
+            } else {
+                None
+            };
+
+            let (emit_probs, use_neutral) = if let Some(req) = required {
+                for k in 0..n_states {
+                    mismatches[k] = if lookup.allele(m, k) == req { 0 } else { 1 };
+                }
+                let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+                let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+                ([p_no_err, p_err], false)
+            } else {
+                mismatches.fill(0);
+                ([1.0f32, 1.0f32], true)
+            };
+
+            let row_offset = m * n_states;
+            if m == 0 {
+                let init_val = 1.0 / n_states as f32;
+                fwd_sum = 0.0;
+                for k in 0..n_states {
+                    let emit = if use_neutral { 1.0 } else { emit_probs[mismatches[k] as usize] };
+                    let val = init_val * emit;
+                    fwd[row_offset + k] = val;
+                    fwd_sum += val;
+                }
+            } else {
+                let prev_row_offset = (m - 1) * n_states;
+                let (before, curr_and_after) = fwd.split_at_mut(row_offset);
+                let prev_row = &before[prev_row_offset..prev_row_offset + n_states];
+                let curr_row = &mut curr_and_after[..n_states];
+                curr_row.copy_from_slice(prev_row);
+                fwd_sum = HmmUpdater::fwd_update(
+                    curr_row,
+                    fwd_sum,
+                    p_recomb_m,
+                    &emit_probs,
+                    &mismatches,
+                    n_states,
+                );
+            }
+
+            if fwd_sum > 0.0 {
+                log_likelihood += (fwd_sum as f64).ln();
+            }
+        }
+
+        let last_row = (n_markers - 1) * n_states;
+        let init_bwd = 1.0 / n_states as f32;
+        for k in 0..n_states {
+            bwd[last_row + k] = init_bwd;
+        }
+
+        for m in (0..n_markers - 1).rev() {
+            let m_next = m + 1;
+            let p_recomb_next = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
+
+            let conf = target_conf
+                .and_then(|c| c.get(m_next).copied())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+
+            let geno1 = geno_a1[m_next];
+            let geno2 = geno_a2[m_next];
+            let partner = partner_alleles[m_next];
+            let required = if conf < CONF_NEUTRAL_THRESHOLD {
+                None
+            } else if geno1 == 255 || geno2 == 255 {
+                None
+            } else if geno1 == geno2 {
+                Some(geno1)
+            } else if partner == geno1 {
+                Some(geno2)
+            } else if partner == geno2 {
+                Some(geno1)
+            } else {
+                None
+            };
+
+            let (emit_probs, use_neutral) = if let Some(req) = required {
+                for k in 0..n_states {
+                    mismatches[k] = if lookup.allele(m_next, k) == req { 0 } else { 1 };
+                }
                 let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
                 let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
                 ([p_no_err, p_err], false)

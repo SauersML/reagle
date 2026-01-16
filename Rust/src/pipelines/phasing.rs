@@ -50,6 +50,7 @@ impl std::ops::Deref for StreamWindowWithResult {
     }
 }
 use crate::model::hmm::BeagleHmm;
+use crate::model::allele_lookup::RefAlleleLookup;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::phase_states::PhaseStates;
@@ -69,77 +70,6 @@ pub struct PhasingPipeline {
 }
 
 const MOSAIC_BLOCK_SIZE: usize = 128;  // Smaller = less memory per sample
-
-/// Pre-computed allele lookup for HMM states.
-///
-/// Stores alleles as a flat Vec<u8> with layout [marker0_state0, marker0_state1, ..., marker1_state0, ...]
-/// This eliminates per-lookup overhead from alignment mapping and reference genotype access.
-struct RefAlleleLookup {
-    /// Pre-computed alleles: alleles[m * n_states + k] = allele for state k at marker m
-    alleles: aligned_vec::AVec<u8, aligned_vec::ConstAlign<32>>,
-    /// Number of HMM states
-    n_states: usize,
-}
-
-impl RefAlleleLookup {
-    /// Create a new lookup directly from ThreadedHaps without intermediate allocation.
-    ///
-    /// This avoids the O(n_markers × n_states × 4) temporary from materialize_all().
-    fn new_from_threaded_with_buffer(
-        threaded_haps: &crate::model::states::ThreadedHaps,
-        n_markers: usize,
-        n_states: usize,
-        n_target_haps: usize,
-        ref_geno: &MutableGenotypes,
-        reference_gt: Option<&GenotypeMatrix<Phased>>,
-        alignment: Option<&MarkerAlignment>,
-        marker_map: Option<&[usize]>,
-        mut alleles: aligned_vec::AVec<u8, aligned_vec::ConstAlign<32>>,
-    ) -> Self {
-        let required = n_markers * n_states;
-        if alleles.len() < required {
-            alleles = aligned_vec::AVec::from_iter(32, std::iter::repeat(0u8).take(required));
-        } else {
-            alleles[..required].fill(0);
-        }
-
-        // Use marker-major iteration to hoist per-marker alignment computation
-        threaded_haps.fill_alleles_marker_major(&mut alleles, |m| {
-            // Per-marker setup (hoisted outside state loop)
-            let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
-            // Pre-compute ref marker index once per marker
-            let ref_m_opt = alignment.and_then(|a| a.target_to_ref(orig_m));
-
-            // Return closure for hap lookups at this marker
-            move |hap: u32| {
-                let hap = hap as usize;
-                if hap < n_target_haps {
-                    ref_geno.get(orig_m, HapIdx::new(hap as u32))
-                } else {
-                    let ref_h = (hap - n_target_haps) as u32;
-                    if let (Some(ref_gt), Some(ref_m)) = (reference_gt, ref_m_opt) {
-                        let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
-                        alignment.unwrap().reverse_map_allele(orig_m, ref_allele)
-                    } else {
-                        255
-                    }
-                }
-            }
-        });
-
-        Self { alleles, n_states }
-    }
-
-    #[inline(always)]
-    fn allele(&self, m: usize, state: usize) -> u8 {
-        // Direct array access - no branching, no indirection
-        self.alleles[m * self.n_states + state]
-    }
-
-    fn into_buffer(self) -> aligned_vec::AVec<u8, aligned_vec::ConstAlign<32>> {
-        self.alleles
-    }
-}
 
 struct FwdCheckpoints {
     block_size: usize,
@@ -2422,11 +2352,48 @@ impl PhasingPipeline {
 
                 let mut fwd1 = Vec::new();
                 let mut bwd1 = Vec::new();
-                hmm.forward_backward_raw(&seq1, Some(&seq_conf), &threaded_haps, &mut fwd1, &mut bwd1);
+                let use_lookup = self.reference_gt.is_some() && self.alignment.is_some();
+                let mut lookup = None;
+                if use_lookup {
+                    lookup = Some(THREAD_WORKSPACE.with(|ws| {
+                        let mut workspace = ws.borrow_mut();
+                        if workspace.is_none() {
+                            *workspace = Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
+                        }
+                        let ws = workspace.as_mut().unwrap();
+                        RefAlleleLookup::new_from_threaded_with_buffer(
+                            &threaded_haps,
+                            n_stage1,
+                            n_states,
+                            n_haps,
+                            ref_geno,
+                            self.reference_gt.as_deref(),
+                            self.alignment.as_ref(),
+                            Some(hi_freq_markers),
+                            std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
+                        )
+                    }));
+                }
+                if let Some(ref lookup) = lookup {
+                    hmm.forward_backward_with_lookup(&seq1, Some(&seq_conf), lookup, &mut fwd1, &mut bwd1);
+                } else {
+                    hmm.forward_backward_raw(&seq1, Some(&seq_conf), &threaded_haps, &mut fwd1, &mut bwd1);
+                }
 
                 let mut fwd2 = Vec::new();
                 let mut bwd2 = Vec::new();
-                hmm.forward_backward_raw(&seq2, Some(&seq_conf), &threaded_haps, &mut fwd2, &mut bwd2);
+                if let Some(ref lookup) = lookup {
+                    hmm.forward_backward_with_lookup(&seq2, Some(&seq_conf), lookup, &mut fwd2, &mut bwd2);
+                } else {
+                    hmm.forward_backward_raw(&seq2, Some(&seq_conf), &threaded_haps, &mut fwd2, &mut bwd2);
+                }
+                if let Some(lookup) = lookup {
+                    THREAD_WORKSPACE.with(|ws| {
+                        if let Some(ws) = ws.borrow_mut().as_mut() {
+                            ws.lookup = lookup.into_buffer();
+                        }
+                    });
+                }
 
                 // Compute posterior state probabilities at each Stage 1 marker
                 let mut probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);

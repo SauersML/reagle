@@ -43,6 +43,7 @@
 //! phasing and imputation.
 
 pub mod hmm;
+pub mod allele_lookup;
 pub mod ibs2;
 pub mod imp_utils;
 pub mod parameters;
