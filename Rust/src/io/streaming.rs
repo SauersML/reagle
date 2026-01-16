@@ -379,20 +379,14 @@ impl StreamingVcfReader {
         // Determine window boundaries
         let window_start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
         let target_end_gen = window_start_gen + self.config.window_cm as f64;
+        let full_window_gen = target_end_gen + self.config.overlap_cm as f64;
 
-        // Find end of window
-        let mut window_end = 0;
-        for (i, m) in self.buffer.iter().enumerate() {
-            if m.gen_pos >= target_end_gen || i >= self.config.max_markers {
-                break;
-            }
-            window_end = i + 1;
-        }
-
-        // If we haven't found the end and we're not at EOF, need more data
-        if window_end == 0 {
-            window_end = self.buffer.len();
-        }
+        // Find end of full window (output + overlap)
+        let window_end = self.buffer
+            .iter()
+            .position(|m| m.gen_pos >= full_window_gen)
+            .unwrap_or(self.buffer.len())
+            .min(self.config.max_markers);
 
         let is_last = self.eof && window_end >= self.buffer.len();
 
@@ -401,17 +395,12 @@ impl StreamingVcfReader {
         let output_end = if is_last {
             window_end
         } else {
-            // Find overlap point
-            let overlap_gen = self
-                .buffer
-                .get(window_end.saturating_sub(1))
-                .map(|m| m.gen_pos - self.config.overlap_cm as f64)
-                .unwrap_or(0.0);
-
-            // Find splice index: keep markers > overlap_gen
-            // Markers <= overlap_gen are discarded (overlap buffer for next window)
-            // We want the index of the first marker that is > overlap_gen
-            self.find_overlap_splice_index(window_end, overlap_gen)
+            // Find the splice point: the first marker that is past the main window part
+            self.buffer
+                .iter()
+                .take(window_end)
+                .position(|m| m.gen_pos >= target_end_gen)
+                .unwrap_or(window_end)
         };
 
         // Build GenotypeMatrix for this window
