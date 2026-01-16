@@ -517,30 +517,20 @@ impl crate::pipelines::ImputationPipeline {
                 let start_pos = window_start_pos;
                 let end_pos = window_end_pos;
                 
-                let mut ref_window = None;
-                let mut window_chrom = None;
-                for cand in &chrom_candidates {
-                    let loaded = if pipeline.config.profile {
-                        let span_guard = info_span!("io_load_ref").entered();
-                        let _ = &span_guard;
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    } else {
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    };
-                    if loaded.is_some() {
-                        ref_window = loaded;
-                        window_chrom = Some(cand.clone());
-                        break;
-                    }
-                }
-                let window_chrom = window_chrom.unwrap_or_else(|| target_chrom.to_string());
+                let loaded = if pipeline.config.profile {
+                    let span_guard = info_span!("io_load_ref").entered();
+                    let _ = &span_guard;
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                } else {
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                };
 
-                let ref_window = match ref_window {
+                let ref_window = match loaded {
                     Some(w) => w,
                     None => {
                         return Err(anyhow::anyhow!(
                             "No reference markers in region for chrom {} ({}..{}); tried: {}",
-                            window_chrom,
+                            target_chrom,
                             start_pos,
                             end_pos,
                             chrom_candidates.join(", ")
@@ -548,6 +538,14 @@ impl crate::pipelines::ImputationPipeline {
                         .into());
                     }
                 };
+
+                let window_chrom_idx = ref_window.genotypes.marker(MarkerIdx::new(0)).chrom;
+                let window_chrom = ref_window
+                    .genotypes
+                    .markers()
+                    .chrom_name(window_chrom_idx)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| target_chrom.to_string());
 
                 // Use RefWindow metadata for coordinate tracking and boundary handling
                 if ref_window.is_first {
@@ -1456,6 +1454,49 @@ target_samples={} target_bytes={}",
                 let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
                 let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
                 let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                // Map target alleles to reference allele space for correct dosage
+                let ref_a1 = if let Some(Some(mapping)) = alignment.allele_mappings.get(target_m) {
+                    if a1 == 255 {
+                        255
+                    } else if (a1 as usize) < mapping.targ_to_ref.len() {
+                        let m = mapping.targ_to_ref[a1 as usize];
+                        if m >= 0 {
+                            m as u8
+                        } else {
+                            255
+                        }
+                    } else {
+                        255
+                    }
+                } else {
+                    a1
+                };
+
+                let ref_a2 = if let Some(Some(mapping)) = alignment.allele_mappings.get(target_m) {
+                    if a2 == 255 {
+                        255
+                    } else if (a2 as usize) < mapping.targ_to_ref.len() {
+                        let m = mapping.targ_to_ref[a2 as usize];
+                        if m >= 0 {
+                            m as u8
+                        } else {
+                            255
+                        }
+                    } else {
+                        255
+                    }
+                } else {
+                    a2
+                };
+
+                // Force hard call dosage for genotyped markers to match Beagle reference
+                if ref_a1 != 255 && ref_a2 != 255 {
+                    let d1 = if ref_a1 == 1 { 1.0 } else { 0.0 };
+                    let d2 = if ref_a2 == 1 { 1.0 } else { 0.0 };
+                    return d1 + d2;
+                }
+
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
