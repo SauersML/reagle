@@ -1129,7 +1129,20 @@ target_samples={} target_bytes={}",
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
+                                let mut prob = p.prob(1);
+                                
+                                // For genotyped markers with high confidence, force dosage to 0.0 or 1.0
+                                // to match reference implementation behavior and DR2 calculation
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let a = target_win.allele(MarkerIdx::new(target_m as u32), hap1_idx);
+                                    let conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s);
+                                    if a != 255 && conf >= 0.99 {
+                                        if a == 0 { prob = 0.0; }
+                                        else if a == 1 { prob = 1.0; }
+                                    }
+                                }
+                                
+                                hap_dosages.push(prob);
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
 
@@ -1204,7 +1217,19 @@ target_samples={} target_bytes={}",
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
+                                let mut prob = p.prob(1);
+                                
+                                // For genotyped markers with high confidence, force dosage to 0.0 or 1.0
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let a = target_win.allele(MarkerIdx::new(target_m as u32), hap2_idx);
+                                    let conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s);
+                                    if a != 255 && conf >= 0.99 {
+                                        if a == 0 { prob = 0.0; }
+                                        else if a == 1 { prob = 1.0; }
+                                    }
+                                }
+
+                                hap_dosages.push(prob);
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
 
