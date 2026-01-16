@@ -1373,13 +1373,21 @@ def stage_prepare_profile():
     # Create input (test samples, downsampled to GSA sites, UNPHASED)
     tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
     if not validate_vcf(paths['input_vcf']) or not has_vcf_records(paths['input_vcf']):
-        print("Downsampling to GSA sites and unphasing...")
-        create_regions_file(filtered_sites, str(paths['gsa_regions']))
+        if filtered_sites:
+            print("Downsampling to GSA sites and unphasing...")
+            create_regions_file(filtered_sites, str(paths['gsa_regions']))
+        else:
+            print("No GSA sites in profiling region; using first 5000 markers from trimmed VCF.")
+            run(
+                f"bcftools query -f '%CHROM\\t%POS\\n' {trimmed_vcf} | head -n 5000 > {paths['gsa_regions']}"
+            )
         tmp_phased = str(tmp_phased_path)
         run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
         run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
         os.remove(tmp_phased)
         run(f"bcftools index -f {paths['input_vcf']}")
+        if not has_vcf_records(paths['input_vcf']):
+            raise RuntimeError("Profiling input VCF is empty after downsampling; adjust subset size.")
     if not has_index(paths['input_vcf']):
         ensure_index(
             paths['input_vcf'],
