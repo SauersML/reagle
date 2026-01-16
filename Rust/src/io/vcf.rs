@@ -180,45 +180,55 @@ impl VcfReader {
             return Ok(false);
         }
         let xlen = u16::from_le_bytes([header[10], header[11]]) as usize;
-        let mut extra = vec![0u8; xlen];
-        let extra_read = file.read(&mut extra)?;
-        file.seek(SeekFrom::Start(0))?;
-        if extra_read < 4 {
+        if xlen < 4 {
+            file.seek(SeekFrom::Start(0))?;
             return Ok(false);
         }
-        // BGZF extra subfield ID is "BC".
-        for i in 0..extra_read.saturating_sub(4) {
-            if extra[i] == b'B' && extra[i + 1] == b'C' {
+        let mut extra = vec![0u8; xlen];
+        file.read_exact(&mut extra)?;
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut i = 0;
+        while i + 4 <= extra.len() {
+            let si1 = extra[i];
+            let si2 = extra[i + 1];
+            let slen = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
+            if si1 == b'B' && si2 == b'C' && slen == 2 {
                 return Ok(true);
             }
+            i = i.saturating_add(4 + slen);
         }
+
         Ok(false)
     }
 
     /// Open a VCF file and read the header
     pub fn open(path: &Path) -> Result<(Self, Box<dyn BufRead + Send>)> {
         info_span!("vcf_open", path = ?path).in_scope(|| {
-        let mut file = File::open(path)?;
+            let mut file = File::open(path)?;
 
-        // Check if gzipped
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let reader: Box<dyn BufRead + Send> = match ext {
-            "bgz" | "bgzf" => Box::new(BufReader::new(bgzf_io::Reader::new(file))),
-            "gz" => {
-                let is_bgzf = Self::detect_bgzf(&mut file)?;
-                if is_bgzf {
+            // Check if gzipped
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let reader: Box<dyn BufRead + Send> = match ext {
+                "bgz" | "bgzf" => {
+                    if !Self::detect_bgzf(&mut file)? {
+                        return Err(anyhow::anyhow!("Expected BGZF file for extension .{}", ext).into());
+                    }
                     Box::new(BufReader::new(bgzf_io::Reader::new(file)))
-                } else {
-                    Box::new(BufReader::new(GzDecoder::new(file)))
                 }
-            }
-            _ => Box::new(BufReader::new(file)),
-        };
+                "gz" => {
+                    if Self::detect_bgzf(&mut file)? {
+                        Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+                    } else {
+                        Box::new(BufReader::new(GzDecoder::new(file)))
+                    }
+                }
+                _ => Box::new(BufReader::new(file)),
+            };
 
-        Self::from_reader(reader)
+            Self::from_reader(reader)
         })
     }
-
     /// Create from a reader
     pub fn from_reader(
         mut reader: Box<dyn BufRead + Send>,
