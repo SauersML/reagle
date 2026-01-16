@@ -2022,7 +2022,7 @@ impl PhasingPipeline {
                     let (swap_bits, swap_lr, new_paths) = if self.config.dynamic_mcmc {
                         // SHAPEIT5-style dynamic MCMC: re-select states each step
                         // Note: Dynamic MCMC doesn't use ThreadWorkspace yet
-                        let (swap_bits, swap_lr) = sample_dynamic_mcmc(
+                        let (swap_bits, swap_lr, new_paths) = sample_dynamic_mcmc(
                             n_hi_freq,
                             n_states,
                             stage1_p_recomb,
@@ -2037,8 +2037,9 @@ impl PhasingPipeline {
                             self.config.mcmc_steps,
                             p_no_err,
                             p_err,
+                            prior_paths.get(s).and_then(|p| p.as_ref()),
                         );
-                        (swap_bits, swap_lr, None)
+                        (swap_bits, swap_lr, Some(new_paths))
                     } else {
                         // Classic Beagle-style: static state space MCMC with thread-local workspace
                         THREAD_WORKSPACE.with(|ws| {
@@ -3436,11 +3437,19 @@ fn sample_dynamic_mcmc(
     n_mcmc_steps: usize,
     p_no_err: f32,
     p_err: f32,
-) -> (Vec<u8>, Vec<f32>) {
+    initial_paths: Option<&MosaicPaths>,
+) -> (Vec<u8>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
 
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
-        return (Vec::new(), Vec::new());
+        return (
+            Vec::new(),
+            Vec::new(),
+            MosaicPaths {
+                path1: Vec::new(),
+                path2: Vec::new(),
+            },
+        );
     }
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
@@ -3474,18 +3483,37 @@ fn sample_dynamic_mcmc(
     // This gives the first iteration something to work with
     let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
     if initial_neighbors.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (
+            Vec::new(),
+            Vec::new(),
+            MosaicPaths {
+                path1: Vec::new(),
+                path2: Vec::new(),
+            },
+        );
     }
 
     // Separate paths for H1 and H2 to avoid cross-talk in Gibbs sampling
-    // Each haplotype's neighbor selection should use its own previous latent state
-    let mut path1 = vec![0u32; n_markers];
-    let mut path2 = vec![0u32; n_markers];
+    // Store reference hap IDs (for persistence) and local state indices (per step)
+    let mut path1_ref = vec![0u32; n_markers];
+    let mut path2_ref = vec![0u32; n_markers];
+    let mut path1_idx = vec![0u32; n_markers];
+    let mut path2_idx = vec![0u32; n_markers];
     let mut fixed_allele = vec![255u8; n_markers];
 
     // Current set of neighbors (reused across markers within an MCMC step)
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
+
+    if let Some(paths) = initial_paths {
+        if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
+            path1_ref.copy_from_slice(&paths.path1);
+            path2_ref.copy_from_slice(&paths.path2);
+        }
+    } else if let Some(&seed_hap) = neighbors.first() {
+        path1_ref.fill(seed_hap);
+        path2_ref.fill(seed_hap);
+    }
 
     fn mix_neighbors(
         neighbors: &mut Vec<u32>,
@@ -3537,9 +3565,11 @@ fn sample_dynamic_mcmc(
         } else {
             n_markers / 2
         };
-        let prev_state = path1[center_marker] as usize;
-        if prev_state < neighbors.len() {
-            let ref_hap = neighbors[prev_state];
+        let ref_hap = path1_ref
+            .get(center_marker)
+            .copied()
+            .unwrap_or(0);
+        if (ref_hap as usize) < phase_ibs.n_haps() {
             neighbors = phase_ibs.find_neighbors_of_state(ref_hap, center_marker, sample_idx, n_states);
         }
         if neighbors.is_empty() {
@@ -3560,7 +3590,7 @@ fn sample_dynamic_mcmc(
 
         // 3. Run haploid FFBS for H1
         ffbs_haploid_constrained(
-            &mut path1, n_markers, neighbors.len(), p_recomb,
+            &mut path1_idx, n_markers, neighbors.len(), p_recomb,
             seq1, seq2, conf, &fixed_allele, &neighbors,
             phase_ibs, p_no_err, p_err, &mut rng
         );
@@ -3569,7 +3599,7 @@ fn sample_dynamic_mcmc(
         //    GIBBS SAMPLING: only update H1, leave H2 fixed
         //    At hets, set H1 to match the reference's allele (if compatible).
         for m in 0..n_markers {
-            let state = path1[m] as usize;
+            let state = path1_idx[m] as usize;
             let a1 = seq1[m];
             let a2 = seq2[m];
 
@@ -3579,11 +3609,13 @@ fn sample_dynamic_mcmc(
                 h1_alleles[m] = a1;
             } else if state < neighbors.len() {
                 // Het: use reference allele to determine H1
-                let ref_al = phase_ibs.allele(m, neighbors[state]);
+                let ref_hap = neighbors[state];
+                let ref_al = phase_ibs.allele(m, ref_hap);
                 if ref_al == a1 || ref_al == a2 {
                     // Set H1 to ref_al, and H2 must be the other allele
                     h1_alleles[m] = ref_al;
                     h2_alleles[m] = if ref_al == a1 { a2 } else { a1 };
+                    path1_ref[m] = ref_hap;
                 }
                 // If ref_al is missing/different, keep current phase
             }
@@ -3592,9 +3624,11 @@ fn sample_dynamic_mcmc(
         // === Sample H2 | (G, H1_new) ===
 
         // 1. Select neighbors for H2 using H2's own latent state (not H1's!)
-        let prev_state = path2[center_marker] as usize;
-        if prev_state < neighbors.len() {
-            let ref_hap = neighbors[prev_state];
+        let ref_hap = path2_ref
+            .get(center_marker)
+            .copied()
+            .unwrap_or(0);
+        if (ref_hap as usize) < phase_ibs.n_haps() {
             neighbors = phase_ibs.find_neighbors_of_state(ref_hap, center_marker, sample_idx, n_states);
         }
         if neighbors.is_empty() {
@@ -3615,7 +3649,7 @@ fn sample_dynamic_mcmc(
 
         // 3. Run haploid FFBS for H2
         ffbs_haploid_constrained(
-            &mut path2, n_markers, neighbors.len(), p_recomb,
+            &mut path2_idx, n_markers, neighbors.len(), p_recomb,
             seq1, seq2, conf, &fixed_allele, &neighbors,
             phase_ibs, p_no_err, p_err, &mut rng
         );
@@ -3636,6 +3670,10 @@ fn sample_dynamic_mcmc(
                 // The constraint in emit_haploid_constrained enforced this.
                 // Just ensure consistency - H2 is the allele NOT assigned to H1.
                 h2_alleles[m] = if h1_alleles[m] == a1 { a2 } else { a1 };
+                let state = path2_idx[m] as usize;
+                if state < neighbors.len() {
+                    path2_ref[m] = neighbors[state];
+                }
             }
         }
 
@@ -3663,8 +3701,8 @@ fn sample_dynamic_mcmc(
         swap_bits.push(if swap { 1 } else { 0 });
 
         // Compute LR from the reference allele at this position (use H1's path)
-        let ref_al = if (path1[m] as usize) < neighbors.len() {
-            phase_ibs.allele(m, neighbors[path1[m] as usize])
+        let ref_al = if (path1_ref[m] as usize) < phase_ibs.n_haps() {
+            phase_ibs.allele(m, path1_ref[m])
         } else {
             255
         };
@@ -3679,7 +3717,14 @@ fn sample_dynamic_mcmc(
         swap_lr.push(lr);
     }
 
-    (swap_bits, swap_lr)
+    (
+        swap_bits,
+        swap_lr,
+        MosaicPaths {
+            path1: path1_ref,
+            path2: path2_ref,
+        },
+    )
 }
 
 /// Sample phase swap decisions using Stochastic EM (single chain MCMC).
@@ -4544,7 +4589,7 @@ mod tests {
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
         // Sample 0: haplotypes 0 and 1
-        let (swap_bits, swap_lr) = sample_dynamic_mcmc(
+        let (swap_bits, swap_lr, paths) = sample_dynamic_mcmc(
             n_markers,
             n_total_haps,
             &p_recomb,
@@ -4559,7 +4604,10 @@ mod tests {
             5,     // n_mcmc_steps
             0.999,
             0.001,
+            None,
         );
+        assert_eq!(paths.path1.len(), n_markers);
+        assert_eq!(paths.path2.len(), n_markers);
 
         // With all reference having allele 0, H1 should be set to 0 at all hets.
         // Since seq1 = 0, this means no swap (swap_bit = 0).
@@ -4614,7 +4662,7 @@ mod tests {
         let p_recomb = vec![0.01f32; n_markers];
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
-        let (swap_bits, swap_lr) = sample_dynamic_mcmc(
+        let (swap_bits, swap_lr, paths) = sample_dynamic_mcmc(
             n_markers,
             n_total_haps,
             &p_recomb,
@@ -4629,7 +4677,10 @@ mod tests {
             5,
             0.999,
             0.001,
+            None,
         );
+        assert_eq!(paths.path1.len(), n_markers);
+        assert_eq!(paths.path2.len(), n_markers);
 
         // With all reference having allele 1, H1 should be set to 1 at all hets.
         // Since seq1 = 0, this means swap (swap_bit = 1).
