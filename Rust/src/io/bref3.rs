@@ -715,7 +715,7 @@ impl WindowedBref3Reader {
         let mut all_columns: Vec<GenotypeColumn> = Vec::new();
         let mut in_range_indices: Vec<usize> = Vec::new();
         let is_first = self.window_num == 0;
-        let is_last = self.inner.is_eof();
+        let is_last = self.inner.is_eof() && self.pending_block.is_none();
 
         for block in &self.block_buffer {
             if block.chrom != chrom {
@@ -921,7 +921,13 @@ impl InMemoryRefReader {
             output_start = 0;
         }
         if is_last {
-            output_end = self.genotypes.n_markers();
+            let n_markers_in_window = markers.len();
+            if n_markers_in_window > 0 {
+                let last_marker = markers.marker(crate::data::marker::MarkerIdx::new(
+                    (n_markers_in_window - 1) as u32,
+                ));
+                output_end = last_marker.pos as usize + 1;
+            }
         }
 
         let genotypes = GenotypeMatrix::new_phased(markers, columns, self.genotypes.samples_arc());
