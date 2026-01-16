@@ -13,11 +13,12 @@
 //! This implements Beagle's two-stage phasing algorithm for handling rare variants.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bitvec::prelude::*;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use tracing::{info_span, instrument};
+use tracing::{info, info_span, instrument};
 
 use crate::config::Config;
 use crate::data::genetic_map::{GeneticMaps, MarkerMap};
@@ -1538,11 +1539,27 @@ impl PhasingPipeline {
         }
 
         // Finalize: convert PhaseStates to ThreadedHaps (parallel)
-        phase_states
+        let empty_count = AtomicUsize::new(0);
+        let finalized: Vec<crate::model::states::ThreadedHaps> = phase_states
             .into_par_iter()
             .enumerate()
-            .map(|(s, mut ps)| ps.finalize_streaming(s as u32, n_total_haps))
-            .collect()
+            .map(|(s, mut ps)| {
+                if !ps.has_ibs_matches() {
+                    empty_count.fetch_add(1, Ordering::Relaxed);
+                }
+                ps.finalize_streaming(s as u32, n_total_haps)
+            })
+            .collect();
+        let empty = empty_count.load(Ordering::Relaxed);
+        if empty > 0 {
+            info!(
+                "finalize_streaming: {} of {} samples had no IBS matches (random fill)",
+                empty, n_samples
+            );
+        } else {
+            info!("finalize_streaming: all {} samples had IBS matches", n_samples);
+        }
+        finalized
     }
 
     /// Build composite haplotypes using direct MutableGenotypes access (no reference panel).
@@ -1669,11 +1686,27 @@ impl PhasingPipeline {
         }
 
         // Finalize
-        phase_states
+        let empty_count = AtomicUsize::new(0);
+        let finalized: Vec<crate::model::states::ThreadedHaps> = phase_states
             .into_par_iter()
             .enumerate()
-            .map(|(s, mut ps)| ps.finalize_streaming(s as u32, n_haps))
-            .collect()
+            .map(|(s, mut ps)| {
+                if !ps.has_ibs_matches() {
+                    empty_count.fetch_add(1, Ordering::Relaxed);
+                }
+                ps.finalize_streaming(s as u32, n_haps)
+            })
+            .collect();
+        let empty = empty_count.load(Ordering::Relaxed);
+        if empty > 0 {
+            info!(
+                "finalize_streaming: {} of {} samples had no IBS matches (random fill)",
+                empty, n_samples
+            );
+        } else {
+            info!("finalize_streaming: all {} samples had IBS matches", n_samples);
+        }
+        finalized
     }
 
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
