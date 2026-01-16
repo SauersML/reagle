@@ -151,9 +151,114 @@ jobs:
           echo "═══════════════════════════════════════════════════════════════"
           echo "                    TRACING PROFILE OUTPUT"
           echo "═══════════════════════════════════════════════════════════════"
+          set -o pipefail
           ./target/release/reagle \
             --gt tests/data/input.vcf.gz \
             --ref tests/data/ref.vcf.gz \
             --out tests/data/profiled_output \
-            --profile
+            --profile 2>&1 | tee profiling.log
           echo "═══════════════════════════════════════════════════════════════"
+
+      - name: Summarize tracing profile
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          log_path = Path("profiling.log")
+          if not log_path.exists():
+              print("No profiling.log found; skipping summary.")
+              raise SystemExit(0)
+
+          ansi_re = re.compile(r"\x1b\\[[0-9;]*m")
+          span_re = re.compile(r"^(.*?)\\s+close\\s+time\\.busy=([^\\s]+)\\s+time\\.idle=([^\\s]+)")
+
+          def parse_dur(s):
+              m = re.match(r"([0-9.]+)(ns|µs|us|ms|s)$", s)
+              if not m:
+                  return 0.0
+              val = float(m.group(1))
+              unit = m.group(2)
+              if unit == "ns":
+                  return val / 1e9
+              if unit in ("µs", "us"):
+                  return val / 1e6
+              if unit == "ms":
+                  return val / 1e3
+              if unit == "s":
+                  return val
+              return 0.0
+
+          totals = {}
+          total_busy = 0.0
+          total_idle = 0.0
+
+          for line in log_path.read_text(errors="ignore").splitlines():
+              line = ansi_re.sub("", line)
+              if "close time.busy=" not in line:
+                  continue
+              # Normalize to "span_path: close time.busy=..."
+              if "close time.busy=" in line:
+                  parts = line.split("close time.busy=")
+                  if len(parts) < 2:
+                      continue
+                  left = parts[0].strip()
+                  # Take last span path (after last space)
+                  span = left.split()[-1]
+                  m = span_re.search(f"{span} close time.busy={parts[1]}")
+                  if not m:
+                      # Fallback: parse busy/idle from remainder
+                      busy_idle = parts[1].strip().split()
+                      busy = busy_idle[0] if busy_idle else "0s"
+                      idle = busy_idle[1].split("=")[-1] if len(busy_idle) > 1 else "0s"
+                      busy_s = parse_dur(busy)
+                      idle_s = parse_dur(idle)
+                      totals[span] = (totals.get(span, (0.0, 0.0))[0] + busy_s,
+                                      totals.get(span, (0.0, 0.0))[1] + idle_s)
+                      total_busy += busy_s
+                      total_idle += idle_s
+                      continue
+                  span = m.group(1)
+                  busy_s = parse_dur(m.group(2))
+                  idle_s = parse_dur(m.group(3))
+                  totals[span] = (totals.get(span, (0.0, 0.0))[0] + busy_s,
+                                  totals.get(span, (0.0, 0.0))[1] + idle_s)
+                  total_busy += busy_s
+                  total_idle += idle_s
+
+          if total_busy == 0:
+              print("No span timing data found in profiling.log.")
+              raise SystemExit(0)
+
+          top = sorted(totals.items(), key=lambda kv: kv[1][0], reverse=True)[:20]
+
+          def fmt_s(s):
+              if s >= 1:
+                  return f"{s:.3f}s"
+              if s >= 1e-3:
+                  return f"{s*1e3:.3f}ms"
+              if s >= 1e-6:
+                  return f"{s*1e6:.3f}us"
+              return f"{s*1e9:.3f}ns"
+
+          lines = []
+          lines.append("### Tracing profile summary")
+          lines.append("")
+          lines.append(f"Total busy time: {fmt_s(total_busy)}")
+          lines.append(f"Total idle time: {fmt_s(total_idle)}")
+          lines.append("")
+          lines.append("| Span | Busy | Idle | % Busy |")
+          lines.append("|---|---:|---:|---:|")
+          for span, (busy, idle) in top:
+              pct = 100.0 * busy / total_busy
+              lines.append(f"| `{span}` | {fmt_s(busy)} | {fmt_s(idle)} | {pct:.2f}% |")
+
+          summary = "\\n".join(lines)
+          print(summary)
+          summary_path = Path("summary.md")
+          summary_path.write_text(summary)
+          github_summary = Path.cwd() / ".." / ".." / ".." / "GITHUB_STEP_SUMMARY"
+          if "GITHUB_STEP_SUMMARY" in __import__("os").environ:
+              Path(__import__("os").environ["GITHUB_STEP_SUMMARY"]).write_text(summary)
+          PY
