@@ -351,10 +351,31 @@ impl crate::pipelines::ImputationPipeline {
             n_ref_haps, n_target_samples
         );
 
+        // Pre-scan reference to get all markers for VCF header.
+        // This is necessary because the VCF header must be written before any records,
+        // and we need the full list of markers to do so.
+        let ref_markers = {
+            if is_bref3 {
+                let reader = crate::io::bref3::StreamingBref3Reader::open(ref_path)?;
+                reader.markers().clone()
+            } else {
+                // For VCF, we must read the file to gather all marker definitions.
+                // A dedicated marker-only scanner would be more memory-efficient
+                // for very large reference VCFs, but this approach is correct and
+                // mirrors the behavior of the in-memory reference loading path.
+                let (mut vcf_reader, vcf_file) = crate::io::vcf::VcfReader::open(ref_path)?;
+                let ref_gt = vcf_reader.read_all(vcf_file)?;
+                ref_gt.markers().clone()
+            }
+        };
+
         // Create output writer
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
+
+        // Write the header immediately using the pre-scanned markers
+        writer.write_header_extended(&ref_markers, true, self.config.gp, self.config.ap)?;
 
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.
