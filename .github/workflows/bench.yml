@@ -95,7 +95,6 @@ jobs:
           key: test-data-hgdp1kg-chr22-v2
 
       - name: Prepare test data
-        if: steps.cache-data.outputs.cache-hit != 'true'
         run: python3 tests/integration_test.py prepare
 
       - name: Build release binary

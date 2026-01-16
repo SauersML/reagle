@@ -67,6 +67,19 @@ def validate_vcf(path):
     return True
 
 
+def has_vcf_records(path):
+    """Return True if VCF/BCF has at least one record."""
+    if not Path(path).exists():
+        return False
+    result = subprocess.run(
+        f"bcftools view -H {path} | head -1",
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def has_index(path):
     return Path(str(path) + ".csi").exists() or Path(str(path) + ".tbi").exists()
 
@@ -1143,7 +1156,7 @@ def stage_prepare():
     )
 
     # Create reference panel (train samples)
-    if not validate_vcf(paths['ref_vcf']):
+    if not validate_vcf(paths['ref_vcf']) or not has_vcf_records(paths['ref_vcf']):
         print("Creating reference panel...")
         paths['ref_vcf'].unlink(missing_ok=True)
         Path(str(paths['ref_vcf']) + ".csi").unlink(missing_ok=True)
@@ -1151,7 +1164,7 @@ def stage_prepare():
     ensure_index(paths['ref_vcf'], recreate_cmd=f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
 
     # Create truth (test samples, full density)
-    if not validate_vcf(paths['truth_vcf']):
+    if not validate_vcf(paths['truth_vcf']) or not has_vcf_records(paths['truth_vcf']):
         print("Creating truth VCF...")
         paths['truth_vcf'].unlink(missing_ok=True)
         Path(str(paths['truth_vcf']) + ".csi").unlink(missing_ok=True)
@@ -1161,7 +1174,7 @@ def stage_prepare():
     # Create input (test samples, downsampled to GSA sites, UNPHASED)
     # We unphase the input so switch error rate measures TRUE phasing accuracy
     tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
-    if not validate_vcf(paths['input_vcf']):
+    if not validate_vcf(paths['input_vcf']) or not has_vcf_records(paths['input_vcf']):
         print("Downsampling to GSA sites and unphasing...")
         create_regions_file(gsa_sites, str(paths['gsa_regions']))
         # Two-step process: downsample, then unphase
