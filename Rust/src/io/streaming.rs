@@ -333,7 +333,7 @@ impl StreamingVcfReader {
 
         let samples = Arc::new(Samples::from_ids(sample_names));
 
-        Ok(Self {
+        let mut reader = Self {
             reader,
             samples,
             config,
@@ -346,8 +346,25 @@ impl StreamingVcfReader {
             eof: false,
             line_buf: String::new(),
             all_phased: true,
+        };
+
+        reader.prefetch_first_marker()?;
+
+        Ok(reader)
         })
-        })
+    }
+
+    fn prefetch_first_marker(&mut self) -> Result<()> {
+        if !self.buffer.is_empty() {
+            return Ok(());
+        }
+        if let Some(bm) = self.read_next_marker()? {
+            self.buffer.push_back(bm);
+            return Ok(());
+        }
+        Err(ReagleError::vcf(
+            "No variant records found while profiling; input VCF may be empty or malformed.",
+        ))
     }
 
     /// Get samples Arc
