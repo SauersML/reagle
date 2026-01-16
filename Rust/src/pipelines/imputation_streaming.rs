@@ -1233,13 +1233,33 @@ target_samples={} target_bytes={}",
         all_results.sort_by_key(|result| result.sample_idx);
 
 
+        for s in 0..n_target_samples {
+            for ref_m in output_start..output_end {
+                if let Some(stats) = window_quality.get_mut(ref_m) {
+                    if !stats.is_imputed {
+                        if let Some(target_m) = alignment.target_marker(ref_m) {
+                            let h1 = HapIdx::new((s * 2) as u32);
+                            let h2 = HapIdx::new((s * 2 + 1) as u32);
+                            let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                            let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+                            if a1 != 255 && a2 != 255 {
+                                stats.add_sample_biallelic(a1 as f32, a2 as f32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for result in &all_results {
             if let Some((ref p1, ref p2)) = result.hap_alt_probs {
                 for (local_m, (&p1_alt, &p2_alt)) in p1.iter().zip(p2.iter()).enumerate() {
                     let ref_m = markers_to_process.start + local_m;
                     if ref_m < n_ref_markers && ref_is_biallelic[ref_m] {
                         if let Some(stats) = window_quality.get_mut(ref_m) {
-                            stats.add_sample_biallelic(p1_alt, p2_alt);
+                            if stats.is_imputed {
+                                stats.add_sample_biallelic(p1_alt, p2_alt);
+                            }
                         }
                     }
                 }
@@ -1403,54 +1423,25 @@ target_samples={} target_bytes={}",
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at markers_to_process_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            let local_m = marker_idx.saturating_sub(markers_to_process_start);
-            let (p1, p2) = if let Some((p1, p2)) = sample_hap_probs.get(&sample_idx) {
-                (p1.get(local_m).copied().unwrap_or(0.0), p2.get(local_m).copied().unwrap_or(0.0))
-            } else {
-                (0.0, 0.0)
-            };
             if let Some(target_m) = alignment.target_marker(marker_idx) {
                 let h1 = HapIdx::new((sample_idx * 2) as u32);
                 let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
                 let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
                 let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    p1 + p2
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    let sum = q00 + q01 + q11;
-                    if sum > 0.0 {
-                        let inv_sum = 1.0 / sum;
-                        let q01n = q01 * inv_sum;
-                        let q11n = q11 * inv_sum;
-                        q01n + 2.0 * q11n
-                    } else {
-                        p1 + p2
-                    }
-                }
-            } else {
-                if let Some((dosages, _)) = sample_data.get(&sample_idx) {
-                    dosages.get(local_m).copied().unwrap_or(p1 + p2)
-                } else {
-                    p1 + p2
+
+                if a1 != 255 && a2 != 255 {
+                    return (a1 + a2) as f32;
                 }
             }
+
+            let local_m = marker_idx.saturating_sub(markers_to_process_start);
+            if let Some((dosages, _)) = sample_data.get(&sample_idx) {
+                if let Some(&dosage) = dosages.get(local_m) {
+                    return dosage;
+                }
+            }
+
+            0.0
         };
 
         // Closure to get best genotype

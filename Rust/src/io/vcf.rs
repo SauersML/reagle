@@ -67,6 +67,13 @@ impl MarkerImputationStats {
     /// Calculate DR2 (dosage R-squared) matching Java Beagle's implementation.
     /// Formula: (Σp² - (Σp)²/N) / (Σp - (Σp)²/N)
     pub fn dr2(&self, allele: usize) -> f32 {
+        if !self.is_imputed {
+            let sum_dosages = self.sum_p.iter().sum::<f32>();
+            let n_samples = (self.n_haps / 2) as f32;
+            if n_samples > 1.0 && sum_dosages > 0.0 && sum_dosages < 2.0 * n_samples {
+                return 1.0;
+            }
+        }
         if allele == 0 || allele >= self.sum_p.len() || self.n_haps == 0 {
             return 0.0;
         }

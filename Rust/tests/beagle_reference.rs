@@ -3584,7 +3584,10 @@ fn test_perfect_ld_trap_rare_variant() {
     let work_dir = tempfile::tempdir().expect("Create temp dir");
     let rust_out = work_dir.path().join("rust_imp");
 
-    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345)
+    let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&beagle.target_sparse_vcf, work_dir.path());
+
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345)
         .expect("Rust imputation failed");
 
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
@@ -3679,7 +3682,9 @@ fn test_position_20066665_rust_vs_java() {
     }
 
     let rust_out = work_dir.path().join("rust_imp");
-    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345)
+    let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&beagle.target_sparse_vcf, work_dir.path());
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345)
         .expect("Rust imputation failed");
 
     let java_vcf = work_dir.path().join("java_imp.vcf.gz");
@@ -3739,7 +3744,10 @@ fn test_dr2_zero_variance_genotyped_marker() {
     let work_dir = tempfile::tempdir().expect("Create temp dir");
     let rust_out = work_dir.path().join("rust_imp");
 
-    run_rust_imputation(&beagle.target_sparse_vcf, &beagle.ref_vcf, &rust_out, 12345)
+    let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&beagle.target_sparse_vcf, work_dir.path());
+
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345)
         .expect("Rust imputation failed");
 
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
@@ -3824,7 +3832,9 @@ fn run_imputation_vs_ground_truth_comparison(source: &TestDataSource) {
 
     // Run Rust imputation
     let rust_out = work_dir.path().join("rust_imp");
-    run_rust_imputation(&source.target_sparse_vcf, &source.ref_vcf, &rust_out, 12345)
+    let ref_vcf = decompress_vcf_for_rust(&source.ref_vcf, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&source.target_sparse_vcf, work_dir.path());
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345)
         .expect("Rust imputation failed");
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
     let (_, rust_records) = parse_vcf(&rust_vcf);

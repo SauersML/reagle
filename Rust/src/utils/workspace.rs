@@ -9,10 +9,6 @@ use aligned_vec::{AVec, ConstAlign};
 /// Workspace for imputation HMM computations
 #[derive(Debug)]
 pub struct ImpWorkspace {
-    /// Forward probabilities
-    pub fwd: AVec<f32, ConstAlign<32>>,
-    /// Backward probabilities
-    pub bwd: AVec<f32, ConstAlign<32>>,
     // --- CSR Storage for Mismatches ---
     // --- CSR Storage for Log-Likelihood Differences ---
     /// Non-zero difference values (log_mismatch - log_match) or (-log_match for missing ref)
@@ -39,8 +35,6 @@ impl ImpWorkspace {
     /// Create a new imputation workspace
     pub fn new(n_states: usize) -> Self {
         Self {
-            fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
-            bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
             diff_vals: Vec::new(),
             diff_cols: Vec::new(),
             diff_row_offsets: vec![0],
