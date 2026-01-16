@@ -1161,7 +1161,9 @@ def stage_prepare():
         paths['ref_vcf'].unlink(missing_ok=True)
         Path(str(paths['ref_vcf']) + ".csi").unlink(missing_ok=True)
         run(f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
-    ensure_index(paths['ref_vcf'], recreate_cmd=f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
+        run(f"bcftools index -f {paths['ref_vcf']}")
+    if not has_index(paths['ref_vcf']):
+        ensure_index(paths['ref_vcf'], recreate_cmd=f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
 
     # Create truth (test samples, full density)
     if not validate_vcf(paths['truth_vcf']) or not has_vcf_records(paths['truth_vcf']):
@@ -1169,7 +1171,9 @@ def stage_prepare():
         paths['truth_vcf'].unlink(missing_ok=True)
         Path(str(paths['truth_vcf']) + ".csi").unlink(missing_ok=True)
         run(f"bcftools view -S {test_file} {paths['chr22_vcf']} -O z -o {paths['truth_vcf']}")
-    ensure_index(paths['truth_vcf'], recreate_cmd=f"bcftools view -S {test_file} {paths['chr22_vcf']} -O z -o {paths['truth_vcf']}")
+        run(f"bcftools index -f {paths['truth_vcf']}")
+    if not has_index(paths['truth_vcf']):
+        ensure_index(paths['truth_vcf'], recreate_cmd=f"bcftools view -S {test_file} {paths['chr22_vcf']} -O z -o {paths['truth_vcf']}")
 
     # Create input (test samples, downsampled to GSA sites, UNPHASED)
     # We unphase the input so switch error rate measures TRUE phasing accuracy
@@ -1185,10 +1189,12 @@ def stage_prepare():
         run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
         # Clean up temp file
         os.remove(tmp_phased)
-    ensure_index(
-        paths['input_vcf'],
-        recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased_path} && bcftools +setGT {tmp_phased_path} -O z -o {paths['input_vcf']} -- -t a -n u",
-    )
+        run(f"bcftools index -f {paths['input_vcf']}")
+    if not has_index(paths['input_vcf']):
+        ensure_index(
+            paths['input_vcf'],
+            recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased_path} && bcftools +setGT {tmp_phased_path} -O z -o {paths['input_vcf']} -- -t a -n u",
+        )
     if tmp_phased_path.exists():
         os.remove(tmp_phased_path)
 
