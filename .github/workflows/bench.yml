@@ -58,3 +58,57 @@ jobs:
           name: benchmark-results
           path: Rust/target/criterion
           retention-days: 30
+
+  profile:
+    name: Tracing Profile
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bcftools tabix curl
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            Rust/target
+          key: ${{ runner.os }}-cargo-profile-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-profile-
+
+      - name: Cache test data
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: Rust/tests/data/
+          key: test-data-hgdp1kg-chr22-v2
+
+      - name: Prepare test data
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        run: python3 tests/integration_test.py prepare
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run with tracing profile
+        run: |
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "                    TRACING PROFILE OUTPUT"
+          echo "═══════════════════════════════════════════════════════════════"
+          ./target/release/reagle \
+            --gt tests/data/input.vcf.gz \
+            --ref tests/data/ref.vcf.gz \
+            --out tests/data/profiled_output \
+            --profile
+          echo "═══════════════════════════════════════════════════════════════"
