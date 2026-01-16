@@ -745,6 +745,48 @@ impl WindowedBref3Reader {
 
 }
 
+/// Scan a reference file (BREF3 or VCF) to get all marker metadata without loading genotypes.
+pub fn scan_ref_markers(path: &Path, is_bref3: bool) -> Result<Markers> {
+    if is_bref3 {
+        let mut reader = StreamingBref3Reader::open(path)?;
+        let mut all_markers = Markers::new();
+        while let Some(block) = reader.next_block()? {
+            let chrom_name = reader.chrom_map.iter()
+                .find(|(_, &idx)| idx == block.markers.marker(crate::data::marker::MarkerIdx::new(0)).chrom)
+                .map(|(s, _)| s.clone())
+                .unwrap_or_else(|| ".".to_string());
+            let chrom_idx = all_markers.add_chrom(&chrom_name);
+            for m in 0..block.n_markers() {
+                let mut marker = block.markers.marker(crate::data::marker::MarkerIdx::new(m as u32)).clone();
+                marker.chrom = chrom_idx;
+                all_markers.push(marker);
+            }
+        }
+        Ok(all_markers)
+    } else {
+        // For VCF, we need to read the whole file, but we can be smart about it.
+        let (_reader, mut file) = crate::io::vcf::VcfReader::open(path)?;
+        let mut markers = Markers::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if file.read_line(&mut line)? == 0 { break; }
+            if line.starts_with('#') { continue; }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 5 { continue; }
+
+            let chrom_idx = markers.add_chrom(fields[0]);
+            let pos: u32 = fields[1].parse()?;
+            let id = if fields[2] == "." { None } else { Some(fields[2].into()) };
+            let ref_allele = Allele::from_str(fields[3]);
+            let alt_alleles: Vec<Allele> = fields[4].split(',').map(Allele::from_str).collect();
+            let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles);
+            markers.push(marker);
+        }
+        Ok(markers)
+    }
+}
+
 /// Unified reference panel reader that supports both BREF3 (streaming) and VCF (in-memory)
 pub enum RefPanelReader {
     /// Streaming BREF3 reader
