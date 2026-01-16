@@ -4,7 +4,7 @@
 //! Uses the `noodles` crate for VCF I/O.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -159,16 +159,59 @@ pub struct VcfReader {
 }
 
 impl VcfReader {
+    fn detect_bgzf(file: &mut File) -> Result<bool> {
+        let mut header = [0u8; 12];
+        let n = file.read(&mut header)?;
+        if n < 10 {
+            file.seek(SeekFrom::Start(0))?;
+            return Ok(false);
+        }
+        if header[0] != 0x1f || header[1] != 0x8b || header[2] != 0x08 {
+            file.seek(SeekFrom::Start(0))?;
+            return Ok(false);
+        }
+        let flg = header[3];
+        if flg & 0x04 == 0 {
+            file.seek(SeekFrom::Start(0))?;
+            return Ok(false);
+        }
+        if n < 12 {
+            file.seek(SeekFrom::Start(0))?;
+            return Ok(false);
+        }
+        let xlen = u16::from_le_bytes([header[10], header[11]]) as usize;
+        let mut extra = vec![0u8; xlen];
+        let extra_read = file.read(&mut extra)?;
+        file.seek(SeekFrom::Start(0))?;
+        if extra_read < 4 {
+            return Ok(false);
+        }
+        // BGZF extra subfield ID is "BC".
+        for i in 0..extra_read.saturating_sub(4) {
+            if extra[i] == b'B' && extra[i + 1] == b'C' {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Open a VCF file and read the header
     pub fn open(path: &Path) -> Result<(Self, Box<dyn BufRead + Send>)> {
         info_span!("vcf_open", path = ?path).in_scope(|| {
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
 
         // Check if gzipped
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let reader: Box<dyn BufRead + Send> = match ext {
             "bgz" | "bgzf" => Box::new(BufReader::new(bgzf_io::Reader::new(file))),
-            "gz" => Box::new(BufReader::new(GzDecoder::new(file))),
+            "gz" => {
+                let is_bgzf = Self::detect_bgzf(&mut file)?;
+                if is_bgzf {
+                    Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+                } else {
+                    Box::new(BufReader::new(GzDecoder::new(file)))
+                }
+            }
             _ => Box::new(BufReader::new(file)),
         };
 
