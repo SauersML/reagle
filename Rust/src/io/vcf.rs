@@ -698,10 +698,11 @@ fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     }
 
     // Parse GL values
-    let gls: Vec<f64> = gl_str
+    let mut gls: Vec<f64> = gl_str
         .split(',')
         .filter_map(|s| s.parse().ok())
         .collect();
+    gls.retain(|v| v.is_finite());
 
     // Need at least 3 values for diploid biallelic
     if gls.len() < 3 {
@@ -728,9 +729,15 @@ fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
 
     // Get the GL for the called genotype
     let called_gl = gls[gt_idx];
+    if !called_gl.is_finite() {
+        return None;
+    }
 
     // Find max GL
     let max_gl = gls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if !max_gl.is_finite() {
+        return None;
+    }
 
     // If called genotype has max GL, compute confidence based on gap to second-best
     // If called genotype doesn't have max GL, confidence is low
@@ -747,7 +754,7 @@ fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     };
 
     // Check if called genotype is the most likely
-    let is_best_call = (called_gl - max_gl).abs() < 0.001;
+    let is_best_call = (called_gl - max_gl).abs() < 1e-4;
 
     // Compute confidence:
     // - Uniform GLs (gap ≈ 0) -> VERY low confidence (call is random)
