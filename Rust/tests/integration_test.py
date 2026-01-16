@@ -151,6 +151,30 @@ def get_chrom_bounds(vcf_path, chrom):
         return None
     return (min_pos, max_pos)
 
+def count_chrom_markers(vcf_path, chrom):
+    """Return number of markers for chrom in VCF/VCF.GZ."""
+    chrom_str = str(chrom)
+    chrom_options = {chrom_str, f"chr{chrom_str}"}
+    if chrom_str.startswith("chr"):
+        chrom_options.add(chrom_str[3:])
+    if str(vcf_path).endswith(".bcf"):
+        return None
+    n = 0
+    try:
+        with _open_maybe_gzip(vcf_path) as handle:
+            for line in handle:
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2:
+                    continue
+                if fields[0] in chrom_options:
+                    n += 1
+    except OSError:
+        return None
+    return n
+
+def find_chrom_label(vcf_path, chrom):
 def find_chrom_label(vcf_path, chrom):
     """Return the exact chromosome label found in the VCF for chrom."""
     chrom_str = str(chrom)
@@ -174,15 +198,45 @@ def find_chrom_label(vcf_path, chrom):
     return None
 
 def compute_profile_region(vcf_path, chrom, fraction=0.05):
-    """Return (region_str, min_pos, end_pos, chrom_label) for the first fraction of chrom."""
-    bounds = get_chrom_bounds(vcf_path, chrom)
-    if not bounds:
-        return None
-    min_pos, max_pos = bounds
-    span = max_pos - min_pos + 1
-    cut = max(1, int(span * fraction))
-    end_pos = min_pos + cut - 1
+    """Return (region_str, min_pos, end_pos, chrom_label) for the first fraction of markers."""
     chrom_label = find_chrom_label(vcf_path, chrom) or f"chr{chrom}"
+    total = count_chrom_markers(vcf_path, chrom)
+    if not total:
+        return None
+    cutoff = max(1, int(total * fraction))
+    chrom_str = str(chrom)
+    chrom_options = {chrom_str, f"chr{chrom_str}"}
+    if chrom_str.startswith("chr"):
+        chrom_options.add(chrom_str[3:])
+    if str(vcf_path).endswith(".bcf"):
+        return None
+    min_pos = None
+    end_pos = None
+    seen = 0
+    try:
+        with _open_maybe_gzip(vcf_path) as handle:
+            for line in handle:
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2:
+                    continue
+                if fields[0] not in chrom_options:
+                    continue
+                try:
+                    pos = int(fields[1])
+                except ValueError:
+                    continue
+                if min_pos is None:
+                    min_pos = pos
+                seen += 1
+                if seen >= cutoff:
+                    end_pos = pos
+                    break
+    except OSError:
+        return None
+    if min_pos is None or end_pos is None:
+        return None
     return f"{chrom_label}:{min_pos}-{end_pos}", min_pos, end_pos, chrom_label
 
 
@@ -1333,7 +1387,24 @@ def stage_prepare_profile():
     for chrom, pos in gsa_sites:
         if min_pos <= pos <= end_pos:
             filtered_sites.add((chrom_label, pos))
-    print(f"Filtered GSA sites in region: {len(filtered_sites)}")
+
+    # Intersect with markers present in trimmed VCF to guarantee overlap
+    present_sites = set()
+    with _open_maybe_gzip(trimmed_vcf) as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            present_sites.add((fields[0], pos))
+
+    filtered_sites = {site for site in filtered_sites if site in present_sites}
+    print(f"Filtered GSA sites in region (present in VCF): {len(filtered_sites)}")
 
     # Download Beagle
     download_if_missing(
@@ -1372,15 +1443,11 @@ def stage_prepare_profile():
 
     # Create input (test samples, downsampled to GSA sites, UNPHASED)
     tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
+    if not filtered_sites:
+        raise RuntimeError("Profiling region contains no GSA sites present in VCF; increase subset size.")
     if not validate_vcf(paths['input_vcf']) or not has_vcf_records(paths['input_vcf']):
-        if filtered_sites:
-            print("Downsampling to GSA sites and unphasing...")
-            create_regions_file(filtered_sites, str(paths['gsa_regions']))
-        else:
-            print("No GSA sites in profiling region; using first 5000 markers from trimmed VCF.")
-            run(
-                f"bcftools query -f '%CHROM\\t%POS\\n' {trimmed_vcf} | head -n 5000 > {paths['gsa_regions']}"
-            )
+        print("Downsampling to GSA sites and unphasing...")
+        create_regions_file(filtered_sites, str(paths['gsa_regions']))
         tmp_phased = str(tmp_phased_path)
         run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
         run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
