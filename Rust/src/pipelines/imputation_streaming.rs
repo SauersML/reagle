@@ -27,6 +27,56 @@ use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::pbwt::PbwtState;
 use crate::utils::workspace::ImpWorkspace;
 
+fn push_unique(dst: &mut Vec<String>, value: String) {
+    if !dst.iter().any(|v| v == &value) {
+        dst.push(value);
+    }
+}
+
+fn chrom_variants(chrom: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    push_unique(&mut candidates, chrom.to_string());
+    let lower = chrom.to_ascii_lowercase();
+    if lower.starts_with("chr") && chrom.len() >= 3 {
+        let stripped = chrom[3..].to_string();
+        if !stripped.is_empty() {
+            push_unique(&mut candidates, stripped.clone());
+            push_unique(&mut candidates, format!("chr{}", stripped));
+            push_unique(&mut candidates, format!("CHR{}", stripped));
+        }
+    } else {
+        push_unique(&mut candidates, format!("chr{}", chrom));
+        push_unique(&mut candidates, format!("CHR{}", chrom));
+    }
+    candidates
+}
+
+fn resolve_chrom_candidates(
+    target_chrom: &str,
+    names: Option<&[Arc<str>]>,
+) -> Vec<String> {
+    let variants = chrom_variants(target_chrom);
+    let Some(names) = names else {
+        return variants;
+    };
+
+    let mut resolved = Vec::new();
+    for cand in variants {
+        if names.iter().any(|n| n.as_ref() == cand) {
+            push_unique(&mut resolved, cand);
+            continue;
+        }
+        let cand_lower = cand.to_ascii_lowercase();
+        if let Some(actual) = names
+            .iter()
+            .find(|n| n.as_ref().to_ascii_lowercase() == cand_lower)
+        {
+            push_unique(&mut resolved, actual.as_ref().to_string());
+        }
+    }
+    resolved
+}
+
 /// Payload passed from Phasing (Producer) to Imputation (Consumer)
 struct StreamingPayload {
     phased_target: GenotypeMatrix<Phased>,
@@ -428,38 +478,8 @@ impl crate::pipelines::ImputationPipeline {
                     .markers()
                     .chrom_name(window_chrom_idx)
                     .ok_or_else(|| anyhow::anyhow!("Invalid target chromosome index"))?;
-                let (chrom_candidates, chrom_names) = {
-                    let names = ref_reader.chrom_names();
-                    if let Some(names) = names {
-                        let mut candidates = Vec::new();
-                        if names.iter().any(|c| c.as_ref() == target_chrom) {
-                            candidates.push(target_chrom.to_string());
-                        } else if let Some(stripped) = target_chrom.strip_prefix("chr") {
-                            if names.iter().any(|c| c.as_ref() == stripped) {
-                                candidates.push(stripped.to_string());
-                            }
-                        } else {
-                            let with_chr = format!("chr{}", target_chrom);
-                            if names.iter().any(|c| c.as_ref() == with_chr) {
-                                candidates.push(with_chr);
-                            }
-                        }
-                        (candidates, Some(names))
-                    } else {
-                        let mut candidates = Vec::new();
-                        candidates.push(target_chrom.to_string());
-                        if let Some(stripped) = target_chrom.strip_prefix("chr") {
-                            if stripped != target_chrom {
-                                candidates.push(stripped.to_string());
-                            }
-                        } else {
-                            let with_chr = format!("chr{}", target_chrom);
-                            candidates.push(with_chr);
-                        }
-                        candidates.dedup();
-                        (candidates, None)
-                    }
-                };
+                let chrom_names = ref_reader.chrom_names();
+                let chrom_candidates = resolve_chrom_candidates(target_chrom, chrom_names);
                 if chrom_candidates.is_empty() {
                     let names = chrom_names
                         .map(|n| n.iter().map(|c| c.as_ref()).collect::<Vec<_>>().join(", "))
@@ -519,10 +539,11 @@ impl crate::pipelines::ImputationPipeline {
                     Some(w) => w,
                     None => {
                         return Err(anyhow::anyhow!(
-                            "No reference markers in region for chrom {} ({}..{})",
+                            "No reference markers in region for chrom {} ({}..{}); tried: {}",
                             window_chrom,
                             start_pos,
-                            end_pos
+                            end_pos,
+                            chrom_candidates.join(", ")
                         )
                         .into());
                     }
