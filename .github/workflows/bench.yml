@@ -35,8 +35,8 @@ jobs:
           path: Rust/tests/data/
           key: test-data-hgdp1kg-chr22-v2
 
-      - name: Prepare test data
-        run: python3 tests/integration_test.py prepare
+      - name: Prepare test data (profiling subset)
+        run: python3 tests/integration_test.py prepare-profile
 
       - name: Upload profiling test data
         uses: actions/upload-artifact@v4
