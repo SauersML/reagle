@@ -332,6 +332,8 @@ impl StreamingVcfReader {
             .collect();
 
         let samples = Arc::new(Samples::from_ids(sample_names));
+        let header_samples = samples.len();
+        let header_lines = header_str.lines().count();
 
         let mut reader = Self {
             reader,
@@ -348,7 +350,12 @@ impl StreamingVcfReader {
             all_phased: true,
         };
 
-        reader.prefetch_first_marker()?;
+        if let Err(e) = reader.prefetch_first_marker() {
+            return Err(ReagleError::vcf(format!(
+                "{} (header_lines={}, header_samples={})",
+                e, header_lines, header_samples
+            )));
+        }
 
         Ok(reader)
         })

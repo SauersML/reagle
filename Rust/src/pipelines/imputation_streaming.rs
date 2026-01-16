@@ -316,6 +316,7 @@ impl crate::pipelines::ImputationPipeline {
             gen_maps.clone(),
             streaming_config.clone(),
         )?;
+        let target_bytes = std::fs::metadata(&self.config.gt).map(|m| m.len()).unwrap_or(0);
         let target_samples = target_reader.samples_arc();
         let n_target_samples = target_samples.len();
         let n_target_haps = n_target_samples * 2;
@@ -347,8 +348,9 @@ impl crate::pipelines::ImputationPipeline {
         self.params.set_n_states(self.config.imp_states.min(n_ref_haps));
 
         eprintln!(
-            "Streaming imputation: {} ref haplotypes, {} target samples",
+            "Streaming imputation: {} ref haplotypes, {} target samples (target_bytes={})",
             n_ref_haps, n_target_samples
+            , target_bytes
         );
 
         // Create output writer
