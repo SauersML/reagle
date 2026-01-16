@@ -49,6 +49,45 @@ def run(cmd, check=True, capture=False):
     return result
 
 
+def validate_vcf(path):
+    """Return True if bcftools can read the VCF/BCF header."""
+    if not Path(path).exists():
+        return False
+    result = subprocess.run(
+        f"bcftools view -h {path}",
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    stderr = result.stderr or ""
+    if "No BGZF EOF marker" in stderr or "Failed to read BGZF block" in stderr:
+        return False
+    return True
+
+
+def has_index(path):
+    return Path(str(path) + ".csi").exists() or Path(str(path) + ".tbi").exists()
+
+
+def ensure_index(path, recreate_cmd=None):
+    """Ensure a CSI/TBI index exists; optionally recreate file on failure."""
+    if has_index(path):
+        return True
+    result = run(f"bcftools index -f {path}", check=False, capture=True)
+    if result.returncode == 0:
+        return True
+    if recreate_cmd:
+        Path(path).unlink(missing_ok=True)
+        Path(str(path) + ".csi").unlink(missing_ok=True)
+        Path(str(path) + ".tbi").unlink(missing_ok=True)
+        run(recreate_cmd)
+        run(f"bcftools index -f {path}")
+        return True
+    return False
+
+
 def _open_maybe_gzip(path):
     if str(path).endswith(".gz"):
         return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
@@ -1055,10 +1094,25 @@ def stage_prepare():
     )
 
     # Convert BCF to VCF.gz for Java Beagle compatibility
-    if not paths['chr22_vcf'].exists():
+    if not validate_vcf(paths['chr22_bcf']):
+        print("ERROR: Cached BCF appears corrupted. Re-downloading...")
+        paths['chr22_bcf'].unlink(missing_ok=True)
+        Path(str(paths['chr22_bcf']) + ".csi").unlink(missing_ok=True)
+        download_if_missing(
+            "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf",
+            str(paths['chr22_bcf'])
+        )
+        download_if_missing(
+            "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf.csi",
+            str(paths['chr22_bcf']) + ".csi"
+        )
+
+    if not validate_vcf(paths['chr22_vcf']):
         print("Converting BCF to VCF.gz...")
+        paths['chr22_vcf'].unlink(missing_ok=True)
+        Path(str(paths['chr22_vcf']) + ".csi").unlink(missing_ok=True)
         run(f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
-        run(f"bcftools index -f {paths['chr22_vcf']}")
+    ensure_index(paths['chr22_vcf'], recreate_cmd=f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
 
     # Download GSA sites
     print("\n" + "=" * 60)
@@ -1089,31 +1143,41 @@ def stage_prepare():
     )
 
     # Create reference panel (train samples)
-    if not paths['ref_vcf'].exists():
+    if not validate_vcf(paths['ref_vcf']):
         print("Creating reference panel...")
+        paths['ref_vcf'].unlink(missing_ok=True)
+        Path(str(paths['ref_vcf']) + ".csi").unlink(missing_ok=True)
         run(f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
-        run(f"bcftools index -f {paths['ref_vcf']}")
+    ensure_index(paths['ref_vcf'], recreate_cmd=f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
 
     # Create truth (test samples, full density)
-    if not paths['truth_vcf'].exists():
+    if not validate_vcf(paths['truth_vcf']):
         print("Creating truth VCF...")
+        paths['truth_vcf'].unlink(missing_ok=True)
+        Path(str(paths['truth_vcf']) + ".csi").unlink(missing_ok=True)
         run(f"bcftools view -S {test_file} {paths['chr22_vcf']} -O z -o {paths['truth_vcf']}")
-        run(f"bcftools index -f {paths['truth_vcf']}")
+    ensure_index(paths['truth_vcf'], recreate_cmd=f"bcftools view -S {test_file} {paths['chr22_vcf']} -O z -o {paths['truth_vcf']}")
 
     # Create input (test samples, downsampled to GSA sites, UNPHASED)
     # We unphase the input so switch error rate measures TRUE phasing accuracy
-    if not paths['input_vcf'].exists():
+    tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
+    if not validate_vcf(paths['input_vcf']):
         print("Downsampling to GSA sites and unphasing...")
         create_regions_file(gsa_sites, str(paths['gsa_regions']))
         # Two-step process: downsample, then unphase
-        tmp_phased = str(paths['data_dir'] / "input_phased_tmp.vcf.gz")
+        tmp_phased = str(tmp_phased_path)
         run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
         # Unphase: convert 0|1 to 0/1 using bcftools +setGT
         # The plugin sets genotypes to unphased while preserving allele values
         run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
-        run(f"bcftools index -f {paths['input_vcf']}")
         # Clean up temp file
         os.remove(tmp_phased)
+    ensure_index(
+        paths['input_vcf'],
+        recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased_path} && bcftools +setGT {tmp_phased_path} -O z -o {paths['input_vcf']} -- -t a -n u",
+    )
+    if tmp_phased_path.exists():
+        os.remove(tmp_phased_path)
 
     # Count variants
     n_truth = run(f"bcftools view -H {paths['truth_vcf']} | wc -l", capture=True).stdout.strip()
