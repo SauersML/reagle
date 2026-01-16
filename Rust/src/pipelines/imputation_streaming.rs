@@ -403,16 +403,35 @@ impl crate::pipelines::ImputationPipeline {
             while let Some(target_window) = target_reader.next_window()? {
                 window_count += 1;
                 let n_markers = target_window.genotypes.n_markers();
+                let window_start_pos = target_window.genotypes.marker(MarkerIdx::new(0)).pos;
+                let window_end_pos = target_window
+                    .genotypes
+                    .marker(MarkerIdx::new((n_markers - 1) as u32))
+                    .pos;
+                let _phase_span = if pipeline.config.profile {
+                    Some(
+                        info_span!(
+                            "phasing_window",
+                            window = window_count,
+                            markers = n_markers,
+                            start_pos = window_start_pos,
+                            end_pos = window_end_pos
+                        )
+                        .entered(),
+                    )
+                } else {
+                    None
+                };
 
                 eprintln!(
                     "  Phasing Window {} ({} markers, pos {}..{})",
                     window_count, n_markers,
-                    target_window.genotypes.marker(MarkerIdx::new(0)).pos,
-                    target_window.genotypes.marker(MarkerIdx::new((n_markers - 1) as u32)).pos
+                    window_start_pos,
+                    window_end_pos
                 );
 
-                let start_pos = target_window.genotypes.marker(MarkerIdx::new(0)).pos;
-                let end_pos = target_window.genotypes.marker(MarkerIdx::new((n_markers - 1) as u32)).pos;
+                let start_pos = window_start_pos;
+                let end_pos = window_end_pos;
                 
                 let ref_window = match ref_reader.load_window_for_region(start_pos, end_pos)? {
                     Some(w) => w,
@@ -488,6 +507,12 @@ impl crate::pipelines::ImputationPipeline {
                     break; // Consumer hung up
                 }
             }
+            if window_count == 0 {
+                return Err(ReagleError::vcf(
+                    "No target markers read; check input VCF GT field and chromosome naming.",
+                ));
+            }
+
             Ok(())
         });
 
@@ -593,8 +618,16 @@ impl crate::pipelines::ImputationPipeline {
         writer.flush()?;
         
         // Check producer result
-        if let Err(e) = producer_handle.join() {
-            std::panic::resume_unwind(e);
+        match producer_handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => std::panic::resume_unwind(e),
+        }
+
+        if total_markers == 0 {
+            return Err(ReagleError::vcf(
+                "No markers imputed; check reference/target overlap and region selection.",
+            ));
         }
 
         eprintln!("Streaming imputation complete: {} markers", total_markers);
@@ -682,6 +715,21 @@ impl crate::pipelines::ImputationPipeline {
         output_start: usize,
         output_end: usize,
     ) -> Result<Option<Vec<HaplotypePriors>>> {
+        let _window_span = if self.config.profile {
+            Some(
+                info_span!(
+                    "imputation_window_compute",
+                    ref_markers = ref_win.n_markers(),
+                    target_markers = target_win.n_markers(),
+                    output_start,
+                    output_end
+                )
+                .entered(),
+            )
+        } else {
+            None
+        };
+
         // Thread-local workspace - must be defined inside the parallel context
         thread_local! {
             static LOCAL_WORKSPACE: std::cell::RefCell<Option<ImpWorkspace>> =
@@ -790,15 +838,30 @@ impl crate::pipelines::ImputationPipeline {
             let batch_samples: Vec<usize> = (batch_start..batch_end).collect();
 
             let pbwt_states = self.params.n_states.min(n_ref_haps);
-            let batch_neighbors = self.build_pbwt_hap_indices_for_batch(
-                target_win,
-                ref_win,
-                alignment,
-                &ref_is_biallelic,
-                &cluster_bounds,
-                pbwt_states,
-                &batch_samples,
-            );
+            let batch_neighbors = {
+                let _pbwt_span = if self.config.profile {
+                    Some(
+                        info_span!(
+                            "pbwt_neighbor_batch",
+                            batch = batch_idx,
+                            batch_size = batch_samples.len(),
+                            n_states = pbwt_states
+                        )
+                        .entered(),
+                    )
+                } else {
+                    None
+                };
+                self.build_pbwt_hap_indices_for_batch(
+                    target_win,
+                    ref_win,
+                    alignment,
+                    &ref_is_biallelic,
+                    &cluster_bounds,
+                    pbwt_states,
+                    &batch_samples,
+                )
+            };
 
             let batch_results: Vec<SampleImputationResult> = batch_samples
                 .par_iter()
