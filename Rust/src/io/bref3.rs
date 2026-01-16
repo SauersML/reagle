@@ -808,6 +808,13 @@ pub enum RefPanelReader {
 }
 
 impl RefPanelReader {
+    pub fn chrom_names(&self) -> Option<&[Arc<str>]> {
+        match self {
+            RefPanelReader::InMemory(r) => Some(r.chrom_names()),
+            RefPanelReader::Bref3(_) | RefPanelReader::StreamingVcf(_) => None,
+        }
+    }
+
     /// Load reference window for a specific genomic region
     pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         match self {
@@ -921,7 +928,7 @@ impl InMemoryRefReader {
             output_start = 0;
         }
         if is_last {
-            output_end = self.genotypes.n_markers();
+            output_end = markers.len();
         }
 
         let genotypes = GenotypeMatrix::new_phased(markers, columns, self.genotypes.samples_arc());
