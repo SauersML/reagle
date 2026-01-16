@@ -841,20 +841,6 @@ impl crate::pipelines::ImputationPipeline {
                             let hap_indices = &hap1_indices;
                             let actual_n_states = pbwt_states;
 
-                            let prior_probs = imp_overlap
-                                .and_then(|overlap| overlap.hap_priors())
-                                .and_then(|priors| priors.get(hap1_idx.as_usize()))
-                                .filter(|priors| !priors.is_empty())
-                                .map(|priors| {
-                                    let mut prior_probs = Vec::new();
-                                    if let Some(first_cluster) = hap_indices.get(0) {
-                                        for &hap in first_cluster.iter().take(actual_n_states) {
-                                            prior_probs.push(priors.prior(hap, actual_n_states));
-                                        }
-                                    }
-                                    prior_probs
-                                });
-
                         let state_probs = compute_state_probs(
                             &hap_indices,
                             &cluster_bounds,
@@ -874,7 +860,6 @@ impl crate::pipelines::ImputationPipeline {
                                 marker_cluster.clone(),
                                 ref_cluster_end.clone(),
                                 cluster_weights.clone(),
-                                prior_probs.as_deref(),
                             );
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
@@ -916,20 +901,6 @@ impl crate::pipelines::ImputationPipeline {
                             let hap_indices = &hap2_indices;
                             let actual_n_states = pbwt_states;
 
-                            let prior_probs = imp_overlap
-                                .and_then(|overlap| overlap.hap_priors())
-                                .and_then(|priors| priors.get(hap2_idx.as_usize()))
-                                .filter(|priors| !priors.is_empty())
-                                .map(|priors| {
-                                    let mut prior_probs = Vec::new();
-                                    if let Some(first_cluster) = hap_indices.get(0) {
-                                        for &hap in first_cluster.iter().take(actual_n_states) {
-                                            prior_probs.push(priors.prior(hap, actual_n_states));
-                                        }
-                                    }
-                                    prior_probs
-                                });
-
                         let state_probs = compute_state_probs(
                             &hap_indices,
                             &cluster_bounds,
@@ -949,7 +920,6 @@ impl crate::pipelines::ImputationPipeline {
                                 marker_cluster.clone(),
                                 ref_cluster_end.clone(),
                                 cluster_weights.clone(),
-                                prior_probs.as_deref(),
                             );
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
@@ -1189,48 +1159,10 @@ impl crate::pipelines::ImputationPipeline {
             } else {
                 (0.0, 0.0)
             };
-            if let Some(target_m) = alignment.target_marker(marker_idx) {
-                let h1 = HapIdx::new((sample_idx * 2) as u32);
-                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    p1 + p2
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    let sum = q00 + q01 + q11;
-                    if sum > 0.0 {
-                        let inv_sum = 1.0 / sum;
-                        let q01n = q01 * inv_sum;
-                        let q11n = q11 * inv_sum;
-                        q01n + 2.0 * q11n
-                    } else {
-                        p1 + p2
-                    }
-                }
-            } else {
-                if let Some((dosages, _)) = sample_data.get(&sample_idx) {
-                    dosages.get(local_m).copied().unwrap_or(p1 + p2)
-                } else {
-                    p1 + p2
-                }
-            }
+            // For both genotyped and imputed markers, dosage is the sum of posterior ALT probabilities
+            // from the HMM. The previous logic had a complex Bayesian update for genotyped markers
+            // that deviated from the Java reference and caused significant errors.
+            p1 + p2
         };
 
         // Closure to get best genotype

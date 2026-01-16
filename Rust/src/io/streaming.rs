@@ -94,17 +94,6 @@ impl HaplotypePriors {
         }
     }
 
-    /// Get prior probability for a haplotype.
-    /// Returns uniform prior (1/n_states) if haplotype not seen in previous window.
-    /// Uses binary search for O(log K) lookup with good cache locality.
-    #[inline]
-    pub fn prior(&self, hap_id: u32, n_states: usize) -> f32 {
-        match self.hap_ids.binary_search(&hap_id) {
-            Ok(idx) => self.probs[idx],
-            Err(_) => 1.0 / n_states.max(1) as f32,
-        }
-    }
-
     /// Set priors from HMM state posteriors at window boundary.
     /// Uses an adaptive threshold to avoid discarding most mass at high state counts.
     /// Sorts by hap_id for efficient binary search lookup.

@@ -170,10 +170,13 @@ pub fn compute_cluster_mismatches_into_workspace(
             let partner_allele = partner_alleles
                 .map(|p| p[target_m])
                 .unwrap_or(255);
-            let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
+            let mut confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
             if confidence <= 0.0 {
                 continue;
             }
+            // For genotyped markers, force confidence to 1.0 to match Java Beagle's hard-call model.
+            // The GL-based confidence model is a refinement that deviates from the reference behavior.
+            confidence = 1.0;
             
             let (log_match, log_mism) = get_log_probs(confidence, p_err);
             let log_diff = log_mism - log_match;
@@ -267,7 +270,6 @@ pub fn run_hmm_forward_backward_to_sparse(
     p_recomb: &[f32],
     n_states: usize,
     hap_indices_input: &[Vec<u32>],
-    prior_probs: Option<&[f32]>,
     threshold: f32,
     fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
@@ -308,22 +310,10 @@ pub fn run_hmm_forward_backward_to_sparse(
         let base_emit = cluster_base_scores[m].max(LOG_EMIT_FLOOR).exp();
 
         if m == 0 {
-            if let Some(priors) = prior_probs {
-                let mut sum = 0.0f32;
-                for k in 0..n_states {
-                    let prior = priors.get(k).copied().unwrap_or(1.0 / n_states as f32);
-                    let val = base_emit * prior;
-                    fwd[curr_off + k] = val;
-                    sum += val;
-                }
-                if sum <= 0.0 {
-                    let val = base_emit / n_states as f32;
-                    fwd[curr_off..curr_off+n_states].fill(val);
-                }
-            } else {
-                let val = base_emit / n_states as f32;
-                fwd[curr_off..curr_off+n_states].fill(val);
-            }
+            // Non-standard HMM initialization to match legacy Java Beagle.
+            // The forward probability is set directly to the emission probability,
+            // without scaling by the uniform state probability (1.0 / n_states).
+            fwd[curr_off..curr_off + n_states].fill(base_emit);
         } else {
             let (lower, upper) = fwd.split_at_mut(prev_base);
             let (curr_slice, prev_slice) = if m % 2 == 0 {
@@ -633,7 +623,6 @@ pub fn compute_state_probs(
     marker_cluster: Arc<Vec<usize>>,
     ref_cluster_end: Arc<Vec<usize>>,
     cluster_weights: Arc<Vec<f32>>,
-    prior_probs: Option<&[f32]>,
 ) -> Arc<ClusterStateProbs> {
     let n_clusters = cluster_bounds.len();
     workspace.reset_and_ensure_capacity(n_clusters, n_states);
@@ -670,7 +659,6 @@ pub fn compute_state_probs(
             cluster_p_recomb,
             n_states,
             hap_indices,
-            prior_probs,
             threshold,
             &mut workspace.fwd,
             &mut workspace.bwd,
