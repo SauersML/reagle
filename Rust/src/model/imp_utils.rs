@@ -52,53 +52,6 @@ pub fn compute_marker_clusters(
     clusters
 }
 
-pub fn compute_marker_clusters_with_blocks(
-    genotyped_markers: &[usize],
-    gen_positions: &[f64],
-    cluster_dist: f64,
-    block_end: &[usize],
-) -> Vec<MarkerCluster> {
-    if genotyped_markers.is_empty() {
-        return Vec::new();
-    }
-
-    let mut clusters = Vec::new();
-    let mut block_start = 0usize;
-    let mut block_end_iter = block_end.iter().copied().filter(|&v| v > 0);
-
-    while let Some(block_end_idx) = block_end_iter.next() {
-        if block_end_idx <= block_start {
-            continue;
-        }
-        let mut cluster_start = block_start;
-        let mut start_pos = gen_positions[genotyped_markers[cluster_start]];
-
-        for m in (cluster_start + 1)..block_end_idx {
-            let pos = gen_positions[genotyped_markers[m]];
-            if pos - start_pos > cluster_dist {
-                clusters.push(MarkerCluster {
-                    start: cluster_start,
-                    end: m,
-                });
-                cluster_start = m;
-                start_pos = pos;
-            }
-        }
-
-        clusters.push(MarkerCluster {
-            start: cluster_start,
-            end: block_end_idx,
-        });
-        block_start = block_end_idx;
-    }
-
-    if clusters.is_empty() {
-        compute_marker_clusters(genotyped_markers, gen_positions, cluster_dist)
-    } else {
-        clusters
-    }
-}
-
 pub fn compute_ref_cluster_bounds(
     genotyped_markers: &[usize],
     clusters: &[MarkerCluster],
@@ -178,7 +131,11 @@ pub fn compute_cluster_mismatches_into_workspace(
     target_gt: &GenotypeMatrix<Phased>,
     ref_gt: &GenotypeMatrix<Phased>,
     alignment: &MarkerAlignment,
-    targ_hap: usize,
+    geno_a1: &[u8],
+    geno_a2: &[u8],
+    targ_alleles: &[u8],
+    partner_alleles: Option<&[u8]>,
+    sample_idx: usize,
     n_states: usize,
     workspace: &mut ImpWorkspace,
     base_err_rate: f32,
@@ -186,8 +143,6 @@ pub fn compute_cluster_mismatches_into_workspace(
     workspace.reset_and_ensure_capacity(hap_indices.len(), n_states);
 
     let n_clusters = hap_indices.len();
-    let targ_hap_idx = HapIdx::new(targ_hap as u32);
-    let sample_idx = targ_hap_idx.sample().as_usize();
     let p_err = base_err_rate.clamp(1e-8, 0.5);
 
     for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
@@ -206,10 +161,15 @@ pub fn compute_cluster_mismatches_into_workspace(
             let target_m = target_m_idx as usize;
 
             let target_marker_idx = MarkerIdx::new(target_m as u32);
-            let targ_allele = target_gt.allele(target_marker_idx, targ_hap_idx);
-            if targ_allele == 255 {
+            let geno1 = geno_a1[target_m];
+            let geno2 = geno_a2[target_m];
+            if geno1 == 255 || geno2 == 255 {
                 continue;
             }
+            let targ_allele = targ_alleles[target_m];
+            let partner_allele = partner_alleles
+                .map(|p| p[target_m])
+                .unwrap_or(255);
             let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
             if confidence <= 0.0 {
                 continue;
@@ -217,6 +177,8 @@ pub fn compute_cluster_mismatches_into_workspace(
             
             let (log_match, log_mism) = get_log_probs(confidence, p_err);
             let log_diff = log_mism - log_match;
+            let hard_log_mism = (1e-12f32).ln();
+            let hard_log_diff = hard_log_mism - log_match;
             
             cluster_base_score += log_match;
 
@@ -235,7 +197,22 @@ pub fn compute_cluster_mismatches_into_workspace(
 
                         if final_ref == 255 {
                             row_buffer[j] -= log_match;
-                        } else if final_ref != targ_allele {
+                        } else if partner_allele != 255 {
+                            let required = if partner_allele == geno1 {
+                                geno2
+                            } else if partner_allele == geno2 {
+                                geno1
+                            } else {
+                                255
+                            };
+                            if required != 255 {
+                                if final_ref != required {
+                                    row_buffer[j] += hard_log_diff;
+                                }
+                            } else if targ_allele != 255 && final_ref != targ_allele {
+                                row_buffer[j] += log_diff;
+                            }
+                        } else if targ_allele != 255 && final_ref != targ_allele {
                             row_buffer[j] += log_diff;
                         }
                     }
@@ -632,7 +609,11 @@ pub fn compute_state_probs(
     target_gt: &GenotypeMatrix<Phased>,
     ref_gt: &GenotypeMatrix<Phased>,
     alignment: &MarkerAlignment,
-    targ_hap: usize,
+    geno_a1: &[u8],
+    geno_a2: &[u8],
+    targ_alleles: &[u8],
+    partner_alleles: Option<&[u8]>,
+    sample_idx: usize,
     n_states: usize,
     workspace: &mut ImpWorkspace,
     base_err_rate: f32,
@@ -652,7 +633,11 @@ pub fn compute_state_probs(
         target_gt,
         ref_gt,
         alignment,
-        targ_hap,
+        geno_a1,
+        geno_a2,
+        targ_alleles,
+        partner_alleles,
+        sample_idx,
         n_states,
         workspace,
         base_err_rate,

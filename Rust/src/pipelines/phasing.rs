@@ -209,6 +209,12 @@ struct MosaicBuffers {
     fwd_block: Vec<f32>,
 }
 
+#[derive(Clone, Debug)]
+struct MosaicPaths {
+    path1: Vec<u32>,
+    path2: Vec<u32>,
+}
+
 struct MosaicChain<'a> {
     rng: rand::rngs::SmallRng,
     n_markers: usize,
@@ -749,6 +755,8 @@ impl PhasingPipeline {
         let confidence_by_sample = build_sample_confidence(&target_gt);
         let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample);
 
+        let mut mcmc_paths: Vec<Option<MosaicPaths>> = vec![None; n_samples];
+
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             let iter_type = if is_burnin { "burnin" } else { "main" };
@@ -771,6 +779,7 @@ impl PhasingPipeline {
                 &hi_freq_to_orig,
                 &ibs2,
                 &mut sample_phases,
+                &mut mcmc_paths,
                 atomic_estimates.as_ref(),
                 it,
             )?;
@@ -1046,6 +1055,7 @@ impl PhasingPipeline {
     ) -> Result<(GenotypeMatrix<crate::data::storage::phase_state::Phased>, Option<StateProbs>)> {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
+        let n_samples = n_haps / 2;
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
 
@@ -1112,6 +1122,8 @@ impl PhasingPipeline {
         let mut sample_phases =
             self.create_sample_phases_with_overlap(&geno, &missing_mask, overlap_markers, &confidence_by_sample);
 
+        let mut mcmc_paths: Vec<Option<MosaicPaths>> = vec![None; n_samples];
+
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
@@ -1130,6 +1142,7 @@ impl PhasingPipeline {
                 &p_recomb,
                 &gen_dists,
                 &ibs2,
+                &mut mcmc_paths,
                 atomic_estimates.as_ref(),
                 &confidence_by_sample,
                 None, // No PBWT state handoff for windowed phasing
@@ -1712,6 +1725,7 @@ impl PhasingPipeline {
         p_recomb: &[f32],
         gen_dists: &[f64],
         ibs2: &Ibs2,
+        mcmc_paths: &mut [Option<MosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
         pbwt_state: Option<&crate::model::pbwt::PbwtState>,
@@ -1730,7 +1744,7 @@ impl PhasingPipeline {
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
         // We use a scoped immutable borrow that ends before the swap phase.
-        let swap_masks: Vec<BitVec<u8, Lsb0>> = info_span!("build_composite_view").in_scope(|| {
+        let swap_results: Vec<(BitVec<u8, Lsb0>, Option<MosaicPaths>)> = info_span!("build_composite_view").in_scope(|| {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
 
@@ -1789,9 +1803,11 @@ impl PhasingPipeline {
                 }
             });
 
-            let mut swap_masks: Vec<BitVec<u8, Lsb0>> = vec![BitVec::repeat(false, n_markers); n_samples];
+            let prior_paths = &mcmc_paths[..];
+            let mut swap_results: Vec<(BitVec<u8, Lsb0>, Option<MosaicPaths>)> =
+                vec![(BitVec::repeat(false, n_markers), None); n_samples];
 
-            tracing::info_span!("hmm_samples").in_scope(|| swap_masks.par_iter_mut().enumerate().for_each(|(s, mask)| {
+            tracing::info_span!("hmm_samples").in_scope(|| swap_results.par_iter_mut().enumerate().for_each(|(s, (mask, paths_out))| {
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
                 let hap2 = sample_idx.hap2();
@@ -1850,7 +1866,7 @@ impl PhasingPipeline {
                 let p_err = self.params.p_mismatch;
                 let p_no_err = 1.0 - p_err;
 
-                let (swap_bits, swap_lr) = THREAD_WORKSPACE.with(|ws| {
+                let (swap_bits, swap_lr, new_paths) = THREAD_WORKSPACE.with(|ws| {
                     let mut workspace = ws.borrow_mut();
                     if workspace.is_none() {
                         *workspace = Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
@@ -1877,6 +1893,7 @@ impl PhasingPipeline {
                         &sample_conf,
                         &lookup,
                         &het_positions,
+                        prior_paths.get(s).and_then(|p| p.as_ref()),
                         sample_seed,
                         self.config.mcmc_burnin,
                         p_no_err,
@@ -1886,6 +1903,11 @@ impl PhasingPipeline {
                     ws.lookup = lookup.into_buffer();
                     result
                 });
+                if new_paths.path1.is_empty() {
+                    *paths_out = None;
+                } else {
+                    *paths_out = Some(new_paths);
+                }
                 assert!(swap_lr.len() <= n_markers);
                 let mut swapped = false;
                 let mut swap_idx = 0usize;
@@ -1900,18 +1922,23 @@ impl PhasingPipeline {
                 }
             }));
 
-            swap_masks
+            swap_results
         });  // ref_geno borrow ends here
 
         // Apply Swaps
         // After computing swap masks for all samples, apply them sequentially.
         // This is done sequentially because swap_haplotypes requires mutable access.
         info_span!("apply_swaps").in_scope(|| {
-            for (s, mask) in swap_masks.into_iter().enumerate() {
+            for (s, (mask, paths)) in swap_results.into_iter().enumerate() {
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
                 let hap2 = sample_idx.hap2();
                 geno.swap_haplotypes(hap1, hap2, &mask);
+                if let Some(paths) = paths {
+                    if let Some(slot) = mcmc_paths.get_mut(s) {
+                        *slot = Some(paths);
+                    }
+                }
             }
         });
 
@@ -1929,6 +1956,7 @@ impl PhasingPipeline {
         hi_freq_to_orig: &[usize],
         ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
+        mcmc_paths: &mut [Option<MosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
     ) -> Result<()> {
@@ -1940,7 +1968,7 @@ impl PhasingPipeline {
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
         // We use a scoped immutable borrow that ends before the apply phase.
-        type PhaseDecision = (Vec<bool>, Vec<(usize, f32)>);
+        type PhaseDecision = (Vec<bool>, Vec<(usize, f32)>, Option<MosaicPaths>);
         let phase_decisions: Vec<PhaseDecision> = {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
@@ -1994,6 +2022,7 @@ impl PhasingPipeline {
             // Returns: (swap_mask, het_lr_values) per sample where:
             //   - swap_mask[i] = true if the sampled phase orientation at marker i is swapped
             //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
+            let prior_paths = &mcmc_paths[..];
             sample_phases
                 .par_iter()
                 .enumerate()
@@ -2040,16 +2069,16 @@ impl PhasingPipeline {
 
                     if het_positions.is_empty() {
                         // No hets to phase: no swaps needed, no LR values
-                        return (vec![false; n_hi_freq], Vec::new());
+                        return (vec![false; n_hi_freq], Vec::new(), None);
                     }
 
                     let p_err = self.params.p_mismatch;
                     let p_no_err = 1.0 - p_err;
 
-                    let (swap_bits, swap_lr) = if self.config.dynamic_mcmc {
+                    let (swap_bits, swap_lr, new_paths) = if self.config.dynamic_mcmc {
                         // SHAPEIT5-style dynamic MCMC: re-select states each step
                         // Note: Dynamic MCMC doesn't use ThreadWorkspace yet
-                        sample_dynamic_mcmc(
+                        let (swap_bits, swap_lr) = sample_dynamic_mcmc(
                             n_hi_freq,
                             n_states,
                             stage1_p_recomb,
@@ -2064,7 +2093,8 @@ impl PhasingPipeline {
                             self.config.mcmc_steps,
                             p_no_err,
                             p_err,
-                        )
+                        );
+                        (swap_bits, swap_lr, None)
                     } else {
                         // Classic Beagle-style: static state space MCMC with thread-local workspace
                         THREAD_WORKSPACE.with(|ws| {
@@ -2094,6 +2124,7 @@ impl PhasingPipeline {
                                 &sample_conf,
                                 &lookup,
                                 &het_positions,
+                                prior_paths.get(s).and_then(|p| p.as_ref()),
                                 sample_seed,
                                 self.config.mcmc_burnin,
                                 p_no_err,
@@ -2101,7 +2132,7 @@ impl PhasingPipeline {
                                 ws,
                             );
                             ws.lookup = lookup.into_buffer();
-                            result
+                            (result.0, result.1, Some(result.2))
                         })
                     };
 
@@ -2122,7 +2153,7 @@ impl PhasingPipeline {
                         .zip(swap_lr.into_iter())
                         .collect();
 
-                    (swap_mask, het_lr_values)
+                    (swap_mask, het_lr_values, new_paths)
                 })
                 .collect()
         };  // ref_geno borrow ends here
@@ -2135,7 +2166,7 @@ impl PhasingPipeline {
         let is_burnin = iteration < self.config.burnin;
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, (swap_mask, het_lr_values)) in phase_decisions.into_iter().enumerate() {
+        for (s, (swap_mask, het_lr_values, new_paths)) in phase_decisions.into_iter().enumerate() {
             let sp = &mut sample_phases[s];
 
             // Apply swaps using the mask (correctly handles cumulative swap propagation)
@@ -2155,6 +2186,12 @@ impl PhasingPipeline {
                         sp.mark_phased(m);
                         total_phased += 1;
                     }
+                }
+            }
+
+            if let Some(paths) = new_paths {
+                if let Some(slot) = mcmc_paths.get_mut(s) {
+                    *slot = Some(paths);
                 }
             }
         }
@@ -3681,14 +3718,22 @@ fn sample_swap_bits_mosaic(
     conf: &[f32],
     lookup: &RefAlleleLookup,
     het_positions: &[usize],
+    initial_paths: Option<&MosaicPaths>,
     seed: u64,
     burnin: usize,
     p_no_err: f32,
     p_err: f32,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
-) -> (Vec<u8>, Vec<f32>) {
+) -> (Vec<u8>, Vec<f32>, MosaicPaths) {
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
-        return (Vec::new(), Vec::new());
+        return (
+            Vec::new(),
+            Vec::new(),
+            MosaicPaths {
+                path1: Vec::new(),
+                path2: Vec::new(),
+            },
+        );
     }
 
     // Resize workspace if needed for this window
@@ -3766,6 +3811,20 @@ fn sample_swap_bits_mosaic(
         p_err,
     );
 
+    if let Some(paths) = initial_paths {
+        let has_valid_lengths = paths.path1.len() == n_markers && paths.path2.len() == n_markers;
+        let has_valid_states = has_valid_lengths
+            && paths.path1.iter().all(|&p| (p as usize) < n_states)
+            && paths.path2.iter().all(|&p| (p as usize) < n_states);
+        if has_valid_states {
+            chain.path1.resize(n_markers, 0);
+            chain.path2.resize(n_markers, 0);
+            chain.path1.copy_from_slice(&paths.path1);
+            chain.path2.copy_from_slice(&paths.path2);
+            chain.first_iteration = false;
+        }
+    }
+
     // Burn-in: let the chain mix
     for _ in 0..burnin {
         chain.step();
@@ -3776,6 +3835,10 @@ fn sample_swap_bits_mosaic(
     // and always take exactly one.
     chain.step();
     let (path1, path2) = chain.paths();
+    let new_paths = MosaicPaths {
+        path1: path1.to_vec(),
+        path2: path2.to_vec(),
+    };
 
     // Determine swap decisions directly from the sampled paths
     let mut swap_bits = Vec::with_capacity(het_positions.len());
@@ -3839,7 +3902,7 @@ fn sample_swap_bits_mosaic(
     workspace.fwd_block = returned.fwd_block;
     workspace.combined_checkpoint_data = combined_checkpoints.into_buffer();
 
-    (swap_bits, swap_lr)
+    (swap_bits, swap_lr, new_paths)
 }
 
 

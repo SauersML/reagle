@@ -99,6 +99,7 @@ impl ThreadedHaps {
     /// Optimized with fast path: most calls don't cross segment boundaries,
     /// so we check the common case first before entering the advancement loop.
     #[inline]
+    #[cfg(test)]
     pub fn hap_at_raw(&mut self, state_idx: usize, marker: usize) -> u32 {
         let cur = self.state_cursors[state_idx] as usize;
 
@@ -115,6 +116,7 @@ impl ThreadedHaps {
     /// Slow path for cursor advancement (called when segment boundary crossed)
     #[cold]
     #[inline(never)]
+    #[cfg(test)]
     fn advance_cursor_slow(&mut self, state_idx: usize, mut cur: usize, marker: usize) -> u32 {
         loop {
             let next = self.segments_next[cur];
@@ -132,6 +134,7 @@ impl ThreadedHaps {
     }
 
     /// Reset cursors for all states (for new iteration pass)
+    #[cfg(test)]
     pub fn reset_cursors(&mut self) {
         self.state_cursors.copy_from_slice(&self.state_heads);
     }

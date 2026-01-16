@@ -14,8 +14,8 @@
 //! - Phasing: Uses PBWT (`PbwtPhaseIbs`)
 //! - Imputation: Uses Recursive Partitioning (`ImpIbs`)
 //!
-//! This Rust implementation uses PBWT for phasing, and (optionally) recursive
-//! partitioning for imputation to match the cluster-coded HMM observation model.
+//! This Rust implementation uses PBWT for both phasing and imputation to keep
+//! state selection accurate and memory-efficient.
 //!
 //! ### 1. Accuracy
 //! PBWT mathematically guarantees finding the longest common substring matches.
@@ -44,8 +44,6 @@
 
 pub mod hmm;
 pub mod ibs2;
-pub mod imp_ibs;
-pub mod imp_states_cluster;
 pub mod imp_utils;
 pub mod parameters;
 pub mod pbwt;

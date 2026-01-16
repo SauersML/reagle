@@ -20,8 +20,6 @@ use crate::io::bref3::RefPanelReader;
 use crate::io::streaming::{HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfWriter, ImputationQuality};
 use crate::pipelines::imputation::{AllelePosteriors, ClusterStateProbs};
-use crate::model::imp_ibs::{ClusterCodedSteps, ImpIbs};
-use crate::model::imp_states_cluster::ImpStatesCluster;
 use crate::model::imp_utils::*;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt_streaming::PbwtWavefront;
@@ -54,6 +52,171 @@ struct SampleImputationResult {
 }
 
 impl crate::pipelines::ImputationPipeline {
+    fn build_pbwt_hap_indices_for_sample(
+        &self,
+        target_win: &GenotypeMatrix<Phased>,
+        ref_win: &GenotypeMatrix<Phased>,
+        alignment: &MarkerAlignment,
+        cluster_midpoints: &[usize],
+        midpoint_to_cluster: &[usize],
+        n_states: usize,
+        sample_idx: usize,
+    ) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+        use std::collections::HashSet;
+
+        let n_ref_markers = ref_win.n_markers();
+        let n_ref_haps = ref_win.n_haplotypes();
+        let n_clusters = cluster_midpoints.len();
+
+        let hap1_idx = HapIdx::new((sample_idx * 2) as u32);
+        let hap2_idx = HapIdx::new((sample_idx * 2 + 1) as u32);
+
+        let n_total_haps = n_ref_haps + 2;
+        let mut wavefront = PbwtWavefront::new(n_total_haps, n_ref_markers);
+        let mut alleles = vec![0u8; n_total_haps];
+
+        let mut hap1_neighbors: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
+        let mut hap2_neighbors: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
+
+        let add_neighbors = |neighbors: &mut Vec<Vec<u32>>, cluster_idx: usize, raw: Vec<u32>| {
+            if cluster_idx >= neighbors.len() {
+                return;
+            }
+            let list = &mut neighbors[cluster_idx];
+            for h in raw {
+                if (h as usize) < n_ref_haps {
+                    list.push(h);
+                }
+            }
+        };
+
+        let n_candidates = n_states.min(n_ref_haps);
+
+        wavefront.reset_forward();
+        for m in 0..n_ref_markers {
+            let ref_marker_idx = MarkerIdx::new(m as u32);
+            let target_m = alignment.target_marker(m);
+
+            for h in 0..n_ref_haps {
+                let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
+                if let Some(target_m) = target_m {
+                    if alignment.has_allele_mapping(target_m) {
+                        allele = alignment.reverse_map_allele(target_m, allele);
+                    }
+                }
+                alleles[h] = allele;
+            }
+
+            let target_allele = target_m
+                .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap1_idx))
+                .unwrap_or(255);
+            alleles[n_ref_haps] = target_allele;
+            let target_allele = target_m
+                .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap2_idx))
+                .unwrap_or(255);
+            alleles[n_ref_haps + 1] = target_allele;
+
+            let mut is_biallelic = true;
+            for &a in &alleles {
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+            let n_alleles = if is_biallelic { 2 } else { 256 };
+
+            wavefront.advance_forward(&alleles, n_alleles);
+
+            if m < midpoint_to_cluster.len() {
+                let cluster_idx = midpoint_to_cluster[m];
+                if cluster_idx != usize::MAX {
+                    wavefront.prepare_fwd_queries();
+                    let h1 = wavefront.find_fwd_neighbors_readonly(n_ref_haps as u32, n_candidates);
+                    let h2 = wavefront.find_fwd_neighbors_readonly(n_ref_haps as u32 + 1, n_candidates);
+                    add_neighbors(&mut hap1_neighbors, cluster_idx, h1);
+                    add_neighbors(&mut hap2_neighbors, cluster_idx, h2);
+                }
+            }
+        }
+
+        wavefront.reset_backward();
+        for m in (0..n_ref_markers).rev() {
+            let ref_marker_idx = MarkerIdx::new(m as u32);
+            let target_m = alignment.target_marker(m);
+
+            for h in 0..n_ref_haps {
+                let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
+                if let Some(target_m) = target_m {
+                    if alignment.has_allele_mapping(target_m) {
+                        allele = alignment.reverse_map_allele(target_m, allele);
+                    }
+                }
+                alleles[h] = allele;
+            }
+
+            let target_allele = target_m
+                .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap1_idx))
+                .unwrap_or(255);
+            alleles[n_ref_haps] = target_allele;
+            let target_allele = target_m
+                .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap2_idx))
+                .unwrap_or(255);
+            alleles[n_ref_haps + 1] = target_allele;
+
+            let mut is_biallelic = true;
+            for &a in &alleles {
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+            let n_alleles = if is_biallelic { 2 } else { 256 };
+
+            wavefront.advance_backward(&alleles, n_alleles);
+
+            if m < midpoint_to_cluster.len() {
+                let cluster_idx = midpoint_to_cluster[m];
+                if cluster_idx != usize::MAX {
+                    wavefront.prepare_bwd_queries();
+                    let h1 = wavefront.find_bwd_neighbors_readonly(n_ref_haps as u32, n_candidates);
+                    let h2 = wavefront.find_bwd_neighbors_readonly(n_ref_haps as u32 + 1, n_candidates);
+                    add_neighbors(&mut hap1_neighbors, cluster_idx, h1);
+                    add_neighbors(&mut hap2_neighbors, cluster_idx, h2);
+                }
+            }
+        }
+
+        let finalize = |neighbors: Vec<Vec<u32>>| -> Vec<Vec<u32>> {
+            let mut out = Vec::with_capacity(n_clusters);
+            for mut list in neighbors {
+                let mut seen: HashSet<u32> = HashSet::new();
+                let mut uniq: Vec<u32> = Vec::with_capacity(n_states);
+                for h in list.drain(..) {
+                    if seen.insert(h) {
+                        uniq.push(h);
+                        if uniq.len() == n_states {
+                            break;
+                        }
+                    }
+                }
+                if uniq.len() < n_states {
+                    for h in 0..n_ref_haps as u32 {
+                        if seen.insert(h) {
+                            uniq.push(h);
+                            if uniq.len() == n_states {
+                                break;
+                            }
+                        }
+                    }
+                }
+                out.push(uniq);
+            }
+            out
+        };
+
+        (finalize(hap1_neighbors), finalize(hap2_neighbors))
+    }
+
     /// Run streaming imputation pipeline
     #[instrument(name = "imputation_streaming", skip(self))]
     pub fn run_streaming(&mut self) -> Result<()> {
@@ -479,6 +642,47 @@ impl crate::pipelines::ImputationPipeline {
             })
             .collect();
 
+        let ref_markers: Vec<usize> = (0..n_ref_markers).collect();
+        let clusters = compute_marker_clusters(
+            &ref_markers,
+            &gen_positions,
+            self.config.cluster as f64,
+        );
+        let n_clusters = clusters.len();
+        let cluster_bounds: Vec<(usize, usize)> = clusters.iter().map(|c| (c.start, c.end)).collect();
+        let cluster_midpoints: Vec<usize> = clusters
+            .iter()
+            .map(|c| {
+                if c.end > c.start {
+                    (c.start + c.end - 1) / 2
+                } else {
+                    c.start
+                }
+            })
+            .collect();
+        let mut midpoint_to_cluster = vec![usize::MAX; n_ref_markers];
+        for (c, &m) in cluster_midpoints.iter().enumerate() {
+            if m < midpoint_to_cluster.len() {
+                midpoint_to_cluster[m] = c;
+            }
+        }
+
+        let cluster_midpoints_pos: Vec<f64> = cluster_midpoints
+            .iter()
+            .map(|&m| gen_positions[m])
+            .collect();
+        let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+            .chain((1..n_clusters).map(|c| {
+                let gen_dist = (cluster_midpoints_pos[c] - cluster_midpoints_pos[c - 1]).abs();
+                self.params.p_recomb(gen_dist)
+            }))
+            .collect();
+
+        let (ref_cluster_start, ref_cluster_end) = compute_ref_cluster_bounds(&ref_markers, &clusters);
+        let marker_cluster = Arc::new(build_marker_cluster_index(&ref_cluster_start, n_ref_markers));
+        let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
+        let cluster_weights = Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
+
         const BATCH_SIZE: usize = 50;
         let n_batches = (n_target_samples + BATCH_SIZE - 1) / BATCH_SIZE;
 
@@ -494,7 +698,6 @@ impl crate::pipelines::ImputationPipeline {
                 .map(|&s| {
                     let hap1_idx = HapIdx::new((s * 2) as u32);
                     let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-                    let target_haps = [hap1_idx, hap2_idx];
                     let sample_genotyped = &sample_genotyped_vec[s];
 
                     if sample_genotyped.is_empty() {
@@ -508,51 +711,6 @@ impl crate::pipelines::ImputationPipeline {
                         };
                     }
 
-                    let clusters = compute_marker_clusters_with_blocks(
-                        sample_genotyped,
-                        &gen_positions,
-                        self.config.cluster as f64,
-                        &[],
-                    );
-
-                    let n_clusters = clusters.len();
-                    let cluster_bounds: Vec<(usize, usize)> = clusters.iter().map(|c| (c.start, c.end)).collect();
-
-                    let cluster_midpoints: Vec<f64> = clusters
-                        .iter()
-                        .map(|c| {
-                            if c.end > c.start {
-                                let start = sample_genotyped[c.start];
-                                let end = sample_genotyped[c.end - 1];
-                                (gen_positions[start] + gen_positions[end]) / 2.0
-                            } else {
-                                gen_positions[sample_genotyped[c.start]]
-                            }
-                        })
-                        .collect();
-
-                    let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-                        .chain((1..n_clusters).map(|c| {
-                            let gen_dist = (cluster_midpoints[c] - cluster_midpoints[c - 1]).abs();
-                            self.params.p_recomb(gen_dist)
-                        })).collect();
-
-                    let cluster_seqs = crate::model::imp_ibs::build_cluster_hap_sequences_for_targets(
-                        ref_win, target_win, alignment, sample_genotyped, &cluster_bounds, &target_haps,
-                    );
-                    let coded_steps = ClusterCodedSteps::from_cluster_sequences(
-                        &cluster_seqs, &cluster_midpoints, self.config.imp_step as f64,
-                    );
-                    let imp_ibs = ImpIbs::new(
-                        coded_steps, self.config.imp_nsteps, self.params.n_states,
-                        n_ref_haps, target_haps.len(), self.config.seed as u64 + s as u64,
-                    );
-
-                    let (ref_cluster_start, ref_cluster_end) = compute_ref_cluster_bounds(sample_genotyped, &clusters);
-                    let marker_cluster = Arc::new(build_marker_cluster_index(&ref_cluster_start, n_ref_markers));
-                    let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
-                    let cluster_weights = Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
-
                     let (dosages, best_gt, priors, state_probs_pair, hap_alt_probs) =
                         LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
@@ -560,18 +718,50 @@ impl crate::pipelines::ImputationPipeline {
                         let ws = ws_opt.as_mut().unwrap();
                         ws.clear();
 
-                        let mut hap_results: Vec<(Vec<f32>, Vec<(u8, u8)>)> = Vec::new();
+                        let pbwt_states = self.params.n_states.min(n_ref_haps);
+                        let (hap1_indices, hap2_indices) = self.build_pbwt_hap_indices_for_sample(
+                            target_win,
+                            ref_win,
+                            alignment,
+                            &cluster_midpoints,
+                            &midpoint_to_cluster,
+                            pbwt_states,
+                            s,
+                        );
+
+                        let obs_hap1: Vec<u8> = (0..target_win.n_markers())
+                            .map(|m| target_win.allele(MarkerIdx::new(m as u32), hap1_idx))
+                            .collect();
+                        let obs_hap2: Vec<u8> = (0..target_win.n_markers())
+                            .map(|m| target_win.allele(MarkerIdx::new(m as u32), hap2_idx))
+                            .collect();
+
+                        let get_ref = |marker: usize, h: u32| {
+                            let ref_allele = ref_win.allele(
+                                MarkerIdx::new(marker as u32),
+                                HapIdx::new(h as u32),
+                            );
+                            if let Some(target_m) = alignment.target_marker(marker) {
+                                if alignment.has_allele_mapping(target_m) {
+                                    alignment.reverse_map_allele(target_m, ref_allele)
+                                } else {
+                                    ref_allele
+                                }
+                            } else {
+                                ref_allele
+                            }
+                        };
+
                         let mut hap_priors: Vec<HaplotypePriors> = Vec::with_capacity(2);
                         let mut hap_state_probs: Vec<Arc<ClusterStateProbs>> = Vec::with_capacity(2);
 
-                        for (local_h, &global_h) in target_haps.iter().enumerate() {
-                            let mut imp_states = ImpStatesCluster::new(&imp_ibs, n_clusters, n_ref_haps, self.params.n_states);
-                            let mut hap_indices: Vec<Vec<u32>> = Vec::new();
-                            let actual_n_states = imp_states.ibs_states_cluster(local_h, &mut hap_indices);
+                        let (hap1_probs, hap1_dosages, hap1_best_gt, h1_locked, hap1_prior) = {
+                            let hap_indices = &hap1_indices;
+                            let actual_n_states = pbwt_states;
 
                             let prior_probs = imp_overlap
                                 .and_then(|overlap| overlap.hap_priors())
-                                .and_then(|priors| priors.get(global_h.as_usize()))
+                                .and_then(|priors| priors.get(hap1_idx.as_usize()))
                                 .filter(|priors| !priors.is_empty())
                                 .map(|priors| {
                                     let mut prior_probs = Vec::new();
@@ -586,11 +776,15 @@ impl crate::pipelines::ImputationPipeline {
                             let state_probs = compute_state_probs(
                                 &hap_indices,
                                 &cluster_bounds,
-                                sample_genotyped,
+                                &ref_markers,
                                 target_win,
                                 ref_win,
                                 alignment,
-                                global_h.as_usize(),
+                                &obs_hap1,
+                                &obs_hap2,
+                                &obs_hap1,
+                                Some(&obs_hap2),
+                                s,
                                 actual_n_states,
                                 ws,
                                 self.params.p_mismatch,
@@ -601,34 +795,23 @@ impl crate::pipelines::ImputationPipeline {
                                 prior_probs.as_deref(),
                             );
 
-                            if include_posteriors {
-                                hap_state_probs.push(Arc::clone(&state_probs));
-                            }
-
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
-                                let get_ref = |marker: usize, h: u32| {
-                                    let ref_allele = ref_win.allele(
-                                        MarkerIdx::new(marker as u32),
-                                        HapIdx::new(h as u32),
-                                    );
-                                    if let Some(target_m) = alignment.target_marker(marker) {
-                                        if alignment.has_allele_mapping(target_m) {
-                                            alignment.reverse_map_allele(target_m, ref_allele)
-                                        } else {
-                                            ref_allele
-                                        }
-                                    } else {
-                                        ref_allele
-                                    }
-                                };
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
                                 hap_dosages.push(p.prob(1));
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
 
-                            if output_end > 0 && n_ref_markers > 0 {
+                            let mut locked = obs_hap1.clone();
+                            for &ref_m in sample_genotyped {
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                    locked[target_m] = p.max_allele();
+                                }
+                            }
+
+                            let priors = if output_end > 0 && n_ref_markers > 0 {
                                 let overlap_size = 1000.min(n_ref_markers);
                                 let overlap_start = output_end.saturating_sub(overlap_size);
                                 let prior_marker = overlap_start.min(n_ref_markers.saturating_sub(1));
@@ -639,20 +822,94 @@ impl crate::pipelines::ImputationPipeline {
                                 );
                                 let mut priors = HaplotypePriors::new();
                                 priors.set_from_posteriors(&hap_ids, &probs, gen_pos, window_idx);
-                                hap_priors.push(priors);
+                                priors
                             } else {
-                                hap_priors.push(HaplotypePriors::new());
+                                HaplotypePriors::new()
+                            };
+
+                            (state_probs, hap_dosages, hap_best_gt, locked, priors)
+                        };
+
+                        let (hap2_probs, hap2_dosages, hap2_best_gt, hap2_prior) = {
+                            let hap_indices = &hap2_indices;
+                            let actual_n_states = pbwt_states;
+
+                            let prior_probs = imp_overlap
+                                .and_then(|overlap| overlap.hap_priors())
+                                .and_then(|priors| priors.get(hap2_idx.as_usize()))
+                                .filter(|priors| !priors.is_empty())
+                                .map(|priors| {
+                                    let mut prior_probs = Vec::new();
+                                    if let Some(first_cluster) = hap_indices.get(0) {
+                                        for &hap in first_cluster.iter().take(actual_n_states) {
+                                            prior_probs.push(priors.prior(hap, actual_n_states));
+                                        }
+                                    }
+                                    prior_probs
+                                });
+
+                            let state_probs = compute_state_probs(
+                                &hap_indices,
+                                &cluster_bounds,
+                                &ref_markers,
+                                target_win,
+                                ref_win,
+                                alignment,
+                                &obs_hap1,
+                                &obs_hap2,
+                                &obs_hap2,
+                                Some(&h1_locked),
+                                s,
+                                actual_n_states,
+                                ws,
+                                self.params.p_mismatch,
+                                &cluster_p_recomb,
+                                marker_cluster.clone(),
+                                ref_cluster_end.clone(),
+                                cluster_weights.clone(),
+                                prior_probs.as_deref(),
+                            );
+
+                            let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
+                            let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
+                            for ref_m in markers_to_process.clone() {
+                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                hap_dosages.push(p.prob(1));
+                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
 
-                            hap_results.push((hap_dosages, hap_best_gt));
+                            let priors = if output_end > 0 && n_ref_markers > 0 {
+                                let overlap_size = 1000.min(n_ref_markers);
+                                let overlap_start = output_end.saturating_sub(overlap_size);
+                                let prior_marker = overlap_start.min(n_ref_markers.saturating_sub(1));
+                                let (hap_ids, probs) = state_probs.haplotype_priors_at(prior_marker);
+                                let gen_pos = gen_maps.gen_pos(
+                                    chrom,
+                                    ref_win.marker(MarkerIdx::new(prior_marker as u32)).pos,
+                                );
+                                let mut priors = HaplotypePriors::new();
+                                priors.set_from_posteriors(&hap_ids, &probs, gen_pos, window_idx);
+                                priors
+                            } else {
+                                HaplotypePriors::new()
+                            };
+
+                            (state_probs, hap_dosages, hap_best_gt, priors)
+                        };
+
+                        if include_posteriors {
+                            hap_state_probs.push(Arc::clone(&hap1_probs));
+                            hap_state_probs.push(Arc::clone(&hap2_probs));
                         }
+
+                        hap_priors.push(hap1_prior);
+                        hap_priors.push(hap2_prior);
 
                         let mut combined_dosages = Vec::new();
                         let mut combined_best_gt = Vec::new();
-
                         for m in 0..markers_to_process.len() {
-                            combined_dosages.push(hap_results[0].0[m] + hap_results[1].0[m]);
-                            combined_best_gt.push((hap_results[0].1[m].0, hap_results[1].1[m].0));
+                            combined_dosages.push(hap1_dosages[m] + hap2_dosages[m]);
+                            combined_best_gt.push((hap1_best_gt[m].0, hap2_best_gt[m].0));
                         }
 
                         let priors = if hap_priors.len() == 2 {
@@ -667,11 +924,7 @@ impl crate::pipelines::ImputationPipeline {
                             None
                         };
 
-                        let hap_alt_probs = if hap_results.len() == 2 {
-                            Some((hap_results[0].0.clone(), hap_results[1].0.clone()))
-                        } else {
-                            None
-                        };
+                        let hap_alt_probs = Some((hap1_dosages.clone(), hap2_dosages.clone()));
 
                         (combined_dosages, combined_best_gt, priors, state_probs_pair, hap_alt_probs)
                     });

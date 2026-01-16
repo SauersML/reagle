@@ -252,6 +252,31 @@ impl<'a> BeagleHmm<'a> {
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
     ) -> f64 {
+        self.conditioned_forward_backward(
+            target_alleles,
+            target_alleles,
+            target_alleles,
+            target_conf,
+            threaded_haps,
+            fwd,
+            bwd,
+        )
+    }
+
+    /// Forward-backward with a fixed partner haplotype constraint.
+    ///
+    /// The emission probability is conditioned on the partner allele such that
+    /// the target haplotype must complement the partner at heterozygous sites.
+    pub fn conditioned_forward_backward(
+        &self,
+        geno_a1: &[u8],
+        geno_a2: &[u8],
+        partner_alleles: &[u8],
+        target_conf: Option<&[f32]>,
+        threaded_haps: &ThreadedHaps,
+        fwd: &mut Vec<f32>,
+        bwd: &mut Vec<f32>,
+    ) -> f64 {
         let n_markers = self.n_markers();
         let n_states = self.n_states;
         let total_size = n_markers * n_states;
@@ -260,78 +285,71 @@ impl<'a> BeagleHmm<'a> {
             return 0.0;
         }
 
-        fwd.resize(total_size, 0.0);
-        bwd.resize(total_size, 0.0);
-
         let p_err_base = self.params.p_mismatch;
         let p_no_err_base = 1.0 - p_err_base;
 
-        // Allocate scratch buffer for allele materialization
+        fwd.resize(total_size, 0.0);
+        bwd.resize(total_size, 0.0);
+
+        let mut cursor = MosaicCursor::from_threaded(threaded_haps);
         let mut scratch = AlleleScratch::new(n_states);
         let mut mismatches = vec![0u8; n_states];
-
-        // Create cursor for traversal
-        let mut cursor = MosaicCursor::from_threaded(threaded_haps);
-
-        // =====================================================================
-        // FORWARD PASS with A-B-C Loop
-        // =====================================================================
         let mut fwd_sum = 1.0f32;
 
-        // Accumulate log-likelihood: ln P(O) = Σ ln(c_m) where c_m is the scaling factor at marker m.
-        // Previously only the last c_m was used, which is mathematically incorrect.
         let mut log_likelihood = 0.0f64;
-
-        // Event stack for efficient backward pass (sparse, O(switches))
-        // For phasing (static states), this remains empty - zero overhead.
         let mut history: Vec<StateSwitch> = Vec::with_capacity(n_markers);
 
         for m in 0..n_markers {
-            let targ_al = target_alleles[m];
             let p_recomb_m = self.p_recomb.get(m).copied().unwrap_or(0.0);
 
-            // Phase A: Advance cursor with history recording
             cursor.advance_with_history(m, threaded_haps, &mut history);
 
-            // Phase B: Materialize alleles into scratch buffer
             scratch.materialize(&cursor, m, |marker, hap| {
                 self.ref_gt.allele(MarkerIdx::new(marker as u32), HapIdx::new(hap))
             });
 
-            // Compute mismatches
-            for k in 0..n_states {
-                mismatches[k] = if scratch.alleles[k] == targ_al { 0 } else { 1 };
-            }
+            let geno1 = geno_a1[m];
+            let geno2 = geno_a2[m];
+            let partner = partner_alleles[m];
+            let required = if geno1 == 255 || geno2 == 255 {
+                None
+            } else if geno1 == geno2 {
+                Some(geno1)
+            } else if partner == geno1 {
+                Some(geno2)
+            } else if partner == geno2 {
+                Some(geno1)
+            } else {
+                None
+            };
 
-            let conf = target_conf
-                .and_then(|c| c.get(m).copied())
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0);
-            let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
-            let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
-            let emit_probs = [p_no_err, p_err];
+            let (emit_probs, use_neutral) = if let Some(req) = required {
+                for k in 0..n_states {
+                    mismatches[k] = if scratch.alleles[k] == req { 0 } else { 1 };
+                }
+                let conf = target_conf
+                    .and_then(|c| c.get(m).copied())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+                let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+                ([p_no_err, p_err], false)
+            } else {
+                mismatches.fill(0);
+                ([1.0f32, 1.0f32], true)
+            };
 
-            // Phase C: Math kernel (SIMD-friendly on contiguous data)
             let row_offset = m * n_states;
-
             if m == 0 {
-                // Initialize: following Java ImpLSBaum, m=0 uses just emission probs
-                // The 1/n_states factor is a normalization convention; what matters is
-                // that fwd_sum is the actual sum for correct scaling at marker 1.
                 let init_val = 1.0 / n_states as f32;
                 fwd_sum = 0.0;
                 for k in 0..n_states {
-                    let val = init_val * emit_probs[mismatches[k] as usize];
+                    let emit = if use_neutral { 1.0 } else { emit_probs[mismatches[k] as usize] };
+                    let val = init_val * emit;
                     fwd[row_offset + k] = val;
                     fwd_sum += val;
                 }
             } else {
-                // Li-Stephens HMM transition update:
-                //   fwd[k] = emit[k] * ((1-ρ)/Σfwd * fwd[k] + ρ/K)
-                // where ρ = p_recomb_m (recombination probability), K = n_states
-                //
-                // The fwd_update function expects p_switch = ρ (raw recombination prob)
-                // and internally computes: shift = ρ/K, scale = (1-ρ)/fwd_sum
                 let prev_row_offset = (m - 1) * n_states;
                 let (before, curr_and_after) = fwd.split_at_mut(row_offset);
                 let prev_row = &before[prev_row_offset..prev_row_offset + n_states];
@@ -340,73 +358,89 @@ impl<'a> BeagleHmm<'a> {
                 fwd_sum = HmmUpdater::fwd_update(
                     curr_row,
                     fwd_sum,
-                    p_recomb_m, // Pass raw recombination probability
+                    p_recomb_m,
                     &emit_probs,
                     &mismatches,
                     n_states,
                 );
             }
 
-            // Accumulate log-likelihood from this marker's scaling factor
             if fwd_sum > 0.0 {
                 log_likelihood += (fwd_sum as f64).ln();
             }
         }
 
-        // =====================================================================
-        // BACKWARD PASS using cursor rewind (Event Stack approach)
-        // =====================================================================
-
-        // Initialize last row
         let last_row = (n_markers - 1) * n_states;
         let init_bwd = 1.0 / n_states as f32;
         for k in 0..n_states {
             bwd[last_row + k] = init_bwd;
         }
 
-        // Backward sweep using cursor.rewind()
-        // Cursor is currently at last marker; we rewind as we go backwards
         for m in (0..n_markers - 1).rev() {
             let m_next = m + 1;
-            let marker_next_idx = MarkerIdx::new(m_next as u32);
-            let targ_al_next = target_alleles[m_next];
-
             let p_recomb_next = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
 
-            // Rewind cursor to m_next (we need alleles at m_next for emission)
             cursor.rewind(m_next, &mut history);
 
-            // Materialize alleles at m_next using rewound cursor
             for k in 0..n_states {
                 let hap = cursor.active_haps()[k];
-                scratch.alleles[k] = self.ref_gt.allele(marker_next_idx, HapIdx::new(hap));
-                mismatches[k] = if scratch.alleles[k] == targ_al_next { 0 } else { 1 };
+                scratch.alleles[k] = self.ref_gt.allele(MarkerIdx::new(m_next as u32), HapIdx::new(hap));
             }
 
-            // Copy backward values from next row
+            let geno1 = geno_a1[m_next];
+            let geno2 = geno_a2[m_next];
+            let partner = partner_alleles[m_next];
+            let required = if geno1 == 255 || geno2 == 255 {
+                None
+            } else if geno1 == geno2 {
+                Some(geno1)
+            } else if partner == geno1 {
+                Some(geno2)
+            } else if partner == geno2 {
+                Some(geno1)
+            } else {
+                None
+            };
+
+            let (emit_probs, use_neutral) = if let Some(req) = required {
+                for k in 0..n_states {
+                    mismatches[k] = if scratch.alleles[k] == req { 0 } else { 1 };
+                }
+                let conf = target_conf
+                    .and_then(|c| c.get(m_next).copied())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+                let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+                ([p_no_err, p_err], false)
+            } else {
+                mismatches.fill(0);
+                ([1.0f32, 1.0f32], true)
+            };
+
             let next_row = m_next * n_states;
             let curr_row = m * n_states;
             for k in 0..n_states {
                 bwd[curr_row + k] = bwd[next_row + k];
             }
 
-            let conf = target_conf
-                .and_then(|c| c.get(m_next).copied())
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0);
-            let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
-            let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
-            let emit_probs = [p_no_err, p_err];
-
-            // Apply backward update (same Li-Stephens formula, different direction)
-            // bwd_update expects p_switch = ρ (raw recombination probability)
-            HmmUpdater::bwd_update(
-                &mut bwd[curr_row..curr_row + n_states],
-                p_recomb_next, // Pass raw recombination probability
-                &emit_probs,
-                &mismatches,
-                n_states,
-            );
+            if use_neutral {
+                HmmUpdater::bwd_update(
+                    &mut bwd[curr_row..curr_row + n_states],
+                    p_recomb_next,
+                    &[1.0f32, 1.0f32],
+                    &mismatches,
+                    n_states,
+                );
+            } else {
+                HmmUpdater::bwd_update(
+                    &mut bwd[curr_row..curr_row + n_states],
+                    p_recomb_next,
+                    &emit_probs,
+                    &mismatches,
+                    n_states,
+                );
+            }
         }
 
         log_likelihood
