@@ -351,10 +351,24 @@ impl crate::pipelines::ImputationPipeline {
             n_ref_haps, n_target_samples
         );
 
+        // Pre-scan reference for all markers to build a complete header
+        let ref_markers = if !is_bref3 {
+            Some(crate::io::vcf::VcfReader::scan_markers(&ref_path)?)
+        } else {
+            // bref3 doesn't support pre-scanning markers yet.
+            // Header will be written on first window.
+            None
+        };
+
         // Create output writer
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
+
+        // Write header immediately if we have all markers
+        if let Some(ref markers) = ref_markers {
+            writer.write_header_extended(markers, true, self.config.gp, self.config.ap)?;
+        }
 
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.

@@ -594,6 +594,23 @@ impl VcfReader {
         }
     }
 
+    /// Scan a VCF file and return just the Markers metadata.
+    /// This is much faster than `read_all` as it doesn't process genotypes.
+    pub fn scan_markers(path: &Path) -> Result<Markers> {
+        let (mut reader, mut file) = VcfReader::open(path)?;
+        let mut markers = Markers::new();
+
+        let mut line = String::new();
+        while file.read_line(&mut line)? > 0 {
+            if !line.starts_with('#') {
+                let (marker, _, _, _) = reader.parse_record(&line, &mut markers, 0)?;
+                markers.push(marker);
+            }
+            line.clear();
+        }
+
+        Ok(markers)
+    }
 }
 
 /// Parse a genotype field (e.g., "0|1", "0/1", ".")
@@ -795,6 +812,7 @@ fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
 pub struct VcfWriter {
     writer: Box<dyn Write + Send>,
     samples: Arc<Samples>,
+    header_written: bool,
 }
 
 impl VcfWriter {
@@ -809,7 +827,7 @@ impl VcfWriter {
             _ => Box::new(BufWriter::new(file)),
         };
 
-        Ok(Self { writer, samples })
+        Ok(Self { writer, samples, header_written: false })
     }
 
     /// Write VCF header for phased output
@@ -964,6 +982,11 @@ impl VcfWriter {
         B: Fn(usize, usize) -> (u8, u8),
         G: Fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors),
     {
+        if !self.header_written {
+            self.write_header_extended(matrix.markers(), true, include_gp, include_ap)?;
+            self.header_written = true;
+        }
+
         let n_samples = self.samples.len();
 
         // Pre-compute format string (same for all markers)
