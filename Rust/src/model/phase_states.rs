@@ -439,13 +439,15 @@ mod tests {
         // Verify that at least one state has had a segment change by checking
         // if the haplotype changes across markers
         let mut found_segment_change = false;
-        let mut th_clone = th.clone();
+        let mut buffer = vec![0u32; th.n_states()];
 
         for state in 0..th.n_states() {
-            th_clone.reset_cursors();
-            let hap_at_start = th_clone.hap_at_raw(state, 0);
-            let hap_at_middle = th_clone.hap_at_raw(state, 150);
-            let hap_at_end = th_clone.hap_at_raw(state, 999);
+            th.materialize_at(0, &mut buffer);
+            let hap_at_start = buffer[state];
+            th.materialize_at(150, &mut buffer);
+            let hap_at_middle = buffer[state];
+            th.materialize_at(999, &mut buffer);
+            let hap_at_end = buffer[state];
 
             if hap_at_start != hap_at_middle || hap_at_middle != hap_at_end {
                 found_segment_change = true;
