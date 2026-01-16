@@ -420,20 +420,6 @@ impl crate::pipelines::ImputationPipeline {
                     .genotypes
                     .marker(MarkerIdx::new((n_markers - 1) as u32))
                     .pos;
-                let _phase_span = if pipeline.config.profile {
-                    Some(
-                        info_span!(
-                            "phasing_window",
-                            window = window_count,
-                            markers = n_markers,
-                            start_pos = window_start_pos,
-                            end_pos = window_end_pos
-                        )
-                        .entered(),
-                    )
-                } else {
-                    None
-                };
 
                 eprintln!(
                     "  Phasing Window {} ({} markers, pos {}..{})",
@@ -498,11 +484,6 @@ impl crate::pipelines::ImputationPipeline {
                 let phased = if target_reader.was_all_phased() {
                     target_window.genotypes.clone().into_phased()
                 } else {
-                    let _span = if pipeline.config.profile {
-                        Some(info_span!("compute_phasing").entered())
-                    } else {
-                        None
-                    };
                     pipeline.phase_window_streaming(
                         &target_window.genotypes,
                         &ref_window_gt,
@@ -617,23 +598,6 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
             }
-
-            let _window_span = if self.config.profile {
-                Some(
-                    info_span!(
-                        "imputation_window",
-                        window = window_idx,
-                        ref_markers = ref_window.n_markers(),
-                        target_markers = phased_target.n_markers(),
-                        output_start = ref_output_start,
-                        output_end = ref_output_end,
-                        n_states = self.params.n_states
-                    )
-                    .entered(),
-                )
-            } else {
-                None
-            };
 
             let next_priors = if self.config.profile {
                 let _span = info_span!("compute_imputation", window = window_idx).entered();
@@ -778,21 +742,6 @@ impl crate::pipelines::ImputationPipeline {
         output_start: usize,
         output_end: usize,
     ) -> Result<Option<Vec<HaplotypePriors>>> {
-        let _window_span = if self.config.profile {
-            Some(
-                info_span!(
-                    "imputation_window_compute",
-                    ref_markers = ref_win.n_markers(),
-                    target_markers = target_win.n_markers(),
-                    output_start,
-                    output_end
-                )
-                .entered(),
-            )
-        } else {
-            None
-        };
-
         // Thread-local workspace - must be defined inside the parallel context
         thread_local! {
             static LOCAL_WORKSPACE: std::cell::RefCell<Option<ImpWorkspace>> =
@@ -902,19 +851,6 @@ impl crate::pipelines::ImputationPipeline {
 
             let pbwt_states = self.params.n_states.min(n_ref_haps);
             let batch_neighbors = {
-                let _pbwt_span = if self.config.profile {
-                    Some(
-                        info_span!(
-                            "pbwt_neighbor_batch",
-                            batch = batch_idx,
-                            batch_size = batch_samples.len(),
-                            n_states = pbwt_states
-                        )
-                        .entered(),
-                    )
-                } else {
-                    None
-                };
                 self.build_pbwt_hap_indices_for_batch(
                     target_win,
                     ref_win,
@@ -1254,19 +1190,6 @@ impl crate::pipelines::ImputationPipeline {
         if n_markers == 0 || all_results.is_empty() {
             return Ok(());
         }
-
-        let _write_span = if self.config.profile {
-            Some(
-                info_span!(
-                    "io_write_output",
-                    markers = n_markers,
-                    samples = target_win.n_samples()
-                )
-                .entered(),
-            )
-        } else {
-            None
-        };
 
         // Build lookup maps for sample -> (dosages, best_gt)
         let sample_data: std::collections::HashMap<usize, (&Vec<f32>, &Vec<(u8, u8)>)> =
