@@ -75,7 +75,6 @@ impl ImpWorkspace {
         if self.row_buffer.len() < n_states {
              self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
         }
-
         let block_fwd_size = (CHECKPOINT_INTERVAL + 1) * n_states;
         if self.block_fwd.len() < block_fwd_size {
              self.block_fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(block_fwd_size));

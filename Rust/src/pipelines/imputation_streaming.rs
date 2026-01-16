@@ -4,6 +4,7 @@
 //! Uses a producer-consumer model with MPSC channel to pipe phased matrices
 //! directly to imputation in-memory.
 
+use std::collections::HashSet;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -58,20 +59,17 @@ impl crate::pipelines::ImputationPipeline {
         ref_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
         ref_is_biallelic: &[bool],
-        cluster_midpoints: &[usize],
-        midpoint_to_cluster: &[usize],
+        cluster_bounds: &[(usize, usize)],
         n_states: usize,
         batch_samples: &[usize],
     ) -> Vec<(Vec<Vec<u32>>, Vec<Vec<u32>>)> {
-        use std::collections::HashSet;
-
         if batch_samples.is_empty() {
             return Vec::new();
         }
 
         let n_ref_markers = ref_win.n_markers();
         let n_ref_haps = ref_win.n_haplotypes();
-        let n_clusters = cluster_midpoints.len();
+        let n_clusters = cluster_bounds.len();
         let n_batch_haps = batch_samples.len() * 2;
         let n_total_haps = n_ref_haps + n_batch_haps;
 
@@ -107,40 +105,88 @@ impl crate::pipelines::ImputationPipeline {
             .map(|(i, _)| ((n_ref_haps + i * 2) as u32, (n_ref_haps + i * 2 + 1) as u32))
             .collect();
 
+        let mut pbwt_ref_markers: Vec<usize> = Vec::new();
+        for ref_m in 0..n_ref_markers {
+            let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
+            if target_m_idx < 0 {
+                continue;
+            }
+            let target_m = target_m_idx as usize;
+            let mut any_informative = false;
+            for hap in &batch_haps {
+                let allele = target_win.allele(MarkerIdx::new(target_m as u32), *hap);
+                if allele < 2 {
+                    any_informative = true;
+                    break;
+                }
+            }
+            if any_informative {
+                pbwt_ref_markers.push(ref_m);
+            }
+        }
+
+        let mut cluster_query_at_ref = vec![usize::MAX; n_ref_markers];
+        if !pbwt_ref_markers.is_empty() {
+            for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
+                if start >= end || start >= n_ref_markers {
+                    continue;
+                }
+                let mid = (start + end - 1) / 2;
+                let start_idx = pbwt_ref_markers.partition_point(|&m| m < start);
+                let end_idx = pbwt_ref_markers.partition_point(|&m| m < end);
+                if start_idx >= end_idx {
+                    continue;
+                }
+
+                let pos = pbwt_ref_markers[start_idx..end_idx].partition_point(|&m| m < mid);
+                let left_idx = if pos == 0 { start_idx } else { start_idx + pos - 1 };
+                let right_idx = if start_idx + pos < end_idx { start_idx + pos } else { left_idx };
+
+                let left_m = pbwt_ref_markers[left_idx];
+                let right_m = pbwt_ref_markers[right_idx];
+                let pick = if (mid as isize - left_m as isize).abs() <= (right_m as isize - mid as isize).abs() {
+                    left_m
+                } else {
+                    right_m
+                };
+                cluster_query_at_ref[pick] = c;
+            }
+        }
+
         PBWT_WORKSPACE.with(|cell| {
             let mut ws_opt = cell.borrow_mut();
             if ws_opt.is_none() {
-                *ws_opt = Some((PbwtWavefront::new(n_total_haps, n_ref_markers), vec![0u8; n_total_haps]));
+                *ws_opt = Some((PbwtWavefront::new(n_total_haps, pbwt_ref_markers.len()), vec![0u8; n_total_haps]));
             }
             let (wavefront, alleles) = ws_opt.as_mut().unwrap();
-            if wavefront.n_haps() != n_total_haps || wavefront.n_markers() != n_ref_markers {
-                *wavefront = PbwtWavefront::new(n_total_haps, n_ref_markers);
+            if wavefront.n_haps() != n_total_haps || wavefront.n_markers() != pbwt_ref_markers.len() {
+                *wavefront = PbwtWavefront::new(n_total_haps, pbwt_ref_markers.len());
                 alleles.resize(n_total_haps, 0u8);
             }
 
             wavefront.reset_forward();
-            for m in 0..n_ref_markers {
-                let ref_marker_idx = MarkerIdx::new(m as u32);
-                let target_m = alignment.target_marker(m);
+            for &ref_m in &pbwt_ref_markers {
+                let ref_marker_idx = MarkerIdx::new(ref_m as u32);
+                let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
+                if target_m_idx < 0 {
+                    continue;
+                }
+                let target_m = target_m_idx as usize;
 
                 for h in 0..n_ref_haps {
                     let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
-                    if let Some(target_m) = target_m {
-                        if alignment.has_allele_mapping(target_m) {
-                            allele = alignment.reverse_map_allele(target_m, allele);
-                        }
+                    if alignment.has_allele_mapping(target_m) {
+                        allele = alignment.reverse_map_allele(target_m, allele);
                     }
                     alleles[h] = allele;
                 }
 
                 let mut is_biallelic = ref_is_biallelic
-                    .get(m)
+                    .get(ref_m)
                     .copied()
                     .unwrap_or(true);
                 for (local_idx, hap_idx) in batch_haps.iter().enumerate() {
-                    let allele = target_m
-                        .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), *hap_idx))
-                        .unwrap_or(255);
+                    let allele = target_win.allele(MarkerIdx::new(target_m as u32), *hap_idx);
                     alleles[n_ref_haps + local_idx] = allele;
                     if allele >= 2 {
                         is_biallelic = false;
@@ -151,8 +197,8 @@ impl crate::pipelines::ImputationPipeline {
 
                 wavefront.advance_forward(alleles, n_alleles);
 
-                if m < midpoint_to_cluster.len() {
-                    let cluster_idx = midpoint_to_cluster[m];
+                if ref_m < cluster_query_at_ref.len() {
+                    let cluster_idx = cluster_query_at_ref[ref_m];
                     if cluster_idx != usize::MAX {
                         wavefront.prepare_fwd_queries();
                         for (batch_idx, &(hap1_pos, hap2_pos)) in batch_positions.iter().enumerate() {
@@ -166,28 +212,28 @@ impl crate::pipelines::ImputationPipeline {
             }
 
             wavefront.reset_backward();
-            for m in (0..n_ref_markers).rev() {
-                let ref_marker_idx = MarkerIdx::new(m as u32);
-                let target_m = alignment.target_marker(m);
+            for &ref_m in pbwt_ref_markers.iter().rev() {
+                let ref_marker_idx = MarkerIdx::new(ref_m as u32);
+                let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
+                if target_m_idx < 0 {
+                    continue;
+                }
+                let target_m = target_m_idx as usize;
 
                 for h in 0..n_ref_haps {
                     let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
-                    if let Some(target_m) = target_m {
-                        if alignment.has_allele_mapping(target_m) {
-                            allele = alignment.reverse_map_allele(target_m, allele);
-                        }
+                    if alignment.has_allele_mapping(target_m) {
+                        allele = alignment.reverse_map_allele(target_m, allele);
                     }
                     alleles[h] = allele;
                 }
 
                 let mut is_biallelic = ref_is_biallelic
-                    .get(m)
+                    .get(ref_m)
                     .copied()
                     .unwrap_or(true);
                 for (local_idx, hap_idx) in batch_haps.iter().enumerate() {
-                    let allele = target_m
-                        .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), *hap_idx))
-                        .unwrap_or(255);
+                    let allele = target_win.allele(MarkerIdx::new(target_m as u32), *hap_idx);
                     alleles[n_ref_haps + local_idx] = allele;
                     if allele >= 2 {
                         is_biallelic = false;
@@ -198,8 +244,8 @@ impl crate::pipelines::ImputationPipeline {
 
                 wavefront.advance_backward(alleles, n_alleles);
 
-                if m < midpoint_to_cluster.len() {
-                    let cluster_idx = midpoint_to_cluster[m];
+                if ref_m < cluster_query_at_ref.len() {
+                    let cluster_idx = cluster_query_at_ref[ref_m];
                     if cluster_idx != usize::MAX {
                         wavefront.prepare_bwd_queries();
                         for (batch_idx, &(hap1_pos, hap2_pos)) in batch_positions.iter().enumerate() {
@@ -692,13 +738,6 @@ impl crate::pipelines::ImputationPipeline {
                 }
             })
             .collect();
-        let mut midpoint_to_cluster = vec![usize::MAX; n_ref_markers];
-        for (c, &m) in cluster_midpoints.iter().enumerate() {
-            if m < midpoint_to_cluster.len() {
-                midpoint_to_cluster[m] = c;
-            }
-        }
-
         let cluster_midpoints_pos: Vec<f64> = cluster_midpoints
             .iter()
             .map(|&m| gen_positions[m])
@@ -731,8 +770,7 @@ impl crate::pipelines::ImputationPipeline {
                 ref_win,
                 alignment,
                 &ref_is_biallelic,
-                &cluster_midpoints,
-                &midpoint_to_cluster,
+                &cluster_bounds,
                 pbwt_states,
                 &batch_samples,
             );

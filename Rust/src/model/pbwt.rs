@@ -87,6 +87,10 @@ impl PbwtDivUpdater {
         }
     }
 
+    pub fn n_haps(&self) -> usize {
+        self.n_haps
+    }
+
     fn ensure_capacity(&mut self, n_alleles: usize) {
         if self.p.len() < n_alleles {
             self.p.resize(n_alleles, 0);

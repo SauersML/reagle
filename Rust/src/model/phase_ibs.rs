@@ -31,7 +31,7 @@ use crate::model::pbwt::PbwtDivUpdater;
 /// Checkpoint interval for sparse PBWT storage.
 /// PPA/div/pos arrays are only stored at every CHECKPOINT_INTERVAL markers.
 /// This reduces memory from O(n_markers × n_haps × 24 bytes) to O(n_markers/INTERVAL × n_haps × 24 bytes).
-/// Queries snap to the nearest checkpoint, which is an approximation but works well for IBS neighbor finding.
+/// Checkpoints are used for storage, and exact states are recomputed per marker when queried.
 const PBWT_CHECKPOINT_INTERVAL: usize = 64;
 
 /// Manages bidirectional PBWT state for HMM state selection.
@@ -61,6 +61,8 @@ pub struct BidirectionalPhaseIbs {
     bwd_div: Vec<Vec<i32>>,
     /// Backward prefix array at checkpoints
     bwd_ppa: Vec<Vec<u32>>,
+    /// Marker indices for each checkpoint (sorted ascending)
+    checkpoint_markers: Vec<usize>,
     /// Total number of haplotypes in the PBWT
     n_haps: usize,
     /// Number of markers in the PBWT (may be subset of full chromosome)
@@ -75,6 +77,8 @@ pub struct BidirectionalPhaseIbs {
     /// Stored alleles per marker for O(1) allele lookup.
     /// alleles[m][h] = allele of haplotype h at marker m.
     alleles: Vec<Vec<u8>>,
+    /// Number of distinct alleles per marker (after normalization)
+    n_alleles_by_marker: Vec<usize>,
 }
 
 impl BidirectionalPhaseIbs {
@@ -92,8 +96,17 @@ impl BidirectionalPhaseIbs {
         n_haps: usize,
         n_markers: usize,
     ) -> Self {
-        // Compute number of checkpoints needed
-        let n_checkpoints = (n_markers + PBWT_CHECKPOINT_INTERVAL - 1) / PBWT_CHECKPOINT_INTERVAL;
+        let mut checkpoint_markers: Vec<usize> = (0..n_markers)
+            .step_by(PBWT_CHECKPOINT_INTERVAL)
+            .collect();
+        if let Some(&last) = checkpoint_markers.last() {
+            if last + 1 < n_markers {
+                checkpoint_markers.push(n_markers - 1);
+            }
+        } else if n_markers > 0 {
+            checkpoint_markers.push(n_markers - 1);
+        }
+        let n_checkpoints = checkpoint_markers.len();
 
         let mut fwd_div = Vec::with_capacity(n_checkpoints);
         let mut fwd_ppa = Vec::with_capacity(n_checkpoints);
@@ -106,30 +119,32 @@ impl BidirectionalPhaseIbs {
         let mut ppa: Vec<u32> = (0..n_haps as u32).collect();
         let mut div: Vec<i32> = vec![0; n_haps + 1];
 
+        let mut next_checkpoint = 0usize;
         for m in 0..n_markers {
             let n_alleles = normalize_pbwt_alleles(&mut alleles[m]);
             n_alleles_by_marker[m] = n_alleles;
             updater.fwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
 
-            // Only store at checkpoint markers (every PBWT_CHECKPOINT_INTERVAL markers)
-            if m % PBWT_CHECKPOINT_INTERVAL == 0 || m == n_markers - 1 {
+            if next_checkpoint < n_checkpoints && m == checkpoint_markers[next_checkpoint] {
                 fwd_ppa.push(ppa.clone());
                 fwd_div.push(div[..n_haps].to_vec());
+                next_checkpoint += 1;
             }
         }
 
         ppa = (0..n_haps as u32).collect();
         div = vec![n_markers as i32; n_haps + 1];
 
+        let mut next_checkpoint = n_checkpoints;
         for m in (0..n_markers).rev() {
             let n_alleles = n_alleles_by_marker[m];
             updater.bwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
 
-            // Only store at checkpoint markers
-            if m % PBWT_CHECKPOINT_INTERVAL == 0 {
-                let checkpoint_idx = m / PBWT_CHECKPOINT_INTERVAL;
+            if next_checkpoint > 0 && m == checkpoint_markers[next_checkpoint - 1] {
+                let checkpoint_idx = next_checkpoint - 1;
                 bwd_ppa[checkpoint_idx] = ppa.clone();
                 bwd_div[checkpoint_idx] = div[..n_haps].to_vec();
+                next_checkpoint -= 1;
             }
         }
 
@@ -138,53 +153,149 @@ impl BidirectionalPhaseIbs {
             fwd_ppa,
             bwd_div,
             bwd_ppa,
+            checkpoint_markers,
             n_haps,
             n_markers,
             n_checkpoints,
             subset_to_global: None,
             alleles,
+            n_alleles_by_marker,
         }
     }
 
-    fn with_fwd_pos<R>(&self, checkpoint_idx: usize, f: impl FnOnce(&[u32]) -> R) -> R {
-        thread_local! {
-            static FWD_POS_CACHE: std::cell::RefCell<(usize, Vec<u32>)> =
-                std::cell::RefCell::new((usize::MAX, Vec::new()));
+    fn with_fwd_state<R>(&self, marker_idx: usize, f: impl FnOnce(&[u32], &[i32]) -> R) -> R {
+        let checkpoint_idx = self.marker_to_checkpoint_floor(marker_idx);
+        let checkpoint_marker = self.checkpoint_markers[checkpoint_idx];
+        if marker_idx == checkpoint_marker {
+            return f(&self.fwd_ppa[checkpoint_idx], &self.fwd_div[checkpoint_idx]);
         }
 
-        let ppa = &self.fwd_ppa[checkpoint_idx];
-        FWD_POS_CACHE.with(|cell| {
-            let mut cache = cell.borrow_mut();
-            if cache.0 != checkpoint_idx || cache.1.len() != ppa.len() {
-                cache.1.clear();
-                cache.1.resize(ppa.len(), 0u32);
-                for (i, &h) in ppa.iter().enumerate() {
-                    cache.1[h as usize] = i as u32;
+        thread_local! {
+            static FWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u32>, Vec<i32>)> =
+                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static FWD_UPDATER: std::cell::RefCell<PbwtDivUpdater> =
+                std::cell::RefCell::new(PbwtDivUpdater::new(0));
+        }
+
+        FWD_STATE_CACHE.with(|state_cell| {
+            FWD_UPDATER.with(|upd_cell| {
+                let mut state = state_cell.borrow_mut();
+                if state.0 != checkpoint_idx || state.1 != marker_idx || state.2.len() != self.n_haps {
+                    state.0 = checkpoint_idx;
+                    state.1 = marker_idx;
+                    state.2 = self.fwd_ppa[checkpoint_idx].clone();
+                    state.3 = self.fwd_div[checkpoint_idx].clone();
+
+                    let mut updater = upd_cell.borrow_mut();
+                    if updater.n_haps() != self.n_haps {
+                        *updater = PbwtDivUpdater::new(self.n_haps);
+                    }
+                    let mut ppa = std::mem::take(&mut state.2);
+                    let mut div = std::mem::take(&mut state.3);
+                    for m in (checkpoint_marker + 1)..=marker_idx {
+                        let n_alleles = self.n_alleles_by_marker[m];
+                        updater.fwd_update(&self.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                    }
+                    state.2 = ppa;
+                    state.3 = div;
                 }
-                cache.0 = checkpoint_idx;
-            }
-            f(&cache.1)
+                f(&state.2, &state.3)
+            })
         })
     }
 
-    fn with_bwd_pos<R>(&self, checkpoint_idx: usize, f: impl FnOnce(&[u32]) -> R) -> R {
-        thread_local! {
-            static BWD_POS_CACHE: std::cell::RefCell<(usize, Vec<u32>)> =
-                std::cell::RefCell::new((usize::MAX, Vec::new()));
+    fn with_bwd_state<R>(&self, marker_idx: usize, f: impl FnOnce(&[u32], &[i32]) -> R) -> R {
+        let checkpoint_idx = self.marker_to_checkpoint_ceil(marker_idx);
+        let checkpoint_marker = self.checkpoint_markers[checkpoint_idx];
+        if marker_idx == checkpoint_marker {
+            return f(&self.bwd_ppa[checkpoint_idx], &self.bwd_div[checkpoint_idx]);
         }
 
-        let ppa = &self.bwd_ppa[checkpoint_idx];
-        BWD_POS_CACHE.with(|cell| {
-            let mut cache = cell.borrow_mut();
-            if cache.0 != checkpoint_idx || cache.1.len() != ppa.len() {
-                cache.1.clear();
-                cache.1.resize(ppa.len(), 0u32);
-                for (i, &h) in ppa.iter().enumerate() {
-                    cache.1[h as usize] = i as u32;
+        thread_local! {
+            static BWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u32>, Vec<i32>)> =
+                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static BWD_UPDATER: std::cell::RefCell<PbwtDivUpdater> =
+                std::cell::RefCell::new(PbwtDivUpdater::new(0));
+        }
+
+        BWD_STATE_CACHE.with(|state_cell| {
+            BWD_UPDATER.with(|upd_cell| {
+                let mut state = state_cell.borrow_mut();
+                if state.0 != checkpoint_idx || state.1 != marker_idx || state.2.len() != self.n_haps {
+                    state.0 = checkpoint_idx;
+                    state.1 = marker_idx;
+                    state.2 = self.bwd_ppa[checkpoint_idx].clone();
+                    state.3 = self.bwd_div[checkpoint_idx].clone();
+
+                    let mut updater = upd_cell.borrow_mut();
+                    if updater.n_haps() != self.n_haps {
+                        *updater = PbwtDivUpdater::new(self.n_haps);
+                    }
+                    let mut ppa = std::mem::take(&mut state.2);
+                    let mut div = std::mem::take(&mut state.3);
+                    for m in (marker_idx..checkpoint_marker).rev() {
+                        let n_alleles = self.n_alleles_by_marker[m];
+                        updater.bwd_update(&self.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                    }
+                    state.2 = ppa;
+                    state.3 = div;
                 }
-                cache.0 = checkpoint_idx;
+                f(&state.2, &state.3)
+            })
+        })
+    }
+
+    fn with_fwd_pos_at_marker<R>(
+        &self,
+        marker_idx: usize,
+        hap_idx: u32,
+        f: impl FnOnce(&[u32], &[i32], usize) -> R,
+    ) -> R {
+        self.with_fwd_state(marker_idx, |ppa, div| {
+            thread_local! {
+                static FWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
+                    std::cell::RefCell::new((usize::MAX, Vec::new()));
             }
-            f(&cache.1)
+            FWD_POS_AT.with(|cell| {
+                let mut cache = cell.borrow_mut();
+                if cache.0 != marker_idx || cache.1.len() != ppa.len() {
+                    cache.1.clear();
+                    cache.1.resize(ppa.len(), 0u32);
+                    for (i, &h) in ppa.iter().enumerate() {
+                        cache.1[h as usize] = i as u32;
+                    }
+                    cache.0 = marker_idx;
+                }
+                let pos = cache.1[hap_idx as usize] as usize;
+                f(ppa, div, pos)
+            })
+        })
+    }
+
+    fn with_bwd_pos_at_marker<R>(
+        &self,
+        marker_idx: usize,
+        hap_idx: u32,
+        f: impl FnOnce(&[u32], &[i32], usize) -> R,
+    ) -> R {
+        self.with_bwd_state(marker_idx, |ppa, div| {
+            thread_local! {
+                static BWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
+                    std::cell::RefCell::new((usize::MAX, Vec::new()));
+            }
+            BWD_POS_AT.with(|cell| {
+                let mut cache = cell.borrow_mut();
+                if cache.0 != marker_idx || cache.1.len() != ppa.len() {
+                    cache.1.clear();
+                    cache.1.resize(ppa.len(), 0u32);
+                    for (i, &h) in ppa.iter().enumerate() {
+                        cache.1[h as usize] = i as u32;
+                    }
+                    cache.0 = marker_idx;
+                }
+                let pos = cache.1[hap_idx as usize] as usize;
+                f(ppa, div, pos)
+            })
         })
     }
 
@@ -215,11 +326,20 @@ impl BidirectionalPhaseIbs {
         result
     }
 
-    /// Convert marker index to checkpoint index for sparse PBWT lookup.
-    /// Uses the nearest checkpoint at or before the marker.
     #[inline(always)]
-    fn marker_to_checkpoint(&self, marker_idx: usize) -> usize {
-        (marker_idx / PBWT_CHECKPOINT_INTERVAL).min(self.n_checkpoints.saturating_sub(1))
+    fn marker_to_checkpoint_floor(&self, marker_idx: usize) -> usize {
+        match self.checkpoint_markers.binary_search(&marker_idx) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        }
+    }
+
+    #[inline(always)]
+    fn marker_to_checkpoint_ceil(&self, marker_idx: usize) -> usize {
+        match self.checkpoint_markers.binary_search(&marker_idx) {
+            Ok(idx) => idx,
+            Err(idx) => idx.min(self.n_checkpoints.saturating_sub(1)),
+        }
     }
 
     /// Find neighbor haplotypes at a marker using bidirectional PBWT and IBS2.
@@ -237,8 +357,7 @@ impl BidirectionalPhaseIbs {
     /// The combined set excludes the target haplotype and its pair from the
     /// same sample.
     ///
-    /// Note: Uses sparse PBWT storage - queries snap to nearest checkpoint for
-    /// an approximation that works well for IBS neighbor finding.
+    /// Note: Uses sparse PBWT storage with exact per-marker recomputation from checkpoints.
     ///
     /// # Arguments
     /// * `hap_idx` - Target haplotype index
@@ -305,41 +424,35 @@ impl BidirectionalPhaseIbs {
             return 0;
         }
 
-        // Snap to nearest checkpoint for sparse storage
-        let checkpoint_idx = self.marker_to_checkpoint(marker_idx);
-        if checkpoint_idx >= self.fwd_ppa.len() || checkpoint_idx >= self.bwd_ppa.len() {
-            return 0;
-        }
-
-        // O(1) position lookup using inverse index at checkpoint
-        let pos_fwd = self.with_fwd_pos(checkpoint_idx, |pos| pos[hap_idx as usize] as usize);
-        let pos_bwd = self.with_bwd_pos(checkpoint_idx, |pos| pos[hap_idx as usize] as usize);
-
         let mut best_fwd = 0usize;
-        for pos in [pos_fwd.wrapping_sub(1), pos_fwd + 1] {
-            if pos < self.n_haps {
-                let start = self.fwd_div[checkpoint_idx][pos];
-                if marker_idx as i32 >= start {
-                    let span = (marker_idx as i32 - start + 1) as usize;
-                    if span > best_fwd {
-                        best_fwd = span;
+        self.with_fwd_pos_at_marker(marker_idx, hap_idx, |_, div, pos_fwd| {
+            for pos in [pos_fwd.wrapping_sub(1), pos_fwd + 1] {
+                if pos < self.n_haps {
+                    let start = div[pos];
+                    if marker_idx as i32 >= start {
+                        let span = (marker_idx as i32 - start + 1) as usize;
+                        if span > best_fwd {
+                            best_fwd = span;
+                        }
                     }
                 }
             }
-        }
+        });
 
         let mut best_bwd = 0usize;
-        for pos in [pos_bwd.wrapping_sub(1), pos_bwd + 1] {
-            if pos < self.n_haps {
-                let end = self.bwd_div[checkpoint_idx][pos];
-                if end >= marker_idx as i32 {
-                    let span = (end - marker_idx as i32 + 1) as usize;
-                    if span > best_bwd {
-                        best_bwd = span;
+        self.with_bwd_pos_at_marker(marker_idx, hap_idx, |_, div, pos_bwd| {
+            for pos in [pos_bwd.wrapping_sub(1), pos_bwd + 1] {
+                if pos < self.n_haps {
+                    let end = div[pos];
+                    if end >= marker_idx as i32 {
+                        let span = (end - marker_idx as i32 + 1) as usize;
+                        if span > best_bwd {
+                            best_bwd = span;
+                        }
                     }
                 }
             }
-        }
+        });
 
         if best_fwd > 0 && best_bwd > 0 {
             best_fwd + best_bwd - 1
@@ -353,85 +466,62 @@ impl BidirectionalPhaseIbs {
             return Vec::new();
         }
 
-        // Snap to nearest checkpoint for sparse storage
-        let checkpoint_idx = self.marker_to_checkpoint(marker_idx);
-        if checkpoint_idx >= self.fwd_ppa.len() {
-            return Vec::new();
-        }
+        self.with_fwd_pos_at_marker(marker_idx, hap_idx, |ppa, div, sorted_pos| {
+            let marker_i32 = marker_idx as i32;
+            let mut result = Vec::with_capacity(n_candidates);
 
-        let ppa = &self.fwd_ppa[checkpoint_idx];
-        let div = &self.fwd_div[checkpoint_idx];
+            let mut u = sorted_pos;
+            let mut v = sorted_pos + 1;
+            let mut max_div_up = i32::MIN;
+            let mut max_div_down = i32::MIN;
 
-        // O(1) position lookup using inverse index at checkpoint
-        let sorted_pos = self.with_fwd_pos(checkpoint_idx, |pos| pos[hap_idx as usize] as usize);
-        let marker_i32 = marker_idx as i32;
+            while result.len() < n_candidates {
+                let div_up = if u > 0 { div.get(u).copied().unwrap_or(i32::MAX) } else { i32::MAX };
+                let div_down = if v < self.n_haps { div.get(v).copied().unwrap_or(i32::MAX) } else { i32::MAX };
 
-        // For forward PBWT, div[i] = marker where match started (divergence point).
-        // A valid match has div[i] <= marker_idx (match still active).
-        // Java: continue while d[u] <= step (match started at or before current step)
-        // Note: backoff_limit is available for future backoff implementation but not used currently
+                let up_valid = u > 0 && max_div_up.max(div_up) <= marker_i32;
+                let down_valid = v < self.n_haps && max_div_down.max(div_down) <= marker_i32;
 
-        let mut result = Vec::with_capacity(n_candidates);
+                if !up_valid && !down_valid {
+                    break;
+                }
 
-        // Dynamic expansion: choose direction with lower divergence (= longer match = better neighbor)
-        // instead of forcing 50/50 split between up/down directions
-        let mut u = sorted_pos;
-        let mut v = sorted_pos + 1;
-        let mut max_div_up = i32::MIN;
-        let mut max_div_down = i32::MIN;
+                let go_up = up_valid && (!down_valid || div_up <= div_down);
 
-        while result.len() < n_candidates {
-            // Get next divergence values in each direction
-            let div_up = if u > 0 { div.get(u).copied().unwrap_or(i32::MAX) } else { i32::MAX };
-            let div_down = if v < self.n_haps { div.get(v).copied().unwrap_or(i32::MAX) } else { i32::MAX };
-
-            // Check if either direction still has valid matches (divergence <= current marker)
-            let up_valid = u > 0 && max_div_up.max(div_up) <= marker_i32;
-            let down_valid = v < self.n_haps && max_div_down.max(div_down) <= marker_i32;
-
-            if !up_valid && !down_valid {
-                break; // No more valid matches in either direction
+                if go_up {
+                    max_div_up = max_div_up.max(div_up);
+                    u -= 1;
+                    let h = ppa[u];
+                    if h != hap_idx {
+                        result.push(h);
+                    }
+                } else {
+                    max_div_down = max_div_down.max(div_down);
+                    let h = ppa[v];
+                    if h != hap_idx {
+                        result.push(h);
+                    }
+                    v += 1;
+                }
             }
 
-            // For forward PBWT: lower divergence = longer match = better neighbor
-            // Choose direction with lower next divergence value
-            let go_up = up_valid && (!down_valid || div_up <= div_down);
-
-            if go_up {
-                max_div_up = max_div_up.max(div_up);
+            while result.len() < n_candidates && u > 0 {
                 u -= 1;
                 let h = ppa[u];
                 if h != hap_idx {
                     result.push(h);
                 }
-            } else {
-                max_div_down = max_div_down.max(div_down);
+            }
+            while result.len() < n_candidates && v < self.n_haps {
                 let h = ppa[v];
                 if h != hap_idx {
                     result.push(h);
                 }
                 v += 1;
             }
-        }
 
-        // Fallback: if strict PBWT matching yields too few neighbors,
-        // expand outward without divergence constraints to fill the pool.
-        while result.len() < n_candidates && u > 0 {
-            u -= 1;
-            let h = ppa[u];
-            if h != hap_idx {
-                result.push(h);
-            }
-        }
-        while result.len() < n_candidates && v < self.n_haps {
-            let h = ppa[v];
-            if h != hap_idx {
-                result.push(h);
-            }
-            v += 1;
-        }
-
-        result
+            result
+        })
     }
 
     fn find_bwd_neighbors(&self, hap_idx: u32, marker_idx: usize, n_candidates: usize) -> Vec<u32> {
@@ -439,85 +529,62 @@ impl BidirectionalPhaseIbs {
             return Vec::new();
         }
 
-        // Snap to nearest checkpoint for sparse storage
-        let checkpoint_idx = self.marker_to_checkpoint(marker_idx);
-        if checkpoint_idx >= self.bwd_ppa.len() {
-            return Vec::new();
-        }
+        self.with_bwd_pos_at_marker(marker_idx, hap_idx, |ppa, div, sorted_pos| {
+            let marker_i32 = marker_idx as i32;
+            let mut result = Vec::with_capacity(n_candidates);
 
-        let ppa = &self.bwd_ppa[checkpoint_idx];
-        let div = &self.bwd_div[checkpoint_idx];
+            let mut u = sorted_pos;
+            let mut v = sorted_pos + 1;
+            let mut min_div_up = i32::MAX;
+            let mut min_div_down = i32::MAX;
 
-        // O(1) position lookup using inverse index at checkpoint
-        let sorted_pos = self.with_bwd_pos(checkpoint_idx, |pos| pos[hap_idx as usize] as usize);
-        let marker_i32 = marker_idx as i32;
+            while result.len() < n_candidates {
+                let div_up = if u > 0 { div.get(u).copied().unwrap_or(0) } else { 0 };
+                let div_down = if v < self.n_haps { div.get(v).copied().unwrap_or(0) } else { 0 };
 
-        // For backward PBWT, div[i] = marker where match ENDS (going backward).
-        // A valid match has div[i] >= marker_idx (match continues at or past current marker).
-        // Java: continue while step <= uNextMatchEnd || step <= vNextMatchEnd
-        // i.e., continue while marker_idx <= div[i] (match still active at current marker)
-        // Note: backoff_limit is available for future backoff implementation but not used currently
+                let up_valid = u > 0 && min_div_up.min(div_up) >= marker_i32;
+                let down_valid = v < self.n_haps && min_div_down.min(div_down) >= marker_i32;
 
-        let mut result = Vec::with_capacity(n_candidates);
+                if !up_valid && !down_valid {
+                    break;
+                }
 
-        // Dynamic expansion: choose direction with higher divergence (= longer match = better neighbor)
-        // For backward PBWT, higher div = match ends later = longer match
-        let mut u = sorted_pos;
-        let mut v = sorted_pos + 1;
-        let mut min_div_up = i32::MAX;
-        let mut min_div_down = i32::MAX;
+                let go_up = up_valid && (!down_valid || div_up >= div_down);
 
-        while result.len() < n_candidates {
-            // Get next divergence values in each direction
-            let div_up = if u > 0 { div.get(u).copied().unwrap_or(0) } else { 0 };
-            let div_down = if v < self.n_haps { div.get(v).copied().unwrap_or(0) } else { 0 };
-
-            // Check if either direction still has valid matches (divergence >= current marker)
-            let up_valid = u > 0 && min_div_up.min(div_up) >= marker_i32;
-            let down_valid = v < self.n_haps && min_div_down.min(div_down) >= marker_i32;
-
-            if !up_valid && !down_valid {
-                break; // No more valid matches in either direction
+                if go_up {
+                    min_div_up = min_div_up.min(div_up);
+                    u -= 1;
+                    let h = ppa[u];
+                    if h != hap_idx {
+                        result.push(h);
+                    }
+                } else {
+                    min_div_down = min_div_down.min(div_down);
+                    let h = ppa[v];
+                    if h != hap_idx {
+                        result.push(h);
+                    }
+                    v += 1;
+                }
             }
 
-            // For backward PBWT: higher divergence = longer match = better neighbor
-            // Choose direction with higher next divergence value
-            let go_up = up_valid && (!down_valid || div_up >= div_down);
-
-            if go_up {
-                min_div_up = min_div_up.min(div_up);
+            while result.len() < n_candidates && u > 0 {
                 u -= 1;
                 let h = ppa[u];
                 if h != hap_idx {
                     result.push(h);
                 }
-            } else {
-                min_div_down = min_div_down.min(div_down);
+            }
+            while result.len() < n_candidates && v < self.n_haps {
                 let h = ppa[v];
                 if h != hap_idx {
                     result.push(h);
                 }
                 v += 1;
             }
-        }
 
-        // Fallback: widen search without divergence constraints if needed.
-        while result.len() < n_candidates && u > 0 {
-            u -= 1;
-            let h = ppa[u];
-            if h != hap_idx {
-                result.push(h);
-            }
-        }
-        while result.len() < n_candidates && v < self.n_haps {
-            let h = ppa[v];
-            if h != hap_idx {
-                result.push(h);
-            }
-            v += 1;
-        }
-
-        result
+            result
+        })
     }
 
     /// Get the number of haplotypes
@@ -559,70 +626,57 @@ impl BidirectionalPhaseIbs {
             return Vec::new();
         }
 
-        // Snap to nearest checkpoint for sparse storage
-        let checkpoint_idx = self.marker_to_checkpoint(marker_idx);
-        if checkpoint_idx >= self.fwd_ppa.len() {
-            return Vec::new();
-        }
-
         let hap1 = sample_idx * 2;
         let hap2 = sample_idx * 2 + 1;
 
-        // O(1) position lookup: where is ref_state in the sorted PBWT at checkpoint?
-        let center_pos = self.with_fwd_pos(checkpoint_idx, |pos| pos[ref_state as usize] as usize);
+        self.with_fwd_pos_at_marker(marker_idx, ref_state, |ppa, div, center_pos| {
+            let marker_i32 = marker_idx as i32;
+            let mut neighbors = Vec::with_capacity(n_candidates + 4);
 
-        let ppa = &self.fwd_ppa[checkpoint_idx];
-        let div = &self.fwd_div[checkpoint_idx];
-        let marker_i32 = marker_idx as i32;
+            let mut u = center_pos;
+            let mut v = center_pos + 1;
+            let mut max_div_u = i32::MIN;
+            let mut max_div_v = i32::MIN;
 
-        let mut neighbors = Vec::with_capacity(n_candidates + 4);
+            while neighbors.len() < n_candidates {
+                let can_go_u = u > 0;
+                let can_go_v = v < self.n_haps;
 
-        // Expand outward from center_pos, respecting divergence constraints
-        let mut u = center_pos;
-        let mut v = center_pos + 1;
-        let mut max_div_u = i32::MIN;
-        let mut max_div_v = i32::MIN;
-
-        while neighbors.len() < n_candidates {
-            let can_go_u = u > 0;
-            let can_go_v = v < self.n_haps;
-
-            if !can_go_u && !can_go_v {
-                break;
-            }
-
-            // Prefer direction with better divergence (longer match)
-            let prefer_u = if can_go_u && can_go_v {
-                let div_u = div.get(u).copied().unwrap_or(i32::MAX);
-                let div_v = div.get(v).copied().unwrap_or(i32::MAX);
-                div_u <= div_v
-            } else {
-                can_go_u
-            };
-
-            if prefer_u && can_go_u {
-                max_div_u = max_div_u.max(div.get(u).copied().unwrap_or(i32::MAX));
-                u -= 1;
-                let h = ppa[u];
-                if h != hap1 && h != hap2 && h != ref_state {
-                    neighbors.push(h);
+                if !can_go_u && !can_go_v {
+                    break;
                 }
-            } else if can_go_v {
-                max_div_v = max_div_v.max(div.get(v).copied().unwrap_or(i32::MAX));
-                let h = ppa[v];
-                if h != hap1 && h != hap2 && h != ref_state {
-                    neighbors.push(h);
+
+                let prefer_u = if can_go_u && can_go_v {
+                    let div_u = div.get(u).copied().unwrap_or(i32::MAX);
+                    let div_v = div.get(v).copied().unwrap_or(i32::MAX);
+                    div_u <= div_v
+                } else {
+                    can_go_u
+                };
+
+                if prefer_u && can_go_u {
+                    max_div_u = max_div_u.max(div.get(u).copied().unwrap_or(i32::MAX));
+                    u -= 1;
+                    let h = ppa[u];
+                    if h != hap1 && h != hap2 && h != ref_state {
+                        neighbors.push(h);
+                    }
+                } else if can_go_v {
+                    max_div_v = max_div_v.max(div.get(v).copied().unwrap_or(i32::MAX));
+                    let h = ppa[v];
+                    if h != hap1 && h != hap2 && h != ref_state {
+                        neighbors.push(h);
+                    }
+                    v += 1;
                 }
-                v += 1;
+
+                if max_div_u > marker_i32 && max_div_v > marker_i32 && neighbors.len() >= n_candidates / 2 {
+                    break;
+                }
             }
 
-            // Stop expanding in a direction if divergence exceeds marker (match broken)
-            if max_div_u > marker_i32 && max_div_v > marker_i32 && neighbors.len() >= n_candidates / 2 {
-                break;
-            }
-        }
-
-        neighbors
+            neighbors
+        })
     }
 }
 

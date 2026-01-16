@@ -98,11 +98,11 @@ impl PhaseStates {
 
     /// Build composite haplotypes for a sample's two haplotypes
     ///
-    /// This samples at SPARSE positions (not all markers) to find IBS neighbors,
+    /// This samples at genetic-distance-spaced positions to find IBS neighbors,
     /// providing dynamic state selection without the O(n_markers) overhead.
     ///
-    /// Samples at ~64 evenly-spaced positions instead of all markers, reducing
-    /// overhead by ~100x for typical datasets (8000 markers -> 64 samples).
+    /// Sampling uses a fixed cM step to keep resolution aligned to recombination
+    /// distance rather than marker count.
     ///
     /// # Arguments
     /// * `sample` - Sample index (hap1 = sample * 2, hap2 = sample * 2 + 1)
@@ -118,19 +118,22 @@ impl PhaseStates {
         phase_ibs: &BidirectionalPhaseIbs,
         ibs2: &Ibs2,
         n_candidates: usize,
+        gen_positions: &[f64],
+        step_cm: f32,
     ) -> ThreadedHaps {
         self.clear();
 
         let h1 = sample * 2;
         let h2 = h1 + 1;
 
-        // Sample at sparse positions instead of all markers
-        // This provides good coverage while being O(1) per sample instead of O(n_markers)
-        const MAX_SAMPLE_POINTS: usize = 64;
-        let step = (self.n_markers / MAX_SAMPLE_POINTS).max(1);
+        let step_cm = step_cm.max(1e-4) as f64;
+        let mut next_cm = gen_positions.first().copied().unwrap_or(0.0);
 
-        let mut marker = 0usize;
-        while marker < self.n_markers {
+        for marker in 0..self.n_markers {
+            let cm = gen_positions.get(marker).copied().unwrap_or(next_cm);
+            if cm < next_cm && marker + 1 < self.n_markers {
+                continue;
+            }
             // Get IBS neighbors for both haplotypes at this marker
             let neighbors1 = phase_ibs.find_neighbors(h1, marker, ibs2, n_candidates);
             let neighbors2 = phase_ibs.find_neighbors(h2, marker, ibs2, n_candidates);
@@ -146,8 +149,7 @@ impl PhaseStates {
                     self.add_ibs_hap(ibs_hap, marker as i32);
                 }
             }
-
-            marker += step;
+            next_cm = cm + step_cm;
         }
 
         // Also sample the last marker if not already covered

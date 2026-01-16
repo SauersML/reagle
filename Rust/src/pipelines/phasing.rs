@@ -632,6 +632,10 @@ impl PhasingPipeline {
 
         // Create mapping from hi-freq index to original index
         let hi_freq_to_orig: Vec<usize> = hi_freq_markers.clone();
+        let hi_freq_gen_positions: Vec<f64> = hi_freq_to_orig
+            .iter()
+            .map(|&m| gen_positions[m])
+            .collect();
 
         // Compute genetic distances only for HIGH-FREQUENCY markers
         // This is critical: recombination probabilities must be computed for the
@@ -707,6 +711,7 @@ impl PhasingPipeline {
                 &stage1_p_recomb,
                 &stage1_gen_dists,
                 &hi_freq_to_orig,
+                &hi_freq_gen_positions,
                 &ibs2,
                 &mut sample_phases,
                 &mut mcmc_paths,
@@ -756,6 +761,7 @@ impl PhasingPipeline {
                 &mut geno,
                 &hi_freq_markers,
                 &gen_positions,
+                &hi_freq_gen_positions,
                 &stage1_p_recomb,
                 &ibs2,
                 &mut sample_phases,
@@ -1147,6 +1153,10 @@ impl PhasingPipeline {
             MarkerMap::from_positions(target_gt.markers())
         };
         let gen_positions_vec = marker_map_full.gen_positions().to_vec();
+        let hi_freq_gen_positions: Vec<f64> = hi_freq_markers
+            .iter()
+            .map(|&m| gen_positions_vec[m])
+            .collect();
 
         let next_state_probs = if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
             eprintln!(
@@ -1157,6 +1167,7 @@ impl PhasingPipeline {
                 &mut geno,
                 &hi_freq_markers,
                 &gen_positions_vec,
+                &hi_freq_gen_positions,
                 &stage1_p_recomb,
                 &ibs2,
                 &mut sample_phases,
@@ -1884,6 +1895,7 @@ impl PhasingPipeline {
         stage1_p_recomb: &[f32],
         stage1_gen_dists: &[f64],
         hi_freq_to_orig: &[usize],
+        hi_freq_gen_positions: &[f64],
         ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
         mcmc_paths: &mut [Option<MosaicPaths>],
@@ -1966,6 +1978,8 @@ impl PhasingPipeline {
                         &phase_ibs,
                         ibs2,
                         20,
+                        hi_freq_gen_positions,
+                        self.config.imp_step,
                     );
                     let n_states = phase_states.n_states();
 
@@ -2184,6 +2198,7 @@ impl PhasingPipeline {
         geno: &mut MutableGenotypes,
         hi_freq_markers: &[usize],
         gen_positions: &[f64],
+        hi_freq_gen_positions: &[f64],
         stage1_p_recomb: &[f32],
         ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
@@ -2341,6 +2356,8 @@ impl PhasingPipeline {
                     &phase_ibs,
                     ibs2,
                     20,
+                    hi_freq_gen_positions,
+                    self.config.imp_step,
                 );
                 let n_states = phase_states.n_states();
 
