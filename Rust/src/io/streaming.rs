@@ -379,6 +379,9 @@ impl StreamingVcfReader {
                     break;
                 }
             } else {
+                // Prepend the line to the reader's buffer, so it can be read again
+                let new_reader = BufReader::new(line.as_bytes().chain(reader));
+                reader = Box::new(new_reader);
                 break;
             }
         }
@@ -395,10 +398,8 @@ impl StreamingVcfReader {
             .collect();
 
         let samples = Arc::new(Samples::from_ids(sample_names));
-        let header_samples = samples.len();
-        let header_lines = header_str.lines().count();
 
-        let mut reader = Self {
+        let reader = Self {
             reader,
             samples,
             config,
@@ -413,13 +414,6 @@ impl StreamingVcfReader {
             all_phased: true,
         };
 
-        if let Err(e) = reader.prefetch_first_marker() {
-            return Err(ReagleError::vcf(format!(
-                "{} (header_lines={}, header_samples={})",
-                e, header_lines, header_samples
-            )));
-        }
-
         Ok(reader)
         })
     }
@@ -432,9 +426,7 @@ impl StreamingVcfReader {
             self.buffer.push_back(bm);
             return Ok(());
         }
-        Err(ReagleError::vcf(
-            "No variant records found while profiling; input VCF may be empty or malformed.",
-        ))
+        Ok(())
     }
 
     /// Get samples Arc
