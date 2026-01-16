@@ -57,6 +57,7 @@ impl crate::pipelines::ImputationPipeline {
         target_win: &GenotypeMatrix<Phased>,
         ref_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
+        ref_is_biallelic: &[bool],
         cluster_midpoints: &[usize],
         midpoint_to_cluster: &[usize],
         n_states: usize,
@@ -72,8 +73,11 @@ impl crate::pipelines::ImputationPipeline {
         let hap2_idx = HapIdx::new((sample_idx * 2 + 1) as u32);
 
         let n_total_haps = n_ref_haps + 2;
-        let mut wavefront = PbwtWavefront::new(n_total_haps, n_ref_markers);
-        let mut alleles = vec![0u8; n_total_haps];
+
+        thread_local! {
+            static PBWT_WORKSPACE: std::cell::RefCell<Option<(PbwtWavefront, Vec<u8>)>> =
+                std::cell::RefCell::new(None);
+        }
 
         let mut hap1_neighbors: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
         let mut hap2_neighbors: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
@@ -92,99 +96,109 @@ impl crate::pipelines::ImputationPipeline {
 
         let n_candidates = n_states.min(n_ref_haps);
 
-        wavefront.reset_forward();
-        for m in 0..n_ref_markers {
-            let ref_marker_idx = MarkerIdx::new(m as u32);
-            let target_m = alignment.target_marker(m);
+        PBWT_WORKSPACE.with(|cell| {
+            let mut ws_opt = cell.borrow_mut();
+            if ws_opt.is_none() {
+                *ws_opt = Some((PbwtWavefront::new(n_total_haps, n_ref_markers), vec![0u8; n_total_haps]));
+            }
+            let (wavefront, alleles) = ws_opt.as_mut().unwrap();
+            if wavefront.n_haps() != n_total_haps || wavefront.n_markers() != n_ref_markers {
+                *wavefront = PbwtWavefront::new(n_total_haps, n_ref_markers);
+                alleles.resize(n_total_haps, 0u8);
+            }
 
-            for h in 0..n_ref_haps {
-                let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
-                if let Some(target_m) = target_m {
-                    if alignment.has_allele_mapping(target_m) {
-                        allele = alignment.reverse_map_allele(target_m, allele);
+            wavefront.reset_forward();
+            for m in 0..n_ref_markers {
+                let ref_marker_idx = MarkerIdx::new(m as u32);
+                let target_m = alignment.target_marker(m);
+
+                for h in 0..n_ref_haps {
+                    let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
+                    if let Some(target_m) = target_m {
+                        if alignment.has_allele_mapping(target_m) {
+                            allele = alignment.reverse_map_allele(target_m, allele);
+                        }
+                    }
+                    alleles[h] = allele;
+                }
+
+                let target_allele = target_m
+                    .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap1_idx))
+                    .unwrap_or(255);
+                alleles[n_ref_haps] = target_allele;
+                let target_allele = target_m
+                    .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap2_idx))
+                    .unwrap_or(255);
+                alleles[n_ref_haps + 1] = target_allele;
+
+                let is_biallelic = ref_is_biallelic
+                    .get(m)
+                    .copied()
+                    .unwrap_or(true)
+                    && alleles[n_ref_haps] < 2
+                    && alleles[n_ref_haps + 1] < 2;
+                let n_alleles = if is_biallelic { 2 } else { 256 };
+
+                wavefront.advance_forward(alleles, n_alleles);
+
+                if m < midpoint_to_cluster.len() {
+                    let cluster_idx = midpoint_to_cluster[m];
+                    if cluster_idx != usize::MAX {
+                        wavefront.prepare_fwd_queries();
+                        let h1 = wavefront.find_fwd_neighbors_readonly(n_ref_haps as u32, n_candidates);
+                        let h2 = wavefront.find_fwd_neighbors_readonly(n_ref_haps as u32 + 1, n_candidates);
+                        add_neighbors(&mut hap1_neighbors, cluster_idx, h1);
+                        add_neighbors(&mut hap2_neighbors, cluster_idx, h2);
                     }
                 }
-                alleles[h] = allele;
             }
 
-            let target_allele = target_m
-                .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap1_idx))
-                .unwrap_or(255);
-            alleles[n_ref_haps] = target_allele;
-            let target_allele = target_m
-                .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap2_idx))
-                .unwrap_or(255);
-            alleles[n_ref_haps + 1] = target_allele;
+            wavefront.reset_backward();
+            for m in (0..n_ref_markers).rev() {
+                let ref_marker_idx = MarkerIdx::new(m as u32);
+                let target_m = alignment.target_marker(m);
 
-            let mut is_biallelic = true;
-            for &a in &alleles {
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
+                for h in 0..n_ref_haps {
+                    let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
+                    if let Some(target_m) = target_m {
+                        if alignment.has_allele_mapping(target_m) {
+                            allele = alignment.reverse_map_allele(target_m, allele);
+                        }
+                    }
+                    alleles[h] = allele;
                 }
-            }
-            let n_alleles = if is_biallelic { 2 } else { 256 };
 
-            wavefront.advance_forward(&alleles, n_alleles);
+                let target_allele = target_m
+                    .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap1_idx))
+                    .unwrap_or(255);
+                alleles[n_ref_haps] = target_allele;
+                let target_allele = target_m
+                    .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap2_idx))
+                    .unwrap_or(255);
+                alleles[n_ref_haps + 1] = target_allele;
 
-            if m < midpoint_to_cluster.len() {
-                let cluster_idx = midpoint_to_cluster[m];
-                if cluster_idx != usize::MAX {
-                    wavefront.prepare_fwd_queries();
-                    let h1 = wavefront.find_fwd_neighbors_readonly(n_ref_haps as u32, n_candidates);
-                    let h2 = wavefront.find_fwd_neighbors_readonly(n_ref_haps as u32 + 1, n_candidates);
-                    add_neighbors(&mut hap1_neighbors, cluster_idx, h1);
-                    add_neighbors(&mut hap2_neighbors, cluster_idx, h2);
-                }
-            }
-        }
+                let is_biallelic = ref_is_biallelic
+                    .get(m)
+                    .copied()
+                    .unwrap_or(true)
+                    && alleles[n_ref_haps] < 2
+                    && alleles[n_ref_haps + 1] < 2;
+                let n_alleles = if is_biallelic { 2 } else { 256 };
 
-        wavefront.reset_backward();
-        for m in (0..n_ref_markers).rev() {
-            let ref_marker_idx = MarkerIdx::new(m as u32);
-            let target_m = alignment.target_marker(m);
+                wavefront.advance_backward(alleles, n_alleles);
 
-            for h in 0..n_ref_haps {
-                let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
-                if let Some(target_m) = target_m {
-                    if alignment.has_allele_mapping(target_m) {
-                        allele = alignment.reverse_map_allele(target_m, allele);
+                if m < midpoint_to_cluster.len() {
+                    let cluster_idx = midpoint_to_cluster[m];
+                    if cluster_idx != usize::MAX {
+                        wavefront.prepare_bwd_queries();
+                        let h1 = wavefront.find_bwd_neighbors_readonly(n_ref_haps as u32, n_candidates);
+                        let h2 = wavefront.find_bwd_neighbors_readonly(n_ref_haps as u32 + 1, n_candidates);
+                        add_neighbors(&mut hap1_neighbors, cluster_idx, h1);
+                        add_neighbors(&mut hap2_neighbors, cluster_idx, h2);
                     }
                 }
-                alleles[h] = allele;
             }
-
-            let target_allele = target_m
-                .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap1_idx))
-                .unwrap_or(255);
-            alleles[n_ref_haps] = target_allele;
-            let target_allele = target_m
-                .map(|tm| target_win.allele(MarkerIdx::new(tm as u32), hap2_idx))
-                .unwrap_or(255);
-            alleles[n_ref_haps + 1] = target_allele;
-
-            let mut is_biallelic = true;
-            for &a in &alleles {
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
-                }
-            }
-            let n_alleles = if is_biallelic { 2 } else { 256 };
-
-            wavefront.advance_backward(&alleles, n_alleles);
-
-            if m < midpoint_to_cluster.len() {
-                let cluster_idx = midpoint_to_cluster[m];
-                if cluster_idx != usize::MAX {
-                    wavefront.prepare_bwd_queries();
-                    let h1 = wavefront.find_bwd_neighbors_readonly(n_ref_haps as u32, n_candidates);
-                    let h2 = wavefront.find_bwd_neighbors_readonly(n_ref_haps as u32 + 1, n_candidates);
-                    add_neighbors(&mut hap1_neighbors, cluster_idx, h1);
-                    add_neighbors(&mut hap2_neighbors, cluster_idx, h2);
-                }
-            }
-        }
+        });
 
         let finalize = |neighbors: Vec<Vec<u32>>| -> Vec<Vec<u32>> {
             let mut out = Vec::with_capacity(n_clusters);
@@ -613,6 +627,9 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let chrom = ref_win.marker(MarkerIdx::new(0)).chrom;
+        let ref_is_biallelic: Vec<bool> = (0..n_ref_markers)
+            .map(|m| ref_win.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
+            .collect();
         let gen_positions: Vec<f64> = (0..n_ref_markers)
             .map(|m| {
                 if m == 0 { 0.0 }
@@ -723,6 +740,7 @@ impl crate::pipelines::ImputationPipeline {
                             target_win,
                             ref_win,
                             alignment,
+                            &ref_is_biallelic,
                             &cluster_midpoints,
                             &midpoint_to_cluster,
                             pbwt_states,
@@ -944,15 +962,12 @@ impl crate::pipelines::ImputationPipeline {
         // Sort all results by sample index for writing
         all_results.sort_by_key(|result| result.sample_idx);
 
-        let is_biallelic: Vec<bool> = (0..n_ref_markers)
-            .map(|m| ref_win.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
-            .collect();
 
         for result in &all_results {
             if let Some((ref p1, ref p2)) = result.hap_alt_probs {
                 for (local_m, (&p1_alt, &p2_alt)) in p1.iter().zip(p2.iter()).enumerate() {
                     let ref_m = markers_to_process.start + local_m;
-                    if ref_m < n_ref_markers && is_biallelic[ref_m] {
+                    if ref_m < n_ref_markers && ref_is_biallelic[ref_m] {
                         if let Some(stats) = window_quality.get_mut(ref_m) {
                             stats.add_sample_biallelic(p1_alt, p2_alt);
                         }
