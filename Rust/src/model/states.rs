@@ -435,7 +435,6 @@ mod tests {
         th.push_new(30);
         th.add_segment(1, 35, 50);
 
-        th.reset_cursors();
         for m in 0..100 {
             let expected0 = if m < 40 {
                 10
@@ -446,13 +445,16 @@ mod tests {
             };
             let expected1 = if m < 50 { 30 } else { 35 };
 
-            assert_eq!(th.hap_at_raw(0, m), expected0);
-            assert_eq!(th.hap_at_raw(1, m), expected1);
+            let mut buffer = vec![0u32; 2];
+            th.materialize_at(m, &mut buffer);
+            assert_eq!(buffer[0], expected0);
+            assert_eq!(buffer[1], expected1);
         }
 
-        th.reset_cursors();
-        assert_eq!(th.hap_at_raw(0, 0), 10);
-        assert_eq!(th.hap_at_raw(1, 0), 30);
+        let mut buffer = vec![0u32; 2];
+        th.materialize_at(0, &mut buffer);
+        assert_eq!(buffer[0], 10);
+        assert_eq!(buffer[1], 30);
     }
 
     #[test]
