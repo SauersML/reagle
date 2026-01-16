@@ -754,14 +754,22 @@ impl crate::pipelines::ImputationPipeline {
         let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
         let cluster_weights = Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
 
-        const BATCH_SIZE: usize = 50;
-        let n_batches = (n_target_samples + BATCH_SIZE - 1) / BATCH_SIZE;
+        const PBWT_BYTES_PER_HAP: usize = 64;
+        let max_haps = self
+            .config
+            .pbwt_batch_mb
+            .saturating_mul(1024 * 1024)
+            / PBWT_BYTES_PER_HAP;
+        let max_batch_haps = max_haps.saturating_sub(n_ref_haps);
+        let max_batch_samples = (max_batch_haps / 2).max(1);
+        let batch_size = max_batch_samples.min(n_target_samples).max(1);
+        let n_batches = (n_target_samples + batch_size - 1) / batch_size;
 
         let mut all_results: Vec<SampleImputationResult> = Vec::new();
 
         for batch_idx in 0..n_batches {
-            let batch_start = batch_idx * BATCH_SIZE;
-            let batch_end = (batch_start + BATCH_SIZE).min(n_target_samples);
+            let batch_start = batch_idx * batch_size;
+            let batch_end = (batch_start + batch_size).min(n_target_samples);
             let batch_samples: Vec<usize> = (batch_start..batch_end).collect();
 
             let pbwt_states = self.params.n_states.min(n_ref_haps);

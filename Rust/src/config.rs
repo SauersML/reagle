@@ -99,6 +99,10 @@ pub struct Config {
     #[arg(long, default_value = "0.005")]
     pub cluster: f32,
 
+    /// PBWT batch memory budget (MB) for imputation state selection
+    #[arg(long = "pbwt-batch-mb", default_value = "256")]
+    pub pbwt_batch_mb: usize,
+
     /// Print posterior allele probabilities
     #[arg(long, default_value = "false")]
     pub ap: bool,
@@ -172,6 +176,7 @@ impl Default for Config {
             imp_step: 0.1,
             imp_nsteps: 7,
             cluster: 0.005,
+            pbwt_batch_mb: 256,
             ap: false,
             gp: false,
             ne: 100000.0,
