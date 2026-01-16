@@ -351,10 +351,27 @@ impl crate::pipelines::ImputationPipeline {
             n_ref_haps, n_target_samples
         );
 
+        // Pre-load reference markers to build a complete VCF header
+        let ref_markers = if is_bref3 {
+            crate::io::bref3::StreamingBref3Reader::open(ref_path)?.markers().clone()
+        } else {
+            // Memory-efficient scan for VCF markers
+            let (mut vcf_reader, vcf_file) = crate::io::vcf::VcfReader::open(ref_path)?;
+            vcf_reader.read_markers_only(vcf_file)?
+        };
+
         // Create output writer
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
+
+        // Write the header BEFORE starting the pipeline
+        writer.write_header_extended(
+            &ref_markers,
+            true, // imputed = true
+            self.config.gp,
+            self.config.ap,
+        )?;
 
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.

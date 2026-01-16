@@ -157,7 +157,7 @@ impl Bref3Reader {
         let block_start_idx = columns.len();
 
         for _ in 0..n_recs {
-            let marker = self.read_marker(chrom_idx)?;
+            let marker = read_marker_bref(&mut self.reader, chrom_idx)?;
             let flag = read_byte(&mut self.reader)?;
 
             match flag {
@@ -195,51 +195,6 @@ impl Bref3Reader {
         Ok(())
     }
 
-    /// Read marker info
-    fn read_marker(&mut self, chrom_idx: ChromIdx) -> Result<Marker> {
-        let pos = read_be_i32(&mut self.reader)? as u32;
-
-        let n_ids = read_byte(&mut self.reader)? as usize;
-        let id = if n_ids == 0 {
-            None
-        } else {
-            let mut ids = Vec::with_capacity(n_ids);
-            for _ in 0..n_ids {
-                ids.push(read_utf8_string(&mut self.reader)?);
-            }
-            Some(Arc::from(ids.join(";")))
-        };
-
-        let allele_code = read_byte(&mut self.reader)? as i8;
-        let (ref_allele, alt_alleles, end) = if allele_code == -1 {
-            let allele_strs = read_string_array(&mut self.reader)?;
-            let end_pos = read_be_i32(&mut self.reader)?;
-            let end = if end_pos >= 0 {
-                Some(end_pos as u32)
-            } else {
-                None
-            };
-            parse_alleles(&allele_strs, end)
-        } else {
-            let n_alleles = 1 + (allele_code & 0b11) as usize;
-            let perm_index = (allele_code >> 2) as usize;
-            let allele_strs: Vec<String> = SNV_PERMS[perm_index][..n_alleles]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            parse_alleles(&allele_strs, None)
-        };
-
-        Ok(Marker::with_end(
-            chrom_idx,
-            pos,
-            end,
-            id,
-            ref_allele,
-            alt_alleles,
-        ))
-    }
-
     /// Read allele-coded genotype record
     fn read_allele_coded_record(&mut self, n_alleles: usize) -> Result<Vec<u8>> {
         let mut alleles = vec![0u8; self.n_haps];
@@ -273,6 +228,51 @@ impl Bref3Reader {
     }
 }
 
+/// Read marker info from a BREF file stream
+fn read_marker_bref<R: Read>(reader: &mut R, chrom_idx: ChromIdx) -> Result<Marker> {
+    let pos = read_be_i32(reader)? as u32;
+
+    let n_ids = read_byte(reader)? as usize;
+    let id = if n_ids == 0 {
+        None
+    } else {
+        let mut ids = Vec::with_capacity(n_ids);
+        for _ in 0..n_ids {
+            ids.push(read_utf8_string(reader)?);
+        }
+        Some(Arc::from(ids.join(";")))
+    };
+
+    let allele_code = read_byte(reader)? as i8;
+    let (ref_allele, alt_alleles, end) = if allele_code == -1 {
+        let allele_strs = read_string_array(reader)?;
+        let end_pos = read_be_i32(reader)?;
+        let end = if end_pos >= 0 {
+            Some(end_pos as u32)
+        } else {
+            None
+        };
+        parse_alleles(&allele_strs, end)
+    } else {
+        let n_alleles = 1 + (allele_code & 0b11) as usize;
+        let perm_index = (allele_code >> 2) as usize;
+        let allele_strs: Vec<String> = SNV_PERMS[perm_index][..n_alleles]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        parse_alleles(&allele_strs, None)
+    };
+
+    Ok(Marker::with_end(
+        chrom_idx,
+        pos,
+        end,
+        id,
+        ref_allele,
+        alt_alleles,
+    ))
+}
+
 /// Parse allele strings into Allele types
 fn parse_alleles(
     allele_strs: &[String],
@@ -294,7 +294,7 @@ fn parse_alleles(
 }
 
 /// Read a big-endian i32
-fn read_be_i32<R: Read>(reader: &mut R) -> Result<i32> {
+fn read_be_i32<R: Read>(reader: &mut R) -> std::io::Result<i32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(i32::from_be_bytes(buf))
@@ -371,6 +371,7 @@ pub struct StreamingBref3Reader {
     reader: BufReader<File>,
     samples: Arc<Samples>,
     n_haps: usize,
+    markers: Markers,
     chrom_map: std::collections::HashMap<String, ChromIdx>,
     /// Whether we've reached end of data
     eof: bool,
@@ -379,6 +380,8 @@ pub struct StreamingBref3Reader {
 impl StreamingBref3Reader {
     /// Open a BREF3 file for streaming
     pub fn open(path: &Path) -> Result<Self> {
+        use std::io::{Seek, SeekFrom};
+
         let file = File::open(path).context("Failed to open BREF3 file")?;
         let mut reader = BufReader::new(file);
 
@@ -396,10 +399,55 @@ impl StreamingBref3Reader {
         let n_haps = sample_ids.len() * 2;
         let samples = Arc::new(Samples::from_ids(sample_ids));
 
+        // Scan for all markers without loading genotypes
+        let start_of_data_pos = reader.seek(SeekFrom::Current(0))?;
+        let mut markers = Markers::new();
+
+        'scan: loop {
+            let n_recs = match read_be_i32(&mut reader) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break 'scan,
+                Err(e) => return Err(e.into()),
+            };
+
+            if n_recs == END_OF_DATA {
+                break 'scan;
+            }
+            let n_recs = n_recs as usize;
+            let chrom_name = read_utf8_string(&mut reader)?;
+            let chrom_idx = markers.add_chrom(&chrom_name);
+            let n_seq = read_be_u16(&mut reader)? as usize;
+            reader.seek_relative((n_haps * 2) as i64)?;
+
+            for _ in 0..n_recs {
+                let marker = read_marker_bref(&mut reader, chrom_idx)?;
+                let n_alleles = marker.n_alleles();
+                let flag = read_byte(&mut reader)?;
+                match flag {
+                    SEQ_CODED => {
+                        reader.seek_relative(n_seq as i64)?;
+                    }
+                    ALLELE_CODED => {
+                        for _ in 0..n_alleles {
+                            let count = read_be_i32(&mut reader)?;
+                            if count > 0 {
+                                reader.seek_relative(count as i64 * 4)?;
+                            }
+                        }
+                    }
+                    _ => bail!("Unknown record type flag: {}", flag),
+                }
+                markers.push(marker);
+            }
+        }
+        reader.seek(SeekFrom::Start(start_of_data_pos))?;
+
+
         Ok(Self {
             reader,
             samples,
             n_haps,
+            markers,
             chrom_map: std::collections::HashMap::new(),
             eof: false,
         })
@@ -408,6 +456,11 @@ impl StreamingBref3Reader {
     /// Get the samples as Arc (for sharing without cloning)
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)
+    }
+
+    /// Get all markers in the file
+    pub fn markers(&self) -> &Markers {
+        &self.markers
     }
 
     /// Get number of haplotypes
@@ -455,7 +508,7 @@ impl StreamingBref3Reader {
         let mut end_pos = 0u32;
 
         for _ in 0..n_recs {
-            let marker = self.read_marker(chrom_idx)?;
+            let marker = read_marker_bref(&mut self.reader, chrom_idx)?;
             end_pos = end_pos.max(marker.pos);
 
             let flag = read_byte(&mut self.reader)?;
@@ -497,51 +550,6 @@ impl StreamingBref3Reader {
             end_pos,
             chrom: chrom_name,
         }))
-    }
-
-    /// Read marker info (same as Bref3Reader but uses internal markers)
-    fn read_marker(&mut self, chrom_idx: ChromIdx) -> Result<Marker> {
-        let pos = read_be_i32(&mut self.reader)? as u32;
-
-        let n_ids = read_byte(&mut self.reader)? as usize;
-        let id = if n_ids == 0 {
-            None
-        } else {
-            let mut ids = Vec::with_capacity(n_ids);
-            for _ in 0..n_ids {
-                ids.push(read_utf8_string(&mut self.reader)?);
-            }
-            Some(Arc::from(ids.join(";")))
-        };
-
-        let allele_code = read_byte(&mut self.reader)? as i8;
-        let (ref_allele, alt_alleles, end) = if allele_code == -1 {
-            let allele_strs = read_string_array(&mut self.reader)?;
-            let end_pos = read_be_i32(&mut self.reader)?;
-            let end = if end_pos >= 0 {
-                Some(end_pos as u32)
-            } else {
-                None
-            };
-            parse_alleles(&allele_strs, end)
-        } else {
-            let n_alleles = 1 + (allele_code & 0b11) as usize;
-            let perm_index = (allele_code >> 2) as usize;
-            let allele_strs: Vec<String> = SNV_PERMS[perm_index][..n_alleles]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            parse_alleles(&allele_strs, None)
-        };
-
-        Ok(Marker::with_end(
-            chrom_idx,
-            pos,
-            end,
-            id,
-            ref_allele,
-            alt_alleles,
-        ))
     }
 
     /// Read allele-coded genotype record
@@ -715,8 +723,16 @@ impl WindowedBref3Reader {
         }
 
         let n_markers = markers.len();
-        let output_start = first_idx - start_idx;
-        let output_end = output_start + (last_idx + 1 - first_idx);
+        let mut output_start = first_idx - start_idx;
+        let mut output_end = output_start + (last_idx + 1 - first_idx);
+
+        if is_first {
+            output_start = 0;
+        }
+        if is_last {
+            output_end = n_markers;
+        }
+
         let global_start = self.global_offset;
         let global_end = global_start + n_markers;
 
@@ -835,10 +851,20 @@ impl InMemoryRefReader {
             columns.push(self.genotypes.column(MarkerIdx::new(m as u32)).clone());
         }
 
-        let output_start = start_idx - buffered_start_idx;
-        let output_end = output_start + (end_idx - start_idx);
         let is_first = self.window_num == 0;
+        let is_last = buffered_end_idx == n_markers;
         self.window_num += 1;
+
+        let n_window_markers = markers.len();
+        let mut output_start = start_idx - buffered_start_idx;
+        let mut output_end = output_start + (end_idx - start_idx);
+        if is_first {
+            output_start = 0;
+        }
+        if is_last {
+            output_end = n_window_markers;
+        }
+
 
         let genotypes = GenotypeMatrix::new_phased(markers, columns, self.genotypes.samples_arc());
 
@@ -849,7 +875,7 @@ impl InMemoryRefReader {
             output_start,
             output_end,
             is_first,
-            is_last: false, // Can't know without looking ahead
+            is_last,
         }))
     }
 }

@@ -223,6 +223,71 @@ impl VcfReader {
         })
     }
 
+    /// Read only marker information from a VCF file, skipping genotype data.
+    pub fn read_markers_only(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<Markers> {
+        info_span!("vcf_read_markers_only").in_scope(|| {
+            let mut markers = Markers::new();
+            let mut line = String::new();
+            let mut line_num = 0usize;
+
+            loop {
+                line.clear();
+                let bytes_read = reader.read_line(&mut line)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                line_num += 1;
+
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                let mut fields = line.split('\t');
+
+                let chrom_name = fields.next().unwrap_or_default();
+                let pos_str = fields.next().unwrap_or_default();
+                let id_str = fields.next().unwrap_or_default();
+                let ref_str = fields.next().unwrap_or_default();
+                let alt_str = fields.next().unwrap_or_default();
+                // Skip QUAL, FILTER
+                fields.next();
+                fields.next();
+                let info_field = fields.next().unwrap_or_default();
+
+                if ref_str.is_empty() {
+                    return Err(ReagleError::parse(line_num, "Malformed VCF record"));
+                }
+
+                let chrom_idx = markers.add_chrom(chrom_name);
+                let pos: u32 = pos_str.parse().map_err(|_| ReagleError::parse(line_num, "Invalid POS field"))?;
+                let id = if id_str == "." { None } else { Some(id_str.into()) };
+                let ref_allele = Allele::from_str(ref_str);
+                let alt_alleles: Vec<Allele> = alt_str.split(',').map(Allele::from_str).collect();
+
+                let end_pos: Option<u32> = if info_field != "." {
+                    info_field.split(';').find_map(|kv| kv.strip_prefix("END=").and_then(|v| v.parse().ok()))
+                } else {
+                    None
+                };
+
+                let marker = Marker::with_end(chrom_idx, pos, end_pos, id, ref_allele, alt_alleles);
+
+                if let Some(ref exclude_ids) = self.exclude_marker_ids {
+                    if let Some(ref marker_id) = marker.id {
+                        if exclude_ids.contains(marker_id.as_ref()) {
+                            continue;
+                        }
+                    }
+                }
+
+                markers.push(marker);
+            }
+
+            Ok(markers)
+        })
+    }
+
     /// Set sample exclusion filter
     ///
     /// # Arguments
