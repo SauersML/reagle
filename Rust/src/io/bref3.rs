@@ -921,7 +921,7 @@ impl InMemoryRefReader {
             output_start = 0;
         }
         if is_last {
-            output_end = self.genotypes.n_markers();
+            output_end = markers.len();
         }
 
         let genotypes = GenotypeMatrix::new_phased(markers, columns, self.genotypes.samples_arc());
