@@ -1208,13 +1208,38 @@ target_samples={} target_bytes={}",
         all_results.sort_by_key(|result| result.sample_idx);
 
 
+        // Populate quality metrics. This is a critical step for accurate DR2.
         for result in &all_results {
-            if let Some((ref p1, ref p2)) = result.hap_alt_probs {
-                for (local_m, (&p1_alt, &p2_alt)) in p1.iter().zip(p2.iter()).enumerate() {
+            let s = result.sample_idx;
+            if let Some((ref p1_vec, ref p2_vec)) = result.hap_alt_probs {
+                for (local_m, (&p1_alt, &p2_alt)) in p1_vec.iter().zip(p2_vec.iter()).enumerate() {
                     let ref_m = markers_to_process.start + local_m;
-                    if ref_m < n_ref_markers && ref_is_biallelic[ref_m] {
-                        if let Some(stats) = window_quality.get_mut(ref_m) {
-                            stats.add_sample_biallelic(p1_alt, p2_alt);
+                    if ref_m >= n_ref_markers || !ref_is_biallelic[ref_m] {
+                        continue;
+                    }
+                    if let Some(stats) = window_quality.get_mut(ref_m) {
+                        // For genotyped markers, DR2 should be ~1. This requires Var(d) ~= Var(X).
+                        // To achieve this, we feed the hard-called genotypes into *both* the
+                        // estimated and observed dosage accumulators. The raw HMM posteriors are
+                        // ignored for DR2 calculation at these sites.
+                        if !stats.is_imputed {
+                            if let Some(target_m) = alignment.target_marker(ref_m) {
+                                let h1 = HapIdx::new((s * 2) as u32);
+                                let h2 = HapIdx::new((s * 2 + 1) as u32);
+                                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+                                if a1 != 255 && a2 != 255 {
+                                    // Use hard-calls for both est and obs stats
+                                    stats.add_est_dosage_biallelic(a1 as f32, a2 as f32);
+                                    stats.add_obs_dosage_biallelic(a1, a2);
+                                } else {
+                                    // Genotyped but missing: fall back to HMM posteriors for est.
+                                    stats.add_est_dosage_biallelic(p1_alt, p2_alt);
+                                }
+                            }
+                        } else {
+                            // Imputed marker: use HMM posteriors for est. stats. obs stats are unused.
+                            stats.add_est_dosage_biallelic(p1_alt, p2_alt);
                         }
                     }
                 }
@@ -1378,114 +1403,65 @@ target_samples={} target_bytes={}",
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at markers_to_process_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            // For genotyped markers, the final dosage must be the hard-called dosage, not a
+            // re-estimated value from the HMM. This is critical for DR2 calculations.
+            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                let h1 = HapIdx::new((sample_idx * 2) as u32);
+                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                if a1 != 255 && a2 != 255 {
+                    // Genotyped and not missing: return hard-called dosage
+                    return (a1 + a2) as f32;
+                }
+            }
+
+            // For imputed markers or genotyped-but-missing markers, use HMM posterior
             let local_m = marker_idx.saturating_sub(markers_to_process_start);
             let (p1, p2) = if let Some((p1, p2)) = sample_hap_probs.get(&sample_idx) {
                 (p1.get(local_m).copied().unwrap_or(0.0), p2.get(local_m).copied().unwrap_or(0.0))
             } else {
                 (0.0, 0.0)
             };
-            if let Some(target_m) = alignment.target_marker(marker_idx) {
-                let h1 = HapIdx::new((sample_idx * 2) as u32);
-                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    p1 + p2
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    let sum = q00 + q01 + q11;
-                    if sum > 0.0 {
-                        let inv_sum = 1.0 / sum;
-                        let q01n = q01 * inv_sum;
-                        let q11n = q11 * inv_sum;
-                        q01n + 2.0 * q11n
-                    } else {
-                        p1 + p2
-                    }
-                }
+            if let Some((dosages, _)) = sample_data.get(&sample_idx) {
+                dosages.get(local_m).copied().unwrap_or(p1 + p2)
             } else {
-                if let Some((dosages, _)) = sample_data.get(&sample_idx) {
-                    dosages.get(local_m).copied().unwrap_or(p1 + p2)
-                } else {
-                    p1 + p2
-                }
+                p1 + p2
             }
         };
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
-            let local_m = marker_idx.saturating_sub(markers_to_process_start);
-            let (p1, p2) = if let Some((p1, p2)) = sample_hap_probs.get(&sample_idx) {
-                (p1.get(local_m).copied().unwrap_or(0.0), p2.get(local_m).copied().unwrap_or(0.0))
-            } else {
-                (0.0, 0.0)
-            };
+            // For genotyped markers, return the original hard-called genotype.
             if let Some(target_m) = alignment.target_marker(marker_idx) {
                 let h1 = HapIdx::new((sample_idx * 2) as u32);
                 let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
                 let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
                 let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    if p1 + p2 >= 1.5 {
-                        (1, 1)
-                    } else if p1 + p2 >= 0.5 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    if q11 >= q01 && q11 >= q00 {
-                        (1, 1)
-                    } else if q01 >= q00 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
+
+                if a1 != 255 && a2 != 255 {
+                    return (a1, a2);
                 }
+            }
+
+            // For imputed markers, use the HMM-derived best guess.
+            let local_m = marker_idx.saturating_sub(markers_to_process_start);
+            if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
+                best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
-                if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
-                    best_gt.get(local_m).copied().unwrap_or((0, 0))
+                // Fallback for safety, though sample_data should always be populated
+                let (p1, p2) = if let Some((p1, p2)) = sample_hap_probs.get(&sample_idx) {
+                    (p1.get(local_m).copied().unwrap_or(0.0), p2.get(local_m).copied().unwrap_or(0.0))
                 } else {
-                    if p1 + p2 >= 1.5 {
-                        (1, 1)
-                    } else if p1 + p2 >= 0.5 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
+                    (0.0, 0.0)
+                };
+                if p1 + p2 >= 1.5 {
+                    (1, 1)
+                } else if p1 + p2 >= 0.5 {
+                    (0, 1)
+                } else {
+                    (0, 0)
                 }
             }
         };

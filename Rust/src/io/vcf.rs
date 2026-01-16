@@ -20,91 +20,105 @@ use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
 use crate::error::{ReagleError, Result};
 
-/// Imputation quality statistics for a single marker
+/// Imputation quality statistics for a single marker.
 ///
-/// Calculates Dosage R-squared (DR2) using the Beagle formula:
-/// R² = (Σp² - (Σp)²/N) / (Σp - (Σp)²/N)
-/// where p is the posterior probability of the ALT allele for each haplotype,
-/// and N is the total number of haplotypes.
+/// Calculates Dosage R-squared (DR2) as `Var(d) / Var(X)`, where `d` is the estimated
+/// dosage from the HMM and `X` is the true allele count.
+///
+/// - For imputed markers, `Var(X)` is estimated from `d`, so DR2 = `Var(d) / Var(d)`.
+/// - For genotyped markers, `Var(X)` is from hard-called genotypes.
 #[derive(Clone, Debug, Default)]
 pub struct MarkerImputationStats {
-    /// Sum of probabilities (p) for each allele across all haplotypes.
-    sum_p: Vec<f32>,
-    /// Sum of squared probabilities (p²) for each allele across all haplotypes.
-    sum_p_sq: Vec<f32>,
-    /// Number of HAPLOTYPES processed.
-    n_haps: usize,
-    /// Whether this marker was imputed.
+    // For Var(d) - variance of ESTIMATED dosage from HMM posteriors
+    sum_p_est: Vec<f32>,
+    sum_p_sq_est: Vec<f32>,
+    n_haps_est: usize,
+
+    // For Var(X) - variance of OBSERVED/TRUE allele count from hard calls
+    sum_p_obs: Vec<f32>,
+    sum_p_sq_obs: Vec<f32>,
+    n_haps_obs: usize,
+
     pub is_imputed: bool,
 }
 
 impl MarkerImputationStats {
-    /// Create new stats for a marker with the given number of alleles.
+    /// Create new stats for a marker with `n_alleles`.
     pub fn new(n_alleles: usize) -> Self {
         Self {
-            sum_p: vec![0.0; n_alleles],
-            sum_p_sq: vec![0.0; n_alleles],
-            n_haps: 0,
+            sum_p_est: vec![0.0; n_alleles],
+            sum_p_sq_est: vec![0.0; n_alleles],
+            n_haps_est: 0,
+            sum_p_obs: vec![0.0; n_alleles],
+            sum_p_sq_obs: vec![0.0; n_alleles],
+            n_haps_obs: 0,
             is_imputed: false,
         }
     }
 
-
-    /// Add a biallelic sample's data with compact representation (no heap allocation).
-    /// p1 = P(ALT) for haplotype 1, p2 = P(ALT) for haplotype 2.
+    /// Add estimated dosage from HMM posteriors (for `Var(d)`).
+    /// `p1`/`p2` are P(ALT) for each haplotype.
     #[inline]
-    pub fn add_sample_biallelic(&mut self, p1: f32, p2: f32) {
-        assert!(self.sum_p.len() == 2, "add_sample_biallelic requires biallelic marker");
-        self.n_haps += 2;
-
-        let p_sum = p1 + p2;
-        let p_sq_sum = p1 * p1 + p2 * p2;
-
-        self.sum_p[1] += p_sum;
-        self.sum_p_sq[1] += p_sq_sum;
+    pub fn add_est_dosage_biallelic(&mut self, p1: f32, p2: f32) {
+        assert_eq!(self.sum_p_est.len(), 2, "Requires biallelic marker");
+        self.n_haps_est += 2;
+        self.sum_p_est[1] += p1 + p2;
+        self.sum_p_sq_est[1] += p1 * p1 + p2 * p2;
     }
 
-    /// Calculate DR2 (dosage R-squared) matching Java Beagle's implementation.
-    /// Formula: (Σp² - (Σp)²/N) / (Σp - (Σp)²/N)
+    /// Add observed dosage from hard-called genotypes (for `Var(X)`).
+    /// `a1`/`a2` are allele codes (0 or 1).
+    #[inline]
+    pub fn add_obs_dosage_biallelic(&mut self, a1: u8, a2: u8) {
+        assert_eq!(self.sum_p_obs.len(), 2, "Requires biallelic marker");
+        self.n_haps_obs += 2;
+        let p1 = a1 as f32;
+        let p2 = a2 as f32;
+        self.sum_p_obs[1] += p1 + p2;
+        self.sum_p_sq_obs[1] += p1 * p1 + p2 * p2;
+    }
+
+    /// Calculate DR2 = Var(d) / Var(X).
     pub fn dr2(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_p.len() || self.n_haps == 0 {
+        if allele == 0 || allele >= self.sum_p_est.len() || self.n_haps_est == 0 {
             return 0.0;
         }
 
-        let sum = self.sum_p[allele];
-        if sum == 0.0 {
-            return 0.0;
-        }
+        // Numerator: Var(d) from estimated dosages
+        let var_d = {
+            let sum = self.sum_p_est[allele];
+            let sum_sq = self.sum_p_sq_est[allele];
+            let n = self.n_haps_est as f32;
+            if sum == 0.0 { 0.0 } else { (sum_sq - sum * sum / n).max(0.0) }
+        };
 
-        let sum_sq = self.sum_p_sq[allele];
-        let n = self.n_haps as f32;
+        // Denominator: Var(X) from observed dosages (if available), else from estimated
+        let var_x = if self.is_imputed || self.n_haps_obs == 0 {
+            // For imputed markers, estimate Var(X) from Var(d) using Beagle's formula
+            let sum = self.sum_p_est[allele];
+            let n = self.n_haps_est as f32;
+            (sum - sum * sum / n).max(0.0)
+        } else {
+            // For genotyped, use true Var(X) from hard calls
+            let sum = self.sum_p_obs[allele];
+            let sum_sq = self.sum_p_sq_obs[allele];
+            let n = self.n_haps_obs as f32;
+            if sum == 0.0 { 0.0 } else { (sum_sq - sum * sum / n).max(0.0) }
+        };
 
-        // Java: float meanTerm = sum*sum/(nInputTargHaps);
-        let mean_term = sum * sum / n;
-
-        // Java: float num = (sum2 - meanTerm);
-        let num = sum_sq - mean_term;
-
-        // Java: float den = (sum - meanTerm);
-        let den = sum - mean_term;
-
-        // Java: return num <= 0 ? 0f : num/den;
-        if num <= 0.0 {
-            0.0
-        } else if den == 0.0 {
+        if var_d == 0.0 || var_x == 0.0 {
             0.0
         } else {
-            (num / den).clamp(0.0, 1.0)
+            (var_d / var_x).clamp(0.0, 1.0)
         }
     }
 
-    /// Calculate estimated allele frequency for the specified ALT allele
+    /// Calculate estimated allele frequency from HMM posteriors.
     pub fn allele_freq(&self, allele: usize) -> f32 {
-        if allele == 0 || allele >= self.sum_p.len() || self.n_haps == 0 {
+        if allele == 0 || allele >= self.sum_p_est.len() || self.n_haps_est == 0 {
             return 0.0;
         }
-        // AF = Total Prob Mass / Total Haplotypes
-        self.sum_p[allele] / self.n_haps as f32
+        self.sum_p_est[allele] / self.n_haps_est as f32
     }
 }
 
