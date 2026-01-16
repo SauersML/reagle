@@ -2854,46 +2854,6 @@ fn emit_combined_fast(ref_al: u8, mode: CombinedEmitMode, conf: f32, p_no_err: f
     base * conf + 0.5 * (1.0 - conf)
 }
 
-/// Compute the likelihood ratio for a phase decision at a heterozygous site.
-///
-/// Given het alleles (a1, a2) and reference alleles (ref1, ref2) from sampled paths,
-/// compute LR = P(better phase) / P(worse phase) based on emission probabilities.
-///
-/// This measures how much more likely the chosen phase is compared to the alternative,
-/// providing a meaningful confidence metric for the phase decision.
-#[inline]
-fn compute_phase_lr(
-    a1: u8,
-    a2: u8,
-    ref1: u8,
-    ref2: u8,
-    conf: f32,
-    p_no_err: f32,
-    p_err: f32,
-) -> f32 {
-    // Phase 0: H1=a1 matches ref1, H2=a2 matches ref2
-    let e0_h1 = emit_prob(ref1, a1, conf, p_no_err, p_err);
-    let e0_h2 = emit_prob(ref2, a2, conf, p_no_err, p_err);
-    let p0 = e0_h1 * e0_h2;
-
-    // Phase 1: H1=a2 matches ref1, H2=a1 matches ref2
-    let e1_h1 = emit_prob(ref1, a2, conf, p_no_err, p_err);
-    let e1_h2 = emit_prob(ref2, a1, conf, p_no_err, p_err);
-    let p1 = e1_h1 * e1_h2;
-
-    // LR = max / min, with bounds to avoid numerical issues
-    let (max_p, min_p) = if p0 >= p1 { (p0, p1) } else { (p1, p0) };
-    if min_p < 1e-30 {
-        if max_p < 1e-30 {
-            1.0 // Both essentially zero, no information
-        } else {
-            1e6 // Strong evidence for one phase (capped)
-        }
-    } else {
-        (max_p / min_p).min(1e6)
-    }
-}
-
 /// Compute the likelihood ratio for a phase decision with a single reference.
 ///
 /// Used when only one reference haplotype path is available (e.g., in Gibbs sampling).
@@ -3830,59 +3790,84 @@ fn sample_swap_bits_mosaic(
         chain.step();
     }
 
-    // Take the final sample (Stochastic EM uses exactly one sample)
-    // Additional samples would be correlated, so we ignore the `samples` parameter
-    // and always take exactly one.
-    chain.step();
-    let (path1, path2) = chain.paths();
-    let new_paths = MosaicPaths {
-        path1: path1.to_vec(),
-        path2: path2.to_vec(),
+    const LR_SAMPLES: usize = 4;
+    let mut swap_counts = vec![0u32; het_positions.len()];
+    let mut obs_counts = vec![0u32; het_positions.len()];
+    let mut last_orients = vec![0u8; het_positions.len()];
+    let mut new_paths = MosaicPaths {
+        path1: Vec::new(),
+        path2: Vec::new(),
     };
 
-    // Determine swap decisions directly from the sampled paths
+    for sample_idx in 0..LR_SAMPLES {
+        chain.step();
+        let (path1, path2) = chain.paths();
+        let is_last = sample_idx + 1 == LR_SAMPLES;
+
+        for (i, &m) in het_positions.iter().enumerate() {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            if a1 == 255 || a2 == 255 || a1 == a2 {
+                if is_last {
+                    last_orients[i] = 0;
+                }
+                continue;
+            }
+
+            let ref1 = lookup.allele(m, path1[m] as usize);
+            let ref2 = lookup.allele(m, path2[m] as usize);
+
+            let orient = if ref1 == a1 && ref2 == a2 {
+                Some(0u8)
+            } else if ref1 == a2 && ref2 == a1 {
+                Some(1u8)
+            } else if ref1 == 255 && ref2 == a2 {
+                Some(0u8)
+            } else if ref1 == 255 && ref2 == a1 {
+                Some(1u8)
+            } else if ref2 == 255 && ref1 == a1 {
+                Some(0u8)
+            } else if ref2 == 255 && ref1 == a2 {
+                Some(1u8)
+            } else {
+                None
+            };
+
+            if let Some(orient) = orient {
+                swap_counts[i] += orient as u32;
+                obs_counts[i] += 1;
+                if is_last {
+                    last_orients[i] = orient;
+                }
+            } else if is_last {
+                last_orients[i] = 0;
+            }
+        }
+
+        if is_last {
+            new_paths = MosaicPaths {
+                path1: path1.to_vec(),
+                path2: path2.to_vec(),
+            };
+        }
+    }
+
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
-
-    for &m in het_positions.iter() {
+    for (i, &m) in het_positions.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
-
-        // Skip non-het positions
-        if a1 == 255 || a2 == 255 || a1 == a2 {
+        if a1 == 255 || a2 == 255 || a1 == a2 || obs_counts[i] == 0 {
             swap_bits.push(0);
             swap_lr.push(1.0);
             continue;
         }
 
-        let ref1 = lookup.allele(m, path1[m] as usize);
-        let ref2 = lookup.allele(m, path2[m] as usize);
-
-        // Determine orientation from the sampled haplotype paths
-        // Orient=0: keep current phase (ref1 matches a1, ref2 matches a2)
-        // Orient=1: swap phase (ref1 matches a2, ref2 matches a1)
-        let orient = if ref1 == a1 && ref2 == a2 {
-            0u8
-        } else if ref1 == a2 && ref2 == a1 {
-            1u8
-        } else if ref1 == 255 && ref2 == a2 {
-            0u8
-        } else if ref1 == 255 && ref2 == a1 {
-            1u8
-        } else if ref2 == 255 && ref1 == a1 {
-            0u8
-        } else if ref2 == 255 && ref1 == a2 {
-            1u8
-        } else {
-            // No clear orientation from reference - keep current phase
-            swap_bits.push(0);
-            swap_lr.push(1.0);
-            continue;
-        };
-
-        swap_bits.push(orient);
-        // Compute LR from the emission probabilities under both phase hypotheses
-        let lr = compute_phase_lr(a1, a2, ref1, ref2, conf[m], p_no_err, p_err);
+        swap_bits.push(last_orients[i]);
+        let p_swap = (swap_counts[i] as f32 + 0.5) / (obs_counts[i] as f32 + 1.0);
+        let p_keep = 1.0 - p_swap;
+        let (max_p, min_p) = if p_swap >= p_keep { (p_swap, p_keep) } else { (p_keep, p_swap) };
+        let lr = if min_p < 1e-30 { 1e6 } else { (max_p / min_p).min(1e6) };
         swap_lr.push(lr);
     }
 

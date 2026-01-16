@@ -427,6 +427,35 @@ mod tests {
     }
 
     #[test]
+    fn test_threaded_haps_cursor_helpers() {
+        let mut th = ThreadedHaps::new(2, 8, 100);
+        th.push_new(10);
+        th.add_segment(0, 15, 40);
+        th.add_segment(0, 20, 70);
+        th.push_new(30);
+        th.add_segment(1, 35, 50);
+
+        th.reset_cursors();
+        for m in 0..100 {
+            let expected0 = if m < 40 {
+                10
+            } else if m < 70 {
+                15
+            } else {
+                20
+            };
+            let expected1 = if m < 50 { 30 } else { 35 };
+
+            assert_eq!(th.hap_at_raw(0, m), expected0);
+            assert_eq!(th.hap_at_raw(1, m), expected1);
+        }
+
+        th.reset_cursors();
+        assert_eq!(th.hap_at_raw(0, 0), 10);
+        assert_eq!(th.hap_at_raw(1, 0), 30);
+    }
+
+    #[test]
     fn test_mosaic_cursor_rewind() {
         // Create a mosaic setup with 2 states, each having segment boundaries
         let mut th = ThreadedHaps::new(2, 8, 100);

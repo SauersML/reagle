@@ -1,5 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use reagle::model::hmm::HmmUpdater;
+use reagle::data::alignment::MarkerAlignment;
 use std::hint::black_box;
 
 /// Benchmark HMM forward update with different state counts
@@ -413,7 +414,7 @@ fn bench_imputation_e2e(c: &mut Criterion) {
             |b, (ref_gt, target_gt)| {
                 b.iter(|| {
                     // Measure alignment creation (lightweight operation)
-                    let alignment = reagle::data::MarkerAlignment::new(
+                    let alignment = MarkerAlignment::new(
                         target_gt,
                         ref_gt,
                     );

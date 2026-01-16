@@ -16,7 +16,7 @@ pub struct DictionaryColumn {
     patterns: Vec<BitVec<u64, Lsb0>>,
 
     /// For each haplotype, which pattern index it uses
-    hap_to_pattern: Vec<u16>,
+    hap_to_pattern: Vec<u32>,
 
     /// Number of markers covered by this block
     n_markers: u32,
@@ -38,9 +38,9 @@ impl DictionaryColumn {
         let bits_per_marker = bits_per_allele as usize + 1;
         let pattern_bits = n_markers * bits_per_marker;
 
-        let mut pattern_map: HashMap<BitVec<u64, Lsb0>, u16> = HashMap::new();
+        let mut pattern_map: HashMap<BitVec<u64, Lsb0>, u32> = HashMap::new();
         let mut patterns: Vec<BitVec<u64, Lsb0>> = Vec::new();
-        let mut hap_to_pattern: Vec<u16> = Vec::with_capacity(n_haplotypes);
+        let mut hap_to_pattern: Vec<u32> = Vec::with_capacity(n_haplotypes);
 
         for h in 0..n_haplotypes {
             let hap = HapIdx::new(h as u32);
@@ -64,7 +64,7 @@ impl DictionaryColumn {
             let pattern_idx = if let Some(&idx) = pattern_map.get(&pattern) {
                 idx
             } else {
-                let idx = patterns.len() as u16;
+                let idx = patterns.len() as u32;
                 pattern_map.insert(pattern.clone(), idx);
                 patterns.push(pattern);
                 idx
@@ -144,7 +144,7 @@ impl DictionaryColumn {
             .map(|p| p.as_raw_slice().len() * std::mem::size_of::<u64>())
             .sum();
         pattern_bytes
-            + self.hap_to_pattern.len() * std::mem::size_of::<u16>()
+            + self.hap_to_pattern.len() * std::mem::size_of::<u32>()
             + std::mem::size_of::<Self>()
     }
 }
