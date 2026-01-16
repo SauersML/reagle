@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -413,6 +413,81 @@ impl StreamingBref3Reader {
     /// Get number of haplotypes
     pub fn n_haps(&self) -> usize {
         self.n_haps
+    }
+
+    /// Pre-scan a BREF3 file to get all marker metadata without loading genotypes.
+    /// This is a static method that creates its own reader to avoid interfering with
+    /// the main streaming reader's state.
+    pub fn prescan_markers(path: &Path) -> Result<Markers> {
+        let mut reader = Self::open(path)?;
+        let mut all_markers = Markers::new();
+
+        while let Some(block_markers) = reader.next_block_prescan()? {
+            for marker in block_markers {
+                let chrom_name = reader.markers.chrom_name(marker.chrom).unwrap_or(".");
+                let chrom_idx = all_markers.add_chrom(chrom_name);
+                let mut new_marker = marker;
+                new_marker.chrom = chrom_idx;
+                all_markers.push(new_marker);
+            }
+        }
+
+        Ok(all_markers)
+    }
+
+    /// Read the next block of markers only, skipping genotype data.
+    fn next_block_prescan(&mut self) -> Result<Option<Vec<Marker>>> {
+        if self.eof {
+            return Ok(None);
+        }
+
+        let n_recs = read_be_i32(&mut self.reader)?;
+        if n_recs == END_OF_DATA {
+            self.eof = true;
+            return Ok(None);
+        }
+
+        let n_recs = n_recs as usize;
+        let chrom_name = read_utf8_string(&mut self.reader)?;
+        let chrom_idx = self.get_or_add_chrom(&chrom_name);
+
+        let n_seq = read_be_u16(&mut self.reader)? as usize;
+
+        // Skip hap_to_seq array
+        self.reader.seek(SeekFrom::Current((self.n_haps * 2) as i64))?;
+
+        let mut markers = Vec::with_capacity(n_recs);
+
+        for _ in 0..n_recs {
+            let marker = self.read_marker(chrom_idx)?;
+            let flag = read_byte(&mut self.reader)?;
+
+            match flag {
+                SEQ_CODED => {
+                    // Skip seq_to_allele array
+                    self.reader.seek(SeekFrom::Current(n_seq as i64))?;
+                }
+                ALLELE_CODED => {
+                    self.skip_allele_coded_record(marker.n_alleles())?;
+                }
+                _ => bail!("Unknown record type flag: {}", flag),
+            }
+            markers.push(marker);
+        }
+
+        Ok(Some(markers))
+    }
+
+    /// Skip an allele-coded genotype record efficiently by seeking.
+    fn skip_allele_coded_record(&mut self, n_alleles: usize) -> Result<()> {
+        for _ in 0..n_alleles {
+            let count = read_be_i32(&mut self.reader)?;
+            if count > 0 {
+                // Skip the haplotype indices by seeking
+                self.reader.seek(SeekFrom::Current((count * 4) as i64))?;
+            }
+        }
+        Ok(())
     }
 
     /// Check if we've reached end of data
