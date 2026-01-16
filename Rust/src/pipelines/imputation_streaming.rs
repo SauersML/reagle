@@ -423,11 +423,43 @@ impl crate::pipelines::ImputationPipeline {
                     .marker(MarkerIdx::new((n_markers - 1) as u32))
                     .pos;
                 let window_chrom_idx = target_window.genotypes.marker(MarkerIdx::new(0)).chrom;
-                let window_chrom = target_window
+                let target_chrom = target_window
                     .genotypes
                     .markers()
                     .chrom_name(window_chrom_idx)
                     .ok_or_else(|| anyhow::anyhow!("Invalid target chromosome index"))?;
+                let window_chrom = match &mut ref_reader {
+                    RefPanelReader::InMemory(r) => {
+                        let mut resolved = None;
+                        if r.chrom_names().iter().any(|c| c.as_ref() == target_chrom) {
+                            resolved = Some(target_chrom.to_string());
+                        } else if let Some(stripped) = target_chrom.strip_prefix("chr") {
+                            if r.chrom_names().iter().any(|c| c.as_ref() == stripped) {
+                                resolved = Some(stripped.to_string());
+                            }
+                        } else {
+                            let with_chr = format!("chr{}", target_chrom);
+                            if r.chrom_names().iter().any(|c| c.as_ref() == with_chr) {
+                                resolved = Some(with_chr);
+                            }
+                        }
+
+                        resolved.ok_or_else(|| {
+                            let names = r
+                                .chrom_names()
+                                .iter()
+                                .map(|c| c.as_ref())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            anyhow::anyhow!(
+                                "Target chrom {} not found in reference (available: {})",
+                                target_chrom,
+                                names
+                            )
+                        })?
+                    }
+                    _ => target_chrom.to_string(),
+                };
                 let phase_span = if pipeline.config.profile {
                     Some(
                         info_span!(
@@ -457,9 +489,9 @@ impl crate::pipelines::ImputationPipeline {
                 let ref_window = if pipeline.config.profile {
                     let span_guard = info_span!("io_load_ref").entered();
                     let _ = &span_guard;
-                    ref_reader.load_window_for_region(window_chrom, start_pos, end_pos)?
+                    ref_reader.load_window_for_region(&window_chrom, start_pos, end_pos)?
                 } else {
-                    ref_reader.load_window_for_region(window_chrom, start_pos, end_pos)?
+                    ref_reader.load_window_for_region(&window_chrom, start_pos, end_pos)?
                 };
 
                 let ref_window = match ref_window {

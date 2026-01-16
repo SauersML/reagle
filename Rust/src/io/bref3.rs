@@ -836,6 +836,10 @@ impl InMemoryRefReader {
         }
     }
 
+    pub fn chrom_names(&self) -> &[Arc<str>] {
+        self.genotypes.markers().chrom_names()
+    }
+
     /// Load reference window for a specific genomic region
     pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         use crate::data::marker::MarkerIdx;
