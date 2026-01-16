@@ -356,6 +356,10 @@ impl crate::pipelines::ImputationPipeline {
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
 
+        // Pre-scan reference to build header
+        let ref_markers = crate::io::bref3::scan_ref_markers(&ref_path_clone, is_bref3)?;
+        writer.write_header_extended(&ref_markers, true, self.config.gp, self.config.ap)?;
+
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.
         let (tx, rx) = mpsc::sync_channel::<StreamingPayload>(2);
