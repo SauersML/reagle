@@ -281,16 +281,35 @@ pub struct StreamingVcfReader {
 impl StreamingVcfReader {
     /// Open a VCF file for streaming
     pub fn open(path: &Path, gen_maps: GeneticMaps, config: StreamingConfig) -> Result<Self> {
-        let file = File::open(path)?;
-
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let reader: Box<dyn BufRead + Send> = match ext {
-            "bgz" | "bgzf" => Box::new(BufReader::new(bgzf_io::Reader::new(file))),
-            "gz" => Box::new(BufReader::new(GzDecoder::new(file))),
-            _ => Box::new(BufReader::new(file)),
-        };
-
-        Self::from_reader(reader, gen_maps, config)
+        match ext {
+            "bgz" | "bgzf" => {
+                let file = File::open(path)?;
+                let reader: Box<dyn BufRead + Send> =
+                    Box::new(BufReader::new(bgzf_io::Reader::new(file)));
+                Self::from_reader(reader, gen_maps, config)
+            }
+            "gz" => {
+                // Try BGZF first (common for VCF.gz), fall back to standard gzip.
+                let file = File::open(path)?;
+                let reader: Box<dyn BufRead + Send> =
+                    Box::new(BufReader::new(bgzf_io::Reader::new(file)));
+                match Self::from_reader(reader, gen_maps.clone(), config.clone()) {
+                    Ok(v) => Ok(v),
+                    Err(_) => {
+                        let file = File::open(path)?;
+                        let reader: Box<dyn BufRead + Send> =
+                            Box::new(BufReader::new(GzDecoder::new(file)));
+                        Self::from_reader(reader, gen_maps, config)
+                    }
+                }
+            }
+            _ => {
+                let file = File::open(path)?;
+                let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(file));
+                Self::from_reader(reader, gen_maps, config)
+            }
+        }
     }
 
     /// Create from a reader
