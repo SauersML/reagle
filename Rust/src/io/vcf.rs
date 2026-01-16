@@ -9,6 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use noodles::bgzf::io as bgzf_io;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use noodles::vcf::Header;
 use tracing::info_span;
 
@@ -162,15 +165,11 @@ impl VcfReader {
         let file = File::open(path)?;
 
         // Check if gzipped
-        let is_gzipped = path
-            .extension()
-            .map(|e| e == "gz" || e == "bgz")
-            .unwrap_or(false);
-
-        let reader: Box<dyn BufRead + Send> = if is_gzipped {
-            Box::new(BufReader::new(bgzf_io::Reader::new(file)))
-        } else {
-            Box::new(BufReader::new(file))
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let reader: Box<dyn BufRead + Send> = match ext {
+            "bgz" | "bgzf" => Box::new(BufReader::new(bgzf_io::Reader::new(file))),
+            "gz" => Box::new(BufReader::new(GzDecoder::new(file))),
+            _ => Box::new(BufReader::new(file)),
         };
 
         Self::from_reader(reader)
@@ -797,15 +796,11 @@ impl VcfWriter {
     pub fn create(path: &Path, samples: Arc<Samples>) -> Result<Self> {
         let file = File::create(path)?;
 
-        let is_gzipped = path
-            .extension()
-            .map(|e| e == "gz" || e == "bgz")
-            .unwrap_or(false);
-
-        let writer: Box<dyn Write + Send> = if is_gzipped {
-            Box::new(BufWriter::new(bgzf_io::Writer::new(file)))
-        } else {
-            Box::new(BufWriter::new(file))
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let writer: Box<dyn Write + Send> = match ext {
+            "bgz" | "bgzf" => Box::new(BufWriter::new(bgzf_io::Writer::new(file))),
+            "gz" => Box::new(BufWriter::new(GzEncoder::new(file, Compression::default()))),
+            _ => Box::new(BufWriter::new(file)),
         };
 
         Ok(Self { writer, samples })

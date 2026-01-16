@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use noodles::bgzf::io as bgzf_io;
+use flate2::read::GzDecoder;
 use tracing::info_span;
 
 use crate::data::ChromIdx;
@@ -281,15 +282,11 @@ impl StreamingVcfReader {
     pub fn open(path: &Path, gen_maps: GeneticMaps, config: StreamingConfig) -> Result<Self> {
         let file = File::open(path)?;
 
-        let is_gzipped = path
-            .extension()
-            .map(|e| e == "gz" || e == "bgz")
-            .unwrap_or(false);
-
-        let reader: Box<dyn BufRead + Send> = if is_gzipped {
-            Box::new(BufReader::new(bgzf_io::Reader::new(file)))
-        } else {
-            Box::new(BufReader::new(file))
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let reader: Box<dyn BufRead + Send> = match ext {
+            "bgz" | "bgzf" => Box::new(BufReader::new(bgzf_io::Reader::new(file))),
+            "gz" => Box::new(BufReader::new(GzDecoder::new(file))),
+            _ => Box::new(BufReader::new(file)),
         };
 
         Self::from_reader(reader, gen_maps, config)
