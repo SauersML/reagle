@@ -35,6 +35,8 @@ struct StreamingPayload {
     output_start: usize,
     output_end: usize,
     window_idx: usize,
+    is_first_window: bool,
+    is_last_window: bool,
     /// Reference window global marker offset (for coordinate translation)
     ref_global_start: usize,
     /// Reference window output range start (where to start output)
@@ -481,6 +483,8 @@ impl crate::pipelines::ImputationPipeline {
                     output_start: target_window.output_start,
                     output_end: target_window.output_end,
                     window_idx: window_count,
+                    is_first_window: ref_window.is_first,
+                    is_last_window: ref_window.is_last,
                     ref_global_start,
                     ref_output_start,
                     ref_output_end,
@@ -505,11 +509,16 @@ impl crate::pipelines::ImputationPipeline {
                 output_start,
                 output_end,
                 window_idx,
+                is_first_window,
+                is_last_window,
                 ref_global_start,
                 ref_output_start,
                 ref_output_end,
             } = payload;
             let _ = (output_start, output_end);
+
+            let actual_output_start = if is_first_window { 0 } else { ref_output_start };
+            let actual_output_end = if is_last_window { ref_window.n_markers() } else { ref_output_end };
 
             eprintln!(
                 "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
@@ -555,11 +564,11 @@ impl crate::pipelines::ImputationPipeline {
                 &mut window_quality,
                 &mut writer,
                 window_idx,
-                ref_output_start,
-                ref_output_end,
+                actual_output_start,
+                actual_output_end,
             )?;
 
-            total_markers += ref_output_end.saturating_sub(ref_output_start);
+            total_markers += actual_output_end.saturating_sub(actual_output_start);
 
             let mut next_overlap = self.extract_imputed_overlap_streaming(
                 &phased_target,
@@ -1118,16 +1127,6 @@ impl crate::pipelines::ImputationPipeline {
                 .iter()
                 .map(|result| (result.sample_idx, (&result.dosages, &result.best_gt)))
                 .collect();
-        let sample_hap_probs: std::collections::HashMap<usize, (&Vec<f32>, &Vec<f32>)> =
-            all_results
-                .iter()
-                .filter_map(|result| {
-                    result
-                        .hap_alt_probs
-                        .as_ref()
-                        .map(|(p1, p2)| (result.sample_idx, (p1, p2)))
-                })
-                .collect();
 
         let sample_posteriors: std::collections::HashMap<
             usize,
@@ -1182,116 +1181,34 @@ impl crate::pipelines::ImputationPipeline {
 
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at markers_to_process_start
+        // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
+        // Dosages array is indexed from 0 for markers starting at markers_to_process_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            let local_m = marker_idx.saturating_sub(markers_to_process_start);
-            let (p1, p2) = if let Some((p1, p2)) = sample_hap_probs.get(&sample_idx) {
-                (p1.get(local_m).copied().unwrap_or(0.0), p2.get(local_m).copied().unwrap_or(0.0))
-            } else {
-                (0.0, 0.0)
-            };
             if let Some(target_m) = alignment.target_marker(marker_idx) {
                 let h1 = HapIdx::new((sample_idx * 2) as u32);
                 let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
                 let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
                 let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    p1 + p2
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    let sum = q00 + q01 + q11;
-                    if sum > 0.0 {
-                        let inv_sum = 1.0 / sum;
-                        let q01n = q01 * inv_sum;
-                        let q11n = q11 * inv_sum;
-                        q01n + 2.0 * q11n
-                    } else {
-                        p1 + p2
-                    }
+
+                if a1 != 255 && a2 != 255 {
+                    return a1 as f32 + a2 as f32;
                 }
+            }
+            let local_m = marker_idx.saturating_sub(markers_to_process_start);
+            if let Some((dosages, _)) = sample_data.get(&sample_idx) {
+                dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
-                if let Some((dosages, _)) = sample_data.get(&sample_idx) {
-                    dosages.get(local_m).copied().unwrap_or(p1 + p2)
-                } else {
-                    p1 + p2
-                }
+                0.0
             }
         };
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(markers_to_process_start);
-            let (p1, p2) = if let Some((p1, p2)) = sample_hap_probs.get(&sample_idx) {
-                (p1.get(local_m).copied().unwrap_or(0.0), p2.get(local_m).copied().unwrap_or(0.0))
+            if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
+                best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
-                (0.0, 0.0)
-            };
-            if let Some(target_m) = alignment.target_marker(marker_idx) {
-                let h1 = HapIdx::new((sample_idx * 2) as u32);
-                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    if p1 + p2 >= 1.5 {
-                        (1, 1)
-                    } else if p1 + p2 >= 0.5 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    if q11 >= q01 && q11 >= q00 {
-                        (1, 1)
-                    } else if q01 >= q00 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
-                }
-            } else {
-                if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
-                    best_gt.get(local_m).copied().unwrap_or((0, 0))
-                } else {
-                    if p1 + p2 >= 1.5 {
-                        (1, 1)
-                    } else if p1 + p2 >= 0.5 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
-                }
+                (0, 0)
             }
         };
 

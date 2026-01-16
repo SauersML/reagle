@@ -849,7 +849,7 @@ impl InMemoryRefReader {
             output_start,
             output_end,
             is_first,
-            is_last: false, // Can't know without looking ahead
+            is_last: buffered_end_idx == n_markers,
         }))
     }
 }
