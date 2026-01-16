@@ -17,16 +17,19 @@ fn bench_fwd_update(c: &mut Criterion) {
                 let mut fwd = vec![1.0 / n_states as f32; n_states];
                 let emit_probs = [0.99, 0.01];
                 let mismatches: Vec<u8> = (0..n_states).map(|i| (i % 2) as u8).collect();
+                let emissions: Vec<f32> = mismatches
+                    .iter()
+                    .map(|&m| emit_probs[m as usize])
+                    .collect();
                 let fwd_sum = 1.0f32;
                 let p_switch = 0.01f32;
 
                 b.iter(|| {
-                    let sum = HmmUpdater::fwd_update(
+                    let sum = HmmUpdater::fwd_update_emissions(
                         black_box(&mut fwd),
                         black_box(fwd_sum),
                         black_box(p_switch),
-                        black_box(&emit_probs),
-                        black_box(&mismatches),
+                        black_box(&emissions),
                         black_box(n_states),
                     );
                     black_box(sum)
@@ -91,18 +94,21 @@ fn bench_forward_backward_scaling(c: &mut Criterion) {
                 let mismatches: Vec<Vec<u8>> = (0..n_markers)
                     .map(|_| (0..n_states).map(|i| (i % 2) as u8).collect())
                     .collect();
+                let emissions: Vec<Vec<f32>> = mismatches
+                    .iter()
+                    .map(|row| row.iter().map(|&m| emit_probs[m as usize]).collect())
+                    .collect();
                 let p_switch = 0.01f32;
 
                 b.iter(|| {
                     // Forward pass
                     let mut fwd_sum = 1.0f32;
                     for m in 0..n_markers {
-                        fwd_sum = HmmUpdater::fwd_update(
+                        fwd_sum = HmmUpdater::fwd_update_emissions(
                             &mut fwd[m],
                             fwd_sum,
                             p_switch,
-                            &emit_probs,
-                            &mismatches[m],
+                            &emissions[m],
                             n_states,
                         );
                     }
@@ -129,6 +135,7 @@ fn bench_forward_backward_scaling(c: &mut Criterion) {
 
 /// Benchmark ThreadedHaps segment lookup (cursor-style traversal)
 fn bench_threaded_haps_traversal(c: &mut Criterion) {
+    use reagle::model::states::MosaicCursor;
     use reagle::ThreadedHaps;
 
     let mut group = c.benchmark_group("threaded_haps");
@@ -150,29 +157,30 @@ fn bench_threaded_haps_traversal(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements((n_markers * n_states) as u64));
 
-    // Original per-state traversal
-    group.bench_function("per_state", |b| {
+    // Direct materialize_at (baseline, per-marker scan)
+    let mut hap_buffer = vec![0u32; n_states];
+    group.bench_function("materialize_at", |b| {
         b.iter(|| {
-            th.reset_cursors();
             let mut sum = 0u32;
             for m in 0..n_markers {
-                for state in 0..n_states {
-                    sum = sum.wrapping_add(th.hap_at_raw(state, m));
+                th.materialize_at(m, &mut hap_buffer);
+                for &hap in &hap_buffer {
+                    sum = sum.wrapping_add(hap);
                 }
             }
             black_box(sum)
         })
     });
 
-    // Batch materialization (new optimized path)
-    let mut hap_buffer = vec![0u32; n_states];
-    group.bench_function("batch_materialize", |b| {
+    // Cursor traversal (optimized path)
+    group.bench_function("cursor_traversal", |b| {
         b.iter(|| {
-            th.reset_cursors();
+            let mut cursor = MosaicCursor::from_threaded(&th);
+            let mut history = Vec::new();
             let mut sum = 0u32;
             for m in 0..n_markers {
-                th.materialize_at(m, &mut hap_buffer);
-                for &hap in &hap_buffer {
+                cursor.advance_with_history(m, &th, &mut history);
+                for &hap in cursor.active_haps() {
                     sum = sum.wrapping_add(hap);
                 }
             }
