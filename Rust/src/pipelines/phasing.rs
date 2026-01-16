@@ -1998,32 +1998,79 @@ impl PhasingPipeline {
 
             let n_candidates = 20.min(n_total_haps).max(1);
             let threaded_haps_vec = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                self.build_composite_haps_streaming(
-                    |subset_m, h| {
-                        let orig_m = hi_freq_to_orig[subset_m];
-                        if h < n_haps {
-                            ref_geno.get(orig_m, HapIdx::new(h as u32))
-                        } else {
-                            let ref_h = h - n_haps;
-                            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
-                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                                alignment.reverse_map_allele(orig_m, ref_allele)
+                if self.config.profile {
+                    info_span!("phase_pbwt_build", markers = n_hi_freq, samples = n_samples)
+                        .in_scope(|| {
+                            self.build_composite_haps_streaming(
+                                |subset_m, h| {
+                                    let orig_m = hi_freq_to_orig[subset_m];
+                                    if h < n_haps {
+                                        ref_geno.get(orig_m, HapIdx::new(h as u32))
+                                    } else {
+                                        let ref_h = h - n_haps;
+                                        if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+                                            let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                            alignment.reverse_map_allele(orig_m, ref_allele)
+                                        } else {
+                                            255
+                                        }
+                                    }
+                                },
+                                n_hi_freq,
+                                n_total_haps,
+                                n_samples,
+                                ibs2,
+                                n_candidates,
+                                self.params.n_states,
+                                None,
+                                Some(hi_freq_to_orig),
+                                hi_freq_gen_positions,
+                                self.config.imp_step,
+                            )
+                        })
+                } else {
+                    self.build_composite_haps_streaming(
+                        |subset_m, h| {
+                            let orig_m = hi_freq_to_orig[subset_m];
+                            if h < n_haps {
+                                ref_geno.get(orig_m, HapIdx::new(h as u32))
                             } else {
-                                255
+                                let ref_h = h - n_haps;
+                                if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+                                    let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                    alignment.reverse_map_allele(orig_m, ref_allele)
+                                } else {
+                                    255
+                                }
                             }
-                        }
-                    },
-                    n_hi_freq,
-                    n_total_haps,
-                    n_samples,
-                    ibs2,
-                    n_candidates,
-                    self.params.n_states,
-                    None,
-                    Some(hi_freq_to_orig),
-                    hi_freq_gen_positions,
-                    self.config.imp_step,
-                )
+                        },
+                        n_hi_freq,
+                        n_total_haps,
+                        n_samples,
+                        ibs2,
+                        n_candidates,
+                        self.params.n_states,
+                        None,
+                        Some(hi_freq_to_orig),
+                        hi_freq_gen_positions,
+                        self.config.imp_step,
+                    )
+                }
+            } else if self.config.profile {
+                info_span!("phase_pbwt_build", markers = n_hi_freq, samples = n_samples)
+                    .in_scope(|| {
+                        self.build_composite_haps_streaming_direct(
+                            ref_geno,
+                            n_hi_freq,
+                            n_samples,
+                            ibs2,
+                            n_candidates,
+                            self.params.n_states,
+                            None,
+                            hi_freq_gen_positions,
+                            self.config.imp_step,
+                        )
+                    })
             } else {
                 self.build_composite_haps_streaming_direct(
                     ref_geno,
@@ -2043,10 +2090,11 @@ impl PhasingPipeline {
             //   - swap_mask[i] = true if the sampled phase orientation at marker i is swapped
             //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
             let prior_paths = &mcmc_paths[..];
-            sample_phases
-                .par_iter()
-                .enumerate()
-                .map(|(s, sp)| {
+            let sample_iter = || {
+                sample_phases
+                    .par_iter()
+                    .enumerate()
+                    .map(|(s, sp)| {
                     let n_hi_freq = hi_freq_to_orig.len();
 
                     let threaded_haps = &threaded_haps_vec[s];
@@ -2091,23 +2139,45 @@ impl PhasingPipeline {
                     let (swap_bits, swap_lr, new_paths) = if self.config.dynamic_mcmc {
                         // SHAPEIT5-style dynamic MCMC: re-select states each step
                         // Note: Dynamic MCMC doesn't use ThreadWorkspace yet
-                        let (swap_bits, swap_lr, new_paths) = sample_dynamic_mcmc(
-                            n_hi_freq,
-                            n_states,
-                            stage1_p_recomb,
-                            &seq1,
-                            &seq2,
-                            &sample_conf,
-                            &phase_ibs,
-                            ibs2,
-                            s as u32,
-                            &het_positions,
-                            sample_seed,
-                            self.config.mcmc_steps,
-                            p_no_err,
-                            p_err,
-                            prior_paths.get(s).and_then(|p| p.as_ref()),
-                        );
+                        let (swap_bits, swap_lr, new_paths) = if self.config.profile {
+                            info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
+                                sample_dynamic_mcmc(
+                                    n_hi_freq,
+                                    n_states,
+                                    stage1_p_recomb,
+                                    &seq1,
+                                    &seq2,
+                                    &sample_conf,
+                                    &phase_ibs,
+                                    ibs2,
+                                    s as u32,
+                                    &het_positions,
+                                    sample_seed,
+                                    self.config.mcmc_steps,
+                                    p_no_err,
+                                    p_err,
+                                    prior_paths.get(s).and_then(|p| p.as_ref()),
+                                )
+                            })
+                        } else {
+                            sample_dynamic_mcmc(
+                                n_hi_freq,
+                                n_states,
+                                stage1_p_recomb,
+                                &seq1,
+                                &seq2,
+                                &sample_conf,
+                                &phase_ibs,
+                                ibs2,
+                                s as u32,
+                                &het_positions,
+                                sample_seed,
+                                self.config.mcmc_steps,
+                                p_no_err,
+                                p_err,
+                                prior_paths.get(s).and_then(|p| p.as_ref()),
+                            )
+                        };
                         (swap_bits, swap_lr, Some(new_paths))
                     } else {
                         // Classic Beagle-style: static state space MCMC with thread-local workspace
@@ -2118,33 +2188,70 @@ impl PhasingPipeline {
                             }
                             let ws = workspace.as_mut().unwrap();
                             ws.clear(); // Explicit reset between samples
-                            let lookup = RefAlleleLookup::new_from_threaded_with_buffer(
-                                &threaded_haps,
-                                n_hi_freq,
-                                n_states,
-                                n_haps,
-                                ref_geno,
-                                self.reference_gt.as_deref(),
-                                self.alignment.as_ref(),
-                                Some(hi_freq_to_orig),
-                                std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
-                            );
-                            let result = sample_swap_bits_mosaic(
-                                n_hi_freq,
-                                n_states,
-                                stage1_p_recomb,
-                                &seq1,
-                                &seq2,
-                                &sample_conf,
-                                &lookup,
-                                &het_positions,
-                                prior_paths.get(s).and_then(|p| p.as_ref()),
-                                sample_seed,
-                                self.config.mcmc_burnin,
-                                p_no_err,
-                                p_err,
-                                ws,
-                            );
+                            let lookup = if self.config.profile {
+                                info_span!("prep_allele_lookup", sample = s).in_scope(|| {
+                                    RefAlleleLookup::new_from_threaded_with_buffer(
+                                        &threaded_haps,
+                                        n_hi_freq,
+                                        n_states,
+                                        n_haps,
+                                        ref_geno,
+                                        self.reference_gt.as_deref(),
+                                        self.alignment.as_ref(),
+                                        Some(hi_freq_to_orig),
+                                        std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
+                                    )
+                                })
+                            } else {
+                                RefAlleleLookup::new_from_threaded_with_buffer(
+                                    &threaded_haps,
+                                    n_hi_freq,
+                                    n_states,
+                                    n_haps,
+                                    ref_geno,
+                                    self.reference_gt.as_deref(),
+                                    self.alignment.as_ref(),
+                                    Some(hi_freq_to_orig),
+                                    std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
+                                )
+                            };
+                            let result = if self.config.profile {
+                                info_span!("run_mcmc_math", sample = s).in_scope(|| {
+                                    sample_swap_bits_mosaic(
+                                        n_hi_freq,
+                                        n_states,
+                                        stage1_p_recomb,
+                                        &seq1,
+                                        &seq2,
+                                        &sample_conf,
+                                        &lookup,
+                                        &het_positions,
+                                        prior_paths.get(s).and_then(|p| p.as_ref()),
+                                        sample_seed,
+                                        self.config.mcmc_burnin,
+                                        p_no_err,
+                                        p_err,
+                                        ws,
+                                    )
+                                })
+                            } else {
+                                sample_swap_bits_mosaic(
+                                    n_hi_freq,
+                                    n_states,
+                                    stage1_p_recomb,
+                                    &seq1,
+                                    &seq2,
+                                    &sample_conf,
+                                    &lookup,
+                                    &het_positions,
+                                    prior_paths.get(s).and_then(|p| p.as_ref()),
+                                    sample_seed,
+                                    self.config.mcmc_burnin,
+                                    p_no_err,
+                                    p_err,
+                                    ws,
+                                )
+                            };
                             ws.lookup = lookup.into_buffer();
                             (result.0, result.1, Some(result.2))
                         })
@@ -2169,7 +2276,14 @@ impl PhasingPipeline {
 
                     (swap_mask, het_lr_values, new_paths)
                 })
-                .collect()
+            };
+
+            if self.config.profile {
+                info_span!("phase_sample_all", samples = n_samples)
+                    .in_scope(|| sample_iter().collect())
+            } else {
+                sample_iter().collect()
+            }
         };  // ref_geno borrow ends here
 
         // Apply phase decisions to SamplePhase

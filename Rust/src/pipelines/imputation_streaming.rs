@@ -395,12 +395,24 @@ impl crate::pipelines::ImputationPipeline {
             };
 
             let mut window_count = 0;
+            let mut skipped_ref_windows = 0usize;
             let mut phased_overlap: Option<PhasedOverlap> = None;
             let mut pbwt_state: Option<PbwtState> = None;
 
             eprintln!("Phase 1: Streaming phasing of target data...");
             
-            while let Some(target_window) = target_reader.next_window()? {
+            loop {
+                let target_window = if pipeline.config.profile {
+                    let _span = info_span!("io_read_target").entered();
+                    target_reader.next_window()?
+                } else {
+                    target_reader.next_window()?
+                };
+
+                let target_window = match target_window {
+                    Some(window) => window,
+                    None => break,
+                };
                 window_count += 1;
                 let n_markers = target_window.genotypes.n_markers();
                 let window_start_pos = target_window.genotypes.marker(MarkerIdx::new(0)).pos;
@@ -433,10 +445,18 @@ impl crate::pipelines::ImputationPipeline {
                 let start_pos = window_start_pos;
                 let end_pos = window_end_pos;
                 
-                let ref_window = match ref_reader.load_window_for_region(start_pos, end_pos)? {
+                let ref_window = if pipeline.config.profile {
+                    let _span = info_span!("io_load_ref").entered();
+                    ref_reader.load_window_for_region(start_pos, end_pos)?
+                } else {
+                    ref_reader.load_window_for_region(start_pos, end_pos)?
+                };
+
+                let ref_window = match ref_window {
                     Some(w) => w,
                     None => {
                         eprintln!("    Warning: No reference markers in region");
+                        skipped_ref_windows += 1;
                         continue;
                     }
                 };
@@ -478,6 +498,11 @@ impl crate::pipelines::ImputationPipeline {
                 let phased = if target_reader.was_all_phased() {
                     target_window.genotypes.clone().into_phased()
                 } else {
+                    let _span = if pipeline.config.profile {
+                        Some(info_span!("compute_phasing").entered())
+                    } else {
+                        None
+                    };
                     pipeline.phase_window_streaming(
                         &target_window.genotypes,
                         &ref_window_gt,
@@ -493,17 +518,33 @@ impl crate::pipelines::ImputationPipeline {
                 pbwt_state = Some(pipeline.extractpbwt_state_streaming(&phased, n_markers));
 
                 // Send to consumer
-                if let Err(_) = tx.send(StreamingPayload {
-                    phased_target: phased,
-                    ref_window: ref_window_gt,
-                    alignment,
-                    output_start: target_window.output_start,
-                    output_end: target_window.output_end,
-                    window_idx: window_count,
-                    ref_global_start,
-                    ref_output_start,
-                    ref_output_end,
-                }) {
+                let send_result = if pipeline.config.profile {
+                    let _span = info_span!("channel_send_wait").entered();
+                    tx.send(StreamingPayload {
+                        phased_target: phased,
+                        ref_window: ref_window_gt,
+                        alignment,
+                        output_start: target_window.output_start,
+                        output_end: target_window.output_end,
+                        window_idx: window_count,
+                        ref_global_start,
+                        ref_output_start,
+                        ref_output_end,
+                    })
+                } else {
+                    tx.send(StreamingPayload {
+                        phased_target: phased,
+                        ref_window: ref_window_gt,
+                        alignment,
+                        output_start: target_window.output_start,
+                        output_end: target_window.output_end,
+                        window_idx: window_count,
+                        ref_global_start,
+                        ref_output_start,
+                        ref_output_end,
+                    })
+                };
+                if let Err(_) = send_result {
                     break; // Consumer hung up
                 }
             }
@@ -511,6 +552,12 @@ impl crate::pipelines::ImputationPipeline {
                 return Err(ReagleError::vcf(
                     "No target markers read; check input VCF GT field and chromosome naming.",
                 ));
+            }
+            if skipped_ref_windows > 0 {
+                eprintln!(
+                    "    Warning: skipped {} target windows with no reference overlap",
+                    skipped_ref_windows
+                );
             }
 
             Ok(())
@@ -588,18 +635,34 @@ impl crate::pipelines::ImputationPipeline {
                 None
             };
 
-            let next_priors = self.run_imputation_window_streaming(
-                &phased_target,
-                &ref_window,
-                &alignment,
-                &gen_maps,
-                imp_overlap.as_ref(),
-                &mut window_quality,
-                &mut writer,
-                window_idx,
-                ref_output_start,
-                ref_output_end,
-            )?;
+            let next_priors = if self.config.profile {
+                let _span = info_span!("compute_imputation", window = window_idx).entered();
+                self.run_imputation_window_streaming(
+                    &phased_target,
+                    &ref_window,
+                    &alignment,
+                    &gen_maps,
+                    imp_overlap.as_ref(),
+                    &mut window_quality,
+                    &mut writer,
+                    window_idx,
+                    ref_output_start,
+                    ref_output_end,
+                )?
+            } else {
+                self.run_imputation_window_streaming(
+                    &phased_target,
+                    &ref_window,
+                    &alignment,
+                    &gen_maps,
+                    imp_overlap.as_ref(),
+                    &mut window_quality,
+                    &mut writer,
+                    window_idx,
+                    ref_output_start,
+                    ref_output_end,
+                )?
+            };
 
             total_markers += ref_output_end.saturating_sub(ref_output_start);
 
@@ -1191,6 +1254,19 @@ impl crate::pipelines::ImputationPipeline {
         if n_markers == 0 || all_results.is_empty() {
             return Ok(());
         }
+
+        let _write_span = if self.config.profile {
+            Some(
+                info_span!(
+                    "io_write_output",
+                    markers = n_markers,
+                    samples = target_win.n_samples()
+                )
+                .entered(),
+            )
+        } else {
+            None
+        };
 
         // Build lookup maps for sample -> (dosages, best_gt)
         let sample_data: std::collections::HashMap<usize, (&Vec<f32>, &Vec<(u8, u8)>)> =
