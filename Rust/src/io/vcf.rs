@@ -162,14 +162,25 @@ impl VcfReader {
     /// Open a VCF file and read the header
     pub fn open(path: &Path) -> Result<(Self, Box<dyn BufRead + Send>)> {
         info_span!("vcf_open", path = ?path).in_scope(|| {
+        eprintln!("VcfReader::open: {:?}", path);
         let file = File::open(path)?;
 
         // Check if gzipped
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        eprintln!("VcfReader::open: ext={:?}", ext);
         let reader: Box<dyn BufRead + Send> = match ext {
-            "bgz" | "bgzf" => Box::new(BufReader::new(bgzf_io::Reader::new(file))),
-            "gz" => Box::new(BufReader::new(GzDecoder::new(file))),
-            _ => Box::new(BufReader::new(file)),
+            "bgz" | "bgzf" => {
+                eprintln!("VcfReader::open: using BGZF reader");
+                Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+            },
+            "gz" => {
+                eprintln!("VcfReader::open: using GzDecoder");
+                Box::new(BufReader::new(GzDecoder::new(file)))
+            },
+            _ => {
+                eprintln!("VcfReader::open: using plain file reader");
+                Box::new(BufReader::new(file))
+            },
         };
 
         Self::from_reader(reader)
@@ -271,6 +282,7 @@ impl VcfReader {
     /// Read all records into a GenotypeMatrix
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
         info_span!("vcf_read_all").in_scope(|| {
+        eprintln!("VcfReader::read_all: starting...");
         let mut markers = Markers::new();
         let mut columns = Vec::new();
         // Accumulate per-marker confidence scores (one Vec<u8> per marker, indexed by sample)
@@ -279,6 +291,7 @@ impl VcfReader {
 
         let mut line = String::new();
         let mut line_num = 0usize;
+        let mut raw_lines_read = 0usize;
 
         // Buffers for batch processing (Dictionary Compression)
         const BATCH_SIZE: usize = 64;
@@ -292,6 +305,7 @@ impl VcfReader {
             if bytes_read == 0 {
                 break;
             }
+            raw_lines_read += 1;
             line_num += 1;
 
             let line = line.trim();
@@ -386,6 +400,9 @@ impl VcfReader {
 
         // Update Samples with detected ploidy information
         self.finalize_samples();
+
+        eprintln!("VcfReader::read_all: finished. Raw lines: {}, Markers: {}, Chromosomes: {:?}",
+            raw_lines_read, markers.len(), markers.chrom_names());
 
         // Return unphased by default - caller should phase if needed
         // The is_phased detection is informational only

@@ -837,6 +837,9 @@ pub struct InMemoryRefReader {
 impl InMemoryRefReader {
     /// Create a new in-memory reader from a loaded reference panel
     pub fn new(genotypes: Arc<GenotypeMatrix<crate::data::storage::phase_state::Phased>>) -> Self {
+        let chroms = genotypes.markers().chrom_names();
+        eprintln!("InMemoryRefReader::new: {} markers, {} chromosomes: {:?}",
+            genotypes.n_markers(), chroms.len(), chroms);
         Self {
             genotypes,
             window_num: 0,
