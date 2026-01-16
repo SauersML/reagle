@@ -371,6 +371,7 @@ pub struct StreamingBref3Reader {
     reader: BufReader<File>,
     samples: Arc<Samples>,
     n_haps: usize,
+    markers: Markers,
     chrom_map: std::collections::HashMap<String, ChromIdx>,
     /// Whether we've reached end of data
     eof: bool,
