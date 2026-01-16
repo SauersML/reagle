@@ -98,6 +98,22 @@ jobs:
       - name: Prepare test data
         run: python3 tests/integration_test.py prepare
 
+      - name: Upload profiling test data
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiling-test-data
+          path: |
+            Rust/tests/data/input.vcf.gz
+            Rust/tests/data/input.vcf.gz.csi
+            Rust/tests/data/ref.vcf.gz
+            Rust/tests/data/ref.vcf.gz.csi
+            Rust/tests/data/truth.vcf.gz
+            Rust/tests/data/truth.vcf.gz.csi
+            Rust/tests/data/gsa_chr22.regions
+            Rust/tests/data/train_samples.txt
+            Rust/tests/data/test_samples.txt
+          retention-days: 7
+
       - name: Build release binary
         run: cargo build --release
 
