@@ -356,6 +356,21 @@ impl crate::pipelines::ImputationPipeline {
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
 
+        // Pre-load reference panel to get all markers for header writing
+        // This is only for the in-memory case; streaming ref is handled differently
+        let (in_memory_ref_gt, header_markers) = if !is_bref3 && !self.config.streaming.unwrap_or(false) {
+            let (mut vcf_reader, vcf_file) = crate::io::vcf::VcfReader::open(&ref_path)?;
+            let ref_gt = Arc::new(vcf_reader.read_all(vcf_file)?.into_phased());
+            let markers = ref_gt.markers().clone();
+            (Some(ref_gt), Some(markers))
+        } else {
+            (None, None)
+        };
+
+        if let Some(ref markers) = header_markers {
+            writer.write_header_extended(markers, true, self.config.gp, self.config.ap)?;
+        }
+
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.
         let (tx, rx) = mpsc::sync_channel::<StreamingPayload>(2);
@@ -389,8 +404,8 @@ impl crate::pipelines::ImputationPipeline {
                 RefPanelReader::StreamingVcf(crate::io::bref3::StreamingRefVcfReader::open(&ref_path_clone)?)
             } else {
                 // In-memory VCF (default, safer for correctness)
-                let (mut vcf_reader, vcf_file) = crate::io::vcf::VcfReader::open(&ref_path_clone)?;
-                let ref_gt = Arc::new(vcf_reader.read_all(vcf_file)?.into_phased());
+                // Use the pre-loaded ref_gt if available
+                let ref_gt = in_memory_ref_gt.expect("In-memory ref_gt should be pre-loaded");
                 RefPanelReader::InMemory(crate::io::bref3::InMemoryRefReader::new(ref_gt))
             };
 

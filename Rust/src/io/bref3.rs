@@ -715,8 +715,16 @@ impl WindowedBref3Reader {
         }
 
         let n_markers = markers.len();
-        let output_start = first_idx - start_idx;
-        let output_end = output_start + (last_idx + 1 - first_idx);
+        let mut output_start = first_idx - start_idx;
+        let mut output_end = output_start + (last_idx + 1 - first_idx);
+
+        // For first/last windows, don't trim the buffer regions
+        if is_first {
+            output_start = 0;
+        }
+        if is_last {
+            output_end = n_markers;
+        }
         let global_start = self.global_offset;
         let global_end = global_start + n_markers;
 
@@ -835,9 +843,17 @@ impl InMemoryRefReader {
             columns.push(self.genotypes.column(MarkerIdx::new(m as u32)).clone());
         }
 
-        let output_start = start_idx - buffered_start_idx;
-        let output_end = output_start + (end_idx - start_idx);
         let is_first = self.window_num == 0;
+        let is_last = buffered_end_idx == n_markers;
+        let mut output_start = start_idx - buffered_start_idx;
+        let mut output_end = output_start + (end_idx - start_idx);
+
+        if is_first {
+            output_start = 0;
+        }
+        if is_last {
+            output_end = buffered_end_idx - buffered_start_idx;
+        }
         self.window_num += 1;
 
         let genotypes = GenotypeMatrix::new_phased(markers, columns, self.genotypes.samples_arc());
@@ -849,7 +865,7 @@ impl InMemoryRefReader {
             output_start,
             output_end,
             is_first,
-            is_last: false, // Can't know without looking ahead
+            is_last,
         }))
     }
 }
