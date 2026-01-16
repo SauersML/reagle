@@ -418,11 +418,12 @@ impl StreamingVcfReader {
             window_end = self.buffer.len();
         }
 
+        let is_first = self.window_num == 0;
         let is_last = self.eof && window_end >= self.buffer.len();
 
         // Determine splice points
         let output_start = 0;
-        let output_end = if is_last {
+        let splice_point = if is_last {
             window_end
         } else {
             // Find overlap point
@@ -437,6 +438,15 @@ impl StreamingVcfReader {
             // We want the index of the first marker that is > overlap_gen
             self.find_overlap_splice_index(window_end, overlap_gen)
         };
+
+        // For first/last windows, consumer processes the full window.
+        // Otherwise, it processes up to the splice point.
+        let output_end = if is_first || is_last {
+            window_end
+        } else {
+            splice_point
+        };
+
 
         // Build GenotypeMatrix for this window
         let mut markers = Markers::new();
@@ -463,12 +473,14 @@ impl StreamingVcfReader {
             global_end: self.global_marker_idx + window_end,
             output_start,
             output_end,
-            is_first: self.window_num == 0,
+            is_first,
             phased_overlap: None, // Caller will set this from previous window's phased output
         };
 
         // Remove processed markers from buffer (keep overlap)
-        let keep_from = output_end;
+        // We always drain up to the splice_point. For the last window, this is the whole buffer.
+        // For other windows, this leaves the overlap region in the buffer.
+        let keep_from = splice_point;
         for _ in 0..keep_from {
             self.buffer.pop_front();
         }
