@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use noodles::bgzf::io as bgzf_io;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use noodles::vcf::Header;
@@ -181,16 +181,25 @@ impl VcfReader {
         }
         let xlen = u16::from_le_bytes([header[10], header[11]]) as usize;
         let mut extra = vec![0u8; xlen];
-        let extra_read = file.read(&mut extra)?;
-        file.seek(SeekFrom::Start(0))?;
-        if extra_read < 4 {
+
+        // Use read_exact to ensure we read the full extra field
+        if let Err(_) = file.read_exact(&mut extra) {
+            // If EOF happens here, file is truncated/corrupt or not valid BGZF
+            file.seek(SeekFrom::Start(0))?;
             return Ok(false);
         }
+
+        file.seek(SeekFrom::Start(0))?;
+
         // BGZF extra subfield ID is "BC".
-        for i in 0..extra_read.saturating_sub(4) {
+        // Format: SI1 (1), SI2 (1), SLEN (2), data (SLEN)
+        let mut i = 0;
+        while i + 4 <= extra.len() {
             if extra[i] == b'B' && extra[i + 1] == b'C' {
                 return Ok(true);
             }
+            let slen = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
+            i += 4 + slen;
         }
         Ok(false)
     }
@@ -203,13 +212,23 @@ impl VcfReader {
         // Check if gzipped
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let reader: Box<dyn BufRead + Send> = match ext {
-            "bgz" | "bgzf" => Box::new(BufReader::new(bgzf_io::Reader::new(file))),
+            "bgz" | "bgzf" => {
+                // For explicit bgz/bgzf extension, we still check content safety
+                if Self::detect_bgzf(&mut file).unwrap_or(false) {
+                    Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+                } else {
+                    // Fallback to MultiGzDecoder if detection failed but extension says bgzip
+                    // This handles cases where file might be just GZIP or detection is strict
+                    Box::new(BufReader::new(MultiGzDecoder::new(file)))
+                }
+            },
             "gz" => {
-                let is_bgzf = Self::detect_bgzf(&mut file)?;
+                let is_bgzf = Self::detect_bgzf(&mut file).unwrap_or(false);
                 if is_bgzf {
                     Box::new(BufReader::new(bgzf_io::Reader::new(file)))
                 } else {
-                    Box::new(BufReader::new(GzDecoder::new(file)))
+                    // Use MultiGzDecoder to support concatenated gzip streams
+                    Box::new(BufReader::new(MultiGzDecoder::new(file)))
                 }
             }
             _ => Box::new(BufReader::new(file)),
