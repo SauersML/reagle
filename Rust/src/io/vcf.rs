@@ -1316,3 +1316,40 @@ fn test_dictionary_compression_integration() {
         panic!("Expected Dictionary column for marker 64");
     }
 }
+
+pub fn read_markers_from_vcf_header(path: &Path) -> Result<Markers> {
+    let file = File::open(path)?;
+    let is_gzipped = path.extension().map(|e| e == gz || e == bgz).unwrap_or(false);
+    let mut reader: Box<dyn BufRead> = if is_gzipped {
+        Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+
+    let mut header_str = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if line.starts_with('#') {
+            header_str.push_str(&line);
+            if line.starts_with(#CHROM) {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if header_str.is_empty() {
+        return Ok(Markers::new());
+    }
+    let vcf_header: Header = header_str.parse().map_err(|e| ReagleError::vcf(e.to_string()))?;
+
+    let mut markers = Markers::new();
+    for (name, _) in vcf_header.contigs().iter() {
+        markers.add_chrom(name.as_str());
+    }
+    Ok(markers)
+}
+
