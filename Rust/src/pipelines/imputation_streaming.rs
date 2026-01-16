@@ -351,10 +351,39 @@ impl crate::pipelines::ImputationPipeline {
             n_ref_haps, n_target_samples
         );
 
+        // TODO: This is a performance regression. We pre-load the entire reference
+        // panel just to get the markers for the VCF header. This negates the
+        // benefit of a streaming pipeline. A better approach would be a two-pass
+        // read on the reference file: first to collect header info, second to
+        // stream for processing.
+        // Load reference markers to write VCF header
+        let ref_markers_for_header = if is_bref3 {
+            let mut reader = crate::io::bref3::StreamingBref3Reader::open(&ref_path)?;
+            let mut markers = crate::data::marker::Markers::new();
+            while let Some(block) = reader.next_block()? {
+                for i in 0..block.markers.len() {
+                    markers.push(block.markers.marker(crate::data::marker::MarkerIdx::new(i as u32)).clone());
+                }
+            }
+            markers
+        } else {
+            let (mut reader, file) = crate::io::vcf::VcfReader::open(&ref_path)?;
+            let matrix = reader.read_all(file)?;
+            matrix.markers().clone()
+        };
+
         // Create output writer
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
+
+        // Write header immediately
+        writer.write_header_extended(
+            &ref_markers_for_header,
+            true, // Imputation fields
+            self.config.gp,
+            self.config.ap,
+        )?;
 
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.
