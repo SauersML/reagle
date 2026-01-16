@@ -354,7 +354,7 @@ impl crate::pipelines::ImputationPipeline {
         // Create output writer
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
-        let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
+        let mut writer = VcfWriter::create(&output_path, target_samples)?;
 
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.

@@ -371,6 +371,7 @@ pub struct StreamingBref3Reader {
     reader: BufReader<File>,
     samples: Arc<Samples>,
     n_haps: usize,
+    markers: Markers,
     chrom_map: std::collections::HashMap<String, ChromIdx>,
     /// Whether we've reached end of data
     eof: bool,
@@ -400,6 +401,7 @@ impl StreamingBref3Reader {
             reader,
             samples,
             n_haps,
+            markers: Markers::new(),
             chrom_map: std::collections::HashMap::new(),
             eof: false,
         })
@@ -570,7 +572,7 @@ impl StreamingBref3Reader {
         if let Some(&idx) = self.chrom_map.get(name) {
             idx
         } else {
-            let idx = ChromIdx::new(self.chrom_map.len() as u16);
+            let idx = self.markers.add_chrom(name);
             self.chrom_map.insert(name.to_string(), idx);
             idx
         }

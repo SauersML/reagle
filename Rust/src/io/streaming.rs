@@ -323,15 +323,8 @@ impl StreamingVcfReader {
         }
 
         // Parse sample names from header
-        let sample_names: Vec<String> = if let Some(header_line) = header_str.lines().last() {
-            header_line
-                .split('\t')
-                .skip(9)
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let header: noodles::vcf::Header = header_str.parse()?;
+        let sample_names: Vec<String> = header.sample_names().iter().map(|s| s.to_string()).collect();
 
         let samples = Arc::new(Samples::from_ids(sample_names));
 
