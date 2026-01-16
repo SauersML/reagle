@@ -326,20 +326,27 @@ impl crate::pipelines::ImputationPipeline {
         })?;
 
         let is_bref3 = ref_path.extension().map(|e| e == "bref3").unwrap_or(false);
-        // Note: RefPanelReader is not cloneable, so we load it inside the producer thread
-        // We need to pass the path
         let ref_path_clone = ref_path.clone();
 
-        // Initialize parameters
-        // We load reference size estimate or just guess?
-        // Ideally we need n_ref_haps for params.
-        // We can open it briefly or just trust config.
-        // Let's open it briefly to get N.
-        let n_ref_haps = if is_bref3 {
-             crate::io::bref3::StreamingBref3Reader::open(&ref_path)?.n_haps()
+        // Pre-load reference markers to write VCF header
+        // This is inefficient for VCF, but necessary to get all contigs for the header
+        let ref_markers_for_header = if is_bref3 {
+            let mut reader = crate::io::bref3::StreamingBref3Reader::open(ref_path)?;
+            // This is a bit of a hack: read all blocks to populate markers, but don't store genotypes
+            while let Some(_) = reader.next_block()? {}
+            reader.markers().clone()
         } else {
-             let (reader, _) = crate::io::vcf::VcfReader::open(&ref_path)?;
-             reader.samples_arc().len() * 2
+            let (mut vcf_reader, vcf_file) = crate::io::vcf::VcfReader::open(ref_path)?;
+            vcf_reader.read_markers_only(vcf_file)?
+        };
+
+        // Get n_ref_haps for parameter initialization
+        let n_ref_haps = if is_bref3 {
+            crate::io::bref3::StreamingBref3Reader::open(ref_path)?.n_haps()
+        } else {
+            // Re-open to get samples, since read_all consumes the reader
+            let (reader, _) = crate::io::vcf::VcfReader::open(ref_path)?;
+            reader.samples_arc().len() * 2
         };
 
         let n_total_haps = n_ref_haps + n_target_haps;
@@ -355,6 +362,14 @@ impl crate::pipelines::ImputationPipeline {
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
+
+        // Write the VCF header BEFORE starting the pipeline
+        writer.write_header_extended(
+            &ref_markers_for_header,
+            true, // imputed=true
+            self.config.gp,
+            self.config.ap,
+        )?;
 
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.

@@ -269,6 +269,36 @@ impl VcfReader {
         Arc::clone(&self.samples)
     }
 
+    /// Read only marker information from a VCF, skipping genotypes.
+    /// This is a memory-efficient way to get all marker metadata for a header.
+    pub fn read_markers_only(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<Markers> {
+        info_span!("vcf_read_markers_only").in_scope(|| {
+            let mut markers = Markers::new();
+            let mut line = String::new();
+            let mut line_num = 0usize;
+
+            loop {
+                line.clear();
+                let bytes_read = reader.read_line(&mut line)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                line_num += 1;
+
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                // Parse only the marker part of the record
+                let (marker, _, _, _) = self.parse_record_no_genotypes(line, &mut markers, line_num)?;
+                markers.push(marker);
+            }
+            Ok(markers)
+        })
+    }
+
+
     /// Read all records into a GenotypeMatrix
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
         info_span!("vcf_read_all").in_scope(|| {
@@ -581,6 +611,50 @@ impl VcfReader {
 
         Ok((marker, alleles, is_phased, confidences))
     }
+
+    /// A version of parse_record that skips all genotype parsing.
+    /// Used for memory-efficient header/marker loading.
+    fn parse_record_no_genotypes(
+        &mut self,
+        line: &str,
+        markers: &mut Markers,
+        line_num: usize,
+    ) -> Result<(Marker, Vec<u8>, bool, Option<Vec<u8>>)> {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 8 { // Need at least 8 fields for marker data
+            return Err(ReagleError::parse(
+                line_num,
+                format!("Expected at least 8 fields, got {}", fields.len()),
+            ));
+        }
+
+        // Parse chrom, pos, id, ref, alt, info
+        let chrom_name = fields[0];
+        let chrom_idx = markers.add_chrom(chrom_name);
+        let pos: u32 = fields[1]
+            .parse()
+            .map_err(|_| ReagleError::parse(line_num, "Invalid POS field"))?;
+        let id = if fields[2] == "." { None } else { Some(fields[2].into()) };
+        let ref_allele = Allele::from_str(fields[3]);
+        let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
+        let info_field = fields[7];
+        let end_pos: Option<u32> = if info_field != "." {
+            info_field
+                .split(';')
+                .filter_map(|kv| {
+                    kv.strip_prefix("END=").and_then(|v| v.parse().ok())
+                })
+                .next()
+        } else {
+            None
+        };
+
+        let marker = Marker::with_end(chrom_idx, pos, end_pos, id, ref_allele, alt_alleles);
+
+        // Return dummy values for genotypes
+        Ok((marker, Vec::new(), true, None))
+    }
+
 
     /// Rebuild Samples with detected ploidy information
     ///

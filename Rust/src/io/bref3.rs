@@ -371,6 +371,7 @@ pub struct StreamingBref3Reader {
     reader: BufReader<File>,
     samples: Arc<Samples>,
     n_haps: usize,
+    markers: Markers,
     chrom_map: std::collections::HashMap<String, ChromIdx>,
     /// Whether we've reached end of data
     eof: bool,
@@ -400,6 +401,7 @@ impl StreamingBref3Reader {
             reader,
             samples,
             n_haps,
+            markers: Markers::new(),
             chrom_map: std::collections::HashMap::new(),
             eof: false,
         })
@@ -408,6 +410,11 @@ impl StreamingBref3Reader {
     /// Get the samples as Arc (for sharing without cloning)
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)
+    }
+
+    /// Get reference to markers metadata
+    pub fn markers(&self) -> &Markers {
+        &self.markers
     }
 
     /// Get number of haplotypes
@@ -570,7 +577,7 @@ impl StreamingBref3Reader {
         if let Some(&idx) = self.chrom_map.get(name) {
             idx
         } else {
-            let idx = ChromIdx::new(self.chrom_map.len() as u16);
+            let idx = self.markers.add_chrom(name);
             self.chrom_map.insert(name.to_string(), idx);
             idx
         }
@@ -715,8 +722,16 @@ impl WindowedBref3Reader {
         }
 
         let n_markers = markers.len();
-        let output_start = first_idx - start_idx;
-        let output_end = output_start + (last_idx + 1 - first_idx);
+        let mut output_start = first_idx - start_idx;
+        let mut output_end = output_start + (last_idx + 1 - first_idx);
+
+        if is_first {
+            output_start = 0;
+        }
+        if is_last {
+            output_end = n_markers;
+        }
+
         let global_start = self.global_offset;
         let global_end = global_start + n_markers;
 
@@ -835,10 +850,18 @@ impl InMemoryRefReader {
             columns.push(self.genotypes.column(MarkerIdx::new(m as u32)).clone());
         }
 
-        let output_start = start_idx - buffered_start_idx;
-        let output_end = output_start + (end_idx - start_idx);
+        let mut output_start = start_idx - buffered_start_idx;
+        let mut output_end = output_start + (end_idx - start_idx);
         let is_first = self.window_num == 0;
+        let is_last = buffered_end_idx == n_markers;
         self.window_num += 1;
+
+        if is_first {
+            output_start = 0;
+        }
+        if is_last {
+            output_end = self.genotypes.n_markers();
+        }
 
         let genotypes = GenotypeMatrix::new_phased(markers, columns, self.genotypes.samples_arc());
 
