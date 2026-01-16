@@ -1389,18 +1389,28 @@ impl PhasingPipeline {
         n_candidates: usize,
         max_states: usize,
         pbwt_state: Option<&crate::model::pbwt::PbwtState>,
+        marker_to_global: Option<&[usize]>,
+        gen_positions: &[f64],
+        step_cm: f32,
     ) -> Vec<crate::model::states::ThreadedHaps>
     where
         F: Fn(usize, usize) -> u8 + Sync,
     {
-        use std::collections::HashSet;
-
-        // Compute sampling points (sparse, ~64 points like PhaseStates)
-        const MAX_SAMPLE_POINTS: usize = 64;
-        let step = (n_markers / MAX_SAMPLE_POINTS).max(1);
-        let sampling_points_vec: Vec<usize> = (0..n_markers).step_by(step).collect();
-        // Use HashSet for O(1) lookup instead of Vec O(n) contains
-        let sampling_points: HashSet<usize> = sampling_points_vec.iter().copied().collect();
+        // Compute sampling points using genetic distance steps
+        let step_cm = step_cm.max(1e-4) as f64;
+        let mut sampling_points = vec![false; n_markers];
+        let mut next_cm = gen_positions.first().copied().unwrap_or(0.0);
+        for m in 0..n_markers {
+            let cm = gen_positions.get(m).copied().unwrap_or(next_cm);
+            if cm < next_cm && m + 1 < n_markers {
+                continue;
+            }
+            sampling_points[m] = true;
+            next_cm = cm + step_cm;
+        }
+        if n_markers > 0 {
+            sampling_points[n_markers - 1] = true;
+        }
 
         // Create PhaseStates for all samples
         let mut phase_states: Vec<PhaseStates> = (0..n_samples)
@@ -1440,7 +1450,7 @@ impl PhasingPipeline {
             wavefront.advance_forward(&alleles, n_alleles);
 
             // At sampling points, collect forward neighbors for all samples
-            if sampling_points.contains(&m) {
+            if sampling_points.get(m).copied().unwrap_or(false) {
                 wavefront.prepare_fwd_queries();
 
                 // Parallel neighbor collection using rayon
@@ -1463,8 +1473,11 @@ impl PhasingPipeline {
                 // Also add IBS2 neighbors
                 for s in 0..n_samples {
                     let sample = SampleIdx::new(s as u32);
+                    let global_m = marker_to_global
+                        .and_then(|map| map.get(m).copied())
+                        .unwrap_or(m);
                     for seg in ibs2.segments(sample) {
-                        if seg.contains(m) {
+                        if seg.contains(global_m) {
                             let other_s = seg.other_sample;
                             if other_s != sample {
                                 // Use stack-allocated array instead of Vec
@@ -1503,7 +1516,7 @@ impl PhasingPipeline {
             wavefront.advance_backward(&alleles, n_alleles);
 
             // At sampling points, collect backward neighbors
-            if sampling_points.contains(&m) {
+            if sampling_points.get(m).copied().unwrap_or(false) {
                 wavefront.prepare_bwd_queries();
 
                 // Parallel neighbor collection
@@ -1546,16 +1559,26 @@ impl PhasingPipeline {
         n_candidates: usize,
         max_states: usize,
         pbwt_state: Option<&crate::model::pbwt::PbwtState>,
+        gen_positions: &[f64],
+        step_cm: f32,
     ) -> Vec<crate::model::states::ThreadedHaps> {
-        use std::collections::HashSet;
-
         let n_haps = geno.n_haps();
 
-        // Compute sampling points
-        const MAX_SAMPLE_POINTS: usize = 64;
-        let step = (n_markers / MAX_SAMPLE_POINTS).max(1);
-        let sampling_points_vec: Vec<usize> = (0..n_markers).step_by(step).collect();
-        let sampling_points: HashSet<usize> = sampling_points_vec.iter().copied().collect();
+        // Compute sampling points using genetic distance steps
+        let step_cm = step_cm.max(1e-4) as f64;
+        let mut sampling_points = vec![false; n_markers];
+        let mut next_cm = gen_positions.first().copied().unwrap_or(0.0);
+        for m in 0..n_markers {
+            let cm = gen_positions.get(m).copied().unwrap_or(next_cm);
+            if cm < next_cm && m + 1 < n_markers {
+                continue;
+            }
+            sampling_points[m] = true;
+            next_cm = cm + step_cm;
+        }
+        if n_markers > 0 {
+            sampling_points[n_markers - 1] = true;
+        }
 
         // Create PhaseStates for all samples
         let mut phase_states: Vec<PhaseStates> = (0..n_samples)
@@ -1583,7 +1606,7 @@ impl PhasingPipeline {
             wavefront.advance_forward(&marker_alleles, n_alleles);
 
             // At sampling points, collect forward neighbors
-            if sampling_points.contains(&m) {
+            if sampling_points.get(m).copied().unwrap_or(false) {
                 wavefront.prepare_fwd_queries();
 
                 let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
@@ -1625,7 +1648,7 @@ impl PhasingPipeline {
 
             wavefront.advance_backward(&marker_alleles, n_alleles);
 
-            if sampling_points.contains(&m) {
+            if sampling_points.get(m).copied().unwrap_or(false) {
                 wavefront.prepare_bwd_queries();
 
                 let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
@@ -1675,6 +1698,12 @@ impl PhasingPipeline {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let markers = target_gt.markers();
+        let mut gen_positions = Vec::with_capacity(n_markers);
+        gen_positions.push(0.0);
+        for i in 1..n_markers {
+            let dist = gen_dists.get(i - 1).copied().unwrap_or(0.0);
+            gen_positions.push(gen_positions[i - 1] + dist);
+        }
 
         tracing::Span::current().record("n_samples", n_samples);
         tracing::Span::current().record("n_markers", n_markers);
@@ -1729,6 +1758,9 @@ impl PhasingPipeline {
                         n_candidates,
                         self.params.n_states,
                         pbwt_state,
+                        None,
+                        &gen_positions,
+                        self.config.imp_step,
                     )
                 } else {
                     // Use optimized direct access version for no-reference case
@@ -1740,6 +1772,8 @@ impl PhasingPipeline {
                         n_candidates,
                         self.params.n_states,
                         pbwt_state,
+                        &gen_positions,
+                        self.config.imp_step,
                     )
                 }
             });
@@ -1907,6 +1941,8 @@ impl PhasingPipeline {
         // Compute total haplotype count (target + reference)
         let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
+        let n_samples = sample_phases.len();
+        let n_hi_freq = hi_freq_to_orig.len();
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
         // We use a scoped immutable borrow that ends before the apply phase.
@@ -1960,6 +1996,48 @@ impl PhasingPipeline {
                 self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps)
             };
 
+            let n_candidates = 20.min(n_total_haps).max(1);
+            let threaded_haps_vec = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                self.build_composite_haps_streaming(
+                    |subset_m, h| {
+                        let orig_m = hi_freq_to_orig[subset_m];
+                        if h < n_haps {
+                            ref_geno.get(orig_m, HapIdx::new(h as u32))
+                        } else {
+                            let ref_h = h - n_haps;
+                            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                alignment.reverse_map_allele(orig_m, ref_allele)
+                            } else {
+                                255
+                            }
+                        }
+                    },
+                    n_hi_freq,
+                    n_total_haps,
+                    n_samples,
+                    ibs2,
+                    n_candidates,
+                    self.params.n_states,
+                    None,
+                    Some(hi_freq_to_orig),
+                    hi_freq_gen_positions,
+                    self.config.imp_step,
+                )
+            } else {
+                self.build_composite_haps_streaming_direct(
+                    ref_geno,
+                    n_hi_freq,
+                    n_samples,
+                    ibs2,
+                    n_candidates,
+                    self.params.n_states,
+                    None,
+                    hi_freq_gen_positions,
+                    self.config.imp_step,
+                )
+            };
+
             // Collect phase decisions per sample using correct per-het algorithm.
             // Returns: (swap_mask, het_lr_values) per sample where:
             //   - swap_mask[i] = true if the sampled phase orientation at marker i is swapped
@@ -1971,17 +2049,8 @@ impl PhasingPipeline {
                 .map(|(s, sp)| {
                     let n_hi_freq = hi_freq_to_orig.len();
 
-                    // Build dynamic composite haplotypes using PhaseStates
-                    let mut phase_states = PhaseStates::new(self.params.n_states, n_hi_freq);
-                    let threaded_haps = phase_states.build_composite_haps(
-                        s as u32,
-                        &phase_ibs,
-                        ibs2,
-                        20,
-                        hi_freq_gen_positions,
-                        self.config.imp_step,
-                    );
-                    let n_states = phase_states.n_states();
+                    let threaded_haps = &threaded_haps_vec[s];
+                    let n_states = threaded_haps.n_states();
 
                     // Extract alleles from SamplePhase for SUBSET of markers
                     let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
@@ -2279,6 +2348,49 @@ impl PhasingPipeline {
                 }
             };
 
+            let n_samples = n_haps / 2;
+            let n_candidates = 20.min(n_total_haps).max(1);
+            let threaded_haps_vec = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                self.build_composite_haps_streaming(
+                    |subset_m, h| {
+                        let orig_m = hi_freq_markers[subset_m];
+                        if h < n_haps {
+                            ref_geno.get(orig_m, HapIdx::new(h as u32))
+                        } else {
+                            let ref_h = h - n_haps;
+                            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                                alignment.reverse_map_allele(orig_m, ref_allele)
+                            } else {
+                                255
+                            }
+                        }
+                    },
+                    n_stage1,
+                    n_total_haps,
+                    n_samples,
+                    ibs2,
+                    n_candidates,
+                    self.params.n_states,
+                    None,
+                    Some(hi_freq_markers),
+                    hi_freq_gen_positions,
+                    self.config.imp_step,
+                )
+            } else {
+                self.build_composite_haps_streaming_direct(
+                    ref_geno,
+                    n_stage1,
+                    n_samples,
+                    ibs2,
+                    n_candidates,
+                    self.params.n_states,
+                    None,
+                    hi_freq_gen_positions,
+                    self.config.imp_step,
+                )
+            };
+
             let get_allele_global = |marker: usize, hap: usize| -> u8 {
                 if hap < n_haps {
                     ref_geno.get(marker, HapIdx::new(hap as u32))
@@ -2350,17 +2462,8 @@ impl PhasingPipeline {
                     .wrapping_add(0xDEAD_BEEF_CAFE_u64); // Stage 2 distinction constant
                 let mut rng = rand::rngs::StdRng::seed_from_u64(sample_seed);
 
-                // Build dynamic composite haplotypes using PhaseStates
-                let mut phase_states = PhaseStates::new(self.params.n_states, n_stage1);
-                let threaded_haps = phase_states.build_composite_haps(
-                    s as u32,
-                    &phase_ibs,
-                    ibs2,
-                    20,
-                    hi_freq_gen_positions,
-                    self.config.imp_step,
-                );
-                let n_states = phase_states.n_states();
+                let threaded_haps = &threaded_haps_vec[s];
+                let n_states = threaded_haps.n_states();
 
                 // Extract Stage 1 alleles from SamplePhase
                 let seq1: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele1(m)).collect();

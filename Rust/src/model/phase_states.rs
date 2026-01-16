@@ -22,8 +22,6 @@ use std::collections::{BinaryHeap, HashMap};
 
 use tracing::info_span;
 
-use crate::model::ibs2::Ibs2;
-use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::states::ThreadedHaps;
 
 /// Entry in the priority queue for managing composite haplotypes
@@ -96,88 +94,7 @@ impl PhaseStates {
         }
     }
 
-    /// Build composite haplotypes for a sample's two haplotypes
-    ///
-    /// This samples at genetic-distance-spaced positions to find IBS neighbors,
-    /// providing dynamic state selection without the O(n_markers) overhead.
-    ///
-    /// Sampling uses a fixed cM step to keep resolution aligned to recombination
-    /// distance rather than marker count.
-    ///
-    /// # Arguments
-    /// * `sample` - Sample index (hap1 = sample * 2, hap2 = sample * 2 + 1)
-    /// * `phase_ibs` - Bidirectional PBWT for finding IBS neighbors
-    /// * `ibs2` - IBS2 segment data for additional neighbors
-    /// * `n_candidates` - Number of candidates to consider at each marker
-    ///
-    /// # Returns
-    /// The composite haplotypes ready for use in the HMM (cloned for ownership transfer)
-    pub fn build_composite_haps(
-        &mut self,
-        sample: u32,
-        phase_ibs: &BidirectionalPhaseIbs,
-        ibs2: &Ibs2,
-        n_candidates: usize,
-        gen_positions: &[f64],
-        step_cm: f32,
-    ) -> ThreadedHaps {
-        self.clear();
 
-        let h1 = sample * 2;
-        let h2 = h1 + 1;
-
-        let step_cm = step_cm.max(1e-4) as f64;
-        let mut next_cm = gen_positions.first().copied().unwrap_or(0.0);
-
-        for marker in 0..self.n_markers {
-            let cm = gen_positions.get(marker).copied().unwrap_or(next_cm);
-            if cm < next_cm && marker + 1 < self.n_markers {
-                continue;
-            }
-            // Get IBS neighbors for both haplotypes at this marker
-            let neighbors1 = phase_ibs.find_neighbors(h1, marker, ibs2, n_candidates);
-            let neighbors2 = phase_ibs.find_neighbors(h2, marker, ibs2, n_candidates);
-
-            // Add IBS haplotypes (excluding same sample)
-            for &ibs_hap in &neighbors1 {
-                if ibs_hap / 2 != sample {
-                    self.add_ibs_hap(ibs_hap, marker as i32);
-                }
-            }
-            for &ibs_hap in &neighbors2 {
-                if ibs_hap / 2 != sample {
-                    self.add_ibs_hap(ibs_hap, marker as i32);
-                }
-            }
-            next_cm = cm + step_cm;
-        }
-
-        // Also sample the last marker if not already covered
-        if self.n_markers > 0 {
-            let last_marker = self.n_markers - 1;
-            let neighbors1 = phase_ibs.find_neighbors(h1, last_marker, ibs2, n_candidates);
-            let neighbors2 = phase_ibs.find_neighbors(h2, last_marker, ibs2, n_candidates);
-            for &ibs_hap in &neighbors1 {
-                if ibs_hap / 2 != sample {
-                    self.add_ibs_hap(ibs_hap, last_marker as i32);
-                }
-            }
-            for &ibs_hap in &neighbors2 {
-                if ibs_hap / 2 != sample {
-                    self.add_ibs_hap(ibs_hap, last_marker as i32);
-                }
-            }
-        }
-
-        // If no IBS haps found, fill with random haps
-        if self.queue.is_empty() {
-            self.fill_with_random(sample, phase_ibs.n_haps());
-        }
-
-        // Finalize and return owned copy
-        self.finalize();
-        self.threaded_haps.clone()
-    }
 
     /// Clear state for reuse
     fn clear(&mut self) {
@@ -305,6 +222,7 @@ impl PhaseStates {
     }
 
     /// Get the number of states
+    #[cfg(test)]
     pub fn n_states(&self) -> usize {
         self.threaded_haps.n_states()
     }
