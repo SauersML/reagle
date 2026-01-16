@@ -40,9 +40,12 @@ def run(cmd, check=True, capture=False):
     sys.stdout.flush()
     if capture:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if check and result.returncode != 0:
+    else:
+        result = subprocess.run(cmd, shell=True)
+    if check and result.returncode != 0:
+        if capture:
             print(f"STDERR: {result.stderr}")
-            raise subprocess.CalledProcessError(result.returncode, cmd)
+        raise subprocess.CalledProcessError(result.returncode, cmd)
     return result
 
 
