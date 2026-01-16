@@ -175,7 +175,6 @@ def count_chrom_markers(vcf_path, chrom):
     return n
 
 def find_chrom_label(vcf_path, chrom):
-def find_chrom_label(vcf_path, chrom):
     """Return the exact chromosome label found in the VCF for chrom."""
     chrom_str = str(chrom)
     chrom_options = {chrom_str, f"chr{chrom_str}"}
