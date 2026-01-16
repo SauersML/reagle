@@ -795,6 +795,7 @@ fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
 pub struct VcfWriter {
     writer: Box<dyn Write + Send>,
     samples: Arc<Samples>,
+    header_written: bool,
 }
 
 impl VcfWriter {
@@ -809,7 +810,11 @@ impl VcfWriter {
             _ => Box::new(BufWriter::new(file)),
         };
 
-        Ok(Self { writer, samples })
+        Ok(Self {
+            writer,
+            samples,
+            header_written: false,
+        })
     }
 
     /// Write VCF header for phased output
