@@ -1127,10 +1127,33 @@ target_samples={} target_bytes={}",
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
+
+                            // Check if this haplotype has a hard-called genotype at this marker
+                            // If so, force the dosage to 0.0 or 1.0 and best_gt to match.
+                            // This ensures DR2=1.0 for genotyped markers and matches input.
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
-                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                let mut prob_alt = 0.0;
+                                let mut best_g = (0, 0);
+                                let mut is_forced = false;
+
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let a = target_win.allele(MarkerIdx::new(target_m as u32), hap1_idx);
+                                    if a != 255 {
+                                        // Force hard call for genotyped marker
+                                        prob_alt = if a > 0 { 1.0 } else { 0.0 };
+                                        best_g = if a > 0 { (1, 0) } else { (0, 0) };
+                                        is_forced = true;
+                                    }
+                                }
+
+                                if !is_forced {
+                                    let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                    prob_alt = p.prob(1);
+                                    best_g = if p.max_allele() == 1 { (1, 0) } else { (0, 0) };
+                                }
+
+                                hap_dosages.push(prob_alt);
+                                hap_best_gt.push(best_g);
                             }
 
                             let mut locked = obs_hap1.clone();
@@ -1202,10 +1225,30 @@ target_samples={} target_bytes={}",
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
+
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
-                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                let mut prob_alt = 0.0;
+                                let mut best_g = (0, 0);
+                                let mut is_forced = false;
+
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let a = target_win.allele(MarkerIdx::new(target_m as u32), hap2_idx);
+                                    if a != 255 {
+                                        // Force hard call for genotyped marker
+                                        prob_alt = if a > 0 { 1.0 } else { 0.0 };
+                                        best_g = if a > 0 { (1, 0) } else { (0, 0) };
+                                        is_forced = true;
+                                    }
+                                }
+
+                                if !is_forced {
+                                    let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                    prob_alt = p.prob(1);
+                                    best_g = if p.max_allele() == 1 { (1, 0) } else { (0, 0) };
+                                }
+
+                                hap_dosages.push(prob_alt);
+                                hap_best_gt.push(best_g);
                             }
 
                             let priors = if output_end > 0 && n_ref_markers > 0 {
@@ -1451,47 +1494,27 @@ target_samples={} target_bytes={}",
             } else {
                 (0.0, 0.0)
             };
+
+            // For genotyped markers, force the hard call output to match the input
             if let Some(target_m) = alignment.target_marker(marker_idx) {
                 let h1 = HapIdx::new((sample_idx * 2) as u32);
                 let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
                 let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
                 let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    p1 + p2
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    let sum = q00 + q01 + q11;
-                    if sum > 0.0 {
-                        let inv_sum = 1.0 / sum;
-                        let q01n = q01 * inv_sum;
-                        let q11n = q11 * inv_sum;
-                        q01n + 2.0 * q11n
-                    } else {
-                        p1 + p2
-                    }
+
+                if a1 != 255 && a2 != 255 {
+                    // Force hard call dosage
+                    let d1 = if a1 > 0 { 1.0 } else { 0.0 };
+                    let d2 = if a2 > 0 { 1.0 } else { 0.0 };
+                    return d1 + d2;
                 }
+            }
+
+            // Fallback for imputed markers or missing genotyped markers
+            if let Some((dosages, _)) = sample_data.get(&sample_idx) {
+                dosages.get(local_m).copied().unwrap_or(p1 + p2)
             } else {
-                if let Some((dosages, _)) = sample_data.get(&sample_idx) {
-                    dosages.get(local_m).copied().unwrap_or(p1 + p2)
-                } else {
-                    p1 + p2
-                }
+                p1 + p2
             }
         };
 
@@ -1503,56 +1526,31 @@ target_samples={} target_bytes={}",
             } else {
                 (0.0, 0.0)
             };
+
+            // For genotyped markers, force the hard call output to match the input
             if let Some(target_m) = alignment.target_marker(marker_idx) {
                 let h1 = HapIdx::new((sample_idx * 2) as u32);
                 let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
                 let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
                 let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    if p1 + p2 >= 1.5 {
-                        (1, 1)
-                    } else if p1 + p2 >= 0.5 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    if q11 >= q01 && q11 >= q00 {
-                        (1, 1)
-                    } else if q01 >= q00 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
+
+                if a1 != 255 && a2 != 255 {
+                    // Force hard call genotype
+                    let g1 = if a1 > 0 { 1 } else { 0 };
+                    let g2 = if a2 > 0 { 1 } else { 0 };
+                    return (g1, g2);
                 }
+            }
+
+            if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
+                best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
-                if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
-                    best_gt.get(local_m).copied().unwrap_or((0, 0))
+                if p1 + p2 >= 1.5 {
+                    (1, 1)
+                } else if p1 + p2 >= 0.5 {
+                    (0, 1)
                 } else {
-                    if p1 + p2 >= 1.5 {
-                        (1, 1)
-                    } else if p1 + p2 >= 0.5 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
+                    (0, 0)
                 }
             }
         };
