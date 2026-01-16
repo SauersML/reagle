@@ -17,7 +17,7 @@ use crate::data::storage::phase_state::{Phased, Unphased};
 use crate::data::storage::GenotypeMatrix;
 use crate::data::alignment::MarkerAlignment;
 use crate::error::{Result, ReagleError};
-use crate::io::bref3::RefPanelReader;
+use crate::io::bref3::{RefPanelReader, StreamingBref3Reader, StreamingRefVcfReader};
 use crate::io::streaming::{HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader};
 use crate::io::vcf::{VcfWriter, ImputationQuality};
 use crate::pipelines::imputation::{AllelePosteriors, ClusterStateProbs};
@@ -351,10 +351,24 @@ impl crate::pipelines::ImputationPipeline {
             n_ref_haps, n_target_samples
         );
 
-        // Create output writer
+        // Pre-scan reference to build header before creating writer
+        eprintln!("Phase 0: Pre-scanning reference panel to build VCF header...");
+        let ref_markers = if is_bref3 {
+            StreamingBref3Reader::prescan_markers(ref_path)?
+        } else {
+            StreamingRefVcfReader::prescan_markers(ref_path)?
+        };
+
+        // Create output writer and write header immediately
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
+        writer.write_header_extended(
+            &ref_markers,
+            true,
+            self.config.gp,
+            self.config.ap,
+        )?;
 
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.
