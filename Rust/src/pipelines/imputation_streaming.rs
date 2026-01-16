@@ -397,7 +397,6 @@ impl crate::pipelines::ImputationPipeline {
             };
 
             let mut window_count = 0;
-            let mut skipped_ref_windows = 0usize;
             let mut phased_overlap: Option<PhasedOverlap> = None;
             let mut pbwt_state: Option<PbwtState> = None;
 
@@ -423,6 +422,12 @@ impl crate::pipelines::ImputationPipeline {
                     .genotypes
                     .marker(MarkerIdx::new((n_markers - 1) as u32))
                     .pos;
+                let window_chrom_idx = target_window.genotypes.marker(MarkerIdx::new(0)).chrom;
+                let window_chrom = target_window
+                    .genotypes
+                    .markers()
+                    .chrom_name(window_chrom_idx)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid target chromosome index"))?;
                 let phase_span = if pipeline.config.profile {
                     Some(
                         info_span!(
@@ -452,27 +457,21 @@ impl crate::pipelines::ImputationPipeline {
                 let ref_window = if pipeline.config.profile {
                     let span_guard = info_span!("io_load_ref").entered();
                     let _ = &span_guard;
-                    ref_reader.load_window_for_region(start_pos, end_pos)?
+                    ref_reader.load_window_for_region(window_chrom, start_pos, end_pos)?
                 } else {
-                    ref_reader.load_window_for_region(start_pos, end_pos)?
+                    ref_reader.load_window_for_region(window_chrom, start_pos, end_pos)?
                 };
 
                 let ref_window = match ref_window {
                     Some(w) => w,
                     None => {
-                        eprintln!("    Warning: No reference markers in region");
-                        if let RefPanelReader::InMemory(r) = &mut ref_reader {
-                            if let Some(full) = r.load_window_for_region(0, u32::MAX)? {
-                                eprintln!("    Falling back to full reference window");
-                                full
-                            } else {
-                                skipped_ref_windows += 1;
-                                continue;
-                            }
-                        } else {
-                            skipped_ref_windows += 1;
-                            continue;
-                        }
+                        return Err(anyhow::anyhow!(
+                            "No reference markers in region for chrom {} ({}..{})",
+                            window_chrom,
+                            start_pos,
+                            end_pos
+                        )
+                        .into());
                     }
                 };
 
@@ -575,12 +574,6 @@ impl crate::pipelines::ImputationPipeline {
 target_samples={} target_bytes={}",
                     target_samples, target_size
                 )));
-            }
-            if skipped_ref_windows > 0 {
-                eprintln!(
-                    "    Warning: skipped {} target windows with no reference overlap",
-                    skipped_ref_windows
-                );
             }
 
             Ok(())

@@ -62,7 +62,7 @@ def validate_vcf(path):
     if result.returncode != 0:
         return False
     stderr = result.stderr or ""
-    if "No BGZF EOF marker" in stderr or "Failed to read BGZF block" in stderr:
+    if "Failed to read BGZF block" in stderr:
         return False
     return True
 
@@ -146,14 +146,11 @@ def get_chrom_bounds(vcf_path, chrom):
 
 
 def resolve_region_arg(paths, chrom):
-    """Prefer ref bounds; fall back to input bounds; then chrom only."""
+    """Use reference bounds for region selection."""
     ref_bounds = get_chrom_bounds(paths["ref_vcf"], chrom)
-    if ref_bounds:
-        return f"chr{chrom}:{ref_bounds[0]}-{ref_bounds[1]}"
-    input_bounds = get_chrom_bounds(paths["input_vcf"], chrom)
-    if input_bounds:
-        return f"chr{chrom}:{input_bounds[0]}-{input_bounds[1]}"
-    return f"chr{chrom}"
+    if not ref_bounds:
+        raise RuntimeError(f"Unable to determine reference bounds for chr{chrom}")
+    return f"chr{chrom}:{ref_bounds[0]}-{ref_bounds[1]}"
 
 
 def print_tool_help(label, cmd):
@@ -1120,7 +1117,7 @@ def stage_prepare():
             str(paths['chr22_bcf']) + ".csi"
         )
 
-    if not validate_vcf(paths['chr22_vcf']):
+    if not validate_vcf(paths['chr22_vcf']) and not has_vcf_records(paths['chr22_vcf']):
         print("Converting BCF to VCF.gz...")
         paths['chr22_vcf'].unlink(missing_ok=True)
         Path(str(paths['chr22_vcf']) + ".csi").unlink(missing_ok=True)
@@ -1156,7 +1153,7 @@ def stage_prepare():
     )
 
     # Create reference panel (train samples)
-    if not validate_vcf(paths['ref_vcf']) or not has_vcf_records(paths['ref_vcf']):
+    if not validate_vcf(paths['ref_vcf']) and not has_vcf_records(paths['ref_vcf']):
         print("Creating reference panel...")
         paths['ref_vcf'].unlink(missing_ok=True)
         Path(str(paths['ref_vcf']) + ".csi").unlink(missing_ok=True)
@@ -1166,7 +1163,7 @@ def stage_prepare():
         ensure_index(paths['ref_vcf'], recreate_cmd=f"bcftools view -S {train_file} {paths['chr22_vcf']} -O z -o {paths['ref_vcf']}")
 
     # Create truth (test samples, full density)
-    if not validate_vcf(paths['truth_vcf']) or not has_vcf_records(paths['truth_vcf']):
+    if not validate_vcf(paths['truth_vcf']) and not has_vcf_records(paths['truth_vcf']):
         print("Creating truth VCF...")
         paths['truth_vcf'].unlink(missing_ok=True)
         Path(str(paths['truth_vcf']) + ".csi").unlink(missing_ok=True)
@@ -1178,7 +1175,7 @@ def stage_prepare():
     # Create input (test samples, downsampled to GSA sites, UNPHASED)
     # We unphase the input so switch error rate measures TRUE phasing accuracy
     tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
-    if not validate_vcf(paths['input_vcf']) or not has_vcf_records(paths['input_vcf']):
+    if not validate_vcf(paths['input_vcf']) and not has_vcf_records(paths['input_vcf']):
         print("Downsampling to GSA sites and unphasing...")
         create_regions_file(gsa_sites, str(paths['gsa_regions']))
         # Two-step process: downsample, then unphase

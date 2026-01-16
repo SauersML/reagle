@@ -281,28 +281,68 @@ pub struct StreamingVcfReader {
 impl StreamingVcfReader {
     /// Open a VCF file for streaming
     pub fn open(path: &Path, gen_maps: GeneticMaps, config: StreamingConfig) -> Result<Self> {
+        fn detect_bgzf(file: &mut File) -> Result<bool> {
+            use std::io::{Read, Seek, SeekFrom};
+
+            let mut header = [0u8; 18];
+            let n = file.read(&mut header)?;
+            file.seek(SeekFrom::Start(0))?;
+            if n < 10 {
+                return Ok(false);
+            }
+            if header[0] != 0x1f || header[1] != 0x8b || header[2] != 0x08 {
+                return Ok(false);
+            }
+            let flg = header[3];
+            if flg & 0x04 == 0 {
+                return Ok(false);
+            }
+            if n < 18 {
+                return Ok(false);
+            }
+            let xlen = u16::from_le_bytes([header[10], header[11]]) as usize;
+            if xlen < 4 {
+                return Ok(false);
+            }
+            let mut extra = vec![0u8; xlen];
+            file.read_exact(&mut extra)?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut i = 0usize;
+            while i + 4 <= extra.len() {
+                let si1 = extra[i];
+                let si2 = extra[i + 1];
+                let slen = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
+                if si1 == b'B' && si2 == b'C' && slen == 2 {
+                    return Ok(true);
+                }
+                i = i.saturating_add(4 + slen);
+            }
+            Ok(false)
+        }
+
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
             "bgz" | "bgzf" => {
-                let file = File::open(path)?;
+                let mut file = File::open(path)?;
+                if !detect_bgzf(&mut file)? {
+                    return Err(anyhow::anyhow!(
+                        "Expected BGZF file for extension .{}",
+                        ext
+                    )
+                    .into());
+                }
                 let reader: Box<dyn BufRead + Send> =
                     Box::new(BufReader::new(bgzf_io::Reader::new(file)));
                 Self::from_reader(reader, gen_maps, config)
             }
             "gz" => {
-                // Try BGZF first (common for VCF.gz), fall back to standard gzip.
-                let file = File::open(path)?;
-                let reader: Box<dyn BufRead + Send> =
-                    Box::new(BufReader::new(bgzf_io::Reader::new(file)));
-                match Self::from_reader(reader, gen_maps.clone(), config.clone()) {
-                    Ok(v) => Ok(v),
-                    Err(_) => {
-                        let file = File::open(path)?;
-                        let reader: Box<dyn BufRead + Send> =
-                            Box::new(BufReader::new(GzDecoder::new(file)));
-                        Self::from_reader(reader, gen_maps, config)
-                    }
-                }
+                let mut file = File::open(path)?;
+                let reader: Box<dyn BufRead + Send> = if detect_bgzf(&mut file)? {
+                    Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+                } else {
+                    Box::new(BufReader::new(GzDecoder::new(file)))
+                };
+                Self::from_reader(reader, gen_maps, config)
             }
             _ => {
                 let file = File::open(path)?;
