@@ -554,9 +554,15 @@ impl crate::pipelines::ImputationPipeline {
                 }
             }
             if window_count == 0 {
-                return Err(ReagleError::vcf(
-                    "No target markers read; check input VCF GT field and chromosome naming.",
-                ));
+                let target_samples = target_reader.samples_arc().len();
+                let target_size = std::fs::metadata(&pipeline.config.gt)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                return Err(ReagleError::vcf(format!(
+                    "No target markers read; check input VCF GT field and chromosome naming. \
+target_samples={} target_bytes={}",
+                    target_samples, target_size
+                )));
             }
             if skipped_ref_windows > 0 {
                 eprintln!(
