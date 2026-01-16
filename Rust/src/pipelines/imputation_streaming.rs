@@ -1233,15 +1233,60 @@ target_samples={} target_bytes={}",
         all_results.sort_by_key(|result| result.sample_idx);
 
 
-        for result in &all_results {
-            if let Some((ref p1, ref p2)) = result.hap_alt_probs {
-                for (local_m, (&p1_alt, &p2_alt)) in p1.iter().zip(p2.iter()).enumerate() {
-                    let ref_m = markers_to_process.start + local_m;
-                    if ref_m < n_ref_markers && ref_is_biallelic[ref_m] {
-                        if let Some(stats) = window_quality.get_mut(ref_m) {
-                            stats.add_sample_biallelic(p1_alt, p2_alt);
-                        }
+        // Build a map for faster lookup of sample results
+        let sample_hap_probs: std::collections::HashMap<usize, (&Vec<f32>, &Vec<f32>)> =
+            all_results
+                .iter()
+                .filter_map(|result| {
+                    result
+                        .hap_alt_probs
+                        .as_ref()
+                        .map(|(p1, p2)| (result.sample_idx, (p1, p2)))
+                })
+                .collect();
+
+        // Populate quality metrics (DR2, AF)
+        // For genotyped markers, DR2 must be computed against the hard-called
+        // alleles to correctly yield DR2=1.0. For imputed markers, we use posteriors.
+        for s in 0..n_target_samples {
+            let (p1_vec_opt, p2_vec_opt) = match sample_hap_probs.get(&s) {
+                Some((p1, p2)) => (Some(*p1), Some(*p2)),
+                None => (None, None),
+            };
+
+            for (local_m, ref_m) in markers_to_process.clone().enumerate() {
+                if ref_m >= n_ref_markers || !ref_is_biallelic[ref_m] {
+                    continue;
+                }
+
+                // Default to posterior probabilities
+                let mut h1_prob = 0.0;
+                let mut h2_prob = 0.0;
+                if let (Some(p1_vec), Some(p2_vec)) = (p1_vec_opt, p2_vec_opt) {
+                    h1_prob = p1_vec.get(local_m).copied().unwrap_or(0.0);
+                    h2_prob = p2_vec.get(local_m).copied().unwrap_or(0.0);
+                }
+
+                let (val1, val2) = if let Some(target_m) = alignment.target_marker(ref_m) {
+                    // Genotyped marker: use hard calls for DR2 calculation
+                    let h1 = HapIdx::new((s * 2) as u32);
+                    let h2 = HapIdx::new((s * 2 + 1) as u32);
+                    let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                    let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                    // If alleles are valid biallelic calls, use them. Otherwise, fall back.
+                    if a1 < 2 && a2 < 2 {
+                        (a1 as f32, a2 as f32)
+                    } else {
+                        (h1_prob, h2_prob) // Missing genotype, use imputed probs
                     }
+                } else {
+                    // Imputed marker: use posterior probabilities
+                    (h1_prob, h2_prob)
+                };
+
+                if let Some(stats) = window_quality.get_mut(ref_m) {
+                    stats.add_sample_biallelic(val1, val2);
                 }
             }
         }
