@@ -268,6 +268,55 @@ impl VcfReader {
         Arc::clone(&self.samples)
     }
 
+    /// Scan a VCF file and return just the Markers.
+    /// This is a lightweight operation that does not parse genotypes.
+    pub fn scan_markers(path: &Path) -> Result<Markers> {
+        let (_, mut file) = VcfReader::open(path)?;
+        let mut markers = Markers::new();
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes_read = file.read_line(&mut line)?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Lightweight parsing of just the marker fields
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 8 {
+                continue; // Not a valid VCF record
+            }
+
+            let chrom_name = fields[0];
+            let chrom_idx = markers.add_chrom(chrom_name);
+
+            let pos: u32 = match fields[1].parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let id = if fields[2] == "." {
+                None
+            } else {
+                Some(fields[2].into())
+            };
+
+            let ref_allele = Allele::from_str(fields[3]);
+            let alt_alleles: Vec<Allele> = fields[4].split(',').map(Allele::from_str).collect();
+
+            let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles);
+            markers.push(marker);
+        }
+
+        Ok(markers)
+    }
+
     /// Read all records into a GenotypeMatrix
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
         info_span!("vcf_read_all").in_scope(|| {
