@@ -644,7 +644,12 @@ impl WindowedBref3Reader {
 
         // Reset if we switched chromosomes (current chrom is not in candidates)
         let switched = self.current_chrom.as_ref()
-            .map(|cur| !candidates.iter().any(|c| c.as_str() == cur.as_ref()))
+            .map(|cur| !candidates.iter().any(|c| {
+                if c == cur.as_ref() { return true; }
+                let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                let cur_norm = cur.strip_prefix("chr").unwrap_or(cur).strip_prefix("CHR").unwrap_or(cur);
+                c_norm.eq_ignore_ascii_case(cur_norm)
+            }))
             .unwrap_or(true);
 
         if switched {
@@ -655,12 +660,18 @@ impl WindowedBref3Reader {
         }
 
         if let Some(pending) = self.pending_block.take() {
-            if candidates.iter().any(|c| c == &pending.chrom) {
+            let block_chrom = pending.chrom.as_str();
+            let is_match = candidates.iter().any(|c| {
+                if c == block_chrom { return true; }
+                let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                let b_norm = block_chrom.strip_prefix("chr").unwrap_or(block_chrom).strip_prefix("CHR").unwrap_or(block_chrom);
+                c_norm.eq_ignore_ascii_case(b_norm)
+            });
+
+            if is_match {
                 self.block_buffer.push_back(pending);
                 if self.current_chrom.is_none() {
-                     if let Some(matching) = candidates.iter().find(|c| *c == &self.block_buffer.back().unwrap().chrom) {
-                         self.current_chrom = Some(Arc::from(matching.as_str()));
-                     }
+                     self.current_chrom = Some(Arc::from(block_chrom));
                 }
             } else {
                 self.pending_block = Some(pending);
@@ -694,7 +705,15 @@ impl WindowedBref3Reader {
                 break;
             };
 
-            let is_match = candidates.iter().any(|c| c == &next_block.chrom);
+            let block_chrom = next_block.chrom.as_str();
+            let is_match = candidates.iter().any(|c| {
+                if c == block_chrom { return true; }
+                // Try normalizing both: strip "chr" and case-insensitive
+                let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                let b_norm = block_chrom.strip_prefix("chr").unwrap_or(block_chrom).strip_prefix("CHR").unwrap_or(block_chrom);
+                c_norm.eq_ignore_ascii_case(b_norm)
+            });
+
             if !is_match {
                 if self.block_buffer.is_empty() {
                     continue; // Skip blocks from other chromosomes until we find a match
@@ -716,7 +735,15 @@ impl WindowedBref3Reader {
                 return Ok(None);
             };
 
-            if candidates.iter().any(|c| c == &next_block.chrom) {
+            let block_chrom = next_block.chrom.as_str();
+            let is_match = candidates.iter().any(|c| {
+                if c == block_chrom { return true; }
+                let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                let b_norm = block_chrom.strip_prefix("chr").unwrap_or(block_chrom).strip_prefix("CHR").unwrap_or(block_chrom);
+                c_norm.eq_ignore_ascii_case(b_norm)
+            });
+
+            if is_match {
                 self.block_buffer.push_back(next_block);
             } else {
                 self.pending_block = Some(next_block);
@@ -735,8 +762,16 @@ impl WindowedBref3Reader {
         let is_last = self.inner.is_eof() && self.pending_block.is_none();
 
         for block in &self.block_buffer {
+            let block_chrom = block.chrom.as_str();
+            let is_match = candidates.iter().any(|c| {
+                if c == block_chrom { return true; }
+                let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                let b_norm = block_chrom.strip_prefix("chr").unwrap_or(block_chrom).strip_prefix("CHR").unwrap_or(block_chrom);
+                c_norm.eq_ignore_ascii_case(b_norm)
+            });
+
             // Verify block matches current request (should be guaranteed by loading logic)
-            if !candidates.iter().any(|c| c == &block.chrom) {
+            if !is_match {
                 continue;
             }
             // Add chromosome if needed
@@ -882,7 +917,12 @@ impl InMemoryRefReader {
             .markers()
             .chrom_names()
             .iter()
-            .position(|name| candidates.iter().any(|c| c.as_str() == name.as_ref()))
+            .position(|name| candidates.iter().any(|c| {
+                if c.as_str() == name.as_ref() { return true; }
+                let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                let name_norm = name.strip_prefix("chr").unwrap_or(name).strip_prefix("CHR").unwrap_or(name);
+                c_norm.eq_ignore_ascii_case(name_norm)
+            }))
             .map(|idx| ChromIdx::new(idx as u16));
 
         let Some(target_chrom_idx) = target_chrom_idx else {
@@ -1089,7 +1129,12 @@ impl StreamingRefVcfReader {
         const BUFFER_MARKERS: usize = 500;
 
         let switched = self.current_chrom.as_ref()
-            .map(|cur| !candidates.iter().any(|c| c.as_str() == cur.as_ref()))
+            .map(|cur| !candidates.iter().any(|c| {
+                if c == cur.as_ref() { return true; }
+                let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                let cur_norm = cur.strip_prefix("chr").unwrap_or(cur).strip_prefix("CHR").unwrap_or(cur);
+                c_norm.eq_ignore_ascii_case(cur_norm)
+            }))
             .unwrap_or(true);
 
         if switched {
@@ -1099,7 +1144,14 @@ impl StreamingRefVcfReader {
 
         if let Some(pending) = self.pending_marker.take() {
             let pending_chrom = self.markers.chrom_name(pending.marker.chrom).unwrap_or("");
-            if candidates.iter().any(|c| c == pending_chrom) {
+            let is_match = candidates.iter().any(|c| {
+                if c == pending_chrom { return true; }
+                let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                let p_norm = pending_chrom.strip_prefix("chr").unwrap_or(pending_chrom).strip_prefix("CHR").unwrap_or(pending_chrom);
+                c_norm.eq_ignore_ascii_case(p_norm)
+            });
+
+            if is_match {
                 self.buffer.push_back(pending);
                 if self.current_chrom.is_none() {
                     self.current_chrom = Some(Arc::from(pending_chrom));
@@ -1125,7 +1177,12 @@ impl StreamingRefVcfReader {
                     break;
                 };
                 let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
-                let is_match = candidates.iter().any(|c| c == marker_chrom);
+                let is_match = candidates.iter().any(|c| {
+                    if c == marker_chrom { return true; }
+                    let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                    let m_norm = marker_chrom.strip_prefix("chr").unwrap_or(marker_chrom).strip_prefix("CHR").unwrap_or(marker_chrom);
+                    c_norm.eq_ignore_ascii_case(m_norm)
+                });
 
                 if !is_match {
                     if self.buffer.is_empty() {
@@ -1164,7 +1221,14 @@ impl StreamingRefVcfReader {
                     break;
                 };
                 let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
-                if !candidates.iter().any(|c| c == marker_chrom) {
+                let is_match = candidates.iter().any(|c| {
+                    if c == marker_chrom { return true; }
+                    let c_norm = c.strip_prefix("chr").unwrap_or(c).strip_prefix("CHR").unwrap_or(c);
+                    let m_norm = marker_chrom.strip_prefix("chr").unwrap_or(marker_chrom).strip_prefix("CHR").unwrap_or(marker_chrom);
+                    c_norm.eq_ignore_ascii_case(m_norm)
+                });
+
+                if !is_match {
                     self.pending_marker = Some(next_marker);
                     break;
                 }

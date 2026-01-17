@@ -530,6 +530,17 @@ impl crate::pipelines::ImputationPipeline {
                 let ref_window = match ref_window {
                     Some(w) => w,
                     None => {
+                        // Diagnostic info
+                        eprintln!("ERROR: Reference window load failed.");
+                        eprintln!("  Target: {} {}-{}", target_chrom, start_pos, end_pos);
+                        eprintln!("  Candidates tried: {}", chrom_candidates.join(", "));
+                        if let Some(names) = ref_reader.chrom_names() {
+                            let available = names.iter().take(5).map(|s| s.as_ref()).collect::<Vec<_>>().join(", ");
+                            eprintln!("  Available ref chroms (first 5): {}", available);
+                        } else {
+                            eprintln!("  Available ref chroms: (unknown/streaming)");
+                        }
+                        
                         return Err(anyhow::anyhow!(
                             "No reference markers in region for chrom {} ({}..{}); tried: {}",
                             target_chrom,
