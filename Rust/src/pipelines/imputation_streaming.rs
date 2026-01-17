@@ -4,7 +4,6 @@
 //! Uses a producer-consumer model with MPSC channel to pipe phased matrices
 //! directly to imputation in-memory.
 
-use std::collections::HashSet;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -22,6 +21,8 @@ use crate::io::streaming::{HaplotypePriors, PhasedOverlap, StreamingConfig, Stre
 use crate::io::vcf::{VcfWriter, ImputationQuality};
 use crate::pipelines::imputation::{AllelePosteriors, ClusterStateProbs};
 use crate::model::imp_utils::*;
+use crate::model::imp_ibs::{ImpIbs, ClusterCodedSteps, build_cluster_hap_sequences_for_targets};
+use crate::model::imp_states_cluster::ImpStatesCluster;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::pbwt::PbwtState;
@@ -103,12 +104,13 @@ struct SampleImputationResult {
 }
 
 impl crate::pipelines::ImputationPipeline {
-    fn build_pbwt_hap_indices_for_batch(
+    fn build_imp_states_for_batch(
         &self,
         target_win: &GenotypeMatrix<Phased>,
         ref_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
-        ref_is_biallelic: &[bool],
+        ref_markers: &[usize],
+        gen_positions: &[f64],
         cluster_bounds: &[(usize, usize)],
         n_states: usize,
         batch_samples: &[usize],
@@ -117,228 +119,85 @@ impl crate::pipelines::ImputationPipeline {
             return Vec::new();
         }
 
-        let n_ref_markers = ref_win.n_markers();
         let n_ref_haps = ref_win.n_haplotypes();
         let n_clusters = cluster_bounds.len();
-        let n_batch_haps = batch_samples.len() * 2;
-        let n_total_haps = n_ref_haps + n_batch_haps;
 
-        thread_local! {
-            static PBWT_WORKSPACE: std::cell::RefCell<Option<(PbwtWavefront, Vec<u8>)>> =
-                std::cell::RefCell::new(None);
-        }
+        // Note: genotyped_markers argument to build_cluster_hap_sequences_for_targets
+        // must match the indexing used in cluster_bounds.
+        // Since cluster_bounds was built using all ref_markers, we pass ref_markers here.
+        // The function filters for mapped markers internally.
 
-        let mut hap1_neighbors: Vec<Vec<Vec<u32>>> = vec![vec![Vec::new(); n_clusters]; batch_samples.len()];
-        let mut hap2_neighbors: Vec<Vec<Vec<u32>>> = vec![vec![Vec::new(); n_clusters]; batch_samples.len()];
-
-        let add_neighbors = |neighbors: &mut Vec<Vec<Vec<u32>>>, batch_idx: usize, cluster_idx: usize, raw: Vec<u32>| {
-            if cluster_idx >= neighbors.len() {
-                return;
-            }
-            let list = &mut neighbors[batch_idx][cluster_idx];
-            for h in raw {
-                if (h as usize) < n_ref_haps {
-                    list.push(h);
-                }
-            }
-        };
-
-        let n_candidates = n_states.min(n_ref_haps);
-        let mut batch_haps: Vec<HapIdx> = Vec::with_capacity(n_batch_haps);
+        let mut batch_haps: Vec<HapIdx> = Vec::with_capacity(batch_samples.len() * 2);
         for &s in batch_samples {
             batch_haps.push(HapIdx::new((s * 2) as u32));
             batch_haps.push(HapIdx::new((s * 2 + 1) as u32));
         }
-        let batch_positions: Vec<(u32, u32)> = batch_samples
-            .iter()
-            .enumerate()
-            .map(|(i, _)| ((n_ref_haps + i * 2) as u32, (n_ref_haps + i * 2 + 1) as u32))
+
+        // Build cluster sequences
+        let cluster_seqs = build_cluster_hap_sequences_for_targets(
+            ref_win,
+            target_win,
+            alignment,
+            ref_markers,
+            cluster_bounds,
+            &batch_haps,
+        );
+
+        // Build coded steps
+        let cluster_pos: Vec<f64> = cluster_bounds.iter()
+            .map(|&(s, e)| {
+                let mid = if e > s { (s + e - 1) / 2 } else { s };
+                gen_positions[mid]
+            })
             .collect();
 
-        let mut pbwt_ref_markers: Vec<usize> = Vec::new();
-        for ref_m in 0..n_ref_markers {
-            let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
-            if target_m_idx < 0 {
-                continue;
-            }
-            let target_m = target_m_idx as usize;
-            let mut any_informative = false;
-            for hap in &batch_haps {
-                let allele = target_win.allele(MarkerIdx::new(target_m as u32), *hap);
-                if allele < 2 {
-                    any_informative = true;
-                    break;
-                }
-            }
-            if any_informative {
-                pbwt_ref_markers.push(ref_m);
-            }
-        }
+        let coded_steps = ClusterCodedSteps::from_cluster_sequences(
+            &cluster_seqs,
+            &cluster_pos,
+            self.config.imp_step as f64,
+        );
 
-        let mut cluster_query_at_ref = vec![usize::MAX; n_ref_markers];
-        if !pbwt_ref_markers.is_empty() {
-            for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
-                if start >= end || start >= n_ref_markers {
-                    continue;
-                }
-                let mid = (start + end - 1) / 2;
-                let start_idx = pbwt_ref_markers.partition_point(|&m| m < start);
-                let end_idx = pbwt_ref_markers.partition_point(|&m| m < end);
-                if start_idx >= end_idx {
-                    continue;
-                }
+        // Build IBS sets
+        // n_targ_haps here refers to the batch size
+        let n_targ_haps = batch_haps.len();
+        let seed = self.config.seed as u64;
+        let ibs = ImpIbs::new(
+            coded_steps,
+            self.config.imp_nsteps,
+            n_states,
+            n_ref_haps,
+            n_targ_haps,
+            seed,
+        );
 
-                let pos = pbwt_ref_markers[start_idx..end_idx].partition_point(|&m| m < mid);
-                let left_idx = if pos == 0 { start_idx } else { start_idx + pos - 1 };
-                let right_idx = if start_idx + pos < end_idx { start_idx + pos } else { left_idx };
-
-                let left_m = pbwt_ref_markers[left_idx];
-                let right_m = pbwt_ref_markers[right_idx];
-                let pick = if (mid as isize - left_m as isize).abs() <= (right_m as isize - mid as isize).abs() {
-                    left_m
-                } else {
-                    right_m
-                };
-                cluster_query_at_ref[pick] = c;
-            }
-        }
-
-        PBWT_WORKSPACE.with(|cell| {
-            let mut ws_opt = cell.borrow_mut();
-            if ws_opt.is_none() {
-                *ws_opt = Some((PbwtWavefront::new(n_total_haps, pbwt_ref_markers.len()), vec![0u8; n_total_haps]));
-            }
-            let (wavefront, alleles) = ws_opt.as_mut().unwrap();
-            if wavefront.n_haps() != n_total_haps || wavefront.n_markers() != pbwt_ref_markers.len() {
-                *wavefront = PbwtWavefront::new(n_total_haps, pbwt_ref_markers.len());
-                alleles.resize(n_total_haps, 0u8);
-            }
-
-            wavefront.reset_forward();
-            for &ref_m in &pbwt_ref_markers {
-                let ref_marker_idx = MarkerIdx::new(ref_m as u32);
-                let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
-                if target_m_idx < 0 {
-                    continue;
-                }
-                let target_m = target_m_idx as usize;
-
-                for h in 0..n_ref_haps {
-                    let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
-                    if alignment.has_allele_mapping(target_m) {
-                        allele = alignment.reverse_map_allele(target_m, allele);
-                    }
-                    alleles[h] = allele;
-                }
-
-                let mut is_biallelic = ref_is_biallelic
-                    .get(ref_m)
-                    .copied()
-                    .unwrap_or(true);
-                for (local_idx, hap_idx) in batch_haps.iter().enumerate() {
-                    let allele = target_win.allele(MarkerIdx::new(target_m as u32), *hap_idx);
-                    alleles[n_ref_haps + local_idx] = allele;
-                    if allele >= 2 {
-                        is_biallelic = false;
-                    }
-                }
-
-                let n_alleles = if is_biallelic { 2 } else { 256 };
-
-                wavefront.advance_forward(alleles, n_alleles);
-
-                if ref_m < cluster_query_at_ref.len() {
-                    let cluster_idx = cluster_query_at_ref[ref_m];
-                    if cluster_idx != usize::MAX {
-                        wavefront.prepare_fwd_queries();
-                        for (batch_idx, &(hap1_pos, hap2_pos)) in batch_positions.iter().enumerate() {
-                            let h1 = wavefront.find_fwd_neighbors_readonly(hap1_pos, n_candidates);
-                            let h2 = wavefront.find_fwd_neighbors_readonly(hap2_pos, n_candidates);
-                            add_neighbors(&mut hap1_neighbors, batch_idx, cluster_idx, h1);
-                            add_neighbors(&mut hap2_neighbors, batch_idx, cluster_idx, h2);
-                        }
-                    }
-                }
-            }
-
-            wavefront.reset_backward();
-            for &ref_m in pbwt_ref_markers.iter().rev() {
-                let ref_marker_idx = MarkerIdx::new(ref_m as u32);
-                let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
-                if target_m_idx < 0 {
-                    continue;
-                }
-                let target_m = target_m_idx as usize;
-
-                for h in 0..n_ref_haps {
-                    let mut allele = ref_win.allele(ref_marker_idx, HapIdx::new(h as u32));
-                    if alignment.has_allele_mapping(target_m) {
-                        allele = alignment.reverse_map_allele(target_m, allele);
-                    }
-                    alleles[h] = allele;
-                }
-
-                let mut is_biallelic = ref_is_biallelic
-                    .get(ref_m)
-                    .copied()
-                    .unwrap_or(true);
-                for (local_idx, hap_idx) in batch_haps.iter().enumerate() {
-                    let allele = target_win.allele(MarkerIdx::new(target_m as u32), *hap_idx);
-                    alleles[n_ref_haps + local_idx] = allele;
-                    if allele >= 2 {
-                        is_biallelic = false;
-                    }
-                }
-
-                let n_alleles = if is_biallelic { 2 } else { 256 };
-
-                wavefront.advance_backward(alleles, n_alleles);
-
-                if ref_m < cluster_query_at_ref.len() {
-                    let cluster_idx = cluster_query_at_ref[ref_m];
-                    if cluster_idx != usize::MAX {
-                        wavefront.prepare_bwd_queries();
-                        for (batch_idx, &(hap1_pos, hap2_pos)) in batch_positions.iter().enumerate() {
-                            let h1 = wavefront.find_bwd_neighbors_readonly(hap1_pos, n_candidates);
-                            let h2 = wavefront.find_bwd_neighbors_readonly(hap2_pos, n_candidates);
-                            add_neighbors(&mut hap1_neighbors, batch_idx, cluster_idx, h1);
-                            add_neighbors(&mut hap2_neighbors, batch_idx, cluster_idx, h2);
-                        }
-                    }
-                }
-            }
-        });
-
-        let finalize = |neighbors: Vec<Vec<u32>>| -> Vec<Vec<u32>> {
-            let mut out = Vec::with_capacity(n_clusters);
-            for mut list in neighbors {
-                list.sort_unstable();
-                list.dedup();
-                if list.len() < n_states {
-                    let mut seen: HashSet<u32> = list.iter().copied().collect();
-                    for h in 0..n_ref_haps as u32 {
-                        if seen.insert(h) {
-                            list.push(h);
-                            if list.len() == n_states {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if list.len() > n_states {
-                    list.truncate(n_states);
-                }
-                out.push(list);
-            }
-            out
-        };
-
+        // Compute composite states for each target haplotype
         let mut out = Vec::with_capacity(batch_samples.len());
-        for batch_idx in 0..batch_samples.len() {
-            let h1 = std::mem::take(&mut hap1_neighbors[batch_idx]);
-            let h2 = std::mem::take(&mut hap2_neighbors[batch_idx]);
-            out.push((finalize(h1), finalize(h2)));
+
+        // Parallelization note: run_streaming iterates batches sequentially.
+        // Inside run_imputation_window_streaming, batch processing is parallel.
+        // ImpIbs construction is the dominant cost here and is sequential.
+        // The subsequent per-sample state selection is fast enough to be sequential.
+
+        let mut hap1_indices = vec![Vec::new(); n_clusters];
+        let mut hap2_indices = vec![Vec::new(); n_clusters];
+
+        let mut imp_states = ImpStatesCluster::new(&ibs, n_clusters, n_ref_haps, n_states);
+
+        for (i, _) in batch_samples.iter().enumerate() {
+            // Target hap indices in ImpIbs are 0..n_targ_haps (local to batch)
+            let h1_local = i * 2;
+            let h2_local = i * 2 + 1;
+
+            imp_states.ibs_states_cluster(h1_local, &mut hap1_indices);
+            // Clone the result because hap1_indices is reused
+            let res1 = hap1_indices.clone();
+
+            imp_states.ibs_states_cluster(h2_local, &mut hap2_indices);
+            let res2 = hap2_indices.clone();
+
+            out.push((res1, res2));
         }
+
         out
     }
 
@@ -1012,11 +871,12 @@ target_samples={} target_bytes={}",
                     None
                 };
                 let _ = &pbwt_span;
-                self.build_pbwt_hap_indices_for_batch(
+                self.build_imp_states_for_batch(
                     target_win,
                     ref_win,
                     alignment,
-                    &ref_is_biallelic,
+                    &ref_markers,
+                    &gen_positions,
                     &cluster_bounds,
                     pbwt_states,
                     &batch_samples,
@@ -1086,7 +946,7 @@ target_samples={} target_bytes={}",
 
                         let (hap1_probs, hap1_dosages, hap1_best_gt, h1_locked, hap1_prior) = {
                             let hap_indices = &hap1_indices;
-                            let actual_n_states = pbwt_states;
+                            let actual_n_states = hap_indices.first().map(|v| v.len()).unwrap_or(0);
 
                             let prior_probs = imp_overlap
                                 .and_then(|overlap| overlap.hap_priors())
@@ -1186,7 +1046,7 @@ target_samples={} target_bytes={}",
 
                         let (hap2_probs, hap2_dosages, hap2_best_gt, hap2_prior) = {
                             let hap_indices = &hap2_indices;
-                            let actual_n_states = pbwt_states;
+                            let actual_n_states = hap_indices.first().map(|v| v.len()).unwrap_or(0);
 
                             let prior_probs = imp_overlap
                                 .and_then(|overlap| overlap.hap_priors())
