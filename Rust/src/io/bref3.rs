@@ -634,18 +634,31 @@ impl WindowedBref3Reader {
     ///
     /// Includes flanking markers outside the region to prevent reference bias
     /// at window boundaries (HMM needs context to stabilize).
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    ///
+    /// Accepts multiple chromosome aliases (e.g. "22", "chr22") to handle mismatch between
+    /// target and reference naming conventions.
+    pub fn load_window_for_region(&mut self, chroms: &[String], start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         // Add buffer zone to prevent reference bias at boundaries
         // Use 500 markers to ensure HMM has context to stabilize at boundaries
         const BUFFER_MARKERS: usize = 500;
 
-        if self.current_chrom.as_deref() != Some(chrom) {
+        // Check if current_chrom matches any of the candidates
+        let mut current_is_valid = false;
+        if let Some(curr) = &self.current_chrom {
+            if chroms.iter().any(|c| c.as_str() == curr.as_ref()) {
+                current_is_valid = true;
+            }
+        }
+
+        if !current_is_valid {
             self.block_buffer.clear();
-            self.current_chrom = Some(Arc::from(chrom));
+            // We'll set current_chrom when we find a matching block
+            self.current_chrom = None;
         }
 
         if let Some(pending) = self.pending_block.take() {
-            if pending.chrom == chrom {
+            if chroms.iter().any(|c| c.as_str() == pending.chrom) {
+                self.current_chrom = Some(Arc::from(pending.chrom.clone()));
                 self.block_buffer.push_back(pending);
             } else {
                 self.pending_block = Some(pending);
@@ -679,14 +692,21 @@ impl WindowedBref3Reader {
                 break;
             };
 
-            if next_block.chrom != chrom {
+            let matches = chroms.iter().any(|c| c.as_str() == next_block.chrom);
+            if !matches {
                 if self.block_buffer.is_empty() {
+                    // Skip non-matching block if we haven't started a window yet
                     continue;
                 }
+                // We have a window in progress, and hit a non-matching block (next chromosome?)
                 self.pending_block = Some(next_block);
                 break;
             }
 
+            if self.current_chrom.is_none() {
+                self.current_chrom = Some(Arc::from(next_block.chrom.clone()));
+            }
+            
             self.block_buffer.push_back(next_block);
         }
         // Load one extra block beyond end_pos for trailing buffer, if available.
@@ -699,7 +719,10 @@ impl WindowedBref3Reader {
                 return Ok(None);
             };
 
-            if next_block.chrom == chrom {
+            if chroms.iter().any(|c| c.as_str() == next_block.chrom) {
+                 if self.current_chrom.is_none() {
+                    self.current_chrom = Some(Arc::from(next_block.chrom.clone()));
+                }
                 self.block_buffer.push_back(next_block);
             } else {
                 self.pending_block = Some(next_block);
@@ -718,9 +741,11 @@ impl WindowedBref3Reader {
         let is_last = self.inner.is_eof();
 
         for block in &self.block_buffer {
-            if block.chrom != chrom {
+            // Block must match candidates (already filtered, but double check)
+            if !chroms.iter().any(|c| c.as_str() == block.chrom) {
                 continue;
             }
+            
             // Add chromosome if needed
             if all_markers.chrom_names().is_empty()
                 || all_markers.chrom_names().last().map(|s| s.as_ref()) != Some(&block.chrom)
@@ -816,11 +841,11 @@ impl RefPanelReader {
     }
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(&mut self, chroms: &[String], start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         match self {
-            RefPanelReader::Bref3(r) => r.load_window_for_region(chrom, start_pos, end_pos),
-            RefPanelReader::InMemory(r) => r.load_window_for_region(chrom, start_pos, end_pos),
-            RefPanelReader::StreamingVcf(r) => r.load_window_for_region(chrom, start_pos, end_pos),
+            RefPanelReader::Bref3(r) => r.load_window_for_region(chroms, start_pos, end_pos),
+            RefPanelReader::InMemory(r) => r.load_window_for_region(chroms, start_pos, end_pos),
+            RefPanelReader::StreamingVcf(r) => r.load_window_for_region(chroms, start_pos, end_pos),
         }
     }
 }
@@ -848,7 +873,7 @@ impl InMemoryRefReader {
     }
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(&mut self, chroms: &[String], start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         use crate::data::marker::MarkerIdx;
 
         let n_markers = self.genotypes.n_markers();
@@ -863,7 +888,7 @@ impl InMemoryRefReader {
             .markers()
             .chrom_names()
             .iter()
-            .position(|name| name.as_ref() == chrom)
+            .position(|name| chroms.iter().any(|c| c == name.as_ref()))
             .map(|idx| ChromIdx::new(idx as u16));
         let Some(target_chrom_idx) = target_chrom_idx else {
             return Ok(None);
@@ -1065,16 +1090,26 @@ impl StreamingRefVcfReader {
 
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(&mut self, chroms: &[String], start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         const BUFFER_MARKERS: usize = 500;
-        if self.current_chrom.as_deref() != Some(chrom) {
+        
+        // Check if current_chrom matches any of the candidates
+        let mut current_is_valid = false;
+        if let Some(curr) = &self.current_chrom {
+            if chroms.iter().any(|c| c.as_str() == curr.as_ref()) {
+                current_is_valid = true;
+            }
+        }
+
+        if !current_is_valid {
             self.buffer.clear();
-            self.current_chrom = Some(Arc::from(chrom));
+            self.current_chrom = None;
         }
 
         if let Some(pending) = self.pending_marker.take() {
             let pending_chrom = self.markers.chrom_name(pending.marker.chrom).unwrap_or("");
-            if pending_chrom == chrom {
+            if chroms.iter().any(|c| c == pending_chrom) {
+                self.current_chrom = Some(Arc::from(pending_chrom));
                 self.buffer.push_back(pending);
             } else {
                 self.pending_marker = Some(pending);
@@ -1097,12 +1132,17 @@ impl StreamingRefVcfReader {
                     break;
                 };
                 let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
-                if marker_chrom != chrom {
+                
+                if !chroms.iter().any(|c| c == marker_chrom) {
                     if self.buffer.is_empty() {
                         continue;
                     }
                     self.pending_marker = Some(next_marker);
                     break;
+                }
+                
+                if self.current_chrom.is_none() {
+                    self.current_chrom = Some(Arc::from(marker_chrom));
                 }
                 self.buffer.push_back(next_marker);
             }
@@ -1133,7 +1173,7 @@ impl StreamingRefVcfReader {
                     break;
                 };
                 let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
-                if marker_chrom != chrom {
+                if !chroms.iter().any(|c| c == marker_chrom) {
                     self.pending_marker = Some(next_marker);
                     break;
                 }
