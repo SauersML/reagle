@@ -1135,7 +1135,9 @@ target_samples={} target_bytes={}",
                                 if let Some(target_m) = alignment.target_marker(ref_m) {
                                     let raw_a = target_win.allele(MarkerIdx::new(target_m as u32), hap1_idx);
                                     if raw_a != 255 {
-                                        let conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s).clamp(0.0, 1.0);
+                                        let mut conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s).clamp(0.0, 1.0);
+                                        if conf >= 0.999 { conf = 1.0; }
+
                                         // Map allele
                                         let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
                                         let mapped_a = if let Some(m) = mapping {
@@ -1235,7 +1237,9 @@ target_samples={} target_bytes={}",
                                 if let Some(target_m) = alignment.target_marker(ref_m) {
                                     let raw_a = target_win.allele(MarkerIdx::new(target_m as u32), hap2_idx);
                                     if raw_a != 255 {
-                                        let conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s).clamp(0.0, 1.0);
+                                        let mut conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s).clamp(0.0, 1.0);
+                                        if conf >= 0.999 { conf = 1.0; }
+
                                         // Map allele
                                         let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
                                         let mapped_a = if let Some(m) = mapping {
@@ -1570,9 +1574,11 @@ target_samples={} target_bytes={}",
                     return (a1 as f32) + (a2 as f32);
                 }
 
-                let conf = target_win
+                let mut conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
+                if conf >= 0.999 { conf = 1.0; }
+
                 if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
                     p1 + p2
                 } else {
@@ -1651,9 +1657,11 @@ target_samples={} target_bytes={}",
                 let a1 = map_allele(raw_a1);
                 let a2 = map_allele(raw_a2);
 
-                let conf = target_win
+                let mut conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
+                if conf >= 0.999 { conf = 1.0; }
+
                 if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
                     if p1 + p2 >= 1.5 {
                         (1, 1)
@@ -1665,7 +1673,7 @@ target_samples={} target_bytes={}",
                 } else {
                     // Start with hard-call from mapped alleles
                     // For phasing preservation, if conf is high, we should respect a1/a2 order
-                    if conf >= 0.99 {
+                    if conf >= 0.999 {
                         (a1, a2)
                     } else {
                         let is_het = a1 != a2;
