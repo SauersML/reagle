@@ -21,12 +21,14 @@ use crate::error::{Result, ReagleError};
 use crate::io::bref3::RefPanelReader;
 use crate::io::streaming::{HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader, StreamWindow};
 use crate::io::vcf::{VcfWriter, ImputationQuality};
-use crate::pipelines::imputation::{AllelePosteriors, ClusterStateProbs};
+use crate::pipelines::imputation::{AllelePosteriors, AllelePosteriorCache, ClusterStateProbs};
 use crate::model::imp_utils::*;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::pbwt::PbwtState;
 use crate::utils::workspace::ImpWorkspace;
+
+const PATTERN_BLOCK_SIZE: usize = 32;
 
 fn push_unique(dst: &mut Vec<String>, value: String) {
     if !dst.iter().any(|v| v == &value) {
@@ -50,6 +52,112 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
         push_unique(&mut candidates, format!("CHR{}", chrom));
     }
     candidates
+}
+
+#[derive(Clone, Debug)]
+struct PatternBlock {
+    start: usize,
+    end: usize,
+    hap_to_pattern: Vec<u32>,
+    pattern_alleles: Vec<Vec<u8>>,
+}
+
+impl PatternBlock {
+    fn block_id(&self) -> usize {
+        self.start
+    }
+
+    fn hap_to_pattern(&self) -> &[u32] {
+        &self.hap_to_pattern
+    }
+
+    fn pattern_alleles(&self, marker: usize) -> Option<&[u8]> {
+        if marker < self.start || marker >= self.end {
+            return None;
+        }
+        let offset = marker - self.start;
+        self.pattern_alleles.get(offset).map(|v| v.as_slice())
+    }
+}
+
+fn build_pattern_block(ref_win: &GenotypeMatrix<Phased>, start: usize, end: usize) -> PatternBlock {
+    use std::collections::HashMap;
+
+    let n_haps = ref_win.n_haplotypes();
+    let block_len = end.saturating_sub(start).max(1);
+    let mut hap_to_pattern = vec![0u32; n_haps];
+    let mut patterns: Vec<Vec<u8>> = Vec::new();
+    let mut pattern_map: HashMap<Vec<u8>, u32> = HashMap::new();
+
+    for h in 0..n_haps {
+        let hap = HapIdx::new(h as u32);
+        let mut seq = Vec::with_capacity(block_len);
+        for m in start..end {
+            let allele = ref_win.allele(MarkerIdx::new(m as u32), hap);
+            seq.push(allele);
+        }
+        let pat_idx = if let Some(&idx) = pattern_map.get(&seq) {
+            idx
+        } else {
+            let idx = patterns.len() as u32;
+            pattern_map.insert(seq.clone(), idx);
+            patterns.push(seq);
+            idx
+        };
+        hap_to_pattern[h] = pat_idx;
+    }
+
+    let n_patterns = patterns.len();
+    let mut pattern_alleles: Vec<Vec<u8>> = Vec::with_capacity(block_len);
+    for offset in 0..block_len {
+        let mut alleles = Vec::with_capacity(n_patterns);
+        for pat in &patterns {
+            let allele = pat.get(offset).copied().unwrap_or(255);
+            alleles.push(allele);
+        }
+        pattern_alleles.push(alleles);
+    }
+
+    PatternBlock {
+        start,
+        end,
+        hap_to_pattern,
+        pattern_alleles,
+    }
+}
+
+fn build_pattern_blocks_for_range(
+    ref_win: &GenotypeMatrix<Phased>,
+    range: std::ops::Range<usize>,
+) -> Vec<Option<PatternBlock>> {
+    let range_len = range.end.saturating_sub(range.start);
+    let n_blocks = (range_len + PATTERN_BLOCK_SIZE - 1) / PATTERN_BLOCK_SIZE;
+    let mut needs_block = vec![false; n_blocks];
+
+    for m in range.clone() {
+        match ref_win.column(MarkerIdx::new(m as u32)) {
+            crate::data::storage::GenotypeColumn::Dense(_)
+            | crate::data::storage::GenotypeColumn::Sparse(_) => {
+                let idx = (m - range.start) / PATTERN_BLOCK_SIZE;
+                if idx < needs_block.len() {
+                    needs_block[idx] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut blocks = Vec::with_capacity(n_blocks);
+    for block_idx in 0..n_blocks {
+        if !needs_block[block_idx] {
+            blocks.push(None);
+            continue;
+        }
+        let block_start = range.start + block_idx * PATTERN_BLOCK_SIZE;
+        let block_end = (block_start + PATTERN_BLOCK_SIZE).min(range.end);
+        blocks.push(Some(build_pattern_block(ref_win, block_start, block_end)));
+    }
+    blocks
 }
 
 fn should_stream_ref_vcf(path: &Path, window_markers: usize) -> Option<u64> {
@@ -919,8 +1027,6 @@ target_samples={} target_bytes={}",
         let n_ref_markers = ref_win.n_markers();
         let n_target_samples = target_win.n_samples();
         let n_ref_haps = ref_win.n_haplotypes();
-        let include_posteriors = self.config.gp || self.config.ap;
-
         let markers_to_process = if let Some(overlap) = imp_overlap {
             let start = overlap.n_markers.max(output_start);
             start..n_ref_markers
@@ -944,36 +1050,41 @@ target_samples={} target_bytes={}",
             .collect();
         let gen_positions: Vec<f64> = (0..n_ref_markers)
             .map(|m| {
-                if m == 0 { 0.0 }
-                else {
-                    let pos1 = ref_win.marker(MarkerIdx::new((m - 1) as u32)).pos;
-                    let pos2 = ref_win.marker(MarkerIdx::new(m as u32)).pos;
-                    let dist = gen_maps.gen_dist(chrom, pos1, pos2);
-                    dist.abs().max(crate::model::imp_utils::MIN_CM_DIST)
-                }
+                let pos = ref_win.marker(MarkerIdx::new(m as u32)).pos;
+                gen_maps.gen_pos(chrom, pos)
             })
             .collect();
 
+        let genotyped_markers: Vec<usize> = alignment
+            .ref_to_target
+            .iter()
+            .enumerate()
+            .filter_map(|(ref_m, &target_m)| if target_m >= 0 { Some(ref_m) } else { None })
+            .collect();
+
+        let pattern_blocks = Arc::new(build_pattern_blocks_for_range(
+            ref_win,
+            markers_to_process.clone(),
+        ));
+
         let sample_genotyped_vec: Vec<Vec<usize>> = (0..n_target_samples)
             .map(|s| {
-                (0..n_ref_markers)
+                genotyped_markers
+                    .iter()
+                    .copied()
                     .filter(|&ref_m| {
-                        if let Some(target_m) = alignment.target_marker(ref_m) {
-                            let marker_idx = MarkerIdx::new(target_m as u32);
-                            let a1 = target_win.allele(marker_idx, HapIdx::new((s * 2) as u32));
-                            let a2 = target_win.allele(marker_idx, HapIdx::new((s * 2 + 1) as u32));
-                            a1 != 255 || a2 != 255
-                        } else {
-                            false
-                        }
+                        let target_m = alignment.ref_to_target[ref_m] as usize;
+                        let marker_idx = MarkerIdx::new(target_m as u32);
+                        let a1 = target_win.allele(marker_idx, HapIdx::new((s * 2) as u32));
+                        let a2 = target_win.allele(marker_idx, HapIdx::new((s * 2 + 1) as u32));
+                        a1 != 255 || a2 != 255
                     })
                     .collect()
             })
             .collect();
 
-        let ref_markers: Vec<usize> = (0..n_ref_markers).collect();
         let clusters = compute_marker_clusters(
-            &ref_markers,
+            &genotyped_markers,
             &gen_positions,
             self.config.cluster as f64,
         );
@@ -982,25 +1093,37 @@ target_samples={} target_bytes={}",
         let cluster_midpoints: Vec<usize> = clusters
             .iter()
             .map(|c| {
-                if c.end > c.start {
+                let mid = if c.end > c.start {
                     (c.start + c.end - 1) / 2
                 } else {
                     c.start
-                }
+                };
+                genotyped_markers.get(mid).copied().unwrap_or(0)
             })
             .collect();
         let cluster_midpoints_pos: Vec<f64> = cluster_midpoints
             .iter()
             .map(|&m| gen_positions[m])
             .collect();
-        let cluster_p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain((1..n_clusters).map(|c| {
-                let gen_dist = (cluster_midpoints_pos[c] - cluster_midpoints_pos[c - 1]).abs();
-                self.params.p_recomb(gen_dist)
-            }))
-            .collect();
+        let cluster_p_recomb: Vec<f32> = if n_clusters == 0 {
+            Vec::new()
+        } else {
+            std::iter::once(0.0f32)
+                .chain((1..n_clusters).map(|c| {
+                    let gen_dist = (cluster_midpoints_pos[c] - cluster_midpoints_pos[c - 1])
+                        .abs()
+                        .max(crate::model::imp_utils::MIN_CM_DIST);
+                    self.params.p_recomb(gen_dist)
+                }))
+                .collect()
+        };
 
-        let (ref_cluster_start, ref_cluster_end) = compute_ref_cluster_bounds(&ref_markers, &clusters);
+        let (ref_cluster_start, ref_cluster_end) = compute_ref_cluster_bounds(&genotyped_markers, &clusters);
+        let cluster_bounds_ref: Vec<(usize, usize)> = ref_cluster_start
+            .iter()
+            .zip(ref_cluster_end.iter())
+            .map(|(&start, &end)| (start, end))
+            .collect();
         let marker_cluster = Arc::new(build_marker_cluster_index(&ref_cluster_start, n_ref_markers));
         let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
         let cluster_weights = Arc::new(compute_cluster_weights(&gen_positions, &ref_cluster_start, &ref_cluster_end));
@@ -1045,12 +1168,13 @@ target_samples={} target_bytes={}",
                     ref_win,
                     alignment,
                     &ref_is_biallelic,
-                    &cluster_bounds,
+                    &cluster_bounds_ref,
                     pbwt_states,
                     &batch_samples,
                 )
             };
 
+            let pattern_blocks = Arc::clone(&pattern_blocks);
             let batch_results: Vec<SampleImputationResult> = batch_samples
                 .par_iter()
                 .enumerate()
@@ -1121,7 +1245,7 @@ target_samples={} target_bytes={}",
                         let state_probs = compute_state_probs(
                             &hap_indices,
                             &cluster_bounds,
-                            &ref_markers,
+                            &genotyped_markers,
                             target_win,
                             ref_win,
                             alignment,
@@ -1143,6 +1267,7 @@ target_samples={} target_bytes={}",
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
+                            let mut posterior_cache = AllelePosteriorCache::default();
                             for ref_m in markers_to_process.clone() {
                                 let marker_idx = MarkerIdx::new(ref_m as u32);
                                 let column = ref_win.column(marker_idx);
@@ -1155,12 +1280,48 @@ target_samples={} target_bytes={}",
                                             .and_then(|m| m.as_ref())
                                             .map(|m| m.ref_to_targ.as_slice())
                                     });
-                                let p = state_probs.allele_posteriors_for_column(
-                                    ref_m,
-                                    2,
-                                    column,
-                                    map_ref_to_targ,
-                                );
+                                let block_idx = (ref_m - markers_to_process.start) / PATTERN_BLOCK_SIZE;
+                                let p = match column {
+                                    crate::data::storage::GenotypeColumn::Dense(_)
+                                    | crate::data::storage::GenotypeColumn::Sparse(_) => {
+                                        if let Some(Some(block)) = pattern_blocks.get(block_idx) {
+                                            if let Some(pattern_alleles) = block.pattern_alleles(ref_m) {
+                                                state_probs.allele_posteriors_for_patterns_cached(
+                                                    ref_m,
+                                                    2,
+                                                    block.hap_to_pattern(),
+                                                    pattern_alleles,
+                                                    map_ref_to_targ,
+                                                    &mut posterior_cache,
+                                                    block.block_id(),
+                                                )
+                                            } else {
+                                                state_probs.allele_posteriors_for_column_cached(
+                                                    ref_m,
+                                                    2,
+                                                    column,
+                                                    map_ref_to_targ,
+                                                    &mut posterior_cache,
+                                                )
+                                            }
+                                        } else {
+                                            state_probs.allele_posteriors_for_column_cached(
+                                                ref_m,
+                                                2,
+                                                column,
+                                                map_ref_to_targ,
+                                                &mut posterior_cache,
+                                            )
+                                        }
+                                    }
+                                    _ => state_probs.allele_posteriors_for_column_cached(
+                                        ref_m,
+                                        2,
+                                        column,
+                                        map_ref_to_targ,
+                                        &mut posterior_cache,
+                                    ),
+                                };
                                 let mut p_val = p.prob(1);
 
                                 // Override with hard call if present
@@ -1203,12 +1364,48 @@ target_samples={} target_bytes={}",
                                                 .and_then(|m| m.as_ref())
                                                 .map(|m| m.ref_to_targ.as_slice())
                                         });
-                                    let p = state_probs.allele_posteriors_for_column(
-                                        ref_m,
-                                        2,
-                                        column,
-                                        map_ref_to_targ,
-                                    );
+                                    let block_idx = (ref_m - markers_to_process.start) / PATTERN_BLOCK_SIZE;
+                                    let p = match column {
+                                        crate::data::storage::GenotypeColumn::Dense(_)
+                                        | crate::data::storage::GenotypeColumn::Sparse(_) => {
+                                            if let Some(Some(block)) = pattern_blocks.get(block_idx) {
+                                                if let Some(pattern_alleles) = block.pattern_alleles(ref_m) {
+                                                    state_probs.allele_posteriors_for_patterns_cached(
+                                                        ref_m,
+                                                        2,
+                                                        block.hap_to_pattern(),
+                                                        pattern_alleles,
+                                                        map_ref_to_targ,
+                                                        &mut posterior_cache,
+                                                        block.block_id(),
+                                                    )
+                                                } else {
+                                                    state_probs.allele_posteriors_for_column_cached(
+                                                        ref_m,
+                                                        2,
+                                                        column,
+                                                        map_ref_to_targ,
+                                                        &mut posterior_cache,
+                                                    )
+                                                }
+                                            } else {
+                                                state_probs.allele_posteriors_for_column_cached(
+                                                    ref_m,
+                                                    2,
+                                                    column,
+                                                    map_ref_to_targ,
+                                                    &mut posterior_cache,
+                                                )
+                                            }
+                                        }
+                                        _ => state_probs.allele_posteriors_for_column_cached(
+                                            ref_m,
+                                            2,
+                                            column,
+                                            map_ref_to_targ,
+                                            &mut posterior_cache,
+                                        ),
+                                    };
                                     locked[target_m] = p.max_allele();
                                 }
                             }
@@ -1253,7 +1450,7 @@ target_samples={} target_bytes={}",
                         let state_probs = compute_state_probs(
                             &hap_indices,
                             &cluster_bounds,
-                            &ref_markers,
+                            &genotyped_markers,
                             target_win,
                             ref_win,
                             alignment,
@@ -1275,6 +1472,7 @@ target_samples={} target_bytes={}",
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
+                            let mut posterior_cache = AllelePosteriorCache::default();
                             for ref_m in markers_to_process.clone() {
                                 let marker_idx = MarkerIdx::new(ref_m as u32);
                                 let column = ref_win.column(marker_idx);
@@ -1287,12 +1485,48 @@ target_samples={} target_bytes={}",
                                             .and_then(|m| m.as_ref())
                                             .map(|m| m.ref_to_targ.as_slice())
                                     });
-                                let p = state_probs.allele_posteriors_for_column(
-                                    ref_m,
-                                    2,
-                                    column,
-                                    map_ref_to_targ,
-                                );
+                                let block_idx = (ref_m - markers_to_process.start) / PATTERN_BLOCK_SIZE;
+                                let p = match column {
+                                    crate::data::storage::GenotypeColumn::Dense(_)
+                                    | crate::data::storage::GenotypeColumn::Sparse(_) => {
+                                        if let Some(Some(block)) = pattern_blocks.get(block_idx) {
+                                            if let Some(pattern_alleles) = block.pattern_alleles(ref_m) {
+                                                state_probs.allele_posteriors_for_patterns_cached(
+                                                    ref_m,
+                                                    2,
+                                                    block.hap_to_pattern(),
+                                                    pattern_alleles,
+                                                    map_ref_to_targ,
+                                                    &mut posterior_cache,
+                                                    block.block_id(),
+                                                )
+                                            } else {
+                                                state_probs.allele_posteriors_for_column_cached(
+                                                    ref_m,
+                                                    2,
+                                                    column,
+                                                    map_ref_to_targ,
+                                                    &mut posterior_cache,
+                                                )
+                                            }
+                                        } else {
+                                            state_probs.allele_posteriors_for_column_cached(
+                                                ref_m,
+                                                2,
+                                                column,
+                                                map_ref_to_targ,
+                                                &mut posterior_cache,
+                                            )
+                                        }
+                                    }
+                                    _ => state_probs.allele_posteriors_for_column_cached(
+                                        ref_m,
+                                        2,
+                                        column,
+                                        map_ref_to_targ,
+                                        &mut posterior_cache,
+                                    ),
+                                };
                                 let mut p_val = p.prob(1);
 
                                 // Override with hard call if present
@@ -1340,10 +1574,8 @@ target_samples={} target_bytes={}",
                             (state_probs, hap_dosages, hap_best_gt, priors)
                         };
 
-                        if include_posteriors {
-                            hap_state_probs.push(Arc::clone(&hap1_probs));
-                            hap_state_probs.push(Arc::clone(&hap2_probs));
-                        }
+                        hap_state_probs.push(Arc::clone(&hap1_probs));
+                        hap_state_probs.push(Arc::clone(&hap2_probs));
 
                         hap_priors.push(hap1_prior);
                         hap_priors.push(hap2_prior);
@@ -1361,7 +1593,7 @@ target_samples={} target_bytes={}",
                             None
                         };
 
-                        let state_probs_pair = if include_posteriors && hap_state_probs.len() == 2 {
+                        let state_probs_pair = if hap_state_probs.len() == 2 {
                             Some((Arc::clone(&hap_state_probs[0]), Arc::clone(&hap_state_probs[1])))
                         } else {
                             None
@@ -1467,8 +1699,18 @@ target_samples={} target_bytes={}",
             bb.set_samples_processed(0);
         }
         self.write_imputed_window_streaming(
-            ref_win, target_win, alignment, final_writer, window_quality, output_start, output_end,
-            markers_to_process.start, &all_results, self.config.gp, self.config.ap,
+            ref_win,
+            target_win,
+            alignment,
+            final_writer,
+            window_quality,
+            output_start,
+            output_end,
+            markers_to_process.start,
+            &pattern_blocks,
+            &all_results,
+            self.config.gp,
+            self.config.ap,
         )?;
         if let Some(bb) = &self.telemetry {
             let output_markers = output_end.saturating_sub(output_start);
@@ -1515,6 +1757,7 @@ target_samples={} target_bytes={}",
         output_start: usize,
         output_end: usize,
         markers_to_process_start: usize,
+        pattern_blocks: &Arc<Vec<Option<PatternBlock>>>,
         all_results: &[SampleImputationResult],
         include_gp: bool,
         include_ap: bool,
@@ -1580,6 +1823,7 @@ target_samples={} target_bytes={}",
             marker_idx: usize::MAX,
             data: Vec::new(),
         });
+        let pattern_blocks = Arc::clone(pattern_blocks);
         let get_posteriors: Option<
             Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors) + '_>,
         > = if include_posteriors {
@@ -1608,18 +1852,107 @@ target_samples={} target_bytes={}",
                         .into_par_iter()
                         .map(|s| {
                             if let Some((p1, p2)) = sample_posteriors.get(&s) {
-                                let post1 = p1.allele_posteriors_for_column(
-                                    marker_idx,
-                                    n_alleles,
-                                    column,
-                                    map_ref_to_targ,
-                                );
-                                let post2 = p2.allele_posteriors_for_column(
-                                    marker_idx,
-                                    n_alleles,
-                                    column,
-                                    map_ref_to_targ,
-                                );
+                                let mut local_cache1 = AllelePosteriorCache::default();
+                                let mut local_cache2 = AllelePosteriorCache::default();
+                                let (post1, post2) = match column {
+                                    crate::data::storage::GenotypeColumn::Dense(_)
+                                    | crate::data::storage::GenotypeColumn::Sparse(_) => {
+                                        if marker_idx >= markers_to_process_start {
+                                            let block_idx = (marker_idx - markers_to_process_start) / PATTERN_BLOCK_SIZE;
+                                            if let Some(Some(block)) = pattern_blocks.get(block_idx) {
+                                                if let Some(pattern_alleles) = block.pattern_alleles(marker_idx) {
+                                                    (
+                                                        p1.allele_posteriors_for_patterns_cached(
+                                                            marker_idx,
+                                                            n_alleles,
+                                                            block.hap_to_pattern(),
+                                                            pattern_alleles,
+                                                            map_ref_to_targ,
+                                                            &mut local_cache1,
+                                                            block.block_id(),
+                                                        ),
+                                                        p2.allele_posteriors_for_patterns_cached(
+                                                            marker_idx,
+                                                            n_alleles,
+                                                            block.hap_to_pattern(),
+                                                            pattern_alleles,
+                                                            map_ref_to_targ,
+                                                            &mut local_cache2,
+                                                            block.block_id(),
+                                                        ),
+                                                    )
+                                                } else {
+                                                    (
+                                                        p1.allele_posteriors_for_column_cached(
+                                                            marker_idx,
+                                                            n_alleles,
+                                                            column,
+                                                            map_ref_to_targ,
+                                                            &mut local_cache1,
+                                                        ),
+                                                        p2.allele_posteriors_for_column_cached(
+                                                            marker_idx,
+                                                            n_alleles,
+                                                            column,
+                                                            map_ref_to_targ,
+                                                            &mut local_cache2,
+                                                        ),
+                                                    )
+                                                }
+                                            } else {
+                                                (
+                                                    p1.allele_posteriors_for_column_cached(
+                                                        marker_idx,
+                                                        n_alleles,
+                                                        column,
+                                                        map_ref_to_targ,
+                                                        &mut local_cache1,
+                                                    ),
+                                                    p2.allele_posteriors_for_column_cached(
+                                                        marker_idx,
+                                                        n_alleles,
+                                                        column,
+                                                        map_ref_to_targ,
+                                                        &mut local_cache2,
+                                                    ),
+                                                )
+                                            }
+                                        } else {
+                                            (
+                                                p1.allele_posteriors_for_column_cached(
+                                                    marker_idx,
+                                                    n_alleles,
+                                                    column,
+                                                    map_ref_to_targ,
+                                                    &mut local_cache1,
+                                                ),
+                                                p2.allele_posteriors_for_column_cached(
+                                                    marker_idx,
+                                                    n_alleles,
+                                                    column,
+                                                    map_ref_to_targ,
+                                                    &mut local_cache2,
+                                                ),
+                                            )
+                                        }
+                                    }
+                                    _ => (
+                                        p1.allele_posteriors_for_column_cached(
+                                            marker_idx,
+                                            n_alleles,
+                                            column,
+                                            map_ref_to_targ,
+                                            &mut local_cache1,
+                                        ),
+                                        p2.allele_posteriors_for_column_cached(
+                                            marker_idx,
+                                            n_alleles,
+                                            column,
+                                            map_ref_to_targ,
+                                            &mut local_cache2,
+                                        ),
+                                    ),
+                                };
                                 (post1, post2)
                             } else {
                                 (default.clone(), default.clone())

@@ -107,6 +107,11 @@ impl SeqCodedColumn {
         &self.block.seq_to_allele[self.marker_offset]
     }
 
+    #[inline]
+    pub fn block_id(&self) -> usize {
+        Arc::as_ptr(&self.block) as usize
+    }
+
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.block.n_haplotypes()

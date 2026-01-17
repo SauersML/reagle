@@ -82,6 +82,22 @@ pub struct ClusterStateProbs {
     probs_p1: Vec<f32>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AllelePosteriorCache {
+    seq_block_id: usize,
+    seq_cluster: usize,
+    seq_probs: Vec<f32>,
+    seq_probs_p1: Vec<f32>,
+    dict_block_id: usize,
+    dict_cluster: usize,
+    dict_probs: Vec<f32>,
+    dict_probs_p1: Vec<f32>,
+    pattern_block_id: usize,
+    pattern_cluster: usize,
+    pattern_probs: Vec<f32>,
+    pattern_probs_p1: Vec<f32>,
+}
+
 impl ClusterStateProbs {
     /// Create from pre-computed sparse CSR data (from run_hmm_forward_backward_to_sparse).
     /// This avoids the O(n_clusters × n_states) dense intermediate allocation.
@@ -108,13 +124,7 @@ impl ClusterStateProbs {
     /// Return haplotype-indexed priors at a reference marker.
     /// Probabilities are interpolated between clusters to match allele posterior logic.
     pub fn haplotype_priors_at(&self, ref_marker: usize) -> (Vec<u32>, Vec<f32>) {
-        let cluster = *self.marker_cluster.get(ref_marker).unwrap_or(&0);
-        let mut in_cluster = ref_marker < *self.ref_cluster_end.get(cluster).unwrap_or(&0);
-        let mut weight = self.weight.get(ref_marker).copied().unwrap_or(0.5);
-        if !weight.is_finite() {
-            in_cluster = true;
-            weight = 0.5;
-        }
+        let (cluster, _, weight) = self.cluster_info(ref_marker);
 
         let start = self.offsets.get(cluster).copied().unwrap_or(0);
         let end = self.offsets.get(cluster + 1).copied().unwrap_or(start);
@@ -126,11 +136,7 @@ impl ClusterStateProbs {
         for (j, _) in haps.iter().enumerate() {
             let prob = probs[j];
             let prob_p1 = probs_p1[j];
-            let interp = if in_cluster {
-                prob
-            } else {
-                weight * prob + (1.0 - weight) * prob_p1
-            };
+            let interp = weight * prob + (1.0 - weight) * prob_p1;
             out_probs.push(interp.max(0.0));
         }
 
@@ -145,12 +151,13 @@ impl ClusterStateProbs {
     }
 
     #[inline]
-    pub fn allele_posteriors_for_column(
+    pub fn allele_posteriors_for_column_cached(
         &self,
         ref_marker: usize,
         n_alleles: usize,
         column: &GenotypeColumn,
         map_ref_to_targ: Option<&[i8]>,
+        cache: &mut AllelePosteriorCache,
     ) -> AllelePosteriors {
         #[inline]
         fn map_allele(map_ref_to_targ: Option<&[i8]>, allele: u8) -> u8 {
@@ -174,13 +181,7 @@ impl ClusterStateProbs {
             }
         }
 
-        let cluster = *self.marker_cluster.get(ref_marker).unwrap_or(&0);
-        let mut in_cluster = ref_marker < *self.ref_cluster_end.get(cluster).unwrap_or(&0);
-        let mut weight = self.weight.get(ref_marker).copied().unwrap_or(0.5);
-        if !weight.is_finite() {
-            in_cluster = true;
-            weight = 0.5;
-        }
+        let (cluster, in_cluster, weight) = self.cluster_info(ref_marker);
 
         let start = self.offsets.get(cluster).copied().unwrap_or(0);
         let end = self.offsets.get(cluster + 1).copied().unwrap_or(start);
@@ -192,20 +193,29 @@ impl ClusterStateProbs {
             GenotypeColumn::SeqCoded(col) => {
                 let hap_to_seq = col.hap_to_seq();
                 let seq_alleles = col.seq_alleles();
-                if n_alleles == 2 {
-                    let mut seq_probs = vec![0.0f32; seq_alleles.len()];
+                let block_id = col.block_id();
+                if cache.seq_block_id != block_id || cache.seq_cluster != cluster {
+                    cache.seq_block_id = block_id;
+                    cache.seq_cluster = cluster;
+                    cache.seq_probs.clear();
+                    cache.seq_probs.resize(seq_alleles.len(), 0.0);
+                    cache.seq_probs_p1.clear();
+                    cache.seq_probs_p1.resize(seq_alleles.len(), 0.0);
                     for (j, &hap) in haps.iter().enumerate() {
                         let idx = hap as usize;
                         if idx < hap_to_seq.len() {
                             let seq_idx = hap_to_seq[idx] as usize;
-                            if seq_idx < seq_probs.len() {
-                                seq_probs[seq_idx] += probs[j];
+                            if seq_idx < cache.seq_probs.len() {
+                                cache.seq_probs[seq_idx] += probs[j];
+                                cache.seq_probs_p1[seq_idx] += probs_p1[j];
                             }
                         }
                     }
+                }
+                if n_alleles == 2 {
                     let mut p_alt = 0.0f32;
                     let mut p_ref = 0.0f32;
-                    for (seq_idx, &p) in seq_probs.iter().enumerate() {
+                    for (seq_idx, &p) in cache.seq_probs.iter().enumerate() {
                         if p == 0.0 {
                             continue;
                         }
@@ -217,19 +227,9 @@ impl ClusterStateProbs {
                         }
                     }
                     if !in_cluster {
-                        let mut seq_probs_p1 = vec![0.0f32; seq_alleles.len()];
-                        for (j, &hap) in haps.iter().enumerate() {
-                            let idx = hap as usize;
-                            if idx < hap_to_seq.len() {
-                                let seq_idx = hap_to_seq[idx] as usize;
-                                if seq_idx < seq_probs_p1.len() {
-                                    seq_probs_p1[seq_idx] += probs_p1[j];
-                                }
-                            }
-                        }
                         let mut p_alt_p1 = 0.0f32;
                         let mut p_ref_p1 = 0.0f32;
-                        for (seq_idx, &p) in seq_probs_p1.iter().enumerate() {
+                        for (seq_idx, &p) in cache.seq_probs_p1.iter().enumerate() {
                             if p == 0.0 {
                                 continue;
                             }
@@ -247,18 +247,8 @@ impl ClusterStateProbs {
                     let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
                     AllelePosteriors::Biallelic(p_alt)
                 } else {
-                    let mut seq_probs = vec![0.0f32; seq_alleles.len()];
-                    for (j, &hap) in haps.iter().enumerate() {
-                        let idx = hap as usize;
-                        if idx < hap_to_seq.len() {
-                            let seq_idx = hap_to_seq[idx] as usize;
-                            if seq_idx < seq_probs.len() {
-                                seq_probs[seq_idx] += probs[j];
-                            }
-                        }
-                    }
                     let mut al_probs = vec![0.0f32; n_alleles];
-                    for (seq_idx, &p) in seq_probs.iter().enumerate() {
+                    for (seq_idx, &p) in cache.seq_probs.iter().enumerate() {
                         if p == 0.0 {
                             continue;
                         }
@@ -268,18 +258,8 @@ impl ClusterStateProbs {
                         }
                     }
                     if !in_cluster {
-                        let mut seq_probs_p1 = vec![0.0f32; seq_alleles.len()];
-                        for (j, &hap) in haps.iter().enumerate() {
-                            let idx = hap as usize;
-                            if idx < hap_to_seq.len() {
-                                let seq_idx = hap_to_seq[idx] as usize;
-                                if seq_idx < seq_probs_p1.len() {
-                                    seq_probs_p1[seq_idx] += probs_p1[j];
-                                }
-                            }
-                        }
                         let mut al_probs_p1 = vec![0.0f32; n_alleles];
-                        for (seq_idx, &p) in seq_probs_p1.iter().enumerate() {
+                        for (seq_idx, &p) in cache.seq_probs_p1.iter().enumerate() {
                             if p == 0.0 {
                                 continue;
                             }
@@ -304,20 +284,29 @@ impl ClusterStateProbs {
             GenotypeColumn::Dictionary(col, offset) => {
                 let hap_to_pattern = col.hap_to_pattern();
                 let n_patterns = col.n_patterns();
-                if n_alleles == 2 {
-                    let mut pattern_probs = vec![0.0f32; n_patterns];
+                let block_id = Arc::as_ptr(col) as usize;
+                if cache.dict_block_id != block_id || cache.dict_cluster != cluster {
+                    cache.dict_block_id = block_id;
+                    cache.dict_cluster = cluster;
+                    cache.dict_probs.clear();
+                    cache.dict_probs.resize(n_patterns, 0.0);
+                    cache.dict_probs_p1.clear();
+                    cache.dict_probs_p1.resize(n_patterns, 0.0);
                     for (j, &hap) in haps.iter().enumerate() {
                         let idx = hap as usize;
                         if idx < hap_to_pattern.len() {
                             let pat_idx = hap_to_pattern[idx] as usize;
-                            if pat_idx < pattern_probs.len() {
-                                pattern_probs[pat_idx] += probs[j];
+                            if pat_idx < cache.dict_probs.len() {
+                                cache.dict_probs[pat_idx] += probs[j];
+                                cache.dict_probs_p1[pat_idx] += probs_p1[j];
                             }
                         }
                     }
+                }
+                if n_alleles == 2 {
                     let mut p_alt = 0.0f32;
                     let mut p_ref = 0.0f32;
-                    for (pat_idx, &p) in pattern_probs.iter().enumerate() {
+                    for (pat_idx, &p) in cache.dict_probs.iter().enumerate() {
                         if p == 0.0 {
                             continue;
                         }
@@ -329,19 +318,9 @@ impl ClusterStateProbs {
                         }
                     }
                     if !in_cluster {
-                        let mut pattern_probs_p1 = vec![0.0f32; n_patterns];
-                        for (j, &hap) in haps.iter().enumerate() {
-                            let idx = hap as usize;
-                            if idx < hap_to_pattern.len() {
-                                let pat_idx = hap_to_pattern[idx] as usize;
-                                if pat_idx < pattern_probs_p1.len() {
-                                    pattern_probs_p1[pat_idx] += probs_p1[j];
-                                }
-                            }
-                        }
                         let mut p_alt_p1 = 0.0f32;
                         let mut p_ref_p1 = 0.0f32;
-                        for (pat_idx, &p) in pattern_probs_p1.iter().enumerate() {
+                        for (pat_idx, &p) in cache.dict_probs_p1.iter().enumerate() {
                             if p == 0.0 {
                                 continue;
                             }
@@ -359,18 +338,8 @@ impl ClusterStateProbs {
                     let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
                     AllelePosteriors::Biallelic(p_alt)
                 } else {
-                    let mut pattern_probs = vec![0.0f32; n_patterns];
-                    for (j, &hap) in haps.iter().enumerate() {
-                        let idx = hap as usize;
-                        if idx < hap_to_pattern.len() {
-                            let pat_idx = hap_to_pattern[idx] as usize;
-                            if pat_idx < pattern_probs.len() {
-                                pattern_probs[pat_idx] += probs[j];
-                            }
-                        }
-                    }
                     let mut al_probs = vec![0.0f32; n_alleles];
-                    for (pat_idx, &p) in pattern_probs.iter().enumerate() {
+                    for (pat_idx, &p) in cache.dict_probs.iter().enumerate() {
                         if p == 0.0 {
                             continue;
                         }
@@ -380,18 +349,8 @@ impl ClusterStateProbs {
                         }
                     }
                     if !in_cluster {
-                        let mut pattern_probs_p1 = vec![0.0f32; n_patterns];
-                        for (j, &hap) in haps.iter().enumerate() {
-                            let idx = hap as usize;
-                            if idx < hap_to_pattern.len() {
-                                let pat_idx = hap_to_pattern[idx] as usize;
-                                if pat_idx < pattern_probs_p1.len() {
-                                    pattern_probs_p1[pat_idx] += probs_p1[j];
-                                }
-                            }
-                        }
                         let mut al_probs_p1 = vec![0.0f32; n_alleles];
-                        for (pat_idx, &p) in pattern_probs_p1.iter().enumerate() {
+                        for (pat_idx, &p) in cache.dict_probs_p1.iter().enumerate() {
                             if p == 0.0 {
                                 continue;
                             }
@@ -562,6 +521,148 @@ impl ClusterStateProbs {
                 }
             }
         }
+    }
+
+    #[inline]
+    pub fn allele_posteriors_for_patterns_cached(
+        &self,
+        ref_marker: usize,
+        n_alleles: usize,
+        hap_to_pattern: &[u32],
+        pattern_alleles: &[u8],
+        map_ref_to_targ: Option<&[i8]>,
+        cache: &mut AllelePosteriorCache,
+        block_id: usize,
+    ) -> AllelePosteriors {
+        #[inline]
+        fn map_allele(map_ref_to_targ: Option<&[i8]>, allele: u8) -> u8 {
+            if allele == 255 {
+                return 255;
+            }
+            if let Some(map) = map_ref_to_targ {
+                let idx = allele as usize;
+                if idx < map.len() {
+                    let mapped = map[idx];
+                    if mapped >= 0 {
+                        mapped as u8
+                    } else {
+                        255
+                    }
+                } else {
+                    255
+                }
+            } else {
+                allele
+            }
+        }
+
+        let (cluster, in_cluster, weight) = self.cluster_info(ref_marker);
+        let start = self.offsets.get(cluster).copied().unwrap_or(0);
+        let end = self.offsets.get(cluster + 1).copied().unwrap_or(start);
+        let haps = &self.hap_indices[start..end];
+        let probs = &self.probs[start..end];
+        let probs_p1 = &self.probs_p1[start..end];
+
+        if cache.pattern_block_id != block_id || cache.pattern_cluster != cluster {
+            cache.pattern_block_id = block_id;
+            cache.pattern_cluster = cluster;
+            cache.pattern_probs.clear();
+            cache.pattern_probs.resize(pattern_alleles.len(), 0.0);
+            cache.pattern_probs_p1.clear();
+            cache.pattern_probs_p1.resize(pattern_alleles.len(), 0.0);
+            for (j, &hap) in haps.iter().enumerate() {
+                let idx = hap as usize;
+                if idx < hap_to_pattern.len() {
+                    let pat_idx = hap_to_pattern[idx] as usize;
+                    if pat_idx < cache.pattern_probs.len() {
+                        cache.pattern_probs[pat_idx] += probs[j];
+                        cache.pattern_probs_p1[pat_idx] += probs_p1[j];
+                    }
+                }
+            }
+        }
+
+        if n_alleles == 2 {
+            let mut p_alt = 0.0f32;
+            let mut p_ref = 0.0f32;
+            for (pat_idx, &p) in cache.pattern_probs.iter().enumerate() {
+                if p == 0.0 {
+                    continue;
+                }
+                let allele = map_allele(map_ref_to_targ, pattern_alleles[pat_idx]);
+                if allele == 1 {
+                    p_alt += p;
+                } else if allele == 0 {
+                    p_ref += p;
+                }
+            }
+            if !in_cluster {
+                let mut p_alt_p1 = 0.0f32;
+                let mut p_ref_p1 = 0.0f32;
+                for (pat_idx, &p) in cache.pattern_probs_p1.iter().enumerate() {
+                    if p == 0.0 {
+                        continue;
+                    }
+                    let allele = map_allele(map_ref_to_targ, pattern_alleles[pat_idx]);
+                    if allele == 1 {
+                        p_alt_p1 += p;
+                    } else if allele == 0 {
+                        p_ref_p1 += p;
+                    }
+                }
+                p_alt = weight * p_alt + (1.0 - weight) * p_alt_p1;
+                p_ref = weight * p_ref + (1.0 - weight) * p_ref_p1;
+            }
+            let total = p_ref + p_alt;
+            let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
+            AllelePosteriors::Biallelic(p_alt)
+        } else {
+            let mut al_probs = vec![0.0f32; n_alleles];
+            for (pat_idx, &p) in cache.pattern_probs.iter().enumerate() {
+                if p == 0.0 {
+                    continue;
+                }
+                let allele = map_allele(map_ref_to_targ, pattern_alleles[pat_idx]);
+                if allele != 255 && (allele as usize) < n_alleles {
+                    al_probs[allele as usize] += p;
+                }
+            }
+            if !in_cluster {
+                let mut al_probs_p1 = vec![0.0f32; n_alleles];
+                for (pat_idx, &p) in cache.pattern_probs_p1.iter().enumerate() {
+                    if p == 0.0 {
+                        continue;
+                    }
+                    let allele = map_allele(map_ref_to_targ, pattern_alleles[pat_idx]);
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs_p1[allele as usize] += p;
+                    }
+                }
+                for i in 0..n_alleles {
+                    al_probs[i] = weight * al_probs[i] + (1.0 - weight) * al_probs_p1[i];
+                }
+            }
+            let total: f32 = al_probs.iter().sum();
+            if total > 1e-10 {
+                for p in &mut al_probs {
+                    *p /= total;
+                }
+            }
+            AllelePosteriors::Multiallelic(al_probs)
+        }
+    }
+
+    #[inline]
+    fn cluster_info(&self, ref_marker: usize) -> (usize, bool, f32) {
+        let cluster = *self.marker_cluster.get(ref_marker).unwrap_or(&0);
+        let mut in_cluster = ref_marker < *self.ref_cluster_end.get(cluster).unwrap_or(&0);
+        let mut weight = self.weight.get(ref_marker).copied().unwrap_or(0.5);
+        if !weight.is_finite() {
+            in_cluster = true;
+            weight = 0.5;
+        }
+        let weight = if in_cluster { 1.0 } else { weight };
+        (cluster, in_cluster, weight)
     }
 }
 
