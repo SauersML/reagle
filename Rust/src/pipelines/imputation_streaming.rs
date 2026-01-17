@@ -517,30 +517,20 @@ impl crate::pipelines::ImputationPipeline {
                 let start_pos = window_start_pos;
                 let end_pos = window_end_pos;
                 
-                let mut ref_window = None;
-                let mut window_chrom = None;
-                for cand in &chrom_candidates {
-                    let loaded = if pipeline.config.profile {
-                        let span_guard = info_span!("io_load_ref").entered();
-                        let _ = &span_guard;
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    } else {
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    };
-                    if loaded.is_some() {
-                        ref_window = loaded;
-                        window_chrom = Some(cand.clone());
-                        break;
-                    }
-                }
-                let window_chrom = window_chrom.unwrap_or_else(|| target_chrom.to_string());
+                let ref_window = if pipeline.config.profile {
+                    let span_guard = info_span!("io_load_ref").entered();
+                    let _ = &span_guard;
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                } else {
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                };
 
                 let ref_window = match ref_window {
                     Some(w) => w,
                     None => {
                         return Err(anyhow::anyhow!(
                             "No reference markers in region for chrom {} ({}..{}); tried: {}",
-                            window_chrom,
+                            target_chrom,
                             start_pos,
                             end_pos,
                             chrom_candidates.join(", ")
