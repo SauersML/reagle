@@ -10,8 +10,6 @@ use std::sync::Arc;
 
 use noodles::bgzf::io as bgzf_io;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use noodles::vcf::Header;
 use tracing::info_span;
 
@@ -858,7 +856,8 @@ impl VcfWriter {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let writer: Box<dyn Write + Send> = match ext {
             "bgz" | "bgzf" => Box::new(BufWriter::new(bgzf_io::Writer::new(file))),
-            "gz" => Box::new(BufWriter::new(GzEncoder::new(file, Compression::default()))),
+            // Use BGZF for .gz so downstream tools (e.g. bcftools) can index .vcf.gz.
+            "gz" => Box::new(BufWriter::new(bgzf_io::Writer::new(file))),
             _ => Box::new(BufWriter::new(file)),
         };
 
