@@ -438,6 +438,29 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
         let rss_mb = get_rss_mb();
         let (vsz_mb, swap_mb) = get_vm_usage_mb();
 
+        let show_extra = {
+            let mut verbose = is_stalled;
+            if swap_mb.unwrap_or(0) > 0 {
+                verbose = true;
+            }
+            if let (Some(vsz), Some(rss)) = (vsz_mb, rss_mb) {
+                if vsz > rss.saturating_add(1024) {
+                    verbose = true;
+                }
+            }
+            if let Some(cpu) = cpu_pct {
+                if cpu < 5.0 || cpu > 95.0 {
+                    verbose = true;
+                }
+            }
+            if snap.channel_capacity > 0
+                && (snap.channel_depth == 0 || snap.channel_depth == snap.channel_capacity)
+            {
+                verbose = true;
+            }
+            verbose
+        };
+
         if is_tty {
             print_tty_progress(
                 &snap,
@@ -448,6 +471,7 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
                 cpu_pct,
                 markers_velocity,
                 is_stalled,
+                show_extra,
             );
         } else {
             print_log_progress(
@@ -459,6 +483,7 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
                 cpu_pct,
                 markers_velocity,
                 is_stalled,
+                show_extra,
             );
         }
     }
@@ -480,6 +505,7 @@ fn print_tty_progress(
     cpu_pct: Option<f64>,
     velocity: f64,
     is_stalled: bool,
+    show_extra: bool,
 ) {
     // Build window/iteration context
     let window_str = if snap.total_windows > 0 {
@@ -518,21 +544,27 @@ fn print_tty_progress(
     let bar: String = "=".repeat(filled.min(bar_width))
         + &" ".repeat(bar_width.saturating_sub(filled));
 
-    let mem_str = match (rss_mb, vsz_mb, swap_mb) {
-        (Some(rss), Some(vsz), Some(swap)) => format!(" {}MB VSZ {}MB SWAP {}MB", rss, vsz, swap),
-        (Some(rss), _, _) => format!(" {}MB", rss),
-        _ => String::new(),
-    };
-    let cpu_str = cpu_pct.map(|c| format!(" CPU {:.0}%", c)).unwrap_or_default();
-    let op_str = if snap.current_op.is_empty() {
-        String::new()
+    let (mem_str, cpu_str, op_str, channel_str) = if show_extra {
+        let mem = match (rss_mb, vsz_mb, swap_mb) {
+            (Some(rss), Some(vsz), Some(swap)) => format!(" {}MB VSZ {}MB SWAP {}MB", rss, vsz, swap),
+            (Some(rss), _, _) => format!(" {}MB", rss),
+            _ => String::new(),
+        };
+        let cpu = cpu_pct.map(|c| format!(" CPU {:.0}%", c)).unwrap_or_default();
+        let op = if snap.current_op.is_empty() {
+            String::new()
+        } else {
+            format!(" OP {}", snap.current_op)
+        };
+        let ch = if snap.channel_capacity > 0 {
+            format!(" CH {}/{}", snap.channel_depth, snap.channel_capacity)
+        } else {
+            String::new()
+        };
+        (mem, cpu, op, ch)
     } else {
-        format!(" OP {}", snap.current_op)
-    };
-    let channel_str = if snap.channel_capacity > 0 {
-        format!(" CH {}/{}", snap.channel_depth, snap.channel_capacity)
-    } else {
-        String::new()
+        let mem = rss_mb.map(|mb| format!(" {}MB", mb)).unwrap_or_default();
+        (mem, String::new(), String::new(), String::new())
     };
     let stall_str = if is_stalled { " [STALLED]" } else { "" };
 
@@ -571,40 +603,64 @@ fn print_log_progress(
     cpu_pct: Option<f64>,
     velocity: f64,
     is_stalled: bool,
+    show_extra: bool,
 ) {
-    eprintln!(
-        "[HEARTBEAT] stage=\"{}\" window={}/{} iter={}/{} samples={}/{} markers={}/{} \
-         velocity={:.0}/s elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} cpu_pct={} \
-         op=\"{}\" channel={}/{} stalled={}",
-        snap.stage.as_str(),
-        snap.current_window,
-        snap.total_windows,
-        snap.current_iteration,
-        snap.total_iterations,
-        snap.samples_processed,
-        snap.total_samples,
-        snap.markers_processed,
-        snap.total_markers,
-        velocity,
-        snap.elapsed_secs,
-        eta,
-        rss_mb
-            .map(|m| m.to_string())
-            .unwrap_or_else(|| "?".to_string()),
-        vsz_mb
-            .map(|m| m.to_string())
-            .unwrap_or_else(|| "?".to_string()),
-        swap_mb
-            .map(|m| m.to_string())
-            .unwrap_or_else(|| "?".to_string()),
-        cpu_pct
-            .map(|c| format!("{:.0}", c))
-            .unwrap_or_else(|| "?".to_string()),
-        snap.current_op,
-        snap.channel_depth,
-        snap.channel_capacity,
-        is_stalled
-    );
+    if show_extra {
+        eprintln!(
+            "[HEARTBEAT] stage=\"{}\" window={}/{} iter={}/{} samples={}/{} markers={}/{} \
+             velocity={:.0}/s elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} cpu_pct={} \
+             op=\"{}\" channel={}/{} stalled={}",
+            snap.stage.as_str(),
+            snap.current_window,
+            snap.total_windows,
+            snap.current_iteration,
+            snap.total_iterations,
+            snap.samples_processed,
+            snap.total_samples,
+            snap.markers_processed,
+            snap.total_markers,
+            velocity,
+            snap.elapsed_secs,
+            eta,
+            rss_mb
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            vsz_mb
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            swap_mb
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            cpu_pct
+                .map(|c| format!("{:.0}", c))
+                .unwrap_or_else(|| "?".to_string()),
+            snap.current_op,
+            snap.channel_depth,
+            snap.channel_capacity,
+            is_stalled
+        );
+    } else {
+        eprintln!(
+            "[HEARTBEAT] stage=\"{}\" window={}/{} iter={}/{} samples={}/{} markers={}/{} \
+             velocity={:.0}/s elapsed={:.0}s eta={} rss_mb={} stalled={}",
+            snap.stage.as_str(),
+            snap.current_window,
+            snap.total_windows,
+            snap.current_iteration,
+            snap.total_iterations,
+            snap.samples_processed,
+            snap.total_samples,
+            snap.markers_processed,
+            snap.total_markers,
+            velocity,
+            snap.elapsed_secs,
+            eta,
+            rss_mb
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            is_stalled
+        );
+    }
 }
 
 #[cfg(test)]
