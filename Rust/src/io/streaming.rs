@@ -557,6 +557,119 @@ impl StreamingVcfReader {
         })
     }
 
+    /// Load a window for a specific genomic region (start_pos..end_pos).
+    pub fn load_window_for_region(
+        &mut self,
+        candidates: &[String],
+        start_pos: u32,
+        end_pos: u32,
+    ) -> Result<Option<StreamWindow>> {
+        // Reset if chromosome changed
+        let current_name = self
+            .current_chrom
+            .and_then(|idx| self.markers_meta.chrom_name(idx).map(|s| s.to_string()));
+        let switched = current_name
+            .as_ref()
+            .map(|cur| !candidates.iter().any(|c| c.as_str() == cur.as_str()))
+            .unwrap_or(true);
+        if switched {
+            self.buffer.clear();
+            self.current_chrom = None;
+        }
+
+        while !self.eof {
+            let need_more = self
+                .buffer
+                .back()
+                .map(|m| m.marker.pos < end_pos)
+                .unwrap_or(true);
+            if !need_more {
+                break;
+            }
+            if let Some(bm) = self.read_next_marker()? {
+                self.buffer.push_back(bm);
+            } else {
+                break;
+            }
+        }
+
+        if self.buffer.is_empty() {
+            return Ok(None);
+        }
+
+        let mut indices = Vec::new();
+        for (i, bm) in self.buffer.iter().enumerate() {
+            if bm.marker.pos >= start_pos && bm.marker.pos <= end_pos {
+                indices.push(i);
+            }
+        }
+        if indices.is_empty() {
+            // Drop markers before start_pos to keep buffer bounded
+            while self.buffer.front().map(|m| m.marker.pos < start_pos).unwrap_or(false) {
+                self.buffer.pop_front();
+                self.global_marker_idx += 1;
+            }
+            return Ok(None);
+        }
+
+        let first_idx = indices[0];
+        let last_idx = *indices.last().unwrap();
+        let n_markers = indices.len();
+
+        let mut markers = Markers::new();
+        let mut columns = Vec::with_capacity(n_markers);
+        let mut confidences: Vec<Vec<u8>> = Vec::new();
+
+        for &i in &indices {
+            let bm = &self.buffer[i];
+            let chrom_name = self
+                .markers_meta
+                .chrom_name(bm.marker.chrom)
+                .unwrap_or("UNKNOWN");
+            let window_chrom_idx = markers.add_chrom(chrom_name);
+            let mut marker = bm.marker.clone();
+            marker.chrom = window_chrom_idx;
+            markers.push(marker);
+            columns.push(bm.column.clone());
+            if self.has_any_confidence {
+                if let Some(conf) = &bm.confidences {
+                    confidences.push(conf.clone());
+                } else {
+                    confidences.push(vec![255; self.samples.len()]);
+                }
+            }
+        }
+
+        let genotypes = if self.has_any_confidence {
+            GenotypeMatrix::new_unphased_with_confidence(
+                markers,
+                columns,
+                Arc::clone(&self.samples),
+                confidences,
+            )
+        } else {
+            GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
+        };
+
+        let window = StreamWindow {
+            genotypes,
+            global_start: self.global_marker_idx + first_idx,
+            global_end: self.global_marker_idx + last_idx + 1,
+            output_start: 0,
+            output_end: n_markers,
+            is_first: self.window_num == 0,
+            phased_overlap: None,
+        };
+
+        while self.buffer.front().map(|m| m.marker.pos < start_pos).unwrap_or(false) {
+            self.buffer.pop_front();
+            self.global_marker_idx += 1;
+        }
+        self.window_num += 1;
+
+        Ok(Some(window))
+    }
+
     /// Fill buffer until we have enough data for a window
     fn fill_buffer_to_window(&mut self) -> Result<()> {
         if self.eof {

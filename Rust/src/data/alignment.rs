@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use crate::data::marker::{AlleleMapping, MarkerIdx};
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
-use crate::error::Result;
 
 /// Marker alignment between target and reference panels
 #[derive(Clone, Debug)]
@@ -101,62 +100,6 @@ impl MarkerAlignment {
             target_to_ref,
             allele_mappings,
         }
-    }
-
-    /// Create alignment from overlapping windows (for streaming)
-    pub fn new_from_windows<S1: PhaseState, S2: PhaseState>(
-        target_win: &GenotypeMatrix<S1>,
-        ref_win: &GenotypeMatrix<S2>,
-    ) -> Result<Self> {
-        let n_ref_markers = ref_win.n_markers();
-        let n_target_markers = target_win.n_markers();
-
-        // Build position -> target index map for the window (keyed by chrom name)
-        let mut target_pos_map: HashMap<(String, u32), usize> = HashMap::new();
-        for m in 0..n_target_markers {
-            let marker = target_win.marker(MarkerIdx::new(m as u32));
-            let chrom_name = target_win
-                .markers()
-                .chrom_name(marker.chrom)
-                .unwrap_or("");
-            let chrom_norm = normalize_chrom(chrom_name).to_string();
-            target_pos_map.insert((chrom_norm, marker.pos), m);
-        }
-
-        // Map reference markers to target markers
-        let mut ref_to_target = vec![-1i32; n_ref_markers];
-        let mut target_to_ref = vec![0usize; n_target_markers];
-        let mut allele_mappings: Vec<Option<AlleleMapping>> =
-            vec![None; n_target_markers];
-
-        for ref_m in 0..n_ref_markers {
-            let ref_marker = ref_win.marker(MarkerIdx::new(ref_m as u32));
-            let ref_chrom = ref_win
-                .markers()
-                .chrom_name(ref_marker.chrom)
-                .unwrap_or("");
-            let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
-
-            // Check if this reference marker is genotyped in target window
-            if let Some(&target_idx) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
-                let target_marker = target_win.marker(MarkerIdx::new(target_idx as u32));
-
-                // Compute allele mapping
-                if let Some(mapping) = crate::data::marker::compute_allele_mapping(target_marker, ref_marker) {
-                    if mapping.is_valid() {
-                        ref_to_target[ref_m] = target_idx as i32;
-                        target_to_ref[target_idx] = ref_m;
-                        allele_mappings[target_idx] = Some(mapping);
-                    }
-                }
-            }
-        }
-
-        Ok(Self {
-            ref_to_target,
-            target_to_ref,
-            allele_mappings,
-        })
     }
 
     /// Get target marker index for a reference marker (returns None if not genotyped)
