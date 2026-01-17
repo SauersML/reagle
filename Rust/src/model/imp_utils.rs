@@ -116,6 +116,30 @@ pub fn build_marker_cluster_index(
 
 #[inline]
 pub fn get_log_probs(conf: f32, p_err: f32) -> (f32, f32) {
+    // Java BEAGLE behavior:
+    // When a mismatch is observed, the penalty should be applied.
+    // However, BEAGLE uses a constant emission model for mismatch vs match.
+    // If conf is used, it should be consistent.
+    //
+    // Critical difference from Java:
+    // Java's ImpLSBaum.java uses:
+    // double pErr = pErr(k);
+    // double pNoErr = 1.0 - pErr;
+    // double matchProb = pNoErr;
+    // double mismatchProb = pErr;
+    // It does NOT blend with confidence in the emission calculation itself for the HMM structure.
+    // Instead, it treats genotyped markers as hard constraints or uses GLs if available.
+    //
+    // But wait, our `compute_cluster_mismatches` logic uses `log_diff` which depends on `conf`.
+    // If `conf` is low (e.g. 0.5), `match_prob` and `mismatch_prob` become similar,
+    // so `log_diff` becomes small (near 0). This is correct: low confidence = little information.
+    //
+    // However, for high confidence (conf=1.0), `match_prob` = `p_no_err` (large),
+    // `mismatch_prob` = `p_err` (small). `log_diff` is large negative.
+    //
+    // The issue might be floating point precision or how `half_compl` is handled.
+    //
+    // Let's stick to the current implementation but ensure `p_err` is small enough.
     let p_no_err = 1.0 - p_err;
     let half_compl = (1.0 - conf) * 0.5;
     let match_prob = conf * p_no_err + half_compl;
