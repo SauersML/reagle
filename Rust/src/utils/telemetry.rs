@@ -415,10 +415,58 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressMetric {
+    Samples,
+    Markers,
+    Windows,
+    None,
+}
+
+struct ProgressSnapshot {
+    metric: ProgressMetric,
+    done: u64,
+    total: u64,
+    unit: &'static str,
+}
+
+fn select_progress_metric(snap: &TelemetrySnapshot) -> ProgressSnapshot {
+    if snap.stage == Stage::Imputation && snap.total_samples > 0 {
+        ProgressSnapshot {
+            metric: ProgressMetric::Samples,
+            done: snap.samples_processed,
+            total: snap.total_samples,
+            unit: "samp",
+        }
+    } else if snap.total_markers > 0 {
+        ProgressSnapshot {
+            metric: ProgressMetric::Markers,
+            done: snap.markers_processed,
+            total: snap.total_markers,
+            unit: "mk",
+        }
+    } else if snap.total_windows > 0 {
+        ProgressSnapshot {
+            metric: ProgressMetric::Windows,
+            done: snap.current_window,
+            total: snap.total_windows,
+            unit: "win",
+        }
+    } else {
+        ProgressSnapshot {
+            metric: ProgressMetric::None,
+            done: 0,
+            total: 0,
+            unit: "unit",
+        }
+    }
+}
+
 /// Main heartbeat loop
 fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty: bool) {
     let interval = Duration::from_secs(config.interval_secs);
-    let mut last_markers = 0u64;
+    let mut last_progress = 0u64;
+    let mut last_metric = ProgressMetric::None;
     let mut last_time = Instant::now();
     #[cfg(target_os = "linux")]
     let mut last_cpu_ticks = get_cpu_ticks();
@@ -436,16 +484,29 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
 
         let snap = bb.snapshot();
 
-        // Calculate velocity (markers per second)
+        let progress = select_progress_metric(&snap);
+
+        // Calculate velocity based on the active progress metric.
         let now = Instant::now();
         let dt = now.duration_since(last_time).as_secs_f64();
-        let markers_velocity = if dt > 0.1 {
-            (snap.markers_processed.saturating_sub(last_markers)) as f64 / dt
+        let (progress_velocity, reset_window) = if progress.metric != last_metric {
+            (0.0, true)
+        } else if dt > 0.1 {
+            (
+                (progress.done.saturating_sub(last_progress)) as f64 / dt,
+                false,
+            )
         } else {
-            0.0
+            (0.0, false)
         };
-        last_markers = snap.markers_processed;
-        last_time = now;
+        if reset_window {
+            last_progress = progress.done;
+            last_time = now;
+            last_metric = progress.metric;
+        } else {
+            last_progress = progress.done;
+            last_time = now;
+        }
 
         let cpu_pct = {
             #[cfg(target_os = "linux")]
@@ -466,10 +527,10 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
             }
         };
 
-        // ETA calculation based on markers
-        let eta_str = if markers_velocity > 0.0 && snap.total_markers > snap.markers_processed {
-            let remaining = snap.total_markers - snap.markers_processed;
-            let eta_secs = remaining as f64 / markers_velocity;
+        // ETA calculation based on the active progress metric.
+        let eta_str = if progress_velocity > 0.0 && progress.total > progress.done {
+            let remaining = progress.total - progress.done;
+            let eta_secs = remaining as f64 / progress_velocity;
             format_duration(eta_secs)
         } else {
             "unknown".to_string()
@@ -509,24 +570,28 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
         if is_tty {
             print_tty_progress(
                 &snap,
+                progress.done,
+                progress.total,
+                progress.unit,
                 &eta_str,
                 rss_mb,
                 vsz_mb,
                 swap_mb,
                 cpu_pct,
-                markers_velocity,
+                progress_velocity,
                 is_stalled,
                 show_extra,
             );
         } else {
             print_log_progress(
                 &snap,
+                progress.unit,
                 &eta_str,
                 rss_mb,
                 vsz_mb,
                 swap_mb,
                 cpu_pct,
-                markers_velocity,
+                progress_velocity,
                 is_stalled,
                 show_extra,
             );
@@ -543,6 +608,9 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
 /// Print progress for TTY (rewriting single line)
 fn print_tty_progress(
     snap: &TelemetrySnapshot,
+    progress_done: u64,
+    progress_total: u64,
+    velocity_unit: &str,
     eta: &str,
     rss_mb: Option<u64>,
     vsz_mb: Option<u64>,
@@ -568,10 +636,8 @@ fn print_tty_progress(
     };
 
     // Calculate progress percentage
-    let progress_pct = if snap.total_markers > 0 {
-        (snap.markers_processed as f64 / snap.total_markers as f64 * 100.0).min(100.0)
-    } else if snap.total_windows > 0 {
-        (snap.current_window as f64 / snap.total_windows as f64 * 100.0).min(100.0)
+    let progress_pct = if progress_total > 0 {
+        (progress_done as f64 / progress_total as f64 * 100.0).min(100.0)
     } else {
         0.0
     };
@@ -621,12 +687,13 @@ fn print_tty_progress(
     let context = context_parts.join(" ");
 
     eprint!(
-        "\r[{}] {:>5.1}% | {} {} | {:.0} mk/s | {} | ETA: {}{}{}{}{}{}    \x1b[K",
+        "\r[{}] {:>5.1}% | {} {} | {:.0} {}/s | {} | ETA: {}{}{}{}{}{}    \x1b[K",
         bar,
         progress_pct,
         snap.stage.as_str(),
         context,
         velocity,
+        velocity_unit,
         format_duration(snap.elapsed_secs),
         eta,
         mem_str,
@@ -641,6 +708,7 @@ fn print_tty_progress(
 /// Print progress for non-TTY (structured log line)
 fn print_log_progress(
     snap: &TelemetrySnapshot,
+    velocity_unit: &str,
     eta: &str,
     rss_mb: Option<u64>,
     vsz_mb: Option<u64>,
@@ -650,21 +718,26 @@ fn print_log_progress(
     is_stalled: bool,
     show_extra: bool,
 ) {
+    let iter_str = if snap.total_iterations > 0 {
+        format!(" iter={}/{}", snap.current_iteration, snap.total_iterations)
+    } else {
+        String::new()
+    };
     if show_extra {
         eprintln!(
-            "[HEARTBEAT] stage=\"{}\" window={}/{} iter={}/{} samples={}/{} markers={}/{} \
-             velocity={:.0}/s elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} cpu_pct={} \
-             op=\"{}\" channel={}/{} stalled={}",
+            "[HEARTBEAT] stage=\"{}\" window={}/{}{} samples={}/{} markers={}/{} \
+             velocity={:.0}/s velocity_unit={} elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} \
+             cpu_pct={} op=\"{}\" channel={}/{} stalled={}",
             snap.stage.as_str(),
             snap.current_window,
             snap.total_windows,
-            snap.current_iteration,
-            snap.total_iterations,
+            iter_str,
             snap.samples_processed,
             snap.total_samples,
             snap.markers_processed,
             snap.total_markers,
             velocity,
+            velocity_unit,
             snap.elapsed_secs,
             eta,
             rss_mb
@@ -686,18 +759,18 @@ fn print_log_progress(
         );
     } else {
         eprintln!(
-            "[HEARTBEAT] stage=\"{}\" window={}/{} iter={}/{} samples={}/{} markers={}/{} \
-             velocity={:.0}/s elapsed={:.0}s eta={} rss_mb={} stalled={}",
+            "[HEARTBEAT] stage=\"{}\" window={}/{}{} samples={}/{} markers={}/{} \
+             velocity={:.0}/s velocity_unit={} elapsed={:.0}s eta={} rss_mb={} stalled={}",
             snap.stage.as_str(),
             snap.current_window,
             snap.total_windows,
-            snap.current_iteration,
-            snap.total_iterations,
+            iter_str,
             snap.samples_processed,
             snap.total_samples,
             snap.markers_processed,
             snap.total_markers,
             velocity,
+            velocity_unit,
             snap.elapsed_secs,
             eta,
             rss_mb

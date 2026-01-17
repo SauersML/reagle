@@ -2192,6 +2192,7 @@ impl PhasingPipeline {
             //   - swap_mask[i] = true if the sampled phase orientation at marker i is swapped
             //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
             let prior_paths = &mcmc_paths[..];
+            let telemetry = self.telemetry.clone();
             let sample_iter = || {
                 sample_phases
                     .par_iter()
@@ -2375,6 +2376,10 @@ impl PhasingPipeline {
                         .copied()
                         .zip(swap_lr.into_iter())
                         .collect();
+
+                    if let Some(bb) = telemetry.as_ref() {
+                        bb.add_samples(1);
+                    }
 
                     (swap_mask, het_lr_values, new_paths)
                 })

@@ -1014,6 +1014,7 @@ target_samples={} target_bytes={}",
 
         let mut all_results: Vec<SampleImputationResult> = Vec::new();
 
+        let telemetry = self.telemetry.clone();
         for batch_idx in 0..n_batches {
             let batch_start = batch_idx * batch_size;
             let batch_end = (batch_start + batch_size).min(n_target_samples);
@@ -1062,7 +1063,7 @@ target_samples={} target_bytes={}",
                     let sample_genotyped = &sample_genotyped_vec[s];
 
                     if sample_genotyped.is_empty() {
-                        return SampleImputationResult {
+                        let result = SampleImputationResult {
                             sample_idx: s,
                             dosages: vec![0.0f32; markers_to_process.len()],
                             best_gt: vec![(0u8, 0u8); markers_to_process.len()],
@@ -1070,6 +1071,10 @@ target_samples={} target_bytes={}",
                             state_probs: None,
                             hap_alt_probs: None,
                         };
+                        if let Some(bb) = telemetry.as_ref() {
+                            bb.add_samples(1);
+                        }
+                        return result;
                     }
 
                     let (dosages, best_gt, priors, state_probs_pair, hap_alt_probs) =
@@ -1330,18 +1335,19 @@ target_samples={} target_bytes={}",
 
                         (combined_dosages, combined_best_gt, priors, state_probs_pair, hap_alt_probs)
                     });
-                    SampleImputationResult {
+                    let result = SampleImputationResult {
                         sample_idx: s,
                         dosages,
                         best_gt,
                         priors,
                         state_probs: state_probs_pair,
                         hap_alt_probs,
+                    };
+                    if let Some(bb) = telemetry.as_ref() {
+                        bb.add_samples(1);
                     }
+                    result
                 }).collect();
-            if let Some(bb) = &self.telemetry {
-                bb.add_samples(batch_results.len() as u64);
-            }
 
             all_results.extend(batch_results);
         }
