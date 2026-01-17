@@ -694,12 +694,7 @@ impl WindowedBref3Reader {
                 break;
             };
 
-            // Check match against candidates
-            // Also normalize chromosome names if exact match fails (remove 'chr' prefix/suffix)
-            let block_chrom = &next_block.chrom;
-            let is_match = candidates.iter().any(|c| c == block_chrom) ||
-                           candidates.iter().any(|c| c.strip_prefix("chr").unwrap_or(c) == block_chrom.strip_prefix("chr").unwrap_or(block_chrom));
-
+            let is_match = candidates.iter().any(|c| c == &next_block.chrom);
             if !is_match {
                 if self.block_buffer.is_empty() {
                     continue; // Skip blocks from other chromosomes until we find a match
@@ -712,19 +707,21 @@ impl WindowedBref3Reader {
             self.block_buffer.push_back(next_block);
         }
 
-        // Load one extra block beyond end_pos for trailing buffer, if available and matching
-        if !self.inner.is_eof() && self.pending_block.is_none() {
-             if let Some(block) = self.inner.next_block()? {
-                let block_chrom = &block.chrom;
-                let is_match = candidates.iter().any(|c| c == block_chrom) ||
-                               candidates.iter().any(|c| c.strip_prefix("chr").unwrap_or(c) == block_chrom.strip_prefix("chr").unwrap_or(block_chrom));
+        // Load one extra block beyond end_pos for trailing buffer, if available.
+        if !self.inner.is_eof() {
+            let next_block = if let Some(pending) = self.pending_block.take() {
+                Some(pending)
+            } else {
+                self.inner.next_block()?
+            };
 
-                if is_match {
-                    self.block_buffer.push_back(block);
+            if let Some(next_block) = next_block {
+                if candidates.iter().any(|c| c == &next_block.chrom) {
+                    self.block_buffer.push_back(next_block);
                 } else {
-                    self.pending_block = Some(block);
+                    self.pending_block = Some(next_block);
                 }
-             }
+            }
         }
 
         if self.block_buffer.is_empty() {

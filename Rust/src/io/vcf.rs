@@ -1101,9 +1101,17 @@ impl VcfWriter {
 
                 // Format: \t{a1}|{a2}:{ds}
                 line_buf.push('\t');
-                line_buf.push((b'0' + a1) as char);
+                if a1 == 255 {
+                    line_buf.push('.');
+                } else {
+                    line_buf.push((b'0' + a1) as char);
+                }
                 line_buf.push('|');
-                line_buf.push((b'0' + a2) as char);
+                if a2 == 255 {
+                    line_buf.push('.');
+                } else {
+                    line_buf.push((b'0' + a2) as char);
+                }
                 line_buf.push(':');
                 let v = format_f32_4dp(ds, &mut ryu_buf);
                 line_buf.push_str(&v);
