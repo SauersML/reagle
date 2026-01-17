@@ -642,9 +642,21 @@ impl WindowedBref3Reader {
         // Use 500 markers to ensure HMM has context to stabilize at boundaries
         const BUFFER_MARKERS: usize = 500;
 
+        // Helper for normalization
+        fn normalize(s: &str) -> String {
+            let s = s.to_ascii_lowercase();
+            if let Some(stripped) = s.strip_prefix("chr") {
+                stripped.to_string()
+            } else {
+                s
+            }
+        }
+        
+        let norm_candidates: Vec<String> = candidates.iter().map(|c| normalize(c)).collect();
+
         // Reset if we switched chromosomes (current chrom is not in candidates)
         let switched = self.current_chrom.as_ref()
-            .map(|cur| !candidates.iter().any(|c| c.as_str() == cur.as_ref()))
+            .map(|cur| !norm_candidates.iter().any(|c| c == &normalize(cur)))
             .unwrap_or(true);
 
         if switched {
@@ -655,12 +667,11 @@ impl WindowedBref3Reader {
         }
 
         if let Some(pending) = self.pending_block.take() {
-            if candidates.iter().any(|c| c == &pending.chrom) {
+            let pending_norm = normalize(&pending.chrom);
+            if norm_candidates.iter().any(|c| c == &pending_norm) {
                 self.block_buffer.push_back(pending);
                 if self.current_chrom.is_none() {
-                     if let Some(matching) = candidates.iter().find(|c| *c == &self.block_buffer.back().unwrap().chrom) {
-                         self.current_chrom = Some(Arc::from(matching.as_str()));
-                     }
+                     self.current_chrom = Some(Arc::from(self.block_buffer.back().unwrap().chrom.as_str()));
                 }
             } else {
                 self.pending_block = Some(pending);
@@ -694,7 +705,8 @@ impl WindowedBref3Reader {
                 break;
             };
 
-            let is_match = candidates.iter().any(|c| c == &next_block.chrom);
+            let block_chrom_norm = normalize(&next_block.chrom);
+            let is_match = norm_candidates.iter().any(|c| c == &block_chrom_norm);
             if !is_match {
                 if self.block_buffer.is_empty() {
                     continue; // Skip blocks from other chromosomes until we find a match
@@ -716,7 +728,8 @@ impl WindowedBref3Reader {
                 return Ok(None);
             };
 
-            if candidates.iter().any(|c| c == &next_block.chrom) {
+            let block_chrom_norm = normalize(&next_block.chrom);
+            if norm_candidates.iter().any(|c| c == &block_chrom_norm) {
                 self.block_buffer.push_back(next_block);
             } else {
                 self.pending_block = Some(next_block);
@@ -736,7 +749,9 @@ impl WindowedBref3Reader {
 
         for block in &self.block_buffer {
             // Verify block matches current request (should be guaranteed by loading logic)
-            if !candidates.iter().any(|c| c == &block.chrom) {
+            // But use normalization check again to be safe
+            let block_chrom_norm = normalize(&block.chrom);
+            if !norm_candidates.iter().any(|c| c == &block_chrom_norm) {
                 continue;
             }
             // Add chromosome if needed
