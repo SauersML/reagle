@@ -184,9 +184,6 @@ pub fn compute_cluster_mismatches_into_workspace(
             
             let (log_match, log_mism) = get_log_probs(confidence, p_err);
             let log_diff = log_mism - log_match;
-            let hard_log_mism = (1e-12f32).ln();
-            let hard_log_diff = hard_log_mism - log_match;
-            
             cluster_base_score += log_match;
 
             let ref_marker_idx = MarkerIdx::new(ref_m as u32);
@@ -205,9 +202,7 @@ pub fn compute_cluster_mismatches_into_workspace(
                         if final_ref == 255 {
                             if ref_allele != 255 {
                                 let penalty = log_diff;
-                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                    row_buffer[j] = penalty;
-                                }
+                                row_buffer[j] += penalty;
                             }
                         } else if partner_allele != 255 {
                             let required = if partner_allele == geno1 {
@@ -219,22 +214,16 @@ pub fn compute_cluster_mismatches_into_workspace(
                             };
                             if required != 255 {
                                 if final_ref != required {
-                                    let penalty = hard_log_diff;
-                                    if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                        row_buffer[j] = penalty;
-                                    }
+                                    let penalty = log_diff;
+                                    row_buffer[j] += penalty;
                                 }
                             } else if targ_allele != 255 && final_ref != targ_allele {
                                 let penalty = log_diff;
-                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                    row_buffer[j] = penalty;
-                                }
+                                row_buffer[j] += penalty;
                             }
                         } else if targ_allele != 255 && final_ref != targ_allele {
                             let penalty = log_diff;
-                            if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                row_buffer[j] = penalty;
-                            }
+                            row_buffer[j] += penalty;
                         }
                     }
                 }
