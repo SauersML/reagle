@@ -743,7 +743,7 @@ fn parse_allele(s: &str) -> u8 {
 /// * `gl_str` - GL field value, e.g., "-0.48,-0.48,-0.48" or "0,-5,-10"
 /// * `a1` - First called allele (0=ref, 1+=alt)
 /// * `a2` - Second called allele
-fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
+pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     // Skip missing values
     if gl_str.is_empty() || gl_str == "." {
         return None;

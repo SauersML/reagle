@@ -634,19 +634,28 @@ impl WindowedBref3Reader {
     ///
     /// Includes flanking markers outside the region to prevent reference bias
     /// at window boundaries (HMM needs context to stabilize).
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(&mut self, chroms: &[String], start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         // Add buffer zone to prevent reference bias at boundaries
         // Use 500 markers to ensure HMM has context to stabilize at boundaries
         const BUFFER_MARKERS: usize = 500;
 
-        if self.current_chrom.as_deref() != Some(chrom) {
+        // Check if current chromosome is still valid (one of the candidates)
+        let current_valid = self.current_chrom.as_ref()
+            .map(|c| chroms.iter().any(|cand| cand == c.as_ref()))
+            .unwrap_or(false);
+
+        if !current_valid {
             self.block_buffer.clear();
-            self.current_chrom = Some(Arc::from(chrom));
+            self.current_chrom = None;
         }
 
         if let Some(pending) = self.pending_block.take() {
-            if pending.chrom == chrom {
+            if chroms.iter().any(|c| c == &pending.chrom) {
                 self.block_buffer.push_back(pending);
+                // Update current chrom if we just started matching
+                if self.current_chrom.is_none() {
+                    self.current_chrom = self.block_buffer.back().map(|b| Arc::from(b.chrom.as_str()));
+                }
             } else {
                 self.pending_block = Some(pending);
             }
@@ -679,7 +688,8 @@ impl WindowedBref3Reader {
                 break;
             };
 
-            if next_block.chrom != chrom {
+            let is_match = chroms.iter().any(|c| c == &next_block.chrom);
+            if !is_match {
                 if self.block_buffer.is_empty() {
                     continue;
                 }
@@ -688,6 +698,9 @@ impl WindowedBref3Reader {
             }
 
             self.block_buffer.push_back(next_block);
+            if self.current_chrom.is_none() {
+                self.current_chrom = self.block_buffer.back().map(|b| Arc::from(b.chrom.as_str()));
+            }
         }
         // Load one extra block beyond end_pos for trailing buffer, if available.
         if !self.inner.is_eof() {
@@ -699,7 +712,7 @@ impl WindowedBref3Reader {
                 return Ok(None);
             };
 
-            if next_block.chrom == chrom {
+            if chroms.iter().any(|c| c == &next_block.chrom) {
                 self.block_buffer.push_back(next_block);
             } else {
                 self.pending_block = Some(next_block);
@@ -718,7 +731,7 @@ impl WindowedBref3Reader {
         let is_last = self.inner.is_eof();
 
         for block in &self.block_buffer {
-            if block.chrom != chrom {
+            if !chroms.iter().any(|c| c == &block.chrom) {
                 continue;
             }
             // Add chromosome if needed
@@ -816,11 +829,11 @@ impl RefPanelReader {
     }
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(&mut self, chroms: &[String], start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         match self {
-            RefPanelReader::Bref3(r) => r.load_window_for_region(chrom, start_pos, end_pos),
-            RefPanelReader::InMemory(r) => r.load_window_for_region(chrom, start_pos, end_pos),
-            RefPanelReader::StreamingVcf(r) => r.load_window_for_region(chrom, start_pos, end_pos),
+            RefPanelReader::Bref3(r) => r.load_window_for_region(chroms, start_pos, end_pos),
+            RefPanelReader::InMemory(r) => r.load_window_for_region(chroms, start_pos, end_pos),
+            RefPanelReader::StreamingVcf(r) => r.load_window_for_region(chroms, start_pos, end_pos),
         }
     }
 }
@@ -848,7 +861,7 @@ impl InMemoryRefReader {
     }
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(&mut self, chroms: &[String], start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         use crate::data::marker::MarkerIdx;
 
         let n_markers = self.genotypes.n_markers();
@@ -858,13 +871,15 @@ impl InMemoryRefReader {
 
         const BUFFER_MARKERS: usize = 500;
 
+        // Find the first matching chromosome index
         let target_chrom_idx = self
             .genotypes
             .markers()
             .chrom_names()
             .iter()
-            .position(|name| name.as_ref() == chrom)
+            .position(|name| chroms.iter().any(|c| c == name.as_ref()))
             .map(|idx| ChromIdx::new(idx as u16));
+
         let Some(target_chrom_idx) = target_chrom_idx else {
             return Ok(None);
         };
@@ -1065,17 +1080,25 @@ impl StreamingRefVcfReader {
 
 
     /// Load reference window for a specific genomic region
-    pub fn load_window_for_region(&mut self, chrom: &str, start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
+    pub fn load_window_for_region(&mut self, chroms: &[String], start_pos: u32, end_pos: u32) -> Result<Option<RefWindow>> {
         const BUFFER_MARKERS: usize = 500;
-        if self.current_chrom.as_deref() != Some(chrom) {
+
+        let current_valid = self.current_chrom.as_ref()
+            .map(|c| chroms.iter().any(|cand| cand == c.as_ref()))
+            .unwrap_or(false);
+
+        if !current_valid {
             self.buffer.clear();
-            self.current_chrom = Some(Arc::from(chrom));
+            self.current_chrom = None;
         }
 
         if let Some(pending) = self.pending_marker.take() {
             let pending_chrom = self.markers.chrom_name(pending.marker.chrom).unwrap_or("");
-            if pending_chrom == chrom {
+            if chroms.iter().any(|c| c == pending_chrom) {
                 self.buffer.push_back(pending);
+                if self.current_chrom.is_none() {
+                    self.current_chrom = Some(Arc::from(pending_chrom));
+                }
             } else {
                 self.pending_marker = Some(pending);
             }
@@ -1097,7 +1120,7 @@ impl StreamingRefVcfReader {
                     break;
                 };
                 let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
-                if marker_chrom != chrom {
+                if !chroms.iter().any(|c| c == marker_chrom) {
                     if self.buffer.is_empty() {
                         continue;
                     }
@@ -1105,6 +1128,9 @@ impl StreamingRefVcfReader {
                     break;
                 }
                 self.buffer.push_back(next_marker);
+                if self.current_chrom.is_none() {
+                    self.current_chrom = Some(Arc::from(marker_chrom));
+                }
             }
 
             if self.buffer.is_empty() {
@@ -1133,7 +1159,7 @@ impl StreamingRefVcfReader {
                     break;
                 };
                 let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
-                if marker_chrom != chrom {
+                if !chroms.iter().any(|c| c == marker_chrom) {
                     self.pending_marker = Some(next_marker);
                     break;
                 }
