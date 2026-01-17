@@ -139,7 +139,14 @@ pub fn compute_cluster_mismatches_into_workspace(
     n_states: usize,
     workspace: &mut ImpWorkspace,
     base_err_rate: f32,
+    trace: bool,
 ) {
+    let span = if trace {
+        Some(tracing::info_span!("mismatch_precalc").entered())
+    } else {
+        None
+    };
+    let _ = &span;
     workspace.reset_and_ensure_capacity(hap_indices.len(), n_states);
 
     let n_clusters = hap_indices.len();
@@ -272,6 +279,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+    trace: bool,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
     use wide::f32x8;
 
@@ -293,6 +301,14 @@ pub fn run_hmm_forward_backward_to_sparse(
 
     let mut fwd_sums = vec![1.0f32; n_clusters];
     let mut last_sum = 1.0f32;
+
+    {
+    let fwd_span = if trace {
+        Some(tracing::info_span!("hmm_fwd_initial").entered())
+    } else {
+        None
+    };
+    let _ = &fwd_span;
 
     for m in 0..n_clusters {
         let p_rec = p_recomb.get(m).copied().unwrap_or(0.0);
@@ -355,12 +371,21 @@ pub fn run_hmm_forward_backward_to_sparse(
         let curr_slice = &mut fwd[curr_off..curr_off+n_states];
         let start = diff_row_offsets[m];
         let end = diff_row_offsets[m+1];
-        for i in start..end {
-            let col = diff_cols[i] as usize;
-            let val = diff_vals[i];
-            if col < n_states {
-                let penalty = val.exp();
-                curr_slice[col] = curr_slice[col] * penalty;
+
+        {
+            let exp_span = if trace && m == 0 {
+                Some(tracing::info_span!("expensive_float_exp").entered())
+            } else {
+                None
+            };
+            let _ = &exp_span;
+            for i in start..end {
+                let col = diff_cols[i] as usize;
+                let val = diff_vals[i];
+                if col < n_states {
+                    let penalty = val.exp();
+                    curr_slice[col] = curr_slice[col] * penalty;
+                }
             }
         }
 
@@ -392,6 +417,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             }
         }
     }
+    } // End fwd_span block
 
     let block_fwd = block_fwd_buffer;
     block_fwd.resize((CHECKPOINT_INTERVAL + 1) * n_states, 0.0);
@@ -416,6 +442,14 @@ pub fn run_hmm_forward_backward_to_sparse(
 
         let mut recomp_sum;
         let mut curr_off;
+
+        {
+        let recomp_span = if trace {
+            Some(tracing::info_span!("hmm_recompute_block").entered())
+        } else {
+            None
+        };
+        let _ = &recomp_span;
 
         if block_idx == 0 {
             let base_emit = cluster_base_scores[0].max(LOG_EMIT_FLOOR).exp();
@@ -494,6 +528,15 @@ pub fn run_hmm_forward_backward_to_sparse(
             recomp_sum = new_sum.max(1e-30);
             curr_off = next_off;
         }
+        } // End recomp_span block
+
+        {
+        let bwd_span = if trace {
+            Some(tracing::info_span!("hmm_bwd_sparse").entered())
+        } else {
+            None
+        };
+        let _ = &bwd_span;
 
         for m in (block_start..block_end).rev() {
             if m + 1 < n_clusters {
@@ -593,6 +636,7 @@ pub fn run_hmm_forward_backward_to_sparse(
             entry_counts.push(hap_indices.len() - entries_before);
             std::mem::swap(&mut curr_posteriors, &mut next_posteriors);
         }
+        } // End bwd_span block
     }
 
     entry_counts.reverse();
@@ -634,6 +678,7 @@ pub fn compute_state_probs(
     ref_cluster_end: Arc<Vec<usize>>,
     cluster_weights: Arc<Vec<f32>>,
     prior_probs: Option<&[f32]>,
+    trace: bool,
 ) -> Arc<ClusterStateProbs> {
     let n_clusters = cluster_bounds.len();
     workspace.reset_and_ensure_capacity(n_clusters, n_states);
@@ -653,6 +698,7 @@ pub fn compute_state_probs(
         n_states,
         workspace,
         base_err_rate,
+        trace,
     );
 
     let threshold = if n_clusters <= 1000 {
@@ -675,6 +721,7 @@ pub fn compute_state_probs(
             &mut workspace.fwd,
             &mut workspace.bwd,
             &mut workspace.block_fwd,
+            trace,
         );
 
     Arc::new(ClusterStateProbs::from_sparse(

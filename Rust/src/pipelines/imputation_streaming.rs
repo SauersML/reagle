@@ -1035,6 +1035,13 @@ target_samples={} target_bytes={}",
                 .par_iter()
                 .enumerate()
                 .map(|(local_idx, &s)| {
+                    let lifecycle_span = if local_idx == 0 {
+                        Some(info_span!("sample_lifecycle", sample_idx = s).entered())
+                    } else {
+                        None
+                    };
+                    let _ = &lifecycle_span;
+
                     let hap1_idx = HapIdx::new((s * 2) as u32);
                     let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
                     let sample_genotyped = &sample_genotyped_vec[s];
@@ -1123,6 +1130,7 @@ target_samples={} target_bytes={}",
                                 ref_cluster_end.clone(),
                                 cluster_weights.clone(),
                                 prior_probs.as_deref(),
+                                local_idx == 0,
                             );
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
@@ -1198,6 +1206,7 @@ target_samples={} target_bytes={}",
                                 ref_cluster_end.clone(),
                                 cluster_weights.clone(),
                                 prior_probs.as_deref(),
+                                local_idx == 0,
                             );
 
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
