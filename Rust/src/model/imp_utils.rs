@@ -205,9 +205,7 @@ pub fn compute_cluster_mismatches_into_workspace(
                         if final_ref == 255 {
                             if ref_allele != 255 {
                                 let penalty = log_diff;
-                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                    row_buffer[j] = penalty;
-                                }
+                                row_buffer[j] += penalty;
                             }
                         } else if partner_allele != 255 {
                             let required = if partner_allele == geno1 {
@@ -220,21 +218,15 @@ pub fn compute_cluster_mismatches_into_workspace(
                             if required != 255 {
                                 if final_ref != required {
                                     let penalty = hard_log_diff;
-                                    if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                        row_buffer[j] = penalty;
-                                    }
+                                    row_buffer[j] += penalty;
                                 }
                             } else if targ_allele != 255 && final_ref != targ_allele {
                                 let penalty = log_diff;
-                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                    row_buffer[j] = penalty;
-                                }
+                                row_buffer[j] += penalty;
                             }
                         } else if targ_allele != 255 && final_ref != targ_allele {
                             let penalty = log_diff;
-                            if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                row_buffer[j] = penalty;
-                            }
+                            row_buffer[j] += penalty;
                         }
                     }
                 }
