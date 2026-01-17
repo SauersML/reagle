@@ -959,7 +959,7 @@ fn test_phasing_perfect_ld() {
     config.iterations = 5;
     config.nthreads = Some(1);
 
-    let mut pipeline = PhasingPipeline::new(config);
+    let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run().expect("Phasing run success");
 
     let out_vcf = temp_dir.path().join("output_phase.vcf.gz");
