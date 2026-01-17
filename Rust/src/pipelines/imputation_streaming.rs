@@ -1137,8 +1137,23 @@ target_samples={} target_bytes={}",
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
-                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                let mut prob_alt = p.prob(1);
+                                let mut best_a = p.max_allele();
+
+                                // Override if genotyped and high confidence
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s);
+                                    if conf >= 0.999 {
+                                        let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap1_idx);
+                                        if allele != 255 {
+                                            prob_alt = if allele == 1 { 1.0 } else { 0.0 };
+                                            best_a = if allele == 1 { 1 } else { 0 };
+                                        }
+                                    }
+                                }
+
+                                hap_dosages.push(prob_alt);
+                                hap_best_gt.push(if best_a == 1 { (1, 0) } else { (0, 0) });
                             }
 
                             let mut locked = obs_hap1.clone();
@@ -1213,8 +1228,23 @@ target_samples={} target_bytes={}",
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
-                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                let mut prob_alt = p.prob(1);
+                                let mut best_a = p.max_allele();
+
+                                // Override if genotyped and high confidence
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s);
+                                    if conf >= 0.999 {
+                                        let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap2_idx);
+                                        if allele != 255 {
+                                            prob_alt = if allele == 1 { 1.0 } else { 0.0 };
+                                            best_a = if allele == 1 { 1 } else { 0 };
+                                        }
+                                    }
+                                }
+
+                                hap_dosages.push(prob_alt);
+                                hap_best_gt.push(if best_a == 1 { (1, 0) } else { (0, 0) });
                             }
 
                             let priors = if output_end > 0 && n_ref_markers > 0 {
@@ -1468,7 +1498,9 @@ target_samples={} target_bytes={}",
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
+                if conf >= 0.999 && a1 != 255 && a2 != 255 {
+                    (if a1 == 1 { 1.0 } else { 0.0 }) + (if a2 == 1 { 1.0 } else { 0.0 })
+                } else if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
                     p1 + p2
                 } else {
                     let is_het = a1 != a2;
@@ -1520,7 +1552,9 @@ target_samples={} target_bytes={}",
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
+                if conf >= 0.999 && a1 != 255 && a2 != 255 {
+                    (a1, a2)
+                } else if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
                     if p1 + p2 >= 1.5 {
                         (1, 1)
                     } else if p1 + p2 >= 0.5 {
