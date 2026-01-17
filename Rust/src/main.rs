@@ -94,7 +94,7 @@ fn run() -> Result<()> {
         eprintln!("Mode: Phasing");
         eprintln!("Input: {:?}", config.gt);
 
-        let mut pipeline = PhasingPipeline::new(config);
+        let mut pipeline = PhasingPipeline::new(config, Some(telemetry.clone()));
         pipeline.run_auto()?;
     }
 

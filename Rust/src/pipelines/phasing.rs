@@ -58,6 +58,7 @@ use crate::model::phase_states::PhaseStates;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::data::alignment::MarkerAlignment;
 use mini_mcmc::core::{MarkovChain, Trace};
+use crate::utils::telemetry::{Stage, TelemetryBlackboard};
 
 /// Phasing pipeline
 pub struct PhasingPipeline {
@@ -68,6 +69,7 @@ pub struct PhasingPipeline {
     reference_gt: Option<Arc<GenotypeMatrix<Phased>>>,
     /// Marker alignment between target and reference
     alignment: Option<MarkerAlignment>,
+    telemetry: Option<Arc<TelemetryBlackboard>>,
 }
 
 const MOSAIC_BLOCK_SIZE: usize = 128;  // Smaller = less memory per sample
@@ -473,13 +475,14 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
 
 impl PhasingPipeline {
     /// Create a new phasing pipeline
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, telemetry: Option<Arc<TelemetryBlackboard>>) -> Self {
         let params = ModelParams::new();
         Self {
             config,
             params,
             reference_gt: None,
             alignment: None,
+            telemetry,
         }
     }
 
@@ -680,6 +683,14 @@ impl PhasingPipeline {
         let n_burnin = self.config.burnin;
         let n_iterations = self.config.iterations;
         let total_iterations = n_burnin + n_iterations;
+        if let Some(bb) = &self.telemetry {
+            bb.set_total_samples(n_samples as u64);
+            bb.set_samples_processed(0);
+            bb.set_total_markers(hi_freq_markers.len() as u64);
+            bb.set_markers_processed(0);
+            bb.set_total_iterations(total_iterations as u64);
+            bb.set_current_iteration(0);
+        }
 
         // Recombination probabilities - mutable so EM can update them
         let mut stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
@@ -696,6 +707,17 @@ impl PhasingPipeline {
             let is_burnin = it < n_burnin;
             let iter_type = if is_burnin { "burnin" } else { "main" };
             eprintln!("Iteration {}/{} ({})", it + 1, total_iterations, iter_type);
+            if let Some(bb) = &self.telemetry {
+                let stage = if is_burnin {
+                    Stage::PhasingBurnin
+                } else {
+                    Stage::PhasingMain
+                };
+                bb.set_stage(stage);
+                bb.set_current_iteration((it + 1) as u64);
+                bb.set_samples_processed(0);
+                bb.set_markers_processed(0);
+            }
 
             // Update LR threshold for this iteration
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
@@ -719,6 +741,10 @@ impl PhasingPipeline {
                 atomic_estimates.as_ref(),
                 it,
             )?;
+            if let Some(bb) = &self.telemetry {
+                bb.set_samples_processed(n_samples as u64);
+                bb.set_markers_processed(hi_freq_markers.len() as u64);
+            }
 
             // Update parameters from EM estimates and recompute recombination probabilities
             if let Some(ref atomic) = atomic_estimates {
@@ -758,6 +784,14 @@ impl PhasingPipeline {
                 "Stage 2: Phasing {} rare markers using HMM interpolation...",
                 rare_markers.len()
             );
+            if let Some(bb) = &self.telemetry {
+                bb.set_stage(Stage::PhasingStage2);
+                bb.set_total_iterations(0);
+                bb.set_current_iteration(0);
+                bb.set_total_markers(rare_markers.len() as u64);
+                bb.set_markers_processed(0);
+                bb.set_samples_processed(0);
+            }
             self.phase_rare_markers_with_hmm(
                 &mut geno,
                 &hi_freq_markers,
@@ -771,6 +805,10 @@ impl PhasingPipeline {
                 None,
                 None,
             );
+            if let Some(bb) = &self.telemetry {
+                bb.set_markers_processed(rare_markers.len() as u64);
+                bb.set_samples_processed(n_samples as u64);
+            }
             
             // Sync again after Stage 2
             self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
@@ -1042,6 +1080,14 @@ impl PhasingPipeline {
         let n_burnin = self.config.burnin.min(3);
         let n_iterations = self.config.iterations.min(6);
         let total_iterations = n_burnin + n_iterations;
+        if let Some(bb) = &self.telemetry {
+            bb.set_total_samples(n_samples as u64);
+            bb.set_samples_processed(0);
+            bb.set_total_markers(n_markers as u64);
+            bb.set_markers_processed(0);
+            bb.set_total_iterations(total_iterations as u64);
+            bb.set_current_iteration(0);
+        }
 
         // Recombination probabilities - mutable so EM can update them
         let mut p_recomb: Vec<f32> = std::iter::once(0.0f32)
@@ -1060,6 +1106,17 @@ impl PhasingPipeline {
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+            if let Some(bb) = &self.telemetry {
+                let stage = if is_burnin {
+                    Stage::PhasingBurnin
+                } else {
+                    Stage::PhasingMain
+                };
+                bb.set_stage(stage);
+                bb.set_current_iteration((it + 1) as u64);
+                bb.set_samples_processed(0);
+                bb.set_markers_processed(0);
+            }
 
             let atomic_estimates = if is_burnin && self.config.em {
                 Some(crate::model::parameters::AtomicParamEstimates::new())
@@ -1080,6 +1137,10 @@ impl PhasingPipeline {
                 &confidence_by_sample,
                 None, // No PBWT state handoff for windowed phasing
             )?;
+            if let Some(bb) = &self.telemetry {
+                bb.set_samples_processed(n_samples as u64);
+                bb.set_markers_processed(n_markers as u64);
+            }
 
             // Update parameters from EM estimates and recompute recombination probabilities
             if let Some(ref atomic) = atomic_estimates {
@@ -1160,6 +1221,14 @@ impl PhasingPipeline {
                 "Stage 2: Phasing {} rare markers using HMM interpolation...",
                 rare_markers.len()
             );
+            if let Some(bb) = &self.telemetry {
+                bb.set_stage(Stage::PhasingStage2);
+                bb.set_total_iterations(0);
+                bb.set_current_iteration(0);
+                bb.set_total_markers(rare_markers.len() as u64);
+                bb.set_markers_processed(0);
+                bb.set_samples_processed(0);
+            }
             let probs = self.phase_rare_markers_with_hmm(
                 &mut geno,
                 &hi_freq_markers,
@@ -1173,6 +1242,10 @@ impl PhasingPipeline {
                 phased_overlap,
                 next_overlap_start,
             );
+            if let Some(bb) = &self.telemetry {
+                bb.set_markers_processed(rare_markers.len() as u64);
+                bb.set_samples_processed(n_samples as u64);
+            }
 
             // Sync again after Stage 2
             self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
@@ -4646,7 +4719,7 @@ mod tests {
             profile: false,
         };
 
-        let pipeline = PhasingPipeline::new(config);
+        let pipeline = PhasingPipeline::new(config, None);
         assert_eq!(pipeline.params.n_states, 280);
     }
     
@@ -4736,7 +4809,7 @@ mod tests {
             profile: false,
         };
 
-        let mut pipeline = PhasingPipeline::new(config);
+        let mut pipeline = PhasingPipeline::new(config, None);
 
         // Run phasing (with no overlap from previous window)
         let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None);

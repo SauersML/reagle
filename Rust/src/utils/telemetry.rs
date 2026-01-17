@@ -120,6 +120,51 @@ impl TelemetryBlackboard {
         self.touch_progress();
     }
 
+    pub fn set_current_window(&self, window: u64) {
+        self.current_window.store(window, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_total_windows(&self, total: u64) {
+        self.total_windows.store(total, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_current_iteration(&self, iter: u64) {
+        self.current_iteration.store(iter, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_total_iterations(&self, total: u64) {
+        self.total_iterations.store(total, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_samples_processed(&self, samples: u64) {
+        self.samples_processed.store(samples, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_total_samples(&self, total: u64) {
+        self.total_samples.store(total, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_markers_processed(&self, markers: u64) {
+        self.markers_processed.store(markers, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_total_markers(&self, total: u64) {
+        self.total_markers.store(total, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn add_samples(&self, delta: u64) {
+        self.samples_processed.fetch_add(delta, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
     pub fn set_op(&self, op: &str) {
         if let Ok(mut guard) = self.current_op.write() {
             guard.clear();

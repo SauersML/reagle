@@ -492,6 +492,18 @@ impl crate::pipelines::ImputationPipeline {
                 };
                 window_count += 1;
                 let n_markers = target_window.genotypes.n_markers();
+                if let Some(bb) = &pipeline.telemetry {
+                    bb.set_current_window(window_count as u64);
+                    if target_window.is_last() {
+                        bb.set_total_windows(window_count as u64);
+                    }
+                    bb.set_total_samples(target_window.genotypes.n_samples() as u64);
+                    bb.set_samples_processed(0);
+                    bb.set_total_markers(n_markers as u64);
+                    bb.set_markers_processed(0);
+                    bb.set_total_iterations(0);
+                    bb.set_current_iteration(0);
+                }
                 let window_start_pos = target_window.genotypes.marker(MarkerIdx::new(0)).pos;
                 let window_end_pos = target_window
                     .genotypes
@@ -543,6 +555,7 @@ impl crate::pipelines::ImputationPipeline {
                 let end_pos = window_end_pos;
                 
                 if let Some(bb) = &pipeline.telemetry {
+                    bb.set_stage(crate::utils::telemetry::Stage::LoadingData);
                     bb.set_op("Loading reference window");
                 }
                 let ref_window = if pipeline.config.profile {
@@ -622,6 +635,10 @@ impl crate::pipelines::ImputationPipeline {
                         pbwt_state.as_ref(),
                     )?
                 };
+                if let Some(bb) = &pipeline.telemetry {
+                    bb.set_samples_processed(target_window.genotypes.n_samples() as u64);
+                    bb.set_markers_processed(n_markers as u64);
+                }
 
                 // Extract state for next window BEFORE moving phased to channel
                 phased_overlap = Some(pipeline.extract_overlap_streaming(&phased, n_markers, target_window.output_end));
@@ -692,6 +709,11 @@ target_samples={} target_bytes={}",
         for payload in rx {
             if let Some(bb) = &self.telemetry {
                 bb.dec_channel_depth();
+                bb.set_stage(crate::utils::telemetry::Stage::Imputation);
+                bb.set_current_window(payload.window_idx as u64);
+                bb.set_total_samples(payload.phased_target.n_samples() as u64);
+                bb.set_samples_processed(0);
+                bb.set_markers_processed(0);
                 bb.set_op(&format!("Imputing window {}", payload.window_idx));
             }
             let StreamingPayload {
@@ -842,7 +864,10 @@ target_samples={} target_bytes={}",
         phased_overlap: Option<&PhasedOverlap>,
         pbwt_state: Option<&PbwtState>,
     ) -> Result<GenotypeMatrix<Phased>> {
-        let mut phasing = crate::pipelines::PhasingPipeline::new(self.config.clone());
+        let mut phasing = crate::pipelines::PhasingPipeline::new(
+            self.config.clone(),
+            self.telemetry.clone(),
+        );
         let ref_gt_arc = Arc::new(ref_gt.clone());
         phasing.set_reference(ref_gt_arc, alignment.clone());
         phasing.phase_window_with_pbwt_handoff(target_gt, gen_maps, phased_overlap, pbwt_state)
@@ -950,6 +975,12 @@ target_samples={} target_bytes={}",
 
         if markers_to_process.start >= markers_to_process.end {
             return Ok(None);
+        }
+        if let Some(bb) = &self.telemetry {
+            bb.set_total_markers(markers_to_process.len() as u64);
+            bb.set_markers_processed(0);
+            bb.set_total_samples(n_target_samples as u64);
+            bb.set_samples_processed(0);
         }
 
         let chrom = ref_win.marker(MarkerIdx::new(0)).chrom;
@@ -1357,7 +1388,10 @@ target_samples={} target_bytes={}",
                         hap_alt_probs,
                     }
                 }).collect();
-            
+            if let Some(bb) = &self.telemetry {
+                bb.add_samples(batch_results.len() as u64);
+            }
+
             all_results.extend(batch_results);
         }
         
@@ -1431,10 +1465,17 @@ target_samples={} target_bytes={}",
             }
         }
 
+        if let Some(bb) = &self.telemetry {
+            bb.set_stage(crate::utils::telemetry::Stage::WritingOutput);
+        }
         self.write_imputed_window_streaming(
             ref_win, target_win, alignment, final_writer, window_quality, output_start, output_end,
             markers_to_process.start, &all_results, self.config.gp, self.config.ap,
         )?;
+        if let Some(bb) = &self.telemetry {
+            bb.set_markers_processed(markers_to_process.len() as u64);
+            bb.set_stage(crate::utils::telemetry::Stage::Imputation);
+        }
         Ok(next_priors)
     }
     
