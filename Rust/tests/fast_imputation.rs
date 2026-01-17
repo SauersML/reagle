@@ -330,7 +330,7 @@ fn test_synthetic_slam_dunk() {
     config.overlap = 0.005;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_slam.vcf.gz");
@@ -393,7 +393,7 @@ fn test_synthetic_recombination() {
     config.overlap = 2.0;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_rec.vcf.gz");
@@ -462,7 +462,7 @@ fn test_simulated_chip_density() {
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_chip.vcf.gz");
@@ -528,7 +528,7 @@ fn test_population_structure() {
     config.window = 20.0;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_admix.vcf.gz");
@@ -602,7 +602,7 @@ fn test_hotspot_switching() {
     config.window = 100.0;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_hotspot.vcf.gz");
@@ -658,7 +658,7 @@ fn test_phase_switch_torture() {
     config.window = 10.0;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_phase_torture.vcf.gz");
@@ -725,7 +725,7 @@ fn test_error_injection() {
     config.window = 10.0;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_error.vcf.gz");
@@ -790,7 +790,7 @@ fn test_rare_variant() {
     config.window = 10.0;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_rare.vcf.gz");
@@ -877,7 +877,7 @@ fn test_dr2_validation() {
     config.window = 10.0;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_dr2.vcf.gz");
@@ -1023,7 +1023,7 @@ fn test_singleton_imputation() {
     config.imp_states = 50;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_singleton.vcf.gz");
@@ -1091,7 +1091,7 @@ fn test_high_recombination_stress() {
     config.imp_states = 30;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline should not crash with high recombination");
 
     let out_vcf = temp_dir.path().join("output_high_recomb.vcf.gz");
@@ -1157,7 +1157,7 @@ fn test_ultra_dense_markers() {
     config.imp_states = 20;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline should handle ultra-dense markers");
 
     let out_vcf = temp_dir.path().join("output_dense.vcf.gz");
@@ -1234,7 +1234,7 @@ fn test_diverse_reference_with_mismatch() {
     config.imp_states = 20;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline should handle diverse reference");
 
     let out_vcf = temp_dir.path().join("output_diverse.vcf.gz");
@@ -1333,7 +1333,7 @@ fn test_microarray_vs_wgs_imputation() {
     config.imp_states = 100;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_microarray.vcf.gz");
@@ -1463,7 +1463,7 @@ fn test_high_density_array_imputation() {
     config.imp_states = 40;
     config.nthreads = Some(1);
 
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run().expect("Pipeline run success");
 
     let out_vcf = temp_dir.path().join("output_highdens.vcf.gz");
