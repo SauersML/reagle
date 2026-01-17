@@ -70,12 +70,12 @@ impl MarkerImputationStats {
         }
 
         let sum = self.sum_p[allele];
-        if sum == 0.0 {
-            return 0.0;
+        let n = self.n_haps as f32;
+        if sum == 0.0 || (sum - n).abs() <= 1e-8 {
+            return 1.0;
         }
 
         let sum_sq = self.sum_p_sq[allele];
-        let n = self.n_haps as f32;
 
         // Java: float meanTerm = sum*sum/(nInputTargHaps);
         let mean_term = sum * sum / n;

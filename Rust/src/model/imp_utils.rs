@@ -67,35 +67,6 @@ pub fn compute_ref_cluster_bounds(
     (starts, ends)
 }
 
-pub fn compute_cluster_weights(
-    gen_positions: &[f64],
-    ref_cluster_start: &[usize],
-    ref_cluster_end: &[usize],
-) -> Vec<f32> {
-    let n_ref_markers = gen_positions.len();
-    let mut wts = vec![f32::NAN; n_ref_markers];
-    if ref_cluster_start.is_empty() {
-        return wts;
-    }
-
-    for c in 0..ref_cluster_start.len().saturating_sub(1) {
-        let end = ref_cluster_end[c];
-        let next_start = ref_cluster_start[c + 1];
-        if end == 0 || next_start <= end {
-            continue;
-        }
-        let next_start_pos = gen_positions[next_start];
-        let end_pos = gen_positions[end - 1];
-        let total_len = (next_start_pos - end_pos).max(1e-12);
-
-        for m in end..next_start {
-            let wt = (next_start_pos - gen_positions[m]) / total_len;
-            wts[m] = wt as f32;
-        }
-    }
-    wts
-}
-
 pub fn build_marker_cluster_index(
     ref_cluster_start: &[usize],
     n_ref_markers: usize,
@@ -678,7 +649,9 @@ pub fn compute_state_probs(
     cluster_p_recomb: &[f32],
     marker_cluster: Arc<Vec<usize>>,
     ref_cluster_end: Arc<Vec<usize>>,
-    cluster_weights: Arc<Vec<f32>>,
+    gen_positions: Arc<Vec<f64>>,
+    cluster_midpoints_pos: Arc<Vec<f64>>,
+    recomb_intensity: f32,
     prior_probs: Option<&[f32]>,
     trace: bool,
 ) -> Arc<ClusterStateProbs> {
@@ -729,7 +702,10 @@ pub fn compute_state_probs(
     Arc::new(ClusterStateProbs::from_sparse(
         marker_cluster,
         ref_cluster_end,
-        cluster_weights,
+        gen_positions,
+        cluster_midpoints_pos,
+        recomb_intensity,
+        n_states,
         offsets,
         sparse_haps,
         sparse_probs,
