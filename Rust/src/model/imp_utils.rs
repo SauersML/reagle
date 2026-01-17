@@ -266,6 +266,7 @@ pub fn compute_cluster_mismatches_into_workspace(
         }
         workspace.diff_row_offsets.push(workspace.diff_vals.len());
     }
+
 }
 
 pub fn run_hmm_forward_backward_to_sparse(

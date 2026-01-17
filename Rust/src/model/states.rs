@@ -94,6 +94,28 @@ impl ThreadedHaps {
         self.state_tails[state_idx] = new_seg_idx;
     }
 
+    /// Reset internal cursors to the start of each state.
+    pub fn reset_cursors(&mut self) {
+        self.state_cursors.copy_from_slice(&self.state_heads);
+    }
+
+    /// Get haplotype for a state at a given marker, advancing internal cursor.
+    /// Assumes markers are accessed sequentially.
+    pub fn hap_at_raw(&mut self, state_idx: usize, marker: usize) -> u32 {
+        let mut cur = self.state_cursors[state_idx] as usize;
+
+        while marker >= self.segments_end[cur] as usize {
+            let next = self.segments_next[cur];
+            if next == Self::NIL {
+                break;
+            }
+            cur = next as usize;
+        }
+
+        self.state_cursors[state_idx] = cur as u32;
+        self.segments_hap[cur]
+    }
+
     /// Materialize haplotypes for a single marker without mutating cursors.
     ///
     /// This method takes `&self` (immutable) since it walks the segment linked lists
