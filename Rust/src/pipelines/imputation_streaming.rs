@@ -360,6 +360,10 @@ impl crate::pipelines::ImputationPipeline {
         let target_samples = target_reader.samples_arc();
         let n_target_samples = target_samples.len();
         let n_target_haps = n_target_samples * 2;
+        if let Some(bb) = &self.telemetry {
+            bb.set_total_samples(n_target_samples as u64);
+            bb.set_samples_processed(0);
+        }
 
         // Load reference panel
         let ref_path = self.config.r#ref.as_ref().ok_or_else(|| {
@@ -1423,14 +1427,21 @@ target_samples={} target_bytes={}",
         }
 
         if let Some(bb) = &self.telemetry {
+            let output_markers = output_end.saturating_sub(output_start);
             bb.set_stage(crate::utils::telemetry::Stage::WritingOutput);
+            bb.set_total_markers(output_markers as u64);
+            bb.set_markers_processed(0);
+            bb.set_total_samples(target_win.n_samples() as u64);
+            bb.set_samples_processed(0);
         }
         self.write_imputed_window_streaming(
             ref_win, target_win, alignment, final_writer, window_quality, output_start, output_end,
             markers_to_process.start, &all_results, self.config.gp, self.config.ap,
         )?;
         if let Some(bb) = &self.telemetry {
-            bb.set_markers_processed(markers_to_process.len() as u64);
+            let output_markers = output_end.saturating_sub(output_start);
+            bb.set_markers_processed(output_markers as u64);
+            bb.set_samples_processed(target_win.n_samples() as u64);
             bb.set_stage(crate::utils::telemetry::Stage::Imputation);
         }
         Ok(next_priors)

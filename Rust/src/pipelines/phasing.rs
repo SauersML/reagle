@@ -528,6 +528,13 @@ impl PhasingPipeline {
         let n_samples = target_gt.n_samples();
         let n_haps = target_gt.n_haplotypes();
 
+        if let Some(bb) = &self.telemetry {
+            bb.set_total_samples(n_samples as u64);
+            bb.set_samples_processed(0);
+            bb.set_total_markers(n_markers as u64);
+            bb.set_markers_processed(0);
+        }
+
         eprintln!(
             "Loaded {} markers, {} samples ({} haplotypes), {:.2} MB",
             n_markers,
