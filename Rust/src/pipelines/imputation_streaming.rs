@@ -1614,7 +1614,11 @@ target_samples={} target_bytes={}",
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
                 if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    if p1 + p2 >= 1.5 {
+                    // If high confidence but mapping failed (e.g. private allele),
+                    // output missing/partial GT to avoid asserting wrong allele.
+                    if conf >= 0.99 && (raw_a1 != 255 && raw_a2 != 255) {
+                        (if a1 == 255 { 255 } else { a1 }, if a2 == 255 { 255 } else { a2 })
+                    } else if p1 + p2 >= 1.5 {
                         (1, 1)
                     } else if p1 + p2 >= 0.5 {
                         (0, 1)
