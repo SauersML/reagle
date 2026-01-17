@@ -203,9 +203,11 @@ pub fn compute_cluster_mismatches_into_workspace(
                         };
 
                         if final_ref == 255 {
-                            let penalty = log_diff;
-                            if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                row_buffer[j] = penalty;
+                            if ref_allele != 255 {
+                                let penalty = log_diff;
+                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
+                                    row_buffer[j] = penalty;
+                                }
                             }
                         } else if partner_allele != 255 {
                             let required = if partner_allele == geno1 {
