@@ -27,6 +27,7 @@ mod utils;
 use config::Config;
 use error::Result;
 use pipelines::{ImputationPipeline, PhasingPipeline};
+use utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
 
 fn main() {
     if let Err(e) = run() {
@@ -72,13 +73,22 @@ fn run() -> Result<()> {
     eprintln!("Reagle v0.1.0");
     eprintln!("Threads: {}", n_threads);
 
+    // Initialize telemetry blackboard and heartbeat thread
+    let telemetry = TelemetryBlackboard::new();
+    let heartbeat = HeartbeatHandle::spawn(
+        telemetry.clone(),
+        HeartbeatConfig::default(),
+    );
+
+    telemetry.set_stage(Stage::LoadingData);
+
     // Run appropriate pipeline
     if config.is_imputation_mode() {
         eprintln!("Mode: Imputation");
         eprintln!("Target: {:?}", config.gt);
         eprintln!("Reference: {:?}", config.r#ref.as_ref().unwrap());
 
-        let mut pipeline = ImputationPipeline::new(config);
+        let mut pipeline = ImputationPipeline::new(config, Some(telemetry.clone()));
         pipeline.run()?;
     } else {
         eprintln!("Mode: Phasing");
@@ -88,8 +98,12 @@ fn run() -> Result<()> {
         pipeline.run_auto()?;
     }
 
+    // Signal completion and shutdown heartbeat
+    telemetry.set_stage(Stage::Complete);
+    heartbeat.shutdown();
+
     let elapsed = start.elapsed();
-    eprintln!("Completed in {:.2}s", elapsed.as_secs_f64());
+    eprintln!("\nCompleted in {:.2}s", elapsed.as_secs_f64());
 
     Ok(())
 }

@@ -1789,7 +1789,7 @@ fn run_rust_imputation(
         "--seed", &seed.to_string(),
         "--gp",
     ]);
-    let mut pipeline = ImputationPipeline::new(config);
+    let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
 

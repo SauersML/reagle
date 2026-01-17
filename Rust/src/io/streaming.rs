@@ -248,6 +248,7 @@ struct BufferedMarker {
     marker: Marker,
     column: GenotypeColumn,
     gen_pos: f64,
+    confidences: Option<Vec<u8>>,
 }
 
 /// Streaming VCF reader that yields windows
@@ -276,6 +277,10 @@ pub struct StreamingVcfReader {
     line_buf: String,
     /// Whether all genotypes seen so far were phased
     all_phased: bool,
+    /// Per-sample ploidy (true=diploid, false=haploid)
+    sample_ploidy: Option<Vec<bool>>,
+    /// Whether any confidence scores were seen
+    has_any_confidence: bool,
 }
 
 impl StreamingVcfReader {
@@ -411,6 +416,8 @@ impl StreamingVcfReader {
             eof: false,
             line_buf: String::new(),
             all_phased: true,
+            sample_ploidy: None,
+            has_any_confidence: false,
         };
 
         if let Err(e) = reader.prefetch_first_marker() {
@@ -466,20 +473,15 @@ impl StreamingVcfReader {
         // Determine window boundaries
         let window_start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
         let target_end_gen = window_start_gen + self.config.window_cm as f64;
+        let full_window_gen = target_end_gen + self.config.overlap_cm as f64;
 
-        // Find end of window
-        let mut window_end = 0;
-        for (i, m) in self.buffer.iter().enumerate() {
-            if m.gen_pos >= target_end_gen || i >= self.config.max_markers {
-                break;
-            }
-            window_end = i + 1;
-        }
-
-        // If we haven't found the end and we're not at EOF, need more data
-        if window_end == 0 {
-            window_end = self.buffer.len();
-        }
+        // Find end of full window (output + overlap)
+        let window_end = self
+            .buffer
+            .iter()
+            .position(|m| m.gen_pos >= full_window_gen)
+            .unwrap_or(self.buffer.len())
+            .min(self.config.max_markers);
 
         let is_last = self.eof && window_end >= self.buffer.len();
 
@@ -488,22 +490,18 @@ impl StreamingVcfReader {
         let output_end = if is_last {
             window_end
         } else {
-            // Find overlap point
-            let overlap_gen = self
-                .buffer
-                .get(window_end.saturating_sub(1))
-                .map(|m| m.gen_pos - self.config.overlap_cm as f64)
-                .unwrap_or(0.0);
-
-            // Find splice index: keep markers > overlap_gen
-            // Markers <= overlap_gen are discarded (overlap buffer for next window)
-            // We want the index of the first marker that is > overlap_gen
-            self.find_overlap_splice_index(window_end, overlap_gen)
+            // Splice at the first marker past the main window
+            self.buffer
+                .iter()
+                .take(window_end)
+                .position(|m| m.gen_pos >= target_end_gen)
+                .unwrap_or(window_end)
         };
 
         // Build GenotypeMatrix for this window
         let mut markers = Markers::new();
         let mut columns = Vec::with_capacity(window_end);
+        let mut confidences: Vec<Vec<u8>> = Vec::new();
 
         for i in 0..window_end {
             let bm = &self.buffer[i];
@@ -516,9 +514,25 @@ impl StreamingVcfReader {
             marker.chrom = window_chrom_idx;
             markers.push(marker);
             columns.push(bm.column.clone());
+            if self.has_any_confidence {
+                if let Some(conf) = &bm.confidences {
+                    confidences.push(conf.clone());
+                } else {
+                    confidences.push(vec![255; self.samples.len()]);
+                }
+            }
         }
 
-        let genotypes = GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples));
+        if let Some(ref ploidy) = self.sample_ploidy {
+            let sample_ids: Vec<String> = self.samples.ids().iter().map(|s| s.to_string()).collect();
+            self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
+        }
+
+        let genotypes = if self.has_any_confidence {
+            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), confidences)
+        } else {
+            GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
+        };
 
         let window = StreamWindow {
             genotypes,
@@ -590,29 +604,6 @@ impl StreamingVcfReader {
         }
     }
 
-    /// Find the splice index for overlap using binary search
-    /// Returns the index such that markers[..index] are <= overlap_gen
-    /// and markers[index..] are > overlap_gen.
-    fn find_overlap_splice_index(&self, window_end: usize, overlap_gen: f64) -> usize {
-        if let Some(front) = self.buffer.front() {
-            if front.gen_pos > overlap_gen {
-                return window_end;
-            }
-        }
-        let mut low = 0;
-        let mut high = window_end;
-
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if self.buffer[mid].gen_pos <= overlap_gen {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        low
-    }
-
     /// Parse a single VCF line
     fn parse_vcf_line(&mut self, line: &str) -> Result<BufferedMarker> {
         let fields: Vec<&str> = line.split('\t').collect();
@@ -657,12 +648,18 @@ impl StreamingVcfReader {
             .split(':')
             .position(|f| f == "GT")
             .ok_or_else(|| ReagleError::parse(self.global_marker_idx, "No GT field in FORMAT"))?;
+        let gl_idx = format.split(':').position(|f| f == "GL");
 
         // Parse genotypes
         let n_samples = self.samples.len();
         let mut alleles = Vec::with_capacity(n_samples * 2);
+        let mut confidences: Option<Vec<u8>> = gl_idx.map(|_| Vec::with_capacity(n_samples));
 
-        for sample_field in fields[9..].iter().take(n_samples) {
+        if self.sample_ploidy.is_none() {
+            self.sample_ploidy = Some(vec![true; n_samples]);
+        }
+
+        for (sample_idx, sample_field) in fields[9..].iter().enumerate().take(n_samples) {
             let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
 
             if gt_field.contains('/') {
@@ -670,8 +667,30 @@ impl StreamingVcfReader {
             }
 
             let (a1, a2) = parse_gt(gt_field);
+
+            if a1 == a2 && !gt_field.contains('|') && !gt_field.contains('/') {
+                if let Some(ref mut ploidy) = self.sample_ploidy {
+                    ploidy[sample_idx] = false;
+                }
+            }
+
             alleles.push(a1);
             alleles.push(a2);
+
+            if let Some(gl_i) = gl_idx {
+                if let Some(conf_vec) = confidences.as_mut() {
+                    let confidence = sample_field
+                        .split(':')
+                        .nth(gl_i)
+                        .and_then(|gl_str| crate::io::vcf::compute_gl_confidence(gl_str, a1, a2))
+                        .unwrap_or(255);
+                    conf_vec.push(confidence);
+                }
+            }
+        }
+
+        if confidences.is_some() {
+            self.has_any_confidence = true;
         }
 
         let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles.clone());
@@ -685,6 +704,7 @@ impl StreamingVcfReader {
             marker,
             column,
             gen_pos,
+            confidences,
         })
     }
 }

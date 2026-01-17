@@ -732,7 +732,7 @@ impl WindowedBref3Reader {
         let mut all_columns: Vec<GenotypeColumn> = Vec::new();
         let mut in_range_indices: Vec<usize> = Vec::new();
         let is_first = self.window_num == 0;
-        let is_last = self.inner.is_eof();
+        let is_last = self.inner.is_eof() && self.pending_block.is_none();
 
         for block in &self.block_buffer {
             // Verify block matches current request (should be guaranteed by loading logic)

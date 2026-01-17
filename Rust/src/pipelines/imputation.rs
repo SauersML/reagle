@@ -11,16 +11,19 @@
 //!
 //! This matches Java `imp/ImpLS.java`, `imp/ImpLSBaum.java`, and related classes.
 
+use std::sync::Arc;
 use tracing::instrument;
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::model::parameters::ModelParams;
+use crate::utils::telemetry::TelemetryBlackboard;
 
 /// Imputation pipeline
 pub struct ImputationPipeline {
     pub(crate) config: Config,
     pub(crate) params: ModelParams,
+    pub(crate) telemetry: Option<Arc<TelemetryBlackboard>>,
 }
 
 /// Per-haplotype allele posterior probabilities.
@@ -167,44 +170,67 @@ impl ClusterStateProbs {
         if n_alleles == 2 {
             let mut p_alt = 0.0f32;
             let mut p_ref = 0.0f32;
-            for (j, &hap) in haps.iter().enumerate() {
-                let prob = probs[j];
-                let prob_p1 = probs_p1[j];
-
-                // Interpolate state probability, anchor to LEFT haplotype's allele
-                // (matches Java: both prob and prob_p1 contribute to current haplotype's allele)
-                let interp_prob = if in_cluster {
-                    prob
-                } else {
-                    weight * prob + (1.0 - weight) * prob_p1
-                };
-
-                let allele = get_ref_allele(ref_marker, hap);
-                if allele == 1 {
-                    p_alt += interp_prob;
-                } else if allele == 0 {
-                    p_ref += interp_prob;
+            if in_cluster {
+                for (j, &hap) in haps.iter().enumerate() {
+                    let interp_prob = probs[j];
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele == 1 {
+                        p_alt += interp_prob;
+                    } else if allele == 0 {
+                        p_ref += interp_prob;
+                    }
                 }
+            } else {
+                for (j, &hap) in haps.iter().enumerate() {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele == 1 {
+                        p_alt += probs[j];
+                    } else if allele == 0 {
+                        p_ref += probs[j];
+                    }
+                }
+                let mut p_alt_p1 = 0.0f32;
+                let mut p_ref_p1 = 0.0f32;
+                for (j, &hap) in haps.iter().enumerate() {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele == 1 {
+                        p_alt_p1 += probs_p1[j];
+                    } else if allele == 0 {
+                        p_ref_p1 += probs_p1[j];
+                    }
+                }
+                p_alt = weight * p_alt + (1.0 - weight) * p_alt_p1;
+                p_ref = weight * p_ref + (1.0 - weight) * p_ref_p1;
             }
             let total = p_ref + p_alt;
             let p_alt = if total > 1e-10 { p_alt / total } else { 0.0 };
             AllelePosteriors::Biallelic(p_alt)
         } else {
             let mut al_probs = vec![0.0f32; n_alleles];
-            for (j, &hap) in haps.iter().enumerate() {
-                let prob = probs[j];
-                let prob_p1 = probs_p1[j];
-
-                // Interpolate state probability, anchor to LEFT haplotype's allele
-                let interp_prob = if in_cluster {
-                    prob
-                } else {
-                    weight * prob + (1.0 - weight) * prob_p1
-                };
-
-                let allele = get_ref_allele(ref_marker, hap);
-                if allele != 255 && (allele as usize) < n_alleles {
-                    al_probs[allele as usize] += interp_prob;
+            if in_cluster {
+                for (j, &hap) in haps.iter().enumerate() {
+                    let interp_prob = probs[j];
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs[allele as usize] += interp_prob;
+                    }
+                }
+            } else {
+                for (j, &hap) in haps.iter().enumerate() {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs[allele as usize] += probs[j];
+                    }
+                }
+                let mut al_probs_p1 = vec![0.0f32; n_alleles];
+                for (j, &hap) in haps.iter().enumerate() {
+                    let allele = get_ref_allele(ref_marker, hap);
+                    if allele != 255 && (allele as usize) < n_alleles {
+                        al_probs_p1[allele as usize] += probs_p1[j];
+                    }
+                }
+                for i in 0..n_alleles {
+                    al_probs[i] = weight * al_probs[i] + (1.0 - weight) * al_probs_p1[i];
                 }
             }
             let total: f32 = al_probs.iter().sum();
@@ -220,9 +246,9 @@ impl ClusterStateProbs {
 
 impl ImputationPipeline {
     /// Create a new imputation pipeline
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, telemetry: Option<Arc<TelemetryBlackboard>>) -> Self {
         let params = ModelParams::new();
-        Self { config, params }
+        Self { config, params, telemetry }
     }
 
     /// Run the imputation pipeline

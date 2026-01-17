@@ -416,12 +416,14 @@ impl crate::pipelines::ImputationPipeline {
         let producer_config = self.config.clone();
         let producer_params = self.params.clone();
         let producer_maps = gen_maps.clone();
+        let producer_telemetry = self.telemetry.clone();
 
         // Spawn Producer (Phasing)
         let producer_handle = thread::spawn(move || -> Result<()> {
             let pipeline = crate::pipelines::ImputationPipeline {
                 config: producer_config,
                 params: producer_params,
+                telemetry: producer_telemetry,
             };
 
             // Re-open readers in thread
@@ -1326,10 +1328,45 @@ target_samples={} target_bytes={}",
             if let Some((ref p1, ref p2)) = result.hap_alt_probs {
                 for (local_m, (&p1_alt, &p2_alt)) in p1.iter().zip(p2.iter()).enumerate() {
                     let ref_m = markers_to_process.start + local_m;
-                    if ref_m < n_ref_markers && ref_is_biallelic[ref_m] {
-                        if let Some(stats) = window_quality.get_mut(ref_m) {
-                            stats.add_sample_biallelic(p1_alt, p2_alt);
+                    if ref_m >= n_ref_markers || !ref_is_biallelic[ref_m] {
+                        continue;
+                    }
+                    if let Some(stats) = window_quality.get_mut(ref_m) {
+                        let mut v1 = p1_alt;
+                        let mut v2 = p2_alt;
+                        if !stats.is_imputed {
+                            if let Some(target_m) = alignment.target_marker(ref_m) {
+                                let h1 = HapIdx::new((result.sample_idx * 2) as u32);
+                                let h2 = HapIdx::new((result.sample_idx * 2 + 1) as u32);
+                                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                                // Map target alleles to reference allele space
+                                let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
+                                let map_allele = |a: u8| -> u8 {
+                                    if a == 255 {
+                                        return 255;
+                                    }
+                                    if let Some(m) = mapping {
+                                        if (a as usize) < m.targ_to_ref.len() {
+                                            let r = m.targ_to_ref[a as usize];
+                                            if r >= 0 { r as u8 } else { 255 }
+                                        } else {
+                                            255
+                                        }
+                                    } else {
+                                        a
+                                    }
+                                };
+                                let a1 = map_allele(raw_a1);
+                                let a2 = map_allele(raw_a2);
+                                if a1 < 2 && a2 < 2 {
+                                    v1 = a1 as f32;
+                                    v2 = a2 as f32;
+                                }
+                            }
                         }
+                        stats.add_sample_biallelic(v1, v2);
                     }
                 }
             }
@@ -1528,6 +1565,10 @@ target_samples={} target_bytes={}",
                 };
                 let a1 = map_allele(raw_a1);
                 let a2 = map_allele(raw_a2);
+
+                if a1 < 2 && a2 < 2 {
+                    return (a1 as f32) + (a2 as f32);
+                }
 
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
