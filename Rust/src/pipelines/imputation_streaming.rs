@@ -427,6 +427,9 @@ impl crate::pipelines::ImputationPipeline {
         // Channel for streaming data
         // Keep the buffer small to avoid holding multiple large windows in memory.
         let (tx, rx) = mpsc::sync_channel::<StreamingPayload>(2);
+        if let Some(bb) = &self.telemetry {
+            bb.set_channel_capacity(2);
+        }
 
         // Clone config/params for producer
         let producer_config = self.config.clone();
@@ -539,6 +542,9 @@ impl crate::pipelines::ImputationPipeline {
                 let start_pos = window_start_pos;
                 let end_pos = window_end_pos;
                 
+                if let Some(bb) = &pipeline.telemetry {
+                    bb.set_op("Loading reference window");
+                }
                 let ref_window = if pipeline.config.profile {
                     let span_guard = info_span!("io_load_ref").entered();
                     let _ = &span_guard;
@@ -595,6 +601,9 @@ impl crate::pipelines::ImputationPipeline {
                     ),
                 };
 
+                if let Some(bb) = &pipeline.telemetry {
+                    bb.set_op(&format!("Phasing window {}", window_count));
+                }
                 let phased = if target_reader.was_all_phased() {
                     target_window.genotypes.clone().into_phased()
                 } else {
@@ -619,6 +628,9 @@ impl crate::pipelines::ImputationPipeline {
                 pbwt_state = Some(pipeline.extractpbwt_state_streaming(&phased, n_markers));
 
                 // Send to consumer
+                if let Some(bb) = &pipeline.telemetry {
+                    bb.set_op("Producer waiting on channel");
+                }
                 let send_result = if pipeline.config.profile {
                     let span_guard = info_span!("channel_send_wait").entered();
                     let _ = &span_guard;
@@ -646,7 +658,12 @@ impl crate::pipelines::ImputationPipeline {
                         ref_output_end,
                     })
                 };
-                if let Err(_) = send_result {
+                if let Ok(()) = send_result {
+                    if let Some(bb) = &pipeline.telemetry {
+                        bb.inc_channel_depth();
+                        bb.set_op("Producer processing");
+                    }
+                } else {
                     break; // Consumer hung up
                 }
             }
@@ -673,6 +690,10 @@ target_samples={} target_bytes={}",
         let mut header_written = false;
 
         for payload in rx {
+            if let Some(bb) = &self.telemetry {
+                bb.dec_channel_depth();
+                bb.set_op(&format!("Imputing window {}", payload.window_idx));
+            }
             let StreamingPayload {
                 phased_target,
                 ref_window,

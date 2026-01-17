@@ -9,7 +9,7 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -81,6 +81,13 @@ pub struct TelemetryBlackboard {
 
     // --- Control ---
     shutdown: AtomicBool,
+
+    // --- Context ---
+    current_op: RwLock<String>,
+
+    // --- Channel Telemetry ---
+    channel_depth: AtomicU64,
+    channel_capacity: AtomicU64,
 }
 
 impl TelemetryBlackboard {
@@ -99,6 +106,9 @@ impl TelemetryBlackboard {
             start_time: Instant::now(),
             last_progress_nanos: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            current_op: RwLock::new(String::new()),
+            channel_depth: AtomicU64::new(0),
+            channel_capacity: AtomicU64::new(0),
         })
     }
 
@@ -107,6 +117,30 @@ impl TelemetryBlackboard {
     #[inline]
     pub fn set_stage(&self, stage: Stage) {
         self.stage.store(stage as u64, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_op(&self, op: &str) {
+        if let Ok(mut guard) = self.current_op.write() {
+            guard.clear();
+            guard.push_str(op);
+        }
+        self.touch_progress();
+    }
+
+    pub fn set_channel_capacity(&self, capacity: u64) {
+        self.channel_capacity.store(capacity, Ordering::Relaxed);
+    }
+
+    pub fn inc_channel_depth(&self) {
+        self.channel_depth.fetch_add(1, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn dec_channel_depth(&self) {
+        self.channel_depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+            Some(val.saturating_sub(1))
+        }).ok();
         self.touch_progress();
     }
 
@@ -143,6 +177,9 @@ impl TelemetryBlackboard {
             elapsed_secs: self.elapsed_secs(),
             last_progress_nanos: self.last_progress_nanos.load(Ordering::Relaxed),
             current_nanos: self.start_time.elapsed().as_nanos() as u64,
+            current_op: self.current_op.read().map(|s| s.clone()).unwrap_or_default(),
+            channel_depth: self.channel_depth.load(Ordering::Relaxed),
+            channel_capacity: self.channel_capacity.load(Ordering::Relaxed),
         }
     }
 
@@ -171,6 +208,9 @@ impl Default for TelemetryBlackboard {
             start_time: Instant::now(),
             last_progress_nanos: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            current_op: RwLock::new(String::new()),
+            channel_depth: AtomicU64::new(0),
+            channel_capacity: AtomicU64::new(0),
         }
     }
 }
@@ -189,6 +229,9 @@ struct TelemetrySnapshot {
     elapsed_secs: f64,
     last_progress_nanos: u64,
     current_nanos: u64,
+    current_op: String,
+    channel_depth: u64,
+    channel_capacity: u64,
 }
 
 /// Heartbeat output configuration
@@ -268,6 +311,52 @@ fn get_rss_mb() -> Option<u64> {
     }
 }
 
+/// Get VmSize and VmSwap in MB (Linux only)
+fn get_vm_usage_mb() -> (Option<u64>, Option<u64>) {
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/self/status").ok();
+        if content.is_none() {
+            return (None, None);
+        }
+        let content = content.unwrap();
+        let mut vsz_kb = None;
+        let mut swap_kb = None;
+
+        for line in content.lines() {
+            if line.starts_with("VmSize:") {
+                vsz_kb = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+            } else if line.starts_with("VmSwap:") {
+                swap_kb = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+            }
+        }
+
+        let vsz_mb = vsz_kb.map(|kb| kb / 1024);
+        let swap_mb = swap_kb.map(|kb| kb / 1024);
+        (vsz_mb, swap_mb)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (None, None)
+    }
+}
+
+/// Get process CPU time (user+system) in clock ticks (Linux only)
+fn get_cpu_ticks() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        let utime = parts.get(13)?.parse::<u64>().ok()?;
+        let stime = parts.get(14)?.parse::<u64>().ok()?;
+        Some(utime + stime)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// Format duration in human-readable form
 fn format_duration(secs: f64) -> String {
     if secs < 60.0 {
@@ -286,6 +375,12 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
     let interval = Duration::from_secs(config.interval_secs);
     let mut last_markers = 0u64;
     let mut last_time = Instant::now();
+    #[cfg(target_os = "linux")]
+    let mut last_cpu_ticks = get_cpu_ticks();
+    #[cfg(not(target_os = "linux"))]
+    let mut last_cpu_ticks: Option<u64> = None;
+    #[cfg(not(target_os = "linux"))]
+    let _ = &last_cpu_ticks;
 
     loop {
         thread::sleep(interval);
@@ -307,6 +402,25 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
         last_markers = snap.markers_processed;
         last_time = now;
 
+        let cpu_pct = {
+            #[cfg(target_os = "linux")]
+            {
+                if let (Some(prev), Some(cur)) = (last_cpu_ticks, get_cpu_ticks()) {
+                    const CLK_TCK_HZ: f64 = 100.0;
+                    let delta_ticks = cur.saturating_sub(prev) as f64;
+                    let cpu_secs = delta_ticks / CLK_TCK_HZ;
+                    last_cpu_ticks = Some(cur);
+                    Some((cpu_secs / dt) * 100.0)
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        };
+
         // ETA calculation based on markers
         let eta_str = if markers_velocity > 0.0 && snap.total_markers > snap.markers_processed {
             let remaining = snap.total_markers - snap.markers_processed;
@@ -322,11 +436,30 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
         let is_stalled = stall_secs > config.stall_threshold_secs;
 
         let rss_mb = get_rss_mb();
+        let (vsz_mb, swap_mb) = get_vm_usage_mb();
 
         if is_tty {
-            print_tty_progress(&snap, &eta_str, rss_mb, markers_velocity, is_stalled);
+            print_tty_progress(
+                &snap,
+                &eta_str,
+                rss_mb,
+                vsz_mb,
+                swap_mb,
+                cpu_pct,
+                markers_velocity,
+                is_stalled,
+            );
         } else {
-            print_log_progress(&snap, &eta_str, rss_mb, markers_velocity, is_stalled);
+            print_log_progress(
+                &snap,
+                &eta_str,
+                rss_mb,
+                vsz_mb,
+                swap_mb,
+                cpu_pct,
+                markers_velocity,
+                is_stalled,
+            );
         }
     }
 
@@ -342,6 +475,9 @@ fn print_tty_progress(
     snap: &TelemetrySnapshot,
     eta: &str,
     rss_mb: Option<u64>,
+    vsz_mb: Option<u64>,
+    swap_mb: Option<u64>,
+    cpu_pct: Option<f64>,
     velocity: f64,
     is_stalled: bool,
 ) {
@@ -382,9 +518,22 @@ fn print_tty_progress(
     let bar: String = "=".repeat(filled.min(bar_width))
         + &" ".repeat(bar_width.saturating_sub(filled));
 
-    let mem_str = rss_mb
-        .map(|mb| format!(" {}MB", mb))
-        .unwrap_or_default();
+    let mem_str = match (rss_mb, vsz_mb, swap_mb) {
+        (Some(rss), Some(vsz), Some(swap)) => format!(" {}MB VSZ {}MB SWAP {}MB", rss, vsz, swap),
+        (Some(rss), _, _) => format!(" {}MB", rss),
+        _ => String::new(),
+    };
+    let cpu_str = cpu_pct.map(|c| format!(" CPU {:.0}%", c)).unwrap_or_default();
+    let op_str = if snap.current_op.is_empty() {
+        String::new()
+    } else {
+        format!(" OP {}", snap.current_op)
+    };
+    let channel_str = if snap.channel_capacity > 0 {
+        format!(" CH {}/{}", snap.channel_depth, snap.channel_capacity)
+    } else {
+        String::new()
+    };
     let stall_str = if is_stalled { " [STALLED]" } else { "" };
 
     // Combine context strings
@@ -395,7 +544,7 @@ fn print_tty_progress(
     let context = context_parts.join(" ");
 
     eprint!(
-        "\r[{}] {:>5.1}% | {} {} | {:.0} mk/s | {} | ETA: {}{}{}    \x1b[K",
+        "\r[{}] {:>5.1}% | {} {} | {:.0} mk/s | {} | ETA: {}{}{}{}{}{}    \x1b[K",
         bar,
         progress_pct,
         snap.stage.as_str(),
@@ -404,6 +553,9 @@ fn print_tty_progress(
         format_duration(snap.elapsed_secs),
         eta,
         mem_str,
+        cpu_str,
+        op_str,
+        channel_str,
         stall_str
     );
     let _ = io::stderr().flush();
@@ -414,12 +566,16 @@ fn print_log_progress(
     snap: &TelemetrySnapshot,
     eta: &str,
     rss_mb: Option<u64>,
+    vsz_mb: Option<u64>,
+    swap_mb: Option<u64>,
+    cpu_pct: Option<f64>,
     velocity: f64,
     is_stalled: bool,
 ) {
     eprintln!(
         "[HEARTBEAT] stage=\"{}\" window={}/{} iter={}/{} samples={}/{} markers={}/{} \
-         velocity={:.0}/s elapsed={:.0}s eta={} rss_mb={} stalled={}",
+         velocity={:.0}/s elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} cpu_pct={} \
+         op=\"{}\" channel={}/{} stalled={}",
         snap.stage.as_str(),
         snap.current_window,
         snap.total_windows,
@@ -435,6 +591,18 @@ fn print_log_progress(
         rss_mb
             .map(|m| m.to_string())
             .unwrap_or_else(|| "?".to_string()),
+        vsz_mb
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        swap_mb
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        cpu_pct
+            .map(|c| format!("{:.0}", c))
+            .unwrap_or_else(|| "?".to_string()),
+        snap.current_op,
+        snap.channel_depth,
+        snap.channel_capacity,
         is_stalled
     );
 }
