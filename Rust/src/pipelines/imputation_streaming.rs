@@ -1142,7 +1142,17 @@ target_samples={} target_bytes={}",
                                         .sample_confidence_f32(MarkerIdx::new(target_m as u32), s)
                                         .clamp(0.0, 1.0);
                                     if conf >= 0.999 {
-                                        let allele = obs_hap1[target_m];
+                                        let mut allele = obs_hap1[target_m];
+                                        // Map target allele to reference allele space (e.g. handle Ref/Alt swaps)
+                                        if let Some(Some(mapping)) = alignment.allele_mappings.get(target_m) {
+                                            if (allele as usize) < mapping.targ_to_ref.len() {
+                                                let mapped = mapping.targ_to_ref[allele as usize];
+                                                if mapped >= 0 {
+                                                    allele = mapped as u8;
+                                                }
+                                            }
+                                        }
+
                                         if allele <= 1 {
                                             hap_dosages.push(allele as f32);
                                             hap_best_gt.push((allele, 0));
@@ -1235,7 +1245,17 @@ target_samples={} target_bytes={}",
                                         .sample_confidence_f32(MarkerIdx::new(target_m as u32), s)
                                         .clamp(0.0, 1.0);
                                     if conf >= 0.999 {
-                                        let allele = obs_hap2[target_m];
+                                        let mut allele = obs_hap2[target_m];
+                                        // Map target allele to reference allele space (e.g. handle Ref/Alt swaps)
+                                        if let Some(Some(mapping)) = alignment.allele_mappings.get(target_m) {
+                                            if (allele as usize) < mapping.targ_to_ref.len() {
+                                                let mapped = mapping.targ_to_ref[allele as usize];
+                                                if mapped >= 0 {
+                                                    allele = mapped as u8;
+                                                }
+                                            }
+                                        }
+
                                         if allele <= 1 {
                                             hap_dosages.push(allele as f32);
                                             hap_best_gt.push((allele, 0));
@@ -1506,7 +1526,21 @@ target_samples={} target_bytes={}",
                     p1 + p2
                 } else {
                     if conf >= 0.999 {
-                        return (a1 + a2) as f32;
+                        let mut ma1 = a1;
+                        let mut ma2 = a2;
+                        if let Some(Some(mapping)) = alignment.allele_mappings.get(target_m) {
+                            if (a1 as usize) < mapping.targ_to_ref.len() {
+                                let m = mapping.targ_to_ref[a1 as usize];
+                                if m >= 0 { ma1 = m as u8; }
+                            }
+                            if (a2 as usize) < mapping.targ_to_ref.len() {
+                                let m = mapping.targ_to_ref[a2 as usize];
+                                if m >= 0 { ma2 = m as u8; }
+                            }
+                        }
+                        if ma1 <= 1 && ma2 <= 1 {
+                            return (ma1 + ma2) as f32;
+                        }
                     }
                     let is_het = a1 != a2;
                     let (l00, l01, l11) = if is_het {
@@ -1567,7 +1601,21 @@ target_samples={} target_bytes={}",
                     }
                 } else {
                     if conf >= 0.999 {
-                        return (a1, a2);
+                        let mut ma1 = a1;
+                        let mut ma2 = a2;
+                        if let Some(Some(mapping)) = alignment.allele_mappings.get(target_m) {
+                            if (a1 as usize) < mapping.targ_to_ref.len() {
+                                let m = mapping.targ_to_ref[a1 as usize];
+                                if m >= 0 { ma1 = m as u8; }
+                            }
+                            if (a2 as usize) < mapping.targ_to_ref.len() {
+                                let m = mapping.targ_to_ref[a2 as usize];
+                                if m >= 0 { ma2 = m as u8; }
+                            }
+                        }
+                        if ma1 <= 1 && ma2 <= 1 {
+                            return (ma1, ma2);
+                        }
                     }
                     let is_het = a1 != a2;
                     let (l00, l01, l11) = if is_het {
