@@ -437,6 +437,7 @@ impl StreamingBref3Reader {
 
         let n_recs = n_recs as usize;
         let chrom_name = read_utf8_string(&mut self.reader)?;
+        println!("DEBUG: StreamingBref3Reader read chrom: '{}'", chrom_name);
         let chrom_idx = self.get_or_add_chrom(&chrom_name);
 
         let n_seq = read_be_u16(&mut self.reader)? as usize;
@@ -695,8 +696,10 @@ impl WindowedBref3Reader {
             };
 
             let is_match = candidates.iter().any(|c| c == &next_block.chrom);
+            println!("DEBUG: WindowedBref3Reader check block chrom='{}' against candidates={:?}, match={}", next_block.chrom, candidates, is_match);
             if !is_match {
                 if self.block_buffer.is_empty() {
+                    println!("DEBUG: Skipping block from chrom '{}' (buffer empty)", next_block.chrom);
                     continue; // Skip blocks from other chromosomes until we find a match
                 }
                 self.pending_block = Some(next_block);
