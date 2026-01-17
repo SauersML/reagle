@@ -1129,8 +1129,32 @@ target_samples={} target_bytes={}",
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
-                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                let mut p_val = p.prob(1);
+
+                                // Override with hard call if present
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let raw_a = target_win.allele(MarkerIdx::new(target_m as u32), hap1_idx);
+                                    if raw_a != 255 {
+                                        let conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s).clamp(0.0, 1.0);
+                                        // Map allele
+                                        let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
+                                        let mapped_a = if let Some(m) = mapping {
+                                            if (raw_a as usize) < m.targ_to_ref.len() {
+                                                let r = m.targ_to_ref[raw_a as usize];
+                                                if r >= 0 { r as u8 } else { 255 }
+                                            } else { 255 }
+                                        } else { raw_a };
+
+                                        if mapped_a == 1 {
+                                            p_val = p_val * (1.0 - conf) + conf;
+                                        } else if mapped_a == 0 {
+                                            p_val = p_val * (1.0 - conf);
+                                        }
+                                    }
+                                }
+
+                                hap_dosages.push(p_val);
+                                hap_best_gt.push(if p_val >= 0.5 { (1, 0) } else { (0, 0) });
                             }
 
                             let mut locked = obs_hap1.clone();
@@ -1204,8 +1228,32 @@ target_samples={} target_bytes={}",
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
-                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                let mut p_val = p.prob(1);
+
+                                // Override with hard call if present
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let raw_a = target_win.allele(MarkerIdx::new(target_m as u32), hap2_idx);
+                                    if raw_a != 255 {
+                                        let conf = target_win.sample_confidence_f32(MarkerIdx::new(target_m as u32), s).clamp(0.0, 1.0);
+                                        // Map allele
+                                        let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
+                                        let mapped_a = if let Some(m) = mapping {
+                                            if (raw_a as usize) < m.targ_to_ref.len() {
+                                                let r = m.targ_to_ref[raw_a as usize];
+                                                if r >= 0 { r as u8 } else { 255 }
+                                            } else { 255 }
+                                        } else { raw_a };
+
+                                        if mapped_a == 1 {
+                                            p_val = p_val * (1.0 - conf) + conf;
+                                        } else if mapped_a == 0 {
+                                            p_val = p_val * (1.0 - conf);
+                                        }
+                                    }
+                                }
+
+                                hap_dosages.push(p_val);
+                                hap_best_gt.push(if p_val >= 0.5 { (1, 0) } else { (0, 0) });
                             }
 
                             let priors = if output_end > 0 && n_ref_markers > 0 {
@@ -1451,11 +1499,37 @@ target_samples={} target_bytes={}",
             } else {
                 (0.0, 0.0)
             };
+
             if let Some(target_m) = alignment.target_marker(marker_idx) {
                 let h1 = HapIdx::new((sample_idx * 2) as u32);
                 let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                // Map target alleles to reference allele space
+                let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
+                let map_allele = |a: u8| -> u8 {
+                    if a == 255 {
+                        return 255;
+                    }
+                    if let Some(m) = mapping {
+                        if (a as usize) < m.targ_to_ref.len() {
+                            let r = m.targ_to_ref[a as usize];
+                            if r >= 0 {
+                                r as u8
+                            } else {
+                                255
+                            }
+                        } else {
+                            255
+                        }
+                    } else {
+                        a
+                    }
+                };
+                let a1 = map_allele(raw_a1);
+                let a2 = map_allele(raw_a2);
+
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
@@ -1483,7 +1557,11 @@ target_samples={} target_bytes={}",
                         let q11n = q11 * inv_sum;
                         q01n + 2.0 * q11n
                     } else {
-                        p1 + p2
+                        // If sum is 0, prior and likelihood are disjoint (e.g. prior says 0|0, data says 1|1 with high confidence)
+                        // Trust the data (hard call) if we have it
+                        let d1 = if a1 != 0 { 1.0 } else { 0.0 };
+                        let d2 = if a2 != 0 { 1.0 } else { 0.0 };
+                        d1 + d2
                     }
                 }
             } else {
@@ -1506,8 +1584,33 @@ target_samples={} target_bytes={}",
             if let Some(target_m) = alignment.target_marker(marker_idx) {
                 let h1 = HapIdx::new((sample_idx * 2) as u32);
                 let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                // Map target alleles to reference allele space
+                let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
+                let map_allele = |a: u8| -> u8 {
+                    if a == 255 {
+                        return 255;
+                    }
+                    if let Some(m) = mapping {
+                        if (a as usize) < m.targ_to_ref.len() {
+                            let r = m.targ_to_ref[a as usize];
+                            if r >= 0 {
+                                r as u8
+                            } else {
+                                255
+                            }
+                        } else {
+                            255
+                        }
+                    } else {
+                        a
+                    }
+                };
+                let a1 = map_allele(raw_a1);
+                let a2 = map_allele(raw_a2);
+
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
@@ -1520,26 +1623,32 @@ target_samples={} target_bytes={}",
                         (0, 0)
                     }
                 } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
+                    // Start with hard-call from mapped alleles
+                    // For phasing preservation, if conf is high, we should respect a1/a2 order
+                    if conf >= 0.99 {
+                        (a1, a2)
                     } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    if q11 >= q01 && q11 >= q00 {
-                        (1, 1)
-                    } else if q01 >= q00 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
+                        let is_het = a1 != a2;
+                        let (l00, l01, l11) = if is_het {
+                            (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
+                        } else if a1 == 1 {
+                            (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
+                        } else {
+                            (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
+                        };
+                        let p00 = (1.0 - p1) * (1.0 - p2);
+                        let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
+                        let p11 = p1 * p2;
+                        let q00 = p00 * l00;
+                        let q01 = p01 * l01;
+                        let q11 = p11 * l11;
+                        if q11 >= q01 && q11 >= q00 {
+                            (1, 1)
+                        } else if q01 >= q00 {
+                            (0, 1)
+                        } else {
+                            (0, 0)
+                        }
                     }
                 }
             } else {
