@@ -956,10 +956,6 @@ impl PhasingPipeline {
 
     /// Automatically select between in-memory and streaming mode based on data size
     pub fn run_auto(&mut self) -> Result<()> {
-        if self.config.streaming == Some(true) {
-            return self.run_streaming();
-        }
-
         let file_size = std::fs::metadata(&self.config.gt)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -4645,7 +4641,6 @@ mod tests {
             window: 40.0,
             window_markers: 4000000,
             overlap: 2.0,
-            streaming: None,
             seed: 12345,
             nthreads: None,
             profile: false,
@@ -4736,7 +4731,6 @@ mod tests {
             window: 40.0,
             window_markers: 4000000,
             overlap: 2.0,
-            streaming: None,
             seed: 12345,
             nthreads: Some(2),
             profile: false,

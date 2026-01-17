@@ -136,9 +136,6 @@ pub struct Config {
     #[arg(long, default_value = "2.0")]
     pub overlap: f32,
 
-    /// Enable streaming mode for large datasets
-    #[arg(long)]
-    pub streaming: Option<bool>,
 
     /// Random seed for reproducibility
     #[arg(long, default_value = "-99999")]
@@ -185,7 +182,6 @@ impl Default for Config {
             window: 40.0,
             window_markers: 4000000,
             overlap: 2.0,
-            streaming: None,
             seed: -99999,
             nthreads: None,
             profile: false,

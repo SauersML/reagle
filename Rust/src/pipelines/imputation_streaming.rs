@@ -5,6 +5,7 @@
 //! directly to imputation in-memory.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -49,6 +50,21 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
         push_unique(&mut candidates, format!("CHR{}", chrom));
     }
     candidates
+}
+
+fn should_stream_ref_vcf(path: &Path, window_markers: usize) -> Option<u64> {
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if file_size == 0 {
+        return None;
+    }
+
+    let estimated_markers = file_size / 100;
+    let threshold = std::cmp::min(window_markers as u64, 500_000);
+    if estimated_markers > threshold {
+        Some(estimated_markers)
+    } else {
+        None
+    }
 }
 
 fn resolve_chrom_candidates(
@@ -433,12 +449,16 @@ impl crate::pipelines::ImputationPipeline {
                 streaming_config.clone(),
             )?;
             
-            let use_streaming_vcf = pipeline.config.streaming.unwrap_or(false);
+            let use_streaming_vcf = should_stream_ref_vcf(&ref_path_clone, pipeline.config.window_markers);
             let mut ref_reader: RefPanelReader = if is_bref3 {
                 let stream_reader = crate::io::bref3::StreamingBref3Reader::open(&ref_path_clone)?;
                 let windowed = crate::io::bref3::WindowedBref3Reader::new(stream_reader);
                 RefPanelReader::Bref3(windowed)
-            } else if use_streaming_vcf {
+            } else if let Some(estimated_markers) = use_streaming_vcf {
+                eprintln!(
+                    "Auto-detected large reference (~{} markers), using streaming VCF reader",
+                    estimated_markers
+                );
                 // Streaming VCF for memory-constrained environments
                 RefPanelReader::StreamingVcf(crate::io::bref3::StreamingRefVcfReader::open(&ref_path_clone)?)
             } else {
