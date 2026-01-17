@@ -437,6 +437,7 @@ impl StreamingBref3Reader {
 
         let n_recs = n_recs as usize;
         let chrom_name = read_utf8_string(&mut self.reader)?;
+        eprintln!("DEBUG: BREF3 block: chrom={}, n_recs={}", chrom_name, n_recs);
         let chrom_idx = self.get_or_add_chrom(&chrom_name);
 
         let n_seq = read_be_u16(&mut self.reader)? as usize;
@@ -648,6 +649,7 @@ impl WindowedBref3Reader {
             .unwrap_or(true);
 
         if switched {
+            eprintln!("DEBUG: Switched chromosome. Buffer clear. candidates={:?}", candidates);
             self.block_buffer.clear();
             // We don't know which candidate will match, so leave current_chrom as None
             // or reset it. We'll set it when we find a matching block.
