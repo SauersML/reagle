@@ -1935,7 +1935,7 @@ fn build_dependencies_directory() -> Option<PathBuf> {
 
 fn locate_build_dependency(deps_dir: &Path, crate_name: &str) -> Option<PathBuf> {
     let prefix = format!("lib{crate_name}-");
-    let mut candidate: Option<PathBuf> = None;
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(deps_dir) {
         for entry in entries.flatten() {
@@ -1950,13 +1950,17 @@ fn locate_build_dependency(deps_dir: &Path, crate_name: &str) -> Option<PathBuf>
             };
 
             if file_name.starts_with(&prefix) {
-                candidate = Some(path);
-                break;
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    if let Ok(modified) = metadata.modified() {
+                        candidates.push((modified, path));
+                    }
+                }
             }
         }
     }
 
-    candidate
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.into_iter().next().map(|(_, path)| path)
 }
 
 fn command_preview(program: &OsStr, args: &[OsString]) -> String {
