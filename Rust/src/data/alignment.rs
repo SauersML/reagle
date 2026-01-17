@@ -6,6 +6,16 @@ use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
 use crate::error::Result;
 
+/// Normalize chromosome name for alignment matching (e.g. "chr22" -> "22", "CHR22" -> "22")
+fn normalize_chrom_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if let Some(stripped) = lower.strip_prefix("chr") {
+        stripped.to_string()
+    } else {
+        lower
+    }
+}
+
 /// Marker alignment between target and reference panels
 #[derive(Clone, Debug)]
 pub struct MarkerAlignment {
@@ -30,7 +40,7 @@ impl MarkerAlignment {
         let n_ref_markers = ref_gt.n_markers();
         let n_target_markers = target_gt.n_markers();
 
-        // Build position -> target index map (keyed by chrom name for stability)
+        // Build position -> target index map (keyed by normalized chrom name for stability)
         let mut target_pos_map: HashMap<(String, u32), usize> = HashMap::new();
         for m in 0..n_target_markers {
             let marker = target_gt.marker(MarkerIdx::new(m as u32));
@@ -39,7 +49,7 @@ impl MarkerAlignment {
                 .chrom_name(marker.chrom)
                 .unwrap_or("")
                 .to_string();
-            target_pos_map.insert((chrom_name, marker.pos), m);
+            target_pos_map.insert((normalize_chrom_name(&chrom_name), marker.pos), m);
         }
 
         // Map reference markers to target markers
@@ -58,7 +68,9 @@ impl MarkerAlignment {
                 .chrom_name(ref_marker.chrom)
                 .unwrap_or("")
                 .to_string();
-            if let Some(&target_idx) = target_pos_map.get(&(ref_chrom, ref_marker.pos)) {
+            let normalized_ref_chrom = normalize_chrom_name(&ref_chrom);
+            
+            if let Some(&target_idx) = target_pos_map.get(&(normalized_ref_chrom, ref_marker.pos)) {
                 let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
 
                 // Compute allele mapping (handles strand flips)
@@ -111,7 +123,7 @@ impl MarkerAlignment {
         let n_ref_markers = ref_win.n_markers();
         let n_target_markers = target_win.n_markers();
 
-        // Build position -> target index map for the window (keyed by chrom name)
+        // Build position -> target index map for the window (keyed by normalized chrom name)
         let mut target_pos_map: HashMap<(String, u32), usize> = HashMap::new();
         for m in 0..n_target_markers {
             let marker = target_win.marker(MarkerIdx::new(m as u32));
@@ -120,7 +132,7 @@ impl MarkerAlignment {
                 .chrom_name(marker.chrom)
                 .unwrap_or("")
                 .to_string();
-            target_pos_map.insert((chrom_name, marker.pos), m);
+            target_pos_map.insert((normalize_chrom_name(&chrom_name), marker.pos), m);
         }
 
         // Map reference markers to target markers
@@ -136,9 +148,10 @@ impl MarkerAlignment {
                 .chrom_name(ref_marker.chrom)
                 .unwrap_or("")
                 .to_string();
+            let normalized_ref_chrom = normalize_chrom_name(&ref_chrom);
 
             // Check if this reference marker is genotyped in target window
-            if let Some(&target_idx) = target_pos_map.get(&(ref_chrom, ref_marker.pos)) {
+            if let Some(&target_idx) = target_pos_map.get(&(normalized_ref_chrom, ref_marker.pos)) {
                 let target_marker = target_win.marker(MarkerIdx::new(target_idx as u32));
 
                 // Compute allele mapping
