@@ -517,23 +517,15 @@ impl crate::pipelines::ImputationPipeline {
                 let start_pos = window_start_pos;
                 let end_pos = window_end_pos;
                 
-                let mut ref_window = None;
-                let mut window_chrom = None;
-                for cand in &chrom_candidates {
-                    let loaded = if pipeline.config.profile {
-                        let span_guard = info_span!("io_load_ref").entered();
-                        let _ = &span_guard;
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    } else {
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    };
-                    if loaded.is_some() {
-                        ref_window = loaded;
-                        window_chrom = Some(cand.clone());
-                        break;
-                    }
-                }
-                let window_chrom = window_chrom.unwrap_or_else(|| target_chrom.to_string());
+                let ref_window = if pipeline.config.profile {
+                    let span_guard = info_span!("io_load_ref").entered();
+                    let _ = &span_guard;
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                } else {
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                };
+
+                let window_chrom = target_chrom.to_string();
 
                 let ref_window = match ref_window {
                     Some(w) => w,
@@ -1137,7 +1129,24 @@ target_samples={} target_bytes={}",
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
+                                let mut prob = p.prob(1);
+
+                                // Force hard call for high confidence genotypes
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let conf = target_win
+                                        .sample_confidence_f32(MarkerIdx::new(target_m as u32), s)
+                                        .clamp(0.0, 1.0);
+                                    if conf >= 0.999 {
+                                        let allele = obs_hap1[target_m];
+                                        if allele == 1 {
+                                            prob = 1.0;
+                                        } else if allele == 0 {
+                                            prob = 0.0;
+                                        }
+                                    }
+                                }
+
+                                hap_dosages.push(prob);
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
 
@@ -1213,7 +1222,24 @@ target_samples={} target_bytes={}",
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
                                 let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
+                                let mut prob = p.prob(1);
+
+                                // Force hard call for high confidence genotypes
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let conf = target_win
+                                        .sample_confidence_f32(MarkerIdx::new(target_m as u32), s)
+                                        .clamp(0.0, 1.0);
+                                    if conf >= 0.999 {
+                                        let allele = obs_hap2[target_m];
+                                        if allele == 1 {
+                                            prob = 1.0;
+                                        } else if allele == 0 {
+                                            prob = 0.0;
+                                        }
+                                    }
+                                }
+
+                                hap_dosages.push(prob);
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
 
@@ -1468,8 +1494,14 @@ target_samples={} target_bytes={}",
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
+
                 if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
                     p1 + p2
+                } else if conf >= 0.999 {
+                    // Force hard call for high confidence genotypes
+                    let d1 = if a1 == 1 { 1.0 } else { 0.0 };
+                    let d2 = if a2 == 1 { 1.0 } else { 0.0 };
+                    d1 + d2
                 } else {
                     let is_het = a1 != a2;
                     let (l00, l01, l11) = if is_het {
@@ -1528,6 +1560,8 @@ target_samples={} target_bytes={}",
                     } else {
                         (0, 0)
                     }
+                } else if conf >= 0.999 {
+                    (a1, a2)
                 } else {
                     let is_het = a1 != a2;
                     let (l00, l01, l11) = if is_het {
