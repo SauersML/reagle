@@ -248,6 +248,7 @@ struct BufferedMarker {
     marker: Marker,
     column: GenotypeColumn,
     gen_pos: f64,
+    confidences: Option<Vec<u8>>,
 }
 
 /// Streaming VCF reader that yields windows
@@ -276,6 +277,10 @@ pub struct StreamingVcfReader {
     line_buf: String,
     /// Whether all genotypes seen so far were phased
     all_phased: bool,
+    /// Per-sample ploidy (true=diploid, false=haploid)
+    sample_ploidy: Option<Vec<bool>>,
+    /// Whether we have seen any confidence scores
+    has_any_confidence: bool,
 }
 
 impl StreamingVcfReader {
@@ -411,6 +416,8 @@ impl StreamingVcfReader {
             eof: false,
             line_buf: String::new(),
             all_phased: true,
+            sample_ploidy: None,
+            has_any_confidence: false,
         };
 
         if let Err(e) = reader.prefetch_first_marker() {
@@ -504,6 +511,7 @@ impl StreamingVcfReader {
         // Build GenotypeMatrix for this window
         let mut markers = Markers::new();
         let mut columns = Vec::with_capacity(window_end);
+        let mut confidences: Vec<Vec<u8>> = Vec::new();
 
         for i in 0..window_end {
             let bm = &self.buffer[i];
@@ -516,9 +524,27 @@ impl StreamingVcfReader {
             marker.chrom = window_chrom_idx;
             markers.push(marker);
             columns.push(bm.column.clone());
+
+            if self.has_any_confidence {
+                if let Some(conf) = &bm.confidences {
+                    confidences.push(conf.clone());
+                } else {
+                    confidences.push(vec![255; self.samples.len()]);
+                }
+            }
         }
 
-        let genotypes = GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples));
+        // Update Samples with detected ploidy information
+        if let Some(ref ploidy) = self.sample_ploidy {
+            let sample_ids: Vec<String> = self.samples.ids().iter().map(|s| s.to_string()).collect();
+            self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
+        }
+
+        let genotypes = if self.has_any_confidence {
+            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), confidences)
+        } else {
+            GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
+        };
 
         let window = StreamWindow {
             genotypes,
@@ -657,12 +683,18 @@ impl StreamingVcfReader {
             .split(':')
             .position(|f| f == "GT")
             .ok_or_else(|| ReagleError::parse(self.global_marker_idx, "No GT field in FORMAT"))?;
+        let gl_idx = format.split(':').position(|f| f == "GL");
 
         // Parse genotypes
         let n_samples = self.samples.len();
         let mut alleles = Vec::with_capacity(n_samples * 2);
+        let mut confidences: Option<Vec<u8>> = gl_idx.map(|_| Vec::with_capacity(n_samples));
 
-        for sample_field in fields[9..].iter().take(n_samples) {
+        if self.sample_ploidy.is_none() {
+            self.sample_ploidy = Some(vec![true; n_samples]);
+        }
+
+        for (sample_idx, sample_field) in fields[9..].iter().enumerate().take(n_samples) {
             let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
 
             if gt_field.contains('/') {
@@ -670,8 +702,31 @@ impl StreamingVcfReader {
             }
 
             let (a1, a2) = parse_gt(gt_field);
+
+            // Haploid check (duplicated alleles for storage, but marked in ploidy)
+            if a1 == a2 && !gt_field.contains('|') && !gt_field.contains('/') {
+                 if let Some(ref mut ploidy) = self.sample_ploidy {
+                      ploidy[sample_idx] = false;
+                 }
+            }
+
             alleles.push(a1);
             alleles.push(a2);
+
+            // Parse GL field
+            if let Some(gl_i) = gl_idx {
+                if let Some(conf_vec) = confidences.as_mut() {
+                    let confidence = sample_field.split(':')
+                        .nth(gl_i)
+                        .and_then(|gl_str| crate::io::vcf::compute_gl_confidence(gl_str, a1, a2))
+                        .unwrap_or(255);
+                    conf_vec.push(confidence);
+                }
+            }
+        }
+
+        if confidences.is_some() {
+            self.has_any_confidence = true;
         }
 
         let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles.clone());
@@ -685,6 +740,7 @@ impl StreamingVcfReader {
             marker,
             column,
             gen_pos,
+            confidences,
         })
     }
 }
