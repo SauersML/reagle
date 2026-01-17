@@ -171,6 +171,33 @@ impl ThreadedHaps {
             }
         }
     }
+
+    /// Reset internal cursors to the start of all states.
+    /// Used for sequential readout (e.g. by ImpStatesCluster).
+    pub fn reset_cursors(&mut self) {
+        if self.state_cursors.len() != self.state_heads.len() {
+             self.state_cursors.resize(self.state_heads.len(), 0);
+        }
+        self.state_cursors.copy_from_slice(&self.state_heads);
+    }
+
+    /// Get haplotype for a state at a specific marker, advancing the cursor if needed.
+    /// Assumes markers are accessed sequentially.
+    pub fn hap_at_raw(&mut self, state_idx: usize, marker: usize) -> u32 {
+        let mut seg_idx = self.state_cursors[state_idx] as usize;
+
+        // Advance cursor if needed
+        while marker >= self.segments_end[seg_idx] as usize {
+            let next = self.segments_next[seg_idx];
+            if next == Self::NIL {
+                break;
+            }
+            seg_idx = next as usize;
+            self.state_cursors[state_idx] = seg_idx as u32;
+        }
+
+        self.segments_hap[seg_idx]
+    }
 }
 
 // ============================================================================
