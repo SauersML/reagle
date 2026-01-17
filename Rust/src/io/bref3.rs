@@ -708,18 +708,18 @@ impl WindowedBref3Reader {
         }
         // Load one extra block beyond end_pos for trailing buffer, if available.
         if !self.inner.is_eof() {
-            let next_block = if let Some(pending) = self.pending_block.take() {
-                pending
-            } else if let Some(block) = self.inner.next_block()? {
-                block
+            let next_block_opt = if let Some(pending) = self.pending_block.take() {
+                Some(pending)
             } else {
-                return Ok(None);
+                self.inner.next_block()?
             };
 
-            if candidates.iter().any(|c| c == &next_block.chrom) {
-                self.block_buffer.push_back(next_block);
-            } else {
-                self.pending_block = Some(next_block);
+            if let Some(next_block) = next_block_opt {
+                if candidates.iter().any(|c| c == &next_block.chrom) {
+                    self.block_buffer.push_back(next_block);
+                } else {
+                    self.pending_block = Some(next_block);
+                }
             }
         }
 
