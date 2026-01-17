@@ -1136,9 +1136,26 @@ target_samples={} target_bytes={}",
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
-                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                let mut use_hmm = true;
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let conf = target_win
+                                        .sample_confidence_f32(MarkerIdx::new(target_m as u32), s)
+                                        .clamp(0.0, 1.0);
+                                    if conf >= 0.999 {
+                                        let allele = obs_hap1[target_m];
+                                        if allele <= 1 {
+                                            hap_dosages.push(allele as f32);
+                                            hap_best_gt.push((allele, 0));
+                                            use_hmm = false;
+                                        }
+                                    }
+                                }
+
+                                if use_hmm {
+                                    let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                    hap_dosages.push(p.prob(1));
+                                    hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                }
                             }
 
                             let mut locked = obs_hap1.clone();
@@ -1212,9 +1229,26 @@ target_samples={} target_bytes={}",
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
-                                hap_dosages.push(p.prob(1));
-                                hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                let mut use_hmm = true;
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let conf = target_win
+                                        .sample_confidence_f32(MarkerIdx::new(target_m as u32), s)
+                                        .clamp(0.0, 1.0);
+                                    if conf >= 0.999 {
+                                        let allele = obs_hap2[target_m];
+                                        if allele <= 1 {
+                                            hap_dosages.push(allele as f32);
+                                            hap_best_gt.push((allele, 0));
+                                            use_hmm = false;
+                                        }
+                                    }
+                                }
+
+                                if use_hmm {
+                                    let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                    hap_dosages.push(p.prob(1));
+                                    hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
+                                }
                             }
 
                             let priors = if output_end > 0 && n_ref_markers > 0 {
@@ -1471,6 +1505,9 @@ target_samples={} target_bytes={}",
                 if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
                     p1 + p2
                 } else {
+                    if conf >= 0.999 {
+                        return (a1 + a2) as f32;
+                    }
                     let is_het = a1 != a2;
                     let (l00, l01, l11) = if is_het {
                         (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
@@ -1529,6 +1566,9 @@ target_samples={} target_bytes={}",
                         (0, 0)
                     }
                 } else {
+                    if conf >= 0.999 {
+                        return (a1, a2);
+                    }
                     let is_het = a1 != a2;
                     let (l00, l01, l11) = if is_het {
                         (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
