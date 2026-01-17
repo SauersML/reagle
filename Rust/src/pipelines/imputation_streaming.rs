@@ -517,23 +517,26 @@ impl crate::pipelines::ImputationPipeline {
                 let start_pos = window_start_pos;
                 let end_pos = window_end_pos;
                 
-                let mut ref_window = None;
-                let mut window_chrom = None;
-                for cand in &chrom_candidates {
-                    let loaded = if pipeline.config.profile {
-                        let span_guard = info_span!("io_load_ref").entered();
-                        let _ = &span_guard;
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
+                let ref_window = if pipeline.config.profile {
+                    let span_guard = info_span!("io_load_ref").entered();
+                    let _ = &span_guard;
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                } else {
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                };
+
+                // Check which chromosome was actually loaded (if any) to report in error message
+                // If None loaded, we use target_chrom for the message
+                let window_chrom = if let Some(ref win) = ref_window {
+                    if win.genotypes.n_markers() > 0 {
+                        let m = win.genotypes.marker(MarkerIdx::new(0));
+                        win.genotypes.markers().chrom_name(m.chrom).unwrap_or(".").to_string()
                     } else {
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    };
-                    if loaded.is_some() {
-                        ref_window = loaded;
-                        window_chrom = Some(cand.clone());
-                        break;
+                        target_chrom.to_string()
                     }
-                }
-                let window_chrom = window_chrom.unwrap_or_else(|| target_chrom.to_string());
+                } else {
+                    target_chrom.to_string()
+                };
 
                 let ref_window = match ref_window {
                     Some(w) => w,
