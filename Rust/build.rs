@@ -3496,6 +3496,7 @@ fn count_variable_occurrences(text: &str, var: &str) -> usize {
     count
 }
 
+#[allow(clippy::collapsible_if)]
 fn is_word_boundary(text: &str, idx: usize, len: usize) -> bool {
     let before = if idx == 0 {
         None
