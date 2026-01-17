@@ -830,6 +830,8 @@ impl ClusterStateProbs {
 
     #[inline]
     fn missing_mass(&self, listed: usize, noise_a: f32, noise_b: f32) -> f32 {
+        // Missing states contribute uniform noise on both sides: (1/K)^2 per state.
+        // We approximate their aggregate by count_missing * noise_a * noise_b.
         if listed >= self.n_states {
             0.0
         } else {

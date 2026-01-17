@@ -1064,7 +1064,7 @@ impl PhasingPipeline {
         // This seeds the phasing with the known phase from the overlap region
         let overlap_markers = if let Some(overlap) = phased_overlap {
             self.apply_overlap_constraint(&mut geno, overlap);
-            overlap.n_markers
+            overlap.n_markers.min(n_markers)
         } else {
             0
         };
@@ -1269,7 +1269,7 @@ impl PhasingPipeline {
     /// This sets the alleles in the overlap region to match the previous window's
     /// phased output, ensuring phase continuity.
     fn apply_overlap_constraint(&self, geno: &mut MutableGenotypes, overlap: &PhasedOverlap) {
-        let n_overlap = overlap.n_markers;
+        let n_overlap = overlap.n_markers.min(geno.n_markers());
         let n_haps = overlap.n_haps.min(geno.n_haps());
         
         for h in 0..n_haps {
