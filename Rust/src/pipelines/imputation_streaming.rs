@@ -2098,7 +2098,14 @@ target_samples={} target_bytes={}",
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
+
+                // Detect unmapped alleles (present in target but not in ref)
+                // We should output these as missing rather than forcing an imputed reference genotype
+                let is_unmapped = (raw_a1 != 255 && a1 == 255) || (raw_a2 != 255 && a2 == 255);
+
+                if is_unmapped {
+                    (255, 255)
+                } else if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
                     if p1 + p2 >= 1.5 {
                         (1, 1)
                     } else if p1 + p2 >= 0.5 {
