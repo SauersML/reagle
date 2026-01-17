@@ -1770,7 +1770,7 @@ fn run_rust_phasing(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Res
         "--out", out_prefix.to_str().unwrap(),
         "--seed", &seed.to_string(),
     ]);
-    let mut pipeline = PhasingPipeline::new(config);
+    let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
 
