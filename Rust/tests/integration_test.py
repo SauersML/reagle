@@ -254,8 +254,6 @@ def print_tool_help(label, cmd):
             print(f"{label} --help output:\n{result.stdout.strip()}")
     except Exception as e:
         print(f"Warning: {label} --help check failed: {e}")
-    else:
-        subprocess.check_call(cmd, shell=True)
 
 
 def check_dependencies():
