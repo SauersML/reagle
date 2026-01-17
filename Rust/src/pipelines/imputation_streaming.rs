@@ -1607,13 +1607,23 @@ target_samples={} target_bytes={}",
                 let a1 = map_allele(raw_a1);
                 let a2 = map_allele(raw_a2);
 
-                if a1 < 2 && a2 < 2 {
-                    return (a1 as f32) + (a2 as f32);
-                }
-
                 let conf = target_win
                     .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
+
+                // If high confidence hard call, force dosage to match
+                if conf >= 0.999 && a1 < 2 && a2 < 2 {
+                     return (a1 as f32) + (a2 as f32);
+                }
+
+                if a1 < 2 && a2 < 2 {
+                    // Weighted blend of hard call and imputed
+                    // If high confidence, we rely mostly on hard call.
+                    // If low confidence (conf ~ 0), we rely on imputed (p1+p2).
+                    let hard_ds = (a1 as f32) + (a2 as f32);
+                    let imputed_ds = p1 + p2;
+                    return imputed_ds * (1.0 - conf) + hard_ds * conf;
+                }
                 if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
                     p1 + p2
                 } else {
