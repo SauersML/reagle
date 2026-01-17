@@ -20,6 +20,7 @@ use crate::data::HapIdx;
 use crate::error::Result;
 use crate::model::parameters::ModelParams;
 use crate::utils::telemetry::TelemetryBlackboard;
+use wide::f32x8;
 
 /// Imputation pipeline
 pub struct ImputationPipeline {
@@ -69,6 +70,11 @@ impl AllelePosteriors {
 }
 
 /// Cluster-based state probabilities with exact decay bridging between anchors.
+///
+/// Exact decay (Li-Stephens): for distance d, decay = exp(-R*d), noise = (1-decay)/K.
+/// Forward/Backward projections: F' = F*decay + noise, B' = B*decay + noise.
+/// Posterior: P(S=k|data) ∝ (F' * B') and normalized.
+/// This avoids linear interpolation and correctly diffuses to uniform in long gaps.
 /// Uses CSR (Compressed Sparse Row) format to eliminate Vec<Vec<T>> overhead.
 #[derive(Clone, Debug)]
 pub struct ClusterStateProbs {
@@ -461,31 +467,21 @@ impl ClusterStateProbs {
             }
             GenotypeColumn::Dense(col) => {
                 if n_alleles == 2 {
-                    let mut p_alt = 0.0f32;
-                    let mut p_ref = 0.0f32;
-                    if in_cluster {
-                        for (j, &hap) in haps.iter().enumerate() {
-                            let allele = map_allele(map_ref_to_targ, col.get(HapIdx::new(hap)));
-                            if allele == 1 {
-                                p_alt += probs[j];
-                            } else if allele == 0 {
-                                p_ref += probs[j];
-                            }
-                        }
-                    } else {
+                    let (mut p_alt, mut p_ref) = self.biallelic_alt_ref_dense_simd(
+                        haps,
+                        probs,
+                        probs_p1,
+                        &|h| col.get(h),
+                        map_ref_to_targ,
+                        in_cluster,
+                        decay_a,
+                        decay_b,
+                        noise_a,
+                        noise_b,
+                    );
+                    if !in_cluster {
                         let missing_mass = self.missing_mass(haps.len(), noise_a, noise_b);
                         let base_freq = self.base_allele_freqs(column, 2, map_ref_to_targ);
-                        for (j, &hap) in haps.iter().enumerate() {
-                            let allele = map_allele(map_ref_to_targ, col.get(HapIdx::new(hap)));
-                            let fa = probs[j] * decay_a + noise_a;
-                            let fb = probs_p1[j] * decay_b + noise_b;
-                            let p = fa * fb;
-                            if allele == 1 {
-                                p_alt += p;
-                            } else if allele == 0 {
-                                p_ref += p;
-                            }
-                        }
                         p_alt += missing_mass * base_freq[1];
                         p_ref += missing_mass * base_freq[0];
                     }
@@ -528,31 +524,21 @@ impl ClusterStateProbs {
             }
             GenotypeColumn::Sparse(col) => {
                 if n_alleles == 2 {
-                    let mut p_alt = 0.0f32;
-                    let mut p_ref = 0.0f32;
-                    if in_cluster {
-                        for (j, &hap) in haps.iter().enumerate() {
-                            let allele = map_allele(map_ref_to_targ, col.get(HapIdx::new(hap)));
-                            if allele == 1 {
-                                p_alt += probs[j];
-                            } else if allele == 0 {
-                                p_ref += probs[j];
-                            }
-                        }
-                    } else {
+                    let (mut p_alt, mut p_ref) = self.biallelic_alt_ref_dense_simd(
+                        haps,
+                        probs,
+                        probs_p1,
+                        &|h| col.get(h),
+                        map_ref_to_targ,
+                        in_cluster,
+                        decay_a,
+                        decay_b,
+                        noise_a,
+                        noise_b,
+                    );
+                    if !in_cluster {
                         let missing_mass = self.missing_mass(haps.len(), noise_a, noise_b);
                         let base_freq = self.base_allele_freqs(column, 2, map_ref_to_targ);
-                        for (j, &hap) in haps.iter().enumerate() {
-                            let allele = map_allele(map_ref_to_targ, col.get(HapIdx::new(hap)));
-                            let fa = probs[j] * decay_a + noise_a;
-                            let fb = probs_p1[j] * decay_b + noise_b;
-                            let p = fa * fb;
-                            if allele == 1 {
-                                p_alt += p;
-                            } else if allele == 0 {
-                                p_ref += p;
-                            }
-                        }
                         p_alt += missing_mass * base_freq[1];
                         p_ref += missing_mass * base_freq[0];
                     }
@@ -883,6 +869,74 @@ impl ClusterStateProbs {
             .into_iter()
             .map(|c| c as f32 / denom as f32)
             .collect()
+    }
+
+    #[inline]
+    fn biallelic_alt_ref_dense_simd<C>(
+        &self,
+        haps: &[u32],
+        probs: &[f32],
+        probs_p1: &[f32],
+        column: &C,
+        map_ref_to_targ: Option<&[i8]>,
+        in_cluster: bool,
+        decay_a: f32,
+        decay_b: f32,
+        noise_a: f32,
+        noise_b: f32,
+    ) -> (f32, f32)
+    where
+        C: Fn(HapIdx) -> u8,
+    {
+        let mut p_alt = 0.0f32;
+        let mut p_ref = 0.0f32;
+        let mut idx = 0usize;
+        while idx + 8 <= haps.len() {
+            let mut p_arr = [0.0f32; 8];
+            let mut alt_mask = [0.0f32; 8];
+            let mut ref_mask = [0.0f32; 8];
+            for lane in 0..8 {
+                let hap = haps[idx + lane] as u32;
+                let allele = Self::map_allele(map_ref_to_targ, column(HapIdx::new(hap)));
+                let prob = probs[idx + lane];
+                let p = if in_cluster {
+                    prob
+                } else {
+                    let fa = prob * decay_a + noise_a;
+                    let fb = probs_p1[idx + lane] * decay_b + noise_b;
+                    fa * fb
+                };
+                p_arr[lane] = p;
+                if allele == 1 {
+                    alt_mask[lane] = 1.0;
+                } else if allele == 0 {
+                    ref_mask[lane] = 1.0;
+                }
+            }
+            let p_vec = f32x8::from(p_arr);
+            let alt_vec = f32x8::from(alt_mask);
+            let ref_vec = f32x8::from(ref_mask);
+            p_alt += (p_vec * alt_vec).reduce_add();
+            p_ref += (p_vec * ref_vec).reduce_add();
+            idx += 8;
+        }
+        for j in idx..haps.len() {
+            let allele = Self::map_allele(map_ref_to_targ, column(HapIdx::new(haps[j] as u32)));
+            let prob = probs[j];
+            let p = if in_cluster {
+                prob
+            } else {
+                let fa = prob * decay_a + noise_a;
+                let fb = probs_p1[j] * decay_b + noise_b;
+                fa * fb
+            };
+            if allele == 1 {
+                p_alt += p;
+            } else if allele == 0 {
+                p_ref += p;
+            }
+        }
+        (p_alt, p_ref)
     }
 }
 
