@@ -97,6 +97,16 @@ impl SeqCodedColumn {
         self.block.get(self.marker_offset, hap)
     }
 
+    #[inline]
+    pub fn hap_to_seq(&self) -> &[u16] {
+        &self.block.hap_to_seq
+    }
+
+    #[inline]
+    pub fn seq_alleles(&self) -> &[u8] {
+        &self.block.seq_to_allele[self.marker_offset]
+    }
+
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.block.n_haplotypes()

@@ -1097,22 +1097,6 @@ target_samples={} target_bytes={}",
                             .map(|m| target_win.allele(MarkerIdx::new(m as u32), hap2_idx))
                             .collect();
 
-                        let get_ref = |marker: usize, h: u32| {
-                            let ref_allele = ref_win.allele(
-                                MarkerIdx::new(marker as u32),
-                                HapIdx::new(h as u32),
-                            );
-                            if let Some(target_m) = alignment.target_marker(marker) {
-                                if alignment.has_allele_mapping(target_m) {
-                                    alignment.reverse_map_allele(target_m, ref_allele)
-                                } else {
-                                    ref_allele
-                                }
-                            } else {
-                                ref_allele
-                            }
-                        };
-
                         let mut hap_priors: Vec<HaplotypePriors> = Vec::with_capacity(2);
                         let mut hap_state_probs: Vec<Arc<ClusterStateProbs>> = Vec::with_capacity(2);
 
@@ -1160,7 +1144,23 @@ target_samples={} target_bytes={}",
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                let marker_idx = MarkerIdx::new(ref_m as u32);
+                                let column = ref_win.column(marker_idx);
+                                let map_ref_to_targ = alignment
+                                    .target_marker(ref_m)
+                                    .and_then(|target_m| {
+                                        alignment
+                                            .allele_mappings
+                                            .get(target_m)
+                                            .and_then(|m| m.as_ref())
+                                            .map(|m| m.ref_to_targ.as_slice())
+                                    });
+                                let p = state_probs.allele_posteriors_for_column(
+                                    ref_m,
+                                    2,
+                                    column,
+                                    map_ref_to_targ,
+                                );
                                 let mut p_val = p.prob(1);
 
                                 // Override with hard call if present
@@ -1192,7 +1192,23 @@ target_samples={} target_bytes={}",
                             let mut locked = obs_hap1.clone();
                             for &ref_m in sample_genotyped {
                                 if let Some(target_m) = alignment.target_marker(ref_m) {
-                                    let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                    let marker_idx = MarkerIdx::new(ref_m as u32);
+                                    let column = ref_win.column(marker_idx);
+                                    let map_ref_to_targ = alignment
+                                        .target_marker(ref_m)
+                                        .and_then(|target_m| {
+                                            alignment
+                                                .allele_mappings
+                                                .get(target_m)
+                                                .and_then(|m| m.as_ref())
+                                                .map(|m| m.ref_to_targ.as_slice())
+                                        });
+                                    let p = state_probs.allele_posteriors_for_column(
+                                        ref_m,
+                                        2,
+                                        column,
+                                        map_ref_to_targ,
+                                    );
                                     locked[target_m] = p.max_allele();
                                 }
                             }
@@ -1260,7 +1276,23 @@ target_samples={} target_bytes={}",
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                let marker_idx = MarkerIdx::new(ref_m as u32);
+                                let column = ref_win.column(marker_idx);
+                                let map_ref_to_targ = alignment
+                                    .target_marker(ref_m)
+                                    .and_then(|target_m| {
+                                        alignment
+                                            .allele_mappings
+                                            .get(target_m)
+                                            .and_then(|m| m.as_ref())
+                                            .map(|m| m.ref_to_targ.as_slice())
+                                    });
+                                let p = state_probs.allele_posteriors_for_column(
+                                    ref_m,
+                                    2,
+                                    column,
+                                    map_ref_to_targ,
+                                );
                                 let mut p_val = p.prob(1);
 
                                 // Override with hard call if present
@@ -1539,38 +1571,67 @@ target_samples={} target_bytes={}",
             .collect();
 
         let include_posteriors = include_gp || include_ap;
+        let n_samples = target_win.n_samples();
+        struct PosteriorCache {
+            marker_idx: usize,
+            data: Vec<(AllelePosteriors, AllelePosteriors)>,
+        }
+        let post_cache = std::cell::RefCell::new(PosteriorCache {
+            marker_idx: usize::MAX,
+            data: Vec::new(),
+        });
         let get_posteriors: Option<
             Box<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors) + '_>,
         > = if include_posteriors {
             Some(Box::new(move |marker_idx, sample_idx| {
-                let n_alleles = 1 + ref_win.marker(MarkerIdx::new(marker_idx as u32)).alt_alleles.len();
-                let default = if n_alleles == 2 {
-                    AllelePosteriors::Biallelic(0.0)
-                } else {
-                    AllelePosteriors::Multiallelic(vec![0.0f32; n_alleles])
-                };
-                if let Some((p1, p2)) = sample_posteriors.get(&sample_idx) {
-                    let get_ref = |marker: usize, h: u32| {
-                        let ref_allele = ref_win.allele(
-                            MarkerIdx::new(marker as u32),
-                            HapIdx::new(h as u32),
-                        );
-                        if let Some(target_m) = alignment.target_marker(marker) {
-                            if alignment.has_allele_mapping(target_m) {
-                                alignment.reverse_map_allele(target_m, ref_allele)
-                            } else {
-                                ref_allele
-                            }
-                        } else {
-                            ref_allele
-                        }
+                let mut cache = post_cache.borrow_mut();
+                if cache.marker_idx != marker_idx {
+                    cache.marker_idx = marker_idx;
+                    let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
+                    let n_alleles = 1 + marker.alt_alleles.len();
+                    let default = if n_alleles == 2 {
+                        AllelePosteriors::Biallelic(0.0)
+                    } else {
+                        AllelePosteriors::Multiallelic(vec![0.0f32; n_alleles])
                     };
-                    let post1 = p1.allele_posteriors(marker_idx, n_alleles, &get_ref);
-                    let post2 = p2.allele_posteriors(marker_idx, n_alleles, &get_ref);
-                    (post1, post2)
-                } else {
-                    (default.clone(), default)
+                    let column = ref_win.column(MarkerIdx::new(marker_idx as u32));
+                    let map_ref_to_targ = alignment
+                        .target_marker(marker_idx)
+                        .and_then(|target_m| {
+                            alignment
+                                .allele_mappings
+                                .get(target_m)
+                                .and_then(|m| m.as_ref())
+                                .map(|m| m.ref_to_targ.as_slice())
+                        });
+                    cache.data = (0..n_samples)
+                        .into_par_iter()
+                        .map(|s| {
+                            if let Some((p1, p2)) = sample_posteriors.get(&s) {
+                                let post1 = p1.allele_posteriors_for_column(
+                                    marker_idx,
+                                    n_alleles,
+                                    column,
+                                    map_ref_to_targ,
+                                );
+                                let post2 = p2.allele_posteriors_for_column(
+                                    marker_idx,
+                                    n_alleles,
+                                    column,
+                                    map_ref_to_targ,
+                                );
+                                (post1, post2)
+                            } else {
+                                (default.clone(), default.clone())
+                            }
+                        })
+                        .collect();
                 }
+                cache
+                    .data
+                    .get(sample_idx)
+                    .cloned()
+                    .unwrap_or_else(|| (AllelePosteriors::Biallelic(0.0), AllelePosteriors::Biallelic(0.0)))
             }))
         } else {
             None
