@@ -187,6 +187,8 @@ jobs:
   impute-reagle:
     runs-on: ubuntu-latest
     needs: [build, prepare-data]
+    outputs:
+      retry_illegal_instruction: ${{ steps.reagle-run.outputs.illegal_instruction }}
     steps:
       - uses: actions/checkout@v4
 
@@ -211,10 +213,63 @@ jobs:
           path: Rust/tests/data/
 
       - name: Run Reagle imputation
+        id: reagle-run
+        working-directory: Rust
+        run: |
+          set -o pipefail
+          log_path="$PWD/tests/data/reagle_imputation.log"
+          python3 tests/integration_test.py reagle 2>&1 | tee "$log_path"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ] && grep -q "Illegal instruction" "$log_path"; then
+            echo "illegal_instruction=true" >> "$GITHUB_OUTPUT"
+            echo "Retryable illegal instruction detected; leaving artifacts for retry."
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Upload Reagle results
+        uses: actions/upload-artifact@v4
+        if: steps.reagle-run.outputs.illegal_instruction != 'true'
+        with:
+          name: reagle-results
+          path: |
+            Rust/tests/data/reagle_imputed.vcf.gz
+            Rust/tests/data/reagle_imputed.vcf.gz.csi
+          retention-days: 1
+
+  # Job 4a: Retry Reagle imputation on a fresh runner if illegal instruction was detected
+  impute-reagle-retry:
+    runs-on: ubuntu-latest
+    needs: [build, prepare-data, impute-reagle]
+    if: needs.impute-reagle.outputs.retry_illegal_instruction == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bcftools tabix
+
+      - name: Download Reagle binary
+        uses: actions/download-artifact@v4
+        with:
+          name: reagle-binary
+          path: Rust/target/release/
+
+      - name: Make Reagle executable
+        run: chmod +x Rust/target/release/reagle
+
+      - name: Download prepared data
+        uses: actions/download-artifact@v4
+        with:
+          name: test-data
+          path: Rust/tests/data/
+
+      - name: Run Reagle imputation (retry)
         working-directory: Rust
         run: python3 tests/integration_test.py reagle
 
-      - name: Upload Reagle results
+      - name: Upload Reagle results (retry)
         uses: actions/upload-artifact@v4
         with:
           name: reagle-results
@@ -227,6 +282,8 @@ jobs:
   impute-reagle-profile:
     runs-on: ubuntu-latest
     needs: [build, prepare-profile-data]
+    outputs:
+      retry_illegal_instruction: ${{ steps.reagle-run.outputs.illegal_instruction }}
     steps:
       - uses: actions/checkout@v4
 
@@ -251,10 +308,63 @@ jobs:
           path: Rust/tests/data/
 
       - name: Run Reagle imputation (5% chr22)
+        id: reagle-run
+        working-directory: Rust
+        run: |
+          set -o pipefail
+          log_path="$PWD/tests/data/reagle_imputation.log"
+          python3 tests/integration_test.py reagle 2>&1 | tee "$log_path"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ] && grep -q "Illegal instruction" "$log_path"; then
+            echo "illegal_instruction=true" >> "$GITHUB_OUTPUT"
+            echo "Retryable illegal instruction detected; leaving artifacts for retry."
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Upload Reagle results (5% chr22)
+        uses: actions/upload-artifact@v4
+        if: steps.reagle-run.outputs.illegal_instruction != 'true'
+        with:
+          name: reagle-results-chr22-5pct
+          path: |
+            Rust/tests/data/reagle_imputed.vcf.gz
+            Rust/tests/data/reagle_imputed.vcf.gz.csi
+          retention-days: 1
+
+  # Job 4c: Retry Reagle imputation (5% chr22) on a fresh runner if illegal instruction was detected
+  impute-reagle-profile-retry:
+    runs-on: ubuntu-latest
+    needs: [build, prepare-profile-data, impute-reagle-profile]
+    if: needs.impute-reagle-profile.outputs.retry_illegal_instruction == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bcftools tabix
+
+      - name: Download Reagle binary
+        uses: actions/download-artifact@v4
+        with:
+          name: reagle-binary
+          path: Rust/target/release/
+
+      - name: Make Reagle executable
+        run: chmod +x Rust/target/release/reagle
+
+      - name: Download prepared 5% chr22 data
+        uses: actions/download-artifact@v4
+        with:
+          name: test-data-chr22-5pct
+          path: Rust/tests/data/
+
+      - name: Run Reagle imputation (5% chr22 retry)
         working-directory: Rust
         run: python3 tests/integration_test.py reagle
 
-      - name: Upload Reagle results (5% chr22)
+      - name: Upload Reagle results (5% chr22 retry)
         uses: actions/upload-artifact@v4
         with:
           name: reagle-results-chr22-5pct
@@ -266,7 +376,13 @@ jobs:
   # Job 5: Calculate metrics (depends on both imputation jobs)
   analyze:
     runs-on: ubuntu-latest
-    needs: [impute-beagle, impute-reagle]
+    needs: [impute-beagle, impute-reagle, impute-reagle-retry]
+    if: >-
+      ${{
+        always() &&
+        needs.impute-beagle.result == 'success' &&
+        (needs.impute-reagle.result == 'success' || needs.impute-reagle-retry.result == 'success')
+      }}
     steps:
       - uses: actions/checkout@v4
 
@@ -308,7 +424,13 @@ jobs:
   # Job 5b: Calculate metrics (5% of chr22)
   analyze-chr22-5pct:
     runs-on: ubuntu-latest
-    needs: [impute-beagle-profile, impute-reagle-profile]
+    needs: [impute-beagle-profile, impute-reagle-profile, impute-reagle-profile-retry]
+    if: >-
+      ${{
+        always() &&
+        needs.impute-beagle-profile.result == 'success' &&
+        (needs.impute-reagle-profile.result == 'success' || needs.impute-reagle-profile-retry.result == 'success')
+      }}
     steps:
       - uses: actions/checkout@v4
 
