@@ -517,30 +517,20 @@ impl crate::pipelines::ImputationPipeline {
                 let start_pos = window_start_pos;
                 let end_pos = window_end_pos;
                 
-                let mut ref_window = None;
-                let mut window_chrom = None;
-                for cand in &chrom_candidates {
-                    let loaded = if pipeline.config.profile {
-                        let span_guard = info_span!("io_load_ref").entered();
-                        let _ = &span_guard;
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    } else {
-                        ref_reader.load_window_for_region(cand, start_pos, end_pos)?
-                    };
-                    if loaded.is_some() {
-                        ref_window = loaded;
-                        window_chrom = Some(cand.clone());
-                        break;
-                    }
-                }
-                let window_chrom = window_chrom.unwrap_or_else(|| target_chrom.to_string());
+                let ref_window = if pipeline.config.profile {
+                    let span_guard = info_span!("io_load_ref").entered();
+                    let _ = &span_guard;
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                } else {
+                    ref_reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                };
 
                 let ref_window = match ref_window {
                     Some(w) => w,
                     None => {
                         return Err(anyhow::anyhow!(
                             "No reference markers in region for chrom {} ({}..{}); tried: {}",
-                            window_chrom,
+                            target_chrom,
                             start_pos,
                             end_pos,
                             chrom_candidates.join(", ")
@@ -1136,7 +1126,19 @@ target_samples={} target_bytes={}",
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                let mut p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let conf = target_win
+                                        .sample_confidence_f32(MarkerIdx::new(target_m as u32), s)
+                                        .clamp(0.0, 1.0);
+                                    if conf >= 0.999 {
+                                        let a1 = target_win.allele(MarkerIdx::new(target_m as u32), hap1_idx);
+                                        if a1 == 0 { p = AllelePosteriors::Biallelic(0.0); }
+                                        else if a1 == 1 { p = AllelePosteriors::Biallelic(1.0); }
+                                    }
+                                }
+
                                 hap_dosages.push(p.prob(1));
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
@@ -1212,7 +1214,19 @@ target_samples={} target_bytes={}",
                             let mut hap_dosages = Vec::with_capacity(markers_to_process.len());
                             let mut hap_best_gt = Vec::with_capacity(markers_to_process.len());
                             for ref_m in markers_to_process.clone() {
-                                let p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+                                let mut p = state_probs.allele_posteriors(ref_m, 2, &get_ref);
+
+                                if let Some(target_m) = alignment.target_marker(ref_m) {
+                                    let conf = target_win
+                                        .sample_confidence_f32(MarkerIdx::new(target_m as u32), s)
+                                        .clamp(0.0, 1.0);
+                                    if conf >= 0.999 {
+                                        let a2 = target_win.allele(MarkerIdx::new(target_m as u32), hap2_idx);
+                                        if a2 == 0 { p = AllelePosteriors::Biallelic(0.0); }
+                                        else if a2 == 1 { p = AllelePosteriors::Biallelic(1.0); }
+                                    }
+                                }
+
                                 hap_dosages.push(p.prob(1));
                                 hap_best_gt.push(if p.max_allele() == 1 { (1, 0) } else { (0, 0) });
                             }
@@ -1424,6 +1438,34 @@ target_samples={} target_bytes={}",
                 } else {
                     AllelePosteriors::Multiallelic(vec![0.0f32; n_alleles])
                 };
+
+                // Check for genotyped marker with high confidence
+                if let Some(target_m) = alignment.target_marker(marker_idx) {
+                    let conf = target_win
+                        .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
+                        .clamp(0.0, 1.0);
+
+                    if conf >= 0.999 {
+                        let h1 = HapIdx::new((sample_idx * 2) as u32);
+                        let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                        let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                        let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                        if a1 != 255 && a2 != 255 && (a1 as usize) < n_alleles && (a2 as usize) < n_alleles {
+                            let force_post = |allele: u8| -> AllelePosteriors {
+                                if n_alleles == 2 {
+                                    AllelePosteriors::Biallelic(if allele == 1 { 1.0 } else { 0.0 })
+                                } else {
+                                    let mut probs = vec![0.0; n_alleles];
+                                    probs[allele as usize] = 1.0;
+                                    AllelePosteriors::Multiallelic(probs)
+                                }
+                            };
+                            return (force_post(a1), force_post(a2));
+                        }
+                    }
+                }
+
                 if let Some((p1, p2)) = sample_posteriors.get(&sample_idx) {
                     let get_ref = |marker: usize, h: u32| {
                         let ref_allele = ref_win.allele(
