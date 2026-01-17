@@ -17,6 +17,7 @@ use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
 use crate::error::{ReagleError, Result};
+use crate::utils::telemetry::TelemetryBlackboard;
 
 /// Imputation quality statistics for a single marker
 ///
@@ -1009,6 +1010,7 @@ impl VcfWriter {
         end: usize,
         include_gp: bool,
         include_ap: bool,
+        telemetry: Option<&Arc<TelemetryBlackboard>>,
     ) -> Result<()>
     where
         S: PhaseState,
@@ -1166,6 +1168,11 @@ impl VcfWriter {
 
             // Single write for entire line
             self.writer.write_all(line_buf.as_bytes())?;
+
+            // Update progress after each marker
+            if let Some(bb) = telemetry {
+                bb.add_markers(1);
+            }
         }
         Ok(())
     }

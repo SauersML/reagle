@@ -777,6 +777,9 @@ target_samples={} target_bytes={}",
                 bb.set_total_samples(payload.phased_target.n_samples() as u64);
                 bb.set_samples_processed(0);
                 bb.set_markers_processed(0);
+                // Clear stale iteration data from phasing phase
+                bb.set_total_iterations(0);
+                bb.set_current_iteration(0);
                 bb.set_op(&format!("Imputing window {}", payload.window_idx));
             }
             let StreamingPayload {
@@ -1481,6 +1484,7 @@ target_samples={} target_bytes={}",
             bb.set_markers_processed(0);
             bb.set_total_samples(target_win.n_samples() as u64);
             bb.set_samples_processed(0);
+            bb.set_op(&format!("Writing window {} ({} markers)", window_idx, output_markers));
         }
         self.write_imputed_window_streaming(
             ref_win,
@@ -2164,6 +2168,7 @@ target_samples={} target_bytes={}",
             output_end,
             include_gp,
             include_ap,
+            self.telemetry.as_ref(),
         )
     }
 }

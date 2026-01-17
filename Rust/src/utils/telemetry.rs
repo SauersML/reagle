@@ -165,6 +165,11 @@ impl TelemetryBlackboard {
         self.touch_progress();
     }
 
+    pub fn add_markers(&self, delta: u64) {
+        self.markers_processed.fetch_add(delta, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
     pub fn set_op(&self, op: &str) {
         if let Ok(mut guard) = self.current_op.write() {
             guard.clear();
