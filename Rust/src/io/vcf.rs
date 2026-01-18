@@ -72,8 +72,9 @@ impl MarkerImputationStats {
 
         let sum = self.sum_p[allele];
         let n = self.n_haps as f32;
-        if sum == 0.0 || (sum - n).abs() <= 1e-8 {
-            return 1.0;
+        // Robust check for monomorphic sites (sum approx 0 or n)
+        if sum.abs() < 1e-5 || (sum - n).abs() < 1e-5 {
+            return 0.0;
         }
 
         let sum_sq = self.sum_p_sq[allele];
@@ -805,9 +806,9 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     };
 
     // Uniform or near-uniform GLs contain no information about the call.
-    // Treat as missing confidence so downstream logic preserves the input GT.
+    // Return 0 confidence so downstream logic treats it as uninformative (no penalty).
     if gl_gap.abs() < 1e-6 {
-        return None;
+        return Some(0);
     }
 
     // Check if called genotype is the most likely
