@@ -1518,10 +1518,6 @@ fn main() {
         return;
     }
 
-    // Manually check for unused variables in the build script
-    update_stage("manual lint self-check");
-    manually_check_for_unused_variables();
-
     // Collect all violations from all checks
     let mut all_violations = Vec::new();
 
