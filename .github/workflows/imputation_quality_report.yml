@@ -3,6 +3,14 @@ name: Imputation Quality Benchmark
 on:
   workflow_dispatch:
   push:
+    branches: [ "main" ]
+    paths:
+      - 'src/**'
+      - 'tests/imputation_quality.rs'
+      - 'scripts/plot_quality.py'
+      - '.github/workflows/imputation_quality_report.yml'
+  pull_request:
+    branches: [ "main" ]
     paths:
       - 'src/**'
       - 'tests/imputation_quality.rs'
@@ -93,43 +101,47 @@ jobs:
             chrom=22 \
             nthreads=2
 
-      - name: Run Quality Metrics (Rust Test)
-        run: |
-          # We use the Truth VCF (WGS) for the person.
-          # BUT wait, the matrix runs on Array data. We need the corresponding WGS Truth VCF.
-          # Reagle repo has WGS data in `data/`?
-          # "One WGS file per person"
-          
-          PERSON="${{ matrix.person }}"
-          if [[ "$PERSON" == "Kat" ]]; then
-             TRUTH_DIR="data/kat_suricata"
-             # Reconstruct WGS
-             cat $TRUTH_DIR/KatSuricata*.part* > truth_full.vcf.gz
-          else
-             TRUTH_DIR="data/christopher_smith"
-             # Reconstruct WGS (assuming it exists and is split)
-             # Based on previous ls: "NG1LRQNESI.hard-filtered.vcf.gz"
-             cat $TRUTH_DIR/NG1LRQNESI*.part* > truth_full.vcf.gz
-          fi
-          
-          # Filter Truth to Chr22 and subset to common sites for fair comparison?
-          # Actually, metrics should be on ALL imputed sites where Truth exists.
-          bcftools view truth_full.vcf.gz --regions chr22 -Oz -o truth.vcf.gz
-          tabix truth.vcf.gz
-          
-          # Run Rust Logic via test harness
-          export TEST_TRUTH_VCF="truth.vcf.gz"
-          
-          # Reagle Metrics
-          export TEST_IMP_VCF="reagle_out.vcf.gz"
-          export TEST_OUTPUT_JSON="reagle_metrics.json"
-          cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
-          
-          # Beagle Metrics
-          export TEST_IMP_VCF="beagle_out.vcf.gz"
-          export TEST_OUTPUT_JSON="beagle_metrics.json"
-          cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
-
+            - name: Run Quality Metrics (Rust Test)
+              run: |
+                # We use the Truth VCF (WGS) for the person.
+                PERSON="${{ matrix.person }}"
+                if [[ "$PERSON" == "Kat" ]]; then
+                   TRUTH_DIR="data/kat_suricata"
+                   # Reconstruct WGS
+                   if ls $TRUTH_DIR/KatSuricata*.part* 1> /dev/null 2>&1; then
+                       cat $TRUTH_DIR/KatSuricata*.part* > truth_full.vcf.gz
+                   else
+                       # Fallback if already combined or zipped
+                       find $TRUTH_DIR -name "KatSuricata*.vcf.gz" -exec cp {} truth_full.vcf.gz \;
+                   fi
+                else
+                   TRUTH_DIR="data/christopher_smith"
+                   # Christopher has a ZIP file for WGS
+                   ZIP_FILE=$(find $TRUTH_DIR -name "genome_Christopher_Smith_v5_Full_*.zip" | head -n 1)
+                   if [[ -f "$ZIP_FILE" ]]; then
+                       unzip -p "$ZIP_FILE" > truth_full.vcf.gz
+                   else
+                       # Fallback to parts if they exist
+                       cat $TRUTH_DIR/NG1LRQNESI*.part* > truth_full.vcf.gz
+                   fi
+                fi
+                
+                # Filter Truth to Chr22
+                bcftools view truth_full.vcf.gz --regions chr22 -Oz -o truth.vcf.gz
+                tabix truth.vcf.gz
+                
+                # Run Rust Logic via test harness
+                export TEST_TRUTH_VCF="truth.vcf.gz"
+                
+                # Reagle Metrics
+                export TEST_IMP_VCF="reagle_out.vcf.gz"
+                export TEST_OUTPUT_JSON="reagle_metrics.json"
+                cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
+                
+                # Beagle Metrics
+                export TEST_IMP_VCF="beagle_out.vcf.gz"
+                export TEST_OUTPUT_JSON="beagle_metrics.json"
+                cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
       - name: Upload Metrics
         uses: actions/upload-artifact@v4
         with:

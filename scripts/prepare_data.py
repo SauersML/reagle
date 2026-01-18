@@ -45,9 +45,9 @@ def run_conversion(input_path, output_vcf):
     
     cmd = [
         "convert_genome",
-        "--input", input_path,
-        "--reference", ref_url,
-        "--output", output_vcf,
+        input_path,
+        ref_url,
+        output_vcf,
         "--format", "vcf"
     ]
     
