@@ -302,7 +302,6 @@ def run_conversion(input_path, output_vcf):
                 print("Error: CrossMap executable not found in PATH.")
                 print(f"PATH: {os.environ.get('PATH')}")
                 try:
-                    import subprocess
                     subprocess.call(["pip", "show", "CrossMap"])
                 except:
                     pass
