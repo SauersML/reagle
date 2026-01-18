@@ -1,0 +1,122 @@
+ Downloading crates ...
+  Downloaded serial_test_derive v3.3.1
+  Downloaded alloca v0.4.0
+  Downloaded page_size v0.6.0
+  Downloaded plotters-backend v0.3.7
+  Downloaded cast v0.3.0
+  Downloaded ciborium-io v0.2.2
+  Downloaded plotters-svg v0.3.7
+  Downloaded ciborium-ll v0.2.2
+  Downloaded serial_test v3.3.1
+  Downloaded tinytemplate v1.2.1
+  Downloaded futures-executor v0.3.31
+  Downloaded sdd v3.0.10
+  Downloaded anes v0.1.6
+  Downloaded criterion-plot v0.8.1
+  Downloaded criterion v0.8.1
+  Downloaded ciborium v0.2.2
+  Downloaded oorandom v11.1.5
+  Downloaded scc v2.4.0
+  Downloaded plotters v0.3.7
+   Compiling futures-core v0.3.31
+   Compiling fastrand v2.3.0
+   Compiling itertools v0.13.0
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.0
+   Compiling find-msvc-tools v0.1.8
+   Compiling futures-lite v2.6.1
+   Compiling shlex v1.3.0
+   Compiling cc v1.2.53
+   Compiling parking_lot_core v0.9.12
+   Compiling reagle v0.1.0 (/app)
+   Compiling cubecl-common v0.6.0
+   Compiling burn-common v0.18.0
+   Compiling ndarray-stats v0.6.0
+   Compiling burn-tensor v0.18.0
+   Compiling alloca v0.4.0
+   Compiling futures-task v0.3.31
+   Compiling ciborium-io v0.2.2
+   Compiling pin-utils v0.1.0
+   Compiling rustix v1.1.3
+   Compiling plotters-backend v0.3.7
+   Compiling slab v0.4.11
+   Compiling futures-util v0.3.31
+   Compiling plotters-svg v0.3.7
+   Compiling ciborium-ll v0.2.2
+   Compiling burn-autodiff v0.18.0
+   Compiling burn-ir v0.18.0
+   Compiling burn-core v0.18.0
+   Compiling cast v0.3.0
+   Compiling bitflags v2.10.0
+   Compiling sdd v3.0.10
+   Compiling linux-raw-sys v0.11.0
+   Compiling scc v2.4.0
+   Compiling parking_lot v0.12.5
+   Compiling burn-ndarray v0.18.0
+   Compiling criterion-plot v0.8.1
+   Compiling futures-executor v0.3.31
+   Compiling ciborium v0.2.2
+   Compiling plotters v0.3.7
+   Compiling tinytemplate v1.2.1
+   Compiling page_size v0.6.0
+   Compiling serial_test_derive v3.3.1
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling tempfile v3.24.0
+   Compiling criterion v0.8.1
+   Compiling serial_test v3.3.1
+   Compiling burn v0.18.0
+   Compiling mini-mcmc v0.8.0 (https://github.com/SauersML/general-mcmc#2469d9dd)
+error: struct `ImputationMetrics` is never constructed
+  --> tests/imputation_quality.rs:11:8
+   |
+11 | struct ImputationMetrics {
+   |        ^^^^^^^^^^^^^^^^^
+   |
+   = note: `-D dead-code` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(dead_code)]`
+
+error: struct `CalibrationMetrics` is never constructed
+  --> tests/imputation_quality.rs:22:8
+   |
+22 | struct CalibrationMetrics {
+   |        ^^^^^^^^^^^^^^^^^^
+
+error: struct `MafMetrics` is never constructed
+  --> tests/imputation_quality.rs:28:8
+   |
+28 | struct MafMetrics {
+   |        ^^^^^^^^^^
+
+error: struct `RecordData` is never constructed
+  --> tests/imputation_quality.rs:33:8
+   |
+33 | struct RecordData {
+   |        ^^^^^^^^^^
+
+error: function `parse_dosage` is never used
+  --> tests/imputation_quality.rs:39:4
+   |
+39 | fn parse_dosage(field: Option<Value>) -> Option<f64> {
+   |    ^^^^^^^^^^^^
+
+error: function `parse_genotype_dose` is never used
+  --> tests/imputation_quality.rs:47:4
+   |
+47 | fn parse_genotype_dose(field: Option<Value>) -> Option<f64> {
+   |    ^^^^^^^^^^^^^^^^^^^
+
+error: function `parse_gp_max` is never used
+  --> tests/imputation_quality.rs:60:4
+   |
+60 | fn parse_gp_max(field: Option<Value>) -> Option<f64> {
+   |    ^^^^^^^^^^^^
+
+error: function `run_metrics` is never used
+  --> tests/imputation_quality.rs:72:4
+   |
+72 | fn run_metrics(truth_path: &Path, imputed_path: &Path, output_json: &Path) {
+   |    ^^^^^^^^^^^
+
+error: could not compile `reagle` (test "imputation_quality") due to 8 previous errors
+warning: build failed, waiting for other jobs to finish...
