@@ -3,8 +3,8 @@ use std::io::BufReader;
 use std::path::Path;
 
 use noodles::vcf;
-use noodles::vcf::variant::record::samples::keys::key;
 use noodles::vcf::variant::record::samples::series::Value;
+use noodles::vcf::variant::record::samples::series::value::Array; 
 use noodles::vcf::variant::record::samples::Sample;
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -13,10 +13,7 @@ struct ImputationMetrics {
     overall_sen: f64,
     overall_concordance: f64,
     r2_aggregate: f64,
-    
-    // Distributions for plotting
     sen_distribution: Vec<f64>,
-    
     calibration: CalibrationMetrics,
     accuracy_by_maf: MafMetrics,
 }
@@ -60,50 +57,68 @@ fn parse_genotype_dose(field: Option<Value>) -> Option<f64> {
     }
 }
 
-use std::str::FromStr; // For Key parsing
-
-// ... (imports)
-
 fn parse_gp_max(field: Option<Value>) -> Option<f64> {
     match field {
-        Some(Value::Array(vals)) => {
-             // Try to iterate if trait allows, otherwise 1.0
-             // noodles 0.83 Array trait has iter()
-             if let Ok(iter) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vals.iter())) {
-                 iter.filter_map(|v| match v {
-                     Some(Value::Float(f)) => Some(f as f64),
-                     _ => None
-                 })
+        Some(Value::Array(Array::Float(vals))) => {
+             vals.iter()
+                 .filter_map(|v| v.ok().flatten())
+                 .map(|f| f as f64)
                  .max_by(|a, b| a.partial_cmp(b).unwrap())
-             } else {
-                 Some(1.0)
-             }
         }
         _ => None,
     }
 }
 
-// ...
+fn run_metrics(truth_path: &Path, imputed_path: &Path, output_json: &Path) {
+    let mut truth_reader = vcf::io::Reader::new(BufReader::new(File::open(truth_path).expect("Open Truth")));
+    let truth_header = truth_reader.read_header().expect("Read Truth Header");
 
+    let mut imp_reader = vcf::io::Reader::new(BufReader::new(File::open(imputed_path).expect("Open Imputed")));
+    let imp_header = imp_reader.read_header().expect("Read Imputed Header");
+
+    let mut metrics_data: Vec<RecordData> = Vec::new();
+    
+    let mut truth_iter = truth_reader.records().peekable();
+    let mut imp_iter = imp_reader.records().peekable();
+    
+    let mut n_processed = 0;
+    
+    while let (Some(Ok(t)), Some(Ok(i))) = (truth_iter.peek(), imp_iter.peek()) {
+        let t_pos = t.variant_start().expect("pos").expect("pos");
+        let i_pos = i.variant_start().expect("pos").expect("pos");
+        
+        if t_pos < i_pos {
+            truth_iter.next();
+            continue;
+        }
+        if i_pos < t_pos {
+            imp_iter.next();
+            continue;
+        }
+        
+        let t = truth_iter.next().unwrap().unwrap();
+        let i = imp_iter.next().unwrap().unwrap();
+        
+        let t_samples = t.samples();
+        let i_samples = i.samples();
+        
+        let t_gt = t_samples.get_index(0);
+        let i_gt = i_samples.get_index(0);
+        
         if let (Some(tgt), Some(igt)) = (t_gt, i_gt) {
-            let truth_dose = parse_genotype_dose(tgt.get(&truth_header, &key::GENOTYPE).transpose().ok().flatten().into_iter().cloned());
+            let truth_dose = parse_genotype_dose(tgt.get(&truth_header, "GT").transpose().ok().flatten().flatten());
             
-            // DS key
-            let ds_key = key::Key::from_str("DS").expect("DS key");
-            let imp_dose = parse_dosage(igt.get(&imp_header, &ds_key).transpose().ok().flatten().into_iter().cloned())
-                .or_else(|| parse_genotype_dose(igt.get(&imp_header, &key::GENOTYPE).transpose().ok().flatten().into_iter().cloned()));
+            let imp_dose = parse_dosage(igt.get(&imp_header, "DS").transpose().ok().flatten().flatten())
+                .or_else(|| parse_genotype_dose(igt.get(&imp_header, "GT").transpose().ok().flatten().flatten()));
 
             if let (Some(td), Some(id)) = (truth_dose, imp_dose) {
-                // GP key
-                let gp_key = key::Key::from_str("GP").expect("GP key");
-                let gp = parse_gp_max(igt.get(&imp_header, &gp_key).transpose().ok().flatten().into_iter().cloned())
-                    .unwrap_or(1.0); 
+                let gp = parse_gp_max(igt.get(&imp_header, "GP").transpose().ok().flatten().flatten()).unwrap_or(1.0); 
 
                 metrics_data.push(RecordData { gt_dose: td, ds: id, gp });
                 n_processed += 1;
             }
         }
-// ...
+    }
     
     let mut sen_sum = 0.0;
     let mut conc_sum = 0.0;
@@ -157,16 +172,6 @@ fn parse_gp_max(field: Option<Value>) -> Option<f64> {
 
 #[test]
 fn test_metrics_calculation_dummy() {
-    // This unit test ensures the logic runs. The integration test in GHA will invoke 
-    // this binary or function logic via a separate harness or by compiling this file 
-    // as a binary `cargo run --bin metric_calc`.
-    // For simplicity in GHA, we can run this test file as a utility if we expose `run_metrics` 
-    // or wrap it in a `main`.
-    
-    // Since this file is in `tests/`, it's compiled as a test binary.
-    // We can add a `#[test]` that checks args and runs `run_metrics` if env vars are set,
-    // acting as a CLI adapter.
-    
     let truth = std::env::var("TEST_TRUTH_VCF");
     let imputed = std::env::var("TEST_IMP_VCF");
     let out = std::env::var("TEST_OUTPUT_JSON");
