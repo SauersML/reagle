@@ -72,8 +72,11 @@ impl MarkerImputationStats {
 
         let sum = self.sum_p[allele];
         let n = self.n_haps as f32;
-        if sum == 0.0 || (sum - n).abs() <= 1e-8 {
-            return 1.0;
+        // Robust check for zero-variance (monomorphic) sites
+        // Returns 0.0 for these sites to avoid statistical errors (undefined R-squared)
+        // This differs from earlier implementation that returned 1.0
+        if sum == 0.0 || (sum - n).abs() <= 1e-5 {
+            return 0.0;
         }
 
         let sum_sq = self.sum_p_sq[allele];
@@ -805,9 +808,11 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     };
 
     // Uniform or near-uniform GLs contain no information about the call.
-    // Treat as missing confidence so downstream logic preserves the input GT.
+    // Treat as missing confidence (Some(0)) so downstream logic preserves the input GT.
+    // Returning None would trigger default fallback to max confidence (255),
+    // causing uncertain calls to be treated as hard constraints.
     if gl_gap.abs() < 1e-6 {
-        return None;
+        return Some(0);
     }
 
     // Check if called genotype is the most likely
@@ -986,7 +991,20 @@ impl VcfWriter {
                 let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
                 let a1 = column.get(hap1);
                 let a2 = column.get(hap2);
-                write!(self.writer, "\t{}|{}", a1, a2)?;
+                
+                // Format alleles: handle 255 as . and values > 9 as numbers
+                write!(self.writer, "\t")?;
+                if a1 == 255 {
+                    write!(self.writer, ".")?;
+                } else {
+                    write!(self.writer, "{}", a1)?;
+                }
+                write!(self.writer, "|")?;
+                if a2 == 255 {
+                    write!(self.writer, ".")?;
+                } else {
+                    write!(self.writer, "{}", a2)?;
+                }
             }
             writeln!(self.writer)?;
         }
@@ -1102,9 +1120,26 @@ impl VcfWriter {
 
                 // Format: \t{a1}|{a2}:{ds}
                 line_buf.push('\t');
-                line_buf.push((b'0' + a1) as char);
+                
+                // Optimized allele formatting
+                if a1 == 255 {
+                    line_buf.push('.');
+                } else if a1 < 10 {
+                    line_buf.push((b'0' + a1) as char);
+                } else {
+                    line_buf.push_str(itoa::Buffer::new().format(a1));
+                }
+
                 line_buf.push('|');
-                line_buf.push((b'0' + a2) as char);
+
+                if a2 == 255 {
+                    line_buf.push('.');
+                } else if a2 < 10 {
+                    line_buf.push((b'0' + a2) as char);
+                } else {
+                    line_buf.push_str(itoa::Buffer::new().format(a2));
+                }
+
                 line_buf.push(':');
                 let v = format_f32_4dp(ds, &mut ryu_buf);
                 line_buf.push_str(&v);
