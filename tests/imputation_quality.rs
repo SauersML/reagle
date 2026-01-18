@@ -60,65 +60,50 @@ fn parse_genotype_dose(field: Option<Value>) -> Option<f64> {
     }
 }
 
+use std::str::FromStr; // For Key parsing
+
+// ... (imports)
+
 fn parse_gp_max(field: Option<Value>) -> Option<f64> {
     match field {
-        Some(Value::Array(..)) => {
-             Some(1.0)
+        Some(Value::Array(vals)) => {
+             // Try to iterate if trait allows, otherwise 1.0
+             // noodles 0.83 Array trait has iter()
+             if let Ok(iter) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vals.iter())) {
+                 iter.filter_map(|v| match v {
+                     Some(Value::Float(f)) => Some(f as f64),
+                     _ => None
+                 })
+                 .max_by(|a, b| a.partial_cmp(b).unwrap())
+             } else {
+                 Some(1.0)
+             }
         }
         _ => None,
     }
 }
 
-fn run_metrics(truth_path: &Path, imputed_path: &Path, output_json: &Path) {
-    let mut truth_reader = vcf::io::Reader::new(BufReader::new(File::open(truth_path).expect("Open Truth")));
-    let truth_header = truth_reader.read_header().expect("Read Truth Header");
+// ...
 
-    let mut imp_reader = vcf::io::Reader::new(BufReader::new(File::open(imputed_path).expect("Open Imputed")));
-    let imp_header = imp_reader.read_header().expect("Read Imputed Header");
-
-    let mut metrics_data: Vec<RecordData> = Vec::new();
-    
-    let mut truth_iter = truth_reader.records().peekable();
-    let mut imp_iter = imp_reader.records().peekable();
-    
-    let mut n_processed = 0;
-    
-    while let (Some(Ok(t)), Some(Ok(i))) = (truth_iter.peek(), imp_iter.peek()) {
-        let t_pos = t.variant_start().expect("pos").unwrap();
-        let i_pos = i.variant_start().expect("pos").unwrap();
-        
-        if t_pos < i_pos {
-            truth_iter.next();
-            continue;
-        }
-        if i_pos < t_pos {
-            imp_iter.next();
-            continue;
-        }
-        
-        let t = truth_iter.next().unwrap().unwrap();
-        let i = imp_iter.next().unwrap().unwrap();
-        
-        let t_samples = t.samples();
-        let i_samples = i.samples();
-        
-        let t_gt = t_samples.get_index(0);
-        let i_gt = i_samples.get_index(0);
-        
         if let (Some(tgt), Some(igt)) = (t_gt, i_gt) {
-            let truth_dose = parse_genotype_dose(tgt.get(&truth_header, &key::GENOTYPE).transpose().ok().flatten().flatten());
+            let truth_dose = parse_genotype_dose(tgt.get(&truth_header, &key::GENOTYPE).transpose().ok().flatten().into_iter().cloned());
             
-            let imp_dose = parse_dosage(igt.get(&imp_header, &key::CONDITIONAL_GENOTYPE_QUALITY).transpose().ok().flatten().flatten())
-                .or_else(|| parse_genotype_dose(igt.get(&imp_header, &key::GENOTYPE).transpose().ok().flatten().flatten()));
+            // DS key
+            let ds_key = key::Key::from_str("DS").expect("DS key");
+            let imp_dose = parse_dosage(igt.get(&imp_header, &ds_key).transpose().ok().flatten().into_iter().cloned())
+                .or_else(|| parse_genotype_dose(igt.get(&imp_header, &key::GENOTYPE).transpose().ok().flatten().into_iter().cloned()));
 
             if let (Some(td), Some(id)) = (truth_dose, imp_dose) {
-                let gp = parse_gp_max(igt.get(&imp_header, &key::GENOTYPE_LIKELIHOODS).transpose().ok().flatten().flatten()).unwrap_or(1.0); 
+                // GP key
+                let gp_key = key::Key::from_str("GP").expect("GP key");
+                let gp = parse_gp_max(igt.get(&imp_header, &gp_key).transpose().ok().flatten().into_iter().cloned())
+                    .unwrap_or(1.0); 
 
                 metrics_data.push(RecordData { gt_dose: td, ds: id, gp });
                 n_processed += 1;
             }
         }
-    }
+// ...
     
     let mut sen_sum = 0.0;
     let mut conc_sum = 0.0;

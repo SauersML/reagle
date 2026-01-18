@@ -62,121 +62,188 @@ jobs:
       - name: Build Reagle
         run: cargo build --release
 
-      - name: Prepare Input Data
-        run: |
-          # Use Python script to install convert_genome, reconstruct parts, and convert to VCF
-          python3 scripts/prepare_data.py "${{ matrix.file_path }}" input_raw.vcf
-          
-          # Filter to Chr22 and compress
-          bcftools view input_raw.vcf --regions chr22 -Oz -o target.vcf.gz
-          tabix target.vcf.gz
+            - name: Prepare Input Data
 
-      - name: Prepare Reference Panel (1kg+HGDP Chr22)
-        run: |
-          # Download a standard Chr22 reference (e.g., from 1000G or a testing repo)
-          # Using a smaller subset for CI stability if full HGDP is unavailable publicly without auth
-          # Fallback: Use 1000G Phase 3 Chr22
-          wget -q http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz -O ref_raw.vcf.gz
-          
-          # Normalize/Filter
-          bcftools view ref_raw.vcf.gz --regions 22 -m 2 -M 2 -v snps -Oz -o ref.vcf.gz
-          tabix -f ref.vcf.gz
+              run: |
 
-      - name: Run Reagle Imputation
-        run: |
-          ./target/release/reagle \
-            --ref ref.vcf.gz \
-            --target target.vcf.gz \
-            --out reagle_out \
-            --chromosome 22
+                # Use Python script to prep everything
 
-      - name: Run Beagle Imputation
-        run: |
-          # Use local jar fixture
-          BEAGLE_JAR="tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
-          java -Xmx6g -jar $BEAGLE_JAR \
-            ref=ref.vcf.gz \
-            gt=target.vcf.gz \
-            out=beagle_out \
-            chrom=22 \
-            nthreads=2
+                # 1. Target (Array)
+
+                python3 scripts/prepare_data.py array "${{ matrix.file_path }}" target.vcf.gz
+
+                
+
+            - name: Prepare Reference Panel
+
+              run: |
+
+                # 2. Reference (Chr22)
+
+                python3 scripts/prepare_data.py reference ref.vcf.gz
+
+      
+
+            - name: Run Reagle Imputation
+
+              run: |
+
+                ./target/release/reagle \
+
+                  --ref ref.vcf.gz \
+
+                  --target target.vcf.gz \
+
+                  --out reagle_out \
+
+                  --chromosome 22
+
+      
+
+            - name: Run Beagle Imputation
+
+              run: |
+
+                BEAGLE_JAR="tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
+
+                java -Xmx6g -jar $BEAGLE_JAR \
+
+                  ref=ref.vcf.gz \
+
+                  gt=target.vcf.gz \
+
+                  out=beagle_out \
+
+                  chrom=22 \
+
+                  nthreads=2
+
+      
 
             - name: Run Quality Metrics (Rust Test)
-              run: |
-                # We use the Truth VCF (WGS) for the person.
-                PERSON="${{ matrix.person }}"
-                if [[ "$PERSON" == "Kat" ]]; then
-                   TRUTH_DIR="data/kat_suricata"
-                   # Reconstruct WGS
-                   if ls $TRUTH_DIR/KatSuricata*.part* 1> /dev/null 2>&1; then
-                       cat $TRUTH_DIR/KatSuricata*.part* > truth_full.vcf.gz
-                   else
-                       # Fallback if already combined or zipped
-                       find $TRUTH_DIR -name "KatSuricata*.vcf.gz" -exec cp {} truth_full.vcf.gz \;
-                   fi
-                else
-                   TRUTH_DIR="data/christopher_smith"
-                   # Christopher has a ZIP file for WGS
-                   ZIP_FILE=$(find $TRUTH_DIR -name "genome_Christopher_Smith_v5_Full_*.zip" | head -n 1)
-                   if [[ -f "$ZIP_FILE" ]]; then
-                       unzip -p "$ZIP_FILE" > truth_full.vcf.gz
-                   else
-                       # Fallback to parts if they exist
-                       cat $TRUTH_DIR/NG1LRQNESI*.part* > truth_full.vcf.gz
-                   fi
-                fi
-                
-                # Filter Truth to Chr22
-                bcftools view truth_full.vcf.gz --regions chr22 -Oz -o truth.vcf.gz
-                tabix truth.vcf.gz
-                
-                # Run Rust Logic via test harness
-                export TEST_TRUTH_VCF="truth.vcf.gz"
-                
-                # Reagle Metrics
-                export TEST_IMP_VCF="reagle_out.vcf.gz"
-                export TEST_OUTPUT_JSON="reagle_metrics.json"
-                cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
-                
-                # Beagle Metrics
-                export TEST_IMP_VCF="beagle_out.vcf.gz"
-                export TEST_OUTPUT_JSON="beagle_metrics.json"
-                cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
-      - name: Upload Metrics
-        uses: actions/upload-artifact@v4
-        with:
-          name: metrics-${{ matrix.person }}-${{ matrix.format }}
-          path: |
-            reagle_metrics.json
-            beagle_metrics.json
 
-  generate-report:
-    needs: impute-and-measure
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+              run: |
+
+                # 3. Truth (WGS)
+
+                # Map person to data dir
+
+                PERSON="${{ matrix.person }}"
+
+                if [[ "$PERSON" == "Kat" ]]; then
+
+                   TRUTH_DIR="data/kat_suricata"
+
+                else
+
+                   TRUTH_DIR="data/christopher_smith"
+
+                fi
+
+                
+
+                python3 scripts/prepare_data.py truth "$TRUTH_DIR" truth.vcf.gz
+
+                
+
+                # Run Rust Metrics
+
+                export TEST_TRUTH_VCF="truth.vcf.gz"
+
+                
+
+                # Reagle Metrics
+
+                export TEST_IMP_VCF="reagle_out.vcf.gz"
+
+                export TEST_OUTPUT_JSON="reagle_metrics.json"
+
+                cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
+
+                
+
+                # Beagle Metrics
+
+                export TEST_IMP_VCF="beagle_out.vcf.gz"
+
+                export TEST_OUTPUT_JSON="beagle_metrics.json"
+
+                cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
+
       
-      - name: Download Metrics
-        uses: actions/download-artifact@v4
-        with:
-          path: metrics
-          
-      - name: Install Python Deps
-        run: pip install matplotlib
-        
-      - name: Generate Report
-        run: |
-          # Aggregate or generate individual reports
-          find metrics -name "reagle_metrics.json" | while read fname; do
-             DIR=$(dirname "$fname")
-             python3 scripts/plot_quality.py "$DIR"
-             
-             echo "" >> $GITHUB_STEP_SUMMARY
-             cat "$DIR/summary.md" >> $GITHUB_STEP_SUMMARY
-          done
-          
-      - name: Upload Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: imputation-reports
-          path: "*.html"
+
+            - name: Upload Metrics
+
+              uses: actions/upload-artifact@v4
+
+              with:
+
+                name: metrics-${{ matrix.person }}-${{ matrix.format }}
+
+                path: |
+
+                  reagle_metrics.json
+
+                  beagle_metrics.json
+
+      
+
+        generate-report:
+
+          needs: impute-and-measure
+
+          runs-on: ubuntu-latest
+
+          steps:
+
+            - uses: actions/checkout@v4
+
+            
+
+            - name: Download Metrics
+
+              uses: actions/download-artifact@v4
+
+              with:
+
+                path: metrics
+
+                
+
+            - name: Install Python Deps
+
+              run: pip install matplotlib
+
+              
+
+            - name: Generate Report
+
+              run: |
+
+                find metrics -name "reagle_metrics.json" | while read fname; do
+
+                   DIR=$(dirname "$fname")
+
+                   # Generate report (HTML with images, MD text-only summary)
+
+                   python3 scripts/plot_quality.py "$DIR"
+
+                   
+
+                   echo "" >> $GITHUB_STEP_SUMMARY
+
+                   cat "$DIR/summary.md" >> $GITHUB_STEP_SUMMARY
+
+                done
+
+                
+
+            - name: Upload HTML Reports
+
+              uses: actions/upload-artifact@v4
+
+              with:
+
+                name: imputation-reports
+
+                path: "metrics/**/*.html"
