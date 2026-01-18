@@ -60,15 +60,34 @@ def generate_reports(data_dir):
 {chr(10).join(rows)}
 
 #### Calibration & SEN Distribution
-| Reagle | Beagle |
-|---|---|
-| ![]({r_cal}) | ![]({b_cal}) |
-| ![]({r_sen}) | ![]({b_sen}) |
+*Note: Plots may not render in Job Summary. Check HTML artifacts.*
 """
     with open(os.path.join(data_dir, "summary.md"), 'w') as f:
         f.write(md)
     
-    print(f"Summary generated in {data_dir}")
+    # Full HTML Report
+    html_rows = []
+    for tool, m in [("Reagle", r_data), ("Beagle", b_data)]:
+        html_rows.append(f"<tr><td>{tool}</td><td>{m['overall_sen']:.5f}</td><td>{m['overall_concordance']:.5f}</td><td>{m['n_sites']}</td></tr>")
+
+    html = f"""
+    <html>
+    <head><title>Benchmark Report</title><style>table {{ border-collapse: collapse; }} td, th {{ border: 1px solid black; padding: 8px; }}</style></head>
+    <body>
+    <h1>Imputation Quality: {os.path.basename(data_dir)}</h1>
+    <table><tr><th>Tool</th><th>Mean SEN</th><th>Concordance</th><th>Sites</th></tr>
+    {''.join(html_rows)}
+    </table>
+    <h2>Calibration</h2>
+    <img src="{r_cal}"> <img src="{b_cal}">
+    <h2>SEN Distribution</h2>
+    <img src="{r_sen}"> <img src="{b_sen}">
+    </body></html>
+    """
+    with open(os.path.join(data_dir, "report.html"), 'w') as f:
+        f.write(html)
+    
+    print(f"Reports generated in {data_dir}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
