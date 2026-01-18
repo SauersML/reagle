@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -22,14 +21,12 @@ use crate::error::{Result, ReagleError};
 use crate::io::bref3::RefPanelReader;
 use crate::io::streaming::{HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader, StreamWindow};
 use crate::io::vcf::{VcfWriter, ImputationQuality};
-use crate::pipelines::imputation::{AllelePosteriors, AllelePosteriorCache, ClusterStateProbs};
+use crate::pipelines::imputation::{AllelePosteriors, AllelePosteriorCache};
 use crate::model::imp_utils::*;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::pbwt::PbwtState;
 use crate::utils::workspace::ImpWorkspace;
-
-const PATTERN_BLOCK_SIZE: usize = 32;
 
 fn push_unique(dst: &mut Vec<String>, value: String) {
     if !dst.iter().any(|v| v == &value) {
@@ -55,77 +52,6 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
     candidates
 }
 
-#[derive(Clone, Debug)]
-struct PatternBlock {
-    start: usize,
-    end: usize,
-    hap_to_pattern: Vec<u32>,
-    pattern_alleles: Vec<Vec<u8>>,
-}
-
-impl PatternBlock {
-    fn block_id(&self) -> usize {
-        self.start
-    }
-
-    fn hap_to_pattern(&self) -> &[u32] {
-        &self.hap_to_pattern
-    }
-
-    fn pattern_alleles(&self, marker: usize) -> Option<&[u8]> {
-        if marker < self.start || marker >= self.end {
-            return None;
-        }
-        let offset = marker - self.start;
-        self.pattern_alleles.get(offset).map(|v| v.as_slice())
-    }
-}
-
-fn build_pattern_block(ref_win: &GenotypeMatrix<Phased>, start: usize, end: usize) -> PatternBlock {
-    use std::collections::HashMap;
-
-    let n_haps = ref_win.n_haplotypes();
-    let block_len = end.saturating_sub(start).max(1);
-    let mut hap_to_pattern = vec![0u32; n_haps];
-    let mut patterns: Vec<Vec<u8>> = Vec::new();
-    let mut pattern_map: HashMap<Vec<u8>, u32> = HashMap::new();
-
-    for h in 0..n_haps {
-        let hap = HapIdx::new(h as u32);
-        let mut seq = Vec::with_capacity(block_len);
-        for m in start..end {
-            let allele = ref_win.allele(MarkerIdx::new(m as u32), hap);
-            seq.push(allele);
-        }
-        let pat_idx = if let Some(&idx) = pattern_map.get(&seq) {
-            idx
-        } else {
-            let idx = patterns.len() as u32;
-            pattern_map.insert(seq.clone(), idx);
-            patterns.push(seq);
-            idx
-        };
-        hap_to_pattern[h] = pat_idx;
-    }
-
-    let n_patterns = patterns.len();
-    let mut pattern_alleles: Vec<Vec<u8>> = Vec::with_capacity(block_len);
-    for offset in 0..block_len {
-        let mut alleles = Vec::with_capacity(n_patterns);
-        for pat in &patterns {
-            let allele = pat.get(offset).copied().unwrap_or(255);
-            alleles.push(allele);
-        }
-        pattern_alleles.push(alleles);
-    }
-
-    PatternBlock {
-        start,
-        end,
-        hap_to_pattern,
-        pattern_alleles,
-    }
-}
 
 fn should_stream_ref_vcf(path: &Path, window_markers: usize) -> Option<u64> {
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
