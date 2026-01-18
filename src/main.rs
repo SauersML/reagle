@@ -16,18 +16,12 @@
 
 use std::time::Instant;
 
-mod config;
-mod data;
-mod error;
-mod io;
-mod model;
-mod pipelines;
-mod utils;
-
-use config::Config;
-use error::Result;
-use pipelines::{ImputationPipeline, PhasingPipeline};
-use utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
+use reagle::Config;
+use reagle::Result;
+use reagle::{ImputationPipeline, PhasingPipeline};
+use reagle::utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::fmt::format::FmtSpan;
 
 fn main() {
     if let Err(e) = run() {
@@ -38,9 +32,6 @@ fn main() {
 
 /// Initialize tracing subscriber for hierarchical profiling output
 fn init_profiling() {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
-    use tracing_subscriber::fmt::format::FmtSpan;
-
     tracing_subscriber::registry()
         .with(
             fmt::layer()
@@ -110,16 +101,14 @@ fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_module_imports() {
-        // Verify all modules are accessible
-        let _ = config::Config::parse_and_validate;
-        let _ = error::ReagleError::vcf("test");
-        let _ = data::marker::MarkerIdx::new;
-        let _ = io::vcf::VcfReader::open;
-        let _ = model::parameters::ModelParams::new;
-        let _ = pipelines::PhasingPipeline::new;
+        // Verify all modules are accessible via library
+        let _ = reagle::Config::parse_and_validate;
+        let _ = reagle::ReagleError::vcf("test");
+        let _ = reagle::MarkerIdx::new;
+        let _ = reagle::VcfReader::open;
+        let _ = reagle::ModelParams::new;
+        let _ = reagle::PhasingPipeline::new;
     }
 }
