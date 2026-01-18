@@ -73,18 +73,23 @@ impl PbwtWavefront {
     }
 
     #[inline]
-    fn push_unique(out: &mut Vec<u32>, cand: u32, target: u32) {
-        if cand == target {
-            return;
+    fn finalize_candidates(mut out: Vec<u32>, target: u32, n_candidates: usize) -> Vec<u32> {
+        if out.is_empty() {
+            return out;
         }
-        if out.iter().any(|&h| h == cand) {
-            return;
+        out.sort_unstable();
+        out.dedup();
+        if let Ok(pos) = out.binary_search(&target) {
+            out.remove(pos);
         }
-        out.push(cand);
+        if out.len() > n_candidates {
+            out.truncate(n_candidates);
+        }
+        out
     }
 
-    // Hybrid selection: local core + diverse strided sampling over the full match block.
-    fn select_hybrid_block(
+    // Hybrid selection: local core + diverse strided sampling over a bounded match window.
+    fn select_hybrid_window(
         ppa: &[u32],
         start: usize,
         end: usize,
@@ -103,15 +108,6 @@ impl PbwtWavefront {
         }
 
         let mut out = Vec::with_capacity(n_candidates);
-        if block_len - 1 <= n_candidates {
-            for idx in start..end {
-                Self::push_unique(&mut out, ppa[idx], target);
-            }
-            if out.len() > n_candidates {
-                out.truncate(n_candidates);
-            }
-            return out;
-        }
 
         let mut local = n_candidates / 2;
         if local == 0 {
@@ -129,17 +125,12 @@ impl PbwtWavefront {
         while out.len() < local && (u > start || v < end) {
             if u > start {
                 u -= 1;
-                Self::push_unique(&mut out, ppa[u], target);
+                out.push(ppa[u]);
             }
             if out.len() < local && v < end {
-                Self::push_unique(&mut out, ppa[v], target);
+                out.push(ppa[v]);
                 v += 1;
             }
-        }
-
-        if out.len() >= n_candidates {
-            out.truncate(n_candidates);
-            return out;
         }
 
         // Diverse set: strided with deterministic hash offsets to avoid aliasing.
@@ -151,10 +142,12 @@ impl PbwtWavefront {
             0
         };
 
-        // Always cover edges if possible.
-        Self::push_unique(&mut out, ppa[start], target);
-        if end > start + 1 {
-            Self::push_unique(&mut out, ppa[end - 1], target);
+        // Cover edges only for large blocks to avoid stealing slots on small blocks.
+        if block_len >= n_candidates.saturating_mul(4) {
+            out.push(ppa[start]);
+            if end > start + 1 {
+                out.push(ppa[end - 1]);
+            }
         }
 
         for &offset in &[offset1, offset2] {
@@ -163,29 +156,41 @@ impl PbwtWavefront {
             }
             let mut idx = start + offset;
             while idx < end && out.len() < n_candidates {
-                Self::push_unique(&mut out, ppa[idx], target);
+                out.push(ppa[idx]);
                 idx += stride;
             }
         }
 
-        // If still short, fill by linear scan across the block.
+        // If still short, fill by scanning outward from the target (bounded O(K)).
         if out.len() < n_candidates {
-            for idx in start..end {
-                if out.len() >= n_candidates {
-                    break;
+            let mut u = sorted_pos;
+            let mut v = sorted_pos + 1;
+            while out.len() < n_candidates && (u > 0 || v < ppa.len()) {
+                if u > 0 {
+                    u -= 1;
+                    out.push(ppa[u]);
                 }
-                Self::push_unique(&mut out, ppa[idx], target);
+                if out.len() < n_candidates && v < ppa.len() {
+                    out.push(ppa[v]);
+                    v += 1;
+                }
             }
         }
 
-        out
+        Self::finalize_candidates(out, target, n_candidates)
     }
 
-    fn fwd_match_block(&self, sorted_pos: usize, marker_i32: i32) -> (usize, usize) {
+    fn fwd_window_bounded(
+        &self,
+        sorted_pos: usize,
+        marker_i32: i32,
+        max_span: usize,
+    ) -> (usize, usize) {
         let mut start = sorted_pos;
         let mut max_div = i32::MIN;
         let mut u = sorted_pos;
-        while u > 0 {
+        let mut steps = 0usize;
+        while u > 0 && steps < max_span {
             let div = self.fwd_div.get(u).copied().unwrap_or(i32::MAX);
             max_div = max_div.max(div);
             if max_div > marker_i32 {
@@ -193,12 +198,14 @@ impl PbwtWavefront {
             }
             u -= 1;
             start = u;
+            steps += 1;
         }
 
         let mut end = sorted_pos + 1;
         let mut max_div_down = i32::MIN;
         let mut v = sorted_pos + 1;
-        while v < self.n_haps {
+        steps = 0;
+        while v < self.n_haps && steps < max_span {
             let div = self.fwd_div.get(v).copied().unwrap_or(i32::MAX);
             max_div_down = max_div_down.max(div);
             if max_div_down > marker_i32 {
@@ -206,15 +213,22 @@ impl PbwtWavefront {
             }
             v += 1;
             end = v;
+            steps += 1;
         }
         (start, end)
     }
 
-    fn bwd_match_block(&self, sorted_pos: usize, marker_i32: i32) -> (usize, usize) {
+    fn bwd_window_bounded(
+        &self,
+        sorted_pos: usize,
+        marker_i32: i32,
+        max_span: usize,
+    ) -> (usize, usize) {
         let mut start = sorted_pos;
         let mut min_div = i32::MAX;
         let mut u = sorted_pos;
-        while u > 0 {
+        let mut steps = 0usize;
+        while u > 0 && steps < max_span {
             let div = self.bwd_div.get(u).copied().unwrap_or(0);
             min_div = min_div.min(div);
             if min_div < marker_i32 {
@@ -222,12 +236,14 @@ impl PbwtWavefront {
             }
             u -= 1;
             start = u;
+            steps += 1;
         }
 
         let mut end = sorted_pos + 1;
         let mut min_div_down = i32::MAX;
         let mut v = sorted_pos + 1;
-        while v < self.n_haps {
+        steps = 0;
+        while v < self.n_haps && steps < max_span {
             let div = self.bwd_div.get(v).copied().unwrap_or(0);
             min_div_down = min_div_down.min(div);
             if min_div_down < marker_i32 {
@@ -235,6 +251,7 @@ impl PbwtWavefront {
             }
             v += 1;
             end = v;
+            steps += 1;
         }
         (start, end)
     }
@@ -387,9 +404,10 @@ impl PbwtWavefront {
 
         let sorted_pos = self.fwd_inverse[hap_idx as usize] as usize;
         let marker_i32 = (self.fwd_marker.saturating_sub(1)) as i32;
-        let (start, end) = self.fwd_match_block(sorted_pos, marker_i32);
-        let marker = self.fwd_marker;
-        Self::select_hybrid_block(
+        let max_span = n_candidates.saturating_mul(8).max(32);
+        let (start, end) = self.fwd_window_bounded(sorted_pos, marker_i32, max_span);
+        let marker = self.fwd_marker as u32;
+        Self::select_hybrid_window(
             &self.fwd_ppa,
             start,
             end,
@@ -409,9 +427,10 @@ impl PbwtWavefront {
 
         let sorted_pos = self.bwd_inverse[hap_idx as usize] as usize;
         let marker_i32 = self.bwd_marker as i32;
-        let (start, end) = self.bwd_match_block(sorted_pos, marker_i32);
-        let marker = self.bwd_marker;
-        Self::select_hybrid_block(
+        let max_span = n_candidates.saturating_mul(8).max(32);
+        let (start, end) = self.bwd_window_bounded(sorted_pos, marker_i32, max_span);
+        let marker = self.bwd_marker as u32;
+        Self::select_hybrid_window(
             &self.bwd_ppa,
             start,
             end,
