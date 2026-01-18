@@ -195,8 +195,8 @@ impl PbwtDivUpdater {
             if any_high <= 1 {
                 // Pure 0/1 data - sum equals count of 1s
                 self.counts[0] = self.n_haps - sum;
-                self.counts[1] = sum;
-                self.counts[n_alleles] = 0;
+                self.counts[1] = 0;   // Bin 1: Missing (empty)
+                self.counts[2] = sum; // Bin 2: Allele 1
             } else {
                 // Has missing data - need detailed count
                 // This path is rare (<1% of markers) so extra scan is acceptable
@@ -218,15 +218,18 @@ impl PbwtDivUpdater {
                 }
 
                 self.counts[0] = self.n_haps - count1 - count_miss;
-                self.counts[1] = count1;
-                self.counts[n_alleles] = count_miss;
+                self.counts[1] = count_miss; // Bin 1: Missing
+                self.counts[2] = count1;     // Bin 2: Allele 1
             }
         } else {
             // General path for multiallelic
             for i in 0..self.n_haps {
                 let allele = self.permuted_alleles[i] as usize;
-                // Map missing/invalid alleles to the dedicated missing bin
-                let bin = if allele >= n_alleles { n_alleles } else { allele };
+                // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
+                // Shift other alleles up by 1 (0->0, 1->2, 2->3...)
+                let bin = if allele == 0 { 0 }
+                         else if allele >= n_alleles { 1 } 
+                         else { allele + 1 };
                 self.counts[bin] += 1;
             }
         }
@@ -240,7 +243,8 @@ impl PbwtDivUpdater {
 
         // 3. Check if there's any missing data (before resetting counts)
         // This lets us use a faster 2-bin path when there's no missing data
-        let has_missing = self.counts[n_alleles] > 0;
+        // Missing data is now in Bin 1
+        let has_missing = self.counts[1] > 0;
 
         // 4. Initialize p array and reset counts for scatter pass
         let init_value = (marker + 1) as i32;
@@ -255,7 +259,7 @@ impl PbwtDivUpdater {
             let mut p0 = init_value;
             let mut p1 = init_value;
             let base0 = self.offsets[0];
-            let base1 = self.offsets[1];
+            let base1 = self.offsets[2]; // Allele 1 is now in Bin 2
             let mut count0 = 0usize;
             let mut count1 = 0usize;
 
@@ -288,8 +292,8 @@ impl PbwtDivUpdater {
             let mut p1 = init_value;
             let mut p_miss = init_value;
             let base0 = self.offsets[0];
-            let base1 = self.offsets[1];
-            let base_miss = self.offsets[2];
+            let base_miss = self.offsets[1]; // Missing is now in Bin 1
+            let base1 = self.offsets[2];     // Allele 1 is now in Bin 2
             let mut count0 = 0usize;
             let mut count1 = 0usize;
             let mut count_miss = 0usize;
@@ -336,8 +340,11 @@ impl PbwtDivUpdater {
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = self.permuted_alleles[i] as usize; // Sequential access
-                // Map missing/invalid alleles to the dedicated missing bin
-                let bin = if allele >= n_alleles { n_alleles } else { allele };
+                // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
+                // Shift other alleles up by 1
+                let bin = if allele == 0 { 0 }
+                         else if allele >= n_alleles { 1 } 
+                         else { allele + 1 };
 
                 // Update p (Max Divergence Propagation) for ALL bins
                 for j in 0..n_bins {
@@ -447,8 +454,8 @@ impl PbwtDivUpdater {
             if any_high <= 1 {
                 // Pure 0/1 data - sum equals count of 1s
                 self.counts[0] = self.n_haps - sum;
-                self.counts[1] = sum;
-                self.counts[n_alleles] = 0;
+                self.counts[1] = 0;   // Bin 1: Missing (empty)
+                self.counts[2] = sum; // Bin 2: Allele 1
             } else {
                 // Has missing data - need detailed count
                 let mut count1 = 0usize;
@@ -469,14 +476,18 @@ impl PbwtDivUpdater {
                 }
 
                 self.counts[0] = self.n_haps - count1 - count_miss;
-                self.counts[1] = count1;
-                self.counts[n_alleles] = count_miss;
+                self.counts[1] = count_miss; // Bin 1: Missing
+                self.counts[2] = count1;     // Bin 2: Allele 1
             }
         } else {
             // General path for multiallelic
             for i in 0..self.n_haps {
                 let allele = self.permuted_alleles[i] as usize;
-                let bin = if allele >= n_alleles { n_alleles } else { allele };
+                // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
+                // Shift other alleles up by 1
+                let bin = if allele == 0 { 0 }
+                         else if allele >= n_alleles { 1 } 
+                         else { allele + 1 };
                 self.counts[bin] += 1;
             }
         }
@@ -489,7 +500,7 @@ impl PbwtDivUpdater {
         }
 
         // 4. Check if there's any missing data (before resetting counts)
-        let has_missing = self.counts[n_alleles] > 0;
+        let has_missing = self.counts[1] > 0;
 
         // 5. Scatter with MIN propagation for backward PBWT
         // p[j] tracks the minimum divergence seen since last output for allele j
@@ -502,7 +513,7 @@ impl PbwtDivUpdater {
             let mut p0 = init_value;
             let mut p1 = init_value;
             let base0 = self.offsets[0];
-            let base1 = self.offsets[1];
+            let base1 = self.offsets[2]; // Allele 1 is now in Bin 2
             let mut count0 = 0usize;
             let mut count1 = 0usize;
 
@@ -535,8 +546,8 @@ impl PbwtDivUpdater {
             let mut p1 = init_value;
             let mut p_miss = init_value;
             let base0 = self.offsets[0];
-            let base1 = self.offsets[1];
-            let base_miss = self.offsets[2];
+            let base_miss = self.offsets[1]; // Missing is now in Bin 1
+            let base1 = self.offsets[2];     // Allele 1 is now in Bin 2
             let mut count0 = 0usize;
             let mut count1 = 0usize;
             let mut count_miss = 0usize;
@@ -582,8 +593,11 @@ impl PbwtDivUpdater {
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = self.permuted_alleles[i] as usize; // Sequential access
-                // Map missing/invalid alleles to the dedicated missing bin
-                let bin = if allele >= n_alleles { n_alleles } else { allele };
+                // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
+                // Shift other alleles up by 1
+                let bin = if allele == 0 { 0 }
+                         else if allele >= n_alleles { 1 } 
+                         else { allele + 1 };
 
                 // Update p: min(p, div) for backward PBWT
                 // Smaller divergence = earlier end point = shorter match
@@ -757,38 +771,36 @@ mod tests {
         let alleles = vec![0u8, 1, 255, 0];
         updater.fwd_update(&alleles, 2, 0, &mut prefix, &mut divergence);
 
-        // With the fix: missing (255) goes to bin 2 (separate from REF and ALT)
-        // Sorted order should be: [REF haps (0,3), ALT haps (1), MISSING haps (2)]
-        // = [0, 3, 1, 2] or similar grouping
-
-        // Key assertion: hap 2 (MISSING) should NOT be grouped with hap 0 (REF)
-        // Find positions of hap 0 and hap 2 in sorted array
+        // With the fix: missing (255) goes to Bin 1 (between REF and ALT)
+        // Sorted order should be: [REF haps (0,3), MISSING hap (2), ALT hap (1)]
+        // This ensures the missing haplotype has access to neighbors from BOTH Ref and Alt groups.
+        
         let hap0_pos = prefix.iter().position(|&h| h == 0).unwrap();
-        let hap2_pos = prefix.iter().position(|&h| h == 2).unwrap();
         let hap1_pos = prefix.iter().position(|&h| h == 1).unwrap();
+        let hap2_pos = prefix.iter().position(|&h| h == 2).unwrap();
         let hap3_pos = prefix.iter().position(|&h| h == 3).unwrap();
 
-        // REF haps (0 and 3) should be adjacent (grouped together)
+        // 1. REF haps (0 and 3) should be adjacent (grouped together)
         assert!(
             (hap0_pos as i32 - hap3_pos as i32).abs() == 1,
             "REF haps 0 and 3 should be adjacent in PBWT. Positions: hap0={}, hap3={}",
             hap0_pos, hap3_pos
         );
 
-        // MISSING hap (2) should NOT be adjacent to REF haps
-        // If the bug existed, hap 2 would be in the REF group
-        let hap2_near_ref = (hap2_pos as i32 - hap0_pos as i32).abs() == 1
-            || (hap2_pos as i32 - hap3_pos as i32).abs() == 1;
-
-        // hap 2 should be in its own bin at the end, not adjacent to REF
-        // Actually, the order is: REF bin, ALT bin, MISSING bin
-        // So hap 2 should be at the end (position 3)
+        // 2. MISSING hap (2) should be positioned BETWEEN Ref and Alt
+        // Max Ref position < Missing Position < Alt Position
+        let max_ref_pos = std::cmp::max(hap0_pos, hap3_pos);
+        
         assert!(
-            !hap2_near_ref || hap1_pos < hap2_pos,
-            "MISSING hap 2 should be in separate bin from REF. \
-             Positions: hap0={}, hap1={}, hap2={}, hap3={}. \
-             If hap2 is adjacent to REF, reference bias exists!",
-            hap0_pos, hap1_pos, hap2_pos, hap3_pos
+            max_ref_pos < hap2_pos,
+            "MISSING hap 2 should come AFTER Ref haps. Positions: max_ref={}, hap2={}",
+            max_ref_pos, hap2_pos
+        );
+        
+        assert!(
+            hap2_pos < hap1_pos,
+            "MISSING hap 2 should come BEFORE Alt hap 1. Positions: hap2={}, hap1={}",
+            hap2_pos, hap1_pos
         );
     }
 
@@ -808,8 +820,9 @@ mod tests {
         let marker = 5; // Use marker 5 so init_value = 4
         updater.bwd_update(&alleles, 2, marker, &mut prefix, &mut divergence);
 
-        // Same logic as forward: MISSING should be in its own bin
+        // Same logic as forward: MISSING should be in Bin 1 (between REF and ALT)
         let hap0_pos = prefix.iter().position(|&h| h == 0).unwrap();
+        let hap1_pos = prefix.iter().position(|&h| h == 1).unwrap();
         let hap2_pos = prefix.iter().position(|&h| h == 2).unwrap();
         let hap3_pos = prefix.iter().position(|&h| h == 3).unwrap();
 
@@ -820,13 +833,19 @@ mod tests {
             hap0_pos, hap3_pos
         );
 
-        // MISSING hap should be separate from REF group
-        let hap2_near_ref = (hap2_pos as i32 - hap0_pos as i32).abs() == 1
-            || (hap2_pos as i32 - hap3_pos as i32).abs() == 1;
+        // MISSING hap (2) should be positioned BETWEEN Ref and Alt
+        let max_ref_pos = std::cmp::max(hap0_pos, hap3_pos);
+        
         assert!(
-            !hap2_near_ref,
-            "MISSING hap 2 should NOT be adjacent to REF haps in backward PBWT. Position: {}",
-            hap2_pos
+            max_ref_pos < hap2_pos,
+            "MISSING hap 2 should come AFTER Ref haps. Positions: max_ref={}, hap2={}",
+            max_ref_pos, hap2_pos
+        );
+        
+        assert!(
+            hap2_pos < hap1_pos,
+            "MISSING hap 2 should come BEFORE Alt hap 1. Positions: hap2={}, hap1={}",
+            hap2_pos, hap1_pos
         );
     }
 }
