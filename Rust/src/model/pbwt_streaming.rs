@@ -58,6 +58,186 @@ pub struct PbwtWavefront {
 }
 
 impl PbwtWavefront {
+    #[inline]
+    fn hash_offset(hap_idx: u32, marker: u32, stride: usize, salt: u64) -> usize {
+        if stride <= 1 {
+            return 0;
+        }
+        let mut x = (hap_idx as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (marker as u64).wrapping_add(salt);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        x ^= x >> 29;
+        (x as usize) % stride
+    }
+
+    #[inline]
+    fn push_unique(out: &mut Vec<u32>, cand: u32, target: u32) {
+        if cand == target {
+            return;
+        }
+        if out.iter().any(|&h| h == cand) {
+            return;
+        }
+        out.push(cand);
+    }
+
+    // Hybrid selection: local core + diverse strided sampling over the full match block.
+    fn select_hybrid_block(
+        ppa: &[u32],
+        start: usize,
+        end: usize,
+        sorted_pos: usize,
+        target: u32,
+        n_candidates: usize,
+        marker: u32,
+        salt: u64,
+    ) -> Vec<u32> {
+        if n_candidates == 0 || start >= end {
+            return Vec::new();
+        }
+        let block_len = end - start;
+        if block_len <= 1 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(n_candidates);
+        if block_len - 1 <= n_candidates {
+            for idx in start..end {
+                Self::push_unique(&mut out, ppa[idx], target);
+            }
+            if out.len() > n_candidates {
+                out.truncate(n_candidates);
+            }
+            return out;
+        }
+
+        let mut local = n_candidates / 2;
+        if local == 0 {
+            local = 1;
+        }
+        let mut diverse = n_candidates - local;
+        if diverse == 0 {
+            diverse = 1;
+            local = n_candidates.saturating_sub(diverse);
+        }
+
+        // Local core: nearest neighbors around target (left/right alternation).
+        let mut u = sorted_pos;
+        let mut v = sorted_pos + 1;
+        while out.len() < local && (u > start || v < end) {
+            if u > start {
+                u -= 1;
+                Self::push_unique(&mut out, ppa[u], target);
+            }
+            if out.len() < local && v < end {
+                Self::push_unique(&mut out, ppa[v], target);
+                v += 1;
+            }
+        }
+
+        if out.len() >= n_candidates {
+            out.truncate(n_candidates);
+            return out;
+        }
+
+        // Diverse set: strided with deterministic hash offsets to avoid aliasing.
+        let stride = (block_len + diverse - 1) / diverse;
+        let offset1 = Self::hash_offset(target, marker, stride, salt);
+        let offset2 = if stride > 1 {
+            (offset1 + stride / 2) % stride
+        } else {
+            0
+        };
+
+        // Always cover edges if possible.
+        Self::push_unique(&mut out, ppa[start], target);
+        if end > start + 1 {
+            Self::push_unique(&mut out, ppa[end - 1], target);
+        }
+
+        for &offset in &[offset1, offset2] {
+            if out.len() >= n_candidates {
+                break;
+            }
+            let mut idx = start + offset;
+            while idx < end && out.len() < n_candidates {
+                Self::push_unique(&mut out, ppa[idx], target);
+                idx += stride;
+            }
+        }
+
+        // If still short, fill by linear scan across the block.
+        if out.len() < n_candidates {
+            for idx in start..end {
+                if out.len() >= n_candidates {
+                    break;
+                }
+                Self::push_unique(&mut out, ppa[idx], target);
+            }
+        }
+
+        out
+    }
+
+    fn fwd_match_block(&self, sorted_pos: usize, marker_i32: i32) -> (usize, usize) {
+        let mut start = sorted_pos;
+        let mut max_div = i32::MIN;
+        let mut u = sorted_pos;
+        while u > 0 {
+            let div = self.fwd_div.get(u).copied().unwrap_or(i32::MAX);
+            max_div = max_div.max(div);
+            if max_div > marker_i32 {
+                break;
+            }
+            u -= 1;
+            start = u;
+        }
+
+        let mut end = sorted_pos + 1;
+        let mut max_div_down = i32::MIN;
+        let mut v = sorted_pos + 1;
+        while v < self.n_haps {
+            let div = self.fwd_div.get(v).copied().unwrap_or(i32::MAX);
+            max_div_down = max_div_down.max(div);
+            if max_div_down > marker_i32 {
+                break;
+            }
+            v += 1;
+            end = v;
+        }
+        (start, end)
+    }
+
+    fn bwd_match_block(&self, sorted_pos: usize, marker_i32: i32) -> (usize, usize) {
+        let mut start = sorted_pos;
+        let mut min_div = i32::MAX;
+        let mut u = sorted_pos;
+        while u > 0 {
+            let div = self.bwd_div.get(u).copied().unwrap_or(0);
+            min_div = min_div.min(div);
+            if min_div < marker_i32 {
+                break;
+            }
+            u -= 1;
+            start = u;
+        }
+
+        let mut end = sorted_pos + 1;
+        let mut min_div_down = i32::MAX;
+        let mut v = sorted_pos + 1;
+        while v < self.n_haps {
+            let div = self.bwd_div.get(v).copied().unwrap_or(0);
+            min_div_down = min_div_down.min(div);
+            if min_div_down < marker_i32 {
+                break;
+            }
+            v += 1;
+            end = v;
+        }
+        (start, end)
+    }
     /// Create a new streaming PBWT wavefront
     pub fn new(n_haps: usize, n_markers: usize) -> Self {
         Self::with_state(n_haps, n_markers, None)
@@ -207,68 +387,18 @@ impl PbwtWavefront {
 
         let sorted_pos = self.fwd_inverse[hap_idx as usize] as usize;
         let marker_i32 = (self.fwd_marker.saturating_sub(1)) as i32;
-
-        let mut result = Vec::with_capacity(n_candidates);
-
-        let mut u = sorted_pos;
-        let mut v = sorted_pos + 1;
-        let mut max_div_up = i32::MIN;
-        let mut max_div_down = i32::MIN;
-
-        while result.len() < n_candidates {
-            let div_up = if u > 0 {
-                self.fwd_div.get(u).copied().unwrap_or(i32::MAX)
-            } else {
-                i32::MAX
-            };
-            let div_down = if v < self.n_haps {
-                self.fwd_div.get(v).copied().unwrap_or(i32::MAX)
-            } else {
-                i32::MAX
-            };
-
-            let up_valid = u > 0 && max_div_up.max(div_up) <= marker_i32;
-            let down_valid = v < self.n_haps && max_div_down.max(div_down) <= marker_i32;
-
-            if !up_valid && !down_valid {
-                break;
-            }
-
-            let go_up = up_valid && (!down_valid || div_up <= div_down);
-
-            if go_up {
-                max_div_up = max_div_up.max(div_up);
-                u -= 1;
-                let h = self.fwd_ppa[u];
-                if h != hap_idx {
-                    result.push(h);
-                }
-            } else {
-                max_div_down = max_div_down.max(div_down);
-                let h = self.fwd_ppa[v];
-                if h != hap_idx {
-                    result.push(h);
-                }
-                v += 1;
-            }
-        }
-
-        while result.len() < n_candidates && u > 0 {
-            u -= 1;
-            let h = self.fwd_ppa[u];
-            if h != hap_idx {
-                result.push(h);
-            }
-        }
-        while result.len() < n_candidates && v < self.n_haps {
-            let h = self.fwd_ppa[v];
-            if h != hap_idx {
-                result.push(h);
-            }
-            v += 1;
-        }
-
-        result
+        let (start, end) = self.fwd_match_block(sorted_pos, marker_i32);
+        let marker = self.fwd_marker;
+        Self::select_hybrid_block(
+            &self.fwd_ppa,
+            start,
+            end,
+            sorted_pos,
+            hap_idx,
+            n_candidates,
+            marker,
+            0xA5A5_5A5A_D00D_1234,
+        )
     }
 
     /// Find backward neighbors for a haplotype (read-only after prepare_bwd_queries)
@@ -279,68 +409,18 @@ impl PbwtWavefront {
 
         let sorted_pos = self.bwd_inverse[hap_idx as usize] as usize;
         let marker_i32 = self.bwd_marker as i32;
-
-        let mut result = Vec::with_capacity(n_candidates);
-
-        let mut u = sorted_pos;
-        let mut v = sorted_pos + 1;
-        let mut min_div_up = i32::MAX;
-        let mut min_div_down = i32::MAX;
-
-        while result.len() < n_candidates {
-            let div_up = if u > 0 {
-                self.bwd_div.get(u).copied().unwrap_or(0)
-            } else {
-                0
-            };
-            let div_down = if v < self.n_haps {
-                self.bwd_div.get(v).copied().unwrap_or(0)
-            } else {
-                0
-            };
-
-            let up_valid = u > 0 && min_div_up.min(div_up) >= marker_i32;
-            let down_valid = v < self.n_haps && min_div_down.min(div_down) >= marker_i32;
-
-            if !up_valid && !down_valid {
-                break;
-            }
-
-            let go_up = up_valid && (!down_valid || div_up >= div_down);
-
-            if go_up {
-                min_div_up = min_div_up.min(div_up);
-                u -= 1;
-                let h = self.bwd_ppa[u];
-                if h != hap_idx {
-                    result.push(h);
-                }
-            } else {
-                min_div_down = min_div_down.min(div_down);
-                let h = self.bwd_ppa[v];
-                if h != hap_idx {
-                    result.push(h);
-                }
-                v += 1;
-            }
-        }
-
-        while result.len() < n_candidates && u > 0 {
-            u -= 1;
-            let h = self.bwd_ppa[u];
-            if h != hap_idx {
-                result.push(h);
-            }
-        }
-        while result.len() < n_candidates && v < self.n_haps {
-            let h = self.bwd_ppa[v];
-            if h != hap_idx {
-                result.push(h);
-            }
-            v += 1;
-        }
-
-        result
+        let (start, end) = self.bwd_match_block(sorted_pos, marker_i32);
+        let marker = self.bwd_marker;
+        Self::select_hybrid_block(
+            &self.bwd_ppa,
+            start,
+            end,
+            sorted_pos,
+            hap_idx,
+            n_candidates,
+            marker,
+            0x5A5A_A5A5_1234_D00D,
+        )
     }
 
 }

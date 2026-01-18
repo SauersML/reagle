@@ -273,6 +273,7 @@ impl crate::pipelines::ImputationPipeline {
             }
         }
 
+        // Multi-point union: query PBWT at left/mid/right typed markers per cluster.
         let mut cluster_query_at_ref = vec![usize::MAX; n_ref_markers];
         if !pbwt_ref_markers.is_empty() {
             for (c, &(start, end)) in cluster_bounds.iter().enumerate() {
@@ -290,14 +291,23 @@ impl crate::pipelines::ImputationPipeline {
                 let left_idx = if pos == 0 { start_idx } else { start_idx + pos - 1 };
                 let right_idx = if start_idx + pos < end_idx { start_idx + pos } else { left_idx };
 
-                let left_m = pbwt_ref_markers[left_idx];
-                let right_m = pbwt_ref_markers[right_idx];
-                let pick = if (mid as isize - left_m as isize).abs() <= (right_m as isize - mid as isize).abs() {
-                    left_m
-                } else {
-                    right_m
+                let left_m = pbwt_ref_markers[start_idx];
+                let right_m = pbwt_ref_markers[end_idx - 1];
+                let mid_m = {
+                    let left_mid = pbwt_ref_markers[left_idx];
+                    let right_mid = pbwt_ref_markers[right_idx];
+                    if (mid as isize - left_mid as isize).abs() <= (right_mid as isize - mid as isize).abs() {
+                        left_mid
+                    } else {
+                        right_mid
+                    }
                 };
-                cluster_query_at_ref[pick] = c;
+
+                for &m in &[left_m, mid_m, right_m] {
+                    if m < cluster_query_at_ref.len() {
+                        cluster_query_at_ref[m] = c;
+                    }
+                }
             }
         }
 
