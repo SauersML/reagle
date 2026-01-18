@@ -163,8 +163,155 @@ struct SampleImputationResult {
     dosages: Vec<f32>,
     best_gt: Vec<(u8, u8)>,
     priors: Option<(HaplotypePriors, HaplotypePriors)>,
-    state_probs: Option<(Arc<ClusterStateProbs>, Arc<ClusterStateProbs>)>,
     hap_alt_probs: Option<(Vec<f32>, Vec<f32>)>,
+    hap_posteriors: Option<(Vec<AllelePosteriors>, Vec<AllelePosteriors>)>,
+}
+
+fn compute_dosage_and_best_gt(
+    marker_idx: usize,
+    sample_idx: usize,
+    p1: f32,
+    p2: f32,
+    target_win: &GenotypeMatrix<Phased>,
+    alignment: &MarkerAlignment,
+) -> (f32, (u8, u8)) {
+    if let Some(target_m) = alignment.target_marker(marker_idx) {
+        let h1 = HapIdx::new((sample_idx * 2) as u32);
+        let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+        let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+        let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+        let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
+        let map_allele = |a: u8| -> u8 {
+            if a == 255 {
+                return 255;
+            }
+            if let Some(m) = mapping {
+                if (a as usize) < m.targ_to_ref.len() {
+                    let r = m.targ_to_ref[a as usize];
+                    if r >= 0 {
+                        r as u8
+                    } else {
+                        255
+                    }
+                } else {
+                    255
+                }
+            } else {
+                a
+            }
+        };
+        let a1 = map_allele(raw_a1);
+        let a2 = map_allele(raw_a2);
+
+        let conf = target_win
+            .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
+            .clamp(0.0, 1.0);
+
+        if a1 < 2 && a2 < 2 {
+            let dosage = (a1 as f32) + (a2 as f32);
+            let gt = if conf >= 0.99 {
+                (a1, a2)
+            } else {
+                let is_het = a1 != a2;
+                let (l00, l01, l11) = if is_het {
+                    (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
+                } else if a1 == 1 {
+                    (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
+                } else {
+                    (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
+                };
+                let p00 = (1.0 - p1) * (1.0 - p2);
+                let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
+                let p11 = p1 * p2;
+                let q00 = p00 * l00;
+                let q01 = p01 * l01;
+                let q11 = p11 * l11;
+                if q11 >= q01 && q11 >= q00 {
+                    (1, 1)
+                } else if q01 >= q00 {
+                    (0, 1)
+                } else {
+                    (0, 0)
+                }
+            };
+            return (dosage, gt);
+        }
+
+        let dosage = if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
+            p1 + p2
+        } else {
+            let is_het = a1 != a2;
+            let (l00, l01, l11) = if is_het {
+                (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
+            } else if a1 == 1 {
+                (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
+            } else {
+                (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
+            };
+            let p00 = (1.0 - p1) * (1.0 - p2);
+            let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
+            let p11 = p1 * p2;
+            let q00 = p00 * l00;
+            let q01 = p01 * l01;
+            let q11 = p11 * l11;
+            let sum = q00 + q01 + q11;
+            if sum > 0.0 {
+                let inv_sum = 1.0 / sum;
+                let q01n = q01 * inv_sum;
+                let q11n = q11 * inv_sum;
+                q01n + 2.0 * q11n
+            } else {
+                let d1 = if a1 != 0 { 1.0 } else { 0.0 };
+                let d2 = if a2 != 0 { 1.0 } else { 0.0 };
+                d1 + d2
+            }
+        };
+
+        let gt = if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
+            if p1 + p2 >= 1.5 {
+                (1, 1)
+            } else if p1 + p2 >= 0.5 {
+                (0, 1)
+            } else {
+                (0, 0)
+            }
+        } else {
+            let is_het = a1 != a2;
+            let (l00, l01, l11) = if is_het {
+                (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
+            } else if a1 == 1 {
+                (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
+            } else {
+                (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
+            };
+            let p00 = (1.0 - p1) * (1.0 - p2);
+            let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
+            let p11 = p1 * p2;
+            let q00 = p00 * l00;
+            let q01 = p01 * l01;
+            let q11 = p11 * l11;
+            if q11 >= q01 && q11 >= q00 {
+                (1, 1)
+            } else if q01 >= q00 {
+                (0, 1)
+            } else {
+                (0, 0)
+            }
+        };
+
+        return (dosage, gt);
+    }
+
+    let dosage = p1 + p2;
+    let gt = if dosage >= 1.5 {
+        (1, 1)
+    } else if dosage >= 0.5 {
+        (0, 1)
+    } else {
+        (0, 0)
+    };
+    (dosage, gt)
 }
 
 impl crate::pipelines::ImputationPipeline {
@@ -1034,6 +1181,67 @@ target_samples={} target_bytes={}",
                 gen_maps.gen_pos(chrom, pos)
             })
             .collect();
+        let ref_marker_maps: Vec<Option<Vec<i8>>> = (0..n_ref_markers)
+            .map(|ref_m| {
+                alignment
+                    .target_marker(ref_m)
+                    .and_then(|target_m| {
+                        alignment
+                            .allele_mappings
+                            .get(target_m)
+                            .and_then(|m| m.as_ref())
+                            .map(|m| m.ref_to_targ.clone())
+                    })
+            })
+            .collect();
+        let (ref_alt_mask, ref_missing_mask, ref_alt_freq) = {
+            let mut alt_mask = vec![0u8; n_ref_markers * n_ref_haps];
+            let mut missing_mask = vec![0u8; n_ref_markers * n_ref_haps];
+            let mut alt_freq = vec![0.0f32; n_ref_markers];
+            for m in 0..n_ref_markers {
+                let map_ref_to_targ = ref_marker_maps[m].as_deref();
+                let mut alt_count = 0usize;
+                let mut non_missing = 0usize;
+                let base = m * n_ref_haps;
+                for h in 0..n_ref_haps {
+                    let allele = ref_win.allele(
+                        MarkerIdx::new(m as u32),
+                        HapIdx::new(h as u32),
+                    );
+                    let mapped = if let Some(map) = map_ref_to_targ {
+                        let idx = allele as usize;
+                        if idx < map.len() {
+                            let r = map[idx];
+                            if r >= 0 {
+                                r as u8
+                            } else {
+                                255
+                            }
+                        } else {
+                            255
+                        }
+                    } else {
+                        allele
+                    };
+                    let offset = base + h;
+                    if mapped == 1 {
+                        alt_mask[offset] = 1;
+                        alt_count += 1;
+                        non_missing += 1;
+                    } else if mapped == 0 {
+                        non_missing += 1;
+                    } else {
+                        missing_mask[offset] = 1;
+                    }
+                }
+                alt_freq[m] = if non_missing > 0 {
+                    alt_count as f32 / non_missing as f32
+                } else {
+                    0.5
+                };
+            }
+            (Arc::new(alt_mask), Arc::new(missing_mask), Arc::new(alt_freq))
+        };
 
         let genotyped_markers: Vec<usize> = alignment
             .ref_to_target
@@ -1114,6 +1322,7 @@ target_samples={} target_bytes={}",
         let max_batch_samples = (max_batch_haps / 2).max(1);
         let batch_size = max_batch_samples.min(n_target_samples).max(1);
         let n_batches = (n_target_samples + batch_size - 1) / batch_size;
+        let include_posteriors = self.config.gp || self.config.ap;
 
         let mut all_results: Vec<SampleImputationResult> = Vec::new();
 
@@ -1171,8 +1380,8 @@ target_samples={} target_bytes={}",
                             dosages: Vec::new(),
                             best_gt: Vec::new(),
                             priors: None,
-                            state_probs: None,
                             hap_alt_probs: None,
+                            hap_posteriors: None,
                         };
                         if let Some(bb) = telemetry.as_ref() {
                             bb.add_samples(1);
@@ -1180,7 +1389,7 @@ target_samples={} target_bytes={}",
                         return result;
                     }
 
-                    let (dosages, best_gt, priors, state_probs_pair, hap_alt_probs) =
+                    let (dosages, best_gt, priors, hap_alt_probs, hap_posteriors) =
                         LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() { *ws_opt = Some(ImpWorkspace::new(n_ref_haps)); }
@@ -1197,7 +1406,6 @@ target_samples={} target_bytes={}",
                             .collect();
 
                         let mut hap_priors: Vec<HaplotypePriors> = Vec::with_capacity(2);
-                        let mut hap_state_probs: Vec<Arc<ClusterStateProbs>> = Vec::with_capacity(2);
 
                         let (hap1_probs, h1_locked, hap1_prior) = {
                             let hap_indices = &hap1_indices;
@@ -1349,14 +1557,99 @@ target_samples={} target_bytes={}",
                             (state_probs, priors)
                         };
 
-                        hap_state_probs.push(Arc::clone(&hap1_probs));
-                        hap_state_probs.push(Arc::clone(&hap2_probs));
-
                         hap_priors.push(hap1_prior);
                         hap_priors.push(hap2_prior);
 
-                        let combined_dosages = Vec::new();
-                        let combined_best_gt = Vec::new();
+                        let output_markers = output_end.saturating_sub(output_start);
+                        let mut combined_dosages = Vec::with_capacity(output_markers);
+                        let mut combined_best_gt = Vec::with_capacity(output_markers);
+                        let mut hap1_alt_probs = Vec::with_capacity(output_markers);
+                        let mut hap2_alt_probs = Vec::with_capacity(output_markers);
+                        let mut hap1_posteriors = Vec::with_capacity(output_markers);
+                        let mut hap2_posteriors = Vec::with_capacity(output_markers);
+
+                        let mut cache1 = AllelePosteriorCache::default();
+                        let mut cache2 = AllelePosteriorCache::default();
+                        for marker_idx in output_start..output_end {
+                            let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
+                            let n_alleles = 1 + marker.alt_alleles.len();
+
+                            let (p1, p2, post1_opt, post2_opt) = if ref_is_biallelic[marker_idx] {
+                                let offset = marker_idx * n_ref_haps;
+                                let alt_mask = &ref_alt_mask[offset..offset + n_ref_haps];
+                                let missing_mask = &ref_missing_mask[offset..offset + n_ref_haps];
+                                let alt_freq = ref_alt_freq[marker_idx];
+                                let p1 = hap1_probs.biallelic_alt_prob_from_masks_simd(
+                                    marker_idx,
+                                    alt_mask,
+                                    missing_mask,
+                                    alt_freq,
+                                );
+                                let p2 = hap2_probs.biallelic_alt_prob_from_masks_simd(
+                                    marker_idx,
+                                    alt_mask,
+                                    missing_mask,
+                                    alt_freq,
+                                );
+                                if include_posteriors {
+                                    (
+                                        p1,
+                                        p2,
+                                        Some(AllelePosteriors::Biallelic(p1)),
+                                        Some(AllelePosteriors::Biallelic(p2)),
+                                    )
+                                } else {
+                                    (p1, p2, None, None)
+                                }
+                            } else {
+                                let column = ref_win.column(MarkerIdx::new(marker_idx as u32));
+                                let map_ref_to_targ = ref_marker_maps[marker_idx].as_deref();
+                                let post1 = hap1_probs.allele_posteriors_for_column_cached(
+                                    marker_idx,
+                                    n_alleles,
+                                    column,
+                                    map_ref_to_targ,
+                                    &mut cache1,
+                                );
+                                let post2 = hap2_probs.allele_posteriors_for_column_cached(
+                                    marker_idx,
+                                    n_alleles,
+                                    column,
+                                    map_ref_to_targ,
+                                    &mut cache2,
+                                );
+                                let p1 = post1.prob(1);
+                                let p2 = post2.prob(1);
+                                if include_posteriors {
+                                    (p1, p2, Some(post1), Some(post2))
+                                } else {
+                                    (p1, p2, None, None)
+                                }
+                            };
+
+                            if include_posteriors {
+                                if let Some(p1) = post1_opt {
+                                    hap1_posteriors.push(p1);
+                                }
+                                if let Some(p2) = post2_opt {
+                                    hap2_posteriors.push(p2);
+                                }
+                            } else {
+                                hap1_alt_probs.push(p1);
+                                hap2_alt_probs.push(p2);
+                            }
+
+                            let (dosage, best_gt) = compute_dosage_and_best_gt(
+                                marker_idx,
+                                s,
+                                p1,
+                                p2,
+                                target_win,
+                                alignment,
+                            );
+                            combined_dosages.push(dosage);
+                            combined_best_gt.push(best_gt);
+                        }
 
                         let priors = if hap_priors.len() == 2 {
                             Some((hap_priors[0].clone(), hap_priors[1].clone()))
@@ -1364,23 +1657,26 @@ target_samples={} target_bytes={}",
                             None
                         };
 
-                        let state_probs_pair = if hap_state_probs.len() == 2 {
-                            Some((Arc::clone(&hap_state_probs[0]), Arc::clone(&hap_state_probs[1])))
+                        let hap_alt_probs = if include_posteriors {
+                            None
+                        } else {
+                            Some((hap1_alt_probs, hap2_alt_probs))
+                        };
+                        let hap_posteriors = if include_posteriors {
+                            Some((hap1_posteriors, hap2_posteriors))
                         } else {
                             None
                         };
 
-                        let hap_alt_probs = None;
-
-                        (combined_dosages, combined_best_gt, priors, state_probs_pair, hap_alt_probs)
+                        (combined_dosages, combined_best_gt, priors, hap_alt_probs, hap_posteriors)
                     });
                     let result = SampleImputationResult {
                         sample_idx: s,
                         dosages,
                         best_gt,
                         priors,
-                        state_probs: state_probs_pair,
                         hap_alt_probs,
+                        hap_posteriors,
                     };
                     if let Some(bb) = telemetry.as_ref() {
                         bb.add_samples(1);
@@ -1507,542 +1803,101 @@ target_samples={} target_bytes={}",
         };
         let _ = &write_span;
 
-        // Build lookup maps for sample -> (dosages, best_gt)
-        let sample_data: std::collections::HashMap<usize, (&Vec<f32>, &Vec<(u8, u8)>)> =
-            all_results
-                .iter()
-                .map(|result| (result.sample_idx, (&result.dosages, &result.best_gt)))
-                .collect();
-        let sample_hap_probs: std::collections::HashMap<usize, (&Vec<f32>, &Vec<f32>)> =
-            all_results
-                .iter()
-                .filter_map(|result| {
-                    result
-                        .hap_alt_probs
-                        .as_ref()
-                        .map(|(p1, p2)| (result.sample_idx, (p1, p2)))
-                })
-                .collect();
-
-        let sample_posteriors: std::collections::HashMap<
-            usize,
-            (&Arc<ClusterStateProbs>, &Arc<ClusterStateProbs>),
-        > = all_results
-            .iter()
-            .filter_map(|result| {
-                result
-                    .state_probs
-                    .as_ref()
-                    .map(|(p1, p2)| (result.sample_idx, (p1, p2)))
-            })
-            .collect();
-        let sample_posteriors = Arc::new(sample_posteriors);
-
         let include_posteriors = include_gp || include_ap;
         let n_samples = target_win.n_samples();
-        struct PatternBlockCache {
-            block_idx: usize,
-            block: Option<Arc<PatternBlock>>,
+        let mut result_by_sample: Vec<Option<&SampleImputationResult>> =
+            vec![None; n_samples];
+        for result in all_results {
+            if result.sample_idx < n_samples {
+                result_by_sample[result.sample_idx] = Some(result);
+            }
         }
-        let pattern_cache = std::cell::RefCell::new(PatternBlockCache {
-            block_idx: usize::MAX,
-            block: None,
-        });
-        let get_pattern_block = |marker_idx: usize| -> Option<Arc<PatternBlock>> {
-            if marker_idx < markers_to_process_start {
-                return None;
+
+        let default_posteriors = |marker_idx: usize| -> (AllelePosteriors, AllelePosteriors) {
+            let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
+            let n_alleles = 1 + marker.alt_alleles.len();
+            if n_alleles == 2 {
+                (
+                    AllelePosteriors::Biallelic(0.0),
+                    AllelePosteriors::Biallelic(0.0),
+                )
+            } else {
+                let zeros = vec![0.0f32; n_alleles];
+                (
+                    AllelePosteriors::Multiallelic(zeros.clone()),
+                    AllelePosteriors::Multiallelic(zeros),
+                )
             }
-            let block_idx = (marker_idx - markers_to_process_start) / PATTERN_BLOCK_SIZE;
-            let mut cache = pattern_cache.borrow_mut();
-            if cache.block_idx != block_idx {
-                let block_start = markers_to_process_start + block_idx * PATTERN_BLOCK_SIZE;
-                let block_end = (block_start + PATTERN_BLOCK_SIZE).min(output_end);
-                cache.block = Some(Arc::new(build_pattern_block(ref_win, block_start, block_end)));
-                cache.block_idx = block_idx;
-            }
-            cache.block.clone()
         };
-        struct PosteriorCache {
-            marker_idx: usize,
-            data: Vec<(AllelePosteriors, AllelePosteriors)>,
-        }
-        let post_cache = std::cell::RefCell::new(PosteriorCache {
-            marker_idx: usize::MAX,
-            data: Vec::new(),
-        });
-        let get_posteriors: Option<
-            Rc<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors) + '_>,
-        > = if include_posteriors {
-            let sample_posteriors = Arc::clone(&sample_posteriors);
-            Some(Rc::new(move |marker_idx, sample_idx| {
-                let mut cache = post_cache.borrow_mut();
-                if cache.marker_idx != marker_idx {
-                    cache.marker_idx = marker_idx;
-                    let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
-                    let n_alleles = 1 + marker.alt_alleles.len();
-                    let default = if n_alleles == 2 {
-                        AllelePosteriors::Biallelic(0.0)
-                    } else {
-                        AllelePosteriors::Multiallelic(vec![0.0f32; n_alleles])
-                    };
-                    let column = ref_win.column(MarkerIdx::new(marker_idx as u32));
-                    let map_ref_to_targ = alignment
-                        .target_marker(marker_idx)
-                        .and_then(|target_m| {
-                            alignment
-                                .allele_mappings
-                                .get(target_m)
-                                .and_then(|m| m.as_ref())
-                                .map(|m| m.ref_to_targ.as_slice())
-                        });
-                    let block = get_pattern_block(marker_idx);
-                    cache.data = (0..n_samples)
-                        .into_par_iter()
-                        .map(|s| {
-                            if let Some((p1, p2)) = sample_posteriors.get(&s) {
-                                let mut local_cache1 = AllelePosteriorCache::default();
-                                let mut local_cache2 = AllelePosteriorCache::default();
-                                let (post1, post2) = match column {
-                                    crate::data::storage::GenotypeColumn::Dense(_)
-                                    | crate::data::storage::GenotypeColumn::Sparse(_) => {
-                                        if let Some(block) = block.as_ref() {
-                                            if let Some(pattern_alleles) = block.pattern_alleles(marker_idx) {
-                                                (
-                                                    p1.allele_posteriors_for_patterns_cached(
-                                                        marker_idx,
-                                                        n_alleles,
-                                                        block.hap_to_pattern(),
-                                                        pattern_alleles,
-                                                        map_ref_to_targ,
-                                                        &mut local_cache1,
-                                                        block.block_id(),
-                                                    ),
-                                                    p2.allele_posteriors_for_patterns_cached(
-                                                        marker_idx,
-                                                        n_alleles,
-                                                        block.hap_to_pattern(),
-                                                        pattern_alleles,
-                                                        map_ref_to_targ,
-                                                        &mut local_cache2,
-                                                        block.block_id(),
-                                                    ),
-                                                )
-                                            } else {
-                                                (
-                                                    p1.allele_posteriors_for_column_cached(
-                                                        marker_idx,
-                                                        n_alleles,
-                                                        column,
-                                                        map_ref_to_targ,
-                                                        &mut local_cache1,
-                                                    ),
-                                                    p2.allele_posteriors_for_column_cached(
-                                                        marker_idx,
-                                                        n_alleles,
-                                                        column,
-                                                        map_ref_to_targ,
-                                                        &mut local_cache2,
-                                                    ),
-                                                )
-                                            }
-                                        } else {
-                                            (
-                                                p1.allele_posteriors_for_column_cached(
-                                                    marker_idx,
-                                                    n_alleles,
-                                                    column,
-                                                    map_ref_to_targ,
-                                                    &mut local_cache1,
-                                                ),
-                                                p2.allele_posteriors_for_column_cached(
-                                                    marker_idx,
-                                                    n_alleles,
-                                                    column,
-                                                    map_ref_to_targ,
-                                                    &mut local_cache2,
-                                                ),
-                                            )
-                                        }
-                                    }
-                                    _ => (
-                                        p1.allele_posteriors_for_column_cached(
-                                            marker_idx,
-                                            n_alleles,
-                                            column,
-                                            map_ref_to_targ,
-                                            &mut local_cache1,
-                                        ),
-                                        p2.allele_posteriors_for_column_cached(
-                                            marker_idx,
-                                            n_alleles,
-                                            column,
-                                            map_ref_to_targ,
-                                            &mut local_cache2,
-                                        ),
-                                    ),
-                                };
-                                (post1, post2)
-                            } else {
-                                (default.clone(), default.clone())
-                            }
-                        })
-                        .collect();
+
+        let get_posteriors_for_writer = if include_posteriors {
+            Some(|marker_idx: usize, sample_idx: usize| {
+                let local_m = marker_idx.saturating_sub(output_start);
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
+                        let post1 = p1
+                            .get(local_m)
+                            .cloned()
+                            .unwrap_or_else(|| default_posteriors(marker_idx).0);
+                        let post2 = p2
+                            .get(local_m)
+                            .cloned()
+                            .unwrap_or_else(|| default_posteriors(marker_idx).1);
+                        return (post1, post2);
+                    }
                 }
-                cache
-                    .data
-                    .get(sample_idx)
-                    .cloned()
-                    .unwrap_or_else(|| (AllelePosteriors::Biallelic(0.0), AllelePosteriors::Biallelic(0.0)))
-            }))
+                default_posteriors(marker_idx)
+            })
         } else {
             None
         };
 
-        struct HapAltCache {
-            marker_idx: usize,
-            data: Vec<(f32, f32)>,
-        }
-        let hap_alt_cache = std::cell::RefCell::new(HapAltCache {
-            marker_idx: usize::MAX,
-            data: Vec::new(),
-        });
-        let get_hap_alt: Option<Box<dyn Fn(usize, usize) -> (f32, f32) + '_>> =
-            if !sample_posteriors.is_empty() && !include_posteriors {
-                let sample_posteriors = Arc::clone(&sample_posteriors);
-                Some(Box::new(move |marker_idx, sample_idx| {
-                    let mut cache = hap_alt_cache.borrow_mut();
-                    if cache.marker_idx != marker_idx {
-                        cache.marker_idx = marker_idx;
-                        let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
-                        let n_alleles = 1 + marker.alt_alleles.len();
-                        let column = ref_win.column(MarkerIdx::new(marker_idx as u32));
-                        let map_ref_to_targ = alignment
-                            .target_marker(marker_idx)
-                            .and_then(|target_m| {
-                                alignment
-                                    .allele_mappings
-                                    .get(target_m)
-                                    .and_then(|m| m.as_ref())
-                                    .map(|m| m.ref_to_targ.as_slice())
-                            });
-                        let block = get_pattern_block(marker_idx);
-                        cache.data = (0..n_samples)
-                            .into_par_iter()
-                            .map(|s| {
-                                if let Some((p1, p2)) = sample_posteriors.get(&s) {
-                                    let mut local_cache1 = AllelePosteriorCache::default();
-                                    let mut local_cache2 = AllelePosteriorCache::default();
-                                    let (post1, post2) = match column {
-                                        crate::data::storage::GenotypeColumn::Dense(_)
-                                        | crate::data::storage::GenotypeColumn::Sparse(_) => {
-                                            if let Some(block) = block.as_ref() {
-                                                if let Some(pattern_alleles) = block.pattern_alleles(marker_idx) {
-                                                    (
-                                                        p1.allele_posteriors_for_patterns_cached(
-                                                            marker_idx,
-                                                            n_alleles,
-                                                            block.hap_to_pattern(),
-                                                            pattern_alleles,
-                                                            map_ref_to_targ,
-                                                            &mut local_cache1,
-                                                            block.block_id(),
-                                                        ),
-                                                        p2.allele_posteriors_for_patterns_cached(
-                                                            marker_idx,
-                                                            n_alleles,
-                                                            block.hap_to_pattern(),
-                                                            pattern_alleles,
-                                                            map_ref_to_targ,
-                                                            &mut local_cache2,
-                                                            block.block_id(),
-                                                        ),
-                                                    )
-                                                } else {
-                                                    (
-                                                        p1.allele_posteriors_for_column_cached(
-                                                            marker_idx,
-                                                            n_alleles,
-                                                            column,
-                                                            map_ref_to_targ,
-                                                            &mut local_cache1,
-                                                        ),
-                                                        p2.allele_posteriors_for_column_cached(
-                                                            marker_idx,
-                                                            n_alleles,
-                                                            column,
-                                                            map_ref_to_targ,
-                                                            &mut local_cache2,
-                                                        ),
-                                                    )
-                                                }
-                                            } else {
-                                                (
-                                                    p1.allele_posteriors_for_column_cached(
-                                                        marker_idx,
-                                                        n_alleles,
-                                                        column,
-                                                        map_ref_to_targ,
-                                                        &mut local_cache1,
-                                                    ),
-                                                    p2.allele_posteriors_for_column_cached(
-                                                        marker_idx,
-                                                        n_alleles,
-                                                        column,
-                                                        map_ref_to_targ,
-                                                        &mut local_cache2,
-                                                    ),
-                                                )
-                                            }
-                                        }
-                                        _ => (
-                                            p1.allele_posteriors_for_column_cached(
-                                                marker_idx,
-                                                n_alleles,
-                                                column,
-                                                map_ref_to_targ,
-                                                &mut local_cache1,
-                                            ),
-                                            p2.allele_posteriors_for_column_cached(
-                                                marker_idx,
-                                                n_alleles,
-                                                column,
-                                                map_ref_to_targ,
-                                                &mut local_cache2,
-                                            ),
-                                        ),
-                                    };
-                                    (post1.prob(1), post2.prob(1))
-                                } else {
-                                    (0.0, 0.0)
-                                }
-                            })
-                            .collect();
-                    }
-                    cache
-                        .data
-                        .get(sample_idx)
-                        .copied()
-                        .unwrap_or((0.0, 0.0))
-                }))
-            } else {
-                None
-            };
-
-        let get_posteriors_for_writer = get_posteriors.as_ref().map(|get_post| {
-            let get_post = Rc::clone(get_post);
-            move |marker_idx: usize, sample_idx: usize| get_post(marker_idx, sample_idx)
-        });
-
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
-        // Dosages array is indexed from 0 for markers starting at markers_to_process_start
+        // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            let local_m = marker_idx.saturating_sub(markers_to_process_start);
-            let (p1, p2) = if let Some((p1, p2)) = sample_hap_probs.get(&sample_idx) {
-                (p1.get(local_m).copied().unwrap_or(0.0), p2.get(local_m).copied().unwrap_or(0.0))
-            } else if let Some(ref get_post) = get_posteriors {
-                let (post1, post2) = get_post(marker_idx, sample_idx);
-                (post1.prob(1), post2.prob(1))
-            } else if let Some(ref get_alt) = get_hap_alt {
-                get_alt(marker_idx, sample_idx)
+            let local_m = marker_idx.saturating_sub(output_start);
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                result.dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
-                (0.0, 0.0)
-            };
-
-            if let Some(target_m) = alignment.target_marker(marker_idx) {
-                let h1 = HapIdx::new((sample_idx * 2) as u32);
-                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-
-                // Map target alleles to reference allele space
-                let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
-                let map_allele = |a: u8| -> u8 {
-                    if a == 255 {
-                        return 255;
-                    }
-                    if let Some(m) = mapping {
-                        if (a as usize) < m.targ_to_ref.len() {
-                            let r = m.targ_to_ref[a as usize];
-                            if r >= 0 {
-                                r as u8
-                            } else {
-                                255
-                            }
-                        } else {
-                            255
-                        }
-                    } else {
-                        a
-                    }
-                };
-                let a1 = map_allele(raw_a1);
-                let a2 = map_allele(raw_a2);
-
-                if a1 < 2 && a2 < 2 {
-                    return (a1 as f32) + (a2 as f32);
-                }
-
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    p1 + p2
-                } else {
-                    let is_het = a1 != a2;
-                    let (l00, l01, l11) = if is_het {
-                        (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                    } else if a1 == 1 {
-                        (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                    } else {
-                        (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                    };
-                    let p00 = (1.0 - p1) * (1.0 - p2);
-                    let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                    let p11 = p1 * p2;
-                    let q00 = p00 * l00;
-                    let q01 = p01 * l01;
-                    let q11 = p11 * l11;
-                    let sum = q00 + q01 + q11;
-                    if sum > 0.0 {
-                        let inv_sum = 1.0 / sum;
-                        let q01n = q01 * inv_sum;
-                        let q11n = q11 * inv_sum;
-                        q01n + 2.0 * q11n
-                    } else {
-                        // If sum is 0, prior and likelihood are disjoint (e.g. prior says 0|0, data says 1|1 with high confidence)
-                        // Trust the data (hard call) if we have it
-                        let d1 = if a1 != 0 { 1.0 } else { 0.0 };
-                        let d2 = if a2 != 0 { 1.0 } else { 0.0 };
-                        d1 + d2
-                    }
-                }
-            } else {
-                if let Some((dosages, _)) = sample_data.get(&sample_idx) {
-                    if !dosages.is_empty() {
-                        dosages.get(local_m).copied().unwrap_or(p1 + p2)
-                    } else {
-                        p1 + p2
-                    }
-                } else {
-                    p1 + p2
-                }
+                0.0
             }
         };
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
-            let local_m = marker_idx.saturating_sub(markers_to_process_start);
-            let (p1, p2) = if let Some((p1, p2)) = sample_hap_probs.get(&sample_idx) {
-                (p1.get(local_m).copied().unwrap_or(0.0), p2.get(local_m).copied().unwrap_or(0.0))
-            } else if let Some(ref get_alt) = get_hap_alt {
-                get_alt(marker_idx, sample_idx)
+            let local_m = marker_idx.saturating_sub(output_start);
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
-                (0.0, 0.0)
-            };
-            if let Some(target_m) = alignment.target_marker(marker_idx) {
-                let h1 = HapIdx::new((sample_idx * 2) as u32);
-                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-
-                // Map target alleles to reference allele space
-                let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
-                let map_allele = |a: u8| -> u8 {
-                    if a == 255 {
-                        return 255;
-                    }
-                    if let Some(m) = mapping {
-                        if (a as usize) < m.targ_to_ref.len() {
-                            let r = m.targ_to_ref[a as usize];
-                            if r >= 0 {
-                                r as u8
-                            } else {
-                                255
-                            }
-                        } else {
-                            255
-                        }
-                    } else {
-                        a
-                    }
-                };
-                let a1 = map_allele(raw_a1);
-                let a2 = map_allele(raw_a2);
-
-                let conf = target_win
-                    .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-                    if p1 + p2 >= 1.5 {
-                        (1, 1)
-                    } else if p1 + p2 >= 0.5 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
-                } else {
-                    // Start with hard-call from mapped alleles
-                    // For phasing preservation, if conf is high, we should respect a1/a2 order
-                    if conf >= 0.99 {
-                        (a1, a2)
-                    } else {
-                        let is_het = a1 != a2;
-                        let (l00, l01, l11) = if is_het {
-                            (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                        } else if a1 == 1 {
-                            (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                        } else {
-                            (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                        };
-                        let p00 = (1.0 - p1) * (1.0 - p2);
-                        let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                        let p11 = p1 * p2;
-                        let q00 = p00 * l00;
-                        let q01 = p01 * l01;
-                        let q11 = p11 * l11;
-                        if q11 >= q01 && q11 >= q00 {
-                            (1, 1)
-                        } else if q01 >= q00 {
-                            (0, 1)
-                        } else {
-                            (0, 0)
-                        }
-                    }
-                }
-            } else {
-                if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
-                    if !best_gt.is_empty() {
-                        best_gt.get(local_m).copied().unwrap_or((0, 0))
-                    } else {
-                        if p1 + p2 >= 1.5 {
-                            (1, 1)
-                        } else if p1 + p2 >= 0.5 {
-                            (0, 1)
-                        } else {
-                            (0, 0)
-                        }
-                    }
-                } else {
-                    if p1 + p2 >= 1.5 {
-                        (1, 1)
-                    } else if p1 + p2 >= 0.5 {
-                        (0, 1)
-                    } else {
-                        (0, 0)
-                    }
-                }
+                (0, 0)
             }
         };
 
-        if let Some(ref get_post) = get_posteriors {
+        let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
+            let local_m = marker_idx.saturating_sub(output_start);
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
+                    let v1 = p1.get(local_m).map(|p| p.prob(1)).unwrap_or(0.0);
+                    let v2 = p2.get(local_m).map(|p| p.prob(1)).unwrap_or(0.0);
+                    return (v1, v2);
+                }
+                if let Some((p1, p2)) = result.hap_alt_probs.as_ref() {
+                    let v1 = p1.get(local_m).copied().unwrap_or(0.0);
+                    let v2 = p2.get(local_m).copied().unwrap_or(0.0);
+                    return (v1, v2);
+                }
+            }
+            (0.0, 0.0)
+        };
+
+        if include_posteriors {
             for marker_idx in markers_to_process_start..output_end {
                 if marker_idx >= ref_is_biallelic.len() || !ref_is_biallelic[marker_idx] {
                     continue;
                 }
                 if let Some(stats) = quality.get_mut(marker_idx) {
                     for s in 0..n_samples {
-                        let (post1, post2) = get_post(marker_idx, s);
-                        let (mut v1, mut v2) = (post1.prob(1), post2.prob(1));
+                        let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
                             if let Some(target_m) = alignment.target_marker(marker_idx) {
                                 let h1 = HapIdx::new((s * 2) as u32);
@@ -2081,14 +1936,14 @@ target_samples={} target_bytes={}",
                     }
                 }
             }
-        } else if let Some(ref get_alt) = get_hap_alt {
+        } else {
             for marker_idx in markers_to_process_start..output_end {
                 if marker_idx >= ref_is_biallelic.len() || !ref_is_biallelic[marker_idx] {
                     continue;
                 }
                 if let Some(stats) = quality.get_mut(marker_idx) {
                     for s in 0..n_samples {
-                        let (mut v1, mut v2) = get_alt(marker_idx, s);
+                        let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
                             if let Some(target_m) = alignment.target_marker(marker_idx) {
                                 let h1 = HapIdx::new((s * 2) as u32);
