@@ -48,74 +48,20 @@ jobs:
         with:
           python-version: '3.10'
           
-      - name: Install Java (for Beagle)
+      - name: Install Java
         uses: actions/setup-java@v3
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Tools
-        run: |
-          # Install bcftools/tabix
-          sudo apt-get update && sudo apt-get install -y bcftools tabix
+      - name: Install System Tools
+        run: sudo apt-get update && sudo apt-get install -y bcftools tabix
 
       - name: Build Reagle
         run: cargo build --release
 
-      - name: Prepare Input Data
-        run: |
-          # Use Python script to prep everything
-          # 1. Target (Array)
-          python3 scripts/prepare_data.py array "${{ matrix.file_path }}" target.vcf.gz
-          
-      - name: Prepare Reference Panel
-        run: |
-          # 2. Reference (Chr22)
-          python3 scripts/prepare_data.py reference ref.vcf.gz
-
-      - name: Run Reagle Imputation
-        run: |
-          ./target/release/reagle \
-            --ref ref.vcf.gz \
-            --gt target.vcf.gz \
-            --out reagle_out \
-            --chrom 22
-
-      - name: Run Beagle Imputation
-        run: |
-          BEAGLE_JAR="tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
-          java -Xmx6g -jar $BEAGLE_JAR \
-            ref=ref.vcf.gz \
-            gt=target.vcf.gz \
-            out=beagle_out \
-            chrom=22 \
-            nthreads=2
-
-      - name: Run Quality Metrics (Rust Test)
-        run: |
-          # 3. Truth (WGS)
-          # Map person to data dir
-          PERSON="${{ matrix.person }}"
-          if [[ "$PERSON" == "Kat" ]]; then
-             TRUTH_DIR="data/kat_suricata"
-          else
-             TRUTH_DIR="data/christopher_smith"
-          fi
-          
-          python3 scripts/prepare_data.py truth "$TRUTH_DIR" truth.vcf.gz
-          
-          # Run Rust Metrics
-          export TEST_TRUTH_VCF="truth.vcf.gz"
-          
-          # Reagle Metrics
-          export TEST_IMP_VCF="reagle_out.vcf.gz"
-          export TEST_OUTPUT_JSON="reagle_metrics.json"
-          cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
-          
-          # Beagle Metrics
-          export TEST_IMP_VCF="beagle_out.vcf.gz"
-          export TEST_OUTPUT_JSON="beagle_metrics.json"
-          cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
+      - name: Run Benchmark
+        run: python3 scripts/benchmark.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}" --format "${{ matrix.format }}"
 
       - name: Upload Metrics
         uses: actions/upload-artifact@v4
@@ -143,9 +89,7 @@ jobs:
         run: |
           find metrics -name "reagle_metrics.json" | while read fname; do
              DIR=$(dirname "$fname")
-             # Generate report (HTML with images, MD text-only summary)
              python3 scripts/plot_quality.py "$DIR"
-             
              echo "" >> $GITHUB_STEP_SUMMARY
              cat "$DIR/summary.md" >> $GITHUB_STEP_SUMMARY
           done
