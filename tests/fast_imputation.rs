@@ -294,6 +294,19 @@ fn compute_mean_dr2(dr2_values: &[f64]) -> f64 {
     valid.iter().sum::<f64>() / valid.len() as f64
 }
 
+/// Calculate Scaled Euclidean Norm (SEN) score
+/// SEN = 1 - mean((truth - imputed)^2) / 4
+/// Range: [0, 1] where 1 is perfect match
+fn calculate_sen(truth: &[f64], imputed: &[f64]) -> f64 {
+    if truth.len() != imputed.len() || truth.is_empty() {
+        return 0.0;
+    }
+    let mse: f64 = truth.iter().zip(imputed.iter())
+        .map(|(t, i)| (t - i).powi(2))
+        .sum::<f64>() / truth.len() as f64;
+    1.0 - (mse / 4.0)
+}
+
 // --- Helper for Config ---
 fn default_test_config() -> Config {
     Config::default()
@@ -354,6 +367,23 @@ fn test_synthetic_slam_dunk() {
     }
     // Clear haplotype structure should give high DR2
     assert!(mean_dr2 > 0.6, "Mean DR2 too low for slam dunk test: {:.4}", mean_dr2);
+
+    // SEN Validation
+    // For slam dunk:
+    // Markers 1, 3... are target sites.
+    // Ref has 0 for h < 50, 1 for h >= 50.
+    // Target matches hap 0 (all 0s) except odd markers are 255 (missing).
+    // So truth at target odd markers is 0.0.
+    // Dosages should be close to 0.0.
+    let mut truth_vec = Vec::new();
+    let mut imp_vec = Vec::new();
+    for m in (1..n_markers).step_by(2) {
+        truth_vec.push(0.0);
+        imp_vec.push(dosages[m][0] as f64);
+    }
+    let sen = calculate_sen(&truth_vec, &imp_vec);
+    println!("Slam dunk test - SEN: {:.4}", sen);
+    assert!(sen > 0.99, "SEN too low for slam dunk test: {:.4}", sen);
 }
 
 #[test]
@@ -417,6 +447,38 @@ fn test_synthetic_recombination() {
     }
     // STRICT: Mean DR2 should be high for well-imputed data with clear haplotype structure
     assert!(mean_dr2 > 0.5, "Mean DR2 too low for recombination test: {:.4} (expected > 0.5)", mean_dr2);
+
+    // SEN Validation
+    // Target:
+    // m < 20: 0
+    // m >= 20: 1
+    // Missing at 15 (should be 0) and 25 (should be 1 -> dosage 2.0 for diploid?)
+    // Note: The allele generator says:
+    // if m == 15 || m == 25 { 255 }
+    // else if m < 20 { 0 }
+    // else { 1 }
+    // Wait, target is diploid (n_ploidy=2 default in Builder).
+    // The allele generator returns u8 per haplotype.
+    // Haps 0 and 1 (sample 0).
+    // So for m < 20: allele 0 + allele 0 = dosage 0.
+    // For m >= 20: allele 1 + allele 1 = dosage 2.
+    // Missing at 15: expected dosage 0.
+    // Missing at 25: expected dosage 2.
+    
+    let mut truth_vec = Vec::new();
+    let mut imp_vec = Vec::new();
+    
+    // Check marker 15
+    truth_vec.push(0.0);
+    imp_vec.push(dosages[15][0] as f64);
+    
+    // Check marker 25
+    truth_vec.push(2.0);
+    imp_vec.push(dosages[25][0] as f64);
+    
+    let sen = calculate_sen(&truth_vec, &imp_vec);
+    println!("Recombination test - SEN: {:.4}", sen);
+    assert!(sen > 0.95, "SEN too low for recombination test: {:.4}", sen);
 }
 
 #[test]

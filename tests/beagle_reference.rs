@@ -266,6 +266,22 @@ fn parse_vcf(path: &Path) -> (Vec<String>, Vec<ParsedRecord>) {
 // Comparison Metrics
 // =============================================================================
 
+/// Calculate Scaled Euclidean Norm (SEN) score
+/// SEN = 1 - mean((truth - imputed)^2) / 4
+/// Range [0, 1], higher is better.
+fn calculate_sen(truth: &[f64], imputed: &[f64]) -> f64 {
+    assert_eq!(truth.len(), imputed.len(), "Vectors must have same length");
+    if truth.is_empty() {
+        return 1.0;
+    }
+    
+    let mse: f64 = truth.iter().zip(imputed.iter())
+        .map(|(t, i)| (t - i).powi(2))
+        .sum::<f64>() / truth.len() as f64;
+    
+    1.0 - (mse / 4.0)
+}
+
 /// Calculate Pearson correlation coefficient (r²) between two vectors of dosages
 fn dosage_correlation(ds1: &[f64], ds2: &[f64]) -> f64 {
     assert_eq!(ds1.len(), ds2.len(), "Dosage vectors must have same length");
@@ -578,6 +594,20 @@ fn compare_imputation_results(
             rust_r2 >= java_r2,
             "[{}] Strict: Rust R² ({:.6}) WORSE than Java R² ({:.6}) vs truth",
             name, rust_r2, java_r2
+        );
+
+        // Calculate and compare SEN scores
+        let java_sen = calculate_sen(&truth_dosages, &java_dosages_r2);
+        let rust_sen = calculate_sen(&truth_dosages, &rust_dosages_r2);
+        
+        println!("[{}] Overall SEN (Truth vs Java): {:.6}", name, java_sen);
+        println!("[{}] Overall SEN (Truth vs Rust): {:.6}", name, rust_sen);
+        
+        // Strict: Rust SEN vs truth must be >= Java SEN vs truth
+        assert!(
+            rust_sen >= java_sen,
+            "[{}] Strict: Rust SEN ({:.6}) WORSE than Java SEN ({:.6}) vs truth",
+            name, rust_sen, java_sen
         );
     }
 
