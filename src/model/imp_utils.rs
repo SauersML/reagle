@@ -167,6 +167,14 @@ pub fn compute_cluster_mismatches_into_workspace(
                 ($col:expr, $get_fn:expr) => {
                     for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
                         let ref_allele = $get_fn($col, HapIdx::new(hap));
+
+                        // Treat missing reference alleles (255) as matches (zero penalty)
+                        // to align with standard HMM behavior for missing data.
+                        if ref_allele == 255 {
+                            // No penalty update needed - row_buffer initialized to 0.0 (match)
+                            continue;
+                        }
+
                         let final_ref = if alignment.has_allele_mapping(target_m) {
                              alignment.reverse_map_allele(target_m, ref_allele)
                         } else {
@@ -174,6 +182,9 @@ pub fn compute_cluster_mismatches_into_workspace(
                         };
 
                         if final_ref == 255 {
+                            // If mapping resulted in missing, treat as mismatch if original was not missing?
+                            // Or treat as missing data (match)?
+                            // Existing logic was:
                             if ref_allele != 255 {
                                 let penalty = log_diff;
                                 if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
