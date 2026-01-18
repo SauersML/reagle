@@ -16,13 +16,18 @@
 
 use std::time::Instant;
 
-mod config;
-mod data;
-mod error;
-mod io;
-mod model;
-mod pipelines;
-mod utils;
+// Use the library crate's modules
+use reagle::config;
+use reagle::error;
+// data and model are not used directly in run(), only in tests
+#[cfg(test)]
+use reagle::data;
+#[cfg(test)]
+use reagle::io;
+#[cfg(test)]
+use reagle::model;
+use reagle::pipelines;
+use reagle::utils;
 
 use config::Config;
 use error::Result;
