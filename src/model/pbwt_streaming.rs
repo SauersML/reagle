@@ -59,20 +59,6 @@ pub struct PbwtWavefront {
 
 impl PbwtWavefront {
     #[inline]
-    fn hash_offset(hap_idx: u32, marker: u32, stride: usize, salt: u64) -> usize {
-        if stride <= 1 {
-            return 0;
-        }
-        let mut x = (hap_idx as u64)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (marker as u64).wrapping_add(salt);
-        x ^= x >> 33;
-        x = x.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-        x ^= x >> 29;
-        (x as usize) % stride
-    }
-
-    #[inline]
     fn finalize_candidates(mut out: Vec<u32>, target: u32, n_candidates: usize) -> Vec<u32> {
         if out.is_empty() {
             return out;
@@ -88,16 +74,14 @@ impl PbwtWavefront {
         out
     }
 
-    // Hybrid selection: local core + diverse strided sampling over a bounded match window.
-    fn select_hybrid_window(
+    // Geometric spiral selection: dense core with exponentially expanding offsets.
+    fn select_spiral_window(
         ppa: &[u32],
         start: usize,
         end: usize,
         sorted_pos: usize,
         target: u32,
         n_candidates: usize,
-        marker: u32,
-        salt: u64,
     ) -> Vec<u32> {
         if n_candidates == 0 || start >= end {
             return Vec::new();
@@ -108,69 +92,54 @@ impl PbwtWavefront {
         }
 
         let mut out = Vec::with_capacity(n_candidates);
+        let max_left = sorted_pos.saturating_sub(start);
+        let max_right = end.saturating_sub(sorted_pos + 1);
+        let max_offset = max_left.max(max_right);
 
-        let mut local = n_candidates / 2;
-        if local == 0 {
-            local = 1;
-        }
-        let mut diverse = n_candidates - local;
-        if diverse == 0 {
-            diverse = 1;
-            local = n_candidates.saturating_sub(diverse);
-        }
-
-        // Local core: nearest neighbors around target (left/right alternation).
-        let mut u = sorted_pos;
-        let mut v = sorted_pos + 1;
-        while out.len() < local && (u > start || v < end) {
-            if u > start {
-                u -= 1;
-                out.push(ppa[u]);
+        let push_offset = |offset: usize, out: &mut Vec<u32>| {
+            if offset == 0 || out.len() >= n_candidates {
+                return;
             }
-            if out.len() < local && v < end {
-                out.push(ppa[v]);
-                v += 1;
+            if offset <= max_left {
+                out.push(ppa[sorted_pos - offset]);
             }
-        }
-
-        // Diverse set: strided with deterministic hash offsets to avoid aliasing.
-        let stride = (block_len + diverse - 1) / diverse;
-        let offset1 = Self::hash_offset(target, marker, stride, salt);
-        let offset2 = if stride > 1 {
-            (offset1 + stride / 2) % stride
-        } else {
-            0
+            if out.len() >= n_candidates {
+                return;
+            }
+            if offset <= max_right {
+                out.push(ppa[sorted_pos + offset]);
+            }
         };
 
-        // Cover edges only for large blocks to avoid stealing slots on small blocks.
-        if block_len >= n_candidates.saturating_mul(4) {
-            out.push(ppa[start]);
-            if end > start + 1 {
-                out.push(ppa[end - 1]);
-            }
+        // Fibonacci offsets: 1, 2, 3, 5, 8, ...
+        let mut prev = 1usize;
+        let mut curr = 2usize;
+        if max_offset >= 1 {
+            push_offset(prev, &mut out);
         }
-
-        for &offset in &[offset1, offset2] {
-            if out.len() >= n_candidates {
+        if out.len() < n_candidates && max_offset >= 2 {
+            push_offset(curr, &mut out);
+        }
+        while out.len() < n_candidates {
+            let next = prev.saturating_add(curr);
+            if next > max_offset {
                 break;
             }
-            let mut idx = start + offset;
-            while idx < end && out.len() < n_candidates {
-                out.push(ppa[idx]);
-                idx += stride;
-            }
+            push_offset(next, &mut out);
+            prev = curr;
+            curr = next;
         }
 
-        // If still short, fill by scanning outward from the target (bounded O(K)).
+        // If still short, fill by scanning outward within the bounded window.
         if out.len() < n_candidates {
             let mut u = sorted_pos;
             let mut v = sorted_pos + 1;
-            while out.len() < n_candidates && (u > 0 || v < ppa.len()) {
-                if u > 0 {
+            while out.len() < n_candidates && (u > start || v < end) {
+                if u > start {
                     u -= 1;
                     out.push(ppa[u]);
                 }
-                if out.len() < n_candidates && v < ppa.len() {
+                if out.len() < n_candidates && v < end {
                     out.push(ppa[v]);
                     v += 1;
                 }
@@ -443,16 +412,13 @@ impl PbwtWavefront {
         let marker_i32 = (self.fwd_marker.saturating_sub(1)) as i32;
         let max_span = n_candidates.saturating_mul(8).max(32);
         let (start, end) = self.fwd_window_bounded(sorted_pos, marker_i32, max_span);
-        let marker = self.fwd_marker as u32;
-        Self::select_hybrid_window(
+        Self::select_spiral_window(
             &self.fwd_ppa,
             start,
             end,
             sorted_pos,
             hap_idx,
             n_candidates,
-            marker,
-            0xA5A5_5A5A_D00D_1234,
         )
     }
 
@@ -466,16 +432,13 @@ impl PbwtWavefront {
         let marker_i32 = self.bwd_marker as i32;
         let max_span = n_candidates.saturating_mul(8).max(32);
         let (start, end) = self.bwd_window_bounded(sorted_pos, marker_i32, max_span);
-        let marker = self.bwd_marker as u32;
-        Self::select_hybrid_window(
+        Self::select_spiral_window(
             &self.bwd_ppa,
             start,
             end,
             sorted_pos,
             hap_idx,
             n_candidates,
-            marker,
-            0x5A5A_A5A5_1234_D00D,
         )
     }
 
