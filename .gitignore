@@ -16,7 +16,7 @@ Rust/clippy_output.txt
 # Java jar files (Beagle binaries)
 *.jar
 # But keep test fixture JARs
-!Rust/tests/fixtures/beagle_reference/*.jar
+!tests/fixtures/beagle_reference/*.jar
 # Python cache
 __pycache__/
 *.pyc
