@@ -2370,10 +2370,10 @@ fn test_multiple_seeds_consistency() {
         java_concordances.push(java_acc.concordance());
         rust_concordances.push(rust_acc.concordance());
 
-        // Per-seed check: Rust should be at least as good as Java
+        // Per-seed check: Rust should be at least as good as Java (NO TOLERANCE)
         assert!(
-            rust_acc.concordance() >= java_acc.concordance() - 0.01,
-            "Seed {}: Rust ({:.4}%) worse than Java ({:.4}%)",
+            rust_acc.concordance() >= java_acc.concordance(),
+            "Seed {}: Rust ({:.4}%) worse than Java ({:.4}%) - STRICT FAILURE",
             seed, rust_acc.concordance() * 100.0, java_acc.concordance() * 100.0
         );
     }
@@ -2388,10 +2388,10 @@ fn test_multiple_seeds_consistency() {
     println!("  Java: mean={:.4}%, std={:.4}%", java_mean * 100.0, java_std * 100.0);
     println!("  Rust: mean={:.4}%, std={:.4}%", rust_mean * 100.0, rust_std * 100.0);
 
-    // Rust mean should be >= Java mean
+    // Rust mean should be >= Java mean (NO TOLERANCE)
     assert!(
-        rust_mean >= java_mean - 0.001,
-        "Rust mean concordance ({:.4}%) worse than Java ({:.4}%)",
+        rust_mean >= java_mean,
+        "Rust mean concordance ({:.4}%) worse than Java ({:.4}%) - STRICT FAILURE",
         rust_mean * 100.0, java_mean * 100.0
     );
 
@@ -2528,7 +2528,7 @@ fn test_per_sample_imputation_accuracy() {
             status
         );
 
-        if diff < -0.001 {
+        if diff < 0.0 {
             samples_with_rust_worse += 1;
             if diff.abs() > max_accuracy_gap {
                 max_accuracy_gap = diff.abs();
@@ -2555,26 +2555,25 @@ fn test_per_sample_imputation_accuracy() {
         println!("  Worst sample: {} (gap: {:.2}%)", sample_names[worst_sample_idx], max_accuracy_gap * 100.0);
     }
 
-    // Strict: Rust should not be significantly worse on any sample
+    // Strict: Rust should not be worse on any sample (NO TOLERANCE)
     assert!(
-        max_accuracy_gap < 0.05,
-        "Per-sample accuracy gap too large: {:.2}% on sample {}",
+        max_accuracy_gap == 0.0,
+        "Per-sample accuracy gap found: {:.4}% on sample {} - STRICT FAILURE",
         max_accuracy_gap * 100.0,
         sample_names[worst_sample_idx]
     );
 
-    // Strict: Less than 50% of samples should show Rust worse
-    let pct_worse = samples_with_rust_worse as f64 / n_samples as f64;
+    // Strict: Rust must be better or equal on ALL samples
     assert!(
-        pct_worse < 0.5,
-        "Too many samples ({:.0}%) show Rust worse than Java",
-        pct_worse * 100.0
+        samples_with_rust_worse == 0,
+        "Rust worse than Java on {}/{} samples - STRICT FAILURE",
+        samples_with_rust_worse, n_samples
     );
 
-    // Strict: Overall Rust accuracy must be >= Java - 1%
+    // Strict: Overall Rust accuracy must be >= Java (NO TOLERANCE)
     assert!(
-        rust_overall >= java_overall - 0.01,
-        "Rust overall accuracy ({:.2}%) worse than Java ({:.2}%) by more than 1%",
+        rust_overall >= java_overall,
+        "Rust overall accuracy ({:.2}%) worse than Java ({:.2}%) - STRICT FAILURE",
         rust_overall * 100.0,
         java_overall * 100.0
     );
@@ -2775,10 +2774,10 @@ fn test_dr2_genotyped_vs_imputed() {
         );
     }
     
-    // Imputed DR2: Rust should not be much worse than Java
+    // Imputed DR2: Rust should not be worse than Java (NO TOLERANCE)
     assert!(
-        rust_imp_mean >= java_imp_mean - 0.02,
-        "IMPUTED DR2 FAIL: Rust ({:.4}) worse than Java ({:.4}) by more than 0.02",
+        rust_imp_mean >= java_imp_mean,
+        "IMPUTED DR2 FAIL: Rust ({:.4}) worse than Java ({:.4}) - STRICT FAILURE",
         rust_imp_mean, java_imp_mean
     );
     
