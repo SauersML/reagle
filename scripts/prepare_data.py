@@ -193,8 +193,8 @@ def prepare_truth(source, output_vcf):
         print(f"Converting {raw_file} to VCF format using convert_genome...")
         install_convert_genome()
         
-        # Use remote hg38 Chr22 reference for standardization
-        ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+        # Use hg19/GRCh37 reference to match 1000G Phase 3 reference panel
+        ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/chromosomes/chr22.fa.gz"
         temp_vcf = "temp_truth_conv.vcf"
         
         cmd = ["convert_genome", raw_file, ref_url, temp_vcf, "--format", "vcf"]
@@ -248,8 +248,9 @@ def run_conversion(input_path, output_vcf):
 
     print(f"Converting {raw_file} to {output_vcf}...")
     
-    # Use remote Chr22 reference for standardization
-    ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    # Use hg19/GRCh37 reference to match 1000G Phase 3 reference panel
+    # DTC files (23andMe, AncestryDNA) are typically GRCh37/hg19
+    ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/chromosomes/chr22.fa.gz"
     
     # convert_genome uses positional arguments: <INPUT> <REFERENCE> [OUTPUT]
     cmd = [
