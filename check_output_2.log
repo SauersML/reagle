@@ -1,0 +1,29 @@
+   Compiling reagle v0.1.0 (/app)
+error: unused import: `reagle::config`
+  --> src/main.rs:20:5
+   |
+20 | use reagle::config;
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `-D unused-imports` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: unused import: `reagle::error`
+  --> src/main.rs:21:5
+   |
+21 | use reagle::error;
+   |     ^^^^^^^^^^^^^
+
+error: unused import: `reagle::pipelines`
+  --> src/main.rs:22:5
+   |
+22 | use reagle::pipelines;
+   |     ^^^^^^^^^^^^^^^^^
+
+error: unused import: `reagle::utils`
+  --> src/main.rs:23:5
+   |
+23 | use reagle::utils;
+   |     ^^^^^^^^^^^^^
+
+error: could not compile `reagle` (bin "reagle") due to 4 previous errors

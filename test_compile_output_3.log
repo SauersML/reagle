@@ -1,0 +1,6 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.53s
+  Executable unittests src/lib.rs (target/debug/deps/reagle-3b9c6642476e69cd)
+  Executable unittests src/main.rs (target/debug/deps/reagle-b1f76dd640000d36)
+  Executable tests/beagle_reference.rs (target/debug/deps/beagle_reference-9016a49bf44ab4d9)
+  Executable tests/fast_imputation.rs (target/debug/deps/fast_imputation-b422c4636a253b12)
