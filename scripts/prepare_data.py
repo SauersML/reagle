@@ -99,46 +99,6 @@ def download_reference(output_vcf):
         os.remove("ref_raw.vcf.gz")
     print(f"Reference prepared: {output_vcf}")
 
-def prepare_truth(input_dir, output_vcf):
-    """Reconstructs and prepares Truth VCF (Chr22)."""
-    print(f"Preparing Truth VCF from {input_dir}...")
-    
-    # Find source file
-    source_vcf = "truth_full.vcf.gz"
-    
-    # Check for split parts
-    parts = sorted(glob.glob(os.path.join(input_dir, "*.part*")))
-    if parts:
-        print("Found split parts, combining...")
-        subprocess.check_call(f"cat {os.path.join(input_dir, '*.part*')} > {source_vcf}", shell=True)
-    else:
-        # Check for zip
-        zips = glob.glob(os.path.join(input_dir, "*Christopher*.zip"))
-        if zips:
-            print(f"Found zip file: {zips[0]}, extracting...")
-            subprocess.check_call(f"unzip -p '{zips[0]}' > {source_vcf}", shell=True)
-        else:
-            # Fallback
-            print("No split or zip found, looking for vcf.gz...")
-            vcfs = glob.glob(os.path.join(input_dir, "*.vcf.gz"))
-            if vcfs:
-                subprocess.check_call(["cp", vcfs[0], source_vcf])
-            else:
-                raise FileNotFoundError("Could not find Truth VCF source files")
-
-    # Index before filtering (required for WGS)
-    print("Indexing Truth VCF...")
-    subprocess.check_call(["bcftools", "index", "-t", source_vcf])
-
-    # Filter to Chr22
-    print("Filtering Truth to Chr22...")
-    subprocess.check_call(f"bcftools view {source_vcf} --regions 22 -Oz -o {output_vcf}", shell=True)
-    subprocess.check_call(["tabix", "-f", output_vcf])
-    
-    if os.path.exists(source_vcf):
-        os.remove(source_vcf)
-    print(f"Truth prepared: {output_vcf}")
-
 def run_conversion(input_path, output_vcf):
     """Runs convert_genome to convert input to VCF."""
     
