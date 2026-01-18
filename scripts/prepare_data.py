@@ -292,11 +292,27 @@ def run_conversion(input_path, output_vcf):
         print("Warning: SKIPPED Liftover (missing tools), output is hg19.")
     else:
         # Run CrossMap
+        # Detect executable name
+        crossmap_exe = "CrossMap.py"
+        if not shutil.which(crossmap_exe):
+            if shutil.which("CrossMap"):
+                crossmap_exe = "CrossMap"
+            else:
+                # Debug info
+                print("Error: CrossMap executable not found in PATH.")
+                print(f"PATH: {os.environ.get('PATH')}")
+                try:
+                    import subprocess
+                    subprocess.call(["pip", "show", "CrossMap"])
+                except:
+                    pass
+                raise FileNotFoundError("CrossMap.py or CrossMap executable not found")
+
         # Output uncompressed vcf first
         temp_hg38_vcf = "temp_hg38.vcf"
         try:
            cmd_liftover = [
-               "CrossMap.py", "vcf", 
+               crossmap_exe, "vcf", 
                chain_file, 
                temp_hg19_vcf,
                ref_hg38,
