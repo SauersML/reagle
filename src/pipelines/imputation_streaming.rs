@@ -694,13 +694,21 @@ impl crate::pipelines::ImputationPipeline {
                 };
                 let _ = &phase_span;
 
-                eprintln!(
-                    "  Phasing Window {} ({} markers, pos {}..{})",
-                    window_count,
-                    target_window.genotypes.n_markers(),
-                    start_pos,
-                    end_pos
-                );
+                // Only log windows with actual markers or every 100th window to reduce spam
+                let should_log = target_window.genotypes.n_markers() > 0 
+                    || ref_window.is_first 
+                    || ref_window.is_last
+                    || window_count % 100 == 0;
+                
+                if should_log {
+                    eprintln!(
+                        "  Phasing Window {} ({} markers, pos {}..{})",
+                        window_count,
+                        target_window.genotypes.n_markers(),
+                        start_pos,
+                        end_pos
+                    );
+                }
 
                 // Use RefWindow metadata for coordinate tracking and boundary handling
                 if ref_window.is_first {
@@ -713,9 +721,11 @@ impl crate::pipelines::ImputationPipeline {
                 // ref_global_end used implicitly via ref_window_gt.n_markers()
                 let ref_output_start = ref_window.output_start;
                 let ref_output_end = ref_window.output_end;
-                // Consume global_end to avoid unused warning
-                eprintln!("    Ref markers: {} (global {}..{})",
-                    ref_window.genotypes.n_markers(), ref_global_start, ref_window.global_end);
+                // Only log ref markers for significant windows
+                if should_log {
+                    eprintln!("    Ref markers: {} (global {}..{})",
+                        ref_window.genotypes.n_markers(), ref_global_start, ref_window.global_end);
+                }
                 let ref_window_gt = ref_window.genotypes;
 
                 let alignment = MarkerAlignment::new(
@@ -855,13 +865,17 @@ target_samples={} target_bytes={}",
                 )?;
                 header_written = true;
             }
-
-            eprintln!(
-                "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
-                window_idx, phased_target.n_markers(),
-                ref_global_start, ref_global_start + ref_window.n_markers(),
-                ref_output_start, ref_output_end
-            );
+            // Only log windows with actual markers or every 100th to reduce spam
+            let should_log = phased_target.n_markers() > 0 || window_idx % 100 == 0;
+            
+            if should_log {
+                eprintln!(
+                    "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
+                    window_idx, phased_target.n_markers(),
+                    ref_global_start, ref_global_start + ref_window.n_markers(),
+                    ref_output_start, ref_output_end
+                );
+            }
 
             // Initialize quality for this window
             let n_alleles_per_marker: Vec<usize> = (0..ref_window.n_markers())
@@ -882,11 +896,13 @@ target_samples={} target_bytes={}",
             }
 
             // Check if we have haplotype priors from previous window for soft-information handoff
-            if let Some(ref overlap) = imp_overlap {
-                if let Some(priors) = overlap.hap_priors() {
-                    let n_with_priors = priors.iter().filter(|p| !p.is_empty()).count();
-                    if n_with_priors > 0 {
-                        eprintln!("    Using {} haplotypes with soft-information priors", n_with_priors);
+            if should_log {
+                if let Some(ref overlap) = imp_overlap {
+                    if let Some(priors) = overlap.hap_priors() {
+                        let n_with_priors = priors.iter().filter(|p| !p.is_empty()).count();
+                        if n_with_priors > 0 {
+                            eprintln!("    Using {} haplotypes with soft-information priors", n_with_priors);
+                        }
                     }
                 }
             }
