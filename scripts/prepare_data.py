@@ -113,51 +113,100 @@ def prepare_truth(source, output_vcf):
     print(f"Preparing Truth VCF from {input_dir}...")
     
     source_vcf = "truth_full.vcf.gz"
+    needs_conversion = False  # Track if we need to convert from non-VCF format
+    raw_file = None  # Path to raw file if conversion needed
     
-    # Check for split parts
-    parts = sorted(glob.glob(os.path.join(input_dir, "*.part*")))
+    # Check for split parts (these are VCF.gz parts)
+    parts = sorted(glob.glob(os.path.join(input_dir, "*.vcf.gz.part*")))
     if parts:
-        print("Found split parts, combining...")
-        subprocess.check_call(f"cat {os.path.join(input_dir, '*.part*')} > {source_vcf}", shell=True)
+        print(f"Found {len(parts)} split VCF parts, combining...")
+        # Combine parts then compress properly through bcftools
+        combined_raw = "truth_combined_raw.vcf.gz"
+        subprocess.check_call(f"cat {os.path.join(input_dir, '*.vcf.gz.part*')} > {combined_raw}", shell=True)
+        # Re-compress through bcftools to ensure valid BGZF
+        subprocess.check_call(f"bcftools view {combined_raw} -Oz -o {source_vcf}", shell=True)
+        os.remove(combined_raw)
     else:
         # Check for zip
-        zips = glob.glob(os.path.join(input_dir, "*Christopher*.zip"))
+        zips = glob.glob(os.path.join(input_dir, "*Christopher*.zip")) + glob.glob(os.path.join(input_dir, "*.zip"))
         if zips:
             print(f"Found zip file: {zips[0]}, extracting...")
-            # Extract to a temp dir to find the VCF safely
             extract_dir = "temp_truth_extract"
             os.makedirs(extract_dir, exist_ok=True)
             subprocess.check_call(["unzip", "-o", zips[0], "-d", extract_dir])
             
-            # Find largest vcf or vcf.gz
-            candidates = []
+            # Find VCF files first
+            vcf_candidates = []
+            text_candidates = []
             for root, _, files in os.walk(extract_dir):
                 for f in files:
+                    fpath = os.path.join(root, f)
                     if f.endswith(".vcf") or f.endswith(".vcf.gz"):
-                        candidates.append(os.path.join(root, f))
+                        vcf_candidates.append(fpath)
+                    elif f.endswith(".txt") or f.endswith(".csv") or f.endswith(".tsv"):
+                        text_candidates.append(fpath)
             
-            if candidates:
-                best = max(candidates, key=os.path.getsize)
+            if vcf_candidates:
+                best = max(vcf_candidates, key=os.path.getsize)
                 print(f"Found VCF in zip: {best}")
-                os.rename(best, source_vcf)
+                if best.endswith(".vcf.gz"):
+                    # Re-compress through bcftools to ensure valid BGZF
+                    subprocess.check_call(f"bcftools view {best} -Oz -o {source_vcf}", shell=True)
+                else:
+                    # Plain VCF - compress with bcftools
+                    subprocess.check_call(f"bcftools view {best} -Oz -o {source_vcf}", shell=True)
+            elif text_candidates:
+                # No VCF found - this is a genotyping array text file, needs conversion
+                best = max(text_candidates, key=os.path.getsize)
+                print(f"No VCF found, found text file that needs conversion: {best}")
+                needs_conversion = True
+                raw_file = best
             else:
-                # If no VCF extension, try largest file
+                # Last resort - largest file
                 all_files = [os.path.join(dp, f) for dp, dn, filenames in os.walk(extract_dir) for f in filenames]
                 if all_files:
                     best = max(all_files, key=os.path.getsize)
-                    print(f"No .vcf found, using largest file as VCF: {best}")
-                    os.rename(best, source_vcf)
+                    print(f"No VCF or text found, largest file needs conversion: {best}")
+                    needs_conversion = True
+                    raw_file = best
                 else:
+                    shutil.rmtree(extract_dir)
                     raise FileNotFoundError("Zip file was empty")
             
-            shutil.rmtree(extract_dir)
+            if not needs_conversion:
+                shutil.rmtree(extract_dir)
         else:
-            # Fallback
+            # Fallback - look for existing VCF
             vcfs = glob.glob(os.path.join(input_dir, "*.vcf.gz"))
             if vcfs:
-                subprocess.check_call(["cp", vcfs[0], source_vcf])
+                # Re-compress through bcftools to ensure valid BGZF
+                subprocess.check_call(f"bcftools view {vcfs[0]} -Oz -o {source_vcf}", shell=True)
             else:
                 raise FileNotFoundError("Could not find Truth VCF source files")
+    
+    # If we need to convert from a text format (23andMe, AncestryDNA, etc.)
+    if needs_conversion:
+        print(f"Converting {raw_file} to VCF format using convert_genome...")
+        install_convert_genome()
+        
+        # Use remote hg38 Chr22 reference for standardization
+        ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+        temp_vcf = "temp_truth_conv.vcf"
+        
+        cmd = ["convert_genome", raw_file, ref_url, temp_vcf, "--format", "vcf"]
+        print(f"Running: {' '.join(cmd)}")
+        subprocess.check_call(cmd)
+        
+        if not os.path.exists(temp_vcf):
+            raise RuntimeError("convert_genome failed to produce output VCF")
+        
+        # Compress with bcftools for proper BGZF
+        subprocess.check_call(f"bcftools view {temp_vcf} -Oz -o {source_vcf}", shell=True)
+        os.remove(temp_vcf)
+        
+        # Cleanup extract dir if it exists
+        if os.path.exists("temp_truth_extract"):
+            shutil.rmtree("temp_truth_extract")
 
     # Index before filtering (required for filtering regions efficiently)
     print("Indexing Truth VCF...")
