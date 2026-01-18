@@ -169,14 +169,3 @@ fn run_metrics(truth_path: &Path, imputed_path: &Path, output_json: &Path) {
     let f = File::create(output_json).expect("Create JSON");
     serde_json::to_writer_pretty(f, &metrics).expect("Write JSON");
 }
-
-#[test]
-fn test_metrics_calculation_dummy() {
-    let truth = std::env::var("TEST_TRUTH_VCF");
-    let imputed = std::env::var("TEST_IMP_VCF");
-    let out = std::env::var("TEST_OUTPUT_JSON");
-    
-    if let (Ok(t), Ok(i), Ok(o)) = (truth, imputed, out) {
-        run_metrics(Path::new(&t), Path::new(&i), Path::new(&o));
-    }
-}

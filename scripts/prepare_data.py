@@ -5,15 +5,19 @@ import glob
 import shutil
 
 def install_convert_genome():
-    """Installs convert_genome using the official install script."""
+    """Installs convert_genome using cargo install (avoids GitHub API rate limits)."""
     print("Installing convert_genome...")
     # Only install if not present
     if shutil.which("convert_genome"):
         print("convert_genome already installed.")
         return
 
-    cmd = "curl -fsSL https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh | bash"
-    subprocess.check_call(cmd, shell=True)
+    # Use cargo install instead of the bash script to avoid GitHub API rate limits
+    try:
+        subprocess.check_call(["cargo", "install", "convert_genome"])
+    except subprocess.CalledProcessError:
+        # Fallback to git-based install if crates.io version is outdated
+        subprocess.check_call(["cargo", "install", "--git", "https://github.com/SauersML/convert_genome.git"])
     
     # Add cargo bin to path for this session
     home = os.path.expanduser("~")
