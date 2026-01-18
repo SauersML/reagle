@@ -1,0 +1,26 @@
+   Compiling reagle v0.1.0 (/app)
+error: failed to run custom build command for `reagle v0.1.0 (/app)`
+
+Caused by:
+  process didn't exit successfully: `/app/target/debug/build/reagle-26fdd0c4ca8d3c39/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:rustc-link-arg=-Wl,--no-keep-memory
+  cargo:rustc-env=GNOMON_LOW_MEMORY_TOTAL_MEMORY_BYTES=8345706496
+  cargo:rustc-env=GNOMON_LOW_MEMORY_SERIAL_BUILD=1
+  cargo:rustc-cfg=gnomon_low_memory_serial_build
+  cargo:rustc-env=GNOMON_BUILD_TIMESTAMP=1768777944
+
+  --- stderr
+
+  ❌ VALIDATION ERRORS
+  ====================
+
+  ❌ ERROR: Found 1 #[allow(dead_code)] attributes in ./tests/imputation_quality.rs:
+     1:#![allow(dead_code)]  // Functions may be used externally or via env-var triggered tests
+
+  ⚠️ #[allow(dead_code)] attributes are STRICTLY FORBIDDEN in this project.
+     Either use the code (removing the attribute) or remove it completely.
+
+  --------------------
+
+  ⚠️ Found 1 total code quality violations. Fix all issues before committing.
