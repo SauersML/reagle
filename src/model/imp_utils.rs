@@ -152,8 +152,14 @@ pub fn compute_cluster_mismatches_into_workspace(
             if confidence <= 0.0 {
                 continue;
             }
-            
-            let (log_match, log_mism) = get_log_probs(confidence, p_err);
+
+            // For high-confidence genotypes (>= 0.999), use a stricter error rate (1e-9)
+            // to enforce the constraint. This prevents the "perfect LD trap" where the
+            // HMM transition penalty outweighs the emission penalty for a rare variant,
+            // causing the HMM to stay on the wrong haplotype.
+            let eff_p_err = if confidence >= 0.999 { 1e-9 } else { p_err };
+
+            let (log_match, log_mism) = get_log_probs(confidence, eff_p_err);
             let log_diff = log_mism - log_match;
             let hard_log_mism = (1e-12f32).ln();
             let hard_log_diff = hard_log_mism - log_match;
