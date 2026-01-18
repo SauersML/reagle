@@ -640,8 +640,27 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     truth_iter = _stream_vcf_lines(truth_cmd)
 
     # 2. Imputed Stream
-    # Query GT:DS:GP fields - Beagle outputs these with gp=true, Reagle outputs them by default
-    imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf}"
+    # Try DS/GP query first, fall back to GT-only if it fails
+    # This handles both Beagle (with gp=true) and Reagle (which may not have DS/GP)
+    imputed_cmd_full = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf}"
+    imputed_cmd_gt = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
+    
+    # Test if DS/GP fields exist by trying to query one line
+    try:
+        test_result = subprocess.run(
+            f"{imputed_cmd_full} | head -1", 
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        if test_result.returncode == 0 and test_result.stdout.strip():
+            imputed_cmd = imputed_cmd_full
+            print(f"Using GT:DS:GP format for {imputed_vcf}")
+        else:
+            imputed_cmd = imputed_cmd_gt
+            print(f"Using GT-only format for {imputed_vcf} (DS/GP not available)")
+    except Exception:
+        imputed_cmd = imputed_cmd_gt
+        print(f"Using GT-only format for {imputed_vcf} (fallback)")
+    
     imputed_iter = _stream_vcf_lines(imputed_cmd)
 
     # Helper to get next parsed line

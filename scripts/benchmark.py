@@ -57,7 +57,7 @@ def run_benchmark(person, file_path, format):
     
     os.remove("sample_name.txt")
     
-    # Run metrics via integration test
+    # Run metrics via integration test (it now auto-detects DS/GP vs GT-only format)
     run_cmd(["python3", "tests/integration_test.py", "metrics"])
 
 if __name__ == "__main__":
