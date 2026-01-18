@@ -11,12 +11,14 @@ use walkdir::WalkDir;
 struct ViolationCollector {
     violations: Vec<String>,
     file_path: PathBuf,
+    lines: Vec<String>,
 }
 
 // A collector for disallowed `let _ = token;` patterns
 struct DisallowedLetCollector {
     violations: Vec<String>,
     file_path: PathBuf,
+    lines: Vec<String>,
 }
 
 // A collector for tuple destructuring patterns that discard values using `_`
@@ -239,10 +241,11 @@ fn configure_rustc_parallelism_for_low_memory(total_memory_bytes: u64) {
 }
 
 impl ViolationCollector {
-    fn new(file_path: &Path) -> Self {
+    fn new(file_path: &Path, original_content: &str) -> Self {
         Self {
             violations: Vec::new(),
             file_path: file_path.to_path_buf(),
+            lines: original_content.lines().map(String::from).collect(),
         }
     }
 
@@ -275,10 +278,11 @@ impl ViolationCollector {
 }
 
 impl DisallowedLetCollector {
-    fn new(file_path: &Path) -> Self {
+    fn new(file_path: &Path, content: &str) -> Self {
         Self {
             violations: Vec::new(),
             file_path: file_path.to_path_buf(),
+            lines: content.lines().map(String::from).collect(),
         }
     }
 
@@ -848,35 +852,11 @@ impl Sink for ViolationCollector {
     fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         // Get the line number and the content of the matched line.
         let line_number = mat.line_number().unwrap_or(0);
-        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
-
-        // Skip matches in comments and string literals to avoid false positives
-        // But make sure we don't miss underscore variables in code
-
-        // Check if this line is purely a comment
-        let is_pure_comment = line_text.trim_start().starts_with("//")
-            || (line_text.contains("/*")
-                && !line_text.contains("*/match")
-                && !line_text.contains("*/let"));
-
-        // Check if the match is in a string literal and not part of code
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            // More careful string detection logic
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            // If the underscore variable is between quotes, it's in a string
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("_") {
-                    // Inside quotes
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
-            return Ok(true); // Skip this match and continue searching
-        }
+        let line_text = if line_number > 0 && line_number as usize <= self.lines.len() {
+            self.lines[line_number as usize - 1].trim_end()
+        } else {
+            ""
+        };
 
         // Format the violation string exactly as the `rg -n` command would.
         self.violations.push(format!("{line_number}:{line_text}"));
@@ -891,27 +871,11 @@ impl Sink for DisallowedLetCollector {
 
     fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         let line_number = mat.line_number().unwrap_or(0);
-        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
-
-        let is_pure_comment = line_text.trim_start().starts_with("//")
-            || (line_text.contains("/*")
-                && !line_text.contains("*/match")
-                && !line_text.contains("*/let"));
-
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("_") {
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
-            return Ok(true);
-        }
+        let line_text = if line_number > 0 && line_number as usize <= self.lines.len() {
+            self.lines[line_number as usize - 1].trim_end()
+        } else {
+            ""
+        };
 
         self.violations.push(format!("{line_number}:{line_text}"));
 
@@ -1998,8 +1962,8 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
                 let path = entry.path();
 
                 // Check if we can read the file
-                match std::fs::read_to_string(path) {
-                    Ok(_) => {}         // File exists and can be read
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,         // File exists and can be read
                     Err(_) => continue, // Skip files we can't read
                 };
 
@@ -2013,12 +1977,15 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
                     );
                 }
 
-                // Create a new collector for each file.
-                let mut collector = ViolationCollector::new(path);
+                // Sanitize content to remove comments and strings
+                let sanitized_bytes = strip_comments_and_strings_for_tokens(&content);
 
-                // Search the file using our regex matcher and collector sink.
+                // Create a new collector for each file, passing original content for error reporting
+                let mut collector = ViolationCollector::new(path, &content);
+
+                // Search the sanitized content using search_reader
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&sanitized_bytes), &mut collector)
                     .is_err()
                 {
                     // Handle search errors gracefully
@@ -2061,14 +2028,16 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
 
-                let mut collector = DisallowedLetCollector::new(path);
+                let sanitized_bytes = strip_comments_and_strings_for_tokens(&content);
+                let mut collector = DisallowedLetCollector::new(path, &content);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&sanitized_bytes), &mut collector)
                     .is_err()
                 {
                     continue;
