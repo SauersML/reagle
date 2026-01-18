@@ -48,6 +48,7 @@ def run_benchmark(person, file_path, format):
     subprocess.check_call(["cargo", "test", "--test", "imputation_quality", "test_metrics_calculation_dummy", "--", "--nocapture"], env=env)
 
 if __name__ == "__main__":
+    print("Benchmark Script v1.1")
     parser = argparse.ArgumentParser()
     parser.add_argument("--person", required=True)
     parser.add_argument("--file", required=True)

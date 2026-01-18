@@ -239,6 +239,7 @@ def run_conversion(input_path, output_vcf):
     print("Conversion complete.")
 
 if __name__ == "__main__":
+    print("Prepare Data Script v1.1 (Positional Args)")
     if len(sys.argv) < 2:
         print("Usage:")
         print("  python3 prepare_data.py array <input_file> <output_vcf>")
