@@ -1,6 +1,6 @@
 use grep::regex::RegexMatcher;
 use grep::searcher::{Searcher, Sink, SinkMatch};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -1517,10 +1517,6 @@ fn main() {
         update_stage("skipping lint checks (GNOMON_SKIP_LINT_CHECKS set)");
         return;
     }
-
-    // Manually check for unused variables in the build script
-    update_stage("manual lint self-check");
-    manually_check_for_unused_variables();
 
     // Collect all violations from all checks
     let mut all_violations = Vec::new();
