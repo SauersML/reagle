@@ -30,7 +30,7 @@ def run_benchmark(person, file_path, format):
     # 3. Run Beagle
     print("=== Running Beagle ===")
     beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
-    run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=22", "nthreads=2"])
+    run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=22", "nthreads=2", "gp=true"])
 
     # 4. Run Metrics using the Python integration test
     print("=== Calculating Metrics ===")
