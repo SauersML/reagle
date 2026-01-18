@@ -32,45 +32,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bcftools tabix curl python3-pip
 
-      - name: Cache check_build and liftover tools
-        id: cache-liftover-tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/check_build
-            ~/liftover/
-          key: liftover-tools-v1
 
-      - name: Install check_build and liftover tools
-        if: steps.cache-liftover-tools.outputs.cache-hit != 'true'
-        run: |
-          cargo install check_build
-          mkdir -p ~/liftover
-          pip install CrossMap
-          wget -q https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz -O ~/liftover/hg19ToHg38.over.chain.gz
-          wget -q https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz -O ~/liftover/hg38.fa.gz
-          gunzip ~/liftover/hg38.fa.gz
-
-      - name: Check and liftover fixture VCFs to hg38
-        run: |
-          for vcf in tests/fixtures/beagle_reference/target*.vcf.gz; do
-            if [ -f "$vcf" ]; then
-              echo "Checking build for $vcf..."
-              zcat "$vcf" > /tmp/check.vcf
-              build_output=$(check_build --detect /tmp/check.vcf 2>&1 || true)
-              echo "$build_output"
-              if echo "$build_output" | grep -q "Best match: Hg19"; then
-                echo "Converting $vcf from hg19 to hg38..."
-                CrossMap.py vcf ~/liftover/hg19ToHg38.over.chain.gz "$vcf" ~/liftover/hg38.fa "${vcf%.vcf.gz}.hg38.vcf"
-                bgzip -f "${vcf%.vcf.gz}.hg38.vcf"
-                mv "${vcf%.vcf.gz}.hg38.vcf.gz" "$vcf"
-                bcftools index -f "$vcf"
-              else
-                echo "$vcf is already hg38"
-              fi
-              rm -f /tmp/check.vcf
-            fi
-          done
 
       - name: Cache test data
         id: cache-data
