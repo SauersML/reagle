@@ -51,6 +51,14 @@ jobs:
       - name: Install System Tools
         run: sudo apt-get update && sudo apt-get install -y bcftools tabix
 
+      - name: Install Python Deps & Liftover Tools
+        run: |
+          pip install CrossMap
+          mkdir -p ~/liftover
+          wget -q https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz -O ~/liftover/hg19ToHg38.over.chain.gz
+          wget -q https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz -O ~/liftover/hg38.fa.gz
+          gunzip ~/liftover/hg38.fa.gz
+
       - name: Build Reagle
         run: cargo build --release
 

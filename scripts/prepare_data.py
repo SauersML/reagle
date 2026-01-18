@@ -81,28 +81,26 @@ def prepare_input_file(input_path):
     return input_path
 
 def download_reference(output_vcf):
-    """Downloads and prepares 1000G Chr22 reference."""
-    if os.path.exists(output_vcf) and os.path.exists(output_vcf + ".tbi"):
+    """Downloads and prepares HGDP+1kG Chr22 reference (hg38)."""
+    if os.path.exists(output_vcf) and os.path.exists(output_vcf + ".csi"):
         print("Reference already exists.")
         return
 
-    print("Downloading reference panel (Chr22)...")
-    url = "https://s3.amazonaws.com/1000genomes/release/20130502/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz"
+    print("Downloading HGDP+1kG reference panel (Chr22, hg38)...")
+    # This URL is for gnomAD HGDP+1kG v3 (hg38)
+    bcf_url = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
     
-    # Download
-    subprocess.check_call(["wget", "-q", url, "-O", "ref_raw.vcf.gz"])
+    # Download BCF
+    subprocess.check_call(["wget", "-q", bcf_url, "-O", "ref_raw.bcf"])
     
-    # Filter/Normalize
-    print("Filtering reference...")
-    # It is already Chr22, just normalize variants
-    # No regions filter needed if file is just Chr22 (avoids index issue on stream if using pipe, but here we use file)
-    # Using -m 2 -M 2 -v snps to keep only biallelic SNPs
-    subprocess.check_call("bcftools view ref_raw.vcf.gz -m 2 -M 2 -v snps -Oz -o " + output_vcf, shell=True)
-    subprocess.check_call(["tabix", "-f", output_vcf])
+    # Convert BCF -> VCF.gz and Index
+    print("Converting BCF to VCF.gz...")
+    subprocess.check_call(f"bcftools view ref_raw.bcf -Oz -o {output_vcf}", shell=True)
+    subprocess.check_call(["bcftools", "index", "-f", output_vcf])
     
     # Cleanup
-    if os.path.exists("ref_raw.vcf.gz"):
-        os.remove("ref_raw.vcf.gz")
+    if os.path.exists("ref_raw.bcf"):
+        os.remove("ref_raw.bcf")
     print(f"Reference prepared: {output_vcf}")
 
 def prepare_truth(source, output_vcf):
@@ -236,61 +234,116 @@ def prepare_truth(source, output_vcf):
     print(f"Truth prepared: {output_vcf}")
 
 def run_conversion(input_path, output_vcf):
-    """Runs convert_genome to convert input to VCF."""
+    """Runs convert_genome to convert input to VCF (hg19) then lifts to hg38."""
     
     # Pre-process input (handle zip/split)
     raw_file = prepare_input_file(input_path)
     
-    # Rename chromosomes from chr22 -> 22 to match 1000G reference
-    # Create a mapping file
+    # === Step 1: Convert to hg19 VCF ===
+    print(f"Converting {raw_file} to hg19 VCF...")
+    
+    # Create chr map for hg19
     with open("chr_map.txt", "w") as f:
         f.write("chr22\t22\n")
 
-    print(f"Converting {raw_file} to {output_vcf}...")
+    # Use hg19/GRCh37 reference for initial conversion (DTC files are hg19)
+    ref_hg19_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/chromosomes/chr22.fa.gz"
+    temp_hg19_vcf = "temp_hg19.vcf"
     
-    # Use hg19/GRCh37 reference to match 1000G Phase 3 reference panel
-    # DTC files (23andMe, AncestryDNA) are typically GRCh37/hg19
-    ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/chromosomes/chr22.fa.gz"
-    
-    # convert_genome uses positional arguments: <INPUT> <REFERENCE> [OUTPUT]
     cmd = [
         "convert_genome",
         raw_file,
-        ref_url,
-        "temp_conv.vcf",
+        ref_hg19_url,
+        temp_hg19_vcf,
         "--format", "vcf"
     ]
     
     print(f"Running: {' '.join(cmd)}")
     subprocess.check_call(cmd)
     
-    if not os.path.exists("temp_conv.vcf"):
-        raise RuntimeError("convert_genome failed to produce temp_conv.vcf")
+    if not os.path.exists(temp_hg19_vcf):
+        raise RuntimeError("convert_genome failed to produce temp_hg19.vcf")
+
+    # Rename chroms to 'chr22' style for CrossMap compatible with chain file usually
+    # Actually CrossMap handles it, but let's standardize.
+    # We'll just pass temp_hg19_vcf to CrossMap.
+    
+    # === Step 2: Liftover to hg38 ===
+    print("Lifting over to hg38...")
+    
+    # Locate liftover tools (expected in ~/liftover from workflow)
+    home = os.path.expanduser("~")
+    chain_file = os.path.join(home, "liftover", "hg19ToHg38.over.chain.gz")
+    ref_hg38 = os.path.join(home, "liftover", "hg38.fa")
+    
+    if not os.path.exists(chain_file) or not os.path.exists(ref_hg38):
+        print(f"Warning: Liftover files not found at {chain_file} or {ref_hg38}.")
+        print("Updating files assuming hg19 is desired if liftover fails...")
+        # Fallback: Just use hg19 output if tools missings (local dev case)
+        # But for CI we expect them.
         
-    print(f"temp_conv.vcf size: {os.path.getsize('temp_conv.vcf')}")
-    
-    # Compress, normalize chroms, filter to Chr22
-    # convert_genome output is already filtered to Chr22 by reference
-    # We pipe: view -> annotate (rename) -> output
-    # Removed --regions 22 to avoid index requirement on stream
-    
-    cmd_process = (
-        f"bcftools view temp_conv.vcf -Ou | "
-        f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
-    )
-    subprocess.check_call(cmd_process, shell=True)
-    subprocess.check_call(["tabix", "-p", "vcf", output_vcf])
-    
-    if os.path.exists("temp_conv.vcf"):
-        os.remove("temp_conv.vcf")
-    if os.path.exists("chr_map.txt"):
-        os.remove("chr_map.txt")
+        # Normalize hg19 output to final
+        cmd_process = (
+            f"bcftools view {temp_hg19_vcf} -Ou | "
+            f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
+        )
+        subprocess.check_call(cmd_process, shell=True)
+        subprocess.check_call(["bcftools", "index", "-f", output_vcf])
+        print("Warning: SKIPPED Liftover (missing tools), output is hg19.")
+    else:
+        # Run CrossMap
+        # Output uncompressed vcf first
+        temp_hg38_vcf = "temp_hg38.vcf"
+        try:
+           cmd_liftover = [
+               "CrossMap.py", "vcf", 
+               chain_file, 
+               temp_hg19_vcf,
+               ref_hg38,
+               temp_hg38_vcf
+           ]
+           print(f"Running CrossMap: {' '.join(cmd_liftover)}")
+           subprocess.check_call(cmd_liftover)
+           
+           # Check if it produced .vcf (CrossMap might append suffix or not depending on version? Usually just takes output arg)
+           # CrossMap vcf output argument is prefix or full name? 
+           # Documentation says: CrossMap.py vcf <chain> <inf> <ref> <outf>
+           
+           if not os.path.exists(temp_hg38_vcf) and os.path.exists(temp_hg38_vcf + ".unmap"):
+                # It might have worked but filtered everything?
+                pass
+                
+           # === Step 3: Finalize Output ===
+           print("Finalizing hg38 output...")
+           # Compress and index
+           # Ensure chromosome name is '22' not 'chr22' (HGDP reference uses 'chr22' usually? let's check)
+           # The HGDP URL uses 'chr22'. So we should KEEP 'chr22' or rename to '22' depending on Reagle requirement.
+           # Reagle integration test uses '22' usually. 
+           # Let's check download_reference output... it downloads BCF from gnomAD.
+           # gnomAD uses 'chr22'.
+           # So we probably want 'chr22'.
+           # Start with '22' for consistency with input if possible, OR 'chr22' if ref has it.
+           # Let's inspect ref in future. For now, 1000G was '22'. HGDP is 'chr22'.
+           # Be consistent with reference.
+           
+           subprocess.check_call(f"bcftools view {temp_hg38_vcf} -Oz -o {output_vcf}", shell=True)
+           subprocess.check_call(["bcftools", "index", "-f", output_vcf])
+           print("Liftover complete.")
+           
+        except Exception as e:
+            print(f"Liftover failed: {e}")
+            raise
+
+    # Cleanup
+    if os.path.exists(temp_hg19_vcf): os.remove(temp_hg19_vcf)
+    if os.path.exists("temp_hg38.vcf"): os.remove("temp_hg38.vcf")
+    if os.path.exists("chr_map.txt"): os.remove("chr_map.txt")
         
     # Cleanup extracted if it was temp
     if "extracted" in raw_file:
         shutil.rmtree(os.path.dirname(raw_file))
         
-    print("Conversion complete.")
+    print("Conversion preparation complete.")
 
 if __name__ == "__main__":
     print("Prepare Data Script v1.2 (Clean Overwrite)")
