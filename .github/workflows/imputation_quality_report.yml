@@ -3,19 +3,7 @@ name: Imputation Quality Benchmark
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
-    paths:
-      - 'src/**'
-      - 'tests/imputation_quality.rs'
-      - 'scripts/plot_quality.py'
-      - '.github/workflows/imputation_quality_report.yml'
   pull_request:
-    branches: [ "main" ]
-    paths:
-      - 'src/**'
-      - 'tests/imputation_quality.rs'
-      - 'scripts/plot_quality.py'
-      - '.github/workflows/imputation_quality_report.yml'
 
 jobs:
   impute-and-measure:
