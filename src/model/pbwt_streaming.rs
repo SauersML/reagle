@@ -388,6 +388,43 @@ impl PbwtWavefront {
         self.ensure_fwd_inverse();
     }
 
+    /// Estimate forward match length with a neighbor carrying the requested allele.
+    pub fn fwd_match_len_with_allele(&mut self, hap_idx: u32, allele: u8, alleles: &[u8]) -> i32 {
+        if (hap_idx as usize) >= self.n_haps {
+            return 0;
+        }
+        self.ensure_fwd_inverse();
+        let pos = self.fwd_inverse[hap_idx as usize] as usize;
+        let m = self.fwd_marker as i32;
+        let mut best = 0i32;
+
+        if pos > 0 {
+            let nb = self.fwd_ppa[pos - 1] as usize;
+            if alleles.get(nb).copied().unwrap_or(255) == allele {
+                let len = m - self.fwd_div[pos];
+                if len > best {
+                    best = len;
+                }
+            }
+        }
+
+        if pos + 1 < self.n_haps {
+            let nb = self.fwd_ppa[pos + 1] as usize;
+            if alleles.get(nb).copied().unwrap_or(255) == allele {
+                let len = m - self.fwd_div[pos + 1];
+                if len > best {
+                    best = len;
+                }
+            }
+        }
+
+        if best < 0 {
+            0
+        } else {
+            best
+        }
+    }
+
     /// Pre-compute backward inverse index for read-only parallel queries
     pub fn prepare_bwd_queries(&mut self) {
         self.ensure_bwd_inverse();

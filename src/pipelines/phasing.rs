@@ -660,6 +660,9 @@ impl PhasingPipeline {
             Vec::new()
         };
 
+        // Greedy PBWT bootstrap to seed local phase before HMM iterations.
+        self.greedy_pbwt_bootstrap_phase(&mut geno, target_gt, &hi_freq_markers, 0);
+
         // Build IBS2 segments for phase consistency (uses PositionMap fallback if no --map)
         eprintln!("Building IBS2 segments...");
         let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
@@ -1068,6 +1071,10 @@ impl PhasingPipeline {
         } else {
             0
         };
+
+        // Greedy PBWT bootstrap, skipping the fixed overlap region.
+        let all_markers: Vec<usize> = (0..n_markers).collect();
+        self.greedy_pbwt_bootstrap_phase(&mut geno, target_gt, &all_markers, overlap_markers);
 
         let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
         let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
@@ -1783,6 +1790,105 @@ impl PhasingPipeline {
             info!("finalize_streaming: all {} samples had IBS matches", n_samples);
         }
         finalized
+    }
+
+    /// Greedy PBWT bootstrap to locally re-phase heterozygotes before HMM iterations.
+    fn greedy_pbwt_bootstrap_phase(
+        &self,
+        geno: &mut MutableGenotypes,
+        target_gt: &GenotypeMatrix,
+        marker_indices: &[usize],
+        skip_before: usize,
+    ) {
+        if marker_indices.is_empty() {
+            return;
+        }
+
+        let n_haps = geno.n_haps();
+        let n_samples = n_haps / 2;
+        let samples = target_gt.samples_arc();
+        let n_ref_haps = self.reference_gt.as_ref().map(|r| r.n_haplotypes()).unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
+
+        let (ref_panel, align) = match (self.reference_gt.as_ref(), self.alignment.as_ref()) {
+            (Some(ref_gt), Some(alignment)) => (Some(ref_gt), Some(alignment)),
+            _ => (None, None),
+        };
+        let has_ref = ref_panel.is_some();
+
+        let mut alleles = vec![0u8; n_total_haps];
+        let mut wavefront = PbwtWavefront::new(n_total_haps, marker_indices.len());
+
+        for pass in 0..2 {
+            wavefront.reset_forward();
+            let iter: Box<dyn Iterator<Item = usize>> = if pass == 0 {
+                Box::new(marker_indices.iter().copied())
+            } else {
+                Box::new(marker_indices.iter().rev().copied())
+            };
+
+            for marker in iter {
+                for h in 0..n_total_haps {
+                    if h < n_haps {
+                        alleles[h] = geno.get(marker, HapIdx::new(h as u32));
+                    } else if has_ref {
+                        let ref_h = h - n_haps;
+                        let ref_panel = ref_panel.expect("reference");
+                        let align = align.expect("alignment");
+                        if let Some(ref_m) = align.target_to_ref(marker) {
+                            let ref_allele =
+                                ref_panel.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                            alleles[h] = align.reverse_map_allele(marker, ref_allele);
+                        } else {
+                            alleles[h] = 255;
+                        }
+                    } else {
+                        alleles[h] = 255;
+                    }
+                }
+
+                wavefront.prepare_fwd_queries();
+
+                if marker >= skip_before {
+                    for s in 0..n_samples {
+                        if !samples.is_diploid(SampleIdx::new(s as u32)) {
+                            continue;
+                        }
+
+                        let h1 = s * 2;
+                        let h2 = h1 + 1;
+                        let a1 = alleles[h1];
+                        let a2 = alleles[h2];
+
+                        if a1 == a2 || a1 > 1 || a2 > 1 {
+                            continue;
+                        }
+
+                        let keep = wavefront.fwd_match_len_with_allele(h1 as u32, a1, &alleles)
+                            + wavefront.fwd_match_len_with_allele(h2 as u32, a2, &alleles);
+                        let swap = wavefront.fwd_match_len_with_allele(h1 as u32, a2, &alleles)
+                            + wavefront.fwd_match_len_with_allele(h2 as u32, a1, &alleles);
+
+                        if swap > keep {
+                            alleles[h1] = a2;
+                            alleles[h2] = a1;
+                            geno.set(marker, HapIdx::new(h1 as u32), a2);
+                            geno.set(marker, HapIdx::new(h2 as u32), a1);
+                        }
+                    }
+                }
+
+                let mut is_biallelic = true;
+                for &a in &alleles {
+                    if a >= 2 && a != 255 {
+                        is_biallelic = false;
+                        break;
+                    }
+                }
+                let n_alleles = if is_biallelic { 2 } else { 256 };
+                wavefront.advance_forward(&alleles, n_alleles);
+            }
+        }
     }
 
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
