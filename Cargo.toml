@@ -52,7 +52,7 @@ tempfile = "3.24.0"
 serial_test = "3.2"
 
 [build-dependencies]
-grep = "0.4.1"
+grep = "0.4"
 walkdir = "2.5.0"
 
 [profile.release]
