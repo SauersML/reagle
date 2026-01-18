@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: Rust
+        working-directory: .
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +32,7 @@ jobs:
         id: cache-data
         uses: actions/cache@v4
         with:
-          path: Rust/tests/data/
+          path: tests/data/
           key: test-data-hgdp1kg-chr22-v2
 
       - name: Prepare test data (profiling subset)
@@ -43,15 +43,15 @@ jobs:
         with:
           name: profiling-test-data
           path: |
-            Rust/tests/data/input.vcf.gz
-            Rust/tests/data/input.vcf.gz.csi
-            Rust/tests/data/ref.vcf.gz
-            Rust/tests/data/ref.vcf.gz.csi
-            Rust/tests/data/truth.vcf.gz
-            Rust/tests/data/truth.vcf.gz.csi
-            Rust/tests/data/gsa_chr22.regions
-            Rust/tests/data/train_samples.txt
-            Rust/tests/data/test_samples.txt
+            tests/data/input.vcf.gz
+            tests/data/input.vcf.gz.csi
+            tests/data/ref.vcf.gz
+            tests/data/ref.vcf.gz.csi
+            tests/data/truth.vcf.gz
+            tests/data/truth.vcf.gz.csi
+            tests/data/gsa_chr22.regions
+            tests/data/train_samples.txt
+            tests/data/test_samples.txt
           retention-days: 7
 
       - name: Print artifact link
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: Rust
+        working-directory: .
     steps:
       - uses: actions/checkout@v4
 
@@ -77,7 +77,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            Rust/target
+            target
           key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-bench-
@@ -105,7 +105,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: Rust/target/criterion
+          path: target/criterion
           retention-days: 30
 
   profile:
@@ -114,7 +114,7 @@ jobs:
     needs: prepare_data
     defaults:
       run:
-        working-directory: Rust
+        working-directory: .
     steps:
       - uses: actions/checkout@v4
 
@@ -132,7 +132,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            Rust/target
+            target
           key: ${{ runner.os }}-cargo-profile-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-profile-
@@ -141,7 +141,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: profiling-test-data
-          path: Rust/tests/data
+          path: tests/data
 
       - name: Build release binary
         run: cargo build --release

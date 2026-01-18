@@ -38,14 +38,14 @@ jobs:
       - name: Cache Cargo build
         uses: actions/cache@v4
         with:
-          path: Rust/target
+          path: target
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-build-
 
       - name: Build and Test (Capture Output)
         id: verify
-        working-directory: Rust
+        working-directory: .
         run: |
           echo "Building reagle..."
           set +e

@@ -117,11 +117,11 @@ def verify_rust_build():
     print("\n--- Verifying Rust Build ---")
 
     # Run cargo check first (faster), then cargo test
-    stdout, stderr, code = run_command("cd Rust && cargo check --all-targets")
+    stdout, stderr, code = run_command("cargo check --all-targets")
 
     if code == 0:
         print("Cargo check passed. Running tests...")
-        stdout, stderr, code = run_command("cd Rust && cargo test")
+        stdout, stderr, code = run_command("cargo test")
 
         if code == 0:
             print("Rust build and tests passed.")
@@ -264,7 +264,7 @@ def main():
         "\n\nNOTE:\n"
         "- You are encouraged to proactively search the web for Rust documentation.\n"
         "- DO NOT modify 'rust-toolchain.toml' if it exists - the Rust version may be pinned.\n"
-        "- Focus ONLY on Rust/*.rs files and Rust/Cargo.toml for improvements.\n"
+        "- Focus ONLY on src/*.rs files and Cargo.toml for improvements.\n"
         "- This is a port of BEAGLE (genotype phasing/imputation) to Rust.\n"
         "- Reference the Java/ directory for the original implementation if needed.\n"
         "- Always try to improve something--commit and finish. No further instruction will be given.\n"
@@ -486,4 +486,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

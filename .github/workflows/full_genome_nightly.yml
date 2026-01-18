@@ -38,18 +38,18 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            Rust/target/
+            target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build Reagle
-        working-directory: Rust
+        working-directory: .
         run: cargo build --release
 
       - name: Upload Reagle binary
         uses: actions/upload-artifact@v4
         with:
           name: reagle-binary
-          path: Rust/target/release/reagle
+          path: target/release/reagle
           retention-days: 7
 
   # Job 2: Prepare data for each chromosome (Run once per chromosome)
@@ -71,19 +71,19 @@ jobs:
         id: cache-data
         uses: actions/cache@v4
         with:
-          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+          path: tests/data_chr${{ matrix.chromosome }}/
           key: test-data-hgdp1kg-chr${{ matrix.chromosome }}-v5
 
       - name: Prepare chromosome ${{ matrix.chromosome }}
         if: steps.cache-data.outputs.cache-hit != 'true'
-        working-directory: Rust
+        working-directory: .
         run: python3 tests/integration_test.py prepare-chr ${{ matrix.chromosome }}
 
       - name: Upload chromosome data
         uses: actions/upload-artifact@v4
         with:
           name: data-chr${{ matrix.chromosome }}
-          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+          path: tests/data_chr${{ matrix.chromosome }}/
           retention-days: 7
 
   # Job 3: Run imputation for each tool on each chromosome
@@ -111,21 +111,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: reagle-binary
-          path: Rust/target/release/
+          path: target/release/
 
       - name: Make Reagle executable
         if: matrix.tool == 'reagle'
-        run: chmod +x Rust/target/release/reagle
+        run: chmod +x target/release/reagle
 
       - name: Download chromosome data
         uses: actions/download-artifact@v4
         with:
           name: data-chr${{ matrix.chromosome }}
-          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+          path: tests/data_chr${{ matrix.chromosome }}/
 
       # Run ONLY the specific tool for this runner
       - name: Run ${{ matrix.tool }} on chr${{ matrix.chromosome }}
-        working-directory: Rust
+        working-directory: .
         run: |
           python3 tests/integration_test.py impute-chr ${{ matrix.chromosome }} \
             --tools ${{ matrix.tool }}
@@ -135,9 +135,9 @@ jobs:
         with:
           name: results-${{ matrix.tool }}-chr${{ matrix.chromosome }}
           path: |
-            Rust/tests/data_chr${{ matrix.chromosome }}/${{ matrix.tool }}_imputed.vcf.gz
-            Rust/tests/data_chr${{ matrix.chromosome }}/${{ matrix.tool }}_imputed.vcf.gz.csi
-            Rust/tests/data_chr${{ matrix.chromosome }}/${{ matrix.tool }}_imputed.vcf.gz.tbi
+            tests/data_chr${{ matrix.chromosome }}/${{ matrix.tool }}_imputed.vcf.gz
+            tests/data_chr${{ matrix.chromosome }}/${{ matrix.tool }}_imputed.vcf.gz.csi
+            tests/data_chr${{ matrix.chromosome }}/${{ matrix.tool }}_imputed.vcf.gz.tbi
           retention-days: 7
 
   # Job 4: Calculate metrics for each tool/chromosome
@@ -162,16 +162,16 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: data-chr${{ matrix.chromosome }}
-          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+          path: tests/data_chr${{ matrix.chromosome }}/
 
       - name: Download imputation results
         uses: actions/download-artifact@v4
         with:
           name: results-${{ matrix.tool }}-chr${{ matrix.chromosome }}
-          path: Rust/tests/data_chr${{ matrix.chromosome }}/
+          path: tests/data_chr${{ matrix.chromosome }}/
 
       - name: Calculate metrics for ${{ matrix.tool }} on chr${{ matrix.chromosome }}
-        working-directory: Rust
+        working-directory: .
         run: python3 tests/integration_test.py metrics-chr ${{ matrix.chromosome }}
 
       - name: Upload metrics
@@ -179,8 +179,8 @@ jobs:
         with:
           name: metrics-${{ matrix.tool }}-chr${{ matrix.chromosome }}
           path: |
-            Rust/tests/data_chr${{ matrix.chromosome }}/*_metrics.txt
-            Rust/tests/data_chr${{ matrix.chromosome }}/*_metrics.json
+            tests/data_chr${{ matrix.chromosome }}/*_metrics.txt
+            tests/data_chr${{ matrix.chromosome }}/*_metrics.json
           retention-days: 30
 
   # Job 4: Aggregate all chromosome metrics
@@ -194,16 +194,16 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: metrics-*
-          path: Rust/tests/
+          path: tests/
           merge-multiple: true
 
       - name: Generate genome-wide summary
-        working-directory: Rust
+        working-directory: .
         run: python3 tests/integration_test.py summary
 
       - name: Upload summary
         uses: actions/upload-artifact@v4
         with:
           name: genome-wide-summary
-          path: Rust/tests/*summary*.txt
+          path: tests/*summary*.txt
           retention-days: 30
