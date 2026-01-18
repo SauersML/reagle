@@ -32,20 +32,23 @@ def run_benchmark(person, file_path, format):
     beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
     run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=22", "nthreads=2"])
 
-    # 4. Run Metrics
+    # 4. Run Metrics using the Python integration test
     print("=== Calculating Metrics ===")
-    env = os.environ.copy()
-    env["TEST_TRUTH_VCF"] = "truth.vcf.gz"
     
-    # Reagle Metrics
-    env["TEST_IMP_VCF"] = "reagle_out.vcf.gz"
-    env["TEST_OUTPUT_JSON"] = "reagle_metrics.json"
-    subprocess.check_call(["cargo", "test", "--test", "imputation_quality", "test_metrics_calculation_dummy", "--", "--nocapture"], env=env)
+    # Move outputs to expected locations for integration test
+    import shutil
+    os.makedirs("tests/data", exist_ok=True)
+    shutil.copy("truth.vcf.gz", "tests/data/truth.vcf.gz")
+    shutil.copy("reagle_out.vcf.gz", "tests/data/reagle_imputed.vcf.gz")
+    shutil.copy("beagle_out.vcf.gz", "tests/data/beagle_imputed.vcf.gz")
     
-    # Beagle Metrics
-    env["TEST_IMP_VCF"] = "beagle_out.vcf.gz"
-    env["TEST_OUTPUT_JSON"] = "beagle_metrics.json"
-    subprocess.check_call(["cargo", "test", "--test", "imputation_quality", "test_metrics_calculation_dummy", "--", "--nocapture"], env=env)
+    # Index files for metrics calculation
+    for vcf in ["tests/data/truth.vcf.gz", "tests/data/reagle_imputed.vcf.gz", "tests/data/beagle_imputed.vcf.gz"]:
+        if os.path.exists(vcf):
+            run_cmd(["bcftools", "index", "-f", vcf])
+    
+    # Run metrics via integration test
+    run_cmd(["python3", "tests/integration_test.py", "metrics"])
 
 if __name__ == "__main__":
     print("Benchmark Script v1.1")
