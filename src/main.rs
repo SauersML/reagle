@@ -1,4 +1,4 @@
-//! # Reagle: High-Performance Genotype Phasing and Imputation
+//! # Reagle: High-performance Genotype Phasing and Imputation
 //!
 //! A Rust reimplementation of Beagle, optimized for modern hardware.
 //!
@@ -16,18 +16,10 @@
 
 use std::time::Instant;
 
-mod config;
-mod data;
-mod error;
-mod io;
-mod model;
-mod pipelines;
-mod utils;
-
-use config::Config;
-use error::Result;
-use pipelines::{ImputationPipeline, PhasingPipeline};
-use utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
+use reagle::config::Config;
+use reagle::error::Result;
+use reagle::pipelines::{ImputationPipeline, PhasingPipeline};
+use reagle::utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
 
 fn main() {
     if let Err(e) = run() {
@@ -110,11 +102,11 @@ fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use reagle::{config, data, error, io, model, pipelines};
 
     #[test]
     fn test_module_imports() {
-        // Verify all modules are accessible
+        // Verify all modules are accessible via the library crate
         let _ = config::Config::parse_and_validate;
         let _ = error::ReagleError::vcf("test");
         let _ = data::marker::MarkerIdx::new;
