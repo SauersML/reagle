@@ -91,6 +91,8 @@ def download_reference(output_vcf):
     # Filter/Normalize
     print("Filtering reference...")
     # It is already Chr22, just normalize variants
+    # No regions filter needed if file is just Chr22 (avoids index issue on stream if using pipe, but here we use file)
+    # Using -m 2 -M 2 -v snps to keep only biallelic SNPs
     subprocess.check_call("bcftools view ref_raw.vcf.gz -m 2 -M 2 -v snps -Oz -o " + output_vcf, shell=True)
     subprocess.check_call(["tabix", "-f", output_vcf])
     
@@ -157,7 +159,7 @@ def prepare_truth(source, output_vcf):
             else:
                 raise FileNotFoundError("Could not find Truth VCF source files")
 
-    # Index before filtering
+    # Index before filtering (required for filtering regions efficiently)
     print("Indexing Truth VCF...")
     subprocess.check_call(["bcftools", "index", "-t", source_vcf])
 
@@ -166,10 +168,10 @@ def prepare_truth(source, output_vcf):
         f.write("chr22\t22\n")
 
     print("Filtering Truth to Chr22...")
+    # Filter FIRST using index (regions 22 or chr22), then rename
     cmd = (
-        f"bcftools view {source_vcf} -Ou | "
-        f"bcftools annotate --rename-chrs chr_map.txt -Ou | "
-        f"bcftools view --regions 22 -Oz -o {output_vcf}"
+        f"bcftools view {source_vcf} --regions 22,chr22 -Ou | "
+        f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
     )
     subprocess.check_call(cmd, shell=True)
     subprocess.check_call(["tabix", "-p", "vcf", output_vcf])
@@ -214,15 +216,13 @@ def run_conversion(input_path, output_vcf):
     print(f"temp_conv.vcf size: {os.path.getsize('temp_conv.vcf')}")
     
     # Compress, normalize chroms, filter to Chr22
-    # convert_genome output is VCF.
-    # We pipe: view -> annotate (rename) -> view (regions 22) -> output
-    # Note: If input has 'chr22', convert_genome might output 'chr22'.
-    # We rename 'chr22' to '22'.
+    # convert_genome output is already filtered to Chr22 by reference
+    # We pipe: view -> annotate (rename) -> output
+    # Removed --regions 22 to avoid index requirement on stream
     
     cmd_process = (
         f"bcftools view temp_conv.vcf -Ou | "
-        f"bcftools annotate --rename-chrs chr_map.txt -Ou | "
-        f"bcftools view --regions 22 -Oz -o {output_vcf}"
+        f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
     )
     subprocess.check_call(cmd_process, shell=True)
     subprocess.check_call(["tabix", "-p", "vcf", output_vcf])
@@ -239,7 +239,7 @@ def run_conversion(input_path, output_vcf):
     print("Conversion complete.")
 
 if __name__ == "__main__":
-    print("Prepare Data Script v1.1 (Positional Args)")
+    print("Prepare Data Script v1.2 (Clean Overwrite)")
     if len(sys.argv) < 2:
         print("Usage:")
         print("  python3 prepare_data.py array <input_file> <output_vcf>")
