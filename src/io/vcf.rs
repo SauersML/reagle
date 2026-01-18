@@ -805,9 +805,11 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     };
 
     // Uniform or near-uniform GLs contain no information about the call.
-    // Treat as missing confidence so downstream logic preserves the input GT.
+    // Return 0 confidence (lowest possible) instead of None.
+    // None triggers a fallback to "Missing GL" which defaults to 255 (max confidence),
+    // which is the opposite of what we want for uniform/uncertain GLs.
     if gl_gap.abs() < 1e-6 {
-        return None;
+        return Some(0);
     }
 
     // Check if called genotype is the most likely
@@ -986,7 +988,19 @@ impl VcfWriter {
                 let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
                 let a1 = column.get(hap1);
                 let a2 = column.get(hap2);
-                write!(self.writer, "\t{}|{}", a1, a2)?;
+
+                write!(self.writer, "\t")?;
+                if a1 == 255 {
+                    write!(self.writer, ".")?;
+                } else {
+                    write!(self.writer, "{}", a1)?;
+                }
+                write!(self.writer, "|")?;
+                if a2 == 255 {
+                    write!(self.writer, ".")?;
+                } else {
+                    write!(self.writer, "{}", a2)?;
+                }
             }
             writeln!(self.writer)?;
         }
@@ -1102,9 +1116,21 @@ impl VcfWriter {
 
                 // Format: \t{a1}|{a2}:{ds}
                 line_buf.push('\t');
-                line_buf.push((b'0' + a1) as char);
+                if a1 == 255 {
+                    line_buf.push('.');
+                } else if a1 < 10 {
+                    line_buf.push((b'0' + a1) as char);
+                } else {
+                    line_buf.push_str(&a1.to_string());
+                }
                 line_buf.push('|');
-                line_buf.push((b'0' + a2) as char);
+                if a2 == 255 {
+                    line_buf.push('.');
+                } else if a2 < 10 {
+                    line_buf.push((b'0' + a2) as char);
+                } else {
+                    line_buf.push_str(&a2.to_string());
+                }
                 line_buf.push(':');
                 let v = format_f32_4dp(ds, &mut ryu_buf);
                 line_buf.push_str(&v);
