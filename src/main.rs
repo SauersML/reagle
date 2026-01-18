@@ -30,6 +30,7 @@ use pipelines::{ImputationPipeline, PhasingPipeline};
 use utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
 
 fn main() {
+    // TODO: This should trigger a build failure
     if let Err(e) = run() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
