@@ -2294,7 +2294,8 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
 fn scan_for_allow_dead_code() -> Vec<String> {
     // Regex pattern to find #[allow(dead_code)] attributes
-    let pattern = r"#\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]";
+    // Also matches inner attributes like #![allow(dead_code)]
+    let pattern = r"#\s*!?\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]";
     let mut all_violations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
