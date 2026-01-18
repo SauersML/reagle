@@ -805,9 +805,11 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     };
 
     // Uniform or near-uniform GLs contain no information about the call.
-    // Treat as missing confidence so downstream logic preserves the input GT.
+    // We must return low confidence (0) rather than None, because None
+    // triggers the default fallback to 255 (full confidence), which would
+    // treat this uncertain call as a hard constraint.
     if gl_gap.abs() < 1e-6 {
-        return None;
+        return Some(0);
     }
 
     // Check if called genotype is the most likely
@@ -1195,6 +1197,17 @@ impl Drop for VcfWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compute_gl_confidence_uniform() {
+        // Uniform GLs -> 0 confidence
+        assert_eq!(compute_gl_confidence("-0.48,-0.48,-0.48", 0, 0), Some(0));
+        assert_eq!(compute_gl_confidence("0,0,0", 0, 0), Some(0));
+
+        // Distinct GLs -> high confidence
+        // -0.01 vs -5.0 -> gap ~5 -> high conf
+        assert!(compute_gl_confidence("-0.01,-5.0,-10.0", 0, 0).unwrap() > 200);
+    }
 
     #[test]
     fn test_parse_genotype() {
