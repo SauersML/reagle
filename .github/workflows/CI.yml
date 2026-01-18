@@ -21,7 +21,8 @@ jobs:
     - name: Compile Java
       run: |
         mkdir -p build/java
-        javac -d build/java Java/*/*.java
+        git clone --depth 1 https://github.com/SauersML/Beagle beagle-java
+        javac -d build/java $(find beagle-java -name "*.java")
 
     - name: Package Jar
       run: jar cfe beagle.jar main.Main -C build/java .
@@ -39,10 +40,8 @@ jobs:
 
     - name: Build Rust
       run: |
-        cd Rust
         cargo build --verbose
 
     - name: Run Rust Tests
       run: |
-        cd Rust
         cargo test --verbose
