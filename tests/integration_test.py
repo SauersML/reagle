@@ -640,24 +640,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     truth_iter = _stream_vcf_lines(truth_cmd)
 
     # 2. Imputed Stream
-    # Check if DS/GP fields exist in the VCF before querying
-    # If not, fall back to GT-only query
-    has_ds_gp = False
-    try:
-        header_check = subprocess.run(
-            ["bcftools", "view", "-h", imputed_vcf],
-            capture_output=True, text=True, check=True
-        )
-        has_ds_gp = ":DS:" in header_check.stdout or "ID=DS" in header_check.stdout
-    except Exception:
-        pass
-    
-    if has_ds_gp:
-        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf}"
-    else:
-        # Fall back to GT-only query for Beagle or other imputors that don't output DS/GP
-        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
-        print(f"Note: DS/GP fields not found, using GT-only for {imputed_vcf}")
+    # Use GT-only query which works universally across all imputors (Beagle, Reagle, etc.)
+    # DS/GP fields are optional and cause bcftools errors with some outputs
+    imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
     imputed_iter = _stream_vcf_lines(imputed_cmd)
 
     # Helper to get next parsed line
