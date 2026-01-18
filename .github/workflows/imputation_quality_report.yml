@@ -77,9 +77,9 @@ jobs:
         run: |
           ./target/release/reagle \
             --ref ref.vcf.gz \
-            --target target.vcf.gz \
+            --gt target.vcf.gz \
             --out reagle_out \
-            --chromosome 22
+            --chrom 22
 
       - name: Run Beagle Imputation
         run: |
