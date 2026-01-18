@@ -411,12 +411,14 @@ def _stream_vcf_lines(cmd):
 
 
 def _parse_truth_line(line, samples):
-    """Parse a truth VCF line into (key, sample_data_dict)."""
+    """Parse a truth VCF line into (key, sample_data_dict, is_multiallelic)."""
     parts = line.split('\t')
     if len(parts) < 5:
-        return None, None
+        return None, None, False
     chrom, pos = parts[0], int(parts[1])
-    key = (chrom, pos)
+    ref, alt = parts[2], parts[3]
+    key = (chrom, pos, ref, alt)
+    is_multiallelic = ',' in alt
     gts = parts[4:]
     sample_data = {}
     for i, gt_str in enumerate(gts):
@@ -424,18 +426,19 @@ def _parse_truth_line(line, samples):
             gt_field = gt_str.split(':')[0]
             gt = parse_genotype(gt_field)
             is_phased = '|' in gt_field
-            if gt is not None:
-                sample_data[samples[i]] = (gt, calculate_dosage(gt), is_phased)
-    return key, sample_data
+            sample_data[samples[i]] = (gt, calculate_dosage(gt) if gt is not None else None, is_phased)
+    return key, sample_data, is_multiallelic
 
 
 def _parse_imputed_line(line, samples):
-    """Parse an imputed VCF line into (key, sample_data_dict)."""
+    """Parse an imputed VCF line into (key, sample_data_dict, is_multiallelic)."""
     parts = line.split('\t')
     if len(parts) < 5:
-        return None, None
+        return None, None, False
     chrom, pos = parts[0], int(parts[1])
-    key = (chrom, pos)
+    ref, alt = parts[2], parts[3]
+    key = (chrom, pos, ref, alt)
+    is_multiallelic = ',' in alt
     sample_data_list = parts[4:]
     sample_data = {}
     for i, data_str in enumerate(sample_data_list):
@@ -469,12 +472,24 @@ def _parse_imputed_line(line, samples):
             if ds is None and gt is not None:
                 ds = calculate_dosage(gt)
 
-            if gt is not None:
-                sample_data[samples[i]] = (gt, ds, is_phased, gp)
-    return key, sample_data
+            sample_data[samples[i]] = (gt, ds, is_phased, gp)
+    return key, sample_data, is_multiallelic
 
 
-def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
+def load_input_sites(input_vcf):
+    if not input_vcf or not os.path.exists(input_vcf):
+        return None
+    cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\n' {input_vcf}"
+    sites = set()
+    for line in _stream_vcf_lines(cmd):
+        parts = line.split('\t')
+        if len(parts) >= 4:
+            chrom, pos, ref, alt = parts[0], int(parts[1]), parts[2], parts[3]
+            sites.add((chrom, pos, ref, alt))
+    return sites
+
+
+def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     """
     Calculate comprehensive imputation accuracy metrics.
 
@@ -514,7 +529,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     if not common_samples:
         print("ERROR: No common samples between truth and imputed VCFs")
         return None
-    print(f"Common samples: {len(common_samples)}")
+    common_samples_list = [s for s in truth_samples if s in common_samples]
+    print(f"Common samples: {len(common_samples_list)}")
+
+    input_sites = load_input_sites(input_vcf)
+    if input_sites is not None:
+        print(f"Input genotyped sites: {len(input_sites)}")
 
     # Calculate metrics
     unphased_concordant = 0  # Genotype match ignoring phase (0|1 == 1|0)
@@ -550,11 +570,20 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     switch_errors = 0
     switch_opportunities = 0
 
+    # Missing genotype counters
+    missing_truth = 0
+    missing_imputed = 0
+    missing_both = 0
+    ref_alt_mismatch = 0
+    multiallelic_sites = 0
+
     # For N50 Phasing Block Length
     # sample -> list of block lengths (in bp)
     phase_blocks = defaultdict(list)
     # sample -> start position of current block
     current_block_start = {}
+    # sample -> last heterozygous position used for switch tracking
+    last_het_pos = {}
 
     # MAF bins for stratified analysis - FINER BINS for rare variants
     def get_maf_bin(maf):
@@ -580,6 +609,24 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         "switch_errors": 0, "switch_opportunities": 0
     })
 
+    # Mask-and-impute metrics (per-sample proxy)
+    mask_rate = 0.02
+    min_mask_gap = 50_000
+    mask_seed = 1337
+    last_mask_pos = {}
+    masked_stats = {"sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0, "count": 0}
+    masked_concordant = 0
+    masked_total = 0
+    masked_nonref_concordant = 0
+    masked_nonref_total = 0
+    masked_brier_sum = 0.0
+    masked_brier_n = 0
+    ece_bins = [{"sum_conf": 0.0, "sum_acc": 0.0, "count": 0} for _ in range(10)]
+    masked_maf_bins = defaultdict(lambda: {
+        "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0, "count": 0,
+        "nonref_concordant": 0, "nonref_total": 0
+    })
+
     # === STREAMING SETUP ===
     print("Initializing streams...")
     
@@ -599,18 +646,18 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
             line = next(truth_iter)
             return _parse_truth_line(line, truth_samples)
         except StopIteration:
-            return None, None
+            return None, None, False
 
     def get_next_imputed():
         try:
             line = next(imputed_iter)
             return _parse_imputed_line(line, imputed_samples)
         except StopIteration:
-            return None, None
+            return None, None, False
 
     # Initial fetch
-    truth_key, truth_data = get_next_truth()
-    imp_key, imp_data = get_next_imputed()
+    truth_key, truth_data, truth_multiallelic = get_next_truth()
+    imp_key, imp_data, imp_multiallelic = get_next_imputed()
 
     # Track previous het for switch error calculation per sample
     prev_het = {}  # sample -> (site, truth_gt, imputed_gt, maf_bin)
@@ -620,9 +667,33 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     print("Streaming and comparing...")
     
     # Merge-join loop
+    def is_biallelic_gt(gt):
+        return gt is not None and all(a in (0, 1) for a in gt)
+
+    def gt_class(gt):
+        if not is_biallelic_gt(gt):
+            return None
+        if gt[0] == 0 and gt[1] == 0:
+            return 0
+        if gt[0] == 1 and gt[1] == 1:
+            return 2
+        return 1
+
+    def mask_pick(chrom, pos, maf_bin):
+        if input_sites is None:
+            return False
+        last_pos = last_mask_pos.get(maf_bin)
+        if last_pos is not None and pos - last_pos < min_mask_gap:
+            return False
+        h = hash((chrom, pos, maf_bin, mask_seed)) & 0xFFFFFFFF
+        if (h / 0xFFFFFFFF) < mask_rate:
+            last_mask_pos[maf_bin] = pos
+            return True
+        return False
+
     while truth_key is not None and imp_key is not None:
-        t_chrom, t_pos = truth_key
-        i_chrom, i_pos = imp_key
+        t_chrom, t_pos, t_ref, t_alt = truth_key
+        i_chrom, i_pos, i_ref, i_alt = imp_key
 
         # Compare positions (Chrom then Pos)
         # Handle string chromosome comparison carefully if needed, 
@@ -631,117 +702,189 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         if t_chrom == i_chrom:
             if t_pos == i_pos:
                 # MATCH! Process site
-                common_sites_count += 1
                 site = truth_key
                 last_pos = site[1]
                 truth_site = truth_data
                 imputed_site = imp_data
+                if t_ref != i_ref or t_alt != i_alt:
+                    ref_alt_mismatch += 1
+                    truth_key, truth_data, truth_multiallelic = get_next_truth()
+                    imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                    continue
+                if truth_multiallelic or imp_multiallelic:
+                    multiallelic_sites += 1
+                    truth_key, truth_data, truth_multiallelic = get_next_truth()
+                    imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                    continue
+                common_sites_count += 1
+                is_input_site = input_sites is not None and truth_key in input_sites
 
                 # --- METRICS CALCULATION LOGIC (same as before) ---
                 
                 # Calculate MAF from truth
-                dosages_at_site = [v[1] for v in truth_site.values() if v[1] is not None]
-                if dosages_at_site:
-                    af = sum(dosages_at_site) / (2 * len(dosages_at_site))
+                alt_count = 0
+                allele_count = 0
+                for sample in common_samples_list:
+                    t_entry = truth_site.get(sample)
+                    if t_entry is None:
+                        continue
+                    t_gt = t_entry[0]
+                    if is_biallelic_gt(t_gt):
+                        alt_count += t_gt[0] + t_gt[1]
+                        allele_count += 2
+                if allele_count > 0:
+                    af = alt_count / allele_count
                     maf = min(af, 1 - af)
                 else:
+                    af = 0
                     maf = 0
 
                 maf_bin = get_maf_bin(maf)
                 site_concordant = 0
                 site_total = 0
 
-                for sample in truth_site:
-                    if sample in imputed_site:
-                        t_gt, t_dos, t_phased = truth_site[sample]
-                        imp_values = imputed_site[sample]
-                        i_gt, i_dos, i_phased = imp_values[0], imp_values[1], imp_values[2]
-                        i_gp = imp_values[3] if len(imp_values) > 3 else None
+                for sample in common_samples_list:
+                    t_entry = truth_site.get(sample)
+                    i_entry = imputed_site.get(sample)
+                    t_gt, t_dos, t_phased = (t_entry if t_entry else (None, None, False))
+                    i_gt, i_dos, i_phased, i_gp = (i_entry if i_entry else (None, None, False, None))
 
-                        if t_dos is not None and i_dos is not None:
-                            # Hellinger score
-                            if i_gp is not None:
-                                t_gp = (1.0, 0.0, 0.0) if t_dos == 0 else ((0.0, 1.0, 0.0) if t_dos == 1 else (0.0, 0.0, 1.0))
-                                bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
-                                hellinger_dist = math.sqrt(max(0, 1 - bc))
-                                h_score = 1 - hellinger_dist
-                                hellinger_sum += h_score
-                                hellinger_count += 1
-                            
-                            total_compared += 1
-                            site_total += 1
+                    if t_gt is None:
+                        missing_truth += 1
+                    if i_gt is None:
+                        missing_imputed += 1
+                    if t_gt is None and i_gt is None:
+                        missing_both += 1
 
-                            # Online R² stats
-                            r2_stats["sum_t"] += t_dos
-                            r2_stats["sum_i"] += i_dos
-                            r2_stats["sum_ti"] += t_dos * i_dos
-                            r2_stats["sum_tt"] += t_dos * t_dos
-                            r2_stats["sum_ii"] += i_dos * i_dos
-                            r2_stats["count"] += 1
+                    t_class = gt_class(t_gt)
+                    i_class = gt_class(i_gt)
 
-                            # MAF bin stats
-                            maf_bins[maf_bin]["sum_t"] += t_dos
-                            maf_bins[maf_bin]["sum_i"] += i_dos
-                            maf_bins[maf_bin]["sum_ti"] += t_dos * i_dos
-                            maf_bins[maf_bin]["sum_tt"] += t_dos * t_dos
-                            maf_bins[maf_bin]["sum_ii"] += i_dos * i_dos
-                            maf_bins[maf_bin]["total"] += 1
+                    if t_class is None or i_dos is None:
+                        continue
 
-                            # Sample stats
-                            sample_metrics[sample]["total"] += 1
-                            sample_metrics[sample]["sum_t"] += t_dos
-                            sample_metrics[sample]["sum_i"] += i_dos
-                            sample_metrics[sample]["sum_ti"] += t_dos * i_dos
-                            sample_metrics[sample]["sum_tt"] += t_dos * t_dos
-                            sample_metrics[sample]["sum_ii"] += i_dos * i_dos
-                            
-                            # Confusion matrix
-                            t_class = 0 if t_dos == 0 else (2 if t_dos == 2 else 1)
-                            i_class = 0 if i_dos == 0 else (2 if i_dos == 2 else 1)
-                            confusion[t_class][i_class] += 1
-                            maf_bins[maf_bin]["confusion"][t_class][i_class] += 1
+                    if i_class is None and i_gt is not None:
+                        continue
 
-                            # Concordance
-                            t_sorted = tuple(sorted(t_gt))
-                            i_sorted = tuple(sorted(i_gt))
+                    # Hellinger score
+                    if i_gp is not None and t_class is not None:
+                        t_gp = (1.0, 0.0, 0.0) if t_class == 0 else ((0.0, 1.0, 0.0) if t_class == 1 else (0.0, 0.0, 1.0))
+                        bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
+                        hellinger_dist = math.sqrt(max(0, 1 - bc))
+                        h_score = 1 - hellinger_dist
+                        hellinger_sum += h_score
+                        hellinger_count += 1
+
+                    total_compared += 1
+                    site_total += 1
+
+                    # Online R² stats
+                    r2_stats["sum_t"] += t_dos
+                    r2_stats["sum_i"] += i_dos
+                    r2_stats["sum_ti"] += t_dos * i_dos
+                    r2_stats["sum_tt"] += t_dos * t_dos
+                    r2_stats["sum_ii"] += i_dos * i_dos
+                    r2_stats["count"] += 1
+
+                    # MAF bin stats
+                    maf_bins[maf_bin]["sum_t"] += t_dos
+                    maf_bins[maf_bin]["sum_i"] += i_dos
+                    maf_bins[maf_bin]["sum_ti"] += t_dos * i_dos
+                    maf_bins[maf_bin]["sum_tt"] += t_dos * t_dos
+                    maf_bins[maf_bin]["sum_ii"] += i_dos * i_dos
+                    maf_bins[maf_bin]["total"] += 1
+
+                    # Sample stats
+                    sample_metrics[sample]["total"] += 1
+                    sample_metrics[sample]["sum_t"] += t_dos
+                    sample_metrics[sample]["sum_i"] += i_dos
+                    sample_metrics[sample]["sum_ti"] += t_dos * i_dos
+                    sample_metrics[sample]["sum_tt"] += t_dos * t_dos
+                    sample_metrics[sample]["sum_ii"] += i_dos * i_dos
+
+                    if i_class is not None:
+                        confusion[t_class][i_class] += 1
+                        maf_bins[maf_bin]["confusion"][t_class][i_class] += 1
+
+                    # Concordance
+                    if i_class is not None:
+                        t_sorted = tuple(sorted(t_gt))
+                        i_sorted = tuple(sorted(i_gt))
+                        if t_sorted == i_sorted:
+                            unphased_concordant += 1
+                            site_concordant += 1
+                            maf_bins[maf_bin]["unphased_concordant"] += 1
+                            sample_metrics[sample]["concordant"] += 1
+
+                    # Non-ref concordance
+                    if t_class > 0 and i_class is not None:
+                        nonref_total += 1
+                        maf_bins[maf_bin]["nonref_total"] += 1
+                        if t_sorted == i_sorted:
+                            nonref_concordant += 1
+                            maf_bins[maf_bin]["nonref_concordant"] += 1
+
+                    # Switch errors
+                    if t_class == 1 and i_class == 1 and t_phased and i_phased:
+                        pos = site[1]
+                        if sample not in current_block_start:
+                            current_block_start[sample] = pos
+
+                        if sample in prev_het:
+                            prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample]
+                            t_same_phase = (t_gt[0] == prev_t_gt[0])
+                            i_same_phase = (i_gt[0] == prev_i_gt[0])
+
+                            if t_same_phase != i_same_phase:
+                                block_len = pos - current_block_start[sample]
+                                phase_blocks[sample].append(block_len)
+                                current_block_start[sample] = pos
+
+                                switch_errors += 1
+                                sample_metrics[sample]["switch_errors"] += 1
+                                maf_bins[maf_bin]["switch_errors"] += 1
+
+                            switch_opportunities += 1
+                            sample_metrics[sample]["switch_opportunities"] += 1
+                            maf_bins[maf_bin]["switch_opportunities"] += 1
+                        prev_het[sample] = (site, t_gt, i_gt, maf_bin)
+                        last_het_pos[sample] = pos
+
+                    # Masked-snp metrics (proxy quality)
+                    if is_input_site and mask_pick(t_chrom, t_pos, maf_bin):
+                        if i_class is not None:
+                            masked_total += 1
+                            masked_stats["sum_t"] += t_dos
+                            masked_stats["sum_i"] += i_dos
+                            masked_stats["sum_ti"] += t_dos * i_dos
+                            masked_stats["sum_tt"] += t_dos * t_dos
+                            masked_stats["sum_ii"] += i_dos * i_dos
+                            masked_stats["count"] += 1
+                            masked_maf_bins[maf_bin]["sum_t"] += t_dos
+                            masked_maf_bins[maf_bin]["sum_i"] += i_dos
+                            masked_maf_bins[maf_bin]["sum_ti"] += t_dos * i_dos
+                            masked_maf_bins[maf_bin]["sum_tt"] += t_dos * t_dos
+                            masked_maf_bins[maf_bin]["sum_ii"] += i_dos * i_dos
+                            masked_maf_bins[maf_bin]["count"] += 1
                             if t_sorted == i_sorted:
-                                unphased_concordant += 1
-                                site_concordant += 1
-                                maf_bins[maf_bin]["unphased_concordant"] += 1
-                                sample_metrics[sample]["concordant"] += 1
-                            
-                            # Non-ref concordance
-                            if t_dos > 0:
-                                nonref_total += 1
-                                maf_bins[maf_bin]["nonref_total"] += 1
+                                masked_concordant += 1
+                            if t_class > 0:
+                                masked_nonref_total += 1
+                                masked_maf_bins[maf_bin]["nonref_total"] += 1
                                 if t_sorted == i_sorted:
-                                    nonref_concordant += 1
-                                    maf_bins[maf_bin]["nonref_concordant"] += 1
-                            
-                            # Switch errors
-                            if t_dos == 1 and i_dos == 1 and t_phased and i_phased:
-                                pos = site[1]
-                                if sample not in current_block_start:
-                                    current_block_start[sample] = pos
-
-                                if sample in prev_het:
-                                    prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample]
-                                    t_same_phase = (t_gt[0] == prev_t_gt[0])
-                                    i_same_phase = (i_gt[0] == prev_i_gt[0])
-                                    
-                                    if t_same_phase != i_same_phase:
-                                        block_len = pos - current_block_start[sample]
-                                        phase_blocks[sample].append(block_len)
-                                        current_block_start[sample] = pos
-                                        
-                                        switch_errors += 1
-                                        sample_metrics[sample]["switch_errors"] += 1
-                                        maf_bins[maf_bin]["switch_errors"] += 1
-                                    
-                                    switch_opportunities += 1
-                                    sample_metrics[sample]["switch_opportunities"] += 1
-                                    maf_bins[maf_bin]["switch_opportunities"] += 1
-                                prev_het[sample] = (site, t_gt, i_gt, maf_bin)
+                                    masked_nonref_concordant += 1
+                                    masked_maf_bins[maf_bin]["nonref_concordant"] += 1
+                        if i_gp is not None and i_class is not None:
+                            y = [0.0, 0.0, 0.0]
+                            y[t_class] = 1.0
+                            brier = sum((p - yk) ** 2 for p, yk in zip(i_gp, y))
+                            masked_brier_sum += brier
+                            masked_brier_n += 1
+                            conf = max(i_gp)
+                            acc = 1.0 if i_class == t_class else 0.0
+                            bin_idx = min(int(conf * len(ece_bins)), len(ece_bins) - 1)
+                            ece_bins[bin_idx]["sum_conf"] += conf
+                            ece_bins[bin_idx]["sum_acc"] += acc
+                            ece_bins[bin_idx]["count"] += 1
 
                 # IQS Calculation
                 if site_total > 0 and maf > 0 and maf < 1:
@@ -755,27 +898,29 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                         maf_bins[maf_bin]["iqs_values"].append(iqs)
 
                 # Advance both
-                truth_key, truth_data = get_next_truth()
-                imp_key, imp_data = get_next_imputed()
+                truth_key, truth_data, truth_multiallelic = get_next_truth()
+                imp_key, imp_data, imp_multiallelic = get_next_imputed()
             
             elif t_pos < i_pos:
                 # Truth is behind, means site missing in imputation (or extra site in Truth)
-                truth_key, truth_data = get_next_truth()
+                truth_key, truth_data, truth_multiallelic = get_next_truth()
             else:
                 # Imputed is behind, means extra site in Imputation
-                imp_key, imp_data = get_next_imputed()
+                imp_key, imp_data, imp_multiallelic = get_next_imputed()
         
         elif t_chrom < i_chrom:
-             truth_key, truth_data = get_next_truth()
+             truth_key, truth_data, truth_multiallelic = get_next_truth()
         else:
-             imp_key, imp_data = get_next_imputed()
+             imp_key, imp_data, imp_multiallelic = get_next_imputed()
 
     print(f"Common sites: {common_sites_count}")
 
     # Close final phase blocks
     for sample, start_pos in current_block_start.items():
-        block_len = last_pos - start_pos
-        phase_blocks[sample].append(block_len)
+        end_pos = last_het_pos.get(sample)
+        if end_pos is not None and end_pos >= start_pos:
+            block_len = end_pos - start_pos
+            phase_blocks[sample].append(block_len)
 
     # Calculate overall metrics
     metrics = {}
@@ -821,6 +966,60 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
     metrics["precision"] = precision
     metrics["recall"] = recall
     metrics["f1_score"] = f1
+    metrics["unphased_concordant_count"] = unphased_concordant
+    metrics["nonref_concordant_count"] = nonref_concordant
+    metrics["missing_truth"] = missing_truth
+    metrics["missing_imputed"] = missing_imputed
+    metrics["missing_both"] = missing_both
+    metrics["ref_alt_mismatch"] = ref_alt_mismatch
+    metrics["multiallelic_sites"] = multiallelic_sites
+
+    if masked_total > 0:
+        metrics["masked_total"] = masked_total
+        metrics["masked_concordance"] = masked_concordant / masked_total
+        if masked_nonref_total > 0:
+            metrics["masked_nonref_concordance"] = masked_nonref_concordant / masked_nonref_total
+            metrics["masked_nonref_total"] = masked_nonref_total
+        if masked_stats["count"] > 1:
+            n = masked_stats["count"]
+            mean_t = masked_stats["sum_t"] / n
+            mean_i = masked_stats["sum_i"] / n
+            cov = masked_stats["sum_ti"] / n - mean_t * mean_i
+            var_t = masked_stats["sum_tt"] / n - mean_t * mean_t
+            var_i = masked_stats["sum_ii"] / n - mean_i * mean_i
+            if var_t > 0 and var_i > 0:
+                r = cov / math.sqrt(var_t * var_i)
+                metrics["masked_r_squared"] = r ** 2
+        if masked_brier_n > 0:
+            metrics["masked_brier"] = masked_brier_sum / masked_brier_n
+            total_ece = 0.0
+            total_count = 0
+            for b in ece_bins:
+                if b["count"] > 0:
+                    acc = b["sum_acc"] / b["count"]
+                    conf = b["sum_conf"] / b["count"]
+                    total_ece += abs(acc - conf) * b["count"]
+                    total_count += b["count"]
+            metrics["masked_ece"] = total_ece / total_count if total_count > 0 else None
+
+        metrics["masked_by_maf"] = {}
+        for maf_bin, data in sorted(masked_maf_bins.items()):
+            if data["count"] > 1:
+                n = data["count"]
+                mean_t = data["sum_t"] / n
+                mean_i = data["sum_i"] / n
+                cov = data["sum_ti"] / n - mean_t * mean_i
+                var_t = data["sum_tt"] / n - mean_t * mean_t
+                var_i = data["sum_ii"] / n - mean_i * mean_i
+                r2 = None
+                if var_t > 0 and var_i > 0:
+                    r = cov / math.sqrt(var_t * var_i)
+                    r2 = r ** 2
+                mb = {"r_squared": r2, "n": n}
+                if data["nonref_total"] > 0:
+                    mb["nonref_concordance"] = data["nonref_concordant"] / data["nonref_total"]
+                    mb["nonref_total"] = data["nonref_total"]
+                metrics["masked_by_maf"][maf_bin] = mb
 
     if total_compared > 0:
         metrics["unphased_concordance"] = unphased_concordant / total_compared
@@ -1009,7 +1208,6 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
         if sample_switch_rates:
             metrics["sample_switch_error_mean"] = sum(sample_switch_rates) / len(sample_switch_rates)
             metrics["sample_switch_error_max"] = max(sample_switch_rates)
-            metrics["sample_switch_error_max"] = max(sample_switch_rates)
             metrics["sample_switch_error_min"] = min(sample_switch_rates)
 
     elapsed = time.time() - start_time
@@ -1082,6 +1280,19 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix):
                     r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
                     switch_str = f"{bin_metrics.get('switch_error_rate'):.4f}" if bin_metrics.get('switch_error_rate') is not None else "N/A"
                     print(f"   {maf_bin:<20} {f1_str:>8} {conc:>8} {r2_str:>8} {switch_str:>10} {bin_metrics['n_genotypes']:>10,}")
+
+        if metrics.get("masked_total"):
+            print(f"\n🧪 MASKED-SNP METRICS (proxy)")
+            print(f"   Masked total:         {metrics['masked_total']:,}")
+            print(f"   Masked concordance:   {metrics.get('masked_concordance', 0):.4f}")
+            if metrics.get("masked_nonref_concordance") is not None:
+                print(f"   Masked non-ref conc:  {metrics.get('masked_nonref_concordance', 0):.4f}")
+            if metrics.get("masked_r_squared") is not None:
+                print(f"   Masked dosage R²:     {metrics.get('masked_r_squared', 0):.4f}")
+            if metrics.get("masked_brier") is not None:
+                print(f"   Masked Brier:         {metrics.get('masked_brier', 0):.4f}")
+            if metrics.get("masked_ece") is not None:
+                print(f"   Masked ECE:           {metrics.get('masked_ece', 0):.4f}")
 
     # Save detailed metrics to file
     metrics_file = f"{output_prefix}_metrics.txt"
@@ -2180,7 +2391,7 @@ def stage_metrics_chr(chrom):
             print(f"Calculating metrics for {prefix.upper()}")
             print("=" * 40)
             try:
-                calculate_metrics(truth_vcf, str(imputed_path), str(data_dir / prefix))
+                calculate_metrics(truth_vcf, str(imputed_path), str(data_dir / prefix), input_vcf=str(paths['input_vcf']))
             except Exception as e:
                 print(f"Error: {e}")
 
@@ -2258,15 +2469,21 @@ def stage_summary():
                     
                     # Concordance counts
                     n_genotypes = data.get("total_genotypes", 0)
-                    conc_rate = data.get("unphased_concordance", 0)
                     agg_genotypes += n_genotypes
-                    agg_concordant += int(conc_rate * n_genotypes) # Reconstruct count
+                    if "unphased_concordant_count" in data:
+                        agg_concordant += data.get("unphased_concordant_count", 0)
+                    else:
+                        conc_rate = data.get("unphased_concordance", 0)
+                        agg_concordant += int(conc_rate * n_genotypes)
                     
                     # Non-ref
-                    nr_rate = data.get("nonref_concordance", 0)
                     nr_total = data.get("nonref_total", 0)
                     agg_nonref_total += nr_total
-                    agg_nonref_concordant += int(nr_rate * nr_total)
+                    if "nonref_concordant_count" in data:
+                        agg_nonref_concordant += data.get("nonref_concordant_count", 0)
+                    else:
+                        nr_rate = data.get("nonref_concordance", 0)
+                        agg_nonref_concordant += int(nr_rate * nr_total)
                     
                     # F1/Prec/Recall
                     agg_tp += data.get("tp", 0)
@@ -2360,7 +2577,7 @@ def stage_summary():
                      "low-freq (1-5%)", "medium (5-20%)", "common (>20%)"]
 
         for chrom in range(1, 23):
-            json_file = script_dir / f"{tool}_chr{chrom}_metrics.json"
+            json_file = script_dir / f"data_chr{chrom}" / f"{tool}_metrics.json"
             if json_file.exists():
                 try:
                     with open(json_file) as f:

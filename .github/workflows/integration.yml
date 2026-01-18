@@ -220,7 +220,7 @@ jobs:
           log_path="$PWD/tests/data/reagle_imputation.log"
           python3 tests/integration_test.py reagle 2>&1 | tee "$log_path"
           status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ] && grep -q "Illegal instruction" "$log_path"; then
+          if grep -q "Illegal instruction" "$log_path" || [ "$status" -eq 132 ]; then
             echo "illegal_instruction=true" >> "$GITHUB_OUTPUT"
             echo "Retryable illegal instruction detected; leaving artifacts for retry."
             exit 0
@@ -315,7 +315,7 @@ jobs:
           log_path="$PWD/tests/data/reagle_imputation.log"
           python3 tests/integration_test.py reagle 2>&1 | tee "$log_path"
           status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ] && grep -q "Illegal instruction" "$log_path"; then
+          if grep -q "Illegal instruction" "$log_path" || [ "$status" -eq 132 ]; then
             echo "illegal_instruction=true" >> "$GITHUB_OUTPUT"
             echo "Retryable illegal instruction detected; leaving artifacts for retry."
             exit 0
