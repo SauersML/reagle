@@ -21,6 +21,10 @@ def run_benchmark(person, file_path, format):
 
     # 2. Run Reagle
     print("=== Running Reagle ===")
+    if not os.path.exists("target.vcf.gz"):
+        print("ERROR: target.vcf.gz missing after prep!")
+        run_cmd(["ls", "-l"])
+    
     run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--gt", "target.vcf.gz", "--out", "reagle_out", "--chrom", "22"])
 
     # 3. Run Beagle

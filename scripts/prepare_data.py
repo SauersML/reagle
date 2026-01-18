@@ -99,60 +99,15 @@ def download_reference(output_vcf):
         os.remove("ref_raw.vcf.gz")
     print(f"Reference prepared: {output_vcf}")
 
-def run_conversion(input_path, output_vcf):
-    """Runs convert_genome to convert input to VCF."""
-    
-    # Pre-process input (handle zip/split)
-    raw_file = prepare_input_file(input_path)
-    
-    # Rename chromosomes from chr22 -> 22 to match 1000G reference
-    # Create a mapping file
-    with open("chr_map.txt", "w") as f:
-        f.write("chr22\t22\n")
+def prepare_truth(source, output_vcf):
+    """Reconstructs and prepares Truth VCF (Chr22). Source can be dir or person name."""
+    if source.lower() == "kat":
+        input_dir = "data/kat_suricata"
+    elif source.lower() == "christopher":
+        input_dir = "data/christopher_smith"
+    else:
+        input_dir = source
 
-    print(f"Converting {raw_file} to {output_vcf}...")
-    
-    # Use remote Chr22 reference for standardization
-    ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
-    
-    # convert_genome uses flags --input, --reference, --output
-    cmd = [
-        "convert_genome",
-        "--input", raw_file,
-        "--reference", ref_url,
-        "--output", "temp_conv.vcf",
-        "--format", "vcf"
-    ]
-    
-    subprocess.check_call(cmd)
-    
-    # Compress, normalize chroms, filter to Chr22
-    # convert_genome output is VCF.
-    # We pipe: view -> annotate (rename) -> view (regions 22) -> output
-    # Note: If input has 'chr22', convert_genome might output 'chr22'.
-    # We rename 'chr22' to '22'.
-    
-    cmd_process = (
-        f"bcftools view temp_conv.vcf -Ou | "
-        f"bcftools annotate --rename-chrs chr_map.txt -Ou | "
-        f"bcftools view --regions 22 -Oz -o {output_vcf}"
-    )
-    subprocess.check_call(cmd_process, shell=True)
-    subprocess.check_call(["tabix", "-p", "vcf", output_vcf])
-    
-    if os.path.exists("temp_conv.vcf"):
-        os.remove("temp_conv.vcf")
-    if os.path.exists("chr_map.txt"):
-        os.remove("chr_map.txt")
-        
-    # Cleanup extracted if it was temp
-    if "extracted" in raw_file:
-        shutil.rmtree(os.path.dirname(raw_file))
-        
-    print("Conversion complete.")
-
-def prepare_truth(input_dir, output_vcf):
-    """Reconstructs and prepares Truth VCF (Chr22)."""
     print(f"Preparing Truth VCF from {input_dir}...")
     
     source_vcf = "truth_full.vcf.gz"
@@ -224,3 +179,91 @@ def prepare_truth(input_dir, output_vcf):
     if os.path.exists("chr_map.txt"):
         os.remove("chr_map.txt")
     print(f"Truth prepared: {output_vcf}")
+
+def run_conversion(input_path, output_vcf):
+    """Runs convert_genome to convert input to VCF."""
+    
+    # Pre-process input (handle zip/split)
+    raw_file = prepare_input_file(input_path)
+    
+    # Rename chromosomes from chr22 -> 22 to match 1000G reference
+    # Create a mapping file
+    with open("chr_map.txt", "w") as f:
+        f.write("chr22\t22\n")
+
+    print(f"Converting {raw_file} to {output_vcf}...")
+    
+    # Use remote Chr22 reference for standardization
+    ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    
+    # convert_genome uses flags --input, --reference, --output
+    cmd = [
+        "convert_genome",
+        "--input", raw_file,
+        "--reference", ref_url,
+        "--output", "temp_conv.vcf",
+        "--format", "vcf"
+    ]
+    
+    print(f"Running: {' '.join(cmd)}")
+    subprocess.check_call(cmd)
+    
+    if not os.path.exists("temp_conv.vcf"):
+        raise RuntimeError("convert_genome failed to produce temp_conv.vcf")
+        
+    print(f"temp_conv.vcf size: {os.path.getsize('temp_conv.vcf')}")
+    
+    # Compress, normalize chroms, filter to Chr22
+    # convert_genome output is VCF.
+    # We pipe: view -> annotate (rename) -> view (regions 22) -> output
+    # Note: If input has 'chr22', convert_genome might output 'chr22'.
+    # We rename 'chr22' to '22'.
+    
+    cmd_process = (
+        f"bcftools view temp_conv.vcf -Ou | "
+        f"bcftools annotate --rename-chrs chr_map.txt -Ou | "
+        f"bcftools view --regions 22 -Oz -o {output_vcf}"
+    )
+    subprocess.check_call(cmd_process, shell=True)
+    subprocess.check_call(["tabix", "-p", "vcf", output_vcf])
+    
+    if os.path.exists("temp_conv.vcf"):
+        os.remove("temp_conv.vcf")
+    if os.path.exists("chr_map.txt"):
+        os.remove("chr_map.txt")
+        
+    # Cleanup extracted if it was temp
+    if "extracted" in raw_file:
+        shutil.rmtree(os.path.dirname(raw_file))
+        
+    print("Conversion complete.")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python3 prepare_data.py array <input_file> <output_vcf>")
+        print("  python3 prepare_data.py reference <output_vcf>")
+        print("  python3 prepare_data.py truth <person_or_dir> <output_vcf>")
+        sys.exit(1)
+        
+    mode = sys.argv[1]
+    
+    if mode == "array":
+        install_convert_genome()
+        run_conversion(sys.argv[2], sys.argv[3])
+        # Post-process array to Chr22 (redundant if run_conversion does it, but kept for safety if run_conversion changed)
+        # Actually run_conversion now does everything including filtering to 22.
+        # So we just verify.
+        if not os.path.exists(sys.argv[3]):
+             print(f"Error: {sys.argv[3]} was not created.")
+             sys.exit(1)
+        
+    elif mode == "reference":
+        download_reference(sys.argv[2])
+        
+    elif mode == "truth":
+        prepare_truth(sys.argv[2], sys.argv[3])
+    
+    else:
+        print(f"Unknown mode: {mode}")
+        sys.exit(1)
