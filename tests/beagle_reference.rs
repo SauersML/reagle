@@ -426,6 +426,85 @@ fn gt_to_dosage(gt: &str) -> Option<f64> {
     Some(gt.matches('1').count() as f64)
 }
 
+/// Parse a diploid GT into allele codes (biallelic only).
+fn gt_to_alleles(gt: &str) -> Option<(u8, u8)> {
+    if gt.contains('.') {
+        return None;
+    }
+    let sep = if gt.contains('|') { '|' } else { '/' };
+    let parts: Vec<&str> = gt.split(sep).collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let a0: u8 = parts[0].parse().ok()?;
+    let a1: u8 = parts[1].parse().ok()?;
+    if a0 > 1 || a1 > 1 {
+        return None;
+    }
+    Some((a0, a1))
+}
+
+/// Build per-haplotype allele vector (length = 2 * n_samples).
+fn hap_alleles_from_record(rec: &ParsedRecord) -> Option<Vec<u8>> {
+    let mut alleles = Vec::with_capacity(rec.genotypes.len() * 2);
+    for gt in &rec.genotypes {
+        let (a0, a1) = gt_to_alleles(&gt.gt)?;
+        alleles.push(a0);
+        alleles.push(a1);
+    }
+    Some(alleles)
+}
+
+/// Fraction of samples that are homozygous reference (0/0).
+fn hom_ref_rate(rec: &ParsedRecord) -> f64 {
+    let mut hom_ref = 0usize;
+    let mut total = 0usize;
+    for gt in &rec.genotypes {
+        if let Some((a0, a1)) = gt_to_alleles(&gt.gt) {
+            total += 1;
+            if a0 == 0 && a1 == 0 {
+                hom_ref += 1;
+            }
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        hom_ref as f64 / total as f64
+    }
+}
+
+/// Fraction of ALT haplotypes in `lhs` that also carry ALT in `rhs`.
+fn alt_association_rate(lhs: &[u8], rhs: &[u8]) -> Option<f64> {
+    if lhs.len() != rhs.len() {
+        return None;
+    }
+    let mut alt_total = 0usize;
+    let mut alt_with_rhs = 0usize;
+    for (l, r) in lhs.iter().zip(rhs.iter()) {
+        if *l == 1 {
+            alt_total += 1;
+            if *r == 1 {
+                alt_with_rhs += 1;
+            }
+        }
+    }
+    if alt_total == 0 {
+        None
+    } else {
+        Some(alt_with_rhs as f64 / alt_total as f64)
+    }
+}
+
+/// Index VCF records by position for quick lookup.
+fn index_by_pos(records: &[ParsedRecord]) -> HashMap<u64, usize> {
+    let mut map = HashMap::new();
+    for (idx, rec) in records.iter().enumerate() {
+        map.insert(rec.pos, idx);
+    }
+    map
+}
+
 /// Helper to compare Java vs Rust imputation results against Ground Truth
 fn compare_imputation_results(
     name: &str,
@@ -3546,43 +3625,201 @@ chr1	10000	.	C	A	.	.	.	GT	0/1
 /// Perfect LD trap: rare variant imputation fails when all target samples
 /// have the same genotype at a flanking genotyped marker.
 ///
-/// Position 20066665 is in perfect LD with genotyped marker 20066422.
-/// All 28 reference haplotypes carrying ALT at 20066665 also carry ALT at 20066422.
-/// All target samples are 0/0 at 20066422.
-///
-/// With Li-Stephens error rate ~0.0002 (for 382 haplotypes), match/mismatch
-/// ratio is ~5000:1. A single mismatch decimates a haplotype's posterior.
-/// Result: Rust gives DS ≈ 0.0001 for all samples at 20066665.
-/// Java Beagle gives DS ≈ 1.0 for Sample 0 (correctly identifies carrier).
+/// Systematic test: find all imputed rare variants that are in near-perfect LD
+/// with a genotyped marker where targets are mostly 0/0, then compare Java vs Rust
+/// against ground truth for carriers.
 #[test]
 #[serial]
-fn test_perfect_ld_trap_rare_variant() {
+fn test_perfect_ld_trap_rare_variants_aggregate() {
     let beagle = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
-    let rust_out = work_dir.path().join("rust_imp");
 
+    // Run Java BEAGLE
+    let java_out = work_dir.path().join("java_imp");
+    let java_output = run_beagle(
+        &beagle.beagle_jar,
+        &[
+            ("ref", beagle.ref_vcf.to_str().unwrap()),
+            ("gt", beagle.target_sparse_vcf.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "12345"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    // Run Rust imputation
+    let rust_out = work_dir.path().join("rust_imp");
     let target_vcf = decompress_vcf_for_rust(&beagle.target_sparse_vcf, work_dir.as_ref());
     let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.as_ref());
     run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345)
         .expect("Rust imputation failed");
 
+    let java_vcf = work_dir.path().join("java_imp.vcf.gz");
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
+
+    let (_, ref_records) = parse_vcf(&beagle.ref_vcf);
+    let (_, target_sparse_records) = parse_vcf(&beagle.target_sparse_vcf);
+    let (_, truth_records) = parse_vcf(&beagle.target_vcf);
+    let (_, java_records) = parse_vcf(&java_vcf);
     let (_, rust_records) = parse_vcf(&rust_vcf);
 
-    // Position 20066665: Java DS=1.0 for Sample 0, Rust DS≈0.0001
-    let problem_pos = 20066665u64;
-    let problem_rec = rust_records.iter().find(|r| r.pos == problem_pos);
+    let ref_idx = index_by_pos(&ref_records);
+    let java_idx = index_by_pos(&java_records);
+    let rust_idx = index_by_pos(&rust_records);
+    let genotyped_positions: Vec<u64> = target_sparse_records.iter().map(|r| r.pos).collect();
+    let genotyped_set: std::collections::HashSet<u64> = genotyped_positions.iter().copied().collect();
 
-    if let Some(rec) = problem_rec {
-        let ds = rec.genotypes[0].ds.unwrap_or(0.0);
-
-        // Should correctly identify carrier (Java gives DS ≈ 1.0)
-        assert!(
-            ds > 0.1,
-            "Position {}: Sample 0 DS={:.6}, should be >0.1 (Java gives ~1.0)",
-            problem_pos, ds
-        );
+    struct GenotypedMarker {
+        pos: u64,
+        hap: Vec<u8>,
+        target_hom_ref_rate: f64,
     }
+
+    let mut genotyped_markers = Vec::new();
+    for rec in &target_sparse_records {
+        let Some(ref_pos) = ref_idx.get(&rec.pos) else { continue };
+        let Some(hap) = hap_alleles_from_record(&ref_records[*ref_pos]) else { continue };
+        genotyped_markers.push(GenotypedMarker {
+            pos: rec.pos,
+            hap,
+            target_hom_ref_rate: hom_ref_rate(rec),
+        });
+    }
+
+    let mut total_java_err = 0.0;
+    let mut total_rust_err = 0.0;
+    let mut total_carriers = 0usize;
+    let mut variant_count = 0usize;
+    let mut java_better = 0usize;
+    let mut example_count = 0usize;
+
+    let min_ld = 0.98;
+    let min_hom_ref_rate = 0.95;
+    let max_maf = 0.10;
+
+    for truth_rec in &truth_records {
+        if genotyped_set.contains(&truth_rec.pos) {
+            continue;
+        }
+        let Some(ref_pos) = ref_idx.get(&truth_rec.pos) else { continue };
+        let Some(java_pos) = java_idx.get(&truth_rec.pos) else { continue };
+        let Some(rust_pos) = rust_idx.get(&truth_rec.pos) else { continue };
+
+        let Some(hap_i) = hap_alleles_from_record(&ref_records[*ref_pos]) else { continue };
+        let alt_count = hap_i.iter().filter(|&&a| a == 1).count();
+        if alt_count == 0 {
+            continue;
+        }
+        let maf = alt_count as f64 / hap_i.len() as f64;
+        if maf > max_maf {
+            continue;
+        }
+
+        let mut carriers = Vec::new();
+        for (s, gt) in truth_rec.genotypes.iter().enumerate() {
+            if let Some(ds) = gt_to_dosage(&gt.gt) {
+                if ds > 0.0 {
+                    carriers.push(s);
+                }
+            }
+        }
+        if carriers.is_empty() {
+            continue;
+        }
+
+        let mut ld_marker = None;
+        for marker in &genotyped_markers {
+            if marker.target_hom_ref_rate < min_hom_ref_rate {
+                continue;
+            }
+            if let Some(ld) = alt_association_rate(&hap_i, &marker.hap) {
+                if ld >= min_ld {
+                    ld_marker = Some(marker.pos);
+                    break;
+                }
+            }
+        }
+        if ld_marker.is_none() {
+            continue;
+        }
+
+        let java_rec = &java_records[*java_pos];
+        let rust_rec = &rust_records[*rust_pos];
+
+        let mut java_err = 0.0;
+        let mut rust_err = 0.0;
+        let mut count = 0usize;
+        for &s in &carriers {
+            let truth_ds = match gt_to_dosage(&truth_rec.genotypes[s].gt) {
+                Some(ds) => ds,
+                None => continue,
+            };
+            let java_ds = java_rec.genotypes[s]
+                .ds
+                .or_else(|| gt_to_dosage(&java_rec.genotypes[s].gt));
+            let rust_ds = rust_rec.genotypes[s]
+                .ds
+                .or_else(|| gt_to_dosage(&rust_rec.genotypes[s].gt));
+            let (Some(j_ds), Some(r_ds)) = (java_ds, rust_ds) else { continue };
+            java_err += (j_ds - truth_ds).abs();
+            rust_err += (r_ds - truth_ds).abs();
+            count += 1;
+        }
+        if count == 0 {
+            continue;
+        }
+
+        let java_mean = java_err / count as f64;
+        let rust_mean = rust_err / count as f64;
+        total_java_err += java_err;
+        total_rust_err += rust_err;
+        total_carriers += count;
+        variant_count += 1;
+        if java_mean + 1e-6 < rust_mean {
+            java_better += 1;
+        }
+
+        if example_count < 5 {
+            println!(
+                "  pos={} ld_marker={} carriers={} Java_err={:.4} Rust_err={:.4}",
+                truth_rec.pos,
+                ld_marker.unwrap(),
+                count,
+                java_mean,
+                rust_mean
+            );
+            example_count += 1;
+        }
+    }
+
+    assert!(
+        variant_count >= 3,
+        "Too few high-LD rare variants found: {} (adjust criteria if needed)",
+        variant_count
+    );
+    assert!(total_carriers > 0, "No carrier samples found in selected variants");
+
+    let java_mean = total_java_err / total_carriers as f64;
+    let rust_mean = total_rust_err / total_carriers as f64;
+
+    println!(
+        "High-LD rare variants: {} variants, {} carrier samples",
+        variant_count, total_carriers
+    );
+    println!(
+        "  Java mean abs error: {:.4}, Rust mean abs error: {:.4}",
+        java_mean, rust_mean
+    );
+    println!("  Java better variants: {}/{}", java_better, variant_count);
+
+    assert!(
+        rust_mean <= java_mean,
+        "Rust mean error {:.4} worse than Java {:.4} for high-LD rare variants",
+        rust_mean,
+        java_mean
+    );
 }
 
 /// Uniform GL (GL=-0.48,-0.48,-0.48) indicates no genotype information.
@@ -3626,76 +3863,6 @@ fn test_gl_confidence_affects_emission() {
 
 // Note: test_single_mismatch_not_catastrophic was moved to unit tests in imputation.rs
 // because it requires access to internal functions marked #[cfg(test)]
-
-/// Rust vs Java dosage comparison at position 20066665.
-///
-/// Java: DS ≈ 1.0 for Sample 0 (correctly identifies carrier)
-/// Rust: DS ≈ 0.0001 for Sample 0 (fails to identify carrier)
-///
-/// Max gap should be < 0.1 when imputation is working correctly.
-#[test]
-#[serial]
-fn test_position_20066665_rust_vs_java() {
-    let beagle = setup_test_files();
-    let work_dir = tempfile::tempdir().expect("Create temp dir");
-
-    let java_out = work_dir.path().join("java_imp");
-    let java_out_str = java_out.to_str().expect("java_out path");
-    let java_output = run_beagle(
-        &beagle.beagle_jar,
-        &[
-            ("ref", beagle.ref_vcf.to_str().unwrap()),
-            ("gt", beagle.target_sparse_vcf.to_str().unwrap()),
-            ("out", java_out_str),
-            ("seed", "12345"),
-            ("gp", "true"),
-        ],
-        work_dir.path(),
-    );
-    if !java_output.status.success() {
-        // Java BEAGLE not available - skip silently
-        return;
-    }
-
-    let rust_out = work_dir.path().join("rust_imp");
-    let target_vcf = decompress_vcf_for_rust(&beagle.target_sparse_vcf, work_dir.as_ref());
-    let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.as_ref());
-    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345)
-        .expect("Rust imputation failed");
-
-    let java_vcf = work_dir.path().join("java_imp.vcf.gz");
-    let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
-
-    let (_, java_records) = parse_vcf(&java_vcf);
-    let (_, rust_records) = parse_vcf(&rust_vcf);
-
-    let problem_pos = 20066665u64;
-    let java_rec = java_records.iter().find(|r| r.pos == problem_pos);
-    let rust_rec = rust_records.iter().find(|r| r.pos == problem_pos);
-
-    if let (Some(java), Some(rust)) = (java_rec, rust_rec) {
-        let mut max_gap = 0.0f64;
-        let mut max_gap_sample = 0;
-
-        for (s, (jgt, rgt)) in java.genotypes.iter().zip(rust.genotypes.iter()).enumerate() {
-            let java_ds: f64 = jgt.ds.unwrap_or(0.0);
-            let rust_ds: f64 = rgt.ds.unwrap_or(0.0);
-            let gap = (java_ds - rust_ds).abs();
-
-            if gap > max_gap {
-                max_gap = gap;
-                max_gap_sample = s;
-            }
-        }
-
-        // Rust should match Java within 0.1 DS
-        assert!(
-            max_gap < 0.1,
-            "Position {}: max DS gap={:.4} at sample {} (should be <0.1)",
-            problem_pos, max_gap, max_gap_sample
-        );
-    }
-}
 
 /// Test: Verify that DR2 is computed correctly for genotyped markers
 ///
