@@ -70,6 +70,7 @@ fn should_stream_ref_vcf(path: &Path, window_markers: usize) -> Option<u64> {
 /// Payload passed from Phasing (Producer) to Imputation (Consumer)
 struct StreamingPayload {
     phased_target: GenotypeMatrix<Phased>,
+    unphased_target: GenotypeMatrix<Unphased>,
     ref_window: GenotypeMatrix<Phased>,
     alignment: MarkerAlignment,
     output_start: usize,
@@ -599,11 +600,13 @@ impl crate::pipelines::ImputationPipeline {
                 if let Some(bb) = &pipeline.telemetry {
                     bb.set_op("Producer waiting on channel");
                 }
+                let unphased_target_clone = target_window.genotypes.clone();
                 let send_result = if pipeline.config.profile {
                     let span_guard = info_span!("channel_send_wait").entered();
                     let _ = &span_guard;
                     tx.send(StreamingPayload {
                         phased_target: phased,
+                        unphased_target: unphased_target_clone,
                         ref_window: ref_window_gt,
                         alignment,
                         output_start: target_window.output_start,
@@ -616,6 +619,7 @@ impl crate::pipelines::ImputationPipeline {
                 } else {
                     tx.send(StreamingPayload {
                         phased_target: phased,
+                        unphased_target: unphased_target_clone,
                         ref_window: ref_window_gt,
                         alignment,
                         output_start: target_window.output_start,
@@ -669,6 +673,7 @@ target_samples={} target_bytes={}",
             }
             let StreamingPayload {
                 phased_target,
+                unphased_target,
                 ref_window,
                 alignment,
                 output_start,
@@ -748,6 +753,7 @@ target_samples={} target_bytes={}",
                 let _ = &span_guard;
                 self.run_imputation_window_streaming(
                     &phased_target,
+                    &unphased_target,
                     &ref_window,
                     &alignment,
                     &gen_maps,
@@ -761,6 +767,7 @@ target_samples={} target_bytes={}",
             } else {
                 self.run_imputation_window_streaming(
                     &phased_target,
+                    &unphased_target,
                     &ref_window,
                     &alignment,
                     &gen_maps,
@@ -880,6 +887,7 @@ target_samples={} target_bytes={}",
     fn run_imputation_window_streaming(
         &self,
         target_win: &GenotypeMatrix<Phased>,
+        unphased_target: &GenotypeMatrix<Unphased>,
         ref_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
         gen_maps: &GeneticMaps,
@@ -938,17 +946,13 @@ target_samples={} target_bytes={}",
         let ref_is_biallelic: Vec<bool> = (0..n_ref_markers)
             .map(|m| ref_win.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
             .collect();
-        let gen_positions: Vec<f64> = (0..n_ref_markers)
+        let mut gen_positions: Vec<f64> = (0..n_ref_markers)
             .map(|m| {
-                if m == 0 { 0.0 }
-                else {
-                    let pos1 = ref_win.marker(MarkerIdx::new((m - 1) as u32)).pos;
-                    let pos2 = ref_win.marker(MarkerIdx::new(m as u32)).pos;
-                    let dist = gen_maps.gen_dist(chrom, pos1, pos2);
-                    dist.abs().max(crate::model::imp_utils::MIN_CM_DIST)
-                }
+                let pos = ref_win.marker(MarkerIdx::new(m as u32)).pos;
+                gen_maps.gen_pos(chrom, pos)
             })
             .collect();
+        crate::data::genetic_map::enforce_min_dist(&mut gen_positions, crate::model::imp_utils::MIN_CM_DIST);
 
         let sample_genotyped_vec: Vec<Vec<usize>> = (0..n_target_samples)
             .map(|s| {
@@ -1093,6 +1097,13 @@ target_samples={} target_bytes={}",
                             .map(|m| target_win.allele(MarkerIdx::new(m as u32), hap2_idx))
                             .collect();
 
+                        let unphased_obs1: Vec<u8> = (0..target_win.n_markers())
+                            .map(|m| unphased_target.allele(MarkerIdx::new(m as u32), HapIdx::new((s * 2) as u32)))
+                            .collect();
+                        let unphased_obs2: Vec<u8> = (0..target_win.n_markers())
+                            .map(|m| unphased_target.allele(MarkerIdx::new(m as u32), HapIdx::new((s * 2 + 1) as u32)))
+                            .collect();
+
                         let get_ref = |marker: usize, h: u32| {
                             let ref_allele = ref_win.allele(
                                 MarkerIdx::new(marker as u32),
@@ -1130,6 +1141,9 @@ target_samples={} target_bytes={}",
                                     prior_probs
                                 });
 
+                        // We use unphased_obs for geno_a1/geno_a2 to ensure we skip missing markers (255).
+                        // We pass obs_hap1/obs_hap2 as targ_alleles/partner_alleles to provide phase constraints
+                        // for markers that ARE present.
                         let state_probs = compute_state_probs(
                             &hap_indices,
                             &cluster_bounds,
@@ -1137,10 +1151,10 @@ target_samples={} target_bytes={}",
                             target_win,
                             ref_win,
                             alignment,
-                            &obs_hap1,
-                            &obs_hap2,
-                            &obs_hap1,
-                            Some(&obs_hap2),
+                            &unphased_obs1, // geno_a1
+                            &unphased_obs2, // geno_a2
+                            &obs_hap1, // targ_alleles
+                            Some(&obs_hap2), // partner_alleles
                             s,
                             actual_n_states,
                             ws,
@@ -1237,10 +1251,10 @@ target_samples={} target_bytes={}",
                             target_win,
                             ref_win,
                             alignment,
-                            &obs_hap1,
-                            &obs_hap2,
-                            &obs_hap2,
-                            Some(&h1_locked),
+                            &unphased_obs1, // geno_a1
+                            &unphased_obs2, // geno_a2
+                            &obs_hap2, // targ_alleles
+                            Some(&h1_locked), // partner_alleles
                             s,
                             actual_n_states,
                             ws,

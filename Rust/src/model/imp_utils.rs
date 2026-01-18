@@ -204,10 +204,7 @@ pub fn compute_cluster_mismatches_into_workspace(
 
                         if final_ref == 255 {
                             if ref_allele != 255 {
-                                let penalty = log_diff;
-                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                    row_buffer[j] = penalty;
-                                }
+                                row_buffer[j] += log_diff;
                             }
                         } else if partner_allele != 255 {
                             let required = if partner_allele == geno1 {
@@ -219,22 +216,13 @@ pub fn compute_cluster_mismatches_into_workspace(
                             };
                             if required != 255 {
                                 if final_ref != required {
-                                    let penalty = hard_log_diff;
-                                    if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                        row_buffer[j] = penalty;
-                                    }
+                                    row_buffer[j] += hard_log_diff;
                                 }
                             } else if targ_allele != 255 && final_ref != targ_allele {
-                                let penalty = log_diff;
-                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                    row_buffer[j] = penalty;
-                                }
+                                row_buffer[j] += log_diff;
                             }
                         } else if targ_allele != 255 && final_ref != targ_allele {
-                            let penalty = log_diff;
-                            if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                row_buffer[j] = penalty;
-                            }
+                            row_buffer[j] += log_diff;
                         }
                     }
                 }
@@ -281,6 +269,7 @@ pub fn run_hmm_forward_backward_to_sparse(
     fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
     block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+    scratch_buffer: &mut [f32], // Scratch buffer for mapping
     trace: bool,
 ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
     use wide::f32x8;
@@ -350,23 +339,35 @@ pub fn run_hmm_forward_backward_to_sparse(
                 (&mut upper[..n_states], &lower[curr_base..curr_base+n_states])
             };
 
-            let shift_vec = f32x8::splat(shift);
-            let scale_vec = f32x8::splat(scale);
-            let emit_vec = f32x8::splat(base_emit);
+            // Map states from prev to curr based on haplotype identity
+            // hap_indices are sorted, so we can use a merge-like scan
+            let prev_haps = &hap_indices_input[m-1];
+            let curr_haps = &hap_indices_input[m];
             
-            let mut k = 0;
-            while k + 8 <= n_states {
-                let prev_chunk_arr: &[f32; 8] = prev_slice[k..k+8].try_into().unwrap();
-                let prev_vec = f32x8::from(*prev_chunk_arr);
-                let trans = prev_vec.mul_add(scale_vec, shift_vec);
-                let res = trans * emit_vec;
-                let res_arr: [f32; 8] = res.into();
-                curr_slice[k..k+8].copy_from_slice(&res_arr);
-                k += 8;
+            // Initialize with recombination mass
+            curr_slice.iter_mut().for_each(|x| *x = shift);
+
+            // Add mapped probability mass
+            let mut i = 0;
+            let mut j = 0;
+            while i < prev_haps.len() && j < curr_haps.len() {
+                let h_prev = prev_haps[i];
+                let h_curr = curr_haps[j];
+                if h_prev < h_curr {
+                    i += 1;
+                } else if h_prev > h_curr {
+                    j += 1;
+                } else {
+                    // Match found: carry over mass with stay probability
+                    curr_slice[j] += prev_slice[i] * scale;
+                    i += 1;
+                    j += 1;
+                }
             }
-            for i in k..n_states {
-                let p = prev_slice[i];
-                curr_slice[i] = base_emit * (scale * p + shift);
+
+            // Apply emissions
+            for x in curr_slice.iter_mut() {
+                *x *= base_emit;
             }
         }
         
@@ -494,24 +495,30 @@ pub fn run_hmm_forward_backward_to_sparse(
             let prev_slice = &before[curr_off..curr_off + n_states];
             let curr_slice = &mut after[0..n_states];
 
-            let shift_vec = f32x8::splat(shift);
-            let scale_vec = f32x8::splat(scale);
-            let emit_vec = f32x8::splat(base_emit);
+            // Map states (same as main fwd pass)
+            let prev_haps = &hap_indices_input[local_m-1];
+            let curr_haps = &hap_indices_input[local_m];
 
-            let mut k = 0;
-            while k + 8 <= n_states {
-                let prev_chunk_arr: &[f32; 8] = prev_slice[k..k+8].try_into().unwrap();
-                let prev_vec = f32x8::from(*prev_chunk_arr);
-                let trans = prev_vec.mul_add(scale_vec, shift_vec);
-                let res = trans * emit_vec;
-                let res_arr: [f32; 8] = res.into();
-                curr_slice[k..k+8].copy_from_slice(&res_arr);
-                k += 8;
+            curr_slice.iter_mut().for_each(|x| *x = shift);
+
+            let mut i = 0;
+            let mut j = 0;
+            while i < prev_haps.len() && j < curr_haps.len() {
+                let h_prev = prev_haps[i];
+                let h_curr = curr_haps[j];
+                if h_prev < h_curr {
+                    i += 1;
+                } else if h_prev > h_curr {
+                    j += 1;
+                } else {
+                    curr_slice[j] += prev_slice[i] * scale;
+                    i += 1;
+                    j += 1;
+                }
             }
 
-            for i in k..n_states {
-                let p = prev_slice[i];
-                curr_slice[i] = base_emit * (scale * p + shift);
+            for x in curr_slice.iter_mut() {
+                *x *= base_emit;
             }
 
             let start = diff_row_offsets[local_m];
@@ -543,7 +550,6 @@ pub fn run_hmm_forward_backward_to_sparse(
         for m in (block_start..block_end).rev() {
             if m + 1 < n_clusters {
                 let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
-                let shift = p_rec / n_states as f32;
                 let base_emit = cluster_base_scores[m + 1].max(LOG_EMIT_FLOOR).exp();
 
                 let mut k = 0;
@@ -583,18 +589,44 @@ pub fn run_hmm_forward_backward_to_sparse(
 
                 if emitted_sum > 0.0 {
                     let scale_v = (1.0 - p_rec) / emitted_sum;
-                    let scale_vec = f32x8::splat(scale_v);
-                    let shift_vec = f32x8::splat(shift);
-                    k = 0;
-                    while k + 8 <= n_states {
-                         let chunk_arr: &[f32; 8] = bwd[k..k+8].try_into().unwrap();
-                         let chunk = f32x8::from(*chunk_arr);
-                         let res = chunk.mul_add(scale_vec, shift_vec);
-                         let res_arr: [f32; 8] = res.into();
-                         bwd[k..k+8].copy_from_slice(&res_arr);
-                         k += 8;
+
+                    // So if mapped: Bwd[j] = scale_v * bwd[k] + shift
+                    // If not mapped: Bwd[j] = shift
+
+                    let shift_val = p_rec / n_states as f32; // This is unscaled shift.
+
+                    // Use scratch buffer for new Bwd values
+                    scratch_buffer[0..n_states].fill(shift_val);
+
+                    // Map states backwards (m -> m+1)
+                    // bwd[k] (at m+1) contributes to bwd[j] (at m)
+                    let prev_haps = &hap_indices_input[m]; // m (physically prev in bwd pass, really current)
+                    let next_haps = &hap_indices_input[m+1]; // m+1 (physically next, source of bwd)
+
+                    // Wait. Bwd[j] at m depends on Bwd[k] at m+1.
+                    // j is index in hap_indices[m]. k is index in hap_indices[m+1].
+                    // Correct.
+
+                    let mut i = 0;
+                    let mut j = 0;
+                    while i < prev_haps.len() && j < next_haps.len() {
+                        let h_prev = prev_haps[i]; // at m
+                        let h_next = next_haps[j]; // at m+1
+                        if h_prev < h_next {
+                            i += 1;
+                        } else if h_prev > h_next {
+                            j += 1;
+                        } else {
+                            // Match
+                            scratch_buffer[i] += bwd[j] * scale_v;
+                            i += 1;
+                            j += 1;
+                        }
                     }
-                    for x in bwd[k..].iter_mut() { *x = scale_v * *x + shift; }
+
+                    // Copy back
+                    bwd[0..n_states].copy_from_slice(&scratch_buffer[0..n_states]);
+
                 } else {
                     bwd.fill(1.0 / n_states as f32);
                 }
@@ -626,16 +658,65 @@ pub fn run_hmm_forward_backward_to_sparse(
             } else {
                 for k in 0..n_states {
                     let prob = curr_posteriors[k];
-                    let prob_next = next_posteriors[k];
-                    if prob > threshold || prob_next > threshold {
-                        hap_indices.push(hap_indices_input[m][k]);
+
+                    // If we map states, we can't interpolate blindly!
+                    // prob corresponds to hap_indices[m][k].
+                    // prob_next corresponds to hap_indices[m+1][k].
+                    // BUT they might be different haplotypes!
+                    // We must interpolate only if haplotypes match?
+                    // Or Beagle stores sparse states independently per marker?
+
+                    // In ClusterStateProbs, probs and probs_p1 are stored per state index j.
+                    // But j is index in "hap_indices" array of the CSR.
+                    // CSR stores `hap_indices` for cluster m.
+                    // So prob[j] is P(State j at m).
+                    // probs_p1[j] is P(State j at m+1).
+                    // This implies State j at m must be same as State j at m+1?
+                    // No. `probs_p1` is used for interpolation.
+                    // Interpolation: P(x) = w * P(m) + (1-w) * P(m+1).
+                    // This implies we are interpolating the probability of THE SAME haplotype.
+
+                    // If hap_indices[m][k] != hap_indices[m+1][k], then using prob_next[k] is wrong.
+
+                    // Solution: We need to find the probability of hap_indices[m][k] at m+1.
+                    // We need to look up `next_posteriors`.
+
+                    if prob > threshold {
+                        // Include this state.
+                        let h = hap_indices_input[m][k];
+                        hap_indices.push(h);
                         probs.push(prob);
-                        probs_p1.push(prob_next);
+
+                        // Find h in m+1
+                        let next_haps = &hap_indices_input[m+1];
+                        // Binary search or linear scan?
+                        // next_haps is sorted.
+                        let mut p_next = 0.0;
+                        if let Ok(idx) = next_haps.binary_search(&h) {
+                            p_next = next_posteriors[idx];
+                        }
+                        // If not found in m+1, p_next = 0 (or re-distributed?)
+                        probs_p1.push(p_next);
                     }
+                    // What if prob is small but prob_next (at matching hap) is large?
+                    // Then it should have been included in m+1's list (which we processed in previous iteration).
+                    // But here we are building the list for m.
+                    // So we only care about states present at m.
+                    // If a haplotype is present at m+1 but not m, it will be in m+1's list (stored in previous loop).
+                    // So we only need to check `prob > threshold`.
+                    // We don't need `|| prob_next > threshold` because that logic was for fixed states.
+                    // With dynamic states, we output the states active at m.
+
                 }
             }
             
             entry_counts.push(hap_indices.len() - entries_before);
+
+            // Swap isn't enough if size changes, but vectors are fixed size n_states.
+            // But logic for next_posteriors needs to handle the state identity change.
+            // Actually, next_posteriors just holds values for m+1 (previously processed).
+            // We only need it for the lookups.
+            // So we can swap.
             std::mem::swap(&mut curr_posteriors, &mut next_posteriors);
         }
         } // End bwd_span block
@@ -723,6 +804,7 @@ pub fn compute_state_probs(
             &mut workspace.fwd,
             &mut workspace.bwd,
             &mut workspace.block_fwd,
+            &mut workspace.row_buffer, // Reuse row_buffer as scratch
             trace,
         );
 

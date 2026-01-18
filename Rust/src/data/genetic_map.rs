@@ -183,6 +183,17 @@ impl PositionMap {
     }
 }
 
+/// Helper to ensure minimum genetic distance between markers
+/// This is used to fix map issues where markers are too close
+pub fn enforce_min_dist(gen_pos: &mut [f64], min_dist: f64) {
+    if gen_pos.len() < 2 { return; }
+    for i in 1..gen_pos.len() {
+        if gen_pos[i] < gen_pos[i-1] + min_dist {
+             gen_pos[i] = gen_pos[i-1] + min_dist;
+        }
+    }
+}
+
 /// Pre-computed genetic positions for a set of markers
 ///
 /// This matches Java `vcf/MarkerMap.java`
