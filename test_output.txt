@@ -1,0 +1,439 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.73s
+     Running unittests src/lib.rs (target/debug/deps/reagle-3b9c6642476e69cd)
+
+running 112 tests
+test data::genetic_map::tests::test_empty_map_for_missing_chrom ... ok
+test data::genetic_map::tests::test_extrapolation ... ok
+test data::genetic_map::tests::test_genetic_maps_collection ... ok
+test data::genetic_map::tests::test_gen_dist ... ok
+test data::genetic_map::tests::test_interpolation ... ok
+test data::genetic_map::tests::test_marker_map_from_positions ... ok
+test data::haplotype::tests::test_sample_hap_indices ... ok
+test data::haplotype::tests::test_hap_sample_index ... ok
+test data::genetic_map::tests::test_position_map ... ok
+test data::haplotype::tests::test_samples_mixed_ploidy ... ok
+test data::haplotype::tests::test_samples_n_haps ... ok
+test data::marker::tests::test_bits_per_allele ... ok
+test data::marker::tests::test_allele_from_char ... ok
+test data::marker::tests::test_marker_is_snv ... ok
+test data::storage::dense::tests::test_biallelic ... ok
+test data::storage::dense::tests::test_multiallelic ... ok
+test data::storage::matrix::tests::test_confidence_scores ... ok
+test data::storage::dictionary::tests::test_dictionary_compression ... ok
+test data::storage::matrix::tests::test_matrix_access ... ok
+test data::storage::matrix::tests::test_no_confidence_defaults_to_full ... ok
+test data::storage::matrix::tests::test_phase_transition ... ok
+test data::storage::mutable::tests::test_haplotype ... ok
+test data::storage::mutable::tests::test_marker_alleles ... ok
+test data::storage::mutable::tests::test_missing_data ... ok
+test data::storage::mutable::tests::test_multiallelic ... ok
+test data::storage::mutable::tests::test_mutable_genotypes ... ok
+test data::storage::mutable::tests::test_memory_layout ... ok
+test data::storage::mutable::tests::test_set_missing ... ok
+test data::storage::mutable::tests::test_swap ... ok
+test data::storage::mutable::tests::test_swap_multiallelic ... ok
+test data::storage::mutable::tests::test_swap_with_missing ... ok
+test data::storage::phase_state::tests::test_zero_sized ... ok
+test data::storage::sample_phase::tests::test_allele_access ... ok
+test data::storage::sample_phase::tests::test_is_unphased ... ok
+test data::storage::sample_phase::tests::test_mark_phased ... ok
+test data::storage::sample_phase::tests::test_multiallelic_support ... ok
+test data::storage::sample_phase::tests::test_new_basic ... ok
+test data::storage::sample_phase::tests::test_swap_alleles ... ok
+test data::storage::sample_phase::tests::test_swap_haps ... ok
+test data::storage::sparse::tests::test_sparse_column ... ok
+test data::storage::tests::test_maf_calculation ... ok
+test data::storage::view::tests::test_view_from_mutable ... ok
+test data::storage::view::tests::test_view_from_matrix ... ok
+test data::storage::tests::test_storage_selection ... ok
+test io::bref3::tests::test_allele_code_decoding ... ok
+test io::bref3::tests::test_magic_number ... ok
+test io::bref3::tests::test_parse_alleles_biallelic ... ok
+test io::bref3::tests::test_parse_alleles_indel ... ok
+test io::bref3::tests::test_parse_alleles_multiallelic ... ok
+test io::bref3::tests::test_read_be_i32 ... ok
+test io::bref3::tests::test_read_be_u16 ... ok
+test io::bref3::tests::test_read_string_array ... ok
+test io::bref3::tests::test_read_string_array_empty ... ok
+test io::bref3::tests::test_read_utf8_string ... ok
+test io::bref3::tests::test_snv_perms ... ok
+test io::streaming::tests::test_parse_gt ... ok
+test io::streaming::tests::test_streaming_config_default ... ok
+test io::vcf::tests::test_allele_frequency ... ok
+test io::vcf::tests::test_dr2_perfect_imputation ... ok
+test io::vcf::tests::test_dr2_variable_imputation ... ok
+test io::vcf::tests::test_dr2_uncertain_imputation ... ok
+test io::vcf::tests::test_imputation_quality_collection ... ok
+test io::vcf::tests::test_marker_imputation_stats_new ... ok
+test io::vcf::tests::test_parse_genotype ... ok
+test io::vcf::tests::test_parse_genotype_haploid ... ok
+test io::vcf::tests::test_parse_genotype_multiallelic ... ok
+test model::hmm::tests::test_bwd_update_normalizes_to_one ... ok
+test model::hmm::tests::test_extreme_recombination_rates ... ok
+test model::hmm::tests::test_fwd_update_favors_matching_states ... ok
+test model::hmm::tests::test_beagle_hmm_forward_backward ... ok
+test model::hmm::tests::test_fwd_update_preserves_probability_mass ... ok
+test io::vcf::test_dictionary_compression_integration ... ok
+test model::hmm::tests::test_hmm_updater_bwd ... ok
+test model::hmm::tests::test_hmm_updater_fwd ... ok
+test model::hmm::tests::test_numerical_stability_small_values ... ok
+test model::ibs2::tests::test_ibs2_segment ... ok
+test model::hmm::tests::test_simd_vectorized_matches_scalar ... ok
+test model::ibs2::tests::test_phase_consistent ... ok
+test model::parameters::tests::test_li_stephens_p_mismatch ... ok
+test model::parameters::tests::test_p_recomb ... ok
+test model::parameters::tests::test_param_estimates_merge ... ok
+test model::parameters::tests::test_lr_threshold_for_iteration ... ok
+test model::parameters::tests::test_recomb_intensity_formula ... ok
+test model::pbwt::tests::test_pbwt_bwd_missing_data_no_reference_bias ... ok
+test model::pbwt::tests::test_pbwt_div_fwd_update ... ok
+test model::pbwt::tests::test_pbwt_long_match_detection ... ok
+test model::pbwt::tests::test_pbwt_missing_data_no_reference_bias ... ok
+test model::pbwt::tests::test_pbwt_multi_marker_divergence_propagation ... ok
+test model::phase_states::tests::test_composite_haps_have_multiple_segments ... ok
+test model::phase_states::tests::test_phase_states_basic ... ok
+test model::phase_states::tests::test_phase_states_replacement ... ok
+test model::states::tests::test_allele_scratch ... ok
+test model::states::tests::test_materialize_at ... ok
+test model::states::tests::test_mosaic_cursor_rewind ... ok
+test model::states::tests::test_mosaic_cursor_threaded ... ok
+test model::states::tests::test_threaded_haps_basic ... ok
+test model::states::tests::test_threaded_haps_cursor_helpers ... ok
+test model::states::tests::test_threaded_haps_segments ... ok
+test pipelines::imputation::tests::test_state_probs_basic ... ok
+test model::pbwt_streaming::tests::test_wavefront_basic ... ok
+test pipelines::phasing::tests::test_dynamic_mcmc_deterministic_phase ... ok
+test pipelines::phasing::tests::test_dynamic_mcmc_opposite_phase ... ok
+test pipelines::phasing::tests::test_emit_haploid_constrained_at_het ... ok
+test pipelines::phasing::tests::test_emit_haploid_constrained_confidence_blending ... ok
+test pipelines::phasing::tests::test_pipeline_creation ... ok
+test pipelines::imputation_streaming::tests::test_sparse_target_should_not_truncate_reference_region ... ok
+test utils::telemetry::tests::test_blackboard_updates ... ok
+test utils::telemetry::tests::test_format_duration ... ok
+test utils::telemetry::tests::test_stage_roundtrip ... ok
+test model::pbwt_streaming::tests::test_bidirectional ... ok
+test pipelines::phasing::tests::test_run_phase ... ok
+test data::storage::mutable::tests::test_memory_efficiency ... ok
+
+test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.46s
+
+     Running unittests src/main.rs (target/debug/deps/reagle-b1f76dd640000d36)
+
+running 113 tests
+test data::genetic_map::tests::test_empty_map_for_missing_chrom ... ok
+test data::genetic_map::tests::test_extrapolation ... ok
+test data::genetic_map::tests::test_gen_dist ... ok
+test data::genetic_map::tests::test_genetic_maps_collection ... ok
+test data::genetic_map::tests::test_interpolation ... ok
+test data::genetic_map::tests::test_marker_map_from_positions ... ok
+test data::genetic_map::tests::test_position_map ... ok
+test data::haplotype::tests::test_hap_sample_index ... ok
+test data::haplotype::tests::test_sample_hap_indices ... ok
+test data::haplotype::tests::test_samples_n_haps ... ok
+test data::haplotype::tests::test_samples_mixed_ploidy ... ok
+test data::marker::tests::test_allele_from_char ... ok
+test data::marker::tests::test_bits_per_allele ... ok
+test data::marker::tests::test_marker_is_snv ... ok
+test data::storage::dense::tests::test_biallelic ... ok
+test data::storage::dense::tests::test_multiallelic ... ok
+test data::storage::matrix::tests::test_confidence_scores ... ok
+test data::storage::dictionary::tests::test_dictionary_compression ... ok
+test data::storage::matrix::tests::test_matrix_access ... ok
+test data::storage::matrix::tests::test_no_confidence_defaults_to_full ... ok
+test data::storage::matrix::tests::test_phase_transition ... ok
+test data::storage::mutable::tests::test_haplotype ... ok
+test data::storage::mutable::tests::test_marker_alleles ... ok
+test data::storage::mutable::tests::test_memory_layout ... ok
+test data::storage::mutable::tests::test_missing_data ... ok
+test data::storage::mutable::tests::test_multiallelic ... ok
+test data::storage::mutable::tests::test_mutable_genotypes ... ok
+test data::storage::mutable::tests::test_set_missing ... ok
+test data::storage::mutable::tests::test_swap ... ok
+test data::storage::mutable::tests::test_swap_multiallelic ... ok
+test data::storage::mutable::tests::test_swap_with_missing ... ok
+test data::storage::phase_state::tests::test_zero_sized ... ok
+test data::storage::sample_phase::tests::test_allele_access ... ok
+test data::storage::sample_phase::tests::test_is_unphased ... ok
+test data::storage::sample_phase::tests::test_mark_phased ... ok
+test data::storage::sample_phase::tests::test_multiallelic_support ... ok
+test data::storage::sample_phase::tests::test_new_basic ... ok
+test data::storage::sample_phase::tests::test_swap_alleles ... ok
+test data::storage::sample_phase::tests::test_swap_haps ... ok
+test data::storage::sparse::tests::test_sparse_column ... ok
+test data::storage::tests::test_maf_calculation ... ok
+test data::storage::view::tests::test_view_from_matrix ... ok
+test data::storage::tests::test_storage_selection ... ok
+test data::storage::view::tests::test_view_from_mutable ... ok
+test io::bref3::tests::test_allele_code_decoding ... ok
+test io::bref3::tests::test_magic_number ... ok
+test io::bref3::tests::test_parse_alleles_biallelic ... ok
+test io::bref3::tests::test_parse_alleles_indel ... ok
+test io::bref3::tests::test_parse_alleles_multiallelic ... ok
+test io::bref3::tests::test_read_be_i32 ... ok
+test io::bref3::tests::test_read_be_u16 ... ok
+test io::bref3::tests::test_read_string_array ... ok
+test io::bref3::tests::test_read_string_array_empty ... ok
+test io::bref3::tests::test_read_utf8_string ... ok
+test io::bref3::tests::test_snv_perms ... ok
+test io::streaming::tests::test_parse_gt ... ok
+test io::streaming::tests::test_streaming_config_default ... ok
+test io::vcf::tests::test_allele_frequency ... ok
+test io::vcf::tests::test_dr2_perfect_imputation ... ok
+test io::vcf::tests::test_dr2_uncertain_imputation ... ok
+test io::vcf::tests::test_dr2_variable_imputation ... ok
+test io::vcf::tests::test_imputation_quality_collection ... ok
+test io::vcf::tests::test_marker_imputation_stats_new ... ok
+test io::vcf::tests::test_parse_genotype ... ok
+test io::vcf::tests::test_parse_genotype_haploid ... ok
+test io::vcf::tests::test_parse_genotype_multiallelic ... ok
+test model::hmm::tests::test_bwd_update_normalizes_to_one ... ok
+test model::hmm::tests::test_beagle_hmm_forward_backward ... ok
+test model::hmm::tests::test_fwd_update_favors_matching_states ... ok
+test model::hmm::tests::test_extreme_recombination_rates ... ok
+test model::hmm::tests::test_fwd_update_preserves_probability_mass ... ok
+test io::vcf::test_dictionary_compression_integration ... ok
+test model::hmm::tests::test_hmm_updater_bwd ... ok
+test model::hmm::tests::test_hmm_updater_fwd ... ok
+test model::hmm::tests::test_numerical_stability_small_values ... ok
+test model::ibs2::tests::test_ibs2_segment ... ok
+test model::hmm::tests::test_simd_vectorized_matches_scalar ... ok
+test model::ibs2::tests::test_phase_consistent ... ok
+test model::parameters::tests::test_li_stephens_p_mismatch ... ok
+test model::parameters::tests::test_lr_threshold_for_iteration ... ok
+test model::parameters::tests::test_p_recomb ... ok
+test model::parameters::tests::test_param_estimates_merge ... ok
+test model::parameters::tests::test_recomb_intensity_formula ... ok
+test model::pbwt::tests::test_pbwt_div_fwd_update ... ok
+test model::pbwt::tests::test_pbwt_bwd_missing_data_no_reference_bias ... ok
+test model::pbwt::tests::test_pbwt_long_match_detection ... ok
+test model::pbwt::tests::test_pbwt_missing_data_no_reference_bias ... ok
+test model::pbwt::tests::test_pbwt_multi_marker_divergence_propagation ... ok
+test model::phase_states::tests::test_composite_haps_have_multiple_segments ... ok
+test model::phase_states::tests::test_phase_states_basic ... ok
+test model::phase_states::tests::test_phase_states_replacement ... ok
+test model::states::tests::test_allele_scratch ... ok
+test model::states::tests::test_materialize_at ... ok
+test model::states::tests::test_mosaic_cursor_rewind ... ok
+test model::states::tests::test_mosaic_cursor_threaded ... ok
+test model::pbwt_streaming::tests::test_wavefront_basic ... ok
+test model::states::tests::test_threaded_haps_basic ... ok
+test model::states::tests::test_threaded_haps_segments ... ok
+test model::states::tests::test_threaded_haps_cursor_helpers ... ok
+test pipelines::imputation::tests::test_state_probs_basic ... ok
+test pipelines::phasing::tests::test_dynamic_mcmc_deterministic_phase ... ok
+test pipelines::phasing::tests::test_dynamic_mcmc_opposite_phase ... ok
+test pipelines::phasing::tests::test_emit_haploid_constrained_at_het ... ok
+test pipelines::phasing::tests::test_emit_haploid_constrained_confidence_blending ... ok
+test pipelines::phasing::tests::test_pipeline_creation ... ok
+test pipelines::imputation_streaming::tests::test_sparse_target_should_not_truncate_reference_region ... ok
+test model::pbwt_streaming::tests::test_bidirectional ... ok
+test tests::test_module_imports ... ok
+test utils::telemetry::tests::test_blackboard_updates ... ok
+test utils::telemetry::tests::test_format_duration ... ok
+test utils::telemetry::tests::test_stage_roundtrip ... ok
+test pipelines::phasing::tests::test_run_phase ... ok
+test data::storage::mutable::tests::test_memory_efficiency ... ok
+
+test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-9016a49bf44ab4d9)
+
+running 27 tests
+test test_comparison_framework_self_check ... FAILED
+test test_diverse_mask_scenarios ... FAILED
+test test_dr2_genotyped_vs_imputed ... FAILED
+test test_dosage_by_distance_from_genotyped ... FAILED
+test test_full_workflow_rust_vs_java ... FAILED
+test test_dr2_zero_variance_genotyped_marker ... FAILED
+test test_genotyped_dosage_correlation_with_truth ... FAILED
+test test_genotyped_dosage_matches_hard_call ... FAILED
+test test_imputation_bref3_ref_rust_vs_java ... FAILED
+test test_imputation_vcf_ref_rust_vs_java ... FAILED
+test test_gl_confidence_affects_emission ... FAILED
+test test_imputation_vs_ground_truth ... FAILED
+test test_java_beagle_bref3_creation ... FAILED
+test test_mask_and_recover_rust_vs_java ... FAILED
+test test_multiple_seeds_consistency ... FAILED
+test test_java_beagle_vcf_vs_bref3_consistency ... FAILED
+test test_output_structure_rust_vs_java ... FAILED
+test test_per_sample_imputation_accuracy ... FAILED
+test test_perfect_ld_trap_rare_variants_aggregate ... FAILED
+test test_phasing_determinism ... FAILED
+test test_phasing_rust_vs_java ... FAILED
+test test_phasing_single_sample ... ok
+test test_phasing_sanity_checks ... FAILED
+test test_phasing_switch_error_rate ... FAILED
+test test_phasing_heterozygote_stress ... FAILED
+test test_posterior_probability_calibration ... FAILED
+test test_strict_dr2_and_dosage_comparison ... FAILED
+
+failures:
+
+---- test_comparison_framework_self_check stdout ----
+
+thread 'test_comparison_framework_self_check' (10750) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- test_diverse_mask_scenarios stdout ----
+
+thread 'test_diverse_mask_scenarios' (10751) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_dr2_genotyped_vs_imputed stdout ----
+
+thread 'test_dr2_genotyped_vs_imputed' (10753) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_dosage_by_distance_from_genotyped stdout ----
+
+thread 'test_dosage_by_distance_from_genotyped' (10752) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_full_workflow_rust_vs_java stdout ----
+
+thread 'test_full_workflow_rust_vs_java' (10755) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_dr2_zero_variance_genotyped_marker stdout ----
+
+======================================================================
+=== DR2 for Zero-Variance Genotyped Markers ===
+======================================================================
+
+thread 'test_dr2_zero_variance_genotyped_marker' (10754) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_genotyped_dosage_correlation_with_truth stdout ----
+
+thread 'test_genotyped_dosage_correlation_with_truth' (10756) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_genotyped_dosage_matches_hard_call stdout ----
+
+thread 'test_genotyped_dosage_matches_hard_call' (10757) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_imputation_bref3_ref_rust_vs_java stdout ----
+
+thread 'test_imputation_bref3_ref_rust_vs_java' (10759) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_imputation_vcf_ref_rust_vs_java stdout ----
+
+thread 'test_imputation_vcf_ref_rust_vs_java' (10760) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_gl_confidence_affects_emission stdout ----
+
+thread 'test_gl_confidence_affects_emission' (10758) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_imputation_vs_ground_truth stdout ----
+
+thread 'test_imputation_vs_ground_truth' (10761) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_java_beagle_bref3_creation stdout ----
+
+thread 'test_java_beagle_bref3_creation' (10762) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_mask_and_recover_rust_vs_java stdout ----
+
+thread 'test_mask_and_recover_rust_vs_java' (10764) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_multiple_seeds_consistency stdout ----
+
+thread 'test_multiple_seeds_consistency' (10765) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_java_beagle_vcf_vs_bref3_consistency stdout ----
+
+thread 'test_java_beagle_vcf_vs_bref3_consistency' (10763) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_output_structure_rust_vs_java stdout ----
+
+thread 'test_output_structure_rust_vs_java' (10766) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_per_sample_imputation_accuracy stdout ----
+
+thread 'test_per_sample_imputation_accuracy' (10767) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_perfect_ld_trap_rare_variants_aggregate stdout ----
+
+thread 'test_perfect_ld_trap_rare_variants_aggregate' (10768) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_phasing_determinism stdout ----
+
+thread 'test_phasing_determinism' (10769) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_phasing_rust_vs_java stdout ----
+
+thread 'test_phasing_rust_vs_java' (10771) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_phasing_sanity_checks stdout ----
+
+thread 'test_phasing_sanity_checks' (10772) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_phasing_switch_error_rate stdout ----
+
+thread 'test_phasing_switch_error_rate' (10774) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_phasing_heterozygote_stress stdout ----
+
+thread 'test_phasing_heterozygote_stress' (10770) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_posterior_probability_calibration stdout ----
+
+thread 'test_posterior_probability_calibration' (10780) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+---- test_strict_dr2_and_dosage_comparison stdout ----
+
+thread 'test_strict_dr2_and_dosage_comparison' (10781) panicked at tests/beagle_reference.rs:121:5:
+BEAGLE JAR missing: /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar
+
+
+failures:
+    test_comparison_framework_self_check
+    test_diverse_mask_scenarios
+    test_dosage_by_distance_from_genotyped
+    test_dr2_genotyped_vs_imputed
+    test_dr2_zero_variance_genotyped_marker
+    test_full_workflow_rust_vs_java
+    test_genotyped_dosage_correlation_with_truth
+    test_genotyped_dosage_matches_hard_call
+    test_gl_confidence_affects_emission
+    test_imputation_bref3_ref_rust_vs_java
+    test_imputation_vcf_ref_rust_vs_java
+    test_imputation_vs_ground_truth
+    test_java_beagle_bref3_creation
+    test_java_beagle_vcf_vs_bref3_consistency
+    test_mask_and_recover_rust_vs_java
+    test_multiple_seeds_consistency
+    test_output_structure_rust_vs_java
+    test_per_sample_imputation_accuracy
+    test_perfect_ld_trap_rare_variants_aggregate
+    test_phasing_determinism
+    test_phasing_heterozygote_stress
+    test_phasing_rust_vs_java
+    test_phasing_sanity_checks
+    test_phasing_switch_error_rate
+    test_posterior_probability_calibration
+    test_strict_dr2_and_dosage_comparison
+
+test result: FAILED. 1 passed; 26 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--test beagle_reference`

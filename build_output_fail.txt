@@ -1,0 +1,27 @@
+   Compiling reagle v0.1.0 (/app)
+error: failed to run custom build command for `reagle v0.1.0 (/app)`
+
+Caused by:
+  process didn't exit successfully: `/app/target/debug/build/reagle-d7849ecc6bca2438/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:rustc-link-arg=-Wl,--no-keep-memory
+  cargo:rustc-env=GNOMON_LOW_MEMORY_TOTAL_MEMORY_BYTES=8345706496
+  cargo:rustc-env=GNOMON_LOW_MEMORY_SERIAL_BUILD=1
+  cargo:rustc-cfg=gnomon_low_memory_serial_build
+  cargo:rustc-env=GNOMON_BUILD_TIMESTAMP=1768719463
+
+  --- stderr
+
+  ❌ VALIDATION ERRORS
+  ====================
+
+  ❌ ERROR: Found 1 TODO/FIXME comments in ./src/dummy_main.rs:
+     2:    // TODO: remove this comment
+
+  ⚠️ TODO/FIXME/"for now" COMMENTS ARE FORBIDDEN IN THIS PROJECT!
+     These comments indicate incomplete work. DO IT NOW!
+     Do NOT just remove the comment - implement the thing first!
+
+  --------------------
+
+  ⚠️ Found 1 total code quality violations. Fix all issues before committing.
