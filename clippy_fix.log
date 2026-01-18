@@ -1,0 +1,2459 @@
+   Compiling reagle v0.1.0 (/app)
+    Checking burn v0.18.0
+    Checking safe_arch v1.0.0
+    Checking funty v2.0.0
+    Checking jiff v0.2.18
+    Checking bitvec v1.0.1
+    Checking wide v1.1.1
+    Checking mini-mcmc v0.8.0 (https://github.com/SauersML/general-mcmc#2469d9dd)
+    Checking thiserror v2.0.17
+    Checking aligned-vec v0.6.4
+    Checking noodles v0.104.0
+    Checking anyhow v1.0.100
+    Checking tracing-tree v0.4.1
+    Checking clap v4.5.54
+    Checking memmap2 v0.9.9
+    Checking ryu v1.0.22
+    Checking env_logger v0.11.8
+error: empty line after doc comment
+  --> src/data/storage/matrix.rs:78:5
+   |
+78 | /     /// Get samples reference
+79 | |
+   | |_^
+80 |       /// Get samples Arc (cloned)
+81 |       pub fn samples_arc(&self) -> Arc<Samples> {
+   |       ------------------ the comment documents this function
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#empty_line_after_doc_comments
+   = note: `-D clippy::empty-line-after-doc-comments` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::empty_line_after_doc_comments)]`
+   = help: if the empty line is unintentional, remove it
+help: if the documentation should include the empty line include it in the comment
+   |
+79 |     ///
+   |
+
+error: empty line after doc comment
+   --> src/data/storage/matrix.rs:105:5
+    |
+105 | /     /// Check if confidence scores are available
+106 | |
+    | |_^
+...
+110 |       pub fn sample_confidence(&self, marker: MarkerIdx, sample_idx: usize) -> u8 {
+    |       ------------------------ the comment documents this function
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#empty_line_after_doc_comments
+    = help: if the empty line is unintentional, remove it
+help: if the documentation should include the empty line include it in the comment
+    |
+106 |     ///
+    |
+
+error: digits of hex, binary or octal literal not in groups of equal size
+    --> src/pipelines/phasing.rs:4202:40
+     |
+4202 |     let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
+     |                                        ^^^^^^^^^^^^^^^^^^^^^ help: consider: `0x00C0_FFEE_BAAD_F00D_u64`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unusual_byte_groupings
+     = note: `-D clippy::unusual-byte-groupings` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::unusual_byte_groupings)]`
+
+error: this `if` statement can be collapsed
+   --> src/config.rs:264:9
+    |
+264 | /         if let Some(ref ref_path) = self.r#ref {
+265 | |             if !ref_path.exists() {
+266 | |                 return Err(ReagleError::FileNotFound {
+267 | |                     path: ref_path.clone(),
+...   |
+270 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+    = note: `-D clippy::collapsible-if` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+    |
+264 ~         if let Some(ref ref_path) = self.r#ref
+265 ~             && !ref_path.exists() {
+266 |                 return Err(ReagleError::FileNotFound {
+267 |                     path: ref_path.clone(),
+268 |                 });
+269 ~             }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/config.rs:273:9
+    |
+273 | /         if let Some(ref map_path) = self.map {
+274 | |             if !map_path.exists() {
+275 | |                 return Err(ReagleError::FileNotFound {
+276 | |                     path: map_path.clone(),
+...   |
+279 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+273 ~         if let Some(ref map_path) = self.map
+274 ~             && !map_path.exists() {
+275 |                 return Err(ReagleError::FileNotFound {
+276 |                     path: map_path.clone(),
+277 |                 });
+278 ~             }
+    |
+
+error: the loop variable `m` is used to index `ref_to_target`
+  --> src/data/alignment.rs:53:18
+   |
+53 |         for m in 0..n_ref_markers {
+   |                  ^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+   = note: `-D clippy::needless-range-loop` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::needless_range_loop)]`
+help: consider using an iterator and enumerate()
+   |
+53 -         for m in 0..n_ref_markers {
+53 +         for (m, <item>) in ref_to_target.iter_mut().enumerate().take(n_ref_markers) {
+   |
+
+error: you should consider adding a `Default` implementation for `PositionMap`
+   --> src/data/genetic_map.rs:174:5
+    |
+174 | /     pub fn new() -> Self {
+175 | |         Self {
+176 | |             scale_factor: DEFAULT_SCALE_FACTOR,
+177 | |         }
+178 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#new_without_default
+    = note: `-D clippy::new-without-default` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::new_without_default)]`
+help: try adding this
+    |
+172 + impl Default for PositionMap {
+173 +     fn default() -> Self {
+174 +         Self::new()
+175 +     }
+176 + }
+    |
+
+error: manual implementation of `.is_multiple_of()`
+  --> src/data/haplotype.rs:71:9
+   |
+71 |         self.0 % 2 == 0
+   |         ^^^^^^^^^^^^^^^ help: replace with: `self.0.is_multiple_of(2)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_is_multiple_of
+   = note: `-D clippy::manual-is-multiple-of` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::manual_is_multiple_of)]`
+
+error: struct `Samples` has a public `len` method, but no `is_empty` method
+   --> src/data/haplotype.rs:168:5
+    |
+168 |     pub fn len(&self) -> usize {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#len_without_is_empty
+    = note: `-D clippy::len-without-is-empty` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::len_without_is_empty)]`
+
+error: method `from_str` can be confused for the standard trait method `std::str::FromStr::from_str`
+  --> src/data/marker.rs:83:5
+   |
+83 | /     pub fn from_str(s: &str) -> Self {
+84 | |         if s.len() == 1 {
+85 | |             Self::from_char(s.chars().next().unwrap())
+86 | |         } else if s == "." || s == "*" || s == "<*>" || s == "<NON_REF>" {
+...  |
+91 | |     }
+   | |_____^
+   |
+   = help: consider implementing the trait `std::str::FromStr` or choosing a less ambiguous method name
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#should_implement_trait
+   = note: `-D clippy::should-implement-trait` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::should_implement_trait)]`
+
+error: accessing first element with `targ_to_ref.get(0)`
+   --> src/data/marker.rs:325:27
+    |
+325 |     let alleles_swapped = targ_to_ref.get(0) == Some(&1);
+    |                           ^^^^^^^^^^^^^^^^^^ help: try: `targ_to_ref.first()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#get_first
+    = note: `-D clippy::get-first` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::get_first)]`
+
+error: accessing first element with `targ_to_ref.get(0)`
+   --> src/data/marker.rs:365:27
+    |
+365 |     let alleles_swapped = targ_to_ref.get(0) == Some(&1);
+    |                           ^^^^^^^^^^^^^^^^^^ help: try: `targ_to_ref.first()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#get_first
+
+error: struct `Markers` has a public `len` method, but no `is_empty` method
+   --> src/data/marker.rs:432:5
+    |
+432 |     pub fn len(&self) -> usize {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#len_without_is_empty
+
+error: manual slice size calculation
+   --> src/data/storage/dense.rs:130:9
+    |
+130 |         self.bits.as_raw_slice().len() * std::mem::size_of::<u64>() 
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `std::mem::size_of_val(self.bits.as_raw_slice())`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_slice_size_calculation
+    = note: `-D clippy::manual-slice-size-calculation` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_slice_size_calculation)]`
+
+error: manual slice size calculation
+   --> src/data/storage/dense.rs:131:15
+    |
+131 |             + self.missing.as_raw_slice().len() * std::mem::size_of::<u64>()
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `std::mem::size_of_val(self.missing.as_raw_slice())`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_slice_size_calculation
+
+error: the loop variable `m` is used to index `columns`
+  --> src/data/storage/dictionary.rs:49:22
+   |
+49 |             for m in 0..n_markers {
+   |                      ^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+49 -             for m in 0..n_markers {
+49 +             for (m, <item>) in columns.iter().enumerate().take(n_markers) {
+   |
+
+error: manual slice size calculation
+   --> src/data/storage/dictionary.rs:171:22
+    |
+171 |             .map(|p| p.as_raw_slice().len() * std::mem::size_of::<u64>())
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `std::mem::size_of_val(p.as_raw_slice())`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_slice_size_calculation
+
+error: manually reimplementing `div_ceil`
+  --> src/data/storage/mutable.rs:76:24
+   |
+76 |         let n_blocks = (n_markers + Self::EXC_BLOCK_SIZE - 1) / Self::EXC_BLOCK_SIZE;
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n_markers.div_ceil(Self::EXC_BLOCK_SIZE)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_div_ceil
+   = note: `-D clippy::manual-div-ceil` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::manual_div_ceil)]`
+
+error: this `if` statement can be collapsed
+   --> src/data/storage/mutable.rs:131:9
+    |
+131 | /         if let Some(block) = self.exceptions.get(block_idx) {
+132 | |             if !block.is_empty() {
+133 | |                 let key = Self::pack_key(offset, h, self.n_haps);
+134 | |                 if let Ok(pos) = block.binary_search_by_key(&key, |(k, _)| *k) {
+...   |
+138 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+131 ~         if let Some(block) = self.exceptions.get(block_idx)
+132 ~             && !block.is_empty() {
+133 |                 let key = Self::pack_key(offset, h, self.n_haps);
+...
+136 |                 }
+137 ~             }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/data/storage/mutable.rs:160:17
+    |
+160 | /                 if let Some(block) = self.exceptions.get_mut(block_idx) {
+161 | |                     if !block.is_empty() {
+162 | |                         let key = Self::pack_key(offset, h, self.n_haps);
+163 | |                         if let Ok(pos) = block.binary_search_by_key(&key, |(k, _)| *k) {
+...   |
+168 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+160 ~                 if let Some(block) = self.exceptions.get_mut(block_idx)
+161 ~                     && !block.is_empty() {
+162 |                         let key = Self::pack_key(offset, h, self.n_haps);
+...
+166 |                         }
+167 ~                     }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/data/storage/mutable.rs:173:17
+    |
+173 | /                 if let Some(block) = self.exceptions.get_mut(block_idx) {
+174 | |                     if !block.is_empty() {
+175 | |                         let key = Self::pack_key(offset, h, self.n_haps);
+176 | |                         if let Ok(pos) = block.binary_search_by_key(&key, |(k, _)| *k) {
+...   |
+181 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+173 ~                 if let Some(block) = self.exceptions.get_mut(block_idx)
+174 ~                     && !block.is_empty() {
+175 |                         let key = Self::pack_key(offset, h, self.n_haps);
+...
+179 |                         }
+180 ~                     }
+    |
+
+error: this `else { if .. }` block can be collapsed
+  --> src/data/storage/sparse.rs:39:16
+   |
+39 |           } else {
+   |  ________________^
+40 | |             if is_carrier { 1 } else { 0 }
+41 | |         }
+   | |_________^ help: collapse nested if block: `if is_carrier { 1 } else { 0 }`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_else_if
+   = note: `-D clippy::collapsible-else-if` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::collapsible_else_if)]`
+
+error: using `contains()` instead of `iter().any()` is more efficient
+   --> src/data/storage/mod.rs:126:27
+    |
+126 |         let has_missing = alleles.iter().any(|&a| a == 255);
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `alleles.contains(&255)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_contains
+    = note: `-D clippy::manual-contains` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_contains)]`
+
+error: the loop variable `i` is only used to index `hap_to_seq`
+   --> src/io/bref3.rs:153:18
+    |
+153 |         for i in 0..self.n_haps {
+    |                  ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+153 -         for i in 0..self.n_haps {
+153 +         for <item> in hap_to_seq.iter_mut().take(self.n_haps) {
+    |
+
+error: the loop variable `col_idx` is only used to index `columns`
+   --> src/io/bref3.rs:189:28
+    |
+189 |             for col_idx in block_start_idx..columns.len() {
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+189 -             for col_idx in block_start_idx..columns.len() {
+189 +             for <item> in columns.iter_mut().skip(block_start_idx) {
+    |
+
+error: the loop variable `i` is only used to index `hap_to_seq`
+   --> src/io/bref3.rs:434:18
+    |
+434 |         for i in 0..self.n_haps {
+    |                  ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+434 -         for i in 0..self.n_haps {
+434 +         for <item> in hap_to_seq.iter_mut().take(self.n_haps) {
+    |
+
+error: the loop variable `col_idx` is only used to index `columns`
+   --> src/io/bref3.rs:473:28
+    |
+473 |             for col_idx in block_start_idx..columns.len() {
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+473 -             for col_idx in block_start_idx..columns.len() {
+473 +             for <item> in columns.iter_mut().skip(block_start_idx) {
+    |
+
+error: this `if` statement can be collapsed
+   --> src/io/bref3.rs:685:13
+    |
+685 | /             if let Some(last) = self.buffer.back() {
+686 | |                 if last.gen_pos >= target_gen || self.buffer.len() >= config.max_markers {
+687 | |                     break;
+688 | |                 }
+689 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+685 ~             if let Some(last) = self.buffer.back()
+686 ~                 && (last.gen_pos >= target_gen || self.buffer.len() >= config.max_markers) {
+687 |                     break;
+688 ~                 }
+    |
+
+error: this `if` statement can be collapsed
+    --> src/io/bref3.rs:1043:13
+     |
+1043 | /             if let Some(last) = self.buffer.back() {
+1044 | |                 if last.gen_pos >= target_gen || self.buffer.len() >= config.max_markers {
+1045 | |                     break;
+1046 | |                 }
+1047 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1043 ~             if let Some(last) = self.buffer.back()
+1044 ~                 && (last.gen_pos >= target_gen || self.buffer.len() >= config.max_markers) {
+1045 |                     break;
+1046 ~                 }
+     |
+
+error: redundant closure
+    --> src/io/bref3.rs:1113:65
+     |
+1113 |         let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
+     |                                                                 ^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the associated function itself: `Allele::from_str`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#redundant_closure
+     = note: `-D clippy::redundant-closure` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::redundant_closure)]`
+
+error: manual `RangeInclusive::contains` implementation
+    --> src/io/bref3.rs:1159:17
+     |
+1159 |              if c >= b'0' && c <= b'9' { return c - b'0'; }
+     |                 ^^^^^^^^^^^^^^^^^^^^^^ help: use: `(b'0'..=b'9').contains(&c)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_range_contains
+     = note: `-D clippy::manual-range-contains` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::manual_range_contains)]`
+
+error: clamp-like pattern without using clamp function
+   --> src/io/streaming.rs:120:24
+    |
+120 |         let min_prob = adaptive_min.min(0.001).max(1e-6);
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with clamp: `adaptive_min.clamp(1e-6, 0.001)`
+    |
+    = note: clamp will panic if max < min, min.is_nan(), or max.is_nan()
+    = note: clamp returns NaN if the input is NaN
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_clamp
+    = note: `-D clippy::manual-clamp` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_clamp)]`
+
+error: this `if` statement can be collapsed
+   --> src/io/streaming.rs:685:13
+    |
+685 | /             if let Some(last) = self.buffer.back() {
+686 | |                 if last.gen_pos >= target_gen || self.buffer.len() >= self.config.max_markers {
+687 | |                     break;
+688 | |                 }
+689 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+685 ~             if let Some(last) = self.buffer.back()
+686 ~                 && (last.gen_pos >= target_gen || self.buffer.len() >= self.config.max_markers) {
+687 |                     break;
+688 ~                 }
+    |
+
+error: redundant closure
+   --> src/io/streaming.rs:756:65
+    |
+756 |         let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
+    |                                                                 ^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the associated function itself: `Allele::from_str`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#redundant_closure
+
+error: this `if` statement can be collapsed
+   --> src/io/streaming.rs:784:13
+    |
+784 | /             if a1 == a2 && !gt_field.contains('|') && !gt_field.contains('/') {
+785 | |                 if let Some(ref mut ploidy) = self.sample_ploidy {
+786 | |                     ploidy[sample_idx] = false;
+787 | |                 }
+788 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+784 ~             if a1 == a2 && !gt_field.contains('|') && !gt_field.contains('/')
+785 ~                 && let Some(ref mut ploidy) = self.sample_ploidy {
+786 |                     ploidy[sample_idx] = false;
+787 ~                 }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/io/streaming.rs:793:13
+    |
+793 | /             if let Some(gl_i) = gl_idx {
+794 | |                 if let Some(conf_vec) = confidences.as_mut() {
+795 | |                     let confidence = sample_field
+796 | |                         .split(':')
+...   |
+802 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+793 ~             if let Some(gl_i) = gl_idx
+794 ~                 && let Some(conf_vec) = confidences.as_mut() {
+795 |                     let confidence = sample_field
+...
+800 |                     conf_vec.push(confidence);
+801 ~                 }
+    |
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/io/streaming.rs:859:12
+    |
+859 |         if c >= b'0' && c <= b'9' {
+    |            ^^^^^^^^^^^^^^^^^^^^^^ help: use: `(b'0'..=b'9').contains(&c)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_range_contains
+
+error: this `if` has identical blocks
+  --> src/io/vcf.rs:91:23
+   |
+91 |           if num <= 0.0 {
+   |  _______________________^
+92 | |             0.0
+93 | |         } else if den == 0.0 {
+   | |_________^
+   |
+note: same as this
+  --> src/io/vcf.rs:93:30
+   |
+93 |           } else if den == 0.0 {
+   |  ______________________________^
+94 | |             0.0
+95 | |         } else {
+   | |_________^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#if_same_then_else
+   = note: `-D clippy::if-same-then-else` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::if_same_then_else)]`
+
+error: this `if` statement can be collapsed
+   --> src/io/vcf.rs:364:13
+    |
+364 | /             if let Some(ref exclude_ids) = self.exclude_marker_ids {
+365 | |                 if let Some(ref id) = marker.id {
+366 | |                     if exclude_ids.contains(id.as_ref()) {
+367 | |                         continue; // Skip this marker
+...   |
+370 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+364 ~             if let Some(ref exclude_ids) = self.exclude_marker_ids
+365 ~                 && let Some(ref id) = marker.id {
+366 |                     if exclude_ids.contains(id.as_ref()) {
+367 |                         continue; // Skip this marker
+368 |                     }
+369 ~                 }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/io/vcf.rs:365:17
+    |
+365 | /                 if let Some(ref id) = marker.id {
+366 | |                     if exclude_ids.contains(id.as_ref()) {
+367 | |                         continue; // Skip this marker
+368 | |                     }
+369 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+365 ~                 if let Some(ref id) = marker.id
+366 ~                     && exclude_ids.contains(id.as_ref()) {
+367 |                         continue; // Skip this marker
+368 ~                     }
+    |
+
+error: very complex type used. Consider factoring parts into `type` definitions
+   --> src/io/vcf.rs:526:10
+    |
+526 |     ) -> Result<(Marker, Vec<u8>, bool, Option<Vec<u8>>)> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#type_complexity
+    = note: `-D clippy::type-complexity` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::type_complexity)]`
+
+error: redundant closure
+   --> src/io/vcf.rs:555:65
+    |
+555 |         let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
+    |                                                                 ^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the associated function itself: `Allele::from_str`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#redundant_closure
+
+error: this `if` statement can be collapsed
+   --> src/io/vcf.rs:610:13
+    |
+610 | /             if is_haploid {
+611 | |                 if let Some(ref mut ploidy) = self.sample_ploidy {
+612 | |                     ploidy[sample_idx] = false; // Mark as haploid
+613 | |                 }
+614 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+610 ~             if is_haploid
+611 ~                 && let Some(ref mut ploidy) = self.sample_ploidy {
+612 |                     ploidy[sample_idx] = false; // Mark as haploid
+613 ~                 }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/io/vcf.rs:620:13
+    |
+620 | /             if let Some(gl_i) = gl_idx {
+621 | |                 if let Some(conf_vec) = confidences.as_mut() {
+622 | |                     let confidence = sample_field.split(':')
+623 | |                         .nth(gl_i)
+...   |
+628 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+620 ~             if let Some(gl_i) = gl_idx
+621 ~                 && let Some(conf_vec) = confidences.as_mut() {
+622 |                     let confidence = sample_field.split(':')
+...
+626 |                     conf_vec.push(confidence);
+627 ~                 }
+    |
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/io/vcf.rs:712:12
+    |
+712 |         if c >= b'0' && c <= b'9' {
+    |            ^^^^^^^^^^^^^^^^^^^^^^ help: use: `(b'0'..=b'9').contains(&c)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_range_contains
+
+error: clamp-like pattern without using clamp function
+   --> src/io/vcf.rs:840:9
+    |
+840 |         conf.min(255.0).max(1.0) as u8
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with clamp: `conf.clamp(1.0, 255.0)`
+    |
+    = note: clamp will panic if max < min, min.is_nan(), or max.is_nan()
+    = note: clamp returns NaN if the input is NaN
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_clamp
+
+error: this function has too many arguments (11/7)
+    --> src/io/vcf.rs:1002:5
+     |
+1002 | /     pub fn write_imputed_streaming<S, F, B, G>(
+1003 | |         &mut self,
+1004 | |         matrix: &GenotypeMatrix<S>,
+1005 | |         get_dosage: F,
+...    |
+1018 | |         B: Fn(usize, usize) -> (u8, u8),
+1019 | |         G: Fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors),
+     | |________________________________________________________________________________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+     = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`
+
+error: casting to the same type is unnecessary (`f32` -> `f32`)
+    --> src/io/vcf.rs:1069:48
+     |
+1069 |                         let v = format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf);
+     |                                                ^^^^^^^^^^^^^^^^^^^ help: try: `stats.dr2(a)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unnecessary_cast
+     = note: `-D clippy::unnecessary-cast` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::unnecessary_cast)]`
+
+error: casting to the same type is unnecessary (`f32` -> `f32`)
+    --> src/io/vcf.rs:1075:48
+     |
+1075 |                         let v = format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf);
+     |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `stats.allele_freq(a)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unnecessary_cast
+
+error: the loop variable `i` is only used to index `bwd`
+   --> src/model/hmm.rs:148:18
+    |
+148 |         for i in k..n_states {
+    |                  ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+148 -         for i in k..n_states {
+148 +         for <item> in bwd.iter_mut().take(n_states).skip(k) {
+    |
+
+error: this function has too many arguments (8/7)
+   --> src/model/hmm.rs:291:5
+    |
+291 | /     pub fn conditioned_forward_backward(
+292 | |         &self,
+293 | |         geno_a1: &[u8],
+294 | |         geno_a2: &[u8],
+...   |
+299 | |         bwd: &mut Vec<f32>,
+300 | |     ) -> f64 {
+    | |____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this `if` has identical blocks
+   --> src/model/hmm.rs:341:61
+    |
+341 |               let required = if conf < CONF_NEUTRAL_THRESHOLD {
+    |  _____________________________________________________________^
+342 | |                 None
+343 | |             } else if geno1 == 255 || geno2 == 255 {
+    | |_____________^
+    |
+note: same as this
+   --> src/model/hmm.rs:343:52
+    |
+343 |               } else if geno1 == 255 || geno2 == 255 {
+    |  ____________________________________________________^
+344 | |                 None
+345 | |             } else if geno1 == geno2 {
+    | |_____________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#if_same_then_else
+
+error: the loop variable `k` is used to index `emissions`
+   --> src/model/hmm.rs:358:26
+    |
+358 |                 for k in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+358 -                 for k in 0..n_states {
+358 +                 for (k, <item>) in emissions.iter_mut().enumerate().take(n_states) {
+    |
+
+error: this `if` has identical blocks
+   --> src/model/hmm.rs:418:61
+    |
+418 |               let required = if conf < CONF_NEUTRAL_THRESHOLD {
+    |  _____________________________________________________________^
+419 | |                 None
+420 | |             } else if geno1 == 255 || geno2 == 255 {
+    | |_____________^
+    |
+note: same as this
+   --> src/model/hmm.rs:420:52
+    |
+420 |               } else if geno1 == 255 || geno2 == 255 {
+    |  ____________________________________________________^
+421 | |                 None
+422 | |             } else if geno1 == geno2 {
+    | |_____________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#if_same_then_else
+
+error: the loop variable `k` is used to index `emissions`
+   --> src/model/hmm.rs:435:26
+    |
+435 |                 for k in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+435 -                 for k in 0..n_states {
+435 +                 for (k, <item>) in emissions.iter_mut().enumerate().take(n_states) {
+    |
+
+error: this function has too many arguments (8/7)
+   --> src/model/hmm.rs:462:5
+    |
+462 | /     pub fn conditioned_forward_backward_with_lookup(
+463 | |         &self,
+464 | |         geno_a1: &[u8],
+465 | |         geno_a2: &[u8],
+...   |
+470 | |         bwd: &mut Vec<f32>,
+471 | |     ) -> f64 {
+    | |____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this `if` has identical blocks
+   --> src/model/hmm.rs:503:61
+    |
+503 |               let required = if conf < CONF_NEUTRAL_THRESHOLD {
+    |  _____________________________________________________________^
+504 | |                 None
+505 | |             } else if geno1 == 255 || geno2 == 255 {
+    | |_____________^
+    |
+note: same as this
+   --> src/model/hmm.rs:505:52
+    |
+505 |               } else if geno1 == 255 || geno2 == 255 {
+    |  ____________________________________________________^
+506 | |                 None
+507 | |             } else if geno1 == geno2 {
+    | |_____________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#if_same_then_else
+
+error: the loop variable `k` is used to index `emissions`
+   --> src/model/hmm.rs:520:26
+    |
+520 |                 for k in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+520 -                 for k in 0..n_states {
+520 +                 for (k, <item>) in emissions.iter_mut().enumerate().take(n_states) {
+    |
+
+error: this `if` has identical blocks
+   --> src/model/hmm.rs:574:61
+    |
+574 |               let required = if conf < CONF_NEUTRAL_THRESHOLD {
+    |  _____________________________________________________________^
+575 | |                 None
+576 | |             } else if geno1 == 255 || geno2 == 255 {
+    | |_____________^
+    |
+note: same as this
+   --> src/model/hmm.rs:576:52
+    |
+576 |               } else if geno1 == 255 || geno2 == 255 {
+    |  ____________________________________________________^
+577 | |                 None
+578 | |             } else if geno1 == geno2 {
+    | |_____________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#if_same_then_else
+
+error: the loop variable `k` is used to index `emissions`
+   --> src/model/hmm.rs:591:26
+    |
+591 |                 for k in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+591 -                 for k in 0..n_states {
+591 +                 for (k, <item>) in emissions.iter_mut().enumerate().take(n_states) {
+    |
+
+error: manually reimplementing `div_ceil`
+   --> src/model/hmm.rs:636:29
+    |
+636 |         let n_checkpoints = (n_markers + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n_markers.div_ceil(CHECKPOINT_INTERVAL)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_div_ceil
+
+error: the loop variable `k` is used to index `fwd`
+   --> src/model/hmm.rs:660:26
+    |
+660 |                 for k in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+660 -                 for k in 0..n_states {
+660 +                 for (k, <item>) in fwd.iter_mut().enumerate().take(n_states) {
+    |
+
+error: the loop variable `k` is used to index `fwd`
+   --> src/model/hmm.rs:672:26
+    |
+672 |                 for k in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+672 -                 for k in 0..n_states {
+672 +                 for (k, <item>) in fwd.iter_mut().enumerate().take(n_states) {
+    |
+
+error: the loop variable `recomp_m` is used to index `target_alleles`
+   --> src/model/hmm.rs:727:29
+    |
+727 |             for recomp_m in (checkpoint_start + 1)..=m {
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+727 -             for recomp_m in (checkpoint_start + 1)..=m {
+727 +             for (recomp_m, <item>) in target_alleles.iter().enumerate().take(m + 1).skip((checkpoint_start + 1)) {
+    |
+
+error: the loop variable `k` is used to index `fwd_recomp`
+   --> src/model/hmm.rs:737:26
+    |
+737 |                 for k in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+737 -                 for k in 0..n_states {
+737 +                 for (k, <item>) in fwd_recomp.iter_mut().enumerate().take(n_states) {
+    |
+
+error: the loop variable `k` is used to index `mismatches`
+   --> src/model/hmm.rs:801:26
+    |
+801 |                 for k in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+801 -                 for k in 0..n_states {
+801 +                 for (k, <item>) in mismatches.iter_mut().enumerate().take(n_states) {
+    |
+
+error: this function has too many arguments (9/7)
+  --> src/model/allele_lookup.rs:27:5
+   |
+27 | /     pub fn new_from_threaded_with_buffer(
+28 | |         threaded_haps: &ThreadedHaps,
+29 | |         n_markers: usize,
+30 | |         n_states: usize,
+...  |
+36 | |         mut alleles: AVec<u8, ConstAlign<32>>,
+37 | |     ) -> Self {
+   | |_____________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this `repeat().take()` can be written more concisely
+  --> src/model/allele_lookup.rs:40:43
+   |
+40 |             alleles = AVec::from_iter(32, std::iter::repeat(0u8).take(required));
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0u8, required)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+   = note: `-D clippy::manual-repeat-n` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::manual_repeat_n)]`
+
+error: the loop variable `m` is used to index `use_marker`
+   --> src/model/ibs2.rs:318:18
+    |
+318 |         for m in 0..n_markers {
+    |                  ^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+318 -         for m in 0..n_markers {
+318 +         for (m, <item>) in use_marker.iter_mut().enumerate().take(n_markers) {
+    |
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/model/ibs2.rs:320:16
+    |
+320 |             if marker_maf >= Self::MIN_MINOR_FREQ && marker_maf <= 1.0 - Self::MIN_MINOR_FREQ {
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(Self::MIN_MINOR_FREQ..=1.0 - Self::MIN_MINOR_FREQ).contains(&marker_maf)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_range_contains
+
+error: the loop variable `m` is used to index `marker_cluster`
+  --> src/model/imp_utils.rs:79:14
+   |
+79 |     for m in 0..n_ref_markers {
+   |              ^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+79 -     for m in 0..n_ref_markers {
+79 +     for (m, <item>) in marker_cluster.iter_mut().enumerate().take(n_ref_markers) {
+   |
+
+error: this function has too many arguments (15/7)
+   --> src/model/imp_utils.rs:98:1
+    |
+ 98 | / pub fn compute_cluster_mismatches_into_workspace(
+ 99 | |     hap_indices: &[Vec<u32>],
+100 | |     cluster_bounds: &[(usize, usize)],
+101 | |     genotyped_markers: &[usize],
+...   |
+113 | |     trace: bool,
+114 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this function has too many arguments (13/7)
+   --> src/model/imp_utils.rs:242:1
+    |
+242 | / pub fn run_hmm_forward_backward_to_sparse(
+243 | |     diff_vals: &[f32],
+244 | |     diff_cols: &[u16],
+245 | |     diff_row_offsets: &[usize],
+...   |
+255 | |     trace: bool,
+256 | | ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
+    | |_______________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: manually reimplementing `div_ceil`
+   --> src/model/imp_utils.rs:268:25
+    |
+268 |     let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n_clusters.div_ceil(CHECKPOINT_INTERVAL)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_div_ceil
+
+error: manual implementation of an assign operation
+   --> src/model/imp_utils.rs:360:21
+    |
+360 |                     curr_slice[col] = curr_slice[col] * penalty;
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace it with: `curr_slice[col] *= penalty`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#assign_op_pattern
+    = note: `-D clippy::assign-op-pattern` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::assign_op_pattern)]`
+
+error: manual implementation of an assign operation
+   --> src/model/imp_utils.rs:439:21
+    |
+439 |                     block_fwd[col] = block_fwd[col] * penalty;
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace it with: `block_fwd[col] *= penalty`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#assign_op_pattern
+
+error: manual implementation of an assign operation
+   --> src/model/imp_utils.rs:495:21
+    |
+495 |                     curr_slice[col] = curr_slice[col] * penalty;
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace it with: `curr_slice[col] *= penalty`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#assign_op_pattern
+
+error: manual implementation of an assign operation
+   --> src/model/imp_utils.rs:539:25
+    |
+539 |                         bwd[col] = bwd[col] * penalty;
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace it with: `bwd[col] *= penalty`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#assign_op_pattern
+
+error: the loop variable `k` is only used to index `curr_posteriors`
+   --> src/model/imp_utils.rs:584:26
+    |
+584 |                 for k in 0..n_states { curr_posteriors[k] *= inv; }
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+584 -                 for k in 0..n_states { curr_posteriors[k] *= inv; }
+584 +                 for <item> in curr_posteriors.iter_mut().take(n_states) { curr_posteriors[k] *= inv; }
+    |
+
+error: this function has too many arguments (22/7)
+   --> src/model/imp_utils.rs:634:1
+    |
+634 | / pub fn compute_state_probs(
+635 | |     hap_indices: &[Vec<u32>],
+636 | |     cluster_bounds: &[(usize, usize)],
+637 | |     genotyped_markers: &[usize],
+...   |
+656 | |     trace: bool,
+657 | | ) -> Arc<ClusterStateProbs> {
+    | |___________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: initializer for `thread_local` value can be made `const`
+   --> src/model/phase_ibs.rs:175:17
+    |
+175 |                 std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `const { std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new())) }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_const_for_thread_local
+    = note: `-D clippy::missing-const-for-thread-local` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::missing_const_for_thread_local)]`
+
+error: initializer for `thread_local` value can be made `const`
+   --> src/model/phase_ibs.rs:216:17
+    |
+216 |                 std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `const { std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new())) }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_const_for_thread_local
+
+error: initializer for `thread_local` value can be made `const`
+   --> src/model/phase_ibs.rs:257:21
+    |
+257 |                     std::cell::RefCell::new((usize::MAX, Vec::new()));
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `const { std::cell::RefCell::new((usize::MAX, Vec::new())) }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_const_for_thread_local
+
+error: initializer for `thread_local` value can be made `const`
+   --> src/model/phase_ibs.rs:284:21
+    |
+284 |                     std::cell::RefCell::new((usize::MAX, Vec::new()));
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `const { std::cell::RefCell::new((usize::MAX, Vec::new())) }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_const_for_thread_local
+
+error: this `if` statement can be collapsed
+   --> src/model/phase_states.rs:112:9
+    |
+112 | /         if let Some(&last_marker) = self.hap_to_last_ibs.get(&ibs_hap) {
+113 | |             if last_marker != NIL {
+114 | |                 // Hap is already in queue, update its last IBS marker
+115 | |                 self.hap_to_last_ibs.insert(ibs_hap, marker);
+...   |
+118 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+112 ~         if let Some(&last_marker) = self.hap_to_last_ibs.get(&ibs_hap)
+113 ~             && last_marker != NIL {
+114 |                 // Hap is already in queue, update its last IBS marker
+115 |                 self.hap_to_last_ibs.insert(ibs_hap, marker);
+116 |                 return;
+117 ~             }
+    |
+
+error: the loop variable `state_idx` is used to index `out`
+   --> src/model/states.rs:109:26
+    |
+109 |         for state_idx in 0..n_states {
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+109 -         for state_idx in 0..n_states {
+109 +         for (state_idx, <item>) in out.iter_mut().enumerate().take(n_states) {
+    |
+
+error: this function has too many arguments (10/7)
+   --> src/pipelines/imputation.rs:119:5
+    |
+119 | /     pub fn from_sparse(
+120 | |         marker_cluster: std::sync::Arc<Vec<usize>>,
+121 | |         ref_cluster_end: std::sync::Arc<Vec<usize>>,
+122 | |         gen_positions: std::sync::Arc<Vec<f64>>,
+...   |
+129 | |         probs_p1: Vec<f32>,
+130 | |     ) -> Self {
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: the loop variable `seq_idx` is used to index `seq_alleles`
+   --> src/pipelines/imputation.rs:270:40
+    |
+270 |                         for seq_idx in 0..cache.seq_probs.len() {
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+270 -                         for seq_idx in 0..cache.seq_probs.len() {
+270 +                         for (seq_idx, <item>) in seq_alleles.iter().enumerate().take(cache.seq_probs.len()) {
+    |
+
+error: the loop variable `seq_idx` is used to index `seq_alleles`
+   --> src/pipelines/imputation.rs:313:40
+    |
+313 |                         for seq_idx in 0..cache.seq_probs.len() {
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+313 -                         for seq_idx in 0..cache.seq_probs.len() {
+313 +                         for (seq_idx, <item>) in seq_alleles.iter().enumerate().take(cache.seq_probs.len()) {
+    |
+
+error: this function has too many arguments (8/7)
+   --> src/pipelines/imputation.rs:586:5
+    |
+586 | /     pub fn allele_posteriors_for_patterns_cached(
+587 | |         &self,
+588 | |         ref_marker: usize,
+589 | |         n_alleles: usize,
+...   |
+594 | |         block_id: usize,
+595 | |     ) -> AllelePosteriors {
+    | |_________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: the loop variable `pat_idx` is used to index `pattern_alleles`
+   --> src/pipelines/imputation.rs:691:32
+    |
+691 |                 for pat_idx in 0..cache.pattern_probs.len() {
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+691 -                 for pat_idx in 0..cache.pattern_probs.len() {
+691 +                 for (pat_idx, <item>) in pattern_alleles.iter().enumerate().take(cache.pattern_probs.len()) {
+    |
+
+error: the loop variable `pat_idx` is used to index `pattern_alleles`
+   --> src/pipelines/imputation.rs:756:32
+    |
+756 |                 for pat_idx in 0..cache.pattern_probs.len() {
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+756 -                 for pat_idx in 0..cache.pattern_probs.len() {
+756 +                 for (pat_idx, <item>) in pattern_alleles.iter().enumerate().take(cache.pattern_probs.len()) {
+    |
+
+error: this function has too many arguments (11/7)
+   --> src/pipelines/imputation.rs:877:5
+    |
+877 | /     fn biallelic_alt_ref_dense_simd<C>(
+878 | |         &self,
+879 | |         haps: &[u32],
+880 | |         probs: &[f32],
+...   |
+890 | |     where
+891 | |         C: Fn(HapIdx) -> u8,
+    | |____________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: casting to the same type is unnecessary (`u32` -> `u32`)
+   --> src/pipelines/imputation.rs:901:27
+    |
+901 |                 let hap = haps[idx + lane] as u32;
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^ help: try: `haps[idx + lane]`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unnecessary_cast
+
+error: casting to the same type is unnecessary (`u32` -> `u32`)
+   --> src/pipelines/imputation.rs:926:79
+    |
+926 |             let allele = Self::map_allele(map_ref_to_targ, column(HapIdx::new(haps[j] as u32)));
+    |                                                                               ^^^^^^^^^^^^^^ help: try: `haps[j]`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unnecessary_cast
+
+error: the loop variable `h` is used to index `hap_to_pattern`
+  --> src/pipelines/imputation_streaming.rs:93:14
+   |
+93 |     for h in 0..n_haps {
+   |              ^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+   |
+93 -     for h in 0..n_haps {
+93 +     for (h, <item>) in hap_to_pattern.iter_mut().enumerate().take(n_haps) {
+   |
+
+error: very complex type used. Consider factoring parts into `type` definitions
+   --> src/pipelines/imputation_streaming.rs:180:10
+    |
+180 |     ) -> Vec<(Vec<Vec<u32>>, Vec<Vec<u32>>)> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#type_complexity
+
+error: this function has too many arguments (8/7)
+   --> src/pipelines/imputation_streaming.rs:171:5
+    |
+171 | /     fn build_pbwt_hap_indices_for_batch(
+172 | |         &self,
+173 | |         target_win: &GenotypeMatrix<Phased>,
+174 | |         ref_win: &GenotypeMatrix<Phased>,
+...   |
+179 | |         batch_samples: &[usize],
+180 | |     ) -> Vec<(Vec<Vec<u32>>, Vec<Vec<u32>>)> {
+    | |____________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: initializer for `thread_local` value can be made `const`
+   --> src/pipelines/imputation_streaming.rs:193:17
+    |
+193 |                 std::cell::RefCell::new(None);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `const { std::cell::RefCell::new(None) }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_const_for_thread_local
+
+error: the loop variable `h` is used to index `alleles`
+   --> src/pipelines/imputation_streaming.rs:301:26
+    |
+301 |                 for h in 0..n_ref_haps {
+    |                          ^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+301 -                 for h in 0..n_ref_haps {
+301 +                 for (h, <item>) in alleles.iter_mut().enumerate().take(n_ref_haps) {
+    |
+
+error: the loop variable `h` is used to index `alleles`
+   --> src/pipelines/imputation_streaming.rs:348:26
+    |
+348 |                 for h in 0..n_ref_haps {
+    |                          ^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+348 -                 for h in 0..n_ref_haps {
+348 +                 for (h, <item>) in alleles.iter_mut().enumerate().take(n_ref_haps) {
+    |
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+   --> src/pipelines/imputation_streaming.rs:469:59
+    |
+469 |              crate::io::bref3::StreamingBref3Reader::open(&ref_path)?.n_haps()
+    |                                                           ^^^^^^^^^ help: change this to: `ref_path`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+    = note: `-D clippy::needless-borrow` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_borrow)]`
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+   --> src/pipelines/imputation_streaming.rs:471:64
+    |
+471 |              let (reader, _) = crate::io::vcf::VcfReader::open(&ref_path)?;
+    |                                                                ^^^^^^^^^ help: change this to: `ref_path`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this `if` has identical blocks
+   --> src/pipelines/imputation_streaming.rs:656:55
+    |
+656 |                   let phased = if n_target_markers == 0 {
+    |  _______________________________________________________^
+657 | |                     target_window.genotypes.clone().into_phased()
+658 | |                 } else if target_reader.was_all_phased() {
+    | |_________________^
+    |
+note: same as this
+   --> src/pipelines/imputation_streaming.rs:658:58
+    |
+658 |                   } else if target_reader.was_all_phased() {
+    |  __________________________________________________________^
+659 | |                     target_window.genotypes.clone().into_phased()
+660 | |                 } else {
+    | |_________________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#if_same_then_else
+
+error: this `if` statement can be collapsed
+   --> src/pipelines/imputation_streaming.rs:811:13
+    |
+811 | /             if let Some(ref overlap) = imp_overlap {
+812 | |                 if let Some(priors) = overlap.hap_priors() {
+813 | |                     let n_with_priors = priors.iter().filter(|p| !p.is_empty()).count();
+814 | |                     if n_with_priors > 0 {
+...   |
+818 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+811 ~             if let Some(ref overlap) = imp_overlap
+812 ~                 && let Some(priors) = overlap.hap_priors() {
+813 |                     let n_with_priors = priors.iter().filter(|p| !p.is_empty()).count();
+...
+816 |                     }
+817 ~                 }
+    |
+
+error: this function has too many arguments (11/7)
+   --> src/pipelines/imputation_streaming.rs:972:5
+    |
+972 | /     fn run_imputation_window_streaming(
+973 | |         &self,
+974 | |         target_win: &GenotypeMatrix<Phased>,
+975 | |         ref_win: &GenotypeMatrix<Phased>,
+...   |
+983 | |         output_end: usize,
+984 | |     ) -> Result<Option<Vec<HaplotypePriors>>> {
+    | |_____________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: initializer for `thread_local` value can be made `const`
+    --> src/pipelines/imputation_streaming.rs:1004:17
+     |
+1004 |                 std::cell::RefCell::new(None);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `const { std::cell::RefCell::new(None) }`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_const_for_thread_local
+
+error: manually reimplementing `div_ceil`
+    --> src/pipelines/imputation_streaming.rs:1116:25
+     |
+1116 |         let n_batches = (n_target_samples + batch_size - 1) / batch_size;
+     |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n_target_samples.div_ceil(batch_size)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_div_ceil
+
+error: accessing first element with `hap_indices.get(0)`
+    --> src/pipelines/imputation_streaming.rs:1212:66
+     |
+1212 | ...                   if let Some(first_cluster) = hap_indices.get(0) {
+     |                                                    ^^^^^^^^^^^^^^^^^^ help: try: `hap_indices.first()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#get_first
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/imputation_streaming.rs:1221:29
+     |
+1221 | ...                   &hap_indices,
+     |                       ^^^^^^^^^^^^ help: change this to: `hap_indices`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: accessing first element with `hap_indices.get(0)`
+    --> src/pipelines/imputation_streaming.rs:1300:66
+     |
+1300 | ...                   if let Some(first_cluster) = hap_indices.get(0) {
+     |                                                    ^^^^^^^^^^^^^^^^^^ help: try: `hap_indices.first()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#get_first
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/imputation_streaming.rs:1309:29
+     |
+1309 | ...                   &hap_indices,
+     |                       ^^^^^^^^^^^^ help: change this to: `hap_indices`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this function has too many arguments (13/7)
+    --> src/pipelines/imputation_streaming.rs:1474:5
+     |
+1474 | /     fn write_imputed_window_streaming(
+1475 | |         &self,
+1476 | |         ref_win: &GenotypeMatrix<Phased>,
+1477 | |         target_win: &GenotypeMatrix<Phased>,
+...    |
+1487 | |         include_ap: bool,
+1488 | |     ) -> Result<()> {
+     | |___________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: very complex type used. Consider factoring parts into `type` definitions
+    --> src/pipelines/imputation_streaming.rs:1511:26
+     |
+1511 |         let sample_data: std::collections::HashMap<usize, (&Vec<f32>, &Vec<(u8, u8)>)> =
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#type_complexity
+
+error: very complex type used. Consider factoring parts into `type` definitions
+    --> src/pipelines/imputation_streaming.rs:1573:29
+     |
+1573 |           let get_posteriors: Option<
+     |  _____________________________^
+1574 | |             Rc<dyn Fn(usize, usize) -> (AllelePosteriors, AllelePosteriors) + '_>,
+1575 | |         > = if include_posteriors {
+     | |_________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#type_complexity
+
+error: unnecessary closure used to substitute value for `Option::None`
+    --> src/pipelines/imputation_streaming.rs:1691:17
+     |
+1691 | /                 cache
+1692 | |                     .data
+1693 | |                     .get(sample_idx)
+1694 | |                     .cloned()
+1695 | |                     .unwrap_or_else(|| (AllelePosteriors::Biallelic(0.0), AllelePosteriors::Biallelic(0.0)))
+     | |____________________________________________________________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unnecessary_lazy_evaluations
+     = note: `-D clippy::unnecessary-lazy-evaluations` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::unnecessary_lazy_evaluations)]`
+help: use `unwrap_or` instead
+     |
+1695 -                     .unwrap_or_else(|| (AllelePosteriors::Biallelic(0.0), AllelePosteriors::Biallelic(0.0)))
+1695 +                     .unwrap_or((AllelePosteriors::Biallelic(0.0), AllelePosteriors::Biallelic(0.0)))
+     |
+
+error: very complex type used. Consider factoring parts into `type` definitions
+    --> src/pipelines/imputation_streaming.rs:1709:26
+     |
+1709 |         let get_hap_alt: Option<Box<dyn Fn(usize, usize) -> (f32, f32) + '_>> =
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#type_complexity
+
+error: this `else { if .. }` block can be collapsed
+    --> src/pipelines/imputation_streaming.rs:1919:20
+     |
+1919 |               } else {
+     |  ____________________^
+1920 | |                 if let Some((dosages, _)) = sample_data.get(&sample_idx) {
+1921 | |                     if !dosages.is_empty() {
+1922 | |                         dosages.get(local_m).copied().unwrap_or(p1 + p2)
+...    |
+1929 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_else_if
+help: collapse nested if block
+     |
+1919 ~             } else if let Some((dosages, _)) = sample_data.get(&sample_idx) {
+1920 +                 if !dosages.is_empty() {
+1921 +                     dosages.get(local_m).copied().unwrap_or(p1 + p2)
+1922 +                 } else {
+1923 +                     p1 + p2
+1924 +                 }
+1925 +             } else {
+1926 +                 p1 + p2
+1927 +             }
+     |
+
+error: this `else { if .. }` block can be collapsed
+    --> src/pipelines/imputation_streaming.rs:2012:20
+     |
+2012 |               } else {
+     |  ____________________^
+2013 | |                 if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
+2014 | |                     if !best_gt.is_empty() {
+2015 | |                         best_gt.get(local_m).copied().unwrap_or((0, 0))
+...    |
+2034 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_else_if
+help: collapse nested if block
+     |
+2012 ~             } else if let Some((_, best_gt)) = sample_data.get(&sample_idx) {
+2013 +                 if !best_gt.is_empty() {
+2014 +                     best_gt.get(local_m).copied().unwrap_or((0, 0))
+2015 +                 } else {
+2016 +                     if p1 + p2 >= 1.5 {
+2017 +                         (1, 1)
+2018 +                     } else if p1 + p2 >= 0.5 {
+2019 +                         (0, 1)
+2020 +                     } else {
+2021 +                         (0, 0)
+2022 +                     }
+2023 +                 }
+2024 +             } else {
+2025 +                 if p1 + p2 >= 1.5 {
+2026 +                     (1, 1)
+2027 +                 } else if p1 + p2 >= 0.5 {
+2028 +                     (0, 1)
+2029 +                 } else {
+2030 +                     (0, 0)
+2031 +                 }
+2032 +             }
+     |
+
+error: this `else { if .. }` block can be collapsed
+    --> src/pipelines/imputation_streaming.rs:2025:24
+     |
+2025 |                   } else {
+     |  ________________________^
+2026 | |                     if p1 + p2 >= 1.5 {
+2027 | |                         (1, 1)
+2028 | |                     } else if p1 + p2 >= 0.5 {
+...    |
+2033 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_else_if
+help: collapse nested if block
+     |
+2025 ~                 } else if p1 + p2 >= 1.5 {
+2026 +                     (1, 1)
+2027 +                 } else if p1 + p2 >= 0.5 {
+2028 +                     (0, 1)
+2029 +                 } else {
+2030 +                     (0, 0)
+2031 +                 }
+     |
+
+error: this `else { if .. }` block can be collapsed
+    --> src/pipelines/imputation_streaming.rs:2016:28
+     |
+2016 |                       } else {
+     |  ____________________________^
+2017 | |                         if p1 + p2 >= 1.5 {
+2018 | |                             (1, 1)
+2019 | |                         } else if p1 + p2 >= 0.5 {
+...    |
+2024 | |                     }
+     | |_____________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_else_if
+help: collapse nested if block
+     |
+2016 ~                     } else if p1 + p2 >= 1.5 {
+2017 +                         (1, 1)
+2018 +                     } else if p1 + p2 >= 0.5 {
+2019 +                         (0, 1)
+2020 +                     } else {
+2021 +                         (0, 0)
+2022 +                     }
+     |
+
+error: this `if` statement can be collapsed
+    --> src/pipelines/imputation_streaming.rs:2046:25
+     |
+2046 | /                         if !stats.is_imputed {
+2047 | |                             if let Some(target_m) = alignment.target_marker(marker_idx) {
+2048 | |                                 let h1 = HapIdx::new((s * 2) as u32);
+2049 | |                                 let h2 = HapIdx::new((s * 2 + 1) as u32);
+...    |
+2079 | |                         }
+     | |_________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+2046 ~                         if !stats.is_imputed
+2047 ~                             && let Some(target_m) = alignment.target_marker(marker_idx) {
+2048 |                                 let h1 = HapIdx::new((s * 2) as u32);
+ ...
+2077 |                                 }
+2078 ~                             }
+     |
+
+error: this `if` statement can be collapsed
+    --> src/pipelines/imputation_streaming.rs:2092:25
+     |
+2092 | /                         if !stats.is_imputed {
+2093 | |                             if let Some(target_m) = alignment.target_marker(marker_idx) {
+2094 | |                                 let h1 = HapIdx::new((s * 2) as u32);
+2095 | |                                 let h2 = HapIdx::new((s * 2 + 1) as u32);
+...    |
+2125 | |                         }
+     | |_________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+2092 ~                         if !stats.is_imputed
+2093 ~                             && let Some(target_m) = alignment.target_marker(marker_idx) {
+2094 |                                 let h1 = HapIdx::new((s * 2) as u32);
+ ...
+2123 |                                 }
+2124 ~                             }
+     |
+
+error: initializer for `thread_local` value can be made `const`
+  --> src/pipelines/phasing.rs:39:9
+   |
+39 |         std::cell::RefCell::new(None);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `const { std::cell::RefCell::new(None) }`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_const_for_thread_local
+
+error: manually reimplementing `div_ceil`
+  --> src/pipelines/phasing.rs:88:24
+   |
+88 |         let n_blocks = (n_markers + block_size - 1) / block_size;
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n_markers.div_ceil(block_size)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_div_ceil
+
+error: this function has too many arguments (12/7)
+   --> src/pipelines/phasing.rs:181:5
+    |
+181 | /     fn new_with_buffers(
+182 | |         seed: u64,
+183 | |         n_markers: usize,
+184 | |         n_states: usize,
+...   |
+193 | |         p_err: f32,
+194 | |     ) -> Self {
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: returning the result of a `let` binding from a block
+   --> src/pipelines/phasing.rs:226:9
+    |
+195 | /         let out = Self {
+196 | |             rng: rand::rngs::SmallRng::seed_from_u64(seed),
+197 | |             n_markers,
+198 | |             n_states,
+...   |
+224 | |             first_iteration: true,
+225 | |         };
+    | |__________- unnecessary `let` binding
+226 |           out
+    |           ^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#let_and_return
+    = note: `-D clippy::let-and-return` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::let_and_return)]`
+help: return the expression directly
+    |
+195 ~         
+196 ~         Self {
+197 +             rng: rand::rngs::SmallRng::seed_from_u64(seed),
+198 +             n_markers,
+199 +             n_states,
+200 +             p_recomb,
+201 +             seq1,
+202 +             seq2,
+203 +             conf,
+204 +             lookup,
+205 +             combined_checkpoints,
+206 +             fwd: buffers.fwd,
+207 +             fwd_prior: buffers.fwd_prior,
+208 +             ref_alleles: buffers.ref_alleles,
+209 +             hap1_checkpoints: buffers.hap1_checkpoints,
+210 +             hap1_allele: buffers.hap1_allele,
+211 +             hap1_use_combined: buffers.hap1_use_combined,
+212 +             hap2_checkpoints: buffers.hap2_checkpoints,
+213 +             hap2_allele: buffers.hap2_allele,
+214 +             hap2_use_combined: buffers.hap2_use_combined,
+215 +             path1: buffers.path1,
+216 +             path2: buffers.path2,
+217 +             fwd_block: buffers.fwd_block,
+218 +             trace: MosaicTrace {
+219 +                 mean_state: 0.0,
+220 +                 switch_rate: 0.0,
+221 +                 log_likelihood: 0.0,
+222 +             },
+223 +             p_no_err,
+224 +             p_err,
+225 +             first_iteration: true,
+226 +         }
+    |
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+   --> src/pipelines/phasing.rs:365:17
+    |
+365 |                 &self.combined_checkpoints,
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `self.combined_checkpoints`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+   --> src/pipelines/phasing.rs:932:25
+    |
+932 |                         &current.phased_result.as_ref().unwrap(),
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `current.phased_result.as_ref().unwrap()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:1109:60
+     |
+1109 |         let confidence_by_sample = build_sample_confidence(&target_gt);
+     |                                                            ^^^^^^^^^^ help: change this to: `target_gt`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this function has too many arguments (15/7)
+    --> src/pipelines/phasing.rs:1464:5
+     |
+1464 | /     fn build_composite_haps_streaming(
+1465 | |         &self,
+1466 | |         target_geno: &mut MutableGenotypes,
+1467 | |         ref_gt: Option<&GenotypeMatrix<crate::data::storage::phase_state::Phased>>,
+...    |
+1479 | |         step_cm: f32,
+1480 | |     ) -> Vec<crate::model::states::ThreadedHaps> {
+     | |________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: the loop variable `m` is used to index `sampling_points`
+    --> src/pipelines/phasing.rs:1485:18
+     |
+1485 |         for m in 0..n_markers {
+     |                  ^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1485 -         for m in 0..n_markers {
+1485 +         for (m, <item>) in sampling_points.iter_mut().enumerate().take(n_markers) {
+     |
+
+error: the loop variable `h` is used to index `alleles`
+    --> src/pipelines/phasing.rs:1523:22
+     |
+1523 |             for h in 0..n_total_haps {
+     |                      ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1523 -             for h in 0..n_total_haps {
+1523 +             for (h, <item>) in alleles.iter_mut().enumerate().take(n_total_haps) {
+     |
+
+error: the loop variable `s` is used to index `phase_states`
+    --> src/pipelines/phasing.rs:1605:26
+     |
+1605 |                 for s in 0..n_samples {
+     |                          ^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1605 -                 for s in 0..n_samples {
+1605 +                 for (s, <item>) in phase_states.iter_mut().enumerate().take(n_samples) {
+     |
+
+error: the loop variable `h` is used to index `alleles`
+    --> src/pipelines/phasing.rs:1636:22
+     |
+1636 |             for h in 0..n_total_haps {
+     |                      ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1636 -             for h in 0..n_total_haps {
+1636 +             for (h, <item>) in alleles.iter_mut().enumerate().take(n_total_haps) {
+     |
+
+error: this function has too many arguments (11/7)
+    --> src/pipelines/phasing.rs:1718:5
+     |
+1718 | /     fn build_composite_haps_streaming_direct(
+1719 | |         &self,
+1720 | |         geno: &mut MutableGenotypes,
+1721 | |         samples: &Samples,
+...    |
+1729 | |         step_cm: f32,
+1730 | |     ) -> Vec<crate::model::states::ThreadedHaps> {
+     | |________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: the loop variable `m` is used to index `sampling_points`
+    --> src/pipelines/phasing.rs:1737:18
+     |
+1737 |         for m in 0..n_markers {
+     |                  ^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1737 -         for m in 0..n_markers {
+1737 +         for (m, <item>) in sampling_points.iter_mut().enumerate().take(n_markers) {
+     |
+
+error: the loop variable `s` is used to index `phase_states`
+    --> src/pipelines/phasing.rs:1822:26
+     |
+1822 |                 for s in 0..n_samples {
+     |                          ^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1822 -                 for s in 0..n_samples {
+1822 +                 for (s, <item>) in phase_states.iter_mut().enumerate().take(n_samples) {
+     |
+
+error: this function has too many arguments (10/7)
+    --> src/pipelines/phasing.rs:1895:5
+     |
+1895 | /     fn run_phase_baum_iteration(
+1896 | |         &mut self,
+1897 | |         target_gt: &GenotypeMatrix,
+1898 | |         geno: &mut MutableGenotypes,
+...    |
+1905 | |         pbwt_state: Option<&crate::model::pbwt::PbwtState>,
+1906 | |     ) -> Result<()> {
+     | |___________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:2069:25
+     |
+2069 |                         &sample_conf,
+     |                         ^^^^^^^^^^^^ help: change this to: `sample_conf`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this `if` statement can be collapsed
+    --> src/pipelines/phasing.rs:2113:17
+     |
+2113 | /                 if let Some(paths) = paths {
+2114 | |                     if let Some(slot) = mcmc_paths.get_mut(s) {
+2115 | |                         *slot = Some(paths);
+2116 | |                     }
+2117 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+2113 ~                 if let Some(paths) = paths
+2114 ~                     && let Some(slot) = mcmc_paths.get_mut(s) {
+2115 |                         *slot = Some(paths);
+2116 ~                     }
+     |
+
+error: this function has too many arguments (12/7)
+    --> src/pipelines/phasing.rs:2127:5
+     |
+2127 | /     fn run_phase_baum_iteration_stage1(
+2128 | |         &mut self,
+2129 | |         geno: &mut MutableGenotypes,
+2130 | |         samples: &Samples,
+...    |
+2139 | |         iteration: usize,
+2140 | |     ) -> Result<()> {
+     | |___________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:2301:50
+     |
+2301 |                         hmm.collect_stats(&seq1, &threaded_haps, stage1_gen_dists, &mut local_est);
+     |                                                  ^^^^^^^^^^^^^^ help: change this to: `threaded_haps`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:2302:50
+     |
+2302 |                         hmm.collect_stats(&seq2, &threaded_haps, stage1_gen_dists, &mut local_est);
+     |                                                  ^^^^^^^^^^^^^^ help: change this to: `threaded_haps`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:2379:41
+     |
+2379 | ...                   &threaded_haps,
+     |                       ^^^^^^^^^^^^^^ help: change this to: `threaded_haps`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:2392:37
+     |
+2392 | ...                   &threaded_haps,
+     |                       ^^^^^^^^^^^^^^ help: change this to: `threaded_haps`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: the loop variable `i` is used to index `swap_mask`
+    --> src/pipelines/phasing.rs:2448:30
+     |
+2448 |                     for i in 0..n_hi_freq {
+     |                              ^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+2448 -                     for i in 0..n_hi_freq {
+2448 +                     for (i, <item>) in swap_mask.iter_mut().enumerate().take(n_hi_freq) {
+     |
+
+error: explicit call to `.into_iter()` in function argument accepting `IntoIterator`
+    --> src/pipelines/phasing.rs:2459:30
+     |
+2459 |                         .zip(swap_lr.into_iter())
+     |                              ^^^^^^^------------
+     |                                     |
+     |                                     help: consider removing the `.into_iter()`
+     |
+note: this parameter accepts any `IntoIterator`, so you don't need to call `.into_iter()`
+    --> /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/iter/traits/iterator.rs:615:12
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#useless_conversion
+     = note: `-D clippy::useless-conversion` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::useless_conversion)]`
+
+error: this `if` statement can be collapsed
+    --> src/pipelines/phasing.rs:2509:13
+     |
+2509 | /             if let Some(paths) = new_paths {
+2510 | |                 if let Some(slot) = mcmc_paths.get_mut(s) {
+2511 | |                     *slot = Some(paths);
+2512 | |                 }
+2513 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+2509 ~             if let Some(paths) = new_paths
+2510 ~                 && let Some(slot) = mcmc_paths.get_mut(s) {
+2511 |                     *slot = Some(paths);
+2512 ~                 }
+     |
+
+error: this function has too many arguments (13/7)
+    --> src/pipelines/phasing.rs:2569:5
+     |
+2569 | /     fn phase_rare_markers_with_hmm(
+2570 | |         &self,
+2571 | |         geno: &mut MutableGenotypes,
+2572 | |         samples: &Samples,
+...    |
+2582 | |         next_overlap_start: Option<usize>,
+2583 | |     ) -> Option<StateProbs> {
+     | |___________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:2782:29
+     |
+2782 | ...                   &threaded_haps,
+     |                       ^^^^^^^^^^^^^^ help: change this to: `threaded_haps`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:2797:70
+     |
+2797 |                     hmm.forward_backward_raw(&seq1, Some(&seq_conf), &threaded_haps, &mut fwd1, &mut bwd1);
+     |                                                                      ^^^^^^^^^^^^^^ help: change this to: `threaded_haps`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:2805:70
+     |
+2805 |                     hmm.forward_backward_raw(&seq2, Some(&seq_conf), &threaded_haps, &mut fwd2, &mut bwd2);
+     |                                                                      ^^^^^^^^^^^^^^ help: change this to: `threaded_haps`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this `if` statement can be collapsed
+    --> src/pipelines/phasing.rs:2820:17
+     |
+2820 | /                 if let Some(overlap) = previous_overlap {
+2821 | |                     if let Some(ref left_state_probs) = overlap.state_probs {
+2822 | |                         let h1_idx = s * 2;
+2823 | |                         let h2_idx = s * 2 + 1;
+...    |
+2836 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+2820 ~                 if let Some(overlap) = previous_overlap
+2821 ~                     && let Some(ref left_state_probs) = overlap.state_probs {
+2822 |                         let h1_idx = s * 2;
+ ...
+2834 |                         }
+2835 ~                     }
+     |
+
+error: the loop variable `m` is used to index `probs`
+    --> src/pipelines/phasing.rs:3163:14
+     |
+3163 |     for m in 0..n_markers {
+     |              ^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+3163 -     for m in 0..n_markers {
+3163 +     for (m, <item>) in probs.iter_mut().enumerate().take(n_markers) {
+     |
+
+error: this function has too many arguments (16/7)
+    --> src/pipelines/phasing.rs:3333:1
+     |
+3333 | / fn build_fwd_checkpoints(
+3334 | |     checkpoints: &mut FwdCheckpoints,
+3335 | |     n_markers: usize,
+3336 | |     n_states: usize,
+...    |
+3349 | |     mode: EmissionMode,
+3350 | | ) {
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: the loop variable `k` is used to index `ref_alleles`
+    --> src/pipelines/phasing.rs:3394:18
+     |
+3394 |         for k in 0..n_states {
+     |                  ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+3394 -         for k in 0..n_states {
+3394 +         for (k, <item>) in ref_alleles.iter_mut().enumerate().take(n_states) {
+     |
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/pipelines/phasing.rs:3476:33
+     |
+3476 |             dst.copy_from_slice(&fwd);
+     |                                 ^^^^ help: change this to: `fwd`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_borrow
+
+error: this function has too many arguments (16/7)
+    --> src/pipelines/phasing.rs:3498:1
+     |
+3498 | / fn sample_path_from_checkpoints(
+3499 | |     path: &mut [u32],
+3500 | |     checkpoints: &FwdCheckpoints,
+3501 | |     n_markers: usize,
+...    |
+3514 | |     mode: EmissionMode,
+3515 | | ) {
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: the loop variable `k` is used to index `ref_alleles`
+    --> src/pipelines/phasing.rs:3556:22
+     |
+3556 |             for k in 0..n_states {
+     |                      ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+3556 -             for k in 0..n_states {
+3556 +             for (k, <item>) in ref_alleles.iter_mut().enumerate().take(n_states) {
+     |
+
+error: this function has too many arguments (13/7)
+    --> src/pipelines/phasing.rs:3686:1
+     |
+3686 | / fn ffbs_haploid_constrained(
+3687 | |     path: &mut [u32],
+3688 | |     n_markers: usize,
+3689 | |     n_states: usize,
+...    |
+3699 | |     rng: &mut rand::rngs::SmallRng,
+3700 | | ) {
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this function has too many arguments (15/7)
+    --> src/pipelines/phasing.rs:3824:1
+     |
+3824 | / fn sample_dynamic_mcmc(
+3825 | |     n_markers: usize,
+3826 | |     n_states: usize,
+3827 | |     p_recomb: &[f32],
+...    |
+3839 | |     initial_paths: Option<&MosaicPaths>,
+3840 | | ) -> (Vec<u8>, Vec<f32>, MosaicPaths) {
+     | |_____________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this function has too many arguments (14/7)
+    --> src/pipelines/phasing.rs:4141:1
+     |
+4141 | / fn sample_swap_bits_mosaic(
+4142 | |     n_markers: usize,
+4143 | |     n_states: usize,
+4144 | |     p_recomb: &[f32],
+...    |
+4155 | |     workspace: &mut crate::utils::workspace::ThreadWorkspace,
+4156 | | ) -> (Vec<u8>, Vec<f32>, MosaicPaths) {
+     | |_____________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: doc list item without indentation
+    --> src/pipelines/phasing.rs:4438:9
+     |
+4438 |     /// Compute allele probabilities using haploid Li-Stephens emission model.
+     |         ^
+     |
+     = help: if this is supposed to be its own paragraph, add a blank line
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#doc_lazy_continuation
+     = note: `-D clippy::doc-lazy-continuation` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::doc_lazy_continuation)]`
+help: indent this line
+     |
+4438 |     ///   Compute allele probabilities using haploid Li-Stephens emission model.
+     |         ++
+
+error: the loop variable `j` is used to index `haps_at_mkr_a`
+    --> src/pipelines/phasing.rs:4460:18
+     |
+4460 |         for j in 0..n_states {
+     |                  ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+4460 -         for j in 0..n_states {
+4460 +         for (j, <item>) in haps_at_mkr_a.iter().enumerate().take(n_states) {
+     |
+
+error: the loop variable `k` is used to index `weights`
+    --> src/pipelines/phasing.rs:4539:18
+     |
+4539 |         for k in 0..n_states {
+     |                  ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+4539 -         for k in 0..n_states {
+4539 +         for (k, <item>) in weights.iter_mut().enumerate().take(n_states) {
+     |
+
+error: this `if` statement can be collapsed
+   --> src/utils/telemetry.rs:557:13
+    |
+557 | /             if let (Some(vsz), Some(rss)) = (vsz_mb, rss_mb) {
+558 | |                 if vsz > rss.saturating_add(1024) {
+559 | |                     verbose = true;
+560 | |                 }
+561 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+557 ~             if let (Some(vsz), Some(rss)) = (vsz_mb, rss_mb)
+558 ~                 && vsz > rss.saturating_add(1024) {
+559 |                     verbose = true;
+560 ~                 }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/utils/telemetry.rs:562:13
+    |
+562 | /             if let Some(cpu) = cpu_pct {
+563 | |                 if cpu < 5.0 || cpu > 95.0 {
+564 | |                     verbose = true;
+565 | |                 }
+566 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+562 ~             if let Some(cpu) = cpu_pct
+563 ~                 && (cpu < 5.0 || cpu > 95.0) {
+564 |                     verbose = true;
+565 ~                 }
+    |
+
+error: manual `!RangeInclusive::contains` implementation
+   --> src/utils/telemetry.rs:563:20
+    |
+563 |                 if cpu < 5.0 || cpu > 95.0 {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^ help: use: `!(5.0..=95.0).contains(&cpu)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_range_contains
+
+error: this function has too many arguments (12/7)
+   --> src/utils/telemetry.rs:614:1
+    |
+614 | / fn print_tty_progress(
+615 | |     snap: &TelemetrySnapshot,
+616 | |     progress_done: u64,
+617 | |     progress_total: u64,
+...   |
+626 | |     show_extra: bool,
+627 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this function has too many arguments (10/7)
+   --> src/utils/telemetry.rs:714:1
+    |
+714 | / fn print_log_progress(
+715 | |     snap: &TelemetrySnapshot,
+716 | |     velocity_unit: &str,
+717 | |     eta: &str,
+...   |
+724 | |     show_extra: bool,
+725 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_arguments
+
+error: this `repeat().take()` can be written more concisely
+  --> src/utils/workspace.rs:42:38
+   |
+42 |             fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, n_states)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+  --> src/utils/workspace.rs:43:38
+   |
+43 |             bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, n_states)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+  --> src/utils/workspace.rs:48:45
+   |
+48 |             row_buffer: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, n_states)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+  --> src/utils/workspace.rs:76:52
+   |
+76 |              self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
+   |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, n_states)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+  --> src/utils/workspace.rs:80:51
+   |
+80 |              self.block_fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(block_fwd_size));
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, block_fwd_size)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: clamp-like pattern without using clamp function
+   --> src/utils/workspace.rs:125:24
+    |
+125 |         let interval = checkpoint_interval.max(1).min(DEFAULT_CHECKPOINT_INTERVAL);
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with clamp: `checkpoint_interval.clamp(1, DEFAULT_CHECKPOINT_INTERVAL)`
+    |
+    = note: clamp will panic if max < min
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_clamp
+
+error: this `repeat().take()` can be written more concisely
+   --> src/utils/workspace.rs:129:38
+    |
+129 |             fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+   --> src/utils/workspace.rs:130:38
+    |
+130 |             bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+   --> src/utils/workspace.rs:131:41
+    |
+131 |             lookup: AVec::from_iter(32, std::iter::repeat(0).take(size)),
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0, size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+   --> src/utils/workspace.rs:132:44
+    |
+132 |             fwd_prior: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
+    |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+   --> src/utils/workspace.rs:159:44
+    |
+159 |             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
+    |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, new_size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+   --> src/utils/workspace.rs:160:44
+    |
+160 |             self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
+    |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, new_size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+   --> src/utils/workspace.rs:161:47
+    |
+161 |             self.lookup = AVec::from_iter(32, std::iter::repeat(0).take(new_size));
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0, new_size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: this `repeat().take()` can be written more concisely
+   --> src/utils/workspace.rs:162:50
+    |
+162 |             self.fwd_prior = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, new_size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_repeat_n
+
+error: manually reimplementing `div_ceil`
+   --> src/utils/workspace.rs:190:24
+    |
+190 |         let n_blocks = (n_markers + block_size - 1) / block_size;
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n_markers.div_ceil(block_size)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#manual_div_ceil
+
+error: could not compile `reagle` (lib) due to 186 previous errors
