@@ -694,11 +694,11 @@ impl crate::pipelines::ImputationPipeline {
                 };
                 let _ = &phase_span;
 
-                // Only log windows with actual markers or every 100th window to reduce spam
-                let should_log = target_window.genotypes.n_markers() > 0 
+                // Only log major windows to reduce spam (100+ markers, first/last, or every 1000th)
+                let should_log = target_window.genotypes.n_markers() >= 100 
                     || ref_window.is_first 
                     || ref_window.is_last
-                    || window_count % 100 == 0;
+                    || window_count % 1000 == 0;
                 
                 if should_log {
                     eprintln!(
@@ -865,8 +865,8 @@ target_samples={} target_bytes={}",
                 )?;
                 header_written = true;
             }
-            // Only log windows with actual markers or every 100th to reduce spam
-            let should_log = phased_target.n_markers() > 0 || window_idx % 100 == 0;
+            // Only log major windows to reduce spam (100+ markers or every 1000th)
+            let should_log = phased_target.n_markers() >= 100 || window_idx % 1000 == 0;
             
             if should_log {
                 eprintln!(

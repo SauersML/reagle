@@ -640,26 +640,31 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     truth_iter = _stream_vcf_lines(truth_cmd)
 
     # 2. Imputed Stream
-    # Try DS/GP query first, fall back to GT-only if it fails
+    # Check VCF header for DS/GP fields before querying
     # This handles both Beagle (with gp=true) and Reagle (which may not have DS/GP)
     imputed_cmd_full = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf}"
     imputed_cmd_gt = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
     
-    # Test if DS/GP fields exist by trying to query one line
+    # Check if DS and GP fields exist in VCF header
+    has_ds_gp = False
     try:
-        test_result = subprocess.run(
-            f"{imputed_cmd_full} | head -1", 
-            shell=True, capture_output=True, text=True, timeout=10
+        header_result = subprocess.run(
+            ["bcftools", "view", "-h", imputed_vcf],
+            capture_output=True, text=True, timeout=30
         )
-        if test_result.returncode == 0 and test_result.stdout.strip():
-            imputed_cmd = imputed_cmd_full
-            print(f"Using GT:DS:GP format for {imputed_vcf}")
-        else:
-            imputed_cmd = imputed_cmd_gt
-            print(f"Using GT-only format for {imputed_vcf} (DS/GP not available)")
-    except Exception:
+        if header_result.returncode == 0:
+            header = header_result.stdout
+            # Check for FORMAT=<ID=DS and FORMAT=<ID=GP in header
+            has_ds_gp = "ID=DS" in header and "ID=GP" in header
+    except Exception as e:
+        print(f"Warning: Could not check VCF header: {e}")
+    
+    if has_ds_gp:
+        imputed_cmd = imputed_cmd_full
+        print(f"Using GT:DS:GP format for {imputed_vcf}")
+    else:
         imputed_cmd = imputed_cmd_gt
-        print(f"Using GT-only format for {imputed_vcf} (fallback)")
+        print(f"Using GT-only format for {imputed_vcf} (DS/GP not in header)")
     
     imputed_iter = _stream_vcf_lines(imputed_cmd)
 
