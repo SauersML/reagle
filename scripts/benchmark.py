@@ -42,10 +42,20 @@ def run_benchmark(person, file_path, format):
     shutil.copy("reagle_out.vcf.gz", "tests/data/reagle_imputed.vcf.gz")
     shutil.copy("beagle_out.vcf.gz", "tests/data/beagle_imputed.vcf.gz")
     
-    # Index files for metrics calculation
+    # Harmonize sample names - all files must have the same sample name for comparison
+    # Create a sample name mapping file
+    with open("sample_name.txt", "w") as f:
+        f.write("SAMPLE\n")
+    
     for vcf in ["tests/data/truth.vcf.gz", "tests/data/reagle_imputed.vcf.gz", "tests/data/beagle_imputed.vcf.gz"]:
         if os.path.exists(vcf):
+            # Rename sample using bcftools reheader
+            temp_vcf = vcf + ".tmp"
+            run_cmd(f"bcftools reheader -s sample_name.txt {vcf} -o {temp_vcf}", shell=True)
+            os.replace(temp_vcf, vcf)
             run_cmd(["bcftools", "index", "-f", vcf])
+    
+    os.remove("sample_name.txt")
     
     # Run metrics via integration test
     run_cmd(["python3", "tests/integration_test.py", "metrics"])
