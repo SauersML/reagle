@@ -1,0 +1,170 @@
+name: Imputation Quality Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
+      - 'tests/imputation_quality.rs'
+      - 'scripts/plot_quality.py'
+      - '.github/workflows/imputation_quality_report.yml'
+
+jobs:
+  impute-and-measure:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - person: "Kat"
+            file_path: "data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt"
+            format: "23andme"
+          - person: "Kat"
+            file_path: "data/kat_suricata/ancestrydna.txt"
+            format: "ancestry"
+          - person: "Christopher"
+            file_path: "data/christopher_smith/dna-data-2023-09-26.zip"
+            format: "23andme"
+          - person: "Christopher"
+            file_path: "data/christopher_smith/genome_Christopher_Smith_v5_Full_20230926164611.zip"
+            format: "23andme"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install Java (for Beagle)
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Tools
+        run: |
+          # Install bcftools/tabix
+          sudo apt-get update && sudo apt-get install -y bcftools tabix
+
+      - name: Build Reagle
+        run: cargo build --release
+
+      - name: Prepare Input Data
+        run: |
+          # Use Python script to install convert_genome, reconstruct parts, and convert to VCF
+          python3 scripts/prepare_data.py "${{ matrix.file_path }}" input_raw.vcf
+          
+          # Filter to Chr22 and compress
+          bcftools view input_raw.vcf --regions chr22 -Oz -o target.vcf.gz
+          tabix target.vcf.gz
+
+      - name: Prepare Reference Panel (1kg+HGDP Chr22)
+        run: |
+          # Download a standard Chr22 reference (e.g., from 1000G or a testing repo)
+          # Using a smaller subset for CI stability if full HGDP is unavailable publicly without auth
+          # Fallback: Use 1000G Phase 3 Chr22
+          wget -q http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz -O ref_raw.vcf.gz
+          
+          # Normalize/Filter
+          bcftools view ref_raw.vcf.gz --regions 22 -m 2 -M 2 -v snps -Oz -o ref.vcf.gz
+          tabix -f ref.vcf.gz
+
+      - name: Run Reagle Imputation
+        run: |
+          ./target/release/reagle \
+            --ref ref.vcf.gz \
+            --target target.vcf.gz \
+            --out reagle_out \
+            --chromosome 22
+
+      - name: Run Beagle Imputation
+        run: |
+          # Use local jar fixture
+          BEAGLE_JAR="tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
+          java -Xmx6g -jar $BEAGLE_JAR \
+            ref=ref.vcf.gz \
+            gt=target.vcf.gz \
+            out=beagle_out \
+            chrom=22 \
+            nthreads=2
+
+      - name: Run Quality Metrics (Rust Test)
+        run: |
+          # We use the Truth VCF (WGS) for the person.
+          # BUT wait, the matrix runs on Array data. We need the corresponding WGS Truth VCF.
+          # Reagle repo has WGS data in `data/`?
+          # "One WGS file per person"
+          
+          PERSON="${{ matrix.person }}"
+          if [[ "$PERSON" == "Kat" ]]; then
+             TRUTH_DIR="data/kat_suricata"
+             # Reconstruct WGS
+             cat $TRUTH_DIR/KatSuricata*.part* > truth_full.vcf.gz
+          else
+             TRUTH_DIR="data/christopher_smith"
+             # Reconstruct WGS (assuming it exists and is split)
+             # Based on previous ls: "NG1LRQNESI.hard-filtered.vcf.gz"
+             cat $TRUTH_DIR/NG1LRQNESI*.part* > truth_full.vcf.gz
+          fi
+          
+          # Filter Truth to Chr22 and subset to common sites for fair comparison?
+          # Actually, metrics should be on ALL imputed sites where Truth exists.
+          bcftools view truth_full.vcf.gz --regions chr22 -Oz -o truth.vcf.gz
+          tabix truth.vcf.gz
+          
+          # Run Rust Logic via test harness
+          export TEST_TRUTH_VCF="truth.vcf.gz"
+          
+          # Reagle Metrics
+          export TEST_IMP_VCF="reagle_out.vcf.gz"
+          export TEST_OUTPUT_JSON="reagle_metrics.json"
+          cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
+          
+          # Beagle Metrics
+          export TEST_IMP_VCF="beagle_out.vcf.gz"
+          export TEST_OUTPUT_JSON="beagle_metrics.json"
+          cargo test --test imputation_quality test_metrics_calculation_dummy -- --nocapture
+
+      - name: Upload Metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ matrix.person }}-${{ matrix.format }}
+          path: |
+            reagle_metrics.json
+            beagle_metrics.json
+
+  generate-report:
+    needs: impute-and-measure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download Metrics
+        uses: actions/download-artifact@v4
+        with:
+          path: metrics
+          
+      - name: Install Python Deps
+        run: pip install matplotlib
+        
+      - name: Generate Report
+        run: |
+          # Aggregate or generate individual reports
+          find metrics -name "reagle_metrics.json" | while read fname; do
+             DIR=$(dirname "$fname")
+             python3 scripts/plot_quality.py "$DIR"
+             
+             echo "" >> $GITHUB_STEP_SUMMARY
+             cat "$DIR/summary.md" >> $GITHUB_STEP_SUMMARY
+          done
+          
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: imputation-reports
+          path: "*.html"
