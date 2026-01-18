@@ -196,12 +196,12 @@ def run_conversion(input_path, output_vcf):
     # Use remote Chr22 reference for standardization
     ref_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
     
-    # convert_genome uses flags --input, --reference, --output
+    # convert_genome uses positional arguments: <INPUT> <REFERENCE> [OUTPUT]
     cmd = [
         "convert_genome",
-        "--input", raw_file,
-        "--reference", ref_url,
-        "--output", "temp_conv.vcf",
+        raw_file,
+        ref_url,
+        "temp_conv.vcf",
         "--format", "vcf"
     ]
     
