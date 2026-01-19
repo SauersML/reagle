@@ -135,15 +135,22 @@ fn compute_dosage_and_best_gt(
             .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
             .clamp(0.0, 1.0);
 
-        if a1 < 2 && a2 < 2 {
-            let dosage = (a1 as f32) + (a2 as f32);
+        // If confidence is low (< 0.5), treat as missing to avoid bias
+        let (eff_a1, eff_a2) = if conf < 0.5 {
+            (255, 255)
+        } else {
+            (a1, a2)
+        };
+
+        if eff_a1 < 2 && eff_a2 < 2 {
+            let dosage = (eff_a1 as f32) + (eff_a2 as f32);
             let gt = if conf >= 0.99 {
-                (a1, a2)
+                (eff_a1, eff_a2)
             } else {
-                let is_het = a1 != a2;
+                let is_het = eff_a1 != eff_a2;
                 let (l00, l01, l11) = if is_het {
                     (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                } else if a1 == 1 {
+                } else if eff_a1 == 1 {
                     (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
                 } else {
                     (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
@@ -165,13 +172,13 @@ fn compute_dosage_and_best_gt(
             return (dosage, gt);
         }
 
-        let dosage = if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
+        let dosage = if eff_a1 == 255 || eff_a2 == 255 || eff_a1 > 1 || eff_a2 > 1 {
             p1 + p2
         } else {
-            let is_het = a1 != a2;
+            let is_het = eff_a1 != eff_a2;
             let (l00, l01, l11) = if is_het {
                 (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-            } else if a1 == 1 {
+            } else if eff_a1 == 1 {
                 (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
             } else {
                 (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
@@ -189,13 +196,13 @@ fn compute_dosage_and_best_gt(
                 let q11n = q11 * inv_sum;
                 q01n + 2.0 * q11n
             } else {
-                let d1 = if a1 != 0 { 1.0 } else { 0.0 };
-                let d2 = if a2 != 0 { 1.0 } else { 0.0 };
+                let d1 = if eff_a1 != 0 { 1.0 } else { 0.0 };
+                let d2 = if eff_a2 != 0 { 1.0 } else { 0.0 };
                 d1 + d2
             }
         };
 
-        let gt = if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
+        let gt = if eff_a1 == 255 || eff_a2 == 255 || eff_a1 > 1 || eff_a2 > 1 {
             if p1 + p2 >= 1.5 {
                 (1, 1)
             } else if p1 + p2 >= 0.5 {
@@ -204,7 +211,7 @@ fn compute_dosage_and_best_gt(
                 (0, 0)
             }
         } else {
-            let is_het = a1 != a2;
+            let is_het = eff_a1 != eff_a2;
             let (l00, l01, l11) = if is_het {
                 (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
             } else if a1 == 1 {
