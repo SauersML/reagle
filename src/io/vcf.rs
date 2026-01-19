@@ -1100,9 +1100,29 @@ impl VcfWriter {
 
                 // Format: \t{a1}|{a2}:{ds}
                 line_buf.push('\t');
-                line_buf.push((b'0' + a1) as char);
+
+                // Handle allele 1
+                if a1 == 255 {
+                    line_buf.push('.');
+                } else if a1 < 10 {
+                    line_buf.push((b'0' + a1) as char);
+                } else {
+                    let mut buffer = itoa::Buffer::new();
+                    line_buf.push_str(buffer.format(a1));
+                }
+
                 line_buf.push('|');
-                line_buf.push((b'0' + a2) as char);
+
+                // Handle allele 2
+                if a2 == 255 {
+                    line_buf.push('.');
+                } else if a2 < 10 {
+                    line_buf.push((b'0' + a2) as char);
+                } else {
+                    let mut buffer = itoa::Buffer::new();
+                    line_buf.push_str(buffer.format(a2));
+                }
+
                 line_buf.push(':');
                 let v = format_f32_4dp(ds, &mut ryu_buf);
                 line_buf.push_str(&v);
