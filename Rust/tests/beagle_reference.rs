@@ -3776,23 +3776,30 @@ fn test_dr2_zero_variance_genotyped_marker() {
                     // This is likely a genotyped marker with integer dosages
                     println!("Pos {}: all DS={:.4}, DR2={:.4}", rec.pos, first_ds, dr2);
 
-                    // DR2 should be low (near 0) when there's no variance
-                    if dr2 < 0.5 {
-                        found_zero_variance = true;
-                    }
+                    let is_imputed = rec.info.contains_key("IMP");
 
-                    // Should NOT be 1.0 for zero-variance markers
-                    assert!(
-                        dr2 < 0.99 || first_ds > 0.01,
-                        "DR2 should not be 1.0 for zero-variance marker at pos {}", rec.pos
-                    );
+                    if is_imputed {
+                        // Imputed marker with no variance: DR2 should be 0.0 (no info)
+                        if dr2 < 0.5 {
+                            found_zero_variance = true;
+                        }
+                        assert!(
+                            dr2 < 0.01,
+                            "DR2 should be 0.0 for zero-variance IMPUTED marker at pos {}", rec.pos
+                        );
+                    } else {
+                        // Genotyped marker with no variance: DR2 should be 1.0 (high confidence)
+                        assert!(
+                            dr2 > 0.99,
+                            "DR2 should be 1.0 for zero-variance GENOTYPED marker at pos {}", rec.pos
+                        );
+                    }
                 }
             }
         }
     }
 
-    println!("\nDR2 zero-variance test: found_zero_variance = {}", found_zero_variance);
-    println!("DR2 is correctly computed (not hardcoded to 1.0)");
+    println!("\nDR2 zero-variance test: found_zero_variance imputed = {}", found_zero_variance);
 }
 
 /// Test imputation accuracy against ground truth, comparing Rust vs Java.

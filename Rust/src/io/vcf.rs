@@ -73,7 +73,9 @@ impl MarkerImputationStats {
         let sum = self.sum_p[allele];
         let n = self.n_haps as f32;
         if sum == 0.0 || (sum - n).abs() <= 1e-5 {
-            return 0.0;
+            // For genotyped markers, zero variance means we are certain about the call (DR2=1.0).
+            // For imputed markers, zero variance means we have no information (DR2=0.0).
+            return if self.is_imputed { 0.0 } else { 1.0 };
         }
 
         let sum_sq = self.sum_p_sq[allele];
