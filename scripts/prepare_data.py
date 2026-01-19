@@ -284,7 +284,7 @@ def run_conversion(input_path, output_vcf):
         
         # Normalize hg19 output to final
         cmd_process = (
-            f"bcftools view {temp_hg19_vcf} -Ou | "
+            f"bcftools view {temp_hg19_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Ou | "
             f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
         )
         subprocess.check_call(cmd_process, shell=True)
@@ -341,7 +341,10 @@ def run_conversion(input_path, output_vcf):
            # Let's inspect ref in future. For now, 1000G was '22'. HGDP is 'chr22'.
            # Be consistent with reference.
            
-           subprocess.check_call(f"bcftools view {temp_hg38_vcf} -Oz -o {output_vcf}", shell=True)
+           # Filter invalid records where ALT="." but GT implies a variant (Beagle crash fix)
+           print("Filtering invalid records (missing ALT but non-ref GT)...")
+           filter_cmd = f"bcftools view {temp_hg38_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Oz -o {output_vcf}"
+           subprocess.check_call(filter_cmd, shell=True)
            subprocess.check_call(["bcftools", "index", "-f", output_vcf])
            print("Liftover complete.")
            
