@@ -2254,6 +2254,11 @@ def stage_prepare_chr(chrom):
         # Downsample and unphase
         tmp_phased = data_dir / "input_phased_tmp.vcf.gz"
         run(f"bcftools view -R {regions_file} {paths['truth_vcf']} -O z -o {tmp_phased}")
+        # Keep phased version for IMPUTE5 (which requires phased input)
+        phased_input = data_dir / "input_phased.vcf.gz"
+        run(f"cp {tmp_phased} {phased_input}")
+        run(f"bcftools index -f {phased_input}")
+        # Create unphased version for Beagle/Reagle
         run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
         run(f"bcftools index -f {paths['input_vcf']}")
         os.remove(tmp_phased)
@@ -2349,12 +2354,16 @@ def run_impute5_chr(chrom, paths):
         try:
             # IMPUTE5 requires an indexed reference and map file usually, but minimal example:
             # --h reference --g input --r region --o output
+            # IMPUTE5 requires PHASED input - use input_phased.vcf.gz
+            phased_input = data_dir / "input_phased.vcf.gz"
+            if not phased_input.exists():
+                raise RuntimeError(f"Phased input not found: {phased_input}. Run stage_prepare_chr first.")
             region_arg = resolve_region_arg(paths, chrom)
             print_tool_help("IMPUTE5", str(impute5_bin))
             print(f"IMPUTE5 region: {region_arg}")
             print(f"IMPUTE5 ref: {paths['ref_vcf']}")
-            print(f"IMPUTE5 input: {paths['input_vcf']}")
-            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
+            print(f"IMPUTE5 input (phased): {phased_input}")
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {phased_input} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
             run(f"bcftools index -f {out}")
         except Exception as e:
             print(f"IMPUTE5 failed on chr{chrom}: {e}")
@@ -2407,13 +2416,19 @@ def run_minimac_chr(chrom, paths):
         print(f"Running Minimac4 on chr{chrom}...")
         try:
             prefix = data_dir / "minimac_imputed"
-            # Minimac4: --refHaps ref.vcf --haps input.vcf --prefix out --region chr
             region_arg = resolve_region_arg(paths, chrom)
+            
+            # Minimac4 v4.x requires reference in MSAV format
+            msav_ref = data_dir / "ref.msav"
+            if not msav_ref.exists():
+                print("Converting reference to MSAV format for Minimac4...")
+                run(f"{minimac_bin} --compress-reference {paths['ref_vcf']} > {msav_ref}")
+            
             print_tool_help("Minimac4", str(minimac_bin))
             print(f"Minimac4 region: {region_arg}")
-            print(f"Minimac4 ref: {paths['ref_vcf']}")
+            print(f"Minimac4 ref (msav): {msav_ref}")
             print(f"Minimac4 input: {paths['input_vcf']}")
-            run(f"{minimac_bin} {paths['ref_vcf']} {paths['input_vcf']} --output {prefix}.dose.vcf.gz --threads 4 --format GT,DS --region {region_arg}")
+            run(f"{minimac_bin} {msav_ref} {paths['input_vcf']} --output {prefix}.dose.vcf.gz --threads 4 --format GT,DS --region {region_arg}")
             
             # Helper to move output
             dose_out = data_dir / "minimac_imputed.dose.vcf.gz"

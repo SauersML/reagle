@@ -25,12 +25,12 @@ def run_benchmark(person, file_path, format):
         print("ERROR: target.vcf.gz missing after prep!")
         run_cmd(["ls", "-l"])
     
-    run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--gt", "target.vcf.gz", "--out", "reagle_out", "--chrom", "22"])
+    run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--gt", "target.vcf.gz", "--out", "reagle_out", "--chrom", "chr22"])
 
     # 3. Run Beagle
     print("=== Running Beagle ===")
     beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
-    run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=22", "nthreads=2", "gp=true"])
+    run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=chr22", "nthreads=2", "gp=true"])
 
     # 4. Run Metrics using the Python integration test
     print("=== Calculating Metrics ===")
