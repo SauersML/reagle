@@ -3887,8 +3887,8 @@ fn test_gl_confidence_affects_emission() {
     );
 
     // The emission calculation should use confidence to scale the penalty.
-    // Currently it doesn't - this is a design gap.
-    // When implemented, low-confidence markers should not decimate haplotypes.
+    // Note: Verify that emission calculation scales penalty by confidence (implementation exists in imp_utils.rs).
+    // When correctly verified, low-confidence markers should not decimate haplotypes.
 }
 
 // Note: test_single_mismatch_not_catastrophic was moved to unit tests in imputation.rs
