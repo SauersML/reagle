@@ -1,0 +1,11 @@
+   Compiling reagle v0.1.0 (/app)
+error: unused import: `OsString`
+ --> build.rs:3:23
+  |
+3 | use std::ffi::{OsStr, OsString};
+  |                       ^^^^^^^^
+  |
+  = note: `-D unused-imports` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: could not compile `reagle` (build script) due to 1 previous error
