@@ -244,8 +244,21 @@ impl PbwtWavefront {
         initial_state: Option<&crate::model::pbwt::PbwtState>
     ) -> Self {
         let (fwd_ppa, fwd_div) = if let Some(state) = initial_state {
-            assert_eq!(state.ppa.len(), n_haps, "Initial state hap count mismatch");
-            (state.ppa.clone(), state.div.clone())
+            if state.ppa.len() == n_haps && state.div.len() == n_haps {
+                // Shift divergence coordinates so the handoff state is relative to the
+                // new window start (marker 0). Any match that began before the new window
+                // is treated as starting at marker 0.
+                let shift = state.marker_pos as i32;
+                let mut div = state.div.clone();
+                if shift > 0 {
+                    for d in &mut div {
+                        *d = (*d - shift).max(0);
+                    }
+                }
+                (state.ppa.clone(), div)
+            } else {
+                ((0..n_haps as u32).collect(), vec![0; n_haps])
+            }
         } else {
             ((0..n_haps as u32).collect(), vec![0; n_haps])
         };

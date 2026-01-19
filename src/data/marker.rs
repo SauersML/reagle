@@ -238,7 +238,7 @@ impl AlleleMapping {
         }
     }
 
-    /// Map a reference allele to target allele (reverse mapping)
+    /// Map a reference allele to target allele space (reverse mapping)
     /// Returns None if the allele cannot be mapped
     pub fn reverse_map_allele(&self, ref_allele: u8) -> Option<u8> {
         self.ref_to_targ
@@ -248,7 +248,9 @@ impl AlleleMapping {
 
     /// Check if all target alleles can be mapped
     pub fn is_valid(&self) -> bool {
-        self.targ_to_ref.iter().all(|&r| r >= 0)
+        // Only require that the target REF allele maps.
+        // Target-only ALT alleles are permitted (left as -1), and will be treated as missing.
+        self.targ_to_ref.first().copied().unwrap_or(-1) >= 0
     }
 }
 
@@ -296,7 +298,6 @@ pub fn compute_allele_mapping(targ: &Marker, ref_marker: &Marker) -> Option<Alle
 fn try_direct_match(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping> {
     let n_targ_alleles = targ.n_alleles();
     let mut targ_to_ref = vec![-1i8; n_targ_alleles];
-    let mut all_matched = true;
 
     // Build reference allele lookup
     let ref_alleles: Vec<&Allele> = std::iter::once(&ref_marker.ref_allele)
@@ -308,16 +309,11 @@ fn try_direct_match(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping>
         .chain(targ.alt_alleles.iter())
         .enumerate()
     {
-        let mut found = false;
         for (r_idx, &r_allele) in ref_alleles.iter().enumerate() {
             if t_allele == r_allele {
                 targ_to_ref[t_idx] = r_idx as i8;
-                found = true;
                 break;
             }
-        }
-        if !found {
-            all_matched = false;
         }
     }
 
@@ -325,18 +321,23 @@ fn try_direct_match(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping>
     let alleles_swapped = targ_to_ref.get(0) == Some(&1);
     let n_ref_alleles = ref_marker.n_alleles();
 
-    if all_matched {
-        Some(AlleleMapping::new(targ_to_ref, n_ref_alleles, false, alleles_swapped))
-    } else {
-        None
+    // Require REF allele to map; allow missing ALT mappings.
+    if targ_to_ref.get(0).copied().unwrap_or(-1) < 0 {
+        return None;
     }
+
+    Some(AlleleMapping::new(
+        targ_to_ref,
+        n_ref_alleles,
+        false,
+        alleles_swapped,
+    ))
 }
 
 /// Try to match alleles with strand flip (A<->T, C<->G)
 fn try_strand_flip(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping> {
     let n_targ_alleles = targ.n_alleles();
     let mut targ_to_ref = vec![-1i8; n_targ_alleles];
-    let mut all_matched = true;
 
     // Build reference allele lookup
     let ref_alleles: Vec<&Allele> = std::iter::once(&ref_marker.ref_allele)
@@ -349,27 +350,28 @@ fn try_strand_flip(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping> 
         .enumerate()
     {
         let flipped = t_allele.complement();
-        let mut found = false;
         for (r_idx, &r_allele) in ref_alleles.iter().enumerate() {
             if &flipped == r_allele {
                 targ_to_ref[t_idx] = r_idx as i8;
-                found = true;
                 break;
             }
-        }
-        if !found {
-            all_matched = false;
         }
     }
 
     let alleles_swapped = targ_to_ref.get(0) == Some(&1);
     let n_ref_alleles = ref_marker.n_alleles();
 
-    if all_matched {
-        Some(AlleleMapping::new(targ_to_ref, n_ref_alleles, true, alleles_swapped))
-    } else {
-        None
+    // Require REF allele to map; allow missing ALT mappings.
+    if targ_to_ref.get(0).copied().unwrap_or(-1) < 0 {
+        return None;
     }
+
+    Some(AlleleMapping::new(
+        targ_to_ref,
+        n_ref_alleles,
+        true,
+        alleles_swapped,
+    ))
 }
 
 /// Check if a marker can potentially have ambiguous strand (A/T or C/G SNV)

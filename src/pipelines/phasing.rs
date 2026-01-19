@@ -56,6 +56,7 @@ use crate::model::allele_lookup::RefAlleleLookup;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::phase_states::PhaseStates;
+use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::data::alignment::MarkerAlignment;
 use mini_mcmc::core::{MarkovChain, Trace};
@@ -884,6 +885,9 @@ impl PhasingPipeline {
         // PhasedOverlap contains state probabilities used for PBWT state handoff
         let mut phased_overlap: Option<PhasedOverlap> = None;
 
+        // Track PBWT state from previous window for state continuity
+        let mut pbwt_state: Option<PbwtState> = None;
+
         // Double-buffered windows
         let mut current_window: Option<StreamWindowWithResult> = None;
         let mut next_window_opt = reader.next_window()?;
@@ -912,12 +916,16 @@ impl PhasingPipeline {
             // Note: PBWT state handoff is handled via phased_overlap's state probabilities
 
             // Phase this window with overlap constraint
-            let (phased, next_state_probs) = self.phase_in_memory_with_overlap(
+            let (phased, next_state_probs, next_pbwt_state) = self.phase_in_memory_with_overlap(
                 &window.genotypes,
                 &gen_maps,
                 window.phased_overlap.as_ref(),
-                Some(window.output_end)
+                Some(window.output_end),
+                pbwt_state.as_ref(),
+                Some(window.output_end),
             )?;
+
+            pbwt_state = next_pbwt_state;
 
             // Extract overlap for next window (contains state probabilities for PBWT handoff)
             if !window.is_last() {
@@ -1033,7 +1041,9 @@ impl PhasingPipeline {
         gen_maps: &GeneticMaps,
         phased_overlap: Option<&PhasedOverlap>,
         next_overlap_start: Option<usize>,
-    ) -> Result<(GenotypeMatrix<crate::data::storage::phase_state::Phased>, Option<StateProbs>)> {
+        pbwt_state: Option<&PbwtState>,
+        pbwt_handoff_at: Option<usize>,
+    ) -> Result<(GenotypeMatrix<crate::data::storage::phase_state::Phased>, Option<StateProbs>, Option<PbwtState>)> {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
         let n_samples = n_haps / 2;
@@ -1042,7 +1052,7 @@ impl PhasingPipeline {
         let samples = target_gt.samples_arc();
 
         if n_markers == 0 {
-            return Ok((target_gt.clone().into_phased(), None));
+            return Ok((target_gt.clone().into_phased(), None, None));
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
@@ -1114,6 +1124,8 @@ impl PhasingPipeline {
 
         let mut mcmc_paths: Vec<Option<MosaicPaths>> = vec![None; n_samples];
 
+        let mut pbwt_state_for_next_window: Option<PbwtState> = None;
+
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
@@ -1137,7 +1149,7 @@ impl PhasingPipeline {
 
             // Use existing run_phase_baum_iteration - overlap constraint is handled
             // via the initial geno state set by apply_overlap_constraint
-            self.run_phase_baum_iteration(
+            let pbwt_state_next = self.run_phase_baum_iteration(
                 target_gt,
                 &mut geno,
                 &p_recomb,
@@ -1146,8 +1158,15 @@ impl PhasingPipeline {
                 &mut mcmc_paths,
                 atomic_estimates.as_ref(),
                 &confidence_by_sample,
-                None, // No PBWT state handoff for windowed phasing
+                pbwt_state,
+                pbwt_handoff_at,
             )?;
+
+            if it + 1 == total_iterations {
+                // Only propagate the final iteration's PBWT state to the next window.
+                // Earlier iterations are intermediate and not used for output.
+                pbwt_state_for_next_window = pbwt_state_next;
+            }
             if let Some(bb) = &self.telemetry {
                 bb.set_samples_processed(n_samples as u64);
                 bb.set_markers_processed(n_markers as u64);
@@ -1266,7 +1285,11 @@ impl PhasingPipeline {
             None
         };
 
-        Ok((self.build_final_matrix(target_gt, &geno), next_state_probs))
+        Ok((
+            self.build_final_matrix(target_gt, &geno),
+            next_state_probs,
+            pbwt_state_for_next_window,
+        ))
     }
     
     /// Apply overlap constraint from previous window's phased output
@@ -1441,12 +1464,21 @@ impl PhasingPipeline {
             alleles_by_marker.push(alleles);
         }
 
-        BidirectionalPhaseIbs::build_for_subset(
+        let mut pbwt = BidirectionalPhaseIbs::build_for_subset(
             alleles_by_marker,
             n_total_haps,
             n_subset,
             marker_indices,
-        )
+        );
+
+        // When using a reference panel, we want state selection to prefer copying
+        // from reference haplotypes rather than other target haplotypes.
+        // The combined hap space is [0..n_target_haps) + [n_target_haps..n_total_haps).
+        let n_target_haps = self.reference_gt.as_ref().map(|r| n_total_haps - r.n_haplotypes());
+        if let Some(start) = n_target_haps {
+            pbwt.set_reference_start_hap(start as u32);
+        }
+        pbwt
     }
 
     /// Build composite haplotypes for all samples using streaming PBWT
@@ -1474,10 +1506,11 @@ impl PhasingPipeline {
         n_candidates: usize,
         max_states: usize,
         pbwt_state: Option<&crate::model::pbwt::PbwtState>,
+        pbwt_handoff_at: Option<usize>,
         marker_to_global: Option<&[usize]>,
         gen_positions: &[f64],
         step_cm: f32,
-    ) -> Vec<crate::model::states::ThreadedHaps> {
+    ) -> (Vec<crate::model::states::ThreadedHaps>, Option<PbwtState>) {
         // Compute sampling points using genetic distance steps
         let step_cm = step_cm.max(1e-4) as f64;
         let mut sampling_points = vec![false; n_markers];
@@ -1509,11 +1542,12 @@ impl PhasingPipeline {
         // Create wavefront with optional initial state
         let mut wavefront = PbwtWavefront::with_state(n_total_haps, n_markers, pbwt_state);
 
+        let mut pbwt_state_for_next_window: Option<PbwtState> = None;
+
         // Temporary allele buffer (reused across markers)
         let mut alleles = vec![0u8; n_total_haps];
 
         // Forward pass
-        wavefront.reset_forward();
         for m in 0..n_markers {
             let orig_m = marker_to_global
                 .and_then(|map| map.get(m).copied())
@@ -1581,6 +1615,14 @@ impl PhasingPipeline {
 
             // Advance wavefront
             wavefront.advance_forward(&alleles, n_alleles);
+
+            if pbwt_state_for_next_window.is_none() {
+                if let Some(handoff) = pbwt_handoff_at {
+                    if m + 1 == handoff {
+                        pbwt_state_for_next_window = Some(wavefront.get_state());
+                    }
+                }
+            }
 
             // At sampling points, collect forward neighbors for all samples
             if sampling_points.get(m).copied().unwrap_or(false) {
@@ -1707,7 +1749,7 @@ impl PhasingPipeline {
         } else {
             info!("finalize_streaming: all {} samples had IBS matches", n_samples);
         }
-        finalized
+        (finalized, pbwt_state_for_next_window)
     }
 
     /// Build composite haplotypes using direct MutableGenotypes access (no reference panel).
@@ -1725,9 +1767,10 @@ impl PhasingPipeline {
         n_candidates: usize,
         max_states: usize,
         pbwt_state: Option<&crate::model::pbwt::PbwtState>,
+        pbwt_handoff_at: Option<usize>,
         gen_positions: &[f64],
         step_cm: f32,
-    ) -> Vec<crate::model::states::ThreadedHaps> {
+    ) -> (Vec<crate::model::states::ThreadedHaps>, Option<PbwtState>) {
         let n_haps = geno.n_haps();
 
         // Compute sampling points using genetic distance steps
@@ -1758,8 +1801,9 @@ impl PhasingPipeline {
         // Create wavefront
         let mut wavefront = PbwtWavefront::with_state(n_haps, n_markers, pbwt_state);
 
+        let mut pbwt_state_for_next_window: Option<PbwtState> = None;
+
         // Forward pass - use direct slice access
-        wavefront.reset_forward();
         for m in 0..n_markers {
             // Direct slice access instead of per-haplotype closure calls
             let mut marker_alleles = geno.marker_alleles(m);
@@ -1798,6 +1842,14 @@ impl PhasingPipeline {
 
             // Advance wavefront
             wavefront.advance_forward(&marker_alleles, n_alleles);
+
+            if pbwt_state_for_next_window.is_none() {
+                if let Some(handoff) = pbwt_handoff_at {
+                    if m + 1 == handoff {
+                        pbwt_state_for_next_window = Some(wavefront.get_state());
+                    }
+                }
+            }
 
             // At sampling points, collect forward neighbors
             if sampling_points.get(m).copied().unwrap_or(false) {
@@ -1883,7 +1935,7 @@ impl PhasingPipeline {
         } else {
             info!("finalize_streaming: all {} samples had IBS matches", n_samples);
         }
-        finalized
+        (finalized, pbwt_state_for_next_window)
     }
 
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
@@ -1903,7 +1955,8 @@ impl PhasingPipeline {
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
         pbwt_state: Option<&crate::model::pbwt::PbwtState>,
-    ) -> Result<()> {
+        pbwt_handoff_at: Option<usize>,
+    ) -> Result<Option<PbwtState>> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
@@ -1928,7 +1981,7 @@ impl PhasingPipeline {
         // Build composite haplotypes for all samples using streaming PBWT
         // This uses O(N) memory instead of O(M*N) for the PBWT index
         let n_candidates = self.params.n_states.min(n_total_haps).max(20);
-        let threaded_haps_vec: Vec<crate::model::states::ThreadedHaps> = tracing::info_span!("streaming_pbwt").in_scope(|| {
+        let (threaded_haps_vec, pbwt_state_next) = tracing::info_span!("streaming_pbwt").in_scope(|| {
             if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
                 self.build_composite_haps_streaming(
                     geno,
@@ -1942,6 +1995,7 @@ impl PhasingPipeline {
                     n_candidates,
                     self.params.n_states,
                     pbwt_state,
+                    pbwt_handoff_at,
                     None,
                     &gen_positions,
                     self.config.imp_step,
@@ -1957,6 +2011,7 @@ impl PhasingPipeline {
                     n_candidates,
                     self.params.n_states,
                     pbwt_state,
+                    pbwt_handoff_at,
                     &gen_positions,
                     self.config.imp_step,
                 )
@@ -2118,7 +2173,7 @@ impl PhasingPipeline {
             }
         });
 
-        Ok(())
+        Ok(pbwt_state_next)
     }
 
     /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only using FB HMM
@@ -2147,7 +2202,7 @@ impl PhasingPipeline {
         let n_hi_freq = hi_freq_to_orig.len();
 
         let n_candidates = 20.min(n_total_haps).max(1);
-        let threaded_haps_vec = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+        let (threaded_haps_vec, _) = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
             if self.config.profile {
                 info_span!("phase_pbwt_build", markers = n_hi_freq, samples = n_samples)
                     .in_scope(|| {
@@ -2162,6 +2217,7 @@ impl PhasingPipeline {
                             ibs2,
                             n_candidates,
                             self.params.n_states,
+                            None,
                             None,
                             Some(hi_freq_to_orig),
                             hi_freq_gen_positions,
@@ -2181,6 +2237,7 @@ impl PhasingPipeline {
                     n_candidates,
                     self.params.n_states,
                     None,
+                    None,
                     Some(hi_freq_to_orig),
                     hi_freq_gen_positions,
                     self.config.imp_step,
@@ -2198,6 +2255,7 @@ impl PhasingPipeline {
                         n_candidates,
                         self.params.n_states,
                         None,
+                        None,
                         hi_freq_gen_positions,
                         self.config.imp_step,
                     )
@@ -2211,6 +2269,7 @@ impl PhasingPipeline {
                 ibs2,
                 n_candidates,
                 self.params.n_states,
+                None,
                 None,
                 hi_freq_gen_positions,
                 self.config.imp_step,
@@ -2628,7 +2687,7 @@ impl PhasingPipeline {
 
         let n_samples = n_haps / 2;
         let n_candidates = 20.min(n_total_haps).max(1);
-        let threaded_haps_vec = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+        let (threaded_haps_vec, _) = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
             self.build_composite_haps_streaming(
                 geno,
                 Some(ref_gt),
@@ -2640,6 +2699,7 @@ impl PhasingPipeline {
                 ibs2,
                 n_candidates,
                 self.params.n_states,
+                None,
                 None,
                 Some(hi_freq_markers),
                 hi_freq_gen_positions,
@@ -2654,6 +2714,7 @@ impl PhasingPipeline {
                 ibs2,
                 n_candidates,
                 self.params.n_states,
+                None,
                 None,
                 hi_freq_gen_positions,
                 self.config.imp_step,
@@ -4576,7 +4637,7 @@ impl PhasingPipeline {
                 "PBWT state handoff from previous window"
             );
         }
-        self.phase_in_memory_with_overlap(target_gt, gen_maps, phased_overlap, None)
+        self.phase_in_memory_with_overlap(target_gt, gen_maps, phased_overlap, None, pbwt_state, None)
             .map(|(result, ..)| result)
     }
 
@@ -4892,10 +4953,10 @@ mod tests {
         let mut pipeline = PhasingPipeline::new(config, None);
 
         // Run phasing (with no overlap from previous window)
-        let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None);
+        let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None, None, None);
 
         assert!(result.is_ok());
-        let (phased, _) = result.unwrap();
+        let (phased, _, _) = result.unwrap();
         assert_eq!(phased.n_markers(), n_markers);
         assert_eq!(phased.n_haplotypes(), n_samples * 2);
     }

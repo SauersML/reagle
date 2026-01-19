@@ -79,6 +79,8 @@ pub struct BidirectionalPhaseIbs {
     alleles: Vec<Vec<u8>>,
     /// Number of distinct alleles per marker (after normalization)
     n_alleles_by_marker: Vec<usize>,
+
+    reference_start_hap: Option<u32>,
 }
 
 impl BidirectionalPhaseIbs {
@@ -160,7 +162,12 @@ impl BidirectionalPhaseIbs {
             subset_to_global: None,
             alleles,
             n_alleles_by_marker,
+            reference_start_hap: None,
         }
+    }
+
+    pub fn set_reference_start_hap(&mut self, start: u32) {
+        self.reference_start_hap = Some(start);
     }
 
     fn with_fwd_state<R>(&self, marker_idx: usize, f: impl FnOnce(&[u32], &[i32]) -> R) -> R {
@@ -378,6 +385,9 @@ impl BidirectionalPhaseIbs {
         let mut neighbors = Vec::with_capacity(n_candidates * 2 + 10);
         let sample = SampleIdx::new(hap_idx / 2);
 
+        let ref_start = self.reference_start_hap;
+        let mut ibs2_fallback: Vec<u32> = Vec::new();
+
         // Convert marker index to global space for IBS2 lookup
         // IBS2 segments use global marker indices, but when built for a subset,
         // marker_idx is in subset space. The mapping handles this conversion.
@@ -391,8 +401,13 @@ impl BidirectionalPhaseIbs {
             if seg.contains(ibs2_marker_idx) {
                 let other_s = seg.other_sample;
                 if other_s != sample {
-                    neighbors.push(other_s.hap1().0);
-                    neighbors.push(other_s.hap2().0);
+                    if ref_start.is_some() {
+                        ibs2_fallback.push(other_s.hap1().0);
+                        ibs2_fallback.push(other_s.hap2().0);
+                    } else {
+                        neighbors.push(other_s.hap1().0);
+                        neighbors.push(other_s.hap2().0);
+                    }
                 }
             }
         }
@@ -402,13 +417,25 @@ impl BidirectionalPhaseIbs {
 
         for h in fwd_neighbors {
             if h != hap_idx && h / 2 != sample.0 {
-                neighbors.push(h);
+                if ref_start.map_or(true, |start| h >= start) {
+                    neighbors.push(h);
+                }
             }
         }
 
         for h in bwd_neighbors {
             if h != hap_idx && h / 2 != sample.0 {
-                neighbors.push(h);
+                if ref_start.map_or(true, |start| h >= start) {
+                    neighbors.push(h);
+                }
+            }
+        }
+
+        if ref_start.is_some() && neighbors.len() < n_candidates {
+            for h in ibs2_fallback {
+                if h != hap_idx && h / 2 != sample.0 {
+                    neighbors.push(h);
+                }
             }
         }
 
@@ -629,6 +656,8 @@ impl BidirectionalPhaseIbs {
         let hap1 = sample_idx * 2;
         let hap2 = sample_idx * 2 + 1;
 
+        let ref_start = self.reference_start_hap;
+
         self.with_fwd_pos_at_marker(marker_idx, ref_state, |ppa, div, center_pos| {
             let marker_i32 = marker_idx as i32;
             let mut neighbors = Vec::with_capacity(n_candidates + 4);
@@ -659,13 +688,17 @@ impl BidirectionalPhaseIbs {
                     u -= 1;
                     let h = ppa[u];
                     if h != hap1 && h != hap2 && h != ref_state {
-                        neighbors.push(h);
+                        if ref_start.map_or(true, |start| h >= start) {
+                            neighbors.push(h);
+                        }
                     }
                 } else if can_go_v {
                     max_div_v = max_div_v.max(div.get(v).copied().unwrap_or(i32::MAX));
                     let h = ppa[v];
                     if h != hap1 && h != hap2 && h != ref_state {
-                        neighbors.push(h);
+                        if ref_start.map_or(true, |start| h >= start) {
+                            neighbors.push(h);
+                        }
                     }
                     v += 1;
                 }

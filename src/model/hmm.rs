@@ -298,8 +298,6 @@ impl<'a> BeagleHmm<'a> {
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
     ) -> f64 {
-        const CONF_NEUTRAL_THRESHOLD: f32 = 0.05;
-
         let n_markers = self.n_markers();
         let n_states = self.n_states;
         let total_size = n_markers * n_states;
@@ -338,9 +336,7 @@ impl<'a> BeagleHmm<'a> {
             let geno1 = geno_a1[m];
             let geno2 = geno_a2[m];
             let partner = partner_alleles[m];
-            let required = if conf < CONF_NEUTRAL_THRESHOLD {
-                None
-            } else if geno1 == 255 || geno2 == 255 {
+            let required = if geno1 == 255 || geno2 == 255 {
                 None
             } else if geno1 == geno2 {
                 Some(geno1)
@@ -415,9 +411,7 @@ impl<'a> BeagleHmm<'a> {
             let geno1 = geno_a1[m_next];
             let geno2 = geno_a2[m_next];
             let partner = partner_alleles[m_next];
-            let required = if conf < CONF_NEUTRAL_THRESHOLD {
-                None
-            } else if geno1 == 255 || geno2 == 255 {
+            let required = if geno1 == 255 || geno2 == 255 {
                 None
             } else if geno1 == geno2 {
                 Some(geno1)
@@ -469,8 +463,6 @@ impl<'a> BeagleHmm<'a> {
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
     ) -> f64 {
-        const CONF_NEUTRAL_THRESHOLD: f32 = 0.05;
-
         let n_markers = self.n_markers();
         let n_states = self.n_states;
         let total_size = n_markers * n_states;
@@ -500,9 +492,7 @@ impl<'a> BeagleHmm<'a> {
             let geno1 = geno_a1[m];
             let geno2 = geno_a2[m];
             let partner = partner_alleles[m];
-            let required = if conf < CONF_NEUTRAL_THRESHOLD {
-                None
-            } else if geno1 == 255 || geno2 == 255 {
+            let required = if geno1 == 255 || geno2 == 255 {
                 None
             } else if geno1 == geno2 {
                 Some(geno1)
@@ -571,9 +561,7 @@ impl<'a> BeagleHmm<'a> {
             let geno1 = geno_a1[m_next];
             let geno2 = geno_a2[m_next];
             let partner = partner_alleles[m_next];
-            let required = if conf < CONF_NEUTRAL_THRESHOLD {
-                None
-            } else if geno1 == 255 || geno2 == 255 {
+            let required = if geno1 == 255 || geno2 == 255 {
                 None
             } else if geno1 == geno2 {
                 Some(geno1)
