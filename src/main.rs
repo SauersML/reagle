@@ -16,13 +16,13 @@
 
 use std::time::Instant;
 
-mod config;
-mod data;
-mod error;
-mod io;
-mod model;
-mod pipelines;
-mod utils;
+use reagle::config;
+use reagle::data;
+use reagle::error;
+use reagle::io;
+use reagle::model;
+use reagle::pipelines;
+use reagle::utils;
 
 use config::Config;
 use error::Result;
