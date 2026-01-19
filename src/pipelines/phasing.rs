@@ -1613,6 +1613,21 @@ impl PhasingPipeline {
         let alignment = alignment.expect("alignment");
 
         let donor_blocks = partition_markers_by_cm(gen_positions, STAGE1_BLOCK_CM);
+        if !donor_blocks.is_empty() {
+            sampling_points.fill(false);
+            for &(s, e) in &donor_blocks {
+                if s < n_markers {
+                    sampling_points[s] = true;
+                }
+                if e > 0 {
+                    let last = e.saturating_sub(1).min(n_markers.saturating_sub(1));
+                    sampling_points[last] = true;
+                }
+            }
+            if n_markers > 0 {
+                sampling_points[n_markers - 1] = true;
+            }
+        }
         let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
         let mut beams_fwd: Vec<RankBeam> = (0..n_target_haps)
             .map(|_| RankBeam::full(n_ref_haps as u32))
