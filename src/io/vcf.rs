@@ -758,7 +758,7 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
 
     // Need at least 3 values for diploid biallelic
     if gls.len() < 3 {
-        return None;
+        return Some(0);
     }
 
     // Map genotype to GL index:
