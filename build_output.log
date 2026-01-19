@@ -1,0 +1,16 @@
+   Compiling fastrand v2.3.0
+   Compiling futures-core v0.3.31
+   Compiling itertools v0.13.0
+   Compiling reagle v0.1.0 (/app)
+   Compiling futures-lite v2.6.1
+   Compiling cubecl-common v0.6.0
+   Compiling ndarray-stats v0.6.0
+   Compiling burn-common v0.18.0
+   Compiling burn-tensor v0.18.0
+   Compiling burn-autodiff v0.18.0
+   Compiling burn-ir v0.18.0
+   Compiling burn-core v0.18.0
+   Compiling burn-ndarray v0.18.0
+   Compiling burn v0.18.0
+   Compiling mini-mcmc v0.8.0 (https://github.com/SauersML/general-mcmc#2469d9dd)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.45s
