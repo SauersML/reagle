@@ -165,7 +165,13 @@ impl ThreadWorkspace {
     }
 
     /// Ensure buffers are sized for the current window and state count.
-    pub fn ensure_for_window(&mut self, n_markers: usize, n_states: usize, block_size: usize) {
+    pub fn ensure_for_window(
+        &mut self,
+        n_markers: usize,
+        n_states: usize,
+        max_block_len: usize,
+        n_blocks: usize,
+    ) {
         self.resize_for_states(n_states);
         self.n_markers = n_markers;
 
@@ -182,12 +188,11 @@ impl ThreadWorkspace {
             self.hap2_use_combined.resize(n_markers, true);
         }
 
-        let block_len = n_states * block_size;
+        let block_len = n_states * max_block_len;
         if self.fwd_block.len() < block_len {
             self.fwd_block.resize(block_len, 0.0);
         }
 
-        let n_blocks = (n_markers + block_size - 1) / block_size;
         let checkpoints_len = n_blocks * n_states;
         if self.combined_checkpoint_data.len() < checkpoints_len {
             self.combined_checkpoint_data.resize(checkpoints_len, 0.0);

@@ -105,19 +105,15 @@ pub struct PhasingPipeline {
     telemetry: Option<Arc<TelemetryBlackboard>>,
 }
 
-const MOSAIC_BLOCK_SIZE: usize = 128;  // Smaller = less memory per sample
-
 struct FwdCheckpoints {
-    block_size: usize,
-    n_blocks: usize,
+    block_starts: Arc<[usize]>,
     n_states: usize,
     data: Vec<f32>,
 }
 
 impl FwdCheckpoints {
-    fn from_buffer(n_markers: usize, n_states: usize, block_size: usize, mut data: Vec<f32>) -> Self {
-        let block_size = block_size.max(1).min(n_markers.max(1));
-        let n_blocks = (n_markers + block_size - 1) / block_size;
+    fn from_buffer(block_starts: Arc<[usize]>, n_states: usize, mut data: Vec<f32>) -> Self {
+        let n_blocks = block_starts.len().max(1);
         let required = n_blocks * n_states;
         if data.len() < required {
             data.resize(required, 0.0);
@@ -125,9 +121,8 @@ impl FwdCheckpoints {
             data[..required].fill(0.0);
         }
         Self {
-            block_size,
-            n_blocks,
             n_states,
+            block_starts,
             data,
         }
     }
@@ -145,6 +140,45 @@ impl FwdCheckpoints {
         let start = block_idx * self.n_states;
         &mut self.data[start..start + self.n_states]
     }
+
+}
+
+fn blocks_to_starts(blocks: &[(usize, usize)], n_markers: usize) -> Vec<usize> {
+    if n_markers == 0 {
+        return Vec::new();
+    }
+    if blocks.is_empty() {
+        return vec![0];
+    }
+    let mut out = Vec::with_capacity(blocks.len());
+    for &(s, _) in blocks {
+        if s < n_markers {
+            out.push(s);
+        }
+    }
+    if out.first().copied().unwrap_or(usize::MAX) != 0 {
+        out.insert(0, 0);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn max_block_len_from_starts(block_starts: &[usize], n_markers: usize) -> usize {
+    if n_markers == 0 {
+        return 0;
+    }
+    if block_starts.is_empty() {
+        return n_markers.max(1);
+    }
+    let mut max_len = 1usize;
+    for (i, &s) in block_starts.iter().enumerate() {
+        let e = block_starts.get(i + 1).copied().unwrap_or(n_markers);
+        if e > s {
+            max_len = max_len.max(e - s);
+        }
+    }
+    max_len
 }
 
 #[derive(Debug, Clone)]
@@ -2191,6 +2225,10 @@ impl PhasingPipeline {
                         None,
                         std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
                     );
+
+                    let donor_blocks = partition_markers_by_cm(&gen_positions, STAGE1_BLOCK_CM);
+                    let block_starts: Arc<[usize]> =
+                        blocks_to_starts(&donor_blocks, n_markers).into_boxed_slice().into();
                     let result = sample_swap_bits_mosaic(
                         n_markers,
                         n_states,
@@ -2200,6 +2238,7 @@ impl PhasingPipeline {
                         &sample_conf,
                         &lookup,
                         Some(PlProvider { gt: target_gt, sample: s, subset_to_orig: None }),
+                        block_starts,
                         &het_positions,
                         prior_paths.get(s).and_then(|p| p.as_ref()),
                         sample_seed,
@@ -2536,6 +2575,10 @@ impl PhasingPipeline {
                                     std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
                                 )
                             };
+
+                            let block_starts: Arc<[usize]> = blocks_to_starts(stage1_blocks, n_hi_freq)
+                                .into_boxed_slice()
+                                .into();
                             let result = if self.config.profile {
                                 info_span!("run_mcmc_math", sample = s).in_scope(|| {
                                     sample_swap_bits_mosaic(
@@ -2547,6 +2590,7 @@ impl PhasingPipeline {
                                         &sample_conf,
                                         &lookup,
                                         Some(PlProvider { gt: target_gt, sample: s, subset_to_orig: Some(hi_freq_to_orig) }),
+                                        block_starts.clone(),
                                         &het_positions,
                                         prior_paths.get(s).and_then(|p| p.as_ref()),
                                         sample_seed,
@@ -2566,6 +2610,7 @@ impl PhasingPipeline {
                                     &sample_conf,
                                     &lookup,
                                     Some(PlProvider { gt: target_gt, sample: s, subset_to_orig: Some(hi_freq_to_orig) }),
+                                    block_starts,
                                     &het_positions,
                                     prior_paths.get(s).and_then(|p| p.as_ref()),
                                     sample_seed,
@@ -3562,6 +3607,13 @@ fn build_fwd_checkpoints(
 
     let mut allele_probs: Vec<f32> = Vec::new();
 
+    let mut next_block_idx = 0usize;
+    let mut next_block_start = checkpoints
+        .block_starts
+        .get(next_block_idx)
+        .copied()
+        .unwrap_or(0);
+
     for m in 0..n_markers {
         if m > 0 {
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
@@ -3728,10 +3780,15 @@ fn build_fwd_checkpoints(
         }
         fwd_sum = fwd_sum.max(1e-30);
 
-        if m % checkpoints.block_size == 0 {
-            let block_idx = m / checkpoints.block_size;
-            let dst = checkpoints.block_slice_mut(block_idx);
+        if m == next_block_start {
+            let dst = checkpoints.block_slice_mut(next_block_idx);
             dst.copy_from_slice(&fwd);
+            next_block_idx += 1;
+            next_block_start = checkpoints
+                .block_starts
+                .get(next_block_idx)
+                .copied()
+                .unwrap_or(usize::MAX);
         }
     }
 }
@@ -3778,17 +3835,23 @@ fn sample_path_from_checkpoints(
         return;
     }
 
-    let block_size = checkpoints.block_size;
-    let n_blocks = checkpoints.n_blocks;
-    let mut current_state: Option<usize> = None;
+    let starts = checkpoints.block_starts.as_ref();
+    let n_blocks = starts.len().max(1);
 
     let mut weights = vec![0.0f32; n_states];
     let mut ref_alleles = vec![0u8; n_states];
     let mut allele_probs: Vec<f32> = Vec::new();
 
     for block_idx in (0..n_blocks).rev() {
-        let start = block_idx * block_size;
-        let end = (start + block_size).min(n_markers);
+        let start = starts.get(block_idx).copied().unwrap_or(0).min(n_markers);
+        let end = starts
+            .get(block_idx + 1)
+            .copied()
+            .unwrap_or(n_markers)
+            .min(n_markers);
+        if end <= start {
+            continue;
+        }
         let block_len = end - start;
         let row_stride = n_states;
         let buf_len = block_len * row_stride;
@@ -3949,15 +4012,31 @@ fn sample_path_from_checkpoints(
             prev_sum = prev_sum.max(1e-30);
         }
 
-        if current_state.is_none() {
-            let last_row = &fwd_buf[(block_len - 1) * row_stride..block_len * row_stride];
+        // Sample the last marker in this block conditional on the first state in the next block.
+        // This is the explicit boundary projection that was missing from the previous checkpoint sampler.
+        let next_state = if end < n_markers {
+            Some(path[end] as usize)
+        } else {
+            None
+        };
+        let last_row = &fwd_buf[(block_len - 1) * row_stride..block_len * row_stride];
+        if let Some(ns) = next_state {
+            let r = p_recomb.get(end).copied().unwrap_or(0.0);
+            let shift = r / n_states as f32;
+            let stay = (1.0 - r) + shift;
+            for i in 0..n_states {
+                let t = if i == ns { stay } else { shift };
+                weights[i] = last_row[i] * t;
+            }
+            let sampled = sample_from_weights(&weights, rng);
+            path[end - 1] = sampled as u32;
+        } else {
             let sampled = sample_from_weights(last_row, rng);
-            current_state = Some(sampled);
             path[end - 1] = sampled as u32;
         }
 
         for m in (start + 1..end).rev() {
-            let next_state = current_state.unwrap();
+            let next_state = path[m] as usize;
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
             let shift = r / n_states as f32;
             // Li-Stephens: P(stay) = (1-r) + r/K, P(switch) = r/K
@@ -3987,7 +4066,6 @@ fn sample_path_from_checkpoints(
 
             let sampled = sample_from_weights(&weights, rng);
             path[m - 1] = sampled as u32;
-            current_state = Some(sampled);
         }
     }
 }
@@ -4463,6 +4541,7 @@ fn sample_swap_bits_mosaic(
     conf: &[f32],
     lookup: &RefAlleleLookup,
     pl_provider: Option<PlProvider>,
+    block_starts: Arc<[usize]>,
     het_positions: &[usize],
     initial_paths: Option<&MosaicPaths>,
     seed: u64,
@@ -4482,12 +4561,14 @@ fn sample_swap_bits_mosaic(
         );
     }
 
+    let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
+    let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
-    workspace.ensure_for_window(n_markers, n_states, MOSAIC_BLOCK_SIZE);
+    workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
 
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     let mut combined_checkpoints =
-        FwdCheckpoints::from_buffer(n_markers, n_states, MOSAIC_BLOCK_SIZE, combined_data);
+        FwdCheckpoints::from_buffer(block_starts.clone(), n_states, combined_data);
     let dummy_allele = vec![255u8; n_markers];
     let dummy_combined = vec![true; n_markers];
     let fwd = &mut workspace.fwd[..n_states];
@@ -4523,15 +4604,13 @@ fn sample_swap_bits_mosaic(
         fwd_prior: std::mem::replace(&mut workspace.fwd_prior, aligned_vec::AVec::new(32)),
         ref_alleles: std::mem::take(&mut workspace.ref_alleles),
         hap1_checkpoints: FwdCheckpoints::from_buffer(
-            n_markers,
+            block_starts.clone(),
             n_states,
-            MOSAIC_BLOCK_SIZE,
             std::mem::take(&mut workspace.hap1_checkpoint_data),
         ),
         hap2_checkpoints: FwdCheckpoints::from_buffer(
-            n_markers,
+            block_starts.clone(),
             n_states,
-            MOSAIC_BLOCK_SIZE,
             std::mem::take(&mut workspace.hap2_checkpoint_data),
         ),
         hap1_allele: std::mem::take(&mut workspace.hap1_allele),
