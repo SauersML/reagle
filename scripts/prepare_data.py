@@ -239,123 +239,36 @@ def run_conversion(input_path, output_vcf):
     # Pre-process input (handle zip/split)
     raw_file = prepare_input_file(input_path)
     
-    # === Step 1: Convert to hg19 VCF ===
-    print(f"Converting {raw_file} to hg19 VCF...")
-    
-    # Create chr map for hg19
-    with open("chr_map.txt", "w") as f:
-        f.write("chr22\t22\n")
+    print(f"Converting {raw_file} to GRCh38 VCF...")
 
-    # Use hg19/GRCh37 reference for initial conversion (DTC files are hg19)
-    ref_hg19_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/chromosomes/chr22.fa.gz"
-    temp_hg19_vcf = "temp_hg19.vcf"
-    
+    ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    temp_hg38_vcf = "temp_hg38.vcf"
+
     cmd = [
         "convert_genome",
-        raw_file,
-        ref_hg19_url,
-        temp_hg19_vcf,
-        "--format", "vcf"
+        "--input", raw_file,
+        "--reference", ref_hg38_url,
+        "--assembly", "GRCh38",
+        "--output", temp_hg38_vcf,
+        "--format", "vcf",
     ]
-    
+
     print(f"Running: {' '.join(cmd)}")
     subprocess.check_call(cmd)
-    
-    if not os.path.exists(temp_hg19_vcf):
-        raise RuntimeError("convert_genome failed to produce temp_hg19.vcf")
 
-    # Rename chroms to 'chr22' style for CrossMap compatible with chain file usually
-    # Actually CrossMap handles it, but let's standardize.
-    # We'll just pass temp_hg19_vcf to CrossMap.
-    
-    # === Step 2: Liftover to hg38 ===
-    print("Lifting over to hg38...")
-    
-    # Locate liftover tools (expected in ~/liftover from workflow)
-    home = os.path.expanduser("~")
-    chain_file = os.path.join(home, "liftover", "hg19ToHg38.over.chain.gz")
-    ref_hg38 = os.path.join(home, "liftover", "hg38.fa")
-    
-    if not os.path.exists(chain_file) or not os.path.exists(ref_hg38):
-        print(f"Warning: Liftover files not found at {chain_file} or {ref_hg38}.")
-        print("Updating files assuming hg19 is desired if liftover fails...")
-        # Fallback: Just use hg19 output if tools missings (local dev case)
-        # But for CI we expect them.
-        
-        # Normalize hg19 output to final
-        cmd_process = (
-            f"bcftools view {temp_hg19_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Ou | "
-            f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
-        )
-        subprocess.check_call(cmd_process, shell=True)
-        subprocess.check_call(["bcftools", "index", "-f", output_vcf])
-        print("Warning: SKIPPED Liftover (missing tools), output is hg19.")
-    else:
-        # Run CrossMap
-        # Detect executable name
-        crossmap_exe = "CrossMap.py"
-        if not shutil.which(crossmap_exe):
-            if shutil.which("CrossMap"):
-                crossmap_exe = "CrossMap"
-            else:
-                # Debug info
-                print("Error: CrossMap executable not found in PATH.")
-                print(f"PATH: {os.environ.get('PATH')}")
-                try:
-                    subprocess.call(["pip", "show", "CrossMap"])
-                except:
-                    pass
-                raise FileNotFoundError("CrossMap.py or CrossMap executable not found")
+    if not os.path.exists(temp_hg38_vcf):
+        raise RuntimeError("convert_genome failed to produce temp_hg38.vcf")
 
-        # Output uncompressed vcf first
-        temp_hg38_vcf = "temp_hg38.vcf"
-        try:
-           cmd_liftover = [
-               crossmap_exe, "vcf", 
-               chain_file, 
-               temp_hg19_vcf,
-               ref_hg38,
-               temp_hg38_vcf
-           ]
-           print(f"Running CrossMap: {' '.join(cmd_liftover)}")
-           subprocess.check_call(cmd_liftover)
-           
-           # Check if it produced .vcf (CrossMap might append suffix or not depending on version? Usually just takes output arg)
-           # CrossMap vcf output argument is prefix or full name? 
-           # Documentation says: CrossMap.py vcf <chain> <inf> <ref> <outf>
-           
-           if not os.path.exists(temp_hg38_vcf) and os.path.exists(temp_hg38_vcf + ".unmap"):
-                # It might have worked but filtered everything?
-                pass
-                
-           # === Step 3: Finalize Output ===
-           print("Finalizing hg38 output...")
-           # Compress and index
-           # Ensure chromosome name is '22' not 'chr22' (HGDP reference uses 'chr22' usually? let's check)
-           # The HGDP URL uses 'chr22'. So we should KEEP 'chr22' or rename to '22' depending on Reagle requirement.
-           # Reagle integration test uses '22' usually. 
-           # Let's check download_reference output... it downloads BCF from gnomAD.
-           # gnomAD uses 'chr22'.
-           # So we probably want 'chr22'.
-           # Start with '22' for consistency with input if possible, OR 'chr22' if ref has it.
-           # Let's inspect ref in future. For now, 1000G was '22'. HGDP is 'chr22'.
-           # Be consistent with reference.
-           
-           # Filter invalid records where ALT="." but GT implies a variant (Beagle crash fix)
-           print("Filtering invalid records (missing ALT but non-ref GT)...")
-           filter_cmd = f"bcftools view {temp_hg38_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Oz -o {output_vcf}"
-           subprocess.check_call(filter_cmd, shell=True)
-           subprocess.check_call(["bcftools", "index", "-f", output_vcf])
-           print("Liftover complete.")
-           
-        except Exception as e:
-            print(f"Liftover failed: {e}")
-            raise
+    print("Finalizing GRCh38 output...")
+    print("Filtering invalid records (missing ALT but non-ref GT)...")
+    filter_cmd = f"bcftools view {temp_hg38_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Oz -o {output_vcf}"
+    subprocess.check_call(filter_cmd, shell=True)
+    subprocess.check_call(["bcftools", "index", "-f", output_vcf])
+    print("Conversion complete.")
 
     # Cleanup
-    if os.path.exists(temp_hg19_vcf): os.remove(temp_hg19_vcf)
-    if os.path.exists("temp_hg38.vcf"): os.remove("temp_hg38.vcf")
-    if os.path.exists("chr_map.txt"): os.remove("chr_map.txt")
+    if os.path.exists("temp_hg38.vcf"):
+        os.remove("temp_hg38.vcf")
         
     # Cleanup extracted if it was temp
     if "extracted" in raw_file:
