@@ -1137,54 +1137,11 @@ target_samples={} target_bytes={}",
                     })
             })
             .collect();
-        let (ref_alt_mask, ref_missing_mask, ref_alt_freq) = {
-            let mut alt_mask = vec![0u8; n_ref_markers * n_ref_haps];
-            let mut missing_mask = vec![0u8; n_ref_markers * n_ref_haps];
-            let mut alt_freq = vec![0.0f32; n_ref_markers];
-            for m in 0..n_ref_markers {
-                let map_ref_to_targ = ref_marker_maps[m].as_deref();
-                let mut alt_count = 0usize;
-                let mut non_missing = 0usize;
-                let base = m * n_ref_haps;
-                for h in 0..n_ref_haps {
-                    let allele = ref_win.allele(
-                        MarkerIdx::new(m as u32),
-                        HapIdx::new(h as u32),
-                    );
-                    let mapped = if let Some(map) = map_ref_to_targ {
-                        let idx = allele as usize;
-                        if idx < map.len() {
-                            let r = map[idx];
-                            if r >= 0 {
-                                r as u8
-                            } else {
-                                255
-                            }
-                        } else {
-                            255
-                        }
-                    } else {
-                        allele
-                    };
-                    let offset = base + h;
-                    if mapped == 1 {
-                        alt_mask[offset] = 1;
-                        alt_count += 1;
-                        non_missing += 1;
-                    } else if mapped == 0 {
-                        non_missing += 1;
-                    } else {
-                        missing_mask[offset] = 1;
-                    }
-                }
-                alt_freq[m] = if non_missing > 0 {
-                    alt_count as f32 / non_missing as f32
-                } else {
-                    0.5
-                };
-            }
-            (Arc::new(alt_mask), Arc::new(missing_mask), Arc::new(alt_freq))
-        };
+        // Memory Optimization: We removed the massive ref_alt_mask/ref_missing_mask allocation (approx 350MB).
+        // Instead, we will use the polymorphic `allele_posteriors_for_column_cached` for all markers,
+        // which leverages the compressed storage (BREF3/Bit-packed) directly.
+        // The `ref_alt_freq` calculation is also skipped as it was only used for the biallelic path.
+
 
         let genotyped_markers: Vec<usize> = alignment
             .ref_to_target
@@ -1517,34 +1474,7 @@ target_samples={} target_bytes={}",
                             let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
                             let n_alleles = 1 + marker.alt_alleles.len();
 
-                            let (p1, p2, post1_opt, post2_opt) = if ref_is_biallelic[marker_idx] {
-                                let offset = marker_idx * n_ref_haps;
-                                let alt_mask = &ref_alt_mask[offset..offset + n_ref_haps];
-                                let missing_mask = &ref_missing_mask[offset..offset + n_ref_haps];
-                                let alt_freq = ref_alt_freq[marker_idx];
-                                let p1 = hap1_probs.biallelic_alt_prob_from_masks_simd(
-                                    marker_idx,
-                                    alt_mask,
-                                    missing_mask,
-                                    alt_freq,
-                                );
-                                let p2 = hap2_probs.biallelic_alt_prob_from_masks_simd(
-                                    marker_idx,
-                                    alt_mask,
-                                    missing_mask,
-                                    alt_freq,
-                                );
-                                if include_posteriors {
-                                    (
-                                        p1,
-                                        p2,
-                                        Some(AllelePosteriors::Biallelic(p1)),
-                                        Some(AllelePosteriors::Biallelic(p2)),
-                                    )
-                                } else {
-                                    (p1, p2, None, None)
-                                }
-                            } else {
+                            let (p1, p2, post1_opt, post2_opt) = {
                                 let column = ref_win.column(MarkerIdx::new(marker_idx as u32));
                                 let map_ref_to_targ = ref_marker_maps[marker_idx].as_deref();
                                 let post1 = hap1_probs.allele_posteriors_for_column_cached(

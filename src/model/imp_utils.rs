@@ -95,6 +95,7 @@ pub fn get_log_probs(conf: f32, p_err: f32) -> (f32, f32) {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 pub fn compute_cluster_mismatches_into_workspace(
     hap_indices: &[Vec<u32>],
     cluster_bounds: &[(usize, usize)],
@@ -112,6 +113,9 @@ pub fn compute_cluster_mismatches_into_workspace(
     base_err_rate: f32,
     trace: bool,
 ) {
+    // wide imports removed as we use scalar unrolled loop
+
+
     let span = if trace {
         Some(tracing::info_span!("mismatch_precalc").entered())
     } else {
@@ -129,106 +133,218 @@ pub fn compute_cluster_mismatches_into_workspace(
         }
 
         let row_buffer = &mut workspace.row_buffer;
-        row_buffer.fill(0.0);
+        // Optimization: No need to fill row_buffer with 0.0 if we overwrite it completely.
+        // But we must handle the case where n_states is not a multiple of 8 carefully 
+        // or just fill the tail. To be safe/simple, we can keeping fill(0.0) or handle overwrite correctly.
+        // Our optimized loop "stores" accumulated values, so it overwrites.
+        // We just need to make sure we visit every state.
+        
         let mut cluster_base_score = 0.0f32;
 
+        // --- Pre-calculate marker constants for the whole cluster ---
+        // This avoids repeated lookups inside the state loop.
+        // We store them in a small aligned buffer on the stack.
+        // Max cluster size is usually small (e.g. < 100 markers).
+        // If it's huge, we might need a heap vec, but stack is fast.
+        // Let's use a Vec for safety but reuse it if we wanted (workspace?)
+        // Allocating a Vec per cluster is efficient for typical cluster sizes.
+        
+        struct MarkerProps {
+            target_m: usize,
+            geno1: u8,
+            geno2: u8,
+            targ_allele: u8,
+            partner_allele: u8,
+            log_diff: f32,
+            hard_log_diff: f32,
+            // log_match removed (unused)
+            ref_marker_idx: MarkerIdx,
+            map_alleles: bool,
+        }
+        
+        // We can't allocate inside the hot loop easily without overhead, 
+        // but populating a vector "markers_in_cluster" O(N_markers) is much cheaper 
+        // than N_states * N_markers lookups.
+        
+        let mut active_markers = Vec::with_capacity(end - start);
+        
         for &ref_m in &genotyped_markers[start..end] {
-            // Use direct access via ref_to_target if possible, or fallback to method
-            let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
-            if target_m_idx < 0 { continue; }
-            let target_m = target_m_idx as usize;
+             let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
+             if target_m_idx < 0 { continue; }
+             let target_m = target_m_idx as usize;
 
-            let target_marker_idx = MarkerIdx::new(target_m as u32);
-            let geno1 = geno_a1[target_m];
-            let geno2 = geno_a2[target_m];
-            if geno1 == 255 || geno2 == 255 {
-                continue;
-            }
-            let targ_allele = targ_alleles[target_m];
-            let partner_allele = partner_alleles
-                .map(|p| p[target_m])
-                .unwrap_or(255);
-            let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
-            if confidence <= 0.0 {
-                continue;
-            }
-            
-            let (log_match, log_mism) = get_log_probs(confidence, p_err);
-            let log_diff = log_mism - log_match;
-            let hard_log_mism = (1e-12f32).ln();
-            let hard_log_diff = hard_log_mism - log_match;
-            
-            cluster_base_score += log_match;
+             let geno1 = geno_a1[target_m];
+             let geno2 = geno_a2[target_m];
+             if geno1 == 255 || geno2 == 255 { continue; }
 
-            let ref_marker_idx = MarkerIdx::new(ref_m as u32);
-            let ref_column = ref_gt.column(ref_marker_idx);
+             let targ_allele = targ_alleles[target_m];
+             let partner_allele = partner_alleles
+                 .map(|p| p[target_m])
+                 .unwrap_or(255);
 
-            macro_rules! process_states {
-                ($col:expr, $get_fn:expr) => {
-                    for (j, &hap) in hap_indices[c].iter().enumerate().take(n_states) {
-                        let ref_allele = $get_fn($col, HapIdx::new(hap));
-                        let final_ref = if alignment.has_allele_mapping(target_m) {
-                             alignment.reverse_map_allele(target_m, ref_allele)
-                        } else {
-                            ref_allele
-                        };
+             let target_marker_idx = MarkerIdx::new(target_m as u32);
+             let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
+             if confidence <= 0.0 { continue; }
 
-                        if final_ref == 255 {
-                            if ref_allele != 255 {
-                                let penalty = log_diff;
-                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                    row_buffer[j] = penalty;
-                                }
-                            }
-                        } else if partner_allele != 255 {
-                            let required = if partner_allele == geno1 {
-                                geno2
-                            } else if partner_allele == geno2 {
-                                geno1
-                            } else {
-                                255
-                            };
-                            if required != 255 {
-                                if final_ref != required {
-                                    let penalty = hard_log_diff;
-                                    if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                        row_buffer[j] = penalty;
-                                    }
-                                }
-                            } else if targ_allele != 255 && final_ref != targ_allele {
-                                let penalty = log_diff;
-                                if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                    row_buffer[j] = penalty;
-                                }
-                            }
-                        } else if targ_allele != 255 && final_ref != targ_allele {
-                            let penalty = log_diff;
-                            if row_buffer[j] == 0.0 || penalty < row_buffer[j] {
-                                row_buffer[j] = penalty;
-                            }
-                        }
-                    }
-                }
-            }
+             let (log_match, log_mism) = get_log_probs(confidence, p_err);
+             let log_diff = log_mism - log_match;
+             let hard_log_mism = (1e-12f32).ln();
+             let hard_log_diff = hard_log_mism - log_match;
+             
+             cluster_base_score += log_match;
 
-            match ref_column {
-                GenotypeColumn::Dense(col) => {
-                     process_states!(col, |c: &crate::data::storage::dense::DenseColumn, h| c.get(h));
-                },
-                GenotypeColumn::Sparse(col) => {
-                     process_states!(col, |c: &crate::data::storage::sparse::SparseColumn, h| c.get(h));
-                },
-                GenotypeColumn::Dictionary(col, offset) => {
-                     process_states!(col, |c: &std::sync::Arc<crate::data::storage::dictionary::DictionaryColumn>, h| c.get(*offset, h));
-                },
-                GenotypeColumn::SeqCoded(col) => {
-                     process_states!(col, |c: &crate::data::storage::seq_coded::SeqCodedColumn, h| c.get(h));
-                }
-            }
+             active_markers.push(MarkerProps {
+                 target_m,
+                 geno1,
+                 geno2,
+                 targ_allele,
+                 partner_allele,
+                 log_diff,
+                 hard_log_diff,
+                 // log_match: 0.0,
+                 ref_marker_idx: MarkerIdx::new(ref_m as u32),
+                 map_alleles: alignment.has_allele_mapping(target_m),
+             });
         }
         
         workspace.cluster_base_scores.push(cluster_base_score);
 
+        // --- Inverted Loop: Iterate State Blocks (Chunks of 8) ---
+        
+        let mut j_base = 0;
+        // chunk_size = 8 (implicit)
+        
+        // Helper to get 8 ref alleles efficiently
+        // We have to inspect the column type. 
+        // Ideally we would inspect column type ONCE per marker, not per state block.
+        // But the column type is attached to the marker.
+        // So inside the marker loop (which is inner), we dispatch.
+        // Dispatching enums 8 at a time is better than 1 at a time.
+        
+        while j_base < n_states {
+            let remainder = n_states - j_base;
+            
+            if remainder >= 8 {
+                let indices: [usize; 8] = [
+                    hap_indices[c][j_base] as usize,
+                    hap_indices[c][j_base+1] as usize,
+                    hap_indices[c][j_base+2] as usize,
+                    hap_indices[c][j_base+3] as usize,
+                    hap_indices[c][j_base+4] as usize,
+                    hap_indices[c][j_base+5] as usize,
+                    hap_indices[c][j_base+6] as usize,
+                    hap_indices[c][j_base+7] as usize,
+                ];
+
+                let mut acc = [0.0f32; 8];
+
+                for m_props in &active_markers {
+                    let ref_column = ref_gt.column(m_props.ref_marker_idx);
+                    
+                    let mut ref_alleles_arr = [0u8; 8];
+                    match ref_column {
+                         GenotypeColumn::Dense(col) => {
+                             for k in 0..8 { ref_alleles_arr[k] = col.get(HapIdx::new(indices[k] as u32)); }
+                         },
+                         GenotypeColumn::Sparse(col) => {
+                             for k in 0..8 { ref_alleles_arr[k] = col.get(HapIdx::new(indices[k] as u32)); }
+                         },
+                         GenotypeColumn::Dictionary(col, offset) => {
+                              for k in 0..8 { ref_alleles_arr[k] = col.get(*offset, HapIdx::new(indices[k] as u32)); }
+                         },
+                         GenotypeColumn::SeqCoded(col) => {
+                             for k in 0..8 { ref_alleles_arr[k] = col.get(HapIdx::new(indices[k] as u32)); }
+                         }
+                    }
+                    
+                    for k in 0..8 {
+                        let ref_allele = ref_alleles_arr[k];
+                        let final_ref = if m_props.map_alleles {
+                            alignment.reverse_map_allele(m_props.target_m, ref_allele)
+                        } else {
+                            ref_allele
+                        };
+                        
+                        // Logic identical to scalar, but unrolled
+                        if final_ref == 255 {
+                            if ref_allele != 255 {
+                                acc[k] += m_props.log_diff;
+                            }
+                        } else if m_props.partner_allele != 255 {
+                             let required = if m_props.partner_allele == m_props.geno1 {
+                                 m_props.geno2
+                             } else if m_props.partner_allele == m_props.geno2 {
+                                 m_props.geno1
+                             } else {
+                                 255
+                             };
+                             if required != 255 {
+                                 if final_ref != required {
+                                     acc[k] += m_props.hard_log_diff;
+                                 }
+                             } else if m_props.targ_allele != 255 && final_ref != m_props.targ_allele {
+                                 acc[k] += m_props.log_diff;
+                             }
+                        } else if m_props.targ_allele != 255 && final_ref != m_props.targ_allele {
+                            acc[k] += m_props.log_diff;
+                        }
+                    }
+                }
+                
+                // Write accumulators to row_buffer
+                row_buffer[j_base..j_base+8].copy_from_slice(&acc);
+                
+                j_base += 8;
+            } else {
+                // Scalar tail loop
+                for j in j_base..n_states {
+                    let hap_idx = hap_indices[c][j];
+                    let mut acc_penalty = 0.0;
+                    
+                    for m_props in &active_markers {
+                        let ref_col = ref_gt.column(m_props.ref_marker_idx);
+                        let ref_allele = ref_col.get(HapIdx::new(hap_idx));
+                         
+                        let final_ref = if m_props.map_alleles {
+                            alignment.reverse_map_allele(m_props.target_m, ref_allele)
+                        } else {
+                            ref_allele
+                        };
+                        
+                        if final_ref == 255 {
+                            if ref_allele != 255 {
+                                acc_penalty += m_props.log_diff;
+                            }
+                        } else if m_props.partner_allele != 255 {
+                             let required = if m_props.partner_allele == m_props.geno1 {
+                                 m_props.geno2
+                             } else if m_props.partner_allele == m_props.geno2 {
+                                 m_props.geno1
+                             } else {
+                                 255
+                             };
+                             if required != 255 {
+                                 if final_ref != required {
+                                     acc_penalty += m_props.hard_log_diff;
+                                 }
+                             } else if m_props.targ_allele != 255 && final_ref != m_props.targ_allele {
+                                 acc_penalty += m_props.log_diff;
+                             }
+                        } else if m_props.targ_allele != 255 && final_ref != m_props.targ_allele {
+                            acc_penalty += m_props.log_diff;
+                        }
+                    }
+                    row_buffer[j] = acc_penalty;
+                }
+                j_base = n_states; // Done
+            }
+        }
+        
+        // --- Populate sparse outputs from row_buffer ---
+        // Optimization: We could have written directly to sparse vectors above, 
+        // but populating row_buffer first is safer and keeps logic separate.
+        // We can optimize this later if needed.
+        
         for (j, &val) in row_buffer.iter().enumerate().take(n_states) {
             if val.abs() > 1e-9 {
                 workspace.diff_vals.push(val);
@@ -711,4 +827,112 @@ pub fn compute_state_probs(
         sparse_probs,
         sparse_probs_p1,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::data::marker::Allele;
+    use crate::data::marker::Marker;
+    use crate::data::marker::Markers;
+    use crate::data::ChromIdx;
+    use crate::data::haplotype::Samples;
+    use crate::utils::workspace::ImpWorkspace;
+    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::data::alignment::MarkerAlignment;
+
+    #[test]
+    fn test_compute_cluster_mismatches_accumulation() {
+        // Regression test for cluster log-likelihood accumulation bug.
+        // Ensures that penalties are summed (product of probabilities) rather than min-reduced.
+        
+        // Setup:
+        // 1 cluster with 2 markers
+        // Target sample has alleles (0, 0)
+        // Reference haplotype 0 has (1, 1) -> mismatch at BOTH markers
+        // Reference haplotype 1 has (1, 0) -> mismatch at FIRST marker only
+        
+        let n_states = 2;
+        let mut workspace = ImpWorkspace::new(n_states);
+        
+        let samples = Arc::new(Samples::from_ids(vec!["S1".to_string()]));
+        let mut markers = Markers::new();
+        markers.add_chrom("chr1");
+        
+        for i in 0..2 {
+             markers.push(Marker::new(
+                ChromIdx::new(0),
+                (i * 100) as u32,
+                None,
+                Allele::Base(0),
+                vec![Allele::Base(1)],
+            ));
+        }
+
+        // Target: (0, 0)
+        let target_col0 = GenotypeColumn::from_alleles(&[0], 2);
+        let target_col1 = GenotypeColumn::from_alleles(&[0], 2);
+        let target_gt = GenotypeMatrix::new_phased(
+            markers.clone(),
+            vec![target_col0, target_col1],
+            samples.clone()
+        );
+
+        // Reference: Hap 0: (1, 1), Hap 1: (1, 0)
+        let ref_col0 = GenotypeColumn::from_alleles(&[1, 1], 2);
+        let ref_col1 = GenotypeColumn::from_alleles(&[1, 0], 2);
+        let ref_samples = Arc::new(Samples::from_ids(vec!["Ref1".to_string()])); 
+        let ref_gt = GenotypeMatrix::new_phased(
+            markers.clone(),
+            vec![ref_col0, ref_col1],
+            ref_samples
+        );
+
+        let cluster_bounds = vec![(0, 2)];
+        let genotyped_markers = vec![0, 1];
+        let hap_indices = vec![vec![0, 1]];
+        
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![0, 1],
+            target_to_ref: vec![0, 1],
+            allele_mappings: vec![None, None],
+        };
+
+        // Inputs
+        let geno_a1 = vec![0, 0]; 
+        let geno_a2 = vec![0, 0];
+        let targ_alleles = vec![0, 0]; 
+        
+        compute_cluster_mismatches_into_workspace(
+            &hap_indices,
+            &cluster_bounds,
+            &genotyped_markers,
+            &target_gt,
+            &ref_gt,
+            &alignment,
+            &geno_a1,
+            &geno_a2,
+            &targ_alleles,
+            None,
+            0, // sample_idx
+            n_states,
+            &mut workspace,
+            0.01,
+            false,
+        );
+        
+        let err = 0.01f32;
+        let match_prob = 1.0 - err;
+        let mismatch_prob = err;
+        let log_match = match_prob.ln();
+        let log_mism = mismatch_prob.ln();
+        let log_diff = log_mism - log_match;
+        
+        // Hap 1: 1 mismatch
+        assert!((workspace.row_buffer[1] - log_diff).abs() < 1e-4, "Hap 1 should confirm single mismatch");
+        
+        // Hap 0: 2 mismatches (sum accumulation)
+        assert!((workspace.row_buffer[0] - 2.0 * log_diff).abs() < 1e-4, "Hap 0 should have double penalty");
+    }
 }
