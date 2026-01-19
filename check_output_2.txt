@@ -1,0 +1,29 @@
+   Compiling reagle v0.1.0 (/app)
+error: unused import: `self`
+  --> src/main.rs:19:22
+   |
+19 | use reagle::config::{self, Config};
+   |                      ^^^^
+   |
+   = note: `-D unused-imports` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: unused import: `self`
+  --> src/main.rs:20:21
+   |
+20 | use reagle::error::{self, Result};
+   |                     ^^^^
+
+error: unused import: `self`
+  --> src/main.rs:21:25
+   |
+21 | use reagle::pipelines::{self, ImputationPipeline, PhasingPipeline};
+   |                         ^^^^
+
+error: unused imports: `data`, `io`, and `model`
+  --> src/main.rs:23:14
+   |
+23 | use reagle::{data, io, model};
+   |              ^^^^  ^^  ^^^^^
+
+error: could not compile `reagle` (bin "reagle") due to 4 previous errors

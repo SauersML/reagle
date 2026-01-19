@@ -16,18 +16,10 @@
 
 use std::time::Instant;
 
-mod config;
-mod data;
-mod error;
-mod io;
-mod model;
-mod pipelines;
-mod utils;
-
-use config::Config;
-use error::Result;
-use pipelines::{ImputationPipeline, PhasingPipeline};
-use utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
+use reagle::config::Config;
+use reagle::error::Result;
+use reagle::pipelines::{ImputationPipeline, PhasingPipeline};
+use reagle::utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
 
 fn main() {
     if let Err(e) = run() {
@@ -111,15 +103,19 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reagle::error::ReagleError;
+    use reagle::data::marker::MarkerIdx;
+    use reagle::io::vcf::VcfReader;
+    use reagle::model::parameters::ModelParams;
 
     #[test]
     fn test_module_imports() {
         // Verify all modules are accessible
-        let _ = config::Config::parse_and_validate;
-        let _ = error::ReagleError::vcf("test");
-        let _ = data::marker::MarkerIdx::new;
-        let _ = io::vcf::VcfReader::open;
-        let _ = model::parameters::ModelParams::new;
-        let _ = pipelines::PhasingPipeline::new;
+        let _ = Config::parse_and_validate;
+        let _ = ReagleError::vcf("test");
+        let _ = MarkerIdx::new;
+        let _ = VcfReader::open;
+        let _ = ModelParams::new;
+        let _ = PhasingPipeline::new;
     }
 }
