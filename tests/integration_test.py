@@ -557,11 +557,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
         "concordant": 0, "total": 0,
         "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0,
         "switch_errors": 0, "switch_opportunities": 0,
-        "sen_sum": 0.0, "sen_values": []
+        "sen_sum": 0.0, "sen_min": 1.0, "sen_max": 0.0, "sen_count": 0
     })
 
     # For IQS calculation: track per-site concordance and expected concordance
-    site_iqs_values = []
+    site_iqs_sum = 0.0
+    site_iqs_count = 0
 
     # For Hellinger score (requires GP field)
     hellinger_sum = 0.0
@@ -609,7 +610,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     maf_bins = defaultdict(lambda: {
         "unphased_concordant": 0, "total": 0,
         "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0,
-        "iqs_values": [], "nonref_concordant": 0, "nonref_total": 0,
+        "iqs_sum": 0.0, "iqs_count": 0, "nonref_concordant": 0, "nonref_total": 0,
         "confusion": [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
         "switch_errors": 0, "switch_opportunities": 0
     })
@@ -838,7 +839,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                     sample_metrics[sample]["sum_tt"] += t_dos * t_dos
                     sample_metrics[sample]["sum_ii"] += i_dos * i_dos
                     sample_metrics[sample]["sen_sum"] += sen
-                    sample_metrics[sample]["sen_values"].append(sen)
+                    sample_metrics[sample]["sen_count"] += 1
+                    if sen < sample_metrics[sample]["sen_min"]:
+                        sample_metrics[sample]["sen_min"] = sen
+                    if sen > sample_metrics[sample]["sen_max"]:
+                        sample_metrics[sample]["sen_max"] = sen
 
                     if i_class is not None:
                         confusion[t_class][i_class] += 1
@@ -933,8 +938,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                     observed_conc = site_concordant / site_total
                     if expected_conc < 1.0:
                         iqs = (observed_conc - expected_conc) / (1.0 - expected_conc)
-                        site_iqs_values.append(iqs)
-                        maf_bins[maf_bin]["iqs_values"].append(iqs)
+                        site_iqs_sum += iqs
+                        site_iqs_count += 1
+                        maf_bins[maf_bin]["iqs_sum"] += iqs
+                        maf_bins[maf_bin]["iqs_count"] += 1
 
                 # Advance both
                 truth_key, truth_data, truth_multiallelic = get_next_truth()
@@ -1145,9 +1152,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
         metrics["rare_r2_stats"] = rare_stats
 
         # Calculate overall IQS (mean across sites)
-        if site_iqs_values:
-            metrics["iqs"] = sum(site_iqs_values) / len(site_iqs_values)
-            metrics["iqs_median"] = sorted(site_iqs_values)[len(site_iqs_values) // 2]
+        if site_iqs_count > 0:
+            metrics["iqs"] = site_iqs_sum / site_iqs_count
+            metrics["iqs_median"] = None
         else:
             metrics["iqs"] = None
 
@@ -1156,20 +1163,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
         else:
             metrics["sen_mean"] = None
             
-        # Per-sample summary statistics (using online stats)
         sample_concordances = []
         sample_r2s = []
-        sample_sen_values = []
-        sample_sen_median_values = []
-
-        def median(values):
-            if not values:
-                return None
-            values = sorted(values)
-            mid = len(values) // 2
-            if len(values) % 2 == 1:
-                return values[mid]
-            return (values[mid - 1] + values[mid]) / 2.0
+        sample_sen_means = []
+        sample_sen_mins = []
+        sample_sen_maxs = []
 
         for sample, data in sample_metrics.items():
             if data["total"] > 0:
@@ -1184,10 +1182,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                 if var_t > 0 and var_i > 0:
                     r = cov / math.sqrt(var_t * var_i)
                     sample_r2s.append(r ** 2)
-            sen_vals = data.get("sen_values", [])
-            if sen_vals:
-                sample_sen_values.append(data.get("sen_sum", 0.0) / len(sen_vals))
-                sample_sen_median_values.append(median(sen_vals))
+            if data["sen_count"] > 0:
+                sample_sen_means.append(data["sen_sum"] / data["sen_count"])
+                sample_sen_mins.append(data["sen_min"])
+                sample_sen_maxs.append(data["sen_max"])
         
         if sample_concordances:
             metrics["sample_concordance_mean"] = sum(sample_concordances) / len(sample_concordances)
@@ -1196,11 +1194,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
         if sample_r2s:
             metrics["sample_r2_mean"] = sum(sample_r2s) / len(sample_r2s)
             metrics["sample_r2_min"] = min(sample_r2s)
-        if sample_sen_values:
-            metrics["sample_sen_mean"] = sum(sample_sen_values) / len(sample_sen_values)
-            metrics["sample_sen_median"] = median(sample_sen_median_values) if sample_sen_median_values else None
-            metrics["sample_sen_min"] = min(sample_sen_values)
-            metrics["sample_sen_max"] = max(sample_sen_values)
+        if sample_sen_means:
+            metrics["sample_sen_mean"] = sum(sample_sen_means) / len(sample_sen_means)
+            metrics["sample_sen_median"] = None
+            metrics["sample_sen_min"] = min(sample_sen_mins)
+            metrics["sample_sen_max"] = max(sample_sen_maxs)
 
         # Per-MAF bin metrics
         metrics["by_maf"] = {}
@@ -1239,8 +1237,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                         r = cov / math.sqrt(var_t * var_i)
                         bin_metrics["r_squared"] = r ** 2
                 # IQS per bin
-                if data["iqs_values"]:
-                    bin_metrics["iqs"] = sum(data["iqs_values"]) / len(data["iqs_values"])
+                if data["iqs_count"] > 0:
+                    bin_metrics["iqs"] = data["iqs_sum"] / data["iqs_count"]
                 # Switch error rate per bin
                 if data["switch_opportunities"] > 0:
                     bin_metrics["switch_error_rate"] = data["switch_errors"] / data["switch_opportunities"]
@@ -1329,7 +1327,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
         if metrics.get('sample_r2_mean'):
             print(f"   R²:          mean={metrics['sample_r2_mean']:.4f}, min={metrics['sample_r2_min']:.4f}")
         if metrics.get('sample_sen_mean') is not None:
-            print(f"   SEN:         mean={metrics['sample_sen_mean']:.4f}, median={metrics['sample_sen_median']:.4f}, min={metrics['sample_sen_min']:.4f}, max={metrics['sample_sen_max']:.4f}")
+            print(f"   SEN:         mean={metrics['sample_sen_mean']:.4f}, min={metrics['sample_sen_min']:.4f}, max={metrics['sample_sen_max']:.4f}")
         if metrics.get('sample_switch_error_mean') is not None:
             print(f"   Switch Err:  mean={metrics['sample_switch_error_mean']:.4f}, min={metrics['sample_switch_error_min']:.4f}, max={metrics['sample_switch_error_max']:.4f}")
 
