@@ -246,10 +246,10 @@ def run_conversion(input_path, output_vcf):
 
     cmd = [
         "convert_genome",
-        "--input", raw_file,
-        "--reference", ref_hg38_url,
+        raw_file,
+        ref_hg38_url,
+        temp_hg38_vcf,
         "--assembly", "GRCh38",
-        "--output", temp_hg38_vcf,
         "--format", "vcf",
     ]
 
