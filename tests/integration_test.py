@@ -489,6 +489,34 @@ def load_input_sites(input_vcf):
     return sites
 
 
+def get_vcf_samples(vcf_path):
+    """Stream sample names from VCF header."""
+    if not vcf_path or not os.path.exists(vcf_path):
+        return []
+    
+    # 1. Check validity first
+    check_cmd = f"bcftools view -h {vcf_path} 2>/dev/null | head -1"
+    try:
+        subprocess.run(check_cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print(f"Warning: VCF header check failed for {vcf_path}")
+        return []
+
+    # 2. Query samples (streaming)
+    cmd = f"bcftools query -l {vcf_path}"
+    samples = []
+    try:
+        for line in _stream_vcf_lines(cmd):
+            s = line.strip()
+            if s:
+                samples.append(s)
+    except Exception as e:
+        print(f"Error reading samples from {vcf_path}: {e}")
+        return []
+        
+    return samples
+
+
 def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     """
     Calculate comprehensive imputation accuracy metrics.
@@ -517,10 +545,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     print(f"\nCalculating metrics: {imputed_vcf} vs {truth_vcf}")
 
     # Get sample lists first (small memory footprint)
-    samples_result = run(f"bcftools query -l {truth_vcf}", capture=True)
-    truth_samples = samples_result.stdout.strip().split('\n')
-    samples_result = run(f"bcftools query -l {imputed_vcf}", capture=True)
-    imputed_samples = samples_result.stdout.strip().split('\n')
+    # Get sample lists first (streaming to avoid memory issues with corrupt files)
+    truth_samples = get_vcf_samples(truth_vcf)
+    imputed_samples = get_vcf_samples(imputed_vcf)
 
     print(f"Truth samples: {len(truth_samples)}, Imputed samples: {len(imputed_samples)}")
 
