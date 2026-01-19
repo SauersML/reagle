@@ -72,9 +72,10 @@ impl MarkerImputationStats {
 
         let sum = self.sum_p[allele];
         let n = self.n_haps as f32;
-        // Robust check for monomorphic sites (sum approx 0 or n)
-        if sum.abs() < 1e-5 || (sum - n).abs() < 1e-5 {
-            return 0.0;
+        // Monomorphic sites (sum ≈ 0 or sum ≈ n) have no variance to measure.
+        // Return 1.0 because they trivially impute correctly.
+        if sum == 0.0 || (sum - n).abs() <= 1e-8 {
+            return 1.0;
         }
 
 
