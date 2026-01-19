@@ -41,6 +41,8 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased> {
     /// None if no confidence information available (assume full confidence).
     confidence: Option<Vec<Vec<u8>>>,
 
+    likelihoods_pl: Option<Vec<Vec<Vec<u16>>>>,
+
     /// Phantom data to hold the State type parameter (zero-sized)
     phantom: PhantomData<State>,
 }
@@ -126,6 +128,15 @@ impl<S: PhaseState> GenotypeMatrix<S> {
         self.confidence.clone()
     }
 
+    #[inline]
+    pub fn sample_pl(&self, marker: MarkerIdx, sample_idx: usize) -> Option<&[u16]> {
+        self.likelihoods_pl
+            .as_ref()
+            .and_then(|m| m.get(marker.as_usize()))
+            .and_then(|row| row.get(sample_idx))
+            .map(|v| v.as_slice())
+    }
+
 }
 
 // ============================================================================
@@ -146,6 +157,7 @@ impl GenotypeMatrix<Unphased> {
             samples,
             is_reversed: false,
             confidence: None,
+            likelihoods_pl: None,
             phantom: PhantomData,
         }
     }
@@ -165,6 +177,30 @@ impl GenotypeMatrix<Unphased> {
             samples,
             is_reversed: false,
             confidence: Some(confidence),
+            likelihoods_pl: None,
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn new_unphased_with_confidence_and_likelihoods(
+        markers: Markers,
+        columns: Vec<GenotypeColumn>,
+        samples: Arc<Samples>,
+        confidence: Option<Vec<Vec<u8>>>,
+        likelihoods_pl: Vec<Vec<Vec<u16>>>,
+    ) -> Self {
+        debug_assert_eq!(markers.len(), columns.len());
+        debug_assert_eq!(markers.len(), likelihoods_pl.len());
+        if let Some(ref conf) = confidence {
+            debug_assert_eq!(markers.len(), conf.len());
+        }
+        Self {
+            markers,
+            columns,
+            samples,
+            is_reversed: false,
+            confidence,
+            likelihoods_pl: Some(likelihoods_pl),
             phantom: PhantomData,
         }
     }
@@ -180,6 +216,7 @@ impl GenotypeMatrix<Unphased> {
             samples: self.samples,
             is_reversed: self.is_reversed,
             confidence: self.confidence,
+            likelihoods_pl: self.likelihoods_pl,
             phantom: PhantomData,
         }
     }
@@ -203,6 +240,7 @@ impl GenotypeMatrix<Phased> {
             samples,
             is_reversed: false,
             confidence: None,
+            likelihoods_pl: None,
             phantom: PhantomData,
         }
     }
@@ -222,6 +260,7 @@ impl GenotypeMatrix<Phased> {
             samples,
             is_reversed: false,
             confidence: Some(confidence),
+            likelihoods_pl: None,
             phantom: PhantomData,
         }
     }

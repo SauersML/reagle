@@ -249,6 +249,7 @@ struct BufferedMarker {
     column: GenotypeColumn,
     gen_pos: f64,
     confidences: Option<Vec<u8>>,
+    likelihoods_pl: Option<Vec<Vec<u16>>>,
 }
 
 /// Streaming VCF reader that yields windows
@@ -502,6 +503,8 @@ impl StreamingVcfReader {
         let mut markers = Markers::new();
         let mut columns = Vec::with_capacity(window_end);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
+        let mut likelihoods_pl: Vec<Vec<Vec<u16>>> = Vec::new();
+        let mut has_any_likelihoods = false;
 
         for i in 0..window_end {
             let bm = &self.buffer[i];
@@ -521,6 +524,13 @@ impl StreamingVcfReader {
                     confidences.push(vec![255; self.samples.len()]);
                 }
             }
+
+            if let Some(pl) = &bm.likelihoods_pl {
+                has_any_likelihoods = true;
+                likelihoods_pl.push(pl.clone());
+            } else if has_any_likelihoods {
+                likelihoods_pl.push(vec![Vec::new(); self.samples.len()]);
+            }
         }
 
         if let Some(ref ploidy) = self.sample_ploidy {
@@ -528,8 +538,21 @@ impl StreamingVcfReader {
             self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
         }
 
-        let genotypes = if self.has_any_confidence {
-            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), confidences)
+        let confidence_opt = if self.has_any_confidence {
+            Some(confidences)
+        } else {
+            None
+        };
+        let genotypes = if has_any_likelihoods {
+            GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
+                markers,
+                columns,
+                Arc::clone(&self.samples),
+                confidence_opt,
+                likelihoods_pl,
+            )
+        } else if let Some(conf) = confidence_opt {
+            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)
         } else {
             GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
         };
@@ -619,6 +642,8 @@ impl StreamingVcfReader {
         let mut markers = Markers::new();
         let mut columns = Vec::with_capacity(n_markers);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
+        let mut likelihoods_pl: Vec<Vec<Vec<u16>>> = Vec::new();
+        let mut has_any_likelihoods = false;
 
         for &i in &indices {
             let bm = &self.buffer[i];
@@ -638,15 +663,30 @@ impl StreamingVcfReader {
                     confidences.push(vec![255; self.samples.len()]);
                 }
             }
+
+            if let Some(pl) = &bm.likelihoods_pl {
+                has_any_likelihoods = true;
+                likelihoods_pl.push(pl.clone());
+            } else if has_any_likelihoods {
+                likelihoods_pl.push(vec![Vec::new(); self.samples.len()]);
+            }
         }
 
-        let genotypes = if self.has_any_confidence {
-            GenotypeMatrix::new_unphased_with_confidence(
+        let confidence_opt = if self.has_any_confidence {
+            Some(confidences)
+        } else {
+            None
+        };
+        let genotypes = if has_any_likelihoods {
+            GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                 markers,
                 columns,
                 Arc::clone(&self.samples),
-                confidences,
+                confidence_opt,
+                likelihoods_pl,
             )
+        } else if let Some(conf) = confidence_opt {
+            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)
         } else {
             GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
         };
@@ -762,11 +802,17 @@ impl StreamingVcfReader {
             .position(|f| f == "GT")
             .ok_or_else(|| ReagleError::parse(self.global_marker_idx, "No GT field in FORMAT"))?;
         let gl_idx = format.split(':').position(|f| f == "GL");
+        let pl_idx = format.split(':').position(|f| f == "PL");
 
         // Parse genotypes
         let n_samples = self.samples.len();
         let mut alleles = Vec::with_capacity(n_samples * 2);
         let mut confidences: Option<Vec<u8>> = gl_idx.map(|_| Vec::with_capacity(n_samples));
+        let mut likelihoods_pl: Option<Vec<Vec<u16>>> = if pl_idx.is_some() || gl_idx.is_some() {
+            Some(Vec::with_capacity(n_samples))
+        } else {
+            None
+        };
 
         if self.sample_ploidy.is_none() {
             self.sample_ploidy = Some(vec![true; n_samples]);
@@ -789,6 +835,25 @@ impl StreamingVcfReader {
 
             alleles.push(a1);
             alleles.push(a2);
+
+            if let Some(ref mut pl_out) = likelihoods_pl {
+                let pl_vec = if let Some(pl_i) = pl_idx {
+                    sample_field
+                        .split(':')
+                        .nth(pl_i)
+                        .and_then(crate::io::vcf::parse_pl)
+                        .unwrap_or_else(Vec::new)
+                } else if let Some(gl_i) = gl_idx {
+                    sample_field
+                        .split(':')
+                        .nth(gl_i)
+                        .and_then(crate::io::vcf::gl_to_pl)
+                        .unwrap_or_else(Vec::new)
+                } else {
+                    Vec::new()
+                };
+                pl_out.push(pl_vec);
+            }
 
             if let Some(gl_i) = gl_idx {
                 if let Some(conf_vec) = confidences.as_mut() {
@@ -818,6 +883,7 @@ impl StreamingVcfReader {
             column,
             gen_pos,
             confidences,
+            likelihoods_pl,
         })
     }
 }
