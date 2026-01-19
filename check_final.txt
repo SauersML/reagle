@@ -1,0 +1,24 @@
+   Compiling reagle v0.1.0 (/app)
+error: unused import: `reagle::data`
+  --> src/main.rs:20:5
+   |
+20 | use reagle::data;
+   |     ^^^^^^^^^^^^
+   |
+   = note: `-D unused-imports` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: unused import: `reagle::io`
+  --> src/main.rs:22:5
+   |
+22 | use reagle::io;
+   |     ^^^^^^^^^^
+
+error: unused import: `reagle::model`
+  --> src/main.rs:23:5
+   |
+23 | use reagle::model;
+   |     ^^^^^^^^^^^^^
+
+error: could not compile `reagle` (bin "reagle") due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...

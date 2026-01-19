@@ -1381,12 +1381,8 @@ target_samples={} target_bytes={}",
                                 let overlap_start = output_end.saturating_sub(overlap_size);
                                 let prior_marker = overlap_start.min(n_ref_markers.saturating_sub(1));
                                 let (hap_ids, probs) = state_probs.haplotype_priors_at(prior_marker);
-                                let gen_pos = gen_maps.gen_pos(
-                                    chrom,
-                                    ref_win.marker(MarkerIdx::new(prior_marker as u32)).pos,
-                                );
                                 let mut priors = HaplotypePriors::new();
-                                priors.set_from_posteriors(&hap_ids, &probs, gen_pos, window_idx);
+                                priors.set_from_posteriors(&hap_ids, &probs);
                                 priors
                             } else {
                                 HaplotypePriors::new()
@@ -1443,12 +1439,8 @@ target_samples={} target_bytes={}",
                                 let overlap_start = output_end.saturating_sub(overlap_size);
                                 let prior_marker = overlap_start.min(n_ref_markers.saturating_sub(1));
                                 let (hap_ids, probs) = state_probs.haplotype_priors_at(prior_marker);
-                                let gen_pos = gen_maps.gen_pos(
-                                    chrom,
-                                    ref_win.marker(MarkerIdx::new(prior_marker as u32)).pos,
-                                );
                                 let mut priors = HaplotypePriors::new();
-                                priors.set_from_posteriors(&hap_ids, &probs, gen_pos, window_idx);
+                                priors.set_from_posteriors(&hap_ids, &probs);
                                 priors
                             } else {
                                 HaplotypePriors::new()

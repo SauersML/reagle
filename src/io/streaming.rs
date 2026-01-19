@@ -110,11 +110,9 @@ impl HaplotypePriors {
     /// Set priors from HMM state posteriors at window boundary.
     /// Uses an adaptive threshold to avoid discarding most mass at high state counts.
     /// Sorts by hap_id for efficient binary search lookup.
-    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32], gen_position: f64, window: usize) {
+    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32]) {
         self.hap_ids.clear();
         self.probs.clear();
-
-        let _ = (gen_position, window);
 
         let adaptive_min = (1.0 / hap_indices.len().max(1) as f32) * 0.5;
         let min_prob = adaptive_min.min(0.001).max(1e-6);

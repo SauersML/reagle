@@ -1207,7 +1207,8 @@ impl VcfWriter {
 
 impl Drop for VcfWriter {
     fn drop(&mut self) {
-        let _ = self.flush();
+        let res = self.flush();
+        let _ = &res;
     }
 }
 

@@ -330,7 +330,8 @@ impl HeartbeatHandle {
     pub fn shutdown(mut self) {
         self.blackboard.signal_shutdown();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            let res = handle.join();
+            let _ = &res;
         }
     }
 }
@@ -606,7 +607,8 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
     // Clear TTY line on shutdown
     if is_tty {
         eprint!("\r\x1b[K");
-        let _ = io::stderr().flush();
+        let res = io::stderr().flush();
+        let _ = &res;
     }
 }
 
