@@ -198,6 +198,8 @@ struct MosaicBuffers {
     fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     ref_alleles: Vec<u8>,
+    weights: Vec<f32>,
+    allele_probs: Vec<f32>,
     hap1_checkpoints: FwdCheckpoints,
     hap2_checkpoints: FwdCheckpoints,
     hap1_allele: Vec<u8>,
@@ -228,6 +230,8 @@ struct MosaicChain<'a> {
     fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     ref_alleles: Vec<u8>,
+    weights: Vec<f32>,
+    allele_probs: Vec<f32>,
     hap1_checkpoints: FwdCheckpoints,
     hap1_allele: Vec<u8>,
     hap1_use_combined: Vec<bool>,
@@ -273,6 +277,8 @@ impl<'a> MosaicChain<'a> {
             fwd: buffers.fwd,
             fwd_prior: buffers.fwd_prior,
             ref_alleles: buffers.ref_alleles,
+            weights: buffers.weights,
+            allele_probs: buffers.allele_probs,
             hap1_checkpoints: buffers.hap1_checkpoints,
             hap1_allele: buffers.hap1_allele,
             hap1_use_combined: buffers.hap1_use_combined,
@@ -304,6 +310,8 @@ impl<'a> MosaicChain<'a> {
             fwd: self.fwd,
             fwd_prior: self.fwd_prior,
             ref_alleles: self.ref_alleles,
+            weights: self.weights,
+            allele_probs: self.allele_probs,
             hap1_checkpoints: self.hap1_checkpoints,
             hap2_checkpoints: self.hap2_checkpoints,
             hap1_allele: self.hap1_allele,
@@ -446,6 +454,9 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                 self.p_err,
                 &mut self.rng,
                 &mut self.fwd_block,
+                &mut self.weights,
+                &mut self.ref_alleles,
+                &mut self.allele_probs,
                 EmissionMode::Combined,
             );
             self.first_iteration = false;
@@ -468,6 +479,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                 &self.hap1_use_combined,
                 self.lookup,
                 self.pl_provider.as_ref(),
+                &mut self.allele_probs,
                 fwd,
                 fwd_prior,
                 ref_alleles,
@@ -492,6 +504,9 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                 self.p_err,
                 &mut self.rng,
                 &mut self.fwd_block,
+                &mut self.weights,
+                &mut self.ref_alleles,
+                &mut self.allele_probs,
                 EmissionMode::Hap,
             );
         }
@@ -513,6 +528,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
             &self.hap2_use_combined,
             self.lookup,
             self.pl_provider.as_ref(),
+            &mut self.allele_probs,
             fwd,
             fwd_prior,
             ref_alleles,
@@ -537,6 +553,9 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
             self.p_err,
             &mut self.rng,
             &mut self.fwd_block,
+            &mut self.weights,
+            &mut self.ref_alleles,
+            &mut self.allele_probs,
             EmissionMode::Hap,
         );
         self.update_trace();
@@ -3586,6 +3605,7 @@ fn build_fwd_checkpoints(
     hap2_use_combined: &[bool],
     lookup: &RefAlleleLookup,
     pl_provider: Option<&PlProvider>,
+    allele_probs: &mut Vec<f32>,
     fwd: &mut [f32],
     fwd_prior: &mut [f32],
     ref_alleles: &mut [u8],
@@ -3604,8 +3624,6 @@ fn build_fwd_checkpoints(
     fwd_prior[..n_states].fill(0.0);
     let init = 1.0f32 / n_states as f32;
     let mut fwd_sum = 1.0f32;
-
-    let mut allele_probs: Vec<f32> = Vec::new();
 
     let mut next_block_idx = 0usize;
     let mut next_block_start = checkpoints
@@ -3655,11 +3673,11 @@ fn build_fwd_checkpoints(
         let mut pl_n_alleles: Option<usize> = None;
         if let Some(pl) = pl {
             if use_combined {
-                pl_n_alleles = allele_probs_uncond_from_pl(pl, &mut allele_probs);
+                pl_n_alleles = allele_probs_uncond_from_pl(pl, allele_probs);
             } else {
                 let partner = hap2_allele[m];
-                pl_n_alleles = allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
-                    .or_else(|| allele_probs_uncond_from_pl(pl, &mut allele_probs));
+                pl_n_alleles = allele_probs_cond_from_pl(pl, partner, allele_probs)
+                    .or_else(|| allele_probs_uncond_from_pl(pl, allele_probs));
             }
         }
         let p_no_err_pl = 1.0 - p_err;
@@ -3827,6 +3845,9 @@ fn sample_path_from_checkpoints(
     p_err: f32,
     rng: &mut rand::rngs::SmallRng,
     fwd_block: &mut [f32],
+    weights: &mut [f32],
+    ref_alleles: &mut [u8],
+    allele_probs: &mut Vec<f32>,
     mode: EmissionMode,
 ) {
     use wide::f32x8;
@@ -3838,9 +3859,8 @@ fn sample_path_from_checkpoints(
     let starts = checkpoints.block_starts.as_ref();
     let n_blocks = starts.len().max(1);
 
-    let mut weights = vec![0.0f32; n_states];
-    let mut ref_alleles = vec![0u8; n_states];
-    let mut allele_probs: Vec<f32> = Vec::new();
+    let weights = &mut weights[..n_states];
+    let ref_alleles = &mut ref_alleles[..n_states];
 
     for block_idx in (0..n_blocks).rev() {
         let start = starts.get(block_idx).copied().unwrap_or(0).min(n_markers);
@@ -3892,11 +3912,11 @@ fn sample_path_from_checkpoints(
             let mut pl_n_alleles: Option<usize> = None;
             if let Some(pl) = pl {
                 if use_combined {
-                    pl_n_alleles = allele_probs_uncond_from_pl(pl, &mut allele_probs);
+                    pl_n_alleles = allele_probs_uncond_from_pl(pl, allele_probs);
                 } else {
                     let partner = hap2_allele[m];
-                    pl_n_alleles = allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
-                        .or_else(|| allele_probs_uncond_from_pl(pl, &mut allele_probs));
+                    pl_n_alleles = allele_probs_cond_from_pl(pl, partner, allele_probs)
+                        .or_else(|| allele_probs_uncond_from_pl(pl, allele_probs));
                 }
             }
             let p_no_err_pl = 1.0 - p_err;
@@ -4586,6 +4606,7 @@ fn sample_swap_bits_mosaic(
         &dummy_combined,
         lookup,
         pl_provider.as_ref(),
+        &mut workspace.allele_probs,
         fwd,
         fwd_prior,
         ref_alleles,
@@ -4603,6 +4624,8 @@ fn sample_swap_bits_mosaic(
         fwd: std::mem::replace(&mut workspace.fwd, aligned_vec::AVec::new(32)),
         fwd_prior: std::mem::replace(&mut workspace.fwd_prior, aligned_vec::AVec::new(32)),
         ref_alleles: std::mem::take(&mut workspace.ref_alleles),
+        weights: std::mem::take(&mut workspace.weights),
+        allele_probs: std::mem::take(&mut workspace.allele_probs),
         hap1_checkpoints: FwdCheckpoints::from_buffer(
             block_starts.clone(),
             n_states,
@@ -4743,6 +4766,8 @@ fn sample_swap_bits_mosaic(
     workspace.fwd = returned.fwd;
     workspace.fwd_prior = returned.fwd_prior;
     workspace.ref_alleles = returned.ref_alleles;
+    workspace.weights = returned.weights;
+    workspace.allele_probs = returned.allele_probs;
     workspace.hap1_checkpoint_data = returned.hap1_checkpoints.into_buffer();
     workspace.hap2_checkpoint_data = returned.hap2_checkpoints.into_buffer();
     workspace.hap1_allele = returned.hap1_allele;
