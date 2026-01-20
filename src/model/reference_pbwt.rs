@@ -231,13 +231,29 @@ impl ReferencePbwt {
             };
 
             if qa == 255 {
+                // Missing query allele: mapping to the union of all bins can cause an
+                // interval explosion and (with overflow merging) degenerate to the full
+                // reference range on sparse targets. Instead, keep only the most informative
+                // mapped intervals.
+                let mut candidates: Vec<(u32, u32, u32)> = Vec::new();
                 for &(l, r) in old.intervals() {
                     for b in 0..n_bins {
                         let nl = self.offsets[b] + self.rank(b, l, n_ref);
                         let nr = self.offsets[b] + self.rank(b, r, n_ref);
-                        next.push_interval(nl, nr);
+                        if nl < nr {
+                            let len = nr - nl;
+                            let score = len.saturating_mul(self.counts[b]);
+                            candidates.push((nl, nr, score));
+                        }
                     }
                 }
+
+                candidates.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                let keep = candidates.len().min(MAX_RANK_INTERVALS);
+                for i in 0..keep {
+                    next.intervals[i] = (candidates[i].0, candidates[i].1);
+                }
+                next.len = keep;
             } else {
                 let b = Self::bin_for_allele(qa, n_alleles);
                 if b < n_bins {

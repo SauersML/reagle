@@ -504,7 +504,8 @@ impl StreamingVcfReader {
         let mut columns = Vec::with_capacity(window_end);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
         let mut likelihoods_pl: Vec<Vec<Vec<u16>>> = Vec::new();
-        let mut has_any_likelihoods = false;
+        let n_samples = self.samples.len();
+        let has_any_likelihoods = self.buffer.iter().take(window_end).any(|bm| bm.likelihoods_pl.is_some());
 
         for i in 0..window_end {
             let bm = &self.buffer[i];
@@ -525,11 +526,12 @@ impl StreamingVcfReader {
                 }
             }
 
-            if let Some(pl) = &bm.likelihoods_pl {
-                has_any_likelihoods = true;
-                likelihoods_pl.push(pl.clone());
-            } else if has_any_likelihoods {
-                likelihoods_pl.push(vec![Vec::new(); self.samples.len()]);
+            if has_any_likelihoods {
+                likelihoods_pl.push(
+                    bm.likelihoods_pl
+                        .clone()
+                        .unwrap_or_else(|| vec![Vec::new(); n_samples]),
+                );
             }
         }
 
@@ -643,7 +645,10 @@ impl StreamingVcfReader {
         let mut columns = Vec::with_capacity(n_markers);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
         let mut likelihoods_pl: Vec<Vec<Vec<u16>>> = Vec::new();
-        let mut has_any_likelihoods = false;
+        let n_samples = self.samples.len();
+        let has_any_likelihoods = indices
+            .iter()
+            .any(|&i| self.buffer.get(i).is_some_and(|bm| bm.likelihoods_pl.is_some()));
 
         for &i in &indices {
             let bm = &self.buffer[i];
@@ -664,11 +669,12 @@ impl StreamingVcfReader {
                 }
             }
 
-            if let Some(pl) = &bm.likelihoods_pl {
-                has_any_likelihoods = true;
-                likelihoods_pl.push(pl.clone());
-            } else if has_any_likelihoods {
-                likelihoods_pl.push(vec![Vec::new(); self.samples.len()]);
+            if has_any_likelihoods {
+                likelihoods_pl.push(
+                    bm.likelihoods_pl
+                        .clone()
+                        .unwrap_or_else(|| vec![Vec::new(); n_samples]),
+                );
             }
         }
 

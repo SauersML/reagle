@@ -373,10 +373,11 @@ impl VcfReader {
         info_span!("vcf_read_all").in_scope(|| {
         let mut markers = Markers::new();
         let mut columns = Vec::new();
+        let n_samples = self.samples.len();
         // Accumulate per-marker confidence scores (one Vec<u8> per marker, indexed by sample)
-        let mut all_confidences: Vec<Vec<u8>> = Vec::new();
+        let mut all_confidences: Vec<Option<Vec<u8>>> = Vec::new();
         let mut has_any_confidence = false;
-        let mut all_likelihoods_pl: Vec<Vec<Vec<u16>>> = Vec::new();
+        let mut all_likelihoods_pl: Vec<Option<Vec<Vec<u16>>>> = Vec::new();
         let mut has_any_likelihoods = false;
 
         let mut line = String::new();
@@ -456,22 +457,15 @@ impl VcfReader {
             }
 
             // Store confidence scores
-            if let Some(conf) = confidences {
+            if confidences.is_some() {
                 has_any_confidence = true;
-                all_confidences.push(conf);
-            } else if has_any_confidence {
-                // If we've seen confidence before but this marker has none, fill with 255
-                let n_samples = self.samples.len();
-                all_confidences.push(vec![255; n_samples]);
             }
+            all_confidences.push(confidences);
 
-            if let Some(pl) = likelihoods_pl {
+            if likelihoods_pl.is_some() {
                 has_any_likelihoods = true;
-                all_likelihoods_pl.push(pl);
-            } else if has_any_likelihoods {
-                let n_samples = self.samples.len();
-                all_likelihoods_pl.push(vec![Vec::new(); n_samples]);
             }
+            all_likelihoods_pl.push(likelihoods_pl);
 
             // Calculate actual number of alleles: 1 REF + N ALT
             let n_alleles = 1 + marker.alt_alleles.len();
@@ -508,7 +502,12 @@ impl VcfReader {
         self.finalize_samples();
 
         let confidence_opt = if has_any_confidence && all_confidences.len() == columns.len() {
-            Some(all_confidences)
+            Some(
+                all_confidences
+                    .into_iter()
+                    .map(|c| c.unwrap_or_else(|| vec![255; n_samples]))
+                    .collect(),
+            )
         } else {
             None
         };
@@ -519,7 +518,10 @@ impl VcfReader {
                 columns,
                 Arc::clone(&self.samples),
                 confidence_opt,
-                all_likelihoods_pl,
+                all_likelihoods_pl
+                    .into_iter()
+                    .map(|pl| pl.unwrap_or_else(|| vec![Vec::new(); n_samples]))
+                    .collect(),
             )
         } else if let Some(conf) = confidence_opt {
             GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)

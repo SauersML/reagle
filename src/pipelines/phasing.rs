@@ -1795,7 +1795,7 @@ impl PhasingPipeline {
             next_block_end_bwd = donor_blocks[block_idx_bwd].1;
         }
 
-        for m in (0..n_markers).rev() {
+        for (rev_step, m) in (0..n_markers).rev().enumerate() {
             let orig_m = marker_to_global
                 .and_then(|map| map.get(m).copied())
                 .unwrap_or(m);
@@ -1825,7 +1825,7 @@ impl PhasingPipeline {
             pbwt_bwd.advance_with_beams(
                 &ref_alleles,
                 n_alleles,
-                m,
+                rev_step,
                 &query_alleles,
                 &mut beams_bwd,
             );
