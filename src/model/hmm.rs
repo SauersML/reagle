@@ -280,6 +280,44 @@ impl<'a> BeagleHmm<'a> {
         let mut log_likelihood = 0.0f64;
         let mut history: Vec<StateSwitch> = Vec::with_capacity(n_markers);
 
+        let conf_at = |m: usize| -> f32 {
+            target_conf
+                .and_then(|c| c.get(m).copied())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0)
+        };
+
+        let required_allele = |m: usize, partner: u8| -> Option<u8> {
+            let g1 = *geno_a1.get(m).unwrap_or(&255);
+            let g2 = *geno_a2.get(m).unwrap_or(&255);
+            if g1 == 255 || g2 == 255 {
+                return None;
+            }
+            if g1 == g2 {
+                return Some(g1);
+            }
+            if partner == g1 {
+                return Some(g2);
+            }
+            if partner == g2 {
+                return Some(g1);
+            }
+            None
+        };
+
+        let fill_conf_emissions = |m: usize, partner: u8, emissions: &mut [f32], ref_alleles: &[u8]| {
+            let conf = conf_at(m);
+            if let Some(req) = required_allele(m, partner) {
+                let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+                let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+                for (k, &ra) in ref_alleles.iter().enumerate() {
+                    emissions[k] = if ra == req { p_no_err } else { p_err };
+                }
+            } else {
+                emissions.fill(1.0);
+            }
+        };
+
         for m in 0..n_markers {
             let p_recomb_m = self.p_recomb.get(m).copied().unwrap_or(0.0);
 
@@ -315,40 +353,14 @@ impl<'a> BeagleHmm<'a> {
                             );
                         }
                     } else {
-                        emissions.fill(1.0);
+                        fill_conf_emissions(m, partner, &mut emissions, &scratch.alleles);
                     }
                 } else {
-                    emissions.fill(1.0);
+                    fill_conf_emissions(m, partner, &mut emissions, &scratch.alleles);
                 }
             } else {
-                let conf = target_conf
-                    .and_then(|c| c.get(m).copied())
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 1.0);
-                let geno1 = geno_a1[m];
-                let geno2 = geno_a2[m];
-                let partner = partner_alleles[m];
-                let required = if geno1 == 255 || geno2 == 255 {
-                    None
-                } else if geno1 == geno2 {
-                    Some(geno1)
-                } else if partner == geno1 {
-                    Some(geno2)
-                } else if partner == geno2 {
-                    Some(geno1)
-                } else {
-                    None
-                };
-
-                if let Some(req) = required {
-                    let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
-                    let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
-                    for k in 0..n_states {
-                        emissions[k] = if scratch.alleles[k] == req { p_no_err } else { p_err };
-                    }
-                } else {
-                    emissions.fill(1.0);
-                };
+                let partner = partner_alleles.get(m).copied().unwrap_or(255);
+                fill_conf_emissions(m, partner, &mut emissions, &scratch.alleles);
             }
 
             let row_offset = m * n_states;
@@ -423,40 +435,14 @@ impl<'a> BeagleHmm<'a> {
                             );
                         }
                     } else {
-                        emissions.fill(1.0);
+                        fill_conf_emissions(m_next, partner, &mut emissions, &scratch.alleles);
                     }
                 } else {
-                    emissions.fill(1.0);
+                    fill_conf_emissions(m_next, partner, &mut emissions, &scratch.alleles);
                 }
             } else {
-                let conf = target_conf
-                    .and_then(|c| c.get(m_next).copied())
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 1.0);
-                let geno1 = geno_a1[m_next];
-                let geno2 = geno_a2[m_next];
-                let partner = partner_alleles[m_next];
-                let required = if geno1 == 255 || geno2 == 255 {
-                    None
-                } else if geno1 == geno2 {
-                    Some(geno1)
-                } else if partner == geno1 {
-                    Some(geno2)
-                } else if partner == geno2 {
-                    Some(geno1)
-                } else {
-                    None
-                };
-
-                if let Some(req) = required {
-                    let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
-                    let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
-                    for k in 0..n_states {
-                        emissions[k] = if scratch.alleles[k] == req { p_no_err } else { p_err };
-                    }
-                } else {
-                    emissions.fill(1.0);
-                };
+                let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
+                fill_conf_emissions(m_next, partner, &mut emissions, &scratch.alleles);
             }
 
             let next_row = m_next * n_states;
@@ -511,6 +497,44 @@ impl<'a> BeagleHmm<'a> {
 
         let mut allele_probs: Vec<f32> = Vec::new();
 
+        let conf_at = |m: usize| -> f32 {
+            target_conf
+                .and_then(|c| c.get(m).copied())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0)
+        };
+
+        let required_allele = |m: usize, partner: u8| -> Option<u8> {
+            let g1 = *geno_a1.get(m).unwrap_or(&255);
+            let g2 = *geno_a2.get(m).unwrap_or(&255);
+            if g1 == 255 || g2 == 255 {
+                return None;
+            }
+            if g1 == g2 {
+                return Some(g1);
+            }
+            if partner == g1 {
+                return Some(g2);
+            }
+            if partner == g2 {
+                return Some(g1);
+            }
+            None
+        };
+
+        let fill_conf_emissions = |m: usize, partner: u8, emissions: &mut [f32]| {
+            let conf = conf_at(m);
+            if let Some(req) = required_allele(m, partner) {
+                let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+                let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+                for k in 0..n_states {
+                    emissions[k] = if lookup.allele(m, k) == req { p_no_err } else { p_err };
+                }
+            } else {
+                emissions.fill(1.0);
+            }
+        };
+
         for m in 0..n_markers {
             let p_recomb_m = self.p_recomb.get(m).copied().unwrap_or(0.0);
             if let Some(plp) = pl_provider {
@@ -539,41 +563,14 @@ impl<'a> BeagleHmm<'a> {
                             );
                         }
                     } else {
-                        emissions.fill(1.0);
+                        fill_conf_emissions(m, partner, &mut emissions);
                     }
                 } else {
-                    emissions.fill(1.0);
+                    fill_conf_emissions(m, partner, &mut emissions);
                 }
             } else {
-                let conf = target_conf
-                    .and_then(|c| c.get(m).copied())
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 1.0);
-
-                let geno1 = geno_a1[m];
-                let geno2 = geno_a2[m];
-                let partner = partner_alleles[m];
-                let required = if geno1 == 255 || geno2 == 255 {
-                    None
-                } else if geno1 == geno2 {
-                    Some(geno1)
-                } else if partner == geno1 {
-                    Some(geno2)
-                } else if partner == geno2 {
-                    Some(geno1)
-                } else {
-                    None
-                };
-
-                if let Some(req) = required {
-                    let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
-                    let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
-                    for k in 0..n_states {
-                        emissions[k] = if lookup.allele(m, k) == req { p_no_err } else { p_err };
-                    }
-                } else {
-                    emissions.fill(1.0);
-                };
+                let partner = partner_alleles.get(m).copied().unwrap_or(255);
+                fill_conf_emissions(m, partner, &mut emissions);
             }
 
             let row_offset = m * n_states;
@@ -615,35 +612,41 @@ impl<'a> BeagleHmm<'a> {
             let m_next = m + 1;
             let p_recomb_next = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
 
-            let conf = target_conf
-                .and_then(|c| c.get(m_next).copied())
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0);
+            let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
 
-            let geno1 = geno_a1[m_next];
-            let geno2 = geno_a2[m_next];
-            let partner = partner_alleles[m_next];
-            let required = if geno1 == 255 || geno2 == 255 {
-                None
-            } else if geno1 == geno2 {
-                Some(geno1)
-            } else if partner == geno1 {
-                Some(geno2)
-            } else if partner == geno2 {
-                Some(geno1)
-            } else {
-                None
-            };
-
-            if let Some(req) = required {
-                let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
-                let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
-                for k in 0..n_states {
-                    emissions[k] = if lookup.allele(m_next, k) == req { p_no_err } else { p_err };
+            if let Some(plp) = pl_provider {
+                let pl = plp.pl(m_next).filter(|v| !v.is_empty());
+                if let Some(pl) = pl {
+                    let n = if partner != 255 {
+                        allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
+                            .or_else(|| allele_probs_uncond_from_pl(pl, &mut allele_probs))
+                    } else {
+                        allele_probs_uncond_from_pl(pl, &mut allele_probs)
+                    };
+                    if let Some(n_alleles) = n {
+                        let p_no_err = p_no_err_base;
+                        let p_err_other = if n_alleles > 1 {
+                            p_err_base / (n_alleles as f32 - 1.0)
+                        } else {
+                            0.0
+                        };
+                        for k in 0..n_states {
+                            emissions[k] = emit_from_allele_probs(
+                                lookup.allele(m_next, k),
+                                &allele_probs,
+                                p_no_err,
+                                p_err_other,
+                            );
+                        }
+                    } else {
+                        fill_conf_emissions(m_next, partner, &mut emissions);
+                    }
+                } else {
+                    fill_conf_emissions(m_next, partner, &mut emissions);
                 }
             } else {
-                emissions.fill(1.0);
-            };
+                fill_conf_emissions(m_next, partner, &mut emissions);
+            }
 
             let next_row = m_next * n_states;
             let curr_row = m * n_states;
