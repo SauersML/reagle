@@ -95,6 +95,10 @@ pub struct ThreadWorkspace {
     pub fwd_prior: AVec<f32, ConstAlign<32>>,
     /// Per-marker ref alleles buffer (n_states)
     pub ref_alleles: Vec<u8>,
+    /// Reusable weights buffer for backward sampling (n_states)
+    pub weights: Vec<f32>,
+    /// Reusable allele probability scratch (variable length; typically n_alleles)
+    pub allele_probs: Vec<f32>,
     /// MCMC path buffers
     pub path1: Vec<u32>,
     pub path2: Vec<u32>,
@@ -131,6 +135,8 @@ impl ThreadWorkspace {
             lookup: AVec::from_iter(32, std::iter::repeat(0).take(size)),
             fwd_prior: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
             ref_alleles: Vec::new(),
+            weights: Vec::new(),
+            allele_probs: Vec::new(),
             path1: Vec::new(),
             path2: Vec::new(),
             hap1_allele: Vec::new(),
@@ -165,12 +171,22 @@ impl ThreadWorkspace {
     }
 
     /// Ensure buffers are sized for the current window and state count.
-    pub fn ensure_for_window(&mut self, n_markers: usize, n_states: usize, block_size: usize) {
+    pub fn ensure_for_window(
+        &mut self,
+        n_markers: usize,
+        n_states: usize,
+        max_block_len: usize,
+        n_blocks: usize,
+    ) {
         self.resize_for_states(n_states);
         self.n_markers = n_markers;
 
         if self.ref_alleles.len() < n_states {
             self.ref_alleles.resize(n_states, 0);
+        }
+
+        if self.weights.len() < n_states {
+            self.weights.resize(n_states, 0.0);
         }
 
         if self.path1.len() < n_markers {
@@ -182,12 +198,11 @@ impl ThreadWorkspace {
             self.hap2_use_combined.resize(n_markers, true);
         }
 
-        let block_len = n_states * block_size;
+        let block_len = n_states * max_block_len;
         if self.fwd_block.len() < block_len {
             self.fwd_block.resize(block_len, 0.0);
         }
 
-        let n_blocks = (n_markers + block_size - 1) / block_size;
         let checkpoints_len = n_blocks * n_states;
         if self.combined_checkpoint_data.len() < checkpoints_len {
             self.combined_checkpoint_data.resize(checkpoints_len, 0.0);

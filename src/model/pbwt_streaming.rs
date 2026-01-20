@@ -229,14 +229,6 @@ impl PbwtWavefront {
         Self::with_state(n_haps, n_markers, None)
     }
 
-    pub fn n_haps(&self) -> usize {
-        self.n_haps
-    }
-
-    pub fn n_markers(&self) -> usize {
-        self.n_markers
-    }
-
     /// Create a new streaming PBWT wavefront with optional initial state
     pub fn with_state(
         n_haps: usize,
@@ -290,6 +282,7 @@ impl PbwtWavefront {
     }
 
     /// Reset for a new forward pass (starts at marker 0)
+    #[cfg(test)]
     pub fn reset_forward(&mut self) {
         for i in 0..self.n_haps {
             self.fwd_ppa[i] = i as u32;

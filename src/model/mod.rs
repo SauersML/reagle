@@ -49,6 +49,8 @@ pub mod imp_utils;
 pub mod parameters;
 pub mod pbwt;
 pub mod pbwt_streaming;
+pub mod reference_pbwt;
+pub mod pl_emission;
 pub mod phase_ibs;
 pub mod phase_states;
 pub mod states;

@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 use aligned_vec::{AVec, ConstAlign};
-use crate::data::haplotype::HapIdx;
-use crate::data::marker::MarkerIdx;
+use crate::data::{HapIdx, MarkerIdx};
+use crate::data::alignment::MarkerAlignment;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::storage::phase_state::Phased;
-use crate::data::alignment::MarkerAlignment;
 use crate::utils::workspace::ImpWorkspace;
+use crate::model::pl_emission::{PlProvider, allele_probs_uncond_from_pl, allele_probs_cond_from_pl};
 use crate::pipelines::imputation::ClusterStateProbs; // Assuming we keep it there or import it
 
 /// Minimum genetic distance between markers
@@ -107,6 +107,7 @@ pub fn compute_cluster_mismatches_into_workspace(
     geno_a2: &[u8],
     targ_alleles: &[u8],
     partner_alleles: Option<&[u8]>,
+    pl_provider: Option<&PlProvider>,
     sample_idx: usize,
     n_states: usize,
     workspace: &mut ImpWorkspace,
@@ -167,6 +168,7 @@ pub fn compute_cluster_mismatches_into_workspace(
         // than N_states * N_markers lookups.
         
         let mut active_markers = Vec::with_capacity(end - start);
+        let mut allele_probs: Vec<f32> = Vec::new();
         
         for &ref_m in &genotyped_markers[start..end] {
              let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
@@ -186,7 +188,47 @@ pub fn compute_cluster_mismatches_into_workspace(
              let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
              if confidence <= 0.0 { continue; }
 
-             let (log_match, log_mism) = get_log_probs(confidence, p_err);
+             // Prefer PL-derived emission when available and biallelic.
+             let log_match: f32;
+             let log_mism: f32;
+             if let Some(plp) = pl_provider {
+                 let pl = plp.pl(target_m).filter(|v| !v.is_empty());
+                 if let Some(pl) = pl {
+                     // Only do exact PL-based emissions for biallelic (0/1).
+                     // For multi-allelic, fall back to confidence-based approximation.
+                     let partner = partner_allele;
+                     let maybe_n = if partner != 255 {
+                         allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
+                     } else {
+                         allele_probs_uncond_from_pl(pl, &mut allele_probs)
+                     };
+                     if maybe_n == Some(2) {
+                         let req = if partner != 255 {
+                             if partner == geno1 { geno2 } else if partner == geno2 { geno1 } else { 255 }
+                         } else {
+                             targ_allele
+                         };
+                         if req < 2 {
+                             let p_req = allele_probs.get(req as usize).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                             let p_no_err = 1.0 - p_err;
+                             // For biallelic, the "other" probability is 1 - p_req.
+                             let emit_match = (p_no_err * p_req + p_err * (1.0 - p_req)).max(1e-30);
+                             let emit_mism = (p_no_err * (1.0 - p_req) + p_err * p_req).max(1e-30);
+                             log_match = emit_match.ln();
+                             log_mism = emit_mism.ln();
+                         } else {
+                             (log_match, log_mism) = get_log_probs(confidence, p_err);
+                         }
+                     } else {
+                         (log_match, log_mism) = get_log_probs(confidence, p_err);
+                     }
+                 } else {
+                     (log_match, log_mism) = get_log_probs(confidence, p_err);
+                 }
+             } else {
+                 (log_match, log_mism) = get_log_probs(confidence, p_err);
+             }
+
              let log_diff = log_mism - log_match;
              let hard_log_mism = (1e-12f32).ln();
              let hard_log_diff = hard_log_mism - log_match;
@@ -353,45 +395,46 @@ pub fn compute_cluster_mismatches_into_workspace(
         }
         workspace.diff_row_offsets.push(workspace.diff_vals.len());
     }
+
 }
 
 pub fn run_hmm_forward_backward_to_sparse(
-    diff_vals: &[f32],
-    diff_cols: &[u16],
-    diff_row_offsets: &[usize],
-    cluster_base_scores: &[f32],
-    p_recomb: &[f32],
-    n_states: usize,
-    hap_indices_input: &[Vec<u32>],
-    prior_probs: Option<&[f32]>,
-    threshold: f32,
-    fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
-    bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
-    block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
-    trace: bool,
-) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
-    use wide::f32x8;
+        diff_vals: &[f32],
+        diff_cols: &[u16],
+        diff_row_offsets: &[usize],
+        cluster_base_scores: &[f32],
+        p_recomb: &[f32],
+        n_states: usize,
+        hap_indices_input: &[Vec<u32>],
+        prior_probs: Option<&[f32]>,
+        threshold: f32,
+        fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+        bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+        block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+        trace: bool,
+    ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
+        use wide::f32x8;
 
-    let n_clusters = cluster_base_scores.len();
-    if n_clusters == 0 {
-        return (vec![0], Vec::new(), Vec::new(), Vec::new());
-    }
+        let n_clusters = cluster_base_scores.len();
+        if n_clusters == 0 {
+            return (vec![0], Vec::new(), Vec::new(), Vec::new());
+        }
 
-    // Prevent exp underflow in long windows (matches legacy -80.0 log-floor)
-    const LOG_EMIT_FLOOR: f32 = -80.0;
+        // Prevent exp underflow in long windows (matches legacy -80.0 log-floor)
+        const LOG_EMIT_FLOOR: f32 = -80.0;
 
-    const CHECKPOINT_INTERVAL: usize = 64;
-    let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
+        const CHECKPOINT_INTERVAL: usize = 64;
+        let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
 
-    let fwd = fwd_buffer;
-    fwd.resize(n_checkpoints * n_states + 2 * n_states, 0.0);
-    let curr_base = n_checkpoints * n_states;
-    let prev_base = curr_base + n_states;
+        let fwd = fwd_buffer;
+        fwd.resize(n_checkpoints * n_states + 2 * n_states, 0.0);
+        let curr_base = n_checkpoints * n_states;
+        let prev_base = curr_base + n_states;
 
-    let mut fwd_sums = vec![1.0f32; n_clusters];
-    let mut last_sum = 1.0f32;
+        let mut fwd_sums = vec![1.0f32; n_clusters];
+        let mut last_sum = 1.0f32;
 
-    {
+        {
     let fwd_span = if trace {
         Some(tracing::info_span!("hmm_fwd_initial").entered())
     } else {
@@ -758,6 +801,7 @@ pub fn compute_state_probs(
     geno_a2: &[u8],
     targ_alleles: &[u8],
     partner_alleles: Option<&[u8]>,
+    pl_provider: Option<&PlProvider>,
     sample_idx: usize,
     n_states: usize,
     workspace: &mut ImpWorkspace,
@@ -785,6 +829,7 @@ pub fn compute_state_probs(
         geno_a2,
         targ_alleles,
         partner_alleles,
+        pl_provider,
         sample_idx,
         n_states,
         workspace,
@@ -840,7 +885,9 @@ mod tests {
     use crate::data::haplotype::Samples;
     use crate::utils::workspace::ImpWorkspace;
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::data::storage::phase_state::Unphased;
     use crate::data::alignment::MarkerAlignment;
+    use crate::model::pl_emission::PlProvider;
 
     #[test]
     fn test_compute_cluster_mismatches_accumulation() {
@@ -915,6 +962,7 @@ mod tests {
             &geno_a2,
             &targ_alleles,
             None,
+            None,
             0, // sample_idx
             n_states,
             &mut workspace,
@@ -934,5 +982,103 @@ mod tests {
         
         // Hap 0: 2 mismatches (sum accumulation)
         assert!((workspace.row_buffer[0] - 2.0 * log_diff).abs() < 1e-4, "Hap 0 should have double penalty");
+    }
+
+    #[test]
+    fn test_compute_cluster_mismatches_uses_pl_provider() {
+        let n_states = 2;
+        let mut markers = Markers::new();
+        markers.add_chrom("chr1");
+        markers.push(Marker::new(
+            ChromIdx::new(0),
+            100,
+            None,
+            Allele::Base(0),
+            vec![Allele::Base(1)],
+        ));
+
+        let samples = Arc::new(Samples::from_ids(vec!["S1".to_string()]));
+        let target_col = GenotypeColumn::from_alleles(&[0, 0], 2);
+        let pl = Arc::new(crate::data::storage::matrix::PlMatrix::from_marker_blocks(
+            1,
+            vec![3u16],
+            vec![vec![0u16, 0u16, 0u16]],
+        ));
+        let target_gt_unphased = GenotypeMatrix::<Unphased>::new_unphased_with_confidence_and_likelihoods(
+            markers.clone(),
+            vec![target_col],
+            samples,
+            None,
+            pl,
+        );
+        let target_gt = target_gt_unphased.into_phased();
+
+        let ref_samples = Arc::new(Samples::from_ids(vec!["R1".to_string()]));
+        let ref_col = GenotypeColumn::from_alleles(&[0, 1], 2);
+        let ref_gt = GenotypeMatrix::new_phased(markers, vec![ref_col], ref_samples);
+
+        let cluster_bounds = vec![(0, 1)];
+        let genotyped_markers = vec![0];
+        let hap_indices = vec![vec![0, 1]];
+
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![0],
+            target_to_ref: vec![0],
+            allele_mappings: vec![None],
+        };
+
+        let geno_a1 = vec![0];
+        let geno_a2 = vec![0];
+        let targ_alleles = vec![0];
+
+        let mut workspace = ImpWorkspace::new(n_states);
+        compute_cluster_mismatches_into_workspace(
+            &hap_indices,
+            &cluster_bounds,
+            &genotyped_markers,
+            &target_gt,
+            &ref_gt,
+            &alignment,
+            &geno_a1,
+            &geno_a2,
+            &targ_alleles,
+            None,
+            None,
+            0,
+            n_states,
+            &mut workspace,
+            0.01,
+            false,
+        );
+        let conf_penalty = workspace.row_buffer[1];
+
+        let plp = PlProvider {
+            gt: target_gt.as_unphased_ref(),
+            sample: 0,
+            subset_to_orig: None,
+        };
+        workspace.clear();
+        compute_cluster_mismatches_into_workspace(
+            &hap_indices,
+            &cluster_bounds,
+            &genotyped_markers,
+            &target_gt,
+            &ref_gt,
+            &alignment,
+            &geno_a1,
+            &geno_a2,
+            &targ_alleles,
+            None,
+            Some(&plp),
+            0,
+            n_states,
+            &mut workspace,
+            0.01,
+            false,
+        );
+        let pl_penalty = workspace.row_buffer[1];
+
+        assert!(conf_penalty < -1.0);
+        assert!(pl_penalty.abs() < 1e-3);
     }
 }

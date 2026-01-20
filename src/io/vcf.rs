@@ -16,8 +16,59 @@ use tracing::info_span;
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
+use crate::data::storage::matrix::PlMatrix;
 use crate::error::{ReagleError, Result};
 use crate::utils::telemetry::TelemetryBlackboard;
+
+pub(crate) fn parse_pl(pl_str: &str) -> Option<Vec<u16>> {
+    if pl_str.is_empty() || pl_str == "." {
+        return None;
+    }
+    let mut out = Vec::new();
+    for s in pl_str.split(',') {
+        if s.is_empty() || s == "." {
+            return None;
+        }
+        let v = s.parse::<u32>().ok()?;
+        out.push(v.min(u16::MAX as u32) as u16);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+pub(crate) fn gl_to_pl(gl_str: &str) -> Option<Vec<u16>> {
+    if gl_str.is_empty() || gl_str == "." {
+        return None;
+    }
+    let mut gls: Vec<f64> = Vec::new();
+    for s in gl_str.split(',') {
+        if s.is_empty() || s == "." {
+            return None;
+        }
+        let v = s.parse::<f64>().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        gls.push(v);
+    }
+    if gls.is_empty() {
+        return None;
+    }
+    let max_gl = gls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if !max_gl.is_finite() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(gls.len());
+    for gl in gls {
+        let d = (max_gl - gl).max(0.0);
+        let pl = (10.0 * d).round();
+        out.push(pl.min(u16::MAX as f64) as u16);
+    }
+    Some(out)
+}
 
 /// Imputation quality statistics for a single marker
 ///
@@ -328,9 +379,12 @@ impl VcfReader {
         info_span!("vcf_read_all").in_scope(|| {
         let mut markers = Markers::new();
         let mut columns = Vec::new();
+        let n_samples = self.samples.len();
         // Accumulate per-marker confidence scores (one Vec<u8> per marker, indexed by sample)
-        let mut all_confidences: Vec<Vec<u8>> = Vec::new();
+        let mut all_confidences: Vec<Option<Vec<u8>>> = Vec::new();
         let mut has_any_confidence = false;
+        let mut all_likelihoods_pl: Vec<Option<Vec<Vec<u16>>>> = Vec::new();
+        let mut has_any_likelihoods = false;
 
         let mut line = String::new();
         let mut line_num = 0usize;
@@ -354,8 +408,8 @@ impl VcfReader {
                 continue;
             }
 
-            // Parse VCF record (now returns confidence if GL is present)
-            let (marker, mut alleles, is_phased, mut confidences) =
+            // Parse VCF record
+            let (marker, mut alleles, is_phased, mut confidences, mut likelihoods_pl) =
                 self.parse_record(line, &mut markers, line_num)?;
 
             // Track if any marker is unphased
@@ -396,17 +450,28 @@ impl VcfReader {
                     }
                     confidences = Some(filtered_conf);
                 }
+
+                if let Some(ref pl) = likelihoods_pl {
+                    let mut filtered_pl = Vec::with_capacity(include_indices.len());
+                    for &sample_idx in include_indices {
+                        if sample_idx < pl.len() {
+                            filtered_pl.push(pl[sample_idx].clone());
+                        }
+                    }
+                    likelihoods_pl = Some(filtered_pl);
+                }
             }
 
             // Store confidence scores
-            if let Some(conf) = confidences {
+            if confidences.is_some() {
                 has_any_confidence = true;
-                all_confidences.push(conf);
-            } else if has_any_confidence {
-                // If we've seen confidence before but this marker has none, fill with 255
-                let n_samples = self.samples.len();
-                all_confidences.push(vec![255; n_samples]);
             }
+            all_confidences.push(confidences);
+
+            if likelihoods_pl.is_some() {
+                has_any_likelihoods = true;
+            }
+            all_likelihoods_pl.push(likelihoods_pl);
 
             // Calculate actual number of alleles: 1 REF + N ALT
             let n_alleles = 1 + marker.alt_alleles.len();
@@ -442,15 +507,60 @@ impl VcfReader {
         // Update Samples with detected ploidy information
         self.finalize_samples();
 
-        // Return unphased by default - caller should phase if needed
-        // The is_phased detection is informational only
-        let matrix = if has_any_confidence && all_confidences.len() == columns.len() {
-            GenotypeMatrix::new_unphased_with_confidence(
+        let confidence_opt = if has_any_confidence && all_confidences.len() == columns.len() {
+            Some(
+                all_confidences
+                    .into_iter()
+                    .map(|c| c.unwrap_or_else(|| vec![255; n_samples]))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let matrix = if has_any_likelihoods && all_likelihoods_pl.len() == columns.len() {
+            let mut marker_strides: Vec<u16> = Vec::with_capacity(all_likelihoods_pl.len());
+            let mut marker_blocks: Vec<Vec<u16>> = Vec::with_capacity(all_likelihoods_pl.len());
+            for pl_opt in all_likelihoods_pl.into_iter() {
+                if let Some(pl_by_sample) = pl_opt {
+                    let stride = pl_by_sample
+                        .get(0)
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                        .min(u16::MAX as usize) as u16;
+                    if stride == 0 {
+                        marker_strides.push(0);
+                        marker_blocks.push(Vec::new());
+                        continue;
+                    }
+
+                    let stride_usize = stride as usize;
+                    let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                    for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
+                        if pls.len() != stride_usize {
+                            continue;
+                        }
+                        let start = s * stride_usize;
+                        block[start..start + stride_usize].copy_from_slice(&pls);
+                    }
+                    marker_strides.push(stride);
+                    marker_blocks.push(block);
+                } else {
+                    marker_strides.push(0);
+                    marker_blocks.push(Vec::new());
+                }
+            }
+
+            let pl = Arc::new(PlMatrix::from_marker_blocks(n_samples, marker_strides, marker_blocks));
+            GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                 markers,
                 columns,
                 Arc::clone(&self.samples),
-                all_confidences,
+                confidence_opt,
+                pl,
             )
+        } else if let Some(conf) = confidence_opt {
+            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)
         } else {
             GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
         };
@@ -519,14 +629,13 @@ impl VcfReader {
 
     /// Parse a single VCF record line
     ///
-    /// Returns (marker, alleles, is_phased, confidences).
-    /// Confidences is Some if the GL field is present, None otherwise.
+    /// Returns (marker, alleles, is_phased, confidences, likelihoods_pl).
     fn parse_record(
         &mut self,
         line: &str,
         markers: &mut Markers,
         line_num: usize,
-    ) -> Result<(Marker, Vec<u8>, bool, Option<Vec<u8>>)> {
+    ) -> Result<(Marker, Vec<u8>, bool, Option<Vec<u8>>, Option<Vec<Vec<u16>>>)> {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 10 {
             return Err(ReagleError::parse(
@@ -580,6 +689,7 @@ impl VcfReader {
             .position(|f| f == "GT")
             .ok_or_else(|| ReagleError::parse(line_num, "No GT field in FORMAT"))?;
         let gl_idx = format.split(':').position(|f| f == "GL");
+        let pl_idx = format.split(':').position(|f| f == "PL");
 
         // Parse genotypes
         let n_samples = self.samples.len();
@@ -587,6 +697,11 @@ impl VcfReader {
         let mut is_phased = true;
         // Confidence scores (only populated if GL field is present)
         let mut confidences: Option<Vec<u8>> = gl_idx.map(|_| Vec::with_capacity(n_samples));
+        let mut likelihoods_pl: Option<Vec<Vec<u16>>> = if pl_idx.is_some() || gl_idx.is_some() {
+            Some(Vec::with_capacity(n_samples))
+        } else {
+            None
+        };
 
         // Initialize ploidy tracking on first variant if not already done
         if self.sample_ploidy.is_none() {
@@ -619,6 +734,25 @@ impl VcfReader {
             alleles.push(a1);
             alleles.push(a2);
 
+            if let Some(ref mut pl_out) = likelihoods_pl {
+                let pl_vec = if let Some(pl_i) = pl_idx {
+                    sample_field
+                        .split(':')
+                        .nth(pl_i)
+                        .and_then(parse_pl)
+                        .unwrap_or_else(Vec::new)
+                } else if let Some(gl_i) = gl_idx {
+                    sample_field
+                        .split(':')
+                        .nth(gl_i)
+                        .and_then(gl_to_pl)
+                        .unwrap_or_else(Vec::new)
+                } else {
+                    Vec::new()
+                };
+                pl_out.push(pl_vec);
+            }
+
             // Parse GL field if present and compute confidence
             if let Some(gl_i) = gl_idx {
                 if let Some(conf_vec) = confidences.as_mut() {
@@ -633,7 +767,7 @@ impl VcfReader {
 
         let marker = Marker::with_end(chrom_idx, pos, end_pos, id, ref_allele, alt_alleles);
 
-        Ok((marker, alleles, is_phased, confidences))
+        Ok((marker, alleles, is_phased, confidences, likelihoods_pl))
     }
 
     /// Rebuild Samples with detected ploidy information
@@ -750,11 +884,17 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     }
 
     // Parse GL values
-    let mut gls: Vec<f64> = gl_str
-        .split(',')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    gls.retain(|v| v.is_finite());
+    let mut gls: Vec<f64> = Vec::new();
+    for s in gl_str.split(',') {
+        if s.is_empty() || s == "." {
+            return None;
+        }
+        let v = s.parse::<f64>().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        gls.push(v);
+    }
 
     // Need at least 3 values for diploid biallelic
     if gls.len() < 3 {
