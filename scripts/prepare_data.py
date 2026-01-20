@@ -214,12 +214,12 @@ def prepare_truth(source, output_vcf):
     print("Indexing Truth VCF...")
     subprocess.check_call(["bcftools", "index", "-t", source_vcf])
 
-    # Rename chroms (chr22 -> 22) and filter
+    # Rename chroms (22 -> chr22) to match reference panel which uses chr22 notation
     with open("chr_map.txt", "w") as f:
-        f.write("chr22\t22\n")
+        f.write("22\tchr22\n")
 
     print("Filtering Truth to Chr22...")
-    # Filter FIRST using index (regions 22 or chr22), then rename
+    # Filter FIRST using index (regions 22 or chr22), then rename to chr22
     cmd = (
         f"bcftools view {source_vcf} --regions 22,chr22 -Ou | "
         f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
