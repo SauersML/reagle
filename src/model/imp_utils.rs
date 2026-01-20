@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 use aligned_vec::{AVec, ConstAlign};
-use crate::data::haplotype::HapIdx;
-use crate::data::marker::MarkerIdx;
+use crate::data::{HapIdx, MarkerIdx};
+use crate::data::alignment::MarkerAlignment;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::storage::phase_state::Phased;
-use crate::data::alignment::MarkerAlignment;
 use crate::utils::workspace::ImpWorkspace;
+use crate::model::pl_emission::{PlProvider, allele_probs_uncond_from_pl, allele_probs_cond_from_pl};
 use crate::pipelines::imputation::ClusterStateProbs; // Assuming we keep it there or import it
 
 /// Minimum genetic distance between markers
@@ -107,6 +107,7 @@ pub fn compute_cluster_mismatches_into_workspace(
     geno_a2: &[u8],
     targ_alleles: &[u8],
     partner_alleles: Option<&[u8]>,
+    pl_provider: Option<&PlProvider>,
     sample_idx: usize,
     n_states: usize,
     workspace: &mut ImpWorkspace,
@@ -167,6 +168,7 @@ pub fn compute_cluster_mismatches_into_workspace(
         // than N_states * N_markers lookups.
         
         let mut active_markers = Vec::with_capacity(end - start);
+        let mut allele_probs: Vec<f32> = Vec::new();
         
         for &ref_m in &genotyped_markers[start..end] {
              let target_m_idx = alignment.ref_to_target.get(ref_m).copied().unwrap_or(-1);
@@ -186,7 +188,47 @@ pub fn compute_cluster_mismatches_into_workspace(
              let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
              if confidence <= 0.0 { continue; }
 
-             let (log_match, log_mism) = get_log_probs(confidence, p_err);
+             // Prefer PL-derived emission when available and biallelic.
+             let log_match: f32;
+             let log_mism: f32;
+             if let Some(plp) = pl_provider {
+                 let pl = plp.pl(target_m).filter(|v| !v.is_empty());
+                 if let Some(pl) = pl {
+                     // Only do exact PL-based emissions for biallelic (0/1).
+                     // For multi-allelic, fall back to confidence-based approximation.
+                     let partner = partner_allele;
+                     let maybe_n = if partner != 255 {
+                         allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
+                     } else {
+                         allele_probs_uncond_from_pl(pl, &mut allele_probs)
+                     };
+                     if maybe_n == Some(2) {
+                         let req = if partner != 255 {
+                             if partner == geno1 { geno2 } else if partner == geno2 { geno1 } else { 255 }
+                         } else {
+                             targ_allele
+                         };
+                         if req < 2 {
+                             let p_req = allele_probs.get(req as usize).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                             let p_no_err = 1.0 - p_err;
+                             // For biallelic, the "other" probability is 1 - p_req.
+                             let emit_match = (p_no_err * p_req + p_err * (1.0 - p_req)).max(1e-30);
+                             let emit_mism = (p_no_err * (1.0 - p_req) + p_err * p_req).max(1e-30);
+                             log_match = emit_match.ln();
+                             log_mism = emit_mism.ln();
+                         } else {
+                             (log_match, log_mism) = get_log_probs(confidence, p_err);
+                         }
+                     } else {
+                         (log_match, log_mism) = get_log_probs(confidence, p_err);
+                     }
+                 } else {
+                     (log_match, log_mism) = get_log_probs(confidence, p_err);
+                 }
+             } else {
+                 (log_match, log_mism) = get_log_probs(confidence, p_err);
+             }
+
              let log_diff = log_mism - log_match;
              let hard_log_mism = (1e-12f32).ln();
              let hard_log_diff = hard_log_mism - log_match;
@@ -758,6 +800,7 @@ pub fn compute_state_probs(
     geno_a2: &[u8],
     targ_alleles: &[u8],
     partner_alleles: Option<&[u8]>,
+    pl_provider: Option<&PlProvider>,
     sample_idx: usize,
     n_states: usize,
     workspace: &mut ImpWorkspace,
@@ -785,6 +828,7 @@ pub fn compute_state_probs(
         geno_a2,
         targ_alleles,
         partner_alleles,
+        pl_provider,
         sample_idx,
         n_states,
         workspace,
@@ -914,6 +958,7 @@ mod tests {
             &geno_a1,
             &geno_a2,
             &targ_alleles,
+            None,
             None,
             0, // sample_idx
             n_states,
