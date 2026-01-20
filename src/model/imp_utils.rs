@@ -395,45 +395,46 @@ pub fn compute_cluster_mismatches_into_workspace(
         }
         workspace.diff_row_offsets.push(workspace.diff_vals.len());
     }
+
 }
 
 pub fn run_hmm_forward_backward_to_sparse(
-    diff_vals: &[f32],
-    diff_cols: &[u16],
-    diff_row_offsets: &[usize],
-    cluster_base_scores: &[f32],
-    p_recomb: &[f32],
-    n_states: usize,
-    hap_indices_input: &[Vec<u32>],
-    prior_probs: Option<&[f32]>,
-    threshold: f32,
-    fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
-    bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
-    block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
-    trace: bool,
-) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
-    use wide::f32x8;
+        diff_vals: &[f32],
+        diff_cols: &[u16],
+        diff_row_offsets: &[usize],
+        cluster_base_scores: &[f32],
+        p_recomb: &[f32],
+        n_states: usize,
+        hap_indices_input: &[Vec<u32>],
+        prior_probs: Option<&[f32]>,
+        threshold: f32,
+        fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+        bwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+        block_fwd_buffer: &mut AVec<f32, ConstAlign<32>>,
+        trace: bool,
+    ) -> (Vec<usize>, Vec<u32>, Vec<f32>, Vec<f32>) {
+        use wide::f32x8;
 
-    let n_clusters = cluster_base_scores.len();
-    if n_clusters == 0 {
-        return (vec![0], Vec::new(), Vec::new(), Vec::new());
-    }
+        let n_clusters = cluster_base_scores.len();
+        if n_clusters == 0 {
+            return (vec![0], Vec::new(), Vec::new(), Vec::new());
+        }
 
-    // Prevent exp underflow in long windows (matches legacy -80.0 log-floor)
-    const LOG_EMIT_FLOOR: f32 = -80.0;
+        // Prevent exp underflow in long windows (matches legacy -80.0 log-floor)
+        const LOG_EMIT_FLOOR: f32 = -80.0;
 
-    const CHECKPOINT_INTERVAL: usize = 64;
-    let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
+        const CHECKPOINT_INTERVAL: usize = 64;
+        let n_checkpoints = (n_clusters + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
 
-    let fwd = fwd_buffer;
-    fwd.resize(n_checkpoints * n_states + 2 * n_states, 0.0);
-    let curr_base = n_checkpoints * n_states;
-    let prev_base = curr_base + n_states;
+        let fwd = fwd_buffer;
+        fwd.resize(n_checkpoints * n_states + 2 * n_states, 0.0);
+        let curr_base = n_checkpoints * n_states;
+        let prev_base = curr_base + n_states;
 
-    let mut fwd_sums = vec![1.0f32; n_clusters];
-    let mut last_sum = 1.0f32;
+        let mut fwd_sums = vec![1.0f32; n_clusters];
+        let mut last_sum = 1.0f32;
 
-    {
+        {
     let fwd_span = if trace {
         Some(tracing::info_span!("hmm_fwd_initial").entered())
     } else {
@@ -884,7 +885,9 @@ mod tests {
     use crate::data::haplotype::Samples;
     use crate::utils::workspace::ImpWorkspace;
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::data::storage::phase_state::Unphased;
     use crate::data::alignment::MarkerAlignment;
+    use crate::model::pl_emission::PlProvider;
 
     #[test]
     fn test_compute_cluster_mismatches_accumulation() {
@@ -979,5 +982,98 @@ mod tests {
         
         // Hap 0: 2 mismatches (sum accumulation)
         assert!((workspace.row_buffer[0] - 2.0 * log_diff).abs() < 1e-4, "Hap 0 should have double penalty");
+    }
+
+    #[test]
+    fn test_compute_cluster_mismatches_uses_pl_provider() {
+        let n_states = 2;
+        let mut markers = Markers::new();
+        markers.add_chrom("chr1");
+        markers.push(Marker::new(
+            ChromIdx::new(0),
+            100,
+            None,
+            Allele::Base(0),
+            vec![Allele::Base(1)],
+        ));
+
+        let samples = Arc::new(Samples::from_ids(vec!["S1".to_string()]));
+        let target_col = GenotypeColumn::from_alleles(&[0, 0], 2);
+        let target_gt_unphased = GenotypeMatrix::<Unphased>::new_unphased_with_confidence_and_likelihoods(
+            markers.clone(),
+            vec![target_col],
+            samples,
+            None,
+            vec![vec![vec![0u16, 0u16, 0u16]]],
+        );
+        let target_gt = target_gt_unphased.into_phased();
+
+        let ref_samples = Arc::new(Samples::from_ids(vec!["R1".to_string()]));
+        let ref_col = GenotypeColumn::from_alleles(&[0, 1], 2);
+        let ref_gt = GenotypeMatrix::new_phased(markers, vec![ref_col], ref_samples);
+
+        let cluster_bounds = vec![(0, 1)];
+        let genotyped_markers = vec![0];
+        let hap_indices = vec![vec![0, 1]];
+
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![0],
+            target_to_ref: vec![0],
+            allele_mappings: vec![None],
+        };
+
+        let geno_a1 = vec![0];
+        let geno_a2 = vec![0];
+        let targ_alleles = vec![0];
+
+        let mut workspace = ImpWorkspace::new(n_states);
+        compute_cluster_mismatches_into_workspace(
+            &hap_indices,
+            &cluster_bounds,
+            &genotyped_markers,
+            &target_gt,
+            &ref_gt,
+            &alignment,
+            &geno_a1,
+            &geno_a2,
+            &targ_alleles,
+            None,
+            None,
+            0,
+            n_states,
+            &mut workspace,
+            0.01,
+            false,
+        );
+        let conf_penalty = workspace.row_buffer[1];
+
+        let plp = PlProvider {
+            gt: target_gt.as_unphased_ref(),
+            sample: 0,
+            subset_to_orig: None,
+        };
+        workspace.clear();
+        compute_cluster_mismatches_into_workspace(
+            &hap_indices,
+            &cluster_bounds,
+            &genotyped_markers,
+            &target_gt,
+            &ref_gt,
+            &alignment,
+            &geno_a1,
+            &geno_a2,
+            &targ_alleles,
+            None,
+            Some(&plp),
+            0,
+            n_states,
+            &mut workspace,
+            0.01,
+            false,
+        );
+        let pl_penalty = workspace.row_buffer[1];
+
+        assert!(conf_penalty < -1.0);
+        assert!(pl_penalty.abs() < 1e-3);
     }
 }
