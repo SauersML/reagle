@@ -57,7 +57,6 @@ impl SamplePhase {
     ///
     /// # Panics
     /// Panics if allele slices don't match n_markers or indices are invalid.
-    #[allow(unused_variables)]
     pub fn new(
         sample: u32,
         n_markers: usize,
@@ -70,6 +69,9 @@ impl SamplePhase {
         assert_eq!(hap1_alleles.len(), n_markers, "hap1 length mismatch");
         assert_eq!(hap2_alleles.len(), n_markers, "hap2 length mismatch");
         assert_eq!(confidence.len(), n_markers, "confidence length mismatch");
+
+        // Suppress unused variable warning by reference drop (per project guidelines)
+        let _ = &sample;
 
         // Copy alleles directly - preserves multiallelic values
         let hap1: Vec<u8> = hap1_alleles.to_vec();
