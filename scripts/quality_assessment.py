@@ -41,6 +41,23 @@ def run_benchmark(person, file_path, format):
     shutil.copy("truth.vcf.gz", "tests/data/truth.vcf.gz")
     shutil.copy("reagle_out.vcf.gz", "tests/data/reagle_imputed.vcf.gz")
     shutil.copy("beagle_out.vcf.gz", "tests/data/beagle_imputed.vcf.gz")
+    shutil.copy("ref.vcf.gz", "tests/data/ref.vcf.gz")
+    
+    # Get sample counts from VCFs for proper reporting
+    result = subprocess.run("bcftools query -l ref.vcf.gz", shell=True, capture_output=True, text=True)
+    ref_samples = [s.strip() for s in result.stdout.strip().split('\n') if s.strip()]
+    
+    result = subprocess.run("bcftools query -l truth.vcf.gz", shell=True, capture_output=True, text=True)
+    truth_samples = [s.strip() for s in result.stdout.strip().split('\n') if s.strip()]
+    
+    # Write sample list files for metrics stage
+    with open("tests/data/train_samples.txt", "w") as f:
+        f.write('\n'.join(ref_samples))
+    with open("tests/data/test_samples.txt", "w") as f:
+        f.write('\n'.join(truth_samples))
+    
+    print(f"Reference samples: {len(ref_samples)}")
+    print(f"Test samples: {len(truth_samples)}")
     
     # Harmonize sample names - all files must have the same sample name for comparison
     # Create a sample name mapping file
