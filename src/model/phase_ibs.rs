@@ -658,16 +658,22 @@ impl BidirectionalPhaseIbs {
 
         let ref_start = self.reference_start_hap;
 
+        let requested = if ref_start.is_some() {
+            n_candidates.saturating_mul(4)
+        } else {
+            n_candidates
+        };
+
         self.with_fwd_pos_at_marker(marker_idx, ref_state, |ppa, div, center_pos| {
             let marker_i32 = marker_idx as i32;
-            let mut neighbors = Vec::with_capacity(n_candidates + 4);
+            let mut neighbors = Vec::with_capacity(requested + 4);
 
             let mut u = center_pos;
             let mut v = center_pos + 1;
             let mut max_div_u = i32::MIN;
             let mut max_div_v = i32::MIN;
 
-            while neighbors.len() < n_candidates {
+            while neighbors.len() < requested {
                 let can_go_u = u > 0;
                 let can_go_v = v < self.n_haps;
 
@@ -708,6 +714,9 @@ impl BidirectionalPhaseIbs {
                 }
             }
 
+            if neighbors.len() > n_candidates {
+                neighbors.truncate(n_candidates);
+            }
             neighbors
         })
     }
