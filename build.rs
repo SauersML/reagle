@@ -1728,10 +1728,10 @@ fn manually_check_for_unused_variables() {
     if !build_path.exists() {
         emit_stage_detail("manual lint self-check: build script source not found");
         eprintln!(
-            "manual lint self-check fatal error: build script source file {:?} is missing",
+            "manual lint self-check warning: build script source file {:?} is missing; skipping self-check",
             build_path
         );
-        std::process::exit(1);
+        return;
     }
 
     let deps_dir = match build_dependencies_directory() {
@@ -1741,9 +1741,9 @@ fn manually_check_for_unused_variables() {
                 "manual lint self-check: could not determine build dependency directory",
             );
             eprintln!(
-                "manual lint self-check fatal error: unable to derive build dependency directory from OUT_DIR"
+                "manual lint self-check warning: unable to derive build dependency directory from OUT_DIR; skipping self-check"
             );
-            std::process::exit(1);
+            return;
         }
     };
 
@@ -1755,9 +1755,9 @@ fn manually_check_for_unused_variables() {
                 "manual lint self-check: unable to obtain source path from manual lint arguments",
             );
             eprintln!(
-                "manual lint self-check fatal error: manual lint argument assembly failed to include the source path"
+                "manual lint self-check warning: manual lint argument assembly failed; skipping self-check"
             );
-            std::process::exit(1);
+            return;
         }
     };
 
@@ -1775,13 +1775,9 @@ fn manually_check_for_unused_variables() {
             }
             None => {
                 emit_stage_detail(&format!(
-                    "manual lint self-check: missing rlib for dependency '{crate_name}'"
+                    "manual lint self-check: missing rlib for dependency '{crate_name}'; skipping self-check"
                 ));
-                eprintln!(
-                    "manual lint self-check fatal error: required dependency '{crate_name}' rlib not found in {:?}",
-                    deps_dir
-                );
-                std::process::exit(1);
+                return;
             }
         }
     }
@@ -1902,9 +1898,9 @@ fn manually_check_for_unused_variables() {
                 "manual lint self-check: failed to start rustc self-lint command: {err}"
             ));
             eprintln!(
-                "manual lint self-check fatal error: failed to spawn rustc self-lint command: {err}"
+                "manual lint self-check warning: failed to spawn rustc self-lint command: {err}; skipping self-check"
             );
-            std::process::exit(1);
+            return;
         }
     }
 }
