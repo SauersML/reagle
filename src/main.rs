@@ -115,11 +115,15 @@ mod tests {
     #[test]
     fn test_module_imports() {
         // Verify all modules are accessible
-        let _ = config::Config::parse_and_validate;
-        let _ = error::ReagleError::vcf("test");
-        let _ = data::marker::MarkerIdx::new;
-        let _ = io::vcf::VcfReader::open;
-        let _ = model::parameters::ModelParams::new;
-        let _ = pipelines::PhasingPipeline::new;
+        let f: fn() -> Result<Config> = config::Config::parse_and_validate;
+        let _ = &f;
+        let err = error::ReagleError::vcf("test");
+        let _ = &err;
+        let idx = data::marker::MarkerIdx::new(0);
+        let _ = &idx;
+        let open: fn(&std::path::Path) -> Result<(io::vcf::VcfReader, Box<dyn std::io::BufRead + Send>)> = io::vcf::VcfReader::open;
+        let _ = &open;
+        let params = model::parameters::ModelParams::new();
+        let _ = &params;
     }
 }

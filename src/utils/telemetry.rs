@@ -330,7 +330,9 @@ impl HeartbeatHandle {
     pub fn shutdown(mut self) {
         self.blackboard.signal_shutdown();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if let Err(e) = handle.join() {
+                eprintln!("Heartbeat thread panic: {:?}", e);
+            }
         }
     }
 }
@@ -606,7 +608,9 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
     // Clear TTY line on shutdown
     if is_tty {
         eprint!("\r\x1b[K");
-        let _ = io::stderr().flush();
+        if let Err(e) = io::stderr().flush() {
+            eprintln!("Failed to flush stderr: {}", e);
+        }
     }
 }
 
@@ -707,7 +711,9 @@ fn print_tty_progress(
         channel_str,
         stall_str
     );
-    let _ = io::stderr().flush();
+    if let Err(e) = io::stderr().flush() {
+        eprintln!("Failed to flush stderr: {}", e);
+    }
 }
 
 /// Print progress for non-TTY (structured log line)

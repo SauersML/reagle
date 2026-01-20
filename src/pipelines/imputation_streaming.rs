@@ -860,7 +860,10 @@ target_samples={} target_bytes={}",
                 ref_output_start,
                 ref_output_end,
             } = payload;
-            let _ = (output_start, output_end);
+
+            // Mark output range as used
+            let _ = &output_start;
+            let _ = &output_end;
 
             if !header_written {
                 writer.write_header_extended(
