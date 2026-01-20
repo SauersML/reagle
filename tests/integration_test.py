@@ -1904,15 +1904,24 @@ def stage_metrics():
             print(f"{name} output not found")
             all_metrics[name] = None
 
-    # Load sample counts
+    # Load sample counts (fallback to VCF headers if files don't exist)
     n_train = 0
     n_test = 0
     if paths['train_file'].exists():
         with open(paths['train_file']) as f:
             n_train = len([l for l in f if l.strip()])
+    elif paths['ref_vcf'].exists():
+        # Fallback: count samples in reference VCF
+        ref_samples = get_vcf_samples(str(paths['ref_vcf']))
+        n_train = len(ref_samples)
+        
     if paths['test_file'].exists():
         with open(paths['test_file']) as f:
             n_test = len([l for l in f if l.strip()])
+    elif paths['truth_vcf'].exists():
+        # Fallback: count samples in truth VCF
+        truth_samples = get_vcf_samples(str(paths['truth_vcf']))
+        n_test = len(truth_samples)
 
     # Final summary
     print("\n" + "=" * 60)
