@@ -1,4 +1,4 @@
-name: Imputation Quality Benchmark
+name: Imputation Quality Assessment
 
 on:
   workflow_dispatch:
@@ -54,8 +54,8 @@ jobs:
       - name: Build Reagle
         run: cargo build --release
 
-      - name: Run Benchmark
-        run: python3 scripts/benchmark.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}" --format "${{ matrix.format }}"
+      - name: Run Quality Assessment
+        run: python3 scripts/quality_assessment.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}" --format "${{ matrix.format }}"
 
       - name: Upload Metrics
         uses: actions/upload-artifact@v4

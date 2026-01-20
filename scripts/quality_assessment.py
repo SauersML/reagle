@@ -61,7 +61,7 @@ def run_benchmark(person, file_path, format):
     run_cmd(["python3", "tests/integration_test.py", "metrics"])
 
 if __name__ == "__main__":
-    print("Benchmark Script v1.1")
+    print("Quality Assessment Script v1.1")
     parser = argparse.ArgumentParser()
     parser.add_argument("--person", required=True)
     parser.add_argument("--file", required=True)
