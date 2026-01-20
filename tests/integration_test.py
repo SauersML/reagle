@@ -1314,8 +1314,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
 
     if metrics:
         print(f"\n📊 OVERALL STATISTICS")
-        print(f"   Sites compared: {metrics.get('sites_compared', 'N/A'):,}")
-        print(f"   Genotypes compared: {metrics.get('total_genotypes', 'N/A'):,}")
+        sites = metrics.get('sites_compared')
+        genotypes = metrics.get('total_genotypes')
+        print(f"   Sites compared: {sites:,}" if sites is not None else "   Sites compared: N/A")
+        print(f"   Genotypes compared: {genotypes:,}" if genotypes is not None else "   Genotypes compared: N/A")
         print(f"   Calculation time: {metrics.get('calculation_time_sec', 0):.1f}s")
         
         print(f"\n🎯 ACCURACY METRICS")
