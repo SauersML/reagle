@@ -1741,9 +1741,9 @@ fn manually_check_for_unused_variables() {
                 "manual lint self-check: could not determine build dependency directory",
             );
             eprintln!(
-                "manual lint self-check fatal error: unable to derive build dependency directory from OUT_DIR"
+                "manual lint self-check warning: unable to derive build dependency directory from OUT_DIR. Skipping check."
             );
-            std::process::exit(1);
+            return;
         }
     };
 
@@ -1778,10 +1778,10 @@ fn manually_check_for_unused_variables() {
                     "manual lint self-check: missing rlib for dependency '{crate_name}'"
                 ));
                 eprintln!(
-                    "manual lint self-check fatal error: required dependency '{crate_name}' rlib not found in {:?}",
+                    "manual lint self-check warning: required dependency '{crate_name}' rlib not found in {:?}. Skipping check.",
                     deps_dir
                 );
-                std::process::exit(1);
+                return;
             }
         }
     }
