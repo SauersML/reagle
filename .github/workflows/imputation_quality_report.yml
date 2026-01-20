@@ -60,7 +60,7 @@ jobs:
       - name: Upload Metrics
         uses: actions/upload-artifact@v4
         with:
-          name: metrics-${{ matrix.person }}-${{ matrix.format }}
+          name: metrics-${{ matrix.person }}-${{ matrix.format }}-${{ hashFiles(matrix.file_path) }}
           path: |
             tests/data/reagle_metrics.json
             tests/data/beagle_metrics.json
