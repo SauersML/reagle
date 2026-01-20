@@ -1,6 +1,30 @@
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::GenotypeMatrix;
 
+#[inline]
+fn smooth_probs(probs: &mut [f32]) {
+    let n = probs.len();
+    if n == 0 {
+        return;
+    }
+    let lambda = 1e-4f32;
+    let eps = 1e-8f32;
+    let n_inv = 1.0f32 / (n as f32);
+    let mut sum = 0.0f32;
+    for p in probs.iter_mut() {
+        *p = (1.0 - lambda) * (*p) + lambda * n_inv;
+        if *p < eps {
+            *p = eps;
+        }
+        sum += *p;
+    }
+    if sum > 0.0 {
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct PlProvider<'a> {
     pub gt: &'a GenotypeMatrix,
@@ -65,6 +89,7 @@ pub fn allele_probs_uncond_from_pl(pl: &[u16], probs: &mut Vec<f32>) -> Option<u
     for p in probs.iter_mut() {
         *p /= sum_w;
     }
+    smooth_probs(probs);
     Some(n_alleles)
 }
 
@@ -103,6 +128,7 @@ pub fn allele_probs_cond_from_pl(pl: &[u16], partner: u8, probs: &mut Vec<f32>) 
     for p in probs.iter_mut() {
         *p /= sum_w;
     }
+    smooth_probs(probs);
     Some(n_alleles)
 }
 

@@ -265,6 +265,28 @@ impl ReferencePbwt {
                 } else {
                     next = RankBeam::full(n_ref as u32);
                 }
+
+                if next.len == 0 {
+                    let mut candidates: Vec<(u32, u32, u32)> = Vec::new();
+                    for &(l, r) in old.intervals() {
+                        for b in 0..n_bins {
+                            let nl = self.offsets[b] + self.rank(b, l, n_ref);
+                            let nr = self.offsets[b] + self.rank(b, r, n_ref);
+                            if nl < nr {
+                                let len = nr - nl;
+                                let score = len.saturating_mul(self.counts[b]);
+                                candidates.push((nl, nr, score));
+                            }
+                        }
+                    }
+
+                    candidates.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                    let keep = candidates.len().min(MAX_RANK_INTERVALS);
+                    for i in 0..keep {
+                        next.intervals[i] = (candidates[i].0, candidates[i].1);
+                    }
+                    next.len = keep;
+                }
             }
 
             next.normalize();
