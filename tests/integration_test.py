@@ -557,8 +557,95 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
         print("ERROR: No common samples between truth and imputed VCFs")
         return None
     common_samples_list = [s for s in truth_samples if s in common_samples]
-    print(f"Common samples: {len(common_samples_list)}")
-
+    print(f"Common samples: {len(common_samples_list)}") 
+    
+    # ============================================================
+    # DIAGNOSTIC OUTPUT - VCF Analysis
+    # ============================================================
+    print("\n" + "="*60)
+    print("DIAGNOSTIC: VCF ANALYSIS")
+    print("="*60)
+    
+    # Check VCF headers for build/format information
+    print("\n📋 VCF Header Information:")
+    for vcf_path, label in [(truth_vcf, "TRUTH"), (imputed_vcf, "IMPUTED")]:
+        try:
+            header_result = subprocess.run(
+                f"bcftools view -h {vcf_path} | head -30",
+                shell=True, capture_output=True, text=True
+            )
+            header_lines = header_result.stdout.split('\n')
+            
+            # Extract key info
+            contigs = [l for l in header_lines if l.startswith('##contig')]
+            formats = [l for l in header_lines if l.startswith('##FORMAT')]
+            
+            print(f"\n  {label} VCF:")
+            if contigs:
+                print(f"    Contigs: {len(contigs)} found")
+                # Show first contig for chr22
+                chr22_contigs = [c for c in contigs if 'chr22' in c or 'ID=22,' in c]
+                if chr22_contigs:
+                    print(f"    Chr22 contig: {chr22_contigs[0][:100]}...")
+            print(f"    FORMAT fields: {len(formats)}")
+            has_gt = any('ID=GT' in f for f in formats)
+            has_ds = any('ID=DS' in f for f in formats)
+            has_gp = any('ID=GP' in f for f in formats)
+            print(f"    Has GT: {has_gt}, DS: {has_ds}, GP: {has_gp}")
+        except Exception as e:
+            print(f"  {label}: Error reading header - {e}")
+    
+    # Sample first 10 sites from each VCF
+    print("\n📍 Sample Sites (first 10):")
+    for vcf_path, label in [(truth_vcf, "TRUTH"), (imputed_vcf, "IMPUTED")]:
+        try:
+            result = subprocess.run(
+                f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {vcf_path} | head -10",
+                shell=True, capture_output=True, text=True
+            )
+            lines = [l for l in result.stdout.strip().split('\n') if l]
+            print(f"\n  {label} (showing {len(lines)} sites):")
+            for i, line in enumerate(lines, 1):
+                parts = line.split('\t')
+                if len(parts) >= 5:
+                    chrom, pos, ref, alt, gt = parts[0], parts[1], parts[2], parts[3], parts[4]
+                    print(f"    {i}. {chrom}:{pos} {ref}>{alt} GT={gt}")
+        except Exception as e:
+            print(f"  {label}: Error - {e}")
+    
+    # Check site overlap
+    print("\n🔍 Site Overlap Analysis:")
+    try:
+        # Get first 100 sites from each
+        truth_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\n' {truth_vcf} | head -100"
+        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\n' {imputed_vcf} | head -100"
+        
+        truth_result = subprocess.run(truth_cmd, shell=True, capture_output=True, text=True)
+        imputed_result = subprocess.run(imputed_cmd, shell=True, capture_output=True, text=True)
+        
+        truth_sites_sample = set(truth_result.stdout.strip().split('\n'))
+        imputed_sites_sample = set(imputed_result.stdout.strip().split('\n'))
+        
+        overlap = truth_sites_sample & imputed_sites_sample
+        print(f"  First 100 sites - Truth: {len(truth_sites_sample)}, Imputed: {len(imputed_sites_sample)}, Overlap: {len(overlap)}")
+        
+        if overlap:
+            print(f"  ✓ Some sites match (good sign)")
+        else:
+            print(f"  ⚠️  NO OVERLAP in first 100 sites (coordinate mismatch?)")
+            print(f"\n  Sample truth sites:")
+            for site in list(truth_sites_sample)[:3]:
+                print(f"    {site}")
+            print(f"\n  Sample imputed sites:")
+            for site in list(imputed_sites_sample)[:3]:
+                print(f"    {site}")
+    except Exception as e:
+        print(f"  Error: {e}")
+    
+    print("\n" + "="*60)
+    print("END DIAGNOSTIC OUTPUT")
+    print("="*60 + "\n")
+    
     input_sites = load_input_sites(input_vcf)
     if input_sites is not None:
         print(f"Input genotyped sites: {len(input_sites)}")
@@ -1339,9 +1426,33 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
         print(f"\n📋 CONFUSION MATRIX (Truth vs Imputed)")
         print(f"   {'':12} {'HomRef':>10} {'Het':>10} {'HomAlt':>10}")
         labels = ['HomRef', 'Het', 'HomAlt']
+        confusion_matrix = metrics.get('confusion_matrix', [[0,0,0],[0,0,0],[0,0,0]])
         for i, label in enumerate(labels):
-            row = metrics.get('confusion_matrix', [[0,0,0],[0,0,0],[0,0,0]])[i]
+            row = confusion_matrix[i]
             print(f"   {label:12} {row[0]:>10,} {row[1]:>10,} {row[2]:>10,}")
+        
+        # Add diagnostic warnings
+        print(f"\n⚠️  DIAGNOSTIC WARNINGS")
+        homref_count = confusion_matrix[0][0] + confusion_matrix[0][1] + confusion_matrix[0][2]
+        if homref_count == 0:
+            print(f"   CRITICAL: Truth has ZERO HomRef genotypes!")
+            print(f"   → This indicates truth VCF is variant-only (no 0/0 calls)")
+            print(f"   → Metrics are calculated ONLY at variant sites")
+            print(f"   → This makes concordance metrics unreliable")
+            print(f"   → Solution: Use array input sites as comparison set, not WGS variants")
+        
+        missing_truth = metrics.get('missing_truth', 0)
+        missing_imputed = metrics.get('missing_imputed', 0)
+        if missing_truth > 0 or missing_imputed > 0:
+            print(f"   Missing genotypes: Truth={missing_truth:,}, Imputed={missing_imputed:,}")
+        
+        ref_alt_mismatch = metrics.get('ref_alt_mismatch', 0)
+        if ref_alt_mismatch > 0:
+            print(f"   REF/ALT mismatches: {ref_alt_mismatch:,} sites (coordinate/strand issue?)")
+        
+        multiallelic = metrics.get('multiallelic_sites', 0)
+        if multiallelic > 0:
+            print(f"   Multiallelic sites skipped: {multiallelic:,}")
         
         print(f"\n📊 PER-CLASS ACCURACY")
         for cls in ['homref', 'het', 'homalt']:
