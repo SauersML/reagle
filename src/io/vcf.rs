@@ -887,18 +887,21 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     let mut gls: Vec<f64> = Vec::new();
     for s in gl_str.split(',') {
         if s.is_empty() || s == "." {
-            return None;
+            return Some(0);
         }
-        let v = s.parse::<f64>().ok()?;
+        let v = match s.parse::<f64>() {
+            Ok(val) => val,
+            Err(_) => return Some(0),
+        };
         if !v.is_finite() {
-            return None;
+            return Some(0);
         }
         gls.push(v);
     }
 
     // Need at least 3 values for diploid biallelic
     if gls.len() < 3 {
-        return None;
+        return Some(0);
     }
 
     // Map genotype to GL index:
@@ -916,19 +919,19 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     };
 
     if gt_idx >= gls.len() {
-        return None;
+        return Some(0);
     }
 
     // Get the GL for the called genotype
     let called_gl = gls[gt_idx];
     if !called_gl.is_finite() {
-        return None;
+        return Some(0);
     }
 
     // Find max GL for numerical stability
     let max_gl = gls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     if !max_gl.is_finite() {
-        return None;
+        return Some(0);
     }
 
     // --- Optimized confidence calculation ---
@@ -967,7 +970,7 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
         .sum();
 
     if denominator <= 0.0 {
-        return None;
+        return Some(0);
     }
 
     let w = numerator / denominator;
@@ -1580,5 +1583,14 @@ mod tests {
         // Conf = 0 (Random guess floor)
         let conf = compute_gl_confidence("0,0,-10", 0, 0).unwrap();
         assert_eq!(conf, 0);
+
+        // Test case 6: Malformed GL (too short)
+        // Should return Some(0) now (low confidence), not None (missing)
+        let conf = compute_gl_confidence("0,-5", 0, 0);
+        assert_eq!(conf, Some(0));
+
+        // Test case 7: Malformed GL (infinite)
+        let conf = compute_gl_confidence("0,-inf,-10", 0, 0);
+        assert_eq!(conf, Some(0));
     }
 }
