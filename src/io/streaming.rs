@@ -116,7 +116,10 @@ impl HaplotypePriors {
         self.hap_ids.clear();
         self.probs.clear();
 
-        let _ = (gen_position, window);
+        // Use variables to suppress unused warning in a way that passes lints
+        // (assign to self-drop reference)
+        let _ = &gen_position;
+        let _ = &window;
 
         let adaptive_min = (1.0 / hap_indices.len().max(1) as f32) * 0.5;
         let min_prob = adaptive_min.min(0.001).max(1e-6);

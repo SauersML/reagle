@@ -1347,7 +1347,9 @@ impl VcfWriter {
 
 impl Drop for VcfWriter {
     fn drop(&mut self) {
-        let _ = self.flush();
+        if let Err(e) = self.flush() {
+            eprintln!("Failed to flush VcfWriter on drop: {}", e);
+        }
     }
 }
 
