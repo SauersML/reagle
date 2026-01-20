@@ -26,11 +26,10 @@ pub(crate) fn parse_pl(pl_str: &str) -> Option<Vec<u16>> {
     let mut out = Vec::new();
     for s in pl_str.split(',') {
         if s.is_empty() || s == "." {
-            continue;
+            return None;
         }
-        if let Ok(v) = s.parse::<u32>() {
-            out.push(v.min(u16::MAX as u32) as u16);
-        }
+        let v = s.parse::<u32>().ok()?;
+        out.push(v.min(u16::MAX as u32) as u16);
     }
     if out.is_empty() {
         None
@@ -43,11 +42,17 @@ pub(crate) fn gl_to_pl(gl_str: &str) -> Option<Vec<u16>> {
     if gl_str.is_empty() || gl_str == "." {
         return None;
     }
-    let mut gls: Vec<f64> = gl_str
-        .split(',')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    gls.retain(|v| v.is_finite());
+    let mut gls: Vec<f64> = Vec::new();
+    for s in gl_str.split(',') {
+        if s.is_empty() || s == "." {
+            return None;
+        }
+        let v = s.parse::<f64>().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        gls.push(v);
+    }
     if gls.is_empty() {
         return None;
     }
@@ -848,11 +853,17 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     }
 
     // Parse GL values
-    let mut gls: Vec<f64> = gl_str
-        .split(',')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    gls.retain(|v| v.is_finite());
+    let mut gls: Vec<f64> = Vec::new();
+    for s in gl_str.split(',') {
+        if s.is_empty() || s == "." {
+            return None;
+        }
+        let v = s.parse::<f64>().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        gls.push(v);
+    }
 
     // Need at least 3 values for diploid biallelic
     if gls.len() < 3 {
