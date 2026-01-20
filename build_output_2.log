@@ -1,0 +1,417 @@
+   Compiling reagle v0.1.0 (/app)
+error[E0277]: the trait bound `ViolationCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1387:22
+     |
+1387 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `ViolationCollector`
+    --> build.rs:11:1
+     |
+  11 | struct ViolationCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut ViolationCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `DisallowedLetCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1437:22
+     |
+1437 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `DisallowedLetCollector`
+    --> build.rs:17:1
+     |
+  17 | struct DisallowedLetCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut DisallowedLetCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `TupleWildcardCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1482:22
+     |
+1482 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `TupleWildcardCollector`
+    --> build.rs:23:1
+     |
+  23 | struct TupleWildcardCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut TupleWildcardCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `ForbiddenCommentCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1541:22
+     |
+1541 |                     .search_path(&forbidden_matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `ForbiddenCommentCollector`
+    --> build.rs:29:1
+     |
+  29 | struct ForbiddenCommentCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut ForbiddenCommentCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `ForbiddenCommentCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1576:22
+     |
+1576 |                     .search_path(&stars_matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `ForbiddenCommentCollector`
+    --> build.rs:29:1
+     |
+  29 | struct ForbiddenCommentCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut ForbiddenCommentCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `CustomUppercaseCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1609:22
+     |
+1609 |                     .search_path(&all_caps_matcher, path, &mut custom_collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `CustomUppercaseCollector`
+    --> build.rs:36:1
+     |
+  36 | struct CustomUppercaseCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut CustomUppercaseCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `DashHeavyCommentCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1642:22
+     |
+1642 |                     .search_path(&dash_matcher, path, &mut dash_collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `DashHeavyCommentCollector`
+    --> build.rs:42:1
+     |
+  42 | struct DashHeavyCommentCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut DashHeavyCommentCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `DeadCodeCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1690:22
+     |
+1690 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `DeadCodeCollector`
+    --> build.rs:48:1
+     |
+  48 | struct DeadCodeCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut DeadCodeCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `IgnoredTestCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1748:22
+     |
+1748 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `IgnoredTestCollector`
+    --> build.rs:54:1
+     |
+  54 | struct IgnoredTestCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut IgnoredTestCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `TodoCommentCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1799:22
+     |
+1799 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `TodoCommentCollector`
+    --> build.rs:76:1
+     |
+  76 | struct TodoCommentCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut TodoCommentCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `DropUsageCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1843:22
+     |
+1843 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `DropUsageCollector`
+    --> build.rs:60:1
+     |
+  60 | struct DropUsageCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut DropUsageCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `DropUsageCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1888:22
+     |
+1888 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `DropUsageCollector`
+    --> build.rs:60:1
+     |
+  60 | struct DropUsageCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut DropUsageCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `DebugAssertCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:1960:22
+     |
+1960 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `DebugAssertCollector`
+    --> build.rs:70:1
+     |
+  70 | struct DebugAssertCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut DebugAssertCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `MeaninglessConditionalCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:2007:22
+     |
+2007 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `MeaninglessConditionalCollector`
+    --> build.rs:82:1
+     |
+  82 | struct MeaninglessConditionalCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut MeaninglessConditionalCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `NoEffectCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:2053:22
+     |
+2053 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `NoEffectCollector`
+    --> build.rs:88:1
+     |
+  88 | struct NoEffectCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut NoEffectCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `OmittedForBrevityCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:2101:22
+     |
+2101 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `OmittedForBrevityCollector`
+    --> build.rs:94:1
+     |
+  94 | struct OmittedForBrevityCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut OmittedForBrevityCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `DeprecatedCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:2147:22
+     |
+2147 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `DeprecatedCollector`
+    --> build.rs:100:1
+     |
+ 100 | struct DeprecatedCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut DeprecatedCollector` to implement `grep::grep_searcher::Sink`
+
+error[E0277]: the trait bound `PlaceholderStubCollector: grep::grep_searcher::Sink` is not satisfied
+    --> build.rs:2197:22
+     |
+2197 |                     .search_path(&matcher, path, &mut collector)
+     |                      ^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `grep::grep_searcher::Sink` is not implemented for `PlaceholderStubCollector`
+    --> build.rs:106:1
+     |
+ 106 | struct PlaceholderStubCollector {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: the following other types implement trait `grep::grep_searcher::Sink`:
+               &'a mut S
+               Box<S>
+               FakeUsageCandidateCollector
+               JSONSink<'p, 's, M, W>
+               Lossy<F>
+               StandardSink<'p, 's, M, W>
+               SummarySink<'p, 's, M, W>
+               UTF8<F>
+               grep::grep_searcher::sinks::Bytes<F>
+     = note: required for `&mut PlaceholderStubCollector` to implement `grep::grep_searcher::Sink`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `reagle` (build script) due to 18 previous errors
