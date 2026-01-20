@@ -1,0 +1,51 @@
+   Compiling futures-core v0.3.31
+   Compiling fastrand v2.3.0
+   Compiling itertools v0.13.0
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.0
+   Compiling futures-task v0.3.31
+   Compiling futures-lite v2.6.1
+   Compiling pin-utils v0.1.0
+   Compiling plotters-backend v0.3.7
+   Compiling reagle v0.1.0 (/app)
+   Compiling slab v0.4.11
+   Compiling ciborium-io v0.2.2
+   Compiling ciborium-ll v0.2.2
+   Compiling futures-util v0.3.31
+   Compiling cubecl-common v0.6.0
+   Compiling burn-common v0.18.0
+   Compiling ndarray-stats v0.6.0
+   Compiling burn-tensor v0.18.0
+   Compiling plotters-svg v0.3.7
+   Compiling parking_lot_core v0.9.12
+   Compiling bitflags v2.10.0
+   Compiling cast v0.3.0
+   Compiling sdd v3.0.10
+   Compiling linux-raw-sys v0.11.0
+   Compiling scc v2.4.0
+   Compiling rustix v1.1.3
+   Compiling burn-autodiff v0.18.0
+   Compiling burn-ir v0.18.0
+   Compiling burn-core v0.18.0
+   Compiling criterion-plot v0.8.1
+   Compiling parking_lot v0.12.5
+   Compiling futures-executor v0.3.31
+   Compiling alloca v0.4.0
+   Compiling plotters v0.3.7
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling burn-ndarray v0.18.0
+   Compiling page_size v0.6.0
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling serial_test v3.3.1
+   Compiling criterion v0.8.1
+   Compiling tempfile v3.24.0
+   Compiling burn v0.18.0
+   Compiling mini-mcmc v0.8.0 (https://github.com/SauersML/general-mcmc#2469d9dd)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.26s
+  Executable unittests src/lib.rs (target/debug/deps/reagle-c2b0c0412341e8ea)
+  Executable unittests src/main.rs (target/debug/deps/reagle-df20b624f6892655)
+  Executable tests/beagle_reference.rs (target/debug/deps/beagle_reference-bec993cf1d0ad63a)
+  Executable tests/fast_imputation.rs (target/debug/deps/fast_imputation-f34b0517c7b6d44e)
+  Executable tests/imputation_quality.rs (target/debug/deps/imputation_quality-e3ed1ed4ee1c9425)
