@@ -72,6 +72,7 @@ fn should_stream_ref_vcf(path: &Path, window_markers: usize) -> Option<u64> {
 /// Payload passed from Phasing (Producer) to Imputation (Consumer)
 struct StreamingPayload {
     phased_target: GenotypeMatrix<Phased>,
+    unphased_target: Arc<GenotypeMatrix<Unphased>>,
     ref_window: GenotypeMatrix<Phased>,
     alignment: MarkerAlignment,
     output_start: usize,
@@ -666,6 +667,9 @@ impl crate::pipelines::ImputationPipeline {
                         phased_overlap: None,
                     }
                 };
+                // Keep reference to unphased target for downstream constraints
+                let unphased_target = Arc::new(target_window.genotypes.clone());
+
                 if let Some(bb) = &pipeline.telemetry {
                     bb.set_current_window(window_count as u64);
                     if ref_window.is_last {
@@ -777,6 +781,7 @@ impl crate::pipelines::ImputationPipeline {
                     let _ = &span_guard;
                     tx.send(StreamingPayload {
                         phased_target: phased,
+                        unphased_target: unphased_target.clone(),
                         ref_window: ref_window_gt,
                         alignment,
                         output_start: target_window.output_start,
@@ -789,6 +794,7 @@ impl crate::pipelines::ImputationPipeline {
                 } else {
                     tx.send(StreamingPayload {
                         phased_target: phased,
+                        unphased_target: unphased_target.clone(),
                         ref_window: ref_window_gt,
                         alignment,
                         output_start: target_window.output_start,
@@ -845,6 +851,7 @@ target_samples={} target_bytes={}",
             }
             let StreamingPayload {
                 phased_target,
+                unphased_target,
                 ref_window,
                 alignment,
                 output_start,
@@ -930,6 +937,7 @@ target_samples={} target_bytes={}",
                 let _ = &span_guard;
                 self.run_imputation_window_streaming(
                     &phased_target,
+                    &unphased_target,
                     &ref_window,
                     &alignment,
                     &gen_maps,
@@ -943,6 +951,7 @@ target_samples={} target_bytes={}",
             } else {
                 self.run_imputation_window_streaming(
                     &phased_target,
+                    &unphased_target,
                     &ref_window,
                     &alignment,
                     &gen_maps,
@@ -1062,6 +1071,7 @@ target_samples={} target_bytes={}",
     fn run_imputation_window_streaming(
         &self,
         target_win: &GenotypeMatrix<Phased>,
+        unphased_win: &GenotypeMatrix<Unphased>,
         ref_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
         gen_maps: &GeneticMaps,
@@ -1158,8 +1168,8 @@ target_samples={} target_bytes={}",
                     .filter(|&ref_m| {
                         let target_m = alignment.ref_to_target[ref_m] as usize;
                         let marker_idx = MarkerIdx::new(target_m as u32);
-                        let a1 = target_win.allele(marker_idx, HapIdx::new((s * 2) as u32));
-                        let a2 = target_win.allele(marker_idx, HapIdx::new((s * 2 + 1) as u32));
+                        let a1 = unphased_win.allele(marker_idx, HapIdx::new((s * 2) as u32));
+                        let a2 = unphased_win.allele(marker_idx, HapIdx::new((s * 2 + 1) as u32));
                         a1 != 255 || a2 != 255
                     })
                     .collect()
