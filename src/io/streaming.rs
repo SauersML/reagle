@@ -19,11 +19,13 @@ use noodles::vcf::Header;
 use flate2::read::GzDecoder;
 use tracing::info_span;
 
-use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, Markers};
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+use crate::data::ChromIdx;
+use crate::data::storage::matrix::GenotypeMatrix;
+use crate::data::storage::matrix::PlMatrix;
+use crate::data::storage::GenotypeColumn;
 use crate::error::{ReagleError, Result};
 
 /// Configuration for streaming window processing
@@ -503,9 +505,11 @@ impl StreamingVcfReader {
         let mut markers = Markers::new();
         let mut columns = Vec::with_capacity(window_end);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
-        let mut likelihoods_pl: Vec<Vec<Vec<u16>>> = Vec::new();
         let n_samples = self.samples.len();
         let has_any_likelihoods = self.buffer.iter().take(window_end).any(|bm| bm.likelihoods_pl.is_some());
+
+        let mut marker_strides: Vec<u16> = Vec::new();
+        let mut marker_blocks: Vec<Vec<u16>> = Vec::new();
 
         for i in 0..window_end {
             let bm = &self.buffer[i];
@@ -527,16 +531,42 @@ impl StreamingVcfReader {
             }
 
             if has_any_likelihoods {
-                likelihoods_pl.push(
-                    bm.likelihoods_pl
-                        .clone()
-                        .unwrap_or_else(|| vec![Vec::new(); n_samples]),
-                );
+                if let Some(pl_by_sample) = bm.likelihoods_pl.clone() {
+                    let stride = pl_by_sample
+                        .get(0)
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                        .min(u16::MAX as usize) as u16;
+                    if stride == 0 {
+                        marker_strides.push(0);
+                        marker_blocks.push(Vec::new());
+                    } else {
+                        let stride_usize = stride as usize;
+                        let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                        for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
+                            if pls.len() != stride_usize {
+                                continue;
+                            }
+                            let start = s * stride_usize;
+                            block[start..start + stride_usize].copy_from_slice(&pls);
+                        }
+                        marker_strides.push(stride);
+                        marker_blocks.push(block);
+                    }
+                } else {
+                    marker_strides.push(0);
+                    marker_blocks.push(Vec::new());
+                }
             }
         }
 
         if let Some(ref ploidy) = self.sample_ploidy {
-            let sample_ids: Vec<String> = self.samples.ids().iter().map(|s| s.to_string()).collect();
+            let sample_ids: Vec<String> = self
+                .samples
+                .ids()
+                .iter()
+                .map(|s: &std::sync::Arc<str>| s.as_ref().to_string())
+                .collect();
             self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
         }
 
@@ -546,12 +576,13 @@ impl StreamingVcfReader {
             None
         };
         let genotypes = if has_any_likelihoods {
+            let pl = Arc::new(PlMatrix::from_marker_blocks(n_samples, marker_strides, marker_blocks));
             GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                 markers,
                 columns,
                 Arc::clone(&self.samples),
                 confidence_opt,
-                likelihoods_pl,
+                pl,
             )
         } else if let Some(conf) = confidence_opt {
             GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)
@@ -595,7 +626,7 @@ impl StreamingVcfReader {
             .and_then(|idx| self.markers_meta.chrom_name(idx).map(|s| s.to_string()));
         let switched = current_name
             .as_ref()
-            .map(|cur| !candidates.iter().any(|c| c.as_str() == cur.as_str()))
+            .map(|cur: &String| !candidates.iter().any(|c| c.as_str() == cur.as_str()))
             .unwrap_or(true);
         if switched {
             self.buffer.clear();
@@ -644,11 +675,13 @@ impl StreamingVcfReader {
         let mut markers = Markers::new();
         let mut columns = Vec::with_capacity(n_markers);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
-        let mut likelihoods_pl: Vec<Vec<Vec<u16>>> = Vec::new();
         let n_samples = self.samples.len();
         let has_any_likelihoods = indices
             .iter()
             .any(|&i| self.buffer.get(i).is_some_and(|bm| bm.likelihoods_pl.is_some()));
+
+        let mut marker_strides: Vec<u16> = Vec::new();
+        let mut marker_blocks: Vec<Vec<u16>> = Vec::new();
 
         for &i in &indices {
             let bm = &self.buffer[i];
@@ -670,11 +703,32 @@ impl StreamingVcfReader {
             }
 
             if has_any_likelihoods {
-                likelihoods_pl.push(
-                    bm.likelihoods_pl
-                        .clone()
-                        .unwrap_or_else(|| vec![Vec::new(); n_samples]),
-                );
+                if let Some(pl_by_sample) = bm.likelihoods_pl.clone() {
+                    let stride = pl_by_sample
+                        .get(0)
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                        .min(u16::MAX as usize) as u16;
+                    if stride == 0 {
+                        marker_strides.push(0);
+                        marker_blocks.push(Vec::new());
+                    } else {
+                        let stride_usize = stride as usize;
+                        let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                        for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
+                            if pls.len() != stride_usize {
+                                continue;
+                            }
+                            let start = s * stride_usize;
+                            block[start..start + stride_usize].copy_from_slice(&pls);
+                        }
+                        marker_strides.push(stride);
+                        marker_blocks.push(block);
+                    }
+                } else {
+                    marker_strides.push(0);
+                    marker_blocks.push(Vec::new());
+                }
             }
         }
 
@@ -684,12 +738,13 @@ impl StreamingVcfReader {
             None
         };
         let genotypes = if has_any_likelihoods {
+            let pl = Arc::new(PlMatrix::from_marker_blocks(n_samples, marker_strides, marker_blocks));
             GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                 markers,
                 columns,
                 Arc::clone(&self.samples),
                 confidence_opt,
-                likelihoods_pl,
+                pl,
             )
         } else if let Some(conf) = confidence_opt {
             GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)

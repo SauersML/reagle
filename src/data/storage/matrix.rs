@@ -17,6 +17,79 @@ use crate::data::marker::{Marker, MarkerIdx, Markers};
 use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
 use crate::data::storage::GenotypeColumn;
 
+#[derive(Clone, Debug)]
+pub struct PlMatrix {
+    n_samples: usize,
+    marker_offsets: Vec<u32>,
+    marker_strides: Vec<u16>,
+    values: Vec<u16>,
+}
+
+impl PlMatrix {
+    const MISSING: u16 = u16::MAX;
+
+    pub fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    pub fn n_markers(&self) -> usize {
+        self.marker_strides.len()
+    }
+
+    #[inline]
+    pub fn sample_pl(&self, marker: usize, sample_idx: usize) -> Option<&[u16]> {
+        if marker >= self.marker_strides.len() || sample_idx >= self.n_samples {
+            return None;
+        }
+        let stride = self.marker_strides[marker] as usize;
+        if stride == 0 {
+            return None;
+        }
+        let base = self.marker_offsets[marker] as usize;
+        let start = base + sample_idx * stride;
+        let end = start + stride;
+        let slice = self.values.get(start..end)?;
+        if slice.iter().all(|&v| v == Self::MISSING) {
+            None
+        } else {
+            Some(slice)
+        }
+    }
+
+    pub fn from_marker_blocks(
+        n_samples: usize,
+        marker_strides: Vec<u16>,
+        mut marker_blocks: Vec<Vec<u16>>,
+    ) -> Self {
+        debug_assert_eq!(marker_strides.len(), marker_blocks.len());
+
+        let mut marker_offsets: Vec<u32> = Vec::with_capacity(marker_strides.len() + 1);
+        marker_offsets.push(0);
+        let mut values: Vec<u16> = Vec::new();
+        let mut running: u32 = 0;
+        for (stride_u16, mut block) in marker_strides.iter().copied().zip(marker_blocks.iter_mut()) {
+            let stride = stride_u16 as usize;
+            if stride == 0 {
+                marker_offsets.push(running);
+                continue;
+            }
+            debug_assert_eq!(block.len(), stride * n_samples);
+            values.append(&mut block);
+            running = running.saturating_add((stride * n_samples) as u32);
+            marker_offsets.push(running);
+        }
+        let out = Self {
+            n_samples,
+            marker_offsets,
+            marker_strides,
+            values,
+        };
+        debug_assert_eq!(out.n_samples(), n_samples);
+        debug_assert_eq!(out.n_markers(), out.marker_strides.len());
+        out
+    }
+}
+
 /// The main genotype matrix structure.
 ///
 /// Type parameter `State` encodes whether data is phased at compile time,
@@ -41,7 +114,7 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased> {
     /// None if no confidence information available (assume full confidence).
     confidence: Option<Vec<Vec<u8>>>,
 
-    likelihoods_pl: Option<Vec<Vec<Vec<u16>>>>,
+    likelihoods_pl: Option<Arc<PlMatrix>>,
 
     /// Phantom data to hold the State type parameter (zero-sized)
     phantom: PhantomData<State>,
@@ -128,13 +201,15 @@ impl<S: PhaseState> GenotypeMatrix<S> {
         self.confidence.clone()
     }
 
+    pub fn likelihoods_pl_arc(&self) -> Option<Arc<PlMatrix>> {
+        self.likelihoods_pl.as_ref().map(Arc::clone)
+    }
+
     #[inline]
     pub fn sample_pl(&self, marker: MarkerIdx, sample_idx: usize) -> Option<&[u16]> {
         self.likelihoods_pl
             .as_ref()
-            .and_then(|m| m.get(marker.as_usize()))
-            .and_then(|row| row.get(sample_idx))
-            .map(|v| v.as_slice())
+            .and_then(|pl| pl.sample_pl(marker.as_usize(), sample_idx))
     }
 
 }
@@ -187,10 +262,9 @@ impl GenotypeMatrix<Unphased> {
         columns: Vec<GenotypeColumn>,
         samples: Arc<Samples>,
         confidence: Option<Vec<Vec<u8>>>,
-        likelihoods_pl: Vec<Vec<Vec<u16>>>,
+        likelihoods_pl: Arc<PlMatrix>,
     ) -> Self {
         debug_assert_eq!(markers.len(), columns.len());
-        debug_assert_eq!(markers.len(), likelihoods_pl.len());
         if let Some(ref conf) = confidence {
             debug_assert_eq!(markers.len(), conf.len());
         }
@@ -261,6 +335,36 @@ impl GenotypeMatrix<Phased> {
             is_reversed: false,
             confidence: Some(confidence),
             likelihoods_pl: None,
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn new_phased_with_confidence_and_likelihoods(
+        markers: Markers,
+        columns: Vec<GenotypeColumn>,
+        samples: Arc<Samples>,
+        confidence: Option<Vec<Vec<u8>>>,
+        likelihoods_pl: Option<Arc<PlMatrix>>,
+    ) -> Self {
+        debug_assert_eq!(markers.len(), columns.len());
+        if let Some(ref conf) = confidence {
+            debug_assert_eq!(markers.len(), conf.len());
+        }
+
+        if likelihoods_pl.is_none() {
+            if let Some(conf) = confidence {
+                return Self::new_phased_with_confidence(markers, columns, samples, conf);
+            }
+            return Self::new_phased(markers, columns, samples);
+        }
+
+        Self {
+            markers,
+            columns,
+            samples,
+            is_reversed: false,
+            confidence,
+            likelihoods_pl,
             phantom: PhantomData,
         }
     }

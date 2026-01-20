@@ -999,12 +999,17 @@ mod tests {
 
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string()]));
         let target_col = GenotypeColumn::from_alleles(&[0, 0], 2);
+        let pl = Arc::new(crate::data::storage::matrix::PlMatrix::from_marker_blocks(
+            1,
+            vec![3u16],
+            vec![vec![0u16, 0u16, 0u16]],
+        ));
         let target_gt_unphased = GenotypeMatrix::<Unphased>::new_unphased_with_confidence_and_likelihoods(
             markers.clone(),
             vec![target_col],
             samples,
             None,
-            vec![vec![vec![0u16, 0u16, 0u16]]],
+            pl,
         );
         let target_gt = target_gt_unphased.into_phased();
 

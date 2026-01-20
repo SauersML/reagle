@@ -16,6 +16,7 @@ use tracing::info_span;
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
+use crate::data::storage::matrix::PlMatrix;
 use crate::error::{ReagleError, Result};
 use crate::utils::telemetry::TelemetryBlackboard;
 
@@ -518,15 +519,45 @@ impl VcfReader {
         };
 
         let matrix = if has_any_likelihoods && all_likelihoods_pl.len() == columns.len() {
+            let mut marker_strides: Vec<u16> = Vec::with_capacity(all_likelihoods_pl.len());
+            let mut marker_blocks: Vec<Vec<u16>> = Vec::with_capacity(all_likelihoods_pl.len());
+            for pl_opt in all_likelihoods_pl.into_iter() {
+                if let Some(pl_by_sample) = pl_opt {
+                    let stride = pl_by_sample
+                        .get(0)
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                        .min(u16::MAX as usize) as u16;
+                    if stride == 0 {
+                        marker_strides.push(0);
+                        marker_blocks.push(Vec::new());
+                        continue;
+                    }
+
+                    let stride_usize = stride as usize;
+                    let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                    for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
+                        if pls.len() != stride_usize {
+                            continue;
+                        }
+                        let start = s * stride_usize;
+                        block[start..start + stride_usize].copy_from_slice(&pls);
+                    }
+                    marker_strides.push(stride);
+                    marker_blocks.push(block);
+                } else {
+                    marker_strides.push(0);
+                    marker_blocks.push(Vec::new());
+                }
+            }
+
+            let pl = Arc::new(PlMatrix::from_marker_blocks(n_samples, marker_strides, marker_blocks));
             GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                 markers,
                 columns,
                 Arc::clone(&self.samples),
                 confidence_opt,
-                all_likelihoods_pl
-                    .into_iter()
-                    .map(|pl| pl.unwrap_or_else(|| vec![Vec::new(); n_samples]))
-                    .collect(),
+                pl,
             )
         } else if let Some(conf) = confidence_opt {
             GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)
