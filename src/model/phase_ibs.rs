@@ -166,8 +166,8 @@ impl BidirectionalPhaseIbs {
         }
     }
 
-    pub fn set_reference_start_hap(&mut self, start: u32) {
-        self.reference_start_hap = Some(start);
+    pub fn n_haps(&self) -> usize {
+        self.n_haps
     }
 
     fn with_fwd_state<R>(&self, marker_idx: usize, f: impl FnOnce(&[u32], &[i32]) -> R) -> R {
@@ -614,11 +614,6 @@ impl BidirectionalPhaseIbs {
         })
     }
 
-    /// Get the number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        self.n_haps
-    }
-
     /// Get the allele of a reference haplotype at a marker.
     ///
     /// This is used during dynamic MCMC to retrieve the reference panel alleles
@@ -653,8 +648,9 @@ impl BidirectionalPhaseIbs {
             return Vec::new();
         }
 
-        let hap1 = sample_idx * 2;
-        let hap2 = sample_idx * 2 + 1;
+        let exclude_sample = sample_idx != u32::MAX;
+        let hap1 = if exclude_sample { sample_idx * 2 } else { 0 };
+        let hap2 = if exclude_sample { sample_idx * 2 + 1 } else { 0 };
 
         let ref_start = self.reference_start_hap;
 
@@ -693,7 +689,7 @@ impl BidirectionalPhaseIbs {
                     max_div_u = max_div_u.max(div.get(u).copied().unwrap_or(i32::MAX));
                     u -= 1;
                     let h = ppa[u];
-                    if h != hap1 && h != hap2 && h != ref_state {
+                    if (!exclude_sample || (h != hap1 && h != hap2)) && h != ref_state {
                         if ref_start.map_or(true, |start| h >= start) {
                             neighbors.push(h);
                         }
@@ -701,7 +697,7 @@ impl BidirectionalPhaseIbs {
                 } else if can_go_v {
                     max_div_v = max_div_v.max(div.get(v).copied().unwrap_or(i32::MAX));
                     let h = ppa[v];
-                    if h != hap1 && h != hap2 && h != ref_state {
+                    if (!exclude_sample || (h != hap1 && h != hap2)) && h != ref_state {
                         if ref_start.map_or(true, |start| h >= start) {
                             neighbors.push(h);
                         }

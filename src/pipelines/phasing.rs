@@ -1542,44 +1542,6 @@ impl PhasingPipeline {
         )
     }
 
-    /// Build bidirectional PBWT for combined haplotype space on a marker subset
-    fn build_bidirectional_pbwt_combined_subset<F>(
-        &self,
-        get_allele: F,
-        marker_indices: &[usize],
-        n_total_haps: usize,
-    ) -> BidirectionalPhaseIbs
-    where
-        F: Fn(usize, usize) -> u8,
-    {
-        let n_subset = marker_indices.len();
-        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
-
-        for &orig_m in marker_indices {
-            let mut alleles = Vec::with_capacity(n_total_haps);
-            for h in 0..n_total_haps {
-                alleles.push(get_allele(orig_m, h));
-            }
-            alleles_by_marker.push(alleles);
-        }
-
-        let mut pbwt = BidirectionalPhaseIbs::build_for_subset(
-            alleles_by_marker,
-            n_total_haps,
-            n_subset,
-            marker_indices,
-        );
-
-        // When using a reference panel, we want state selection to prefer copying
-        // from reference haplotypes rather than other target haplotypes.
-        // The combined hap space is [0..n_target_haps) + [n_target_haps..n_total_haps).
-        let n_target_haps = self.reference_gt.as_ref().map(|r| n_total_haps - r.n_haplotypes());
-        if let Some(start) = n_target_haps {
-            pbwt.set_reference_start_hap(start as u32);
-        }
-        pbwt
-    }
-
     /// Build composite haplotypes for all samples using streaming PBWT
     ///
     /// This streaming approach uses O(N) memory instead of O(M*N) for the PBWT index.
@@ -2436,31 +2398,11 @@ impl PhasingPipeline {
             };
 
             // 2. Build bidirectional PBWT on high-frequency markers only
-            // When reference is available, include reference haplotypes in the PBWT
-            // Filter low-confidence target markers to prevent bad hard calls from
-            // excluding correct reference haplotypes during state selection.
-
-            let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                self.build_bidirectional_pbwt_combined_subset(
-                    |orig_m, h| {
-                        if h < n_haps {
-                            ref_geno.get(orig_m, HapIdx::new(h as u32))
-                        } else {
-                            let ref_h = h - n_haps;
-                            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
-                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                                // Map reference allele to target encoding (handles strand flips)
-                                alignment.reverse_map_allele(orig_m, ref_allele)
-                            } else {
-                                255 // Missing - marker not in reference
-                            }
-                        }
-                    },
-                    hi_freq_to_orig,
-                    n_total_haps,
-                )
+            let use_dynamic_mcmc = self.config.dynamic_mcmc && self.reference_gt.is_none();
+            let phase_ibs = if use_dynamic_mcmc {
+                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
             } else {
-                self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps)
+                None
             };
 
             // Collect phase decisions per sample using correct per-het algorithm.
@@ -2515,7 +2457,7 @@ impl PhasingPipeline {
                     let p_err = self.params.p_mismatch;
                     let p_no_err = 1.0 - p_err;
 
-                    let (swap_bits, swap_lr, new_paths) = if self.config.dynamic_mcmc {
+                    let (swap_bits, swap_lr, new_paths) = if use_dynamic_mcmc {
                         // SHAPEIT5-style dynamic MCMC: re-select states each step
                         // Note: Dynamic MCMC doesn't use ThreadWorkspace yet
                         let (swap_bits, swap_lr, new_paths) = if self.config.profile {
@@ -2527,7 +2469,7 @@ impl PhasingPipeline {
                                     &seq1,
                                     &seq2,
                                     &sample_conf,
-                                    &phase_ibs,
+                                    phase_ibs.as_ref().expect("phase_ibs"),
                                     ibs2,
                                     s as u32,
                                     &het_positions,
@@ -2546,7 +2488,7 @@ impl PhasingPipeline {
                                 &seq1,
                                 &seq2,
                                 &sample_conf,
-                                &phase_ibs,
+                                phase_ibs.as_ref().expect("phase_ibs"),
                                 ibs2,
                                 s as u32,
                                 &het_positions,
@@ -2920,30 +2862,11 @@ impl PhasingPipeline {
             }
 
             // Build bidirectional PBWT on hi-freq markers for consistent state selection
-            // When reference is available, include reference haplotypes
-            // Filter low-confidence target markers to prevent bad hard calls from
-            // excluding correct reference haplotypes during state selection.
-            let phase_ibs = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                self.build_bidirectional_pbwt_combined_subset(
-                    |orig_m, h| {
-                        if h < n_haps {
-                            ref_geno.get(orig_m, HapIdx::new(h as u32))
-                        } else {
-                            let ref_h = h - n_haps;
-                            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
-                                let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
-                                // Map reference allele to target encoding (handles strand flips)
-                                alignment.reverse_map_allele(orig_m, ref_allele)
-                            } else {
-                                255 // Missing - marker not in reference
-                            }
-                        }
-                    },
-                    hi_freq_markers,
-                    n_total_haps,
-                )
+            let has_ref = self.reference_gt.is_some() && self.alignment.is_some();
+            let phase_ibs = if has_ref {
+                None
             } else {
-                self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_markers, n_haps)
+                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_markers, n_haps))
             };
 
             // Process samples in parallel - collect results: Stage2Decision
@@ -3225,12 +3148,24 @@ impl PhasingPipeline {
                             let stage1_idx = stage2_phaser.prev_stage1_marker[m];
                             let hap1_idx = (s * 2) as u32;
                             let hap2_idx = (s * 2 + 1) as u32;
-                            let span1 = phase_ibs.best_match_span(hap1_idx, stage1_idx);
-                            let span2 = phase_ibs.best_match_span(hap2_idx, stage1_idx);
+                            let shorter_is_hap1 = if has_ref {
+                                let max1 = probs1
+                                    .get(stage1_idx)
+                                    .and_then(|v| v.iter().copied().reduce(f32::max))
+                                    .unwrap_or(0.0);
+                                let max2 = probs2
+                                    .get(stage1_idx)
+                                    .and_then(|v| v.iter().copied().reduce(f32::max))
+                                    .unwrap_or(0.0);
+                                max1 < max2
+                            } else {
+                                let span1 = phase_ibs.as_ref().expect("phase_ibs").best_match_span(hap1_idx, stage1_idx);
+                                let span2 = phase_ibs.as_ref().expect("phase_ibs").best_match_span(hap2_idx, stage1_idx);
+                                span1 < span2
+                            };
                             let alt_on_hap1 = a1 > 0 && a1 != 255;
                             let alt_on_hap2 = a2 > 0 && a2 != 255;
                             if alt_on_hap1 ^ alt_on_hap2 {
-                                let shorter_is_hap1 = span1 < span2;
                                 let should_swap = if alt_on_hap1 {
                                     !shorter_is_hap1
                                 } else {
