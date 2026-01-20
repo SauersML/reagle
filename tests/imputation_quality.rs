@@ -1,5 +1,3 @@
-#![allow(dead_code)]  // Functions may be used externally or via env-var triggered tests
-
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -170,4 +168,15 @@ fn run_metrics(truth_path: &Path, imputed_path: &Path, output_json: &Path) {
     
     let f = File::create(output_json).expect("Create JSON");
     serde_json::to_writer_pretty(f, &metrics).expect("Write JSON");
+}
+
+#[test]
+fn test_metrics_if_env_set() {
+    let truth = std::env::var("GNOMON_TEST_TRUTH_VCF").ok();
+    let imputed = std::env::var("GNOMON_TEST_IMPUTED_VCF").ok();
+    let output = std::env::var("GNOMON_TEST_OUTPUT_JSON").ok();
+
+    if let (Some(t), Some(i), Some(o)) = (truth, imputed, output) {
+        run_metrics(Path::new(&t), Path::new(&i), Path::new(&o));
+    }
 }
