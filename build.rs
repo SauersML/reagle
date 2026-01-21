@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 use grep::regex::RegexMatcher;
 use grep::searcher::{Searcher, Sink, SinkMatch};
 use std::ffi::{OsStr, OsString};
