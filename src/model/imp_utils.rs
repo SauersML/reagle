@@ -641,6 +641,8 @@ pub fn run_hmm_forward_backward_to_sparse(
     let mut entry_counts = Vec::with_capacity(n_clusters);
     let mut curr_posteriors = vec![0.0f32; n_states];
     let mut next_posteriors = vec![0.0f32; n_states];
+    let mut next_bwd_norm = vec![0.0f32; n_states];
+    let mut curr_fwd_norm = vec![0.0f32; n_states];
 
     for block_idx in (0..n_checkpoints).rev() {
         let block_start = block_idx * CHECKPOINT_INTERVAL;
@@ -758,6 +760,24 @@ pub fn run_hmm_forward_backward_to_sparse(
             let _ = &bwd_span;
 
             for m in (block_start..block_end).rev() {
+                // Capture current Backward values (which correspond to m+1) before update
+                // These are needed for bridge interpolation B(m+1).
+                // For the last marker (m = n_clusters - 1), B(m+1) is implicitly uniform.
+                // Note: bwd is already normalized during updates.
+                let mut bwd_sum = 0.0f32;
+                for &x in &bwd[0..n_states] {
+                    bwd_sum += x;
+                }
+                if bwd_sum > 0.0 {
+                    let inv = 1.0 / bwd_sum;
+                    for k in 0..n_states {
+                        next_bwd_norm[k] = bwd[k] * inv;
+                    }
+                } else {
+                    let val = 1.0 / n_states as f32;
+                    next_bwd_norm.fill(val);
+                }
+
                 if m + 1 < n_clusters {
                     let p_rec = p_recomb.get(m + 1).copied().unwrap_or(0.0);
                     let shift = p_rec / n_states as f32;
@@ -830,6 +850,22 @@ pub fn run_hmm_forward_backward_to_sparse(
                 };
                 let fwd_row = &block_fwd[local_offset..local_offset + n_states];
 
+                // Compute normalized Forward(m)
+                let mut fwd_sum = 0.0f32;
+                for &x in fwd_row.iter().take(n_states) {
+                    fwd_sum += x;
+                }
+                if fwd_sum > 0.0 {
+                    let inv = 1.0 / fwd_sum;
+                    for k in 0..n_states {
+                        curr_fwd_norm[k] = fwd_row[k] * inv;
+                    }
+                } else {
+                    let val = 1.0 / n_states as f32;
+                    curr_fwd_norm.fill(val);
+                }
+
+                // Compute Posterior(m) = F(m) * B(m)
                 let mut state_sum = 0.0f32;
                 for k in 0..n_states {
                     curr_posteriors[k] = fwd_row[k] * bwd[k];
@@ -844,22 +880,26 @@ pub fn run_hmm_forward_backward_to_sparse(
 
                 let entries_before = hap_indices.len();
                 if m == n_clusters - 1 {
+                    // For the last marker, bridge logic isn't used for right side,
+                    // but we store F(m) and B(m) (or B(m+1)=uniform) to be consistent.
+                    // Storing B(m+1) = uniform (from next_bwd_norm init) is fine.
                     for k in 0..n_states {
                         let prob = curr_posteriors[k];
                         if prob > threshold {
                             hap_indices.push(hap_indices_input[m][k]);
-                            probs.push(prob);
-                            probs_p1.push(prob);
+                            probs.push(curr_fwd_norm[k]);
+                            probs_p1.push(next_bwd_norm[k]);
                         }
                     }
                 } else {
                     for k in 0..n_states {
                         let prob = curr_posteriors[k];
                         let prob_next = next_posteriors[k];
+                        // Select if significant at m OR m+1
                         if prob > threshold || prob_next > threshold {
                             hap_indices.push(hap_indices_input[m][k]);
-                            probs.push(prob);
-                            probs_p1.push(prob_next);
+                            probs.push(curr_fwd_norm[k]);
+                            probs_p1.push(next_bwd_norm[k]);
                         }
                     }
                 }
