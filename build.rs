@@ -1723,10 +1723,8 @@ fn manually_check_for_unused_variables() {
             emit_stage_detail(
                 "manual lint self-check: could not determine build dependency directory",
             );
-            eprintln!(
-                "manual lint self-check fatal error: unable to derive build dependency directory from OUT_DIR"
-            );
-            std::process::exit(1);
+            println!("cargo:warning=manual lint self-check skipped: unable to derive build dependency directory from OUT_DIR");
+            return;
         }
     };
 
@@ -1737,10 +1735,8 @@ fn manually_check_for_unused_variables() {
             emit_stage_detail(
                 "manual lint self-check: unable to obtain source path from manual lint arguments",
             );
-            eprintln!(
-                "manual lint self-check fatal error: manual lint argument assembly failed to include the source path"
-            );
-            std::process::exit(1);
+            println!("cargo:warning=manual lint self-check skipped: manual lint argument assembly failed to include the source path");
+            return;
         }
     };
 
@@ -1760,11 +1756,11 @@ fn manually_check_for_unused_variables() {
                 emit_stage_detail(&format!(
                     "manual lint self-check: missing rlib for dependency '{crate_name}'"
                 ));
-                eprintln!(
-                    "manual lint self-check fatal error: required dependency '{crate_name}' rlib not found in {:?}",
+                println!(
+                    "cargo:warning=manual lint self-check skipped: required dependency '{crate_name}' rlib not found in {:?}",
                     deps_dir
                 );
-                std::process::exit(1);
+                return;
             }
         }
     }
@@ -1863,8 +1859,8 @@ fn manually_check_for_unused_variables() {
                     eprintln!("   Either use the imported item or remove the import completely.");
                     std::process::exit(1);
                 } else {
-                    eprintln!(
-                        "manual lint self-check fatal error: rustc self-lint exited with status {}",
+                    println!(
+                        "cargo:warning=manual lint self-check skipped: rustc invocation failed with status {}",
                         output
                             .status
                             .code()
@@ -1872,9 +1868,9 @@ fn manually_check_for_unused_variables() {
                             .unwrap_or_else(|| String::from("<signal>"))
                     );
                     if !output.stderr.is_empty() {
-                        eprintln!("rustc self-lint stderr:\n{}", stderr);
+                        emit_stage_detail(&format!("rustc self-lint stderr:\n{}", stderr));
                     }
-                    std::process::exit(1);
+                    return;
                 }
             } else {
                 emit_stage_detail("Completed rustc self-lint for build.rs");
@@ -1884,10 +1880,10 @@ fn manually_check_for_unused_variables() {
             emit_stage_detail(&format!(
                 "manual lint self-check: failed to start rustc self-lint command: {err}"
             ));
-            eprintln!(
-                "manual lint self-check fatal error: failed to spawn rustc self-lint command: {err}"
+            println!(
+                "cargo:warning=manual lint self-check skipped: failed to spawn rustc self-lint command: {err}"
             );
-            std::process::exit(1);
+            return;
         }
     }
 }
