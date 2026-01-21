@@ -16,13 +16,10 @@
 
 use std::time::Instant;
 
-mod config;
-mod data;
-mod error;
-mod io;
-mod model;
-mod pipelines;
-mod utils;
+use reagle::config;
+use reagle::error;
+use reagle::pipelines;
+use reagle::utils;
 
 use config::Config;
 use error::Result;
@@ -108,6 +105,7 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reagle::{data, io, model};
 
     #[test]
     fn test_module_imports() {

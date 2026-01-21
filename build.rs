@@ -1895,7 +1895,7 @@ fn manually_check_for_unused_variables() {
 fn manual_lint_arguments(build_path: &Path) -> Vec<OsString> {
     vec![
         OsString::from("--edition"),
-        OsString::from("2024"),
+        OsString::from("2021"),
         OsString::from("-D"),
         OsString::from("unused_variables"),
         OsString::from("-D"),
