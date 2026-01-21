@@ -158,7 +158,7 @@ pub fn compute_cluster_mismatches_into_workspace(
             partner_allele: u8,
             log_diff: f32,
             hard_log_diff: f32,
-            // log_match removed (unused)
+            log_missing_penalty: f32,
             ref_marker_idx: MarkerIdx,
             map_alleles: bool,
         }
@@ -247,6 +247,10 @@ pub fn compute_cluster_mismatches_into_workspace(
             let hard_log_mism = (1e-12f32).ln();
             let hard_log_diff = hard_log_mism - log_match;
 
+            // Treat missing reference alleles as "neutral" (P=0.5) instead of match (P=match_prob).
+            // penalty = ln(0.5) - ln(match_prob) = -0.693... - log_match
+            let log_missing_penalty = -0.69314718f32 - log_match;
+
             if !printed_hmm_trace
                 && c == 0
                 && geno1 != geno2
@@ -303,7 +307,7 @@ pub fn compute_cluster_mismatches_into_workspace(
                 partner_allele,
                 log_diff,
                 hard_log_diff,
-                // log_match: 0.0,
+                log_missing_penalty,
                 ref_marker_idx: MarkerIdx::new(ref_m as u32),
                 map_alleles: alignment.has_allele_mapping(target_m),
             });
@@ -380,6 +384,8 @@ pub fn compute_cluster_mismatches_into_workspace(
                         if final_ref == 255 {
                             if ref_allele != 255 {
                                 acc[k] += m_props.log_diff;
+                            } else {
+                                acc[k] += m_props.log_missing_penalty;
                             }
                         } else if m_props.partner_allele != 255 {
                             let required = if m_props.partner_allele == m_props.geno1 {
@@ -426,6 +432,8 @@ pub fn compute_cluster_mismatches_into_workspace(
                         if final_ref == 255 {
                             if ref_allele != 255 {
                                 acc_penalty += m_props.log_diff;
+                            } else {
+                                acc_penalty += m_props.log_missing_penalty;
                             }
                         } else if m_props.partner_allele != 255 {
                             let required = if m_props.partner_allele == m_props.geno1 {
@@ -936,11 +944,10 @@ pub fn compute_state_probs(
         trace,
     );
 
-    let threshold = if n_clusters <= 1000 {
-        0.0
-    } else {
-        (0.9999f32 / n_states as f32).min(0.005f32)
-    };
+    // Java Beagle uses minProb = 1.0E-5.
+    // Pruning noise is essential for maintaining high confidence (stickiness).
+    // Using 0.0 for small windows allows noise accumulation which degrades dosage accuracy.
+    let threshold = 1e-5f32;
 
     let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) = run_hmm_forward_backward_to_sparse(
         &workspace.diff_vals,
