@@ -881,7 +881,7 @@ fn run_imputation_comparison(source: &TestDataSource) {
     let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_imputed");
-    let rust_result = run_rust_imputation(&gt_vcf, &ref_vcf, &rust_out, 42);
+    let rust_result = run_rust_imputation(&gt_vcf, &ref_vcf, &rust_out, 42, None);
     assert!(
         rust_result.is_ok(),
         "{}: Rust imputation failed: {:?}",
@@ -985,7 +985,7 @@ fn test_imputation_bref3_ref_rust_vs_java() {
     // Run Rust with bref3 reference (decompress gt for Rust)
     let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_bref3");
-    let rust_result = run_rust_imputation(&gt_vcf, &bref3_path, &rust_out, 42);
+    let rust_result = run_rust_imputation(&gt_vcf, &bref3_path, &rust_out, 42, None);
     assert!(
         rust_result.is_ok(),
         "Rust with bref3 failed: {:?}",
@@ -1096,7 +1096,7 @@ fn run_full_workflow_comparison(source: &TestDataSource) {
     );
 
     let rust_imp = work_dir.path().join("rust_imputed");
-    let rust_result = run_rust_imputation(&gt_vcf, &ref_vcf, &rust_imp, 42);
+    let rust_result = run_rust_imputation(&gt_vcf, &ref_vcf, &rust_imp, 42, None);
     assert!(
         rust_result.is_ok(),
         "{}: Rust imputation failed: {:?}",
@@ -1211,7 +1211,7 @@ fn run_output_structure_comparison(source: &TestDataSource) {
     let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_out");
-    let rust_result = run_rust_imputation(&gt_vcf, &ref_vcf, &rust_out, 42);
+    let rust_result = run_rust_imputation(&gt_vcf, &ref_vcf, &rust_out, 42, None);
     assert!(
         rust_result.is_ok(),
         "{}: Rust imputation failed: {:?}",
@@ -1796,7 +1796,7 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     // Run Rust (use uncompressed masked.vcf, decompress ref for Rust)
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_imputed");
-    let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, 42);
+    let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, 42, None);
     assert!(
         rust_result.is_ok(),
         "{}: Rust imputation failed: {:?}",
@@ -2156,19 +2156,27 @@ fn run_rust_imputation(
     ref_path: &Path,
     out_prefix: &Path,
     seed: i64,
+    ne: Option<f32>,
 ) -> reagle::Result<()> {
-    let config = Config::parse_from([
-        "reagle",
-        "--gt",
-        gt_path.to_str().unwrap(),
-        "--ref",
-        ref_path.to_str().unwrap(),
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--seed",
-        &seed.to_string(),
-        "--gp",
-    ]);
+    let mut args = vec![
+        "reagle".to_string(),
+        "--gt".to_string(),
+        gt_path.to_str().unwrap().to_string(),
+        "--ref".to_string(),
+        ref_path.to_str().unwrap().to_string(),
+        "--out".to_string(),
+        out_prefix.to_str().unwrap().to_string(),
+        "--seed".to_string(),
+        seed.to_string(),
+        "--gp".to_string(),
+    ];
+
+    if let Some(ne_val) = ne {
+        args.push("--ne".to_string());
+        args.push(ne_val.to_string());
+    }
+
+    let config = Config::parse_from(args);
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2497,7 +2505,7 @@ fn test_genotyped_dosage_correlation_with_truth() {
         let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
         let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
         let rust_out = work_dir.path().join("rust_out");
-        let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+        let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42, None);
         assert!(
             rust_result.is_ok(),
             "{}: Rust imputation failed: {:?}",
@@ -2560,7 +2568,7 @@ fn test_strict_dr2_and_dosage_comparison() {
         let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
         let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
         let rust_out = work_dir.path().join("rust_out");
-        let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+        let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42, None);
         assert!(
             rust_result.is_ok(),
             "{}: Rust imputation failed: {:?}",
@@ -2650,7 +2658,7 @@ fn test_diverse_mask_scenarios() {
         // Run Rust
         let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
         let rust_out = work_dir.path().join("rust_imputed");
-        let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, seed as i64);
+        let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, seed as i64, None);
         assert!(
             rust_result.is_ok(),
             "Rust imputation failed for {}: {:?}",
@@ -2766,7 +2774,7 @@ fn test_multiple_seeds_consistency() {
         // Run Rust
         let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
         let rust_out = work_dir.path().join("rust_out");
-        let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, seed as i64);
+        let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, seed as i64, None);
         assert!(
             rust_result.is_ok(),
             "Rust failed for seed {}: {:?}",
@@ -2895,7 +2903,7 @@ fn test_per_sample_imputation_accuracy() {
     // Run Rust
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_out");
-    let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, 42);
+    let rust_result = run_rust_imputation(&masked_path, &ref_vcf, &rust_out, 42, None);
     assert!(
         rust_result.is_ok(),
         "Rust imputation failed: {:?}",
@@ -3087,7 +3095,7 @@ fn test_dr2_genotyped_vs_imputed() {
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_out");
-    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42, Some(1_000_000.0));
     assert!(
         rust_result.is_ok(),
         "Rust imputation failed: {:?}",
@@ -3326,7 +3334,7 @@ fn test_dosage_by_distance_from_genotyped() {
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_out");
-    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42, None);
     assert!(
         rust_result.is_ok(),
         "Rust imputation failed: {:?}",
@@ -3493,7 +3501,7 @@ fn test_posterior_probability_calibration() {
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&sparse_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_out");
-    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42, None);
     assert!(
         rust_result.is_ok(),
         "Rust imputation failed: {:?}",
@@ -3661,7 +3669,7 @@ fn test_genotyped_dosage_matches_hard_call() {
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_out");
-    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42, None);
     assert!(
         rust_result.is_ok(),
         "Rust imputation failed: {:?}",
@@ -4350,7 +4358,7 @@ fn test_perfect_ld_trap_rare_variants_aggregate() {
     let rust_out = work_dir.path().join("rust_imp");
     let target_vcf = decompress_vcf_for_rust(&beagle.target_sparse_vcf, work_dir.as_ref());
     let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.as_ref());
-    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345).expect("Rust imputation failed");
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345, None).expect("Rust imputation failed");
 
     let java_vcf = work_dir.path().join("java_imp.vcf.gz");
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
@@ -4603,7 +4611,7 @@ fn test_dr2_zero_variance_genotyped_marker() {
 
     let target_vcf = decompress_vcf_for_rust(&beagle.target_sparse_vcf, work_dir.as_ref());
     let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.as_ref());
-    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345).expect("Rust imputation failed");
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345, None).expect("Rust imputation failed");
 
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
     let (_, rust_records) = parse_vcf(&rust_vcf);
@@ -4685,7 +4693,7 @@ fn run_imputation_vs_ground_truth_comparison(source: &TestDataSource) {
     let rust_out = work_dir.path().join("rust_imp");
     let target_vcf = decompress_vcf_for_rust(&source.target_sparse_vcf, work_dir.as_ref());
     let ref_vcf = decompress_vcf_for_rust(&source.ref_vcf, work_dir.as_ref());
-    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345).expect("Rust imputation failed");
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345, None).expect("Rust imputation failed");
     let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
     let (_, rust_records) = parse_vcf(&rust_vcf);
 
