@@ -136,7 +136,6 @@ pub struct Config {
     #[arg(long, default_value = "2.0")]
     pub overlap: f32,
 
-
     /// Random seed for reproducibility
     #[arg(long, default_value = "-99999")]
     pub seed: i64,
@@ -204,8 +203,8 @@ impl Config {
     /// Returns an empty set if no exclusion file is specified.
     pub fn load_exclude_samples(&self) -> Result<std::collections::HashSet<String>> {
         info_span!("load_exclude_samples").in_scope(|| {
-            use std::io::{BufRead, BufReader};
             use std::fs::File;
+            use std::io::{BufRead, BufReader};
 
             let mut exclude_set = std::collections::HashSet::new();
 
@@ -230,8 +229,8 @@ impl Config {
     /// Returns an empty set if no exclusion file is specified.
     pub fn load_exclude_markers(&self) -> Result<std::collections::HashSet<String>> {
         info_span!("load_exclude_markers").in_scope(|| {
-            use std::io::{BufRead, BufReader};
             use std::fs::File;
+            use std::io::{BufRead, BufReader};
 
             let mut exclude_set = std::collections::HashSet::new();
 

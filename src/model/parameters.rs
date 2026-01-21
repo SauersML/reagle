@@ -97,7 +97,12 @@ impl ModelParams {
     /// Java ImpData uses different counts for different parameters:
     /// - errProb: uses nHaps = nRefHaps + nTargHaps
     /// - pRecomb: uses refGT.nHaps() (ref only)
-    pub fn for_imputation(n_ref_haps: usize, n_total_haps: usize, ne: f32, err: Option<f32>) -> Self {
+    pub fn for_imputation(
+        n_ref_haps: usize,
+        n_total_haps: usize,
+        ne: f32,
+        err: Option<f32>,
+    ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))

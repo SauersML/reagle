@@ -14,18 +14,18 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
 
+use flate2::read::GzDecoder;
 use noodles::bgzf::io as bgzf_io;
 use noodles::vcf::Header;
-use flate2::read::GzDecoder;
 use tracing::info_span;
 
+use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, Markers};
-use crate::data::ChromIdx;
+use crate::data::storage::GenotypeColumn;
 use crate::data::storage::matrix::GenotypeMatrix;
 use crate::data::storage::matrix::PlMatrix;
-use crate::data::storage::GenotypeColumn;
 use crate::error::{ReagleError, Result};
 
 /// Configuration for streaming window processing
@@ -112,7 +112,13 @@ impl HaplotypePriors {
     /// Set priors from HMM state posteriors at window boundary.
     /// Uses an adaptive threshold to avoid discarding most mass at high state counts.
     /// Sorts by hap_id for efficient binary search lookup.
-    pub fn set_from_posteriors(&mut self, hap_indices: &[u32], probs: &[f32], gen_position: f64, window: usize) {
+    pub fn set_from_posteriors(
+        &mut self,
+        hap_indices: &[u32],
+        probs: &[f32],
+        gen_position: f64,
+        window: usize,
+    ) {
         self.hap_ids.clear();
         self.probs.clear();
 
@@ -128,10 +134,10 @@ impl HaplotypePriors {
             .filter(|(_, p)| **p > min_prob)
             .map(|(&h, &p)| (h, p))
             .collect();
-        
+
         // Sort by hap_id for binary search
         pairs.sort_unstable_by_key(|(h, _)| *h);
-        
+
         // Split into parallel arrays
         self.hap_ids.reserve(pairs.len());
         self.probs.reserve(pairs.len());
@@ -337,11 +343,7 @@ impl StreamingVcfReader {
             "bgz" | "bgzf" => {
                 let mut file = File::open(path)?;
                 if !detect_bgzf(&mut file)? {
-                    return Err(anyhow::anyhow!(
-                        "Expected BGZF file for extension .{}",
-                        ext
-                    )
-                    .into());
+                    return Err(anyhow::anyhow!("Expected BGZF file for extension .{}", ext).into());
                 }
                 let reader: Box<dyn BufRead + Send> =
                     Box::new(BufReader::new(bgzf_io::Reader::new(file)));
@@ -371,66 +373,66 @@ impl StreamingVcfReader {
         config: StreamingConfig,
     ) -> Result<Self> {
         info_span!("streaming_vcf_from_reader").in_scope(|| {
-        // Read header
-        let mut header_str = String::new();
-        let mut line = String::new();
+            // Read header
+            let mut header_str = String::new();
+            let mut line = String::new();
 
-        loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line)?;
-            if bytes_read == 0 {
-                break;
-            }
-            if line.starts_with('#') {
-                header_str.push_str(&line);
-                if line.starts_with("#CHROM") {
+            loop {
+                line.clear();
+                let bytes_read = reader.read_line(&mut line)?;
+                if bytes_read == 0 {
                     break;
                 }
-            } else {
-                break;
+                if line.starts_with('#') {
+                    header_str.push_str(&line);
+                    if line.starts_with("#CHROM") {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
-        }
 
-        let header: Header = header_str
-            .parse()
-            .map_err(|e| ReagleError::vcf(format!("{}", e)))?;
+            let header: Header = header_str
+                .parse()
+                .map_err(|e| ReagleError::vcf(format!("{}", e)))?;
 
-        // Parse sample names from header.
-        let sample_names: Vec<String> = header
-            .sample_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+            // Parse sample names from header.
+            let sample_names: Vec<String> = header
+                .sample_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
 
-        let samples = Arc::new(Samples::from_ids(sample_names));
-        let header_samples = samples.len();
-        let header_lines = header_str.lines().count();
+            let samples = Arc::new(Samples::from_ids(sample_names));
+            let header_samples = samples.len();
+            let header_lines = header_str.lines().count();
 
-        let mut reader = Self {
-            reader,
-            samples,
-            config,
-            gen_maps,
-            buffer: VecDeque::new(),
-            markers_meta: Markers::new(),
-            current_chrom: None,
-            window_num: 0,
-            global_marker_idx: 0,
-            eof: false,
-            line_buf: String::new(),
-            all_phased: true,
-            sample_ploidy: None,
-            has_any_confidence: false,
-        };
+            let mut reader = Self {
+                reader,
+                samples,
+                config,
+                gen_maps,
+                buffer: VecDeque::new(),
+                markers_meta: Markers::new(),
+                current_chrom: None,
+                window_num: 0,
+                global_marker_idx: 0,
+                eof: false,
+                line_buf: String::new(),
+                all_phased: true,
+                sample_ploidy: None,
+                has_any_confidence: false,
+            };
 
-        if let Err(e) = reader.prefetch_first_marker() {
-            return Err(ReagleError::vcf(format!(
-                "{} (header_lines={}, header_samples={})",
-                e, header_lines, header_samples
-            )));
-        }
+            if let Err(e) = reader.prefetch_first_marker() {
+                return Err(ReagleError::vcf(format!(
+                    "{} (header_lines={}, header_samples={})",
+                    e, header_lines, header_samples
+                )));
+            }
 
-        Ok(reader)
+            Ok(reader)
         })
     }
 
@@ -469,147 +471,160 @@ impl StreamingVcfReader {
             // Fill buffer until we have a complete window
             self.fill_buffer_to_window()?;
 
-        if self.buffer.is_empty() {
-            return Ok(None);
-        }
+            if self.buffer.is_empty() {
+                return Ok(None);
+            }
 
-        // Determine window boundaries
-        let window_start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
-        let target_end_gen = window_start_gen + self.config.window_cm as f64;
-        let full_window_gen = target_end_gen + self.config.overlap_cm as f64;
+            // Determine window boundaries
+            let window_start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
+            let target_end_gen = window_start_gen + self.config.window_cm as f64;
+            let full_window_gen = target_end_gen + self.config.overlap_cm as f64;
 
-        // Find end of full window (output + overlap)
-        let window_end = self
-            .buffer
-            .iter()
-            .position(|m| m.gen_pos >= full_window_gen)
-            .unwrap_or(self.buffer.len())
-            .min(self.config.max_markers);
+            // Find end of full window (output + overlap)
+            let window_end = self
+                .buffer
+                .iter()
+                .position(|m| m.gen_pos >= full_window_gen)
+                .unwrap_or(self.buffer.len())
+                .min(self.config.max_markers);
 
-        let is_last = self.eof && window_end >= self.buffer.len();
+            let is_last = self.eof && window_end >= self.buffer.len();
 
-        // Determine splice points
-        let output_start = 0;
-        let output_end = if is_last {
-            window_end
-        } else {
-            // Splice at the first marker past the main window
-            self.buffer
+            // Determine splice points
+            let output_start = 0;
+            let output_end = if is_last {
+                window_end
+            } else {
+                // Splice at the first marker past the main window
+                self.buffer
+                    .iter()
+                    .take(window_end)
+                    .position(|m| m.gen_pos >= target_end_gen)
+                    .unwrap_or(window_end)
+            };
+
+            // Build GenotypeMatrix for this window
+            let mut markers = Markers::new();
+            let mut columns = Vec::with_capacity(window_end);
+            let mut confidences: Vec<Vec<u8>> = Vec::new();
+            let n_samples = self.samples.len();
+            let has_any_likelihoods = self
+                .buffer
                 .iter()
                 .take(window_end)
-                .position(|m| m.gen_pos >= target_end_gen)
-                .unwrap_or(window_end)
-        };
+                .any(|bm| bm.likelihoods_pl.is_some());
 
-        // Build GenotypeMatrix for this window
-        let mut markers = Markers::new();
-        let mut columns = Vec::with_capacity(window_end);
-        let mut confidences: Vec<Vec<u8>> = Vec::new();
-        let n_samples = self.samples.len();
-        let has_any_likelihoods = self.buffer.iter().take(window_end).any(|bm| bm.likelihoods_pl.is_some());
+            let mut marker_strides: Vec<u16> = Vec::new();
+            let mut marker_blocks: Vec<Vec<u16>> = Vec::new();
 
-        let mut marker_strides: Vec<u16> = Vec::new();
-        let mut marker_blocks: Vec<Vec<u16>> = Vec::new();
-
-        for i in 0..window_end {
-            let bm = &self.buffer[i];
-            let chrom_name = self
-                .markers_meta
-                .chrom_name(bm.marker.chrom)
-                .unwrap_or("UNKNOWN");
-            let window_chrom_idx = markers.add_chrom(chrom_name);
-            let mut marker = bm.marker.clone();
-            marker.chrom = window_chrom_idx;
-            markers.push(marker);
-            columns.push(bm.column.clone());
-            if self.has_any_confidence {
-                if let Some(conf) = &bm.confidences {
-                    confidences.push(conf.clone());
-                } else {
-                    confidences.push(vec![255; self.samples.len()]);
+            for i in 0..window_end {
+                let bm = &self.buffer[i];
+                let chrom_name = self
+                    .markers_meta
+                    .chrom_name(bm.marker.chrom)
+                    .unwrap_or("UNKNOWN");
+                let window_chrom_idx = markers.add_chrom(chrom_name);
+                let mut marker = bm.marker.clone();
+                marker.chrom = window_chrom_idx;
+                markers.push(marker);
+                columns.push(bm.column.clone());
+                if self.has_any_confidence {
+                    if let Some(conf) = &bm.confidences {
+                        confidences.push(conf.clone());
+                    } else {
+                        confidences.push(vec![255; self.samples.len()]);
+                    }
                 }
-            }
 
-            if has_any_likelihoods {
-                if let Some(pl_by_sample) = bm.likelihoods_pl.clone() {
-                    let stride = pl_by_sample
-                        .get(0)
-                        .map(|v| v.len())
-                        .unwrap_or(0)
-                        .min(u16::MAX as usize) as u16;
-                    if stride == 0 {
+                if has_any_likelihoods {
+                    if let Some(pl_by_sample) = bm.likelihoods_pl.clone() {
+                        let stride = pl_by_sample
+                            .get(0)
+                            .map(|v| v.len())
+                            .unwrap_or(0)
+                            .min(u16::MAX as usize) as u16;
+                        if stride == 0 {
+                            marker_strides.push(0);
+                            marker_blocks.push(Vec::new());
+                        } else {
+                            let stride_usize = stride as usize;
+                            let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                            for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
+                                if pls.len() != stride_usize {
+                                    continue;
+                                }
+                                let start = s * stride_usize;
+                                block[start..start + stride_usize].copy_from_slice(&pls);
+                            }
+                            marker_strides.push(stride);
+                            marker_blocks.push(block);
+                        }
+                    } else {
                         marker_strides.push(0);
                         marker_blocks.push(Vec::new());
-                    } else {
-                        let stride_usize = stride as usize;
-                        let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
-                        for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
-                            if pls.len() != stride_usize {
-                                continue;
-                            }
-                            let start = s * stride_usize;
-                            block[start..start + stride_usize].copy_from_slice(&pls);
-                        }
-                        marker_strides.push(stride);
-                        marker_blocks.push(block);
                     }
-                } else {
-                    marker_strides.push(0);
-                    marker_blocks.push(Vec::new());
                 }
             }
-        }
 
-        if let Some(ref ploidy) = self.sample_ploidy {
-            let sample_ids: Vec<String> = self
-                .samples
-                .ids()
-                .iter()
-                .map(|s: &std::sync::Arc<str>| s.as_ref().to_string())
-                .collect();
-            self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
-        }
+            if let Some(ref ploidy) = self.sample_ploidy {
+                let sample_ids: Vec<String> = self
+                    .samples
+                    .ids()
+                    .iter()
+                    .map(|s: &std::sync::Arc<str>| s.as_ref().to_string())
+                    .collect();
+                self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
+            }
 
-        let confidence_opt = if self.has_any_confidence {
-            Some(confidences)
-        } else {
-            None
-        };
-        let genotypes = if has_any_likelihoods {
-            let pl = Arc::new(PlMatrix::from_marker_blocks(n_samples, marker_strides, marker_blocks));
-            GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
-                markers,
-                columns,
-                Arc::clone(&self.samples),
-                confidence_opt,
-                pl,
-            )
-        } else if let Some(conf) = confidence_opt {
-            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)
-        } else {
-            GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
-        };
+            let confidence_opt = if self.has_any_confidence {
+                Some(confidences)
+            } else {
+                None
+            };
+            let genotypes = if has_any_likelihoods {
+                let pl = Arc::new(PlMatrix::from_marker_blocks(
+                    n_samples,
+                    marker_strides,
+                    marker_blocks,
+                ));
+                GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
+                    markers,
+                    columns,
+                    Arc::clone(&self.samples),
+                    confidence_opt,
+                    pl,
+                )
+            } else if let Some(conf) = confidence_opt {
+                GenotypeMatrix::new_unphased_with_confidence(
+                    markers,
+                    columns,
+                    Arc::clone(&self.samples),
+                    conf,
+                )
+            } else {
+                GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
+            };
 
-        let window = StreamWindow {
-            genotypes,
-            global_start: self.global_marker_idx,
-            global_end: self.global_marker_idx + window_end,
-            output_start,
-            output_end,
-            is_first: self.window_num == 0,
-            phased_overlap: None, // Caller will set this from previous window's phased output
-        };
+            let window = StreamWindow {
+                genotypes,
+                global_start: self.global_marker_idx,
+                global_end: self.global_marker_idx + window_end,
+                output_start,
+                output_end,
+                is_first: self.window_num == 0,
+                phased_overlap: None, // Caller will set this from previous window's phased output
+            };
 
-        // Remove processed markers from buffer (keep overlap)
-        let keep_from = output_end;
-        for _ in 0..keep_from {
-            self.buffer.pop_front();
-        }
+            // Remove processed markers from buffer (keep overlap)
+            let keep_from = output_end;
+            for _ in 0..keep_from {
+                self.buffer.pop_front();
+            }
 
-        self.global_marker_idx += keep_from;
-        self.window_num += 1;
+            self.global_marker_idx += keep_from;
+            self.window_num += 1;
 
-        Ok(Some(window))
+            Ok(Some(window))
         })
     }
 
@@ -661,7 +676,12 @@ impl StreamingVcfReader {
         }
         if indices.is_empty() {
             // Drop markers before start_pos to keep buffer bounded
-            while self.buffer.front().map(|m| m.marker.pos < start_pos).unwrap_or(false) {
+            while self
+                .buffer
+                .front()
+                .map(|m| m.marker.pos < start_pos)
+                .unwrap_or(false)
+            {
                 self.buffer.pop_front();
                 self.global_marker_idx += 1;
             }
@@ -676,9 +696,11 @@ impl StreamingVcfReader {
         let mut columns = Vec::with_capacity(n_markers);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
         let n_samples = self.samples.len();
-        let has_any_likelihoods = indices
-            .iter()
-            .any(|&i| self.buffer.get(i).is_some_and(|bm| bm.likelihoods_pl.is_some()));
+        let has_any_likelihoods = indices.iter().any(|&i| {
+            self.buffer
+                .get(i)
+                .is_some_and(|bm| bm.likelihoods_pl.is_some())
+        });
 
         let mut marker_strides: Vec<u16> = Vec::new();
         let mut marker_blocks: Vec<Vec<u16>> = Vec::new();
@@ -738,7 +760,11 @@ impl StreamingVcfReader {
             None
         };
         let genotypes = if has_any_likelihoods {
-            let pl = Arc::new(PlMatrix::from_marker_blocks(n_samples, marker_strides, marker_blocks));
+            let pl = Arc::new(PlMatrix::from_marker_blocks(
+                n_samples,
+                marker_strides,
+                marker_blocks,
+            ));
             GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                 markers,
                 columns,
@@ -747,7 +773,12 @@ impl StreamingVcfReader {
                 pl,
             )
         } else if let Some(conf) = confidence_opt {
-            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)
+            GenotypeMatrix::new_unphased_with_confidence(
+                markers,
+                columns,
+                Arc::clone(&self.samples),
+                conf,
+            )
         } else {
             GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
         };
@@ -762,7 +793,12 @@ impl StreamingVcfReader {
             phased_overlap: None,
         };
 
-        while self.buffer.front().map(|m| m.marker.pos < start_pos).unwrap_or(false) {
+        while self
+            .buffer
+            .front()
+            .map(|m| m.marker.pos < start_pos)
+            .unwrap_or(false)
+        {
             self.buffer.pop_front();
             self.global_marker_idx += 1;
         }

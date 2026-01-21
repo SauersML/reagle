@@ -199,7 +199,9 @@ impl MarkerMap {
     pub fn create(markers: &Markers, gen_map: &GeneticMap) -> Self {
         let n = markers.len();
         if n == 0 {
-            return Self { gen_pos: Vec::new() };
+            return Self {
+                gen_pos: Vec::new(),
+            };
         }
 
         // Calculate mean single-base genetic distance
@@ -219,7 +221,9 @@ impl MarkerMap {
     ) -> Self {
         let n = markers.len();
         if n == 0 {
-            return Self { gen_pos: Vec::new() };
+            return Self {
+                gen_pos: Vec::new(),
+            };
         }
 
         let mut gen_pos = Vec::with_capacity(n);
@@ -249,7 +253,9 @@ impl MarkerMap {
     pub fn from_positions(markers: &Markers) -> Self {
         let n = markers.len();
         if n == 0 {
-            return Self { gen_pos: Vec::new() };
+            return Self {
+                gen_pos: Vec::new(),
+            };
         }
 
         let pos_map = PositionMap::new();
@@ -404,11 +410,17 @@ mod tests {
 
         // Before first position (should extrapolate)
         let before = map.gen_pos(500_000);
-        assert!(before < 0.0, "Position before first marker should extrapolate to < 0");
+        assert!(
+            before < 0.0,
+            "Position before first marker should extrapolate to < 0"
+        );
 
         // After last position (should extrapolate)
         let after = map.gen_pos(3_500_000);
-        assert!(after > 2.5, "Position after last marker should extrapolate to > 2.5");
+        assert!(
+            after > 2.5,
+            "Position after last marker should extrapolate to > 2.5"
+        );
     }
 
     #[test]
@@ -416,7 +428,7 @@ mod tests {
         // Load map for a chromosome that doesn't exist - should return empty map
         let map = GeneticMap::from_plink_file(fixture_map_path().as_path(), "chr99")
             .expect("Loading map for missing chrom should succeed with empty positions");
-        
+
         // Empty map should use default rate of 1 cM per Mb
         assert!((map.gen_pos(1_000_000) - 1.0).abs() < 0.001);
     }
@@ -428,7 +440,7 @@ mod tests {
 
         // Distance from 1Mb (0.0 cM) to 2Mb (1.0 cM) = 1.0 cM
         assert!((map.gen_dist(1_000_000, 2_000_000) - 1.0).abs() < 0.001);
-        
+
         // Distance from 1Mb to 1.5Mb (interpolated to 0.5 cM) = 0.5 cM
         assert!((map.gen_dist(1_000_000, 1_500_000) - 0.5).abs() < 0.001);
     }
@@ -468,7 +480,7 @@ mod tests {
 
         // Should have loaded chr1
         assert!(maps.get(ChromIdx::new(0)).is_some());
-        
+
         // Test gen_pos through collection
         let pos = maps.gen_pos(ChromIdx::new(0), 1_500_000);
         assert!((pos - 0.5).abs() < 0.001);

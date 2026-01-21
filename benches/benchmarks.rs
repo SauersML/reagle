@@ -1,6 +1,6 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use reagle::model::hmm::HmmUpdater;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use reagle::data::alignment::MarkerAlignment;
+use reagle::model::hmm::HmmUpdater;
 use std::hint::black_box;
 
 /// Benchmark HMM forward update with different state counts
@@ -17,10 +17,8 @@ fn bench_fwd_update(c: &mut Criterion) {
                 let mut fwd = vec![1.0 / n_states as f32; n_states];
                 let emit_probs = [0.99, 0.01];
                 let mismatches: Vec<u8> = (0..n_states).map(|i| (i % 2) as u8).collect();
-                let emissions: Vec<f32> = mismatches
-                    .iter()
-                    .map(|&m| emit_probs[m as usize])
-                    .collect();
+                let emissions: Vec<f32> =
+                    mismatches.iter().map(|&m| emit_probs[m as usize]).collect();
                 let fwd_sum = 1.0f32;
                 let p_switch = 0.01f32;
 
@@ -135,8 +133,8 @@ fn bench_forward_backward_scaling(c: &mut Criterion) {
 
 /// Benchmark ThreadedHaps segment lookup (cursor-style traversal)
 fn bench_threaded_haps_traversal(c: &mut Criterion) {
-    use reagle::model::states::MosaicCursor;
     use reagle::ThreadedHaps;
+    use reagle::model::states::MosaicCursor;
 
     let mut group = c.benchmark_group("threaded_haps");
 
@@ -208,7 +206,11 @@ fn bench_mismatch_computation(c: &mut Criterion) {
 
                 b.iter(|| {
                     for k in 0..n_states {
-                        mismatches[k] = if ref_alleles[k] == target_allele { 0 } else { 1 };
+                        mismatches[k] = if ref_alleles[k] == target_allele {
+                            0
+                        } else {
+                            1
+                        };
                     }
                     black_box(mismatches.iter().sum::<u8>())
                 })
@@ -227,7 +229,9 @@ fn bench_memory_access_patterns(c: &mut Criterion) {
     // Simulate state probability array access patterns
     let n_markers = 5000;
     let n_states = 1600;
-    let data: Vec<f32> = (0..n_markers * n_states).map(|i| (i as f32) * 0.0001).collect();
+    let data: Vec<f32> = (0..n_markers * n_states)
+        .map(|i| (i as f32) * 0.0001)
+        .collect();
 
     group.throughput(Throughput::Elements((n_markers * n_states) as u64));
 
@@ -270,23 +274,19 @@ fn bench_priority_queue(c: &mut Criterion) {
     for n_ops in [100, 1000, 10000] {
         group.throughput(Throughput::Elements(n_ops as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("push_pop", n_ops),
-            &n_ops,
-            |b, &n_ops| {
-                b.iter(|| {
-                    let mut heap: BinaryHeap<i32> = BinaryHeap::with_capacity(n_ops);
-                    // Simulate ImpStates pattern: push, then pop oldest
-                    for i in 0..n_ops {
-                        heap.push(i as i32);
-                        if heap.len() > 1600 {
-                            heap.pop();
-                        }
+        group.bench_with_input(BenchmarkId::new("push_pop", n_ops), &n_ops, |b, &n_ops| {
+            b.iter(|| {
+                let mut heap: BinaryHeap<i32> = BinaryHeap::with_capacity(n_ops);
+                // Simulate ImpStates pattern: push, then pop oldest
+                for i in 0..n_ops {
+                    heap.push(i as i32);
+                    if heap.len() > 1600 {
+                        heap.pop();
                     }
-                    black_box(heap.len())
-                })
-            },
-        );
+                }
+                black_box(heap.len())
+            })
+        });
     }
 
     group.finish();
@@ -342,10 +342,10 @@ fn bench_hashmap_vs_vec(c: &mut Criterion) {
 /// E2E benchmark: Full imputation pipeline with synthetic data
 /// This measures the complete pipeline including I/O simulation
 fn bench_imputation_e2e(c: &mut Criterion) {
-    use reagle::data::marker::{Allele, Marker, Markers};
-    use reagle::data::haplotype::Samples;
-    use reagle::data::storage::{GenotypeColumn, GenotypeMatrix};
     use reagle::data::ChromIdx;
+    use reagle::data::haplotype::Samples;
+    use reagle::data::marker::{Allele, Marker, Markers};
+    use reagle::data::storage::{GenotypeColumn, GenotypeMatrix};
     use std::sync::Arc;
 
     let mut group = c.benchmark_group("imputation_e2e");
@@ -359,7 +359,7 @@ fn bench_imputation_e2e(c: &mut Criterion) {
 
         // Build synthetic reference panel
         let ref_samples = Arc::new(Samples::from_ids(
-            (0..n_ref_samples).map(|i| format!("REF{}", i)).collect()
+            (0..n_ref_samples).map(|i| format!("REF{}", i)).collect(),
         ));
         let mut ref_markers = Markers::new();
         ref_markers.add_chrom("chr1");
@@ -383,7 +383,7 @@ fn bench_imputation_e2e(c: &mut Criterion) {
 
         // Build synthetic target panel (subset of markers)
         let target_samples = Arc::new(Samples::from_ids(
-            (0..n_target_samples).map(|i| format!("TGT{}", i)).collect()
+            (0..n_target_samples).map(|i| format!("TGT{}", i)).collect(),
         ));
         let n_target_haps = n_target_samples * 2;
         let genotyped_fraction = 0.1; // 10% genotyped
@@ -412,7 +412,8 @@ fn bench_imputation_e2e(c: &mut Criterion) {
                 target_columns.push(GenotypeColumn::from_alleles(&alleles, 2));
             }
         }
-        let target_gt = GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
+        let target_gt =
+            GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
 
         group.throughput(Throughput::Elements(n_markers as u64));
 
@@ -422,10 +423,7 @@ fn bench_imputation_e2e(c: &mut Criterion) {
             |b, (ref_gt, target_gt)| {
                 b.iter(|| {
                     // Measure alignment creation (lightweight operation)
-                    let alignment = MarkerAlignment::new(
-                        target_gt,
-                        ref_gt,
-                    );
+                    let alignment = MarkerAlignment::new(target_gt, ref_gt);
                     black_box(alignment.n_aligned())
                 })
             },

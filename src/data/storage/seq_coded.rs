@@ -3,8 +3,8 @@
 //! This format keeps data in BREF3's native compression without expansion.
 //! Memory savings: ~6x compared to Dense storage for typical reference panels.
 
-use std::sync::Arc;
 use crate::data::HapIdx;
+use std::sync::Arc;
 
 /// A block of markers sharing the same haplotype-to-sequence mapping
 ///
@@ -88,7 +88,10 @@ pub struct SeqCodedColumn {
 impl SeqCodedColumn {
     /// Create a view into a specific marker within a block
     pub fn new(block: Arc<SeqCodedBlock>, marker_offset: usize) -> Self {
-        Self { block, marker_offset }
+        Self {
+            block,
+            marker_offset,
+        }
     }
 
     /// Get allele for a haplotype

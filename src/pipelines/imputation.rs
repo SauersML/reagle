@@ -15,8 +15,8 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use crate::config::Config;
-use crate::data::storage::GenotypeColumn;
 use crate::data::HapIdx;
+use crate::data::storage::GenotypeColumn;
 use crate::error::Result;
 use crate::model::parameters::ModelParams;
 use crate::utils::telemetry::TelemetryBlackboard;
@@ -45,11 +45,15 @@ impl AllelePosteriors {
     pub fn prob(&self, allele: usize) -> f32 {
         match self {
             AllelePosteriors::Biallelic(p_alt) => {
-                if allele == 0 { 1.0 - p_alt } else if allele == 1 { *p_alt } else { 0.0 }
+                if allele == 0 {
+                    1.0 - p_alt
+                } else if allele == 1 {
+                    *p_alt
+                } else {
+                    0.0
+                }
             }
-            AllelePosteriors::Multiallelic(probs) => {
-                probs.get(allele).copied().unwrap_or(0.0)
-            }
+            AllelePosteriors::Multiallelic(probs) => probs.get(allele).copied().unwrap_or(0.0),
         }
     }
 
@@ -57,16 +61,21 @@ impl AllelePosteriors {
     #[inline]
     pub fn max_allele(&self) -> u8 {
         match self {
-            AllelePosteriors::Biallelic(p_alt) => if *p_alt >= 0.5 { 1 } else { 0 },
-            AllelePosteriors::Multiallelic(probs) => {
-                probs.iter().enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i as u8)
-                    .unwrap_or(0)
+            AllelePosteriors::Biallelic(p_alt) => {
+                if *p_alt >= 0.5 {
+                    1
+                } else {
+                    0
+                }
             }
+            AllelePosteriors::Multiallelic(probs) => probs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u8)
+                .unwrap_or(0),
         }
     }
-
 }
 
 /// Cluster-based state probabilities with exact decay bridging between anchors.
@@ -192,11 +201,7 @@ impl ClusterStateProbs {
                 let idx = allele as usize;
                 if idx < map.len() {
                     let mapped = map[idx];
-                    if mapped >= 0 {
-                        mapped as u8
-                    } else {
-                        255
-                    }
+                    if mapped >= 0 { mapped as u8 } else { 255 }
                 } else {
                     255
                 }
@@ -373,7 +378,8 @@ impl ClusterStateProbs {
                             if p == 0.0 {
                                 continue;
                             }
-                            let allele = map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
+                            let allele =
+                                map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
                             if allele == 1 {
                                 p_alt += p;
                             } else if allele == 0 {
@@ -398,7 +404,8 @@ impl ClusterStateProbs {
                             if group_mass == 0.0 {
                                 continue;
                             }
-                            let allele = map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
+                            let allele =
+                                map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
                             if allele == 1 {
                                 p_alt += group_mass;
                             } else if allele == 0 {
@@ -418,7 +425,8 @@ impl ClusterStateProbs {
                             if p == 0.0 {
                                 continue;
                             }
-                            let allele = map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
+                            let allele =
+                                map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
                             if allele != 255 && (allele as usize) < n_alleles {
                                 al_probs[allele as usize] += p;
                             }
@@ -441,7 +449,8 @@ impl ClusterStateProbs {
                             if group_mass == 0.0 {
                                 continue;
                             }
-                            let allele = map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
+                            let allele =
+                                map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
                             if allele != 255 && (allele as usize) < n_alleles {
                                 al_probs[allele as usize] += group_mass;
                             }
@@ -576,8 +585,6 @@ impl ClusterStateProbs {
         }
     }
 
-
-
     #[inline]
     fn bridge_terms(&self, ref_marker: usize) -> (usize, bool, f32, f32, f32, f32) {
         let cluster = *self.marker_cluster.get(ref_marker).unwrap_or(&0);
@@ -606,11 +613,7 @@ impl ClusterStateProbs {
             let idx = allele as usize;
             if idx < map.len() {
                 let mapped = map[idx];
-                if mapped >= 0 {
-                    mapped as u8
-                } else {
-                    255
-                }
+                if mapped >= 0 { mapped as u8 } else { 255 }
             } else {
                 255
             }
@@ -669,7 +672,6 @@ impl ClusterStateProbs {
     /// `alt_mask` and `missing_mask` must be per-haplotype arrays for the marker,
     /// with 1 meaning ALT or MISSING respectively.
     // biallelic_alt_prob_from_masks_simd removed (unused after memory optimization)
-
 
     #[inline]
     fn biallelic_alt_ref_dense_simd<C>(
@@ -744,7 +746,11 @@ impl ImputationPipeline {
     /// Create a new imputation pipeline
     pub fn new(config: Config, telemetry: Option<Arc<TelemetryBlackboard>>) -> Self {
         let params = ModelParams::new();
-        Self { config, params, telemetry }
+        Self {
+            config,
+            params,
+            telemetry,
+        }
     }
 
     /// Run the imputation pipeline

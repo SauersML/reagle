@@ -42,17 +42,15 @@
 //! absolute best haplotypes matching on both sides, which is crucial for accurate
 //! phasing and imputation.
 
-pub mod hmm;
 pub mod allele_lookup;
+pub mod hmm;
 pub mod ibs2;
 pub mod imp_utils;
 pub mod parameters;
 pub mod pbwt;
 pub mod pbwt_streaming;
-pub mod reference_pbwt;
-pub mod pl_emission;
 pub mod phase_ibs;
 pub mod phase_states;
+pub mod pl_emission;
+pub mod reference_pbwt;
 pub mod states;
-
-

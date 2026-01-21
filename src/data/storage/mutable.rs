@@ -100,7 +100,13 @@ impl MutableGenotypes {
             }
         }
 
-        Self { bits, exceptions, exc_count, n_markers, n_haps }
+        Self {
+            bits,
+            exceptions,
+            exc_count,
+            n_markers,
+            n_haps,
+        }
     }
 
     /// Number of markers
@@ -295,12 +301,11 @@ impl MutableGenotypes {
     /// Efficiently swaps alleles where the mask bit is set.
     pub fn swap_haplotypes(&mut self, hap1: HapIdx, hap2: HapIdx, mask: &BitSlice<u8, Lsb0>) {
         assert_eq!(mask.len(), self.n_markers, "Swap mask length mismatch");
-        
+
         for m in mask.iter_ones() {
             self.swap(m, hap1, hap2);
         }
     }
-
 }
 
 // Test-only diagnostic methods
@@ -388,10 +393,10 @@ mod tests {
         // Check get returns correct values
         assert_eq!(geno.get(0, HapIdx::new(0)), 0);
         assert_eq!(geno.get(0, HapIdx::new(1)), 1);
-        assert_eq!(geno.get(1, HapIdx::new(0)), 255);  // Missing preserved!
+        assert_eq!(geno.get(1, HapIdx::new(0)), 255); // Missing preserved!
         assert_eq!(geno.get(1, HapIdx::new(1)), 0);
         assert_eq!(geno.get(2, HapIdx::new(0)), 1);
-        assert_eq!(geno.get(2, HapIdx::new(1)), 255);  // Missing preserved!
+        assert_eq!(geno.get(2, HapIdx::new(1)), 255); // Missing preserved!
         assert_eq!(geno.get(3, HapIdx::new(0)), 255);
         assert_eq!(geno.get(3, HapIdx::new(1)), 255);
 
@@ -419,7 +424,7 @@ mod tests {
 
         // Set some values including missing
         geno.set(0, HapIdx::new(0), 1);
-        geno.set(1, HapIdx::new(0), 255);  // Set missing
+        geno.set(1, HapIdx::new(0), 255); // Set missing
         geno.set(2, HapIdx::new(0), 0);
 
         assert_eq!(geno.get(0, HapIdx::new(0)), 1);
@@ -456,8 +461,8 @@ mod tests {
         geno.swap(0, HapIdx::new(0), HapIdx::new(1));
 
         // After swap - missing should move with the haplotype
-        assert_eq!(geno.get(0, HapIdx::new(0)), 255);  // Was 1, now missing
-        assert_eq!(geno.get(0, HapIdx::new(1)), 1);    // Was missing, now ALT
+        assert_eq!(geno.get(0, HapIdx::new(0)), 255); // Was 1, now missing
+        assert_eq!(geno.get(0, HapIdx::new(1)), 1); // Was missing, now ALT
         assert!(geno.is_missing(0, HapIdx::new(0)));
         assert!(!geno.is_missing(0, HapIdx::new(1)));
     }
@@ -472,7 +477,7 @@ mod tests {
                 (1, 0) => 2, // ALT2
                 (1, 1) => 3, // ALT3
                 (2, 0) => 0,
-                (2, 1) => 2, // ALT2
+                (2, 1) => 2,   // ALT2
                 (3, 0) => 255, // Missing
                 (3, 1) => 3,   // ALT3
                 _ => 0,
@@ -542,7 +547,12 @@ mod tests {
         // Memory should be ~1.25 MB (10M bits / 8 = 1.25 MB)
         let mem = geno.memory_bytes();
         let expected_max = 2_000_000; // 2 MB with overhead
-        assert!(mem < expected_max, "Memory {} exceeds expected {}", mem, expected_max);
+        assert!(
+            mem < expected_max,
+            "Memory {} exceeds expected {}",
+            mem,
+            expected_max
+        );
 
         // Compare to byte-packed: 10M bytes = 10 MB
         // 8x savings confirmed
@@ -553,8 +563,8 @@ mod tests {
         // Test swapping when one value is multiallelic
         let mut geno = MutableGenotypes::from_fn(2, 2, |m, h| {
             match (m, h) {
-                (0, 0) => 1,   // biallelic
-                (0, 1) => 3,   // multiallelic
+                (0, 0) => 1, // biallelic
+                (0, 1) => 3, // multiallelic
                 (1, 0) => 0,
                 (1, 1) => 1,
                 _ => 0,
@@ -566,7 +576,7 @@ mod tests {
 
         geno.swap(0, HapIdx::new(0), HapIdx::new(1));
 
-        assert_eq!(geno.get(0, HapIdx::new(0)), 3);  // multiallelic moved
-        assert_eq!(geno.get(0, HapIdx::new(1)), 1);  // biallelic moved
+        assert_eq!(geno.get(0, HapIdx::new(0)), 3); // multiallelic moved
+        assert_eq!(geno.get(0, HapIdx::new(1)), 1); // biallelic moved
     }
 }

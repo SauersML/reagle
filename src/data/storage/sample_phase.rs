@@ -84,7 +84,8 @@ impl SamplePhase {
 
         for m in 0..n_markers {
             let is_missing = missing_idx < missing.len() && missing[missing_idx] == m;
-            let is_unphased = unphased_idx < unphased_hets.len() && unphased_hets[unphased_idx] == m;
+            let is_unphased =
+                unphased_idx < unphased_hets.len() && unphased_hets[unphased_idx] == m;
 
             if is_missing {
                 missing_idx += 1;

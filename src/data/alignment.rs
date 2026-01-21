@@ -1,9 +1,9 @@
 //! Marker alignment between target and reference panels.
 
-use std::collections::HashMap;
 use crate::data::marker::{AlleleMapping, MarkerIdx};
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
+use std::collections::HashMap;
 
 /// Marker alignment between target and reference panels
 #[derive(Clone, Debug)]
@@ -12,7 +12,7 @@ pub struct MarkerAlignment {
     pub ref_to_target: Vec<i32>,
     /// For each target marker, the index of the corresponding reference marker
     pub target_to_ref: Vec<usize>,
-    
+
     /// Allele mapping for each aligned marker (indexed by target marker)
     /// Maps target allele indices to reference allele indices
     pub allele_mappings: Vec<Option<AlleleMapping>>,
@@ -23,7 +23,10 @@ impl MarkerAlignment {
     ///
     /// This handles strand flips (A/T vs T/A) and allele swaps automatically
     /// using `compute_allele_mapping`.
-    pub fn new<S1: PhaseState, S2: PhaseState>(target_gt: &GenotypeMatrix<S1>, ref_gt: &GenotypeMatrix<S2>) -> Self {
+    pub fn new<S1: PhaseState, S2: PhaseState>(
+        target_gt: &GenotypeMatrix<S1>,
+        ref_gt: &GenotypeMatrix<S2>,
+    ) -> Self {
         use crate::data::marker::compute_allele_mapping;
 
         let n_ref_markers = ref_gt.n_markers();
@@ -33,10 +36,7 @@ impl MarkerAlignment {
         let mut target_pos_map: HashMap<(String, u32), usize> = HashMap::new();
         for m in 0..n_target_markers {
             let marker = target_gt.marker(MarkerIdx::new(m as u32));
-            let chrom_name = target_gt
-                .markers()
-                .chrom_name(marker.chrom)
-                .unwrap_or("");
+            let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
             let chrom_norm = normalize_chrom(chrom_name).to_string();
             target_pos_map.insert((chrom_norm, marker.pos), m);
         }
@@ -44,18 +44,14 @@ impl MarkerAlignment {
         // Map reference markers to target markers
         let mut ref_to_target = vec![-1i32; n_ref_markers];
         let mut target_to_ref = vec![0usize; n_target_markers];
-        let mut allele_mappings: Vec<Option<AlleleMapping>> =
-            vec![None; n_target_markers];
+        let mut allele_mappings: Vec<Option<AlleleMapping>> = vec![None; n_target_markers];
 
         let mut n_strand_flipped = 0usize;
         let mut n_allele_swapped = 0usize;
 
         for m in 0..n_ref_markers {
             let ref_marker = ref_gt.marker(MarkerIdx::new(m as u32));
-            let ref_chrom = ref_gt
-                .markers()
-                .chrom_name(ref_marker.chrom)
-                .unwrap_or("");
+            let ref_chrom = ref_gt.markers().chrom_name(ref_marker.chrom).unwrap_or("");
             let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
             if let Some(&target_idx) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
                 let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
@@ -132,7 +128,12 @@ impl MarkerAlignment {
     pub fn target_to_ref(&self, target_marker: usize) -> Option<usize> {
         // Check allele_mappings to ensure the marker actually aligns.
         // The raw target_to_ref vector initializes with 0s, which is ambiguous.
-        if self.allele_mappings.get(target_marker).and_then(|m| m.as_ref()).is_some() {
+        if self
+            .allele_mappings
+            .get(target_marker)
+            .and_then(|m| m.as_ref())
+            .is_some()
+        {
             Some(self.target_to_ref[target_marker])
         } else {
             None
@@ -145,7 +146,8 @@ impl MarkerAlignment {
     /// Most biallelic markers have identity mapping (no flips/swaps).
     #[inline]
     pub fn has_allele_mapping(&self, target_marker: usize) -> bool {
-        self.allele_mappings.get(target_marker)
+        self.allele_mappings
+            .get(target_marker)
             .and_then(|m| m.as_ref())
             .is_some()
     }

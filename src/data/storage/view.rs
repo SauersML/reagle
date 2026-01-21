@@ -64,7 +64,12 @@ impl<'a> GenotypeView<'a> {
                 let real_idx = subset[marker.as_usize()];
                 geno.get(real_idx, hap)
             }
-            GenotypeView::Composite { target, reference, alignment, n_target_haps } => {
+            GenotypeView::Composite {
+                target,
+                reference,
+                alignment,
+                n_target_haps,
+            } => {
                 let hap_idx = hap.as_usize();
                 if hap_idx < *n_target_haps {
                     // Target haplotype - direct lookup
@@ -74,7 +79,8 @@ impl<'a> GenotypeView<'a> {
                     let ref_hap = hap_idx - n_target_haps;
                     let target_marker = marker.as_usize();
                     if let Some(ref_m) = alignment.target_to_ref(target_marker) {
-                        let ref_allele = reference.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_hap as u32));
+                        let ref_allele = reference
+                            .allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_hap as u32));
                         // Map reference allele back to target encoding (handles strand flips)
                         alignment.reverse_map_allele(target_marker, ref_allele)
                     } else {
@@ -82,7 +88,13 @@ impl<'a> GenotypeView<'a> {
                     }
                 }
             }
-            GenotypeView::CompositeSubset { target, reference, alignment, subset, n_target_haps } => {
+            GenotypeView::CompositeSubset {
+                target,
+                reference,
+                alignment,
+                subset,
+                n_target_haps,
+            } => {
                 let orig_marker = subset[marker.as_usize()]; // Subset index -> original target marker index
                 let hap_idx = hap.as_usize();
                 if hap_idx < *n_target_haps {
@@ -92,7 +104,8 @@ impl<'a> GenotypeView<'a> {
                     // Reference haplotype - translate marker, look up, and map allele to target encoding
                     let ref_hap = hap_idx - n_target_haps;
                     if let Some(ref_m) = alignment.target_to_ref(orig_marker) {
-                        let ref_allele = reference.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_hap as u32));
+                        let ref_allele = reference
+                            .allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_hap as u32));
                         // Map reference allele back to target encoding (handles strand flips)
                         alignment.reverse_map_allele(orig_marker, ref_allele)
                     } else {
@@ -132,8 +145,8 @@ mod tests {
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker};
-    use crate::data::storage::phase_state::Phased;
     use crate::data::storage::GenotypeColumn;
+    use crate::data::storage::phase_state::Phased;
     use std::sync::Arc;
 
     fn make_test_matrix() -> GenotypeMatrix<Phased> {

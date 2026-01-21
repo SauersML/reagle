@@ -93,14 +93,9 @@ impl BidirectionalPhaseIbs {
     /// * `alleles` - Allele data per marker
     /// * `n_haps` - Number of haplotypes
     /// * `n_markers` - Number of markers
-    pub fn build(
-        mut alleles: Vec<Vec<u8>>,
-        n_haps: usize,
-        n_markers: usize,
-    ) -> Self {
-        let mut checkpoint_markers: Vec<usize> = (0..n_markers)
-            .step_by(PBWT_CHECKPOINT_INTERVAL)
-            .collect();
+    pub fn build(mut alleles: Vec<Vec<u8>>, n_haps: usize, n_markers: usize) -> Self {
+        let mut checkpoint_markers: Vec<usize> =
+            (0..n_markers).step_by(PBWT_CHECKPOINT_INTERVAL).collect();
         if let Some(&last) = checkpoint_markers.last() {
             if last + 1 < n_markers {
                 checkpoint_markers.push(n_markers - 1);
@@ -187,7 +182,10 @@ impl BidirectionalPhaseIbs {
         FWD_STATE_CACHE.with(|state_cell| {
             FWD_UPDATER.with(|upd_cell| {
                 let mut state = state_cell.borrow_mut();
-                if state.0 != checkpoint_idx || state.1 != marker_idx || state.2.len() != self.n_haps {
+                if state.0 != checkpoint_idx
+                    || state.1 != marker_idx
+                    || state.2.len() != self.n_haps
+                {
                     state.0 = checkpoint_idx;
                     state.1 = marker_idx;
                     state.2 = self.fwd_ppa[checkpoint_idx].clone();
@@ -228,7 +226,10 @@ impl BidirectionalPhaseIbs {
         BWD_STATE_CACHE.with(|state_cell| {
             BWD_UPDATER.with(|upd_cell| {
                 let mut state = state_cell.borrow_mut();
-                if state.0 != checkpoint_idx || state.1 != marker_idx || state.2.len() != self.n_haps {
+                if state.0 != checkpoint_idx
+                    || state.1 != marker_idx
+                    || state.2.len() != self.n_haps
+                {
                     state.0 = checkpoint_idx;
                     state.1 = marker_idx;
                     state.2 = self.bwd_ppa[checkpoint_idx].clone();
@@ -503,8 +504,16 @@ impl BidirectionalPhaseIbs {
             let mut max_div_down = i32::MIN;
 
             while result.len() < n_candidates {
-                let div_up = if u > 0 { div.get(u).copied().unwrap_or(i32::MAX) } else { i32::MAX };
-                let div_down = if v < self.n_haps { div.get(v).copied().unwrap_or(i32::MAX) } else { i32::MAX };
+                let div_up = if u > 0 {
+                    div.get(u).copied().unwrap_or(i32::MAX)
+                } else {
+                    i32::MAX
+                };
+                let div_down = if v < self.n_haps {
+                    div.get(v).copied().unwrap_or(i32::MAX)
+                } else {
+                    i32::MAX
+                };
 
                 let up_valid = u > 0 && max_div_up.max(div_up) <= marker_i32;
                 let down_valid = v < self.n_haps && max_div_down.max(div_down) <= marker_i32;
@@ -566,8 +575,16 @@ impl BidirectionalPhaseIbs {
             let mut min_div_down = i32::MAX;
 
             while result.len() < n_candidates {
-                let div_up = if u > 0 { div.get(u).copied().unwrap_or(0) } else { 0 };
-                let div_down = if v < self.n_haps { div.get(v).copied().unwrap_or(0) } else { 0 };
+                let div_up = if u > 0 {
+                    div.get(u).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                let div_down = if v < self.n_haps {
+                    div.get(v).copied().unwrap_or(0)
+                } else {
+                    0
+                };
 
                 let up_valid = u > 0 && min_div_up.min(div_up) >= marker_i32;
                 let down_valid = v < self.n_haps && min_div_down.min(div_down) >= marker_i32;
@@ -650,7 +667,11 @@ impl BidirectionalPhaseIbs {
 
         let exclude_sample = sample_idx != u32::MAX;
         let hap1 = if exclude_sample { sample_idx * 2 } else { 0 };
-        let hap2 = if exclude_sample { sample_idx * 2 + 1 } else { 0 };
+        let hap2 = if exclude_sample {
+            sample_idx * 2 + 1
+        } else {
+            0
+        };
 
         let ref_start = self.reference_start_hap;
 
@@ -705,7 +726,10 @@ impl BidirectionalPhaseIbs {
                     v += 1;
                 }
 
-                if max_div_u > marker_i32 && max_div_v > marker_i32 && neighbors.len() >= n_candidates / 2 {
+                if max_div_u > marker_i32
+                    && max_div_v > marker_i32
+                    && neighbors.len() >= n_candidates / 2
+                {
                     break;
                 }
             }

@@ -24,7 +24,9 @@ pub fn bits_per_allele(n_alleles: usize) -> u8 {
 }
 
 /// Zero-cost newtype for marker indices
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub struct MarkerIdx(pub u32);
 
 impl MarkerIdx {
@@ -94,7 +96,6 @@ impl Allele {
     pub fn is_snv(&self) -> bool {
         matches!(self, Self::Base(_))
     }
-
 
     /// Get complement (for strand flipping)
     pub fn complement(&self) -> Self {
@@ -222,7 +223,12 @@ pub struct AlleleMapping {
 
 impl AlleleMapping {
     /// Create an AlleleMapping with automatic reverse mapping computation
-    pub fn new(targ_to_ref: Vec<i8>, n_ref_alleles: usize, strand_flipped: bool, alleles_swapped: bool) -> Self {
+    pub fn new(
+        targ_to_ref: Vec<i8>,
+        n_ref_alleles: usize,
+        strand_flipped: bool,
+        alleles_swapped: bool,
+    ) -> Self {
         // Build reverse mapping
         let mut ref_to_targ = vec![-1i8; n_ref_alleles];
         for (targ_idx, &ref_idx) in targ_to_ref.iter().enumerate() {

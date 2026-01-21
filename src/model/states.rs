@@ -36,7 +36,11 @@ impl ThreadedHaps {
     const NIL: u32 = u32::MAX;
 
     /// Create new threaded haps arena
-    pub fn new(initial_capacity_states: usize, initial_capacity_segments: usize, n_markers: usize) -> Self {
+    pub fn new(
+        initial_capacity_states: usize,
+        initial_capacity_segments: usize,
+        n_markers: usize,
+    ) -> Self {
         Self {
             segments_hap: Vec::with_capacity(initial_capacity_segments),
             segments_end: Vec::with_capacity(initial_capacity_segments),
@@ -144,12 +148,11 @@ impl ThreadedHaps {
         let mut cursors: Vec<usize> = (0..n_states)
             .map(|s| self.state_heads[s] as usize)
             .collect();
-        let mut seg_ends: Vec<usize> = cursors.iter()
+        let mut seg_ends: Vec<usize> = cursors
+            .iter()
             .map(|&c| self.segments_end[c] as usize)
             .collect();
-        let mut haps: Vec<u32> = cursors.iter()
-            .map(|&c| self.segments_hap[c])
-            .collect();
+        let mut haps: Vec<u32> = cursors.iter().map(|&c| self.segments_hap[c]).collect();
 
         for m in 0..n_markers {
             // Get the hap-to-allele function for this marker (allows hoisting per-marker work)
@@ -345,7 +348,6 @@ impl AlleleScratch {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,52 +463,52 @@ mod tests {
     fn test_mosaic_cursor_rewind() {
         // Create a mosaic setup with 2 states, each having segment boundaries
         let mut th = ThreadedHaps::new(2, 8, 100);
-        
+
         // State 0: hap 10 for [0, 40), hap 15 for [40, 70), hap 20 for [70, 100)
         th.push_new(10);
         th.add_segment(0, 15, 40);
         th.add_segment(0, 20, 70);
-        
+
         // State 1: hap 30 for [0, 50), hap 35 for [50, 100)
         th.push_new(30);
         th.add_segment(1, 35, 50);
-        
+
         let mut cursor = MosaicCursor::from_threaded(&th);
         let mut history: Vec<StateSwitch> = Vec::new();
-        
+
         // Advance through all markers recording history
         for m in 0..100 {
             cursor.advance_with_history(m, &th, &mut history);
         }
-        
+
         // Verify cursor is at end state
         assert_eq!(cursor.active_haps()[0], 20); // State 0 at marker 99
         assert_eq!(cursor.active_haps()[1], 35); // State 1 at marker 99
-        
+
         // History should have recorded 3 switches total:
         // - State 0 switched at marker 40, 70
         // - State 1 switched at marker 50
         assert_eq!(history.len(), 3);
-        
+
         // Now test rewinding
         // Rewind to marker 80 - should stay at hap 20, 35
         cursor.rewind(80, &mut history);
         assert_eq!(cursor.active_haps()[0], 20);
         assert_eq!(cursor.active_haps()[1], 35);
         assert_eq!(history.len(), 3); // No events popped
-        
+
         // Rewind to marker 60 - state 1 stays at 35, state 0 reverts to 15
         cursor.rewind(60, &mut history);
         assert_eq!(cursor.active_haps()[0], 15);
         assert_eq!(cursor.active_haps()[1], 35);
         assert_eq!(history.len(), 2); // One event popped (state 0's switch at 70)
-        
+
         // Rewind to marker 45 - state 1 reverts to 30, state 0 stays at 15
         cursor.rewind(45, &mut history);
         assert_eq!(cursor.active_haps()[0], 15);
         assert_eq!(cursor.active_haps()[1], 30);
         assert_eq!(history.len(), 1); // Two events popped total
-        
+
         // Rewind to marker 30 - state 0 reverts to 10, state 1 stays at 30
         cursor.rewind(30, &mut history);
         assert_eq!(cursor.active_haps()[0], 10);

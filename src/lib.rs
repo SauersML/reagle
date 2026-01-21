@@ -22,15 +22,15 @@ pub mod utils;
 
 // Re-export commonly used types
 pub use config::Config;
+pub use data::genetic_map::{GeneticMap, GeneticMaps, MarkerMap};
 pub use data::haplotype::{HapIdx, SampleIdx, Samples};
 pub use data::marker::{Marker, MarkerIdx, Markers};
-pub use data::genetic_map::{GeneticMap, GeneticMaps, MarkerMap};
 pub use data::storage::GenotypeMatrix;
 pub use error::{ReagleError, Result};
 pub use io::bref3::Bref3Reader;
 pub use io::vcf::{VcfReader, VcfWriter};
 pub use model::hmm::BeagleHmm;
-pub use model::states::ThreadedHaps;
 pub use model::parameters::ModelParams;
+pub use model::states::ThreadedHaps;
 
 pub use pipelines::{ImputationPipeline, PhasingPipeline};

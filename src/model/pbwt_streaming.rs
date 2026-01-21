@@ -233,7 +233,7 @@ impl PbwtWavefront {
     pub fn with_state(
         n_haps: usize,
         n_markers: usize,
-        initial_state: Option<&crate::model::pbwt::PbwtState>
+        initial_state: Option<&crate::model::pbwt::PbwtState>,
     ) -> Self {
         let (fwd_ppa, fwd_div) = if let Some(state) = initial_state {
             if state.ppa.len() == n_haps && state.div.len() == n_haps {
@@ -277,7 +277,7 @@ impl PbwtWavefront {
         crate::model::pbwt::PbwtState::new(
             self.fwd_ppa.clone(),
             self.fwd_div.clone(),
-            self.fwd_marker
+            self.fwd_marker,
         )
     }
 
@@ -393,11 +393,7 @@ impl PbwtWavefront {
             }
         }
 
-        if best < 0 {
-            0
-        } else {
-            best
-        }
+        if best < 0 { 0 } else { best }
     }
 
     /// Pre-compute backward inverse index for read-only parallel queries
@@ -418,14 +414,7 @@ impl PbwtWavefront {
         let marker_i32 = (self.fwd_marker.saturating_sub(1)) as i32;
         let max_span = n_candidates.saturating_mul(8).max(32);
         let (start, end) = self.fwd_window_bounded(sorted_pos, marker_i32, max_span);
-        Self::select_spiral_window(
-            &self.fwd_ppa,
-            start,
-            end,
-            sorted_pos,
-            hap_idx,
-            n_candidates,
-        )
+        Self::select_spiral_window(&self.fwd_ppa, start, end, sorted_pos, hap_idx, n_candidates)
     }
 
     /// Find backward neighbors for a haplotype (read-only after prepare_bwd_queries)
@@ -438,16 +427,8 @@ impl PbwtWavefront {
         let marker_i32 = self.bwd_marker as i32;
         let max_span = n_candidates.saturating_mul(8).max(32);
         let (start, end) = self.bwd_window_bounded(sorted_pos, marker_i32, max_span);
-        Self::select_spiral_window(
-            &self.bwd_ppa,
-            start,
-            end,
-            sorted_pos,
-            hap_idx,
-            n_candidates,
-        )
+        Self::select_spiral_window(&self.bwd_ppa, start, end, sorted_pos, hap_idx, n_candidates)
     }
-
 }
 
 #[cfg(test)]

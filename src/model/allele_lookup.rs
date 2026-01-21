@@ -54,7 +54,8 @@ impl RefAlleleLookup {
                 } else {
                     let ref_h = (hap - n_target_haps) as u32;
                     if let (Some(ref_gt), Some(ref_m)) = (reference_gt, ref_m_opt) {
-                        let ref_allele = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
+                        let ref_allele =
+                            ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
                         alignment.unwrap().reverse_map_allele(orig_m, ref_allele)
                     } else {
                         255

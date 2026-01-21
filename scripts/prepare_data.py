@@ -4,6 +4,18 @@ import subprocess
 import glob
 import shutil
 
+
+def _resolve_local_panel_path():
+    candidates = [
+        "ref.vcf.gz",
+        os.path.join("tests", "data", "ref.vcf.gz"),
+        os.path.join("tests", "fixtures", "gnomad_hgdp", "ref.vcf.gz"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
 def install_convert_genome():
     """Installs convert_genome using cargo install (avoids GitHub API rate limits)."""
     print("Installing convert_genome...")
@@ -187,6 +199,12 @@ def run_conversion(input_path, output_vcf):
     ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
     temp_hg38_vcf = "temp_hg38.vcf"
 
+    panel_path = _resolve_local_panel_path()
+    if not panel_path:
+        raise RuntimeError(
+            "HGDP+1KG panel VCF not found locally (expected one of: ref.vcf.gz, tests/data/ref.vcf.gz, tests/fixtures/gnomad_hgdp/ref.vcf.gz)."
+        )
+
     cmd = [
         "convert_genome",
         raw_file,
@@ -194,6 +212,8 @@ def run_conversion(input_path, output_vcf):
         temp_hg38_vcf,
         "--assembly", "GRCh38",
         "--format", "vcf",
+        "--standardize",
+        "--panel", panel_path,
     ]
 
     print(f"Running: {' '.join(cmd)}")

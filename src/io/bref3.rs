@@ -26,17 +26,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 use flate2::read::GzDecoder;
-use tracing::info_span;
 use noodles::bgzf::io as bgzf_io;
+use tracing::info_span;
 
 use anyhow::{Context, Result, bail};
 
+use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, SeqCodedBlock, SeqCodedColumn};
-use crate::data::ChromIdx;
 
 /// BREF3 magic number (big-endian integer: 2055763188)
 const BREF3_MAGIC: i32 = 2055763188;
@@ -121,17 +121,17 @@ impl Bref3Reader {
         info_span!("bref3_read_all").in_scope(|| {
             let mut columns: Vec<GenotypeColumn> = Vec::new();
 
-        loop {
-            let n_recs = read_be_i32(&mut self.reader)?;
-            if n_recs == END_OF_DATA {
-                break;
+            loop {
+                let n_recs = read_be_i32(&mut self.reader)?;
+                if n_recs == END_OF_DATA {
+                    break;
+                }
+
+                self.read_block(n_recs as usize, &mut columns)?;
             }
 
-            self.read_block(n_recs as usize, &mut columns)?;
-        }
-
-        let samples = Arc::new(self.samples);
-        Ok(GenotypeMatrix::new_phased(self.markers, columns, samples))
+            let samples = Arc::new(self.samples);
+            Ok(GenotypeMatrix::new_phased(self.markers, columns, samples))
         })
     }
 
@@ -139,11 +139,7 @@ impl Bref3Reader {
     ///
     /// Optimized to use SeqCodedBlock for sequence-coded records, avoiding
     /// expansion from the compact BREF3 format. ~6x memory savings.
-    fn read_block(
-        &mut self,
-        n_recs: usize,
-        columns: &mut Vec<GenotypeColumn>,
-    ) -> Result<()> {
+    fn read_block(&mut self, n_recs: usize, columns: &mut Vec<GenotypeColumn>) -> Result<()> {
         let chrom_name = read_utf8_string(&mut self.reader)?;
         let chrom_idx = self.get_or_add_chrom(&chrom_name);
 
@@ -170,7 +166,9 @@ impl Bref3Reader {
                     seq_block.push_marker(seq_to_allele);
                     self.markers.push(marker);
                     // Placeholder - will be replaced with SeqCoded below
-                    columns.push(GenotypeColumn::Dense(crate::data::storage::DenseColumn::new(0, 1)));
+                    columns.push(GenotypeColumn::Dense(
+                        crate::data::storage::DenseColumn::new(0, 1),
+                    ));
                 }
                 ALLELE_CODED => {
                     let alleles = self.read_allele_coded_record(marker.n_alleles())?;
@@ -187,8 +185,12 @@ impl Bref3Reader {
             let block = Arc::new(seq_block);
             let mut seq_marker_idx = 0;
             for col_idx in block_start_idx..columns.len() {
-                if matches!(columns[col_idx], GenotypeColumn::Dense(ref d) if d.n_haplotypes() == 0) {
-                    columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(Arc::clone(&block), seq_marker_idx));
+                if matches!(columns[col_idx], GenotypeColumn::Dense(ref d) if d.n_haplotypes() == 0)
+                {
+                    columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(
+                        Arc::clone(&block),
+                        seq_marker_idx,
+                    ));
                     seq_marker_idx += 1;
                 }
             }
@@ -276,10 +278,7 @@ impl Bref3Reader {
 }
 
 /// Parse allele strings into Allele types
-fn parse_alleles(
-    allele_strs: &[String],
-    end: Option<u32>,
-) -> (Allele, Vec<Allele>, Option<u32>) {
+fn parse_alleles(allele_strs: &[String], end: Option<u32>) -> (Allele, Vec<Allele>, Option<u32>) {
     let ref_allele = if allele_strs.is_empty() {
         Allele::Missing
     } else {
@@ -326,8 +325,7 @@ fn read_utf8_string<R: Read>(reader: &mut R) -> Result<String> {
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
 
-    String::from_utf8(buf)
-        .context("Invalid UTF-8 in BREF3 string")
+    String::from_utf8(buf).context("Invalid UTF-8 in BREF3 string")
 }
 
 /// Read a string array (length-prefixed)
@@ -454,7 +452,9 @@ impl StreamingBref3Reader {
                     seq_block.push_marker(seq_to_allele);
                     markers.push(marker);
                     // Placeholder - will be replaced with SeqCoded below
-                    columns.push(GenotypeColumn::Dense(crate::data::storage::DenseColumn::new(0, 1)));
+                    columns.push(GenotypeColumn::Dense(
+                        crate::data::storage::DenseColumn::new(0, 1),
+                    ));
                 }
                 ALLELE_CODED => {
                     let alleles = self.read_allele_coded_record(marker.n_alleles())?;
@@ -471,8 +471,12 @@ impl StreamingBref3Reader {
             let block = Arc::new(seq_block);
             let mut seq_marker_idx = 0;
             for col_idx in block_start_idx..columns.len() {
-                if matches!(columns[col_idx], GenotypeColumn::Dense(ref d) if d.n_haplotypes() == 0) {
-                    columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(Arc::clone(&block), seq_marker_idx));
+                if matches!(columns[col_idx], GenotypeColumn::Dense(ref d) if d.n_haplotypes() == 0)
+                {
+                    columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(
+                        Arc::clone(&block),
+                        seq_marker_idx,
+                    ));
                     seq_marker_idx += 1;
                 }
             }
@@ -634,10 +638,7 @@ impl StreamingBref3WindowReader {
 
         let mut markers = Markers::new();
         let mut columns = Vec::with_capacity(window_end);
-        let chrom_name = self
-            .current_chrom
-            .as_deref()
-            .unwrap_or("UNKNOWN");
+        let chrom_name = self.current_chrom.as_deref().unwrap_or("UNKNOWN");
         let window_chrom_idx = markers.add_chrom(chrom_name);
 
         for i in 0..window_end {
@@ -710,7 +711,11 @@ impl StreamingBref3WindowReader {
                     let column = block.columns[*idx].clone();
                     *idx += 1;
                     let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
-                    return Ok(Some(Bref3BufferedMarker { marker, column, gen_pos }));
+                    return Ok(Some(Bref3BufferedMarker {
+                        marker,
+                        column,
+                        gen_pos,
+                    }));
                 }
                 self.current_block = None;
                 continue;
@@ -924,17 +929,29 @@ impl StreamingRefVcfReader {
         let mut line = String::new();
         loop {
             line.clear();
-            if reader.read_line(&mut line)? == 0 { break; }
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
             if line.starts_with('#') {
                 header_str.push_str(&line);
-                if line.starts_with("#CHROM") { break; }
-            } else { break; }
+                if line.starts_with("#CHROM") {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
 
         // Parse samples
         let sample_names: Vec<String> = if let Some(header_line) = header_str.lines().last() {
-             header_line.split('\t').skip(9).map(|s| s.to_string()).collect()
-        } else { Vec::new() };
+            header_line
+                .split('\t')
+                .skip(9)
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let samples = Arc::new(Samples::from_ids(sample_names));
 
         Ok(Self {
@@ -950,7 +967,6 @@ impl StreamingRefVcfReader {
             global_marker_idx: 0,
         })
     }
-
 
     /// Read the next reference-driven window (streaming).
     pub fn next_window(
@@ -1054,7 +1070,10 @@ impl StreamingRefVcfReader {
                 break;
             };
 
-            let marker_chrom = self.markers.chrom_name(next_marker.marker.chrom).unwrap_or("");
+            let marker_chrom = self
+                .markers
+                .chrom_name(next_marker.marker.chrom)
+                .unwrap_or("");
             if let Some(cur) = self.current_chrom.as_ref() {
                 if marker_chrom != cur.as_ref() {
                     self.pending_marker = Some(next_marker);
@@ -1093,7 +1112,7 @@ impl StreamingRefVcfReader {
     fn parse_vcf_line(&mut self, line: &str) -> Result<RefPanelMarker> {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 10 {
-             bail!("VCF line has too few fields");
+            bail!("VCF line has too few fields");
         }
 
         // Parse CHROM
@@ -1104,7 +1123,11 @@ impl StreamingRefVcfReader {
         let pos: u32 = fields[1].parse().context("Invalid POS")?;
 
         // Parse ID
-        let id = if fields[2] == "." { None } else { Some(fields[2].into()) };
+        let id = if fields[2] == "." {
+            None
+        } else {
+            Some(fields[2].into())
+        };
 
         // Parse REF
         let ref_allele = Allele::from_str(fields[3]);
@@ -1121,8 +1144,10 @@ impl StreamingRefVcfReader {
 
         // Find GT index
         let format = fields[8];
-        let gt_idx = format.split(':').position(|f| f == "GT")
-             .ok_or_else(|| anyhow::anyhow!("No GT field in FORMAT"))?;
+        let gt_idx = format
+            .split(':')
+            .position(|f| f == "GT")
+            .ok_or_else(|| anyhow::anyhow!("No GT field in FORMAT"))?;
 
         if fields.len() < 9 + n_samples {
             bail!("VCF line has fewer samples than header");
@@ -1137,28 +1162,43 @@ impl StreamingRefVcfReader {
 
         let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
 
-        Ok(RefPanelMarker { marker, column, gen_pos: 0.0 })
+        Ok(RefPanelMarker {
+            marker,
+            column,
+            gen_pos: 0.0,
+        })
     }
 
     fn parse_gt_local(&self, gt: &str) -> (u8, u8) {
-        if gt == "." || gt == "./." || gt == ".|." { return (255, 255); }
+        if gt == "." || gt == "./." || gt == ".|." {
+            return (255, 255);
+        }
         let sep = if gt.contains('|') { '|' } else { '/' };
         let parts: Vec<&str> = gt.split(sep).collect();
         if parts.len() == 1 {
             let a = self.parse_allele_local(parts[0]);
             return (a, a);
         }
-        if parts.len() != 2 { return (255, 255); }
-        (self.parse_allele_local(parts[0]), self.parse_allele_local(parts[1]))
+        if parts.len() != 2 {
+            return (255, 255);
+        }
+        (
+            self.parse_allele_local(parts[0]),
+            self.parse_allele_local(parts[1]),
+        )
     }
 
     fn parse_allele_local(&self, s: &str) -> u8 {
-         if s == "." || s.is_empty() { return 255; }
-         if s.len() == 1 {
-             let c = s.as_bytes()[0];
-             if c >= b'0' && c <= b'9' { return c - b'0'; }
-         }
-         s.parse().unwrap_or(255)
+        if s == "." || s.is_empty() {
+            return 255;
+        }
+        if s.len() == 1 {
+            let c = s.as_bytes()[0];
+            if c >= b'0' && c <= b'9' {
+                return c - b'0';
+            }
+        }
+        s.parse().unwrap_or(255)
     }
 }
 

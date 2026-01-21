@@ -188,9 +188,11 @@ impl TelemetryBlackboard {
     }
 
     pub fn dec_channel_depth(&self) {
-        self.channel_depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-            Some(val.saturating_sub(1))
-        }).ok();
+        self.channel_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                Some(val.saturating_sub(1))
+            })
+            .ok();
         self.touch_progress();
     }
 
@@ -227,7 +229,11 @@ impl TelemetryBlackboard {
             elapsed_secs: self.elapsed_secs(),
             last_progress_nanos: self.last_progress_nanos.load(Ordering::Relaxed),
             current_nanos: self.start_time.elapsed().as_nanos() as u64,
-            current_op: self.current_op.read().map(|s| s.clone()).unwrap_or_default(),
+            current_op: self
+                .current_op
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or_default(),
             channel_depth: self.channel_depth.load(Ordering::Relaxed),
             channel_capacity: self.channel_capacity.load(Ordering::Relaxed),
         }
@@ -375,9 +381,15 @@ fn get_vm_usage_mb() -> (Option<u64>, Option<u64>) {
 
         for line in content.lines() {
             if line.starts_with("VmSize:") {
-                vsz_kb = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+                vsz_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok());
             } else if line.starts_with("VmSwap:") {
-                swap_kb = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+                swap_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok());
             }
         }
 
@@ -657,16 +669,20 @@ fn print_tty_progress(
     // Build progress bar (20 chars)
     let bar_width = 20;
     let filled = ((progress_pct / 100.0) * bar_width as f64) as usize;
-    let bar: String = "=".repeat(filled.min(bar_width))
-        + &" ".repeat(bar_width.saturating_sub(filled));
+    let bar: String =
+        "=".repeat(filled.min(bar_width)) + &" ".repeat(bar_width.saturating_sub(filled));
 
     let (mem_str, cpu_str, op_str, channel_str) = if show_extra {
         let mem = match (rss_mb, vsz_mb, swap_mb) {
-            (Some(rss), Some(vsz), Some(swap)) => format!(" {}MB VSZ {}MB SWAP {}MB", rss, vsz, swap),
+            (Some(rss), Some(vsz), Some(swap)) => {
+                format!(" {}MB VSZ {}MB SWAP {}MB", rss, vsz, swap)
+            }
             (Some(rss), _, _) => format!(" {}MB", rss),
             _ => String::new(),
         };
-        let cpu = cpu_pct.map(|c| format!(" CPU {:.0}%", c)).unwrap_or_default();
+        let cpu = cpu_pct
+            .map(|c| format!(" CPU {:.0}%", c))
+            .unwrap_or_default();
         let op = if snap.current_op.is_empty() {
             String::new()
         } else {

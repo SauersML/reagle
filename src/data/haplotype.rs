@@ -2,12 +2,14 @@
 //!
 //! Sample and haplotype index types. Replaces `vcf/Samples.java`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 
 /// Zero-cost newtype for sample indices
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub struct SampleIdx(pub u32);
 
 impl SampleIdx {
@@ -49,7 +51,9 @@ impl From<SampleIdx> for usize {
 }
 
 /// Zero-cost newtype for haplotype indices
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub struct HapIdx(pub u32);
 
 impl HapIdx {
@@ -132,7 +136,11 @@ impl Samples {
     /// * `ids` - Sample identifiers
     /// * `is_diploid` - Whether each sample is diploid (true) or haploid (false)
     pub fn from_ids_with_ploidy(ids: Vec<String>, is_diploid: Vec<bool>) -> Self {
-        assert_eq!(ids.len(), is_diploid.len(), "ids and is_diploid must have same length");
+        assert_eq!(
+            ids.len(),
+            is_diploid.len(),
+            "ids and is_diploid must have same length"
+        );
 
         let ids: Vec<Arc<str>> = ids.into_iter().map(|s| s.into()).collect();
         let id_to_idx = ids

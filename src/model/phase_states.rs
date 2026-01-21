@@ -92,8 +92,6 @@ impl PhaseStates {
         }
     }
 
-
-
     /// Clear state for reuse
     fn clear(&mut self) {
         self.threaded_haps.clear();
@@ -144,7 +142,9 @@ impl PhaseStates {
 
             // Calculate transition point (midpoint between last seen and current)
             let next_start = ((head.last_ibs_marker + marker) / 2) as usize;
-            let next_start = next_start.max(prev_start).min(self.n_markers.saturating_sub(1));
+            let next_start = next_start
+                .max(prev_start)
+                .min(self.n_markers.saturating_sub(1));
 
             // Remove old hap from tracking
             self.hap_to_last_ibs.remove(&prev_hap);

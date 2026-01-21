@@ -397,6 +397,46 @@ def calculate_dosage(gt):
     return gt[0] + gt[1]
 
 
+def _normalize_imputed_to_truth_alleles(t_ref, t_alt, i_ref, i_alt, i_gt, i_dos, i_gp):
+    """Normalize imputed GT/DS/GP into the truth REF/ALT orientation for biallelic sites.
+
+    This handles the common case where the same SNP is represented with swapped REF/ALT between VCFs.
+    For swapped alleles, the allele index meaning flips: 0<->1.
+    """
+    # Only support biallelic swaps here.
+    if "," in str(t_alt) or "," in str(i_alt):
+        return False, i_gt, i_dos, i_gp
+
+    if t_ref == i_ref and t_alt == i_alt:
+        return False, i_gt, i_dos, i_gp
+
+    swapped = t_ref == i_alt and t_alt == i_ref
+    if not swapped:
+        return False, i_gt, i_dos, i_gp
+
+    # Flip hard-call genotype.
+    if i_gt is not None:
+        a0, a1 = i_gt
+        if a0 in (0, 1) and a1 in (0, 1):
+            i_gt = (1 - a0, 1 - a1)
+        else:
+            # Non-biallelic allele codes; give up on normalization.
+            return False, i_gt, i_dos, i_gp
+
+    # Invert dosage: DS is ALT dosage; after swapping ALT, DS' = 2 - DS.
+    if i_dos is not None:
+        try:
+            i_dos = 2.0 - float(i_dos)
+        except Exception:
+            pass
+
+    # Swap GP(0/0) <-> GP(1/1). Keep GP(0/1) the same.
+    if i_gp is not None and len(i_gp) == 3:
+        i_gp = (i_gp[2], i_gp[1], i_gp[0])
+
+    return True, i_gt, i_dos, i_gp
+
+
 def _stream_vcf_lines(cmd):
     """Stream VCF query output line by line to avoid loading all into memory."""
     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -695,6 +735,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     missing_imputed = 0
     missing_both = 0
     ref_alt_mismatch = 0
+    ref_alt_swapped = 0
+    ref_alt_mismatch_examples = 0
+    ref_alt_swapped_examples = 0
     multiallelic_sites = 0
 
     # For N50 Phasing Block Length
@@ -849,11 +892,27 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                 last_pos = site[1]
                 truth_site = truth_data
                 imputed_site = imp_data
+                swapped_site = False
                 if t_ref != i_ref or t_alt != i_alt:
-                    ref_alt_mismatch += 1
-                    truth_key, truth_data, truth_multiallelic = get_next_truth()
-                    imp_key, imp_data, imp_multiallelic = get_next_imputed()
-                    continue
+                    # Try to handle biallelic REF/ALT swaps instead of discarding the site.
+                    if ("," not in str(t_alt)) and ("," not in str(i_alt)) and (t_ref == i_alt and t_alt == i_ref):
+                        swapped_site = True
+                        ref_alt_swapped += 1
+                        if ref_alt_swapped_examples < 5:
+                            ref_alt_swapped_examples += 1
+                            print(
+                                f"[ALLELE SWAP] {t_chrom}:{t_pos} truth {t_ref}>{t_alt} imputed {i_ref}>{i_alt}"
+                            )
+                    else:
+                        ref_alt_mismatch += 1
+                        if ref_alt_mismatch_examples < 5:
+                            ref_alt_mismatch_examples += 1
+                            print(
+                                f"[ALLELE MISMATCH] {t_chrom}:{t_pos} truth {t_ref}>{t_alt} imputed {i_ref}>{i_alt}"
+                            )
+                        truth_key, truth_data, truth_multiallelic = get_next_truth()
+                        imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                        continue
                 if truth_multiallelic or imp_multiallelic:
                     multiallelic_sites += 1
                     truth_key, truth_data, truth_multiallelic = get_next_truth()
@@ -891,6 +950,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                     i_entry = imputed_site.get(sample)
                     t_gt, t_dos, t_phased = (t_entry if t_entry else (None, None, False))
                     i_gt, i_dos, i_phased, i_gp = (i_entry if i_entry else (None, None, False, None))
+
+                    if swapped_site:
+                        _, i_gt, i_dos, i_gp = _normalize_imputed_to_truth_alleles(
+                            t_ref, t_alt, i_ref, i_alt, i_gt, i_dos, i_gp
+                        )
 
                     if t_gt is None:
                         missing_truth += 1
@@ -1132,6 +1196,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     metrics["missing_imputed"] = missing_imputed
     metrics["missing_both"] = missing_both
     metrics["ref_alt_mismatch"] = ref_alt_mismatch
+    metrics["ref_alt_swapped"] = ref_alt_swapped
     metrics["multiallelic_sites"] = multiallelic_sites
 
     if masked_total > 0:
@@ -1447,8 +1512,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
             print(f"   Missing genotypes: Truth={missing_truth:,}, Imputed={missing_imputed:,}")
         
         ref_alt_mismatch = metrics.get('ref_alt_mismatch', 0)
+        ref_alt_swapped = metrics.get('ref_alt_swapped', 0)
         if ref_alt_mismatch > 0:
             print(f"   REF/ALT mismatches: {ref_alt_mismatch:,} sites (coordinate/strand issue?)")
+        if ref_alt_swapped > 0:
+            print(f"   REF/ALT swaps normalized: {ref_alt_swapped:,} sites")
         
         multiallelic = metrics.get('multiallelic_sites', 0)
         if multiallelic > 0:

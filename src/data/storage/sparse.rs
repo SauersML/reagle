@@ -78,5 +78,4 @@ mod tests {
 
         assert_eq!(col.n_carriers(), 3);
     }
-
 }

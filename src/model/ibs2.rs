@@ -84,9 +84,7 @@ impl Ibs2 {
             })
             .collect();
 
-        Self {
-            sample_segs,
-        }
+        Self { sample_segs }
     }
 
     /// Create an empty IBS2 structure with no segments.
@@ -333,17 +331,20 @@ impl Ibs2Markers {
 
         let mut step_starts = Vec::new();
         let mut last_start = 0;
-        
+
         while last_start < n_markers {
             step_starts.push(last_start);
-            
+
             let mut next_start = last_start + 1;
             let mut mkr_cnt = 0;
-            let mut min_cm_pos = gen_maps.gen_pos(chrom, gt.marker(MarkerIdx::new(last_start as u32)).pos) + Self::MIN_INTERMARKER_CM;
-            
+            let mut min_cm_pos = gen_maps
+                .gen_pos(chrom, gt.marker(MarkerIdx::new(last_start as u32)).pos)
+                + Self::MIN_INTERMARKER_CM;
+
             while next_start < n_markers && mkr_cnt < Self::MIN_MARKER_CNT {
                 if use_marker[next_start] {
-                    let cur_cm_pos = gen_maps.gen_pos(chrom, gt.marker(MarkerIdx::new(next_start as u32)).pos);
+                    let cur_cm_pos =
+                        gen_maps.gen_pos(chrom, gt.marker(MarkerIdx::new(next_start as u32)).pos);
                     if cur_cm_pos < min_cm_pos {
                         use_marker[next_start] = false;
                     } else {
@@ -356,7 +357,10 @@ impl Ibs2Markers {
             last_start = next_start;
         }
 
-        Self { use_marker, step_starts }
+        Self {
+            use_marker,
+            step_starts,
+        }
     }
 
     fn markers_in_step(&self, step_idx: usize, n_markers: usize) -> Vec<usize> {
@@ -366,7 +370,7 @@ impl Ibs2Markers {
         } else {
             n_markers
         };
-        
+
         (start..end).filter(|&m| self.use_marker[m]).collect()
     }
 }
@@ -416,7 +420,9 @@ impl Ibs2Sets {
                 for &m in &step_markers {
                     let m_idx = MarkerIdx::new(m as u32);
                     let sample = SampleIdx::new(s as u32);
-                    if gt.allele(m_idx, sample.hap1()) == 255 || gt.allele(m_idx, sample.hap2()) == 255 {
+                    if gt.allele(m_idx, sample.hap1()) == 255
+                        || gt.allele(m_idx, sample.hap2()) == 255
+                    {
                         miss_cnt += 1;
                     }
                 }
@@ -436,7 +442,9 @@ impl Ibs2Sets {
                     next_partition.extend(Self::partition_cluster(gt, parent, m));
                 }
                 partition = next_partition;
-                if partition.is_empty() { break; }
+                if partition.is_empty() {
+                    break;
+                }
             }
 
             let mut step_results = vec![None; n_samples];
@@ -449,7 +457,8 @@ impl Ibs2Sets {
                             step_results[s_idx] = Some(Arc::clone(&arc_samples));
                         } else {
                             // Clone the inner Vec from the existing Arc
-                            let mut merged: Vec<u32> = (**step_results[s_idx].as_ref().unwrap()).clone();
+                            let mut merged: Vec<u32> =
+                                (**step_results[s_idx].as_ref().unwrap()).clone();
                             merged.extend(arc_samples.iter().copied());
                             merged.sort_unstable();
                             merged.dedup();
@@ -488,10 +497,10 @@ impl Ibs2Sets {
         let m_idx = MarkerIdx::new(m as u32);
         let n_alleles = 1 + gt.marker(m_idx).alt_alleles.len();
         let n_gt = (n_alleles * (n_alleles + 1)) / 2;
-        
+
         let mut gt_to_list: Vec<Option<Vec<u32>>> = vec![None; n_gt];
         let mut missing = Vec::new();
-        
+
         let mut next_is_hom = vec![false; n_gt];
         if parent.is_homozygous {
             for a in 0..n_alleles {
@@ -518,7 +527,7 @@ impl Ibs2Sets {
                 } else {
                     (a1 as usize * (a1 as usize + 1)) / 2 + a2 as usize
                 };
-                
+
                 if gt_idx < n_gt {
                     let list = gt_to_list[gt_idx].get_or_insert_with(|| missing.clone());
                     list.push(s);
@@ -526,7 +535,9 @@ impl Ibs2Sets {
             }
         }
 
-        gt_to_list.into_iter().enumerate()
+        gt_to_list
+            .into_iter()
+            .enumerate()
             .filter_map(|(i, opt_list)| {
                 let list = opt_list?;
                 if list.len() > 1 {

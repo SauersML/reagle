@@ -110,7 +110,7 @@ impl GenotypeColumn {
         // Count ALT carriers for MAF calculation (ignore missing = 255)
         let alt_count = alleles.iter().filter(|&&a| a > 0 && a != 255).count();
         let present_count = alleles.iter().filter(|&&a| a != 255).count();
-        
+
         let maf = if present_count > 0 {
             let freq = alt_count as f64 / present_count as f64;
             freq.min(1.0 - freq)
@@ -151,7 +151,6 @@ impl GenotypeColumn {
             ))
         }
     }
-
 }
 
 impl Default for GenotypeColumn {

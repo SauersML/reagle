@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use crate::data::haplotype::{HapIdx, Samples};
 use crate::data::marker::{Marker, MarkerIdx, Markers};
-use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
 use crate::data::storage::GenotypeColumn;
+use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
 
 #[derive(Clone, Debug)]
 pub struct PlMatrix {
@@ -67,7 +67,8 @@ impl PlMatrix {
         marker_offsets.push(0);
         let mut values: Vec<u16> = Vec::new();
         let mut running: u32 = 0;
-        for (stride_u16, mut block) in marker_strides.iter().copied().zip(marker_blocks.iter_mut()) {
+        for (stride_u16, mut block) in marker_strides.iter().copied().zip(marker_blocks.iter_mut())
+        {
             let stride = stride_u16 as usize;
             if stride == 0 {
                 marker_offsets.push(running);
@@ -171,7 +172,9 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Total memory usage in bytes (approximate)
     pub fn size_bytes(&self) -> usize {
         let column_bytes: usize = self.columns.iter().map(|c| c.size_bytes()).sum();
-        let confidence_bytes: usize = self.confidence.as_ref()
+        let confidence_bytes: usize = self
+            .confidence
+            .as_ref()
             .map(|c| c.iter().map(|v| v.len()).sum())
             .unwrap_or(0);
         column_bytes + confidence_bytes + std::mem::size_of::<Self>()
@@ -183,7 +186,8 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Returns 255 (full confidence) if confidence data is not available.
     #[inline]
     pub fn sample_confidence(&self, marker: MarkerIdx, sample_idx: usize) -> u8 {
-        self.confidence.as_ref()
+        self.confidence
+            .as_ref()
             .and_then(|c| c.get(marker.as_usize()))
             .and_then(|row| row.get(sample_idx))
             .copied()
@@ -211,7 +215,6 @@ impl<S: PhaseState> GenotypeMatrix<S> {
             .as_ref()
             .and_then(|pl| pl.sample_pl(marker.as_usize(), sample_idx))
     }
-
 }
 
 // ============================================================================
@@ -492,8 +495,8 @@ mod tests {
 
         // Create confidence scores: marker 0 has full confidence, marker 1 has 50% for sample 0
         let confidence = vec![
-            vec![255, 255],         // marker 0: full confidence for both samples
-            vec![128, 255],         // marker 1: 50% for sample 0, full for sample 1
+            vec![255, 255], // marker 0: full confidence for both samples
+            vec![128, 255], // marker 1: 50% for sample 0, full for sample 1
         ];
 
         let matrix = GenotypeMatrix::new_unphased_with_confidence(

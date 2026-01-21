@@ -3,14 +3,14 @@ use reagle::pipelines::imputation::ImputationPipeline;
 use reagle::pipelines::phasing::PhasingPipeline;
 
 // Serialize tests to prevent OOM from parallel execution
-use serial_test::serial;
-use std::io::Write;
-use tempfile::NamedTempFile;
-use std::fs::File;
 use ::noodles::bgzf::io as bgzf_io;
 use ::noodles::vcf as noodles_vcf;
 use noodles_vcf::Record;
 use noodles_vcf::variant::record::samples::Series;
+use serial_test::serial;
+use std::fs::File;
+use std::io::Write;
+use tempfile::NamedTempFile;
 
 // --- Helpers ---
 
@@ -44,7 +44,7 @@ impl SyntheticVcfBuilder {
         self.allele_generator = Box::new(generator);
         self
     }
-    
+
     fn unphased(mut self) -> Self {
         self.is_phased = false;
         self
@@ -55,47 +55,70 @@ impl SyntheticVcfBuilder {
             .suffix(".vcf")
             .tempfile()
             .expect("Create temp file");
-        
+
         // Write Header
         writeln!(file, "##fileformat=VCFv4.2").unwrap();
-        writeln!(file, "##FILTER=<ID=PASS,Description=\"All filters passed\">").unwrap();
-        writeln!(file, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">").unwrap();
+        writeln!(
+            file,
+            "##FILTER=<ID=PASS,Description=\"All filters passed\">"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+        )
+        .unwrap();
         writeln!(file, "##contig=<ID=chr1,length=1000000>").unwrap();
-        
-        write!(file, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").unwrap();
+
+        write!(
+            file,
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
+        )
+        .unwrap();
         for i in 0..self.n_samples {
             write!(file, "\tSample{}", i).unwrap();
         }
         writeln!(file).unwrap();
-        
+
         // Write Data
         for m in 0..self.n_markers {
             let pos = if let Some(ref positions) = self.positions {
-                if m < positions.len() { positions[m] } else { m * 1000 + 1 }
+                if m < positions.len() {
+                    positions[m]
+                } else {
+                    m * 1000 + 1
+                }
             } else {
                 m * 1000 + 1
             };
             write!(file, "chr1\t{}\trs{}\tA\tT\t.\tPASS\t.\tGT", pos, m).unwrap();
-            
+
             for s in 0..self.n_samples {
                 let mut alleles = Vec::new();
                 for p in 0..self.n_ploidy {
                     let hap_idx = s * self.n_ploidy + p;
                     alleles.push((self.allele_generator)(m, hap_idx));
                 }
-                
+
                 let sep = if self.is_phased { "|" } else { "/" };
-                
+
                 // Format genotype string (e.g. 0|1, .|., 1/0)
-                let gt_parts: Vec<String> = alleles.iter().map(|&a| {
-                    if a == 255 { ".".to_string() } else { a.to_string() }
-                }).collect();
-                
+                let gt_parts: Vec<String> = alleles
+                    .iter()
+                    .map(|&a| {
+                        if a == 255 {
+                            ".".to_string()
+                        } else {
+                            a.to_string()
+                        }
+                    })
+                    .collect();
+
                 write!(file, "\t{}", gt_parts.join(sep)).unwrap();
             }
             writeln!(file).unwrap();
         }
-        
+
         file
     }
 }
@@ -105,76 +128,88 @@ fn inspect_dosages(path: &std::path::Path, _: usize) -> Vec<Vec<f32>> {
     let file = File::open(path).expect("Open output VCF");
     let decoder = bgzf_io::Reader::new(file);
     let mut reader = noodles_vcf::io::Reader::new(decoder);
-    
+
     let header = reader.read_header().expect("Read header");
-    
+
     // Validate Header
     assert!(header.formats().contains_key("GT"), "GT format missing");
     assert!(header.formats().contains_key("DS"), "DS format missing");
-    
+
     let mut all_dosages = Vec::new();
-    
+
     for result in reader.records() {
         let result: std::io::Result<Record> = result;
         let record = result.expect("Read record");
         let mut site_dosages = Vec::new();
-        
+
         let samples = record.samples();
-        
+
         let ds_col = samples.select("DS").expect("DS column missing");
-        
+
         for value in ds_col.iter(&header) {
-             match value {
-                 Ok(Some(v)) => {
-                     // Check debug string since path to Value enum is unstable/private
-                     let s = format!("{:?}", v);
+            match value {
+                Ok(Some(v)) => {
+                    // Check debug string since path to Value enum is unstable/private
+                    let s = format!("{:?}", v);
 
-                     // Handle various formats:
-                     // - Float(1.94) -> 1.94
-                     // - Array([Ok(Some(1.94))]) -> 1.94
-                     // - Integer(1) -> 1.0
+                    // Handle various formats:
+                    // - Float(1.94) -> 1.94
+                    // - Array([Ok(Some(1.94))]) -> 1.94
+                    // - Integer(1) -> 1.0
 
-                     let parsed = if s.contains("Array") {
-                         // Format: Array([Ok(Some(1.94))])
-                         // Extract the innermost number
-                         if let Some(start) = s.rfind("Some(") {
-                             let after_some = &s[start + 5..];
-                             if let Some(end) = after_some.find(')') {
-                                 after_some[..end].parse().unwrap_or(0.0)
-                             } else { 0.0 }
-                         } else { 0.0 }
-                     } else if s.contains("Float") {
-                         // Format: Float(0.9)
-                         if let Some(start) = s.find('(') {
-                             if let Some(end) = s.find(')') {
-                                 s[start+1..end].parse().unwrap_or(0.0)
-                             } else { 0.0 }
-                         } else { 0.0 }
-                     } else if s.contains("Integer") {
-                         // Format: Integer(1)
-                         if let Some(start) = s.find('(') {
-                             if let Some(end) = s.find(')') {
-                                 s[start+1..end].parse().unwrap_or(0.0)
-                             } else { 0.0 }
-                         } else { 0.0 }
-                     } else {
-                         // Maybe it's just a raw number?
-                         s.parse().unwrap_or(0.0)
-                     };
+                    let parsed = if s.contains("Array") {
+                        // Format: Array([Ok(Some(1.94))])
+                        // Extract the innermost number
+                        if let Some(start) = s.rfind("Some(") {
+                            let after_some = &s[start + 5..];
+                            if let Some(end) = after_some.find(')') {
+                                after_some[..end].parse().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        }
+                    } else if s.contains("Float") {
+                        // Format: Float(0.9)
+                        if let Some(start) = s.find('(') {
+                            if let Some(end) = s.find(')') {
+                                s[start + 1..end].parse().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        }
+                    } else if s.contains("Integer") {
+                        // Format: Integer(1)
+                        if let Some(start) = s.find('(') {
+                            if let Some(end) = s.find(')') {
+                                s[start + 1..end].parse().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        // Maybe it's just a raw number?
+                        s.parse().unwrap_or(0.0)
+                    };
 
-                     site_dosages.push(parsed);
-                 }
-                 Ok(None) => site_dosages.push(-1.0), // Mark missing as -1.0
-                 Err(e) => panic!("Error reading DS: {}", e),
-             }
+                    site_dosages.push(parsed);
+                }
+                Ok(None) => site_dosages.push(-1.0), // Mark missing as -1.0
+                Err(e) => panic!("Error reading DS: {}", e),
+            }
         }
-        
+
         // Debug print for failed markers
         if site_dosages.len() > 0 && site_dosages[0] == -1.0 {
-             println!("Marker at index with missing DS");
+            println!("Marker at index with missing DS");
         }
-        
-        all_dosages.push(site_dosages); 
+
+        all_dosages.push(site_dosages);
     }
     all_dosages
 }
@@ -218,16 +253,16 @@ fn inspect_gt_phasing(path: &std::path::Path) -> Vec<Vec<String>> {
     let decoder = bgzf_io::Reader::new(file);
     let mut reader = noodles_vcf::io::Reader::new(decoder);
     let header = reader.read_header().expect("Read header");
-    
+
     let mut all_gts = Vec::new();
-    
+
     for result in reader.records() {
         let result: std::io::Result<Record> = result;
         let record = result.expect("Read record");
         let mut site_gts = Vec::new();
         let samples = record.samples();
         let gt_series = samples.select("GT").expect("GT missing");
-        
+
         for val in gt_series.iter(&header) {
             match val {
                 Ok(Some(v)) => site_gts.push(format!("{:?}", v)),
@@ -246,22 +281,25 @@ fn inspect_dr2(path: &std::path::Path) -> Vec<f64> {
     let file = File::open(path).expect("Open output VCF");
     let decoder = bgzf_io::Reader::new(file);
     let mut reader = noodles_vcf::io::Reader::new(decoder);
-    
+
     let header = reader.read_header().expect("Read header");
-    
+
     // Validate header was read successfully
-    assert!(header.formats().len() > 0 || header.infos().len() > 0, "VCF header should have fields");
-    
+    assert!(
+        header.formats().len() > 0 || header.infos().len() > 0,
+        "VCF header should have fields"
+    );
+
     let mut dr2_values = Vec::new();
-    
+
     for result in reader.records() {
         let result: std::io::Result<Record> = result;
         let record = result.expect("Read record");
-        
+
         // DR2 is typically stored in the INFO field as DR2=<value>
         // Parse the info field as a string and extract DR2
         let info_str = format!("{:?}", record.info());
-        
+
         // Look for DR2 in the info string
         let dr2 = if let Some(start) = info_str.find("DR2") {
             // Find the value after DR2=
@@ -269,7 +307,8 @@ fn inspect_dr2(path: &std::path::Path) -> Vec<f64> {
             if let Some(eq_pos) = after_dr2.find('=') {
                 let after_eq = &after_dr2[eq_pos + 1..];
                 // Find the end of the value (comma, semicolon, parenthesis, or end)
-                let end_pos = after_eq.find(|c: char| c == ',' || c == ';' || c == ')' || c == '"')
+                let end_pos = after_eq
+                    .find(|c: char| c == ',' || c == ';' || c == ')' || c == '"')
                     .unwrap_or(after_eq.len());
                 after_eq[..end_pos].trim().parse::<f64>().unwrap_or(-1.0)
             } else {
@@ -278,16 +317,20 @@ fn inspect_dr2(path: &std::path::Path) -> Vec<f64> {
         } else {
             -1.0 // No DR2 field
         };
-        
+
         dr2_values.push(dr2);
     }
-    
+
     dr2_values
 }
 
 /// Compute mean DR2 for valid DR2 values (>= 0)
 fn compute_mean_dr2(dr2_values: &[f64]) -> f64 {
-    let valid: Vec<f64> = dr2_values.iter().filter(|&&x| x >= 0.0 && x <= 1.0).copied().collect();
+    let valid: Vec<f64> = dr2_values
+        .iter()
+        .filter(|&&x| x >= 0.0 && x <= 1.0)
+        .copied()
+        .collect();
     if valid.is_empty() {
         return 0.0;
     }
@@ -301,9 +344,12 @@ fn calculate_sen(truth: &[f64], imputed: &[f64]) -> f64 {
     if truth.len() != imputed.len() || truth.is_empty() {
         return 0.0;
     }
-    let mse: f64 = truth.iter().zip(imputed.iter())
+    let mse: f64 = truth
+        .iter()
+        .zip(imputed.iter())
         .map(|(t, i)| (t - i).powi(2))
-        .sum::<f64>() / truth.len() as f64;
+        .sum::<f64>()
+        / truth.len() as f64;
     1.0 - (mse / 4.0)
 }
 
@@ -318,11 +364,11 @@ fn default_test_config() -> Config {
 #[serial]
 fn test_synthetic_slam_dunk() {
     let n_markers = 50;
-    
+
     let ref_file = SyntheticVcfBuilder::new(n_markers, 50)
         .allele_generator(|_, h| if h < 50 { 0 } else { 1 })
         .build();
-        
+
     let target_file = SyntheticVcfBuilder::new(n_markers, 1)
         .unphased()
         .allele_generator(|m, _| if m % 2 != 0 { 255 } else { 0 })
@@ -350,23 +396,31 @@ fn test_synthetic_slam_dunk() {
     assert!(out_vcf.exists());
 
     let dosages = inspect_dosages(&out_vcf, 1);
-    
+
     for m in (1..n_markers).step_by(2) {
         let ds = dosages[m][0];
         assert!(ds < 0.1, "Marker {} should be 0, got {}", m, ds);
     }
-    
+
     // DR2 validation for slam dunk test
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Slam dunk test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    println!(
+        "Slam dunk test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
         }
     }
     // Clear haplotype structure should give high DR2
-    assert!(mean_dr2 > 0.6, "Mean DR2 too low for slam dunk test: {:.4}", mean_dr2);
+    assert!(
+        mean_dr2 > 0.6,
+        "Mean DR2 too low for slam dunk test: {:.4}",
+        mean_dr2
+    );
 
     // SEN Validation
     // For slam dunk:
@@ -404,9 +458,13 @@ fn test_synthetic_recombination() {
         .positions(positions)
         .unphased()
         .allele_generator(|m, _| {
-            if m == 15 || m == 25 { 255 }
-            else if m < 20 { 0 }
-            else { 1 }
+            if m == 15 || m == 25 {
+                255
+            } else if m < 20 {
+                0
+            } else {
+                1
+            }
         })
         .build();
 
@@ -430,15 +488,27 @@ fn test_synthetic_recombination() {
     let dosages = inspect_dosages(&out_vcf, 1);
 
     // Marker 15 (in 0-region, should be 0)
-    assert!(dosages[15][0] < 0.1, "Marker 15 should be 0, got {}", dosages[15][0]);
+    assert!(
+        dosages[15][0] < 0.1,
+        "Marker 15 should be 0, got {}",
+        dosages[15][0]
+    );
     // Marker 25 (in 1-region, should be 2 for diploid 1|1)
-    assert!(dosages[25][0] > 1.9, "Marker 25 should be 2, got {}", dosages[25][0]);
-    
+    assert!(
+        dosages[25][0] > 1.9,
+        "Marker 25 should be 2, got {}",
+        dosages[25][0]
+    );
+
     // DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Recombination test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
-    
+    println!(
+        "Recombination test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
+
     // STRICT: All DR2 values must be in valid range [0, 1]
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
@@ -446,7 +516,11 @@ fn test_synthetic_recombination() {
         }
     }
     // STRICT: Mean DR2 should be high for well-imputed data with clear haplotype structure
-    assert!(mean_dr2 > 0.5, "Mean DR2 too low for recombination test: {:.4} (expected > 0.5)", mean_dr2);
+    assert!(
+        mean_dr2 > 0.5,
+        "Mean DR2 too low for recombination test: {:.4} (expected > 0.5)",
+        mean_dr2
+    );
 
     // SEN Validation
     // Target:
@@ -464,18 +538,18 @@ fn test_synthetic_recombination() {
     // For m >= 20: allele 1 + allele 1 = dosage 2.
     // Missing at 15: expected dosage 0.
     // Missing at 25: expected dosage 2.
-    
+
     let mut truth_vec = Vec::new();
     let mut imp_vec = Vec::new();
-    
+
     // Check marker 15
     truth_vec.push(0.0);
     imp_vec.push(dosages[15][0] as f64);
-    
+
     // Check marker 25
     truth_vec.push(2.0);
     imp_vec.push(dosages[25][0] as f64);
-    
+
     let sen = calculate_sen(&truth_vec, &imp_vec);
     println!("Recombination test - SEN: {:.4}", sen);
     assert!(sen > 0.95, "SEN too low for recombination test: {:.4}", sen);
@@ -542,18 +616,29 @@ fn test_simulated_chip_density() {
     let ds1 = dosages[150][1];
     assert!(ds0 < 0.1, "Sample 0 at Marker 150 should be 0, got {}", ds0);
     assert!(ds1 > 1.9, "Sample 1 at Marker 150 should be 2, got {}", ds1);
-    
+
     // DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Chip density test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
-    
+    println!(
+        "Chip density test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
+
     // STRICT: All DR2 values must be valid
     let valid_dr2_count = dr2_values.iter().filter(|&&x| x >= 0.0 && x <= 1.0).count();
-    assert!(valid_dr2_count > 0, "No valid DR2 values found in chip density test");
-    
+    assert!(
+        valid_dr2_count > 0,
+        "No valid DR2 values found in chip density test"
+    );
+
     // STRICT: High DR2 expected for clear two-population reference structure
-    assert!(mean_dr2 > 0.6, "Mean DR2 too low for chip density test: {:.4} (expected > 0.6)", mean_dr2);
+    assert!(
+        mean_dr2 > 0.6,
+        "Mean DR2 too low for chip density test: {:.4} (expected > 0.6)",
+        mean_dr2
+    );
 }
 
 #[test]
@@ -597,14 +682,26 @@ fn test_population_structure() {
     let dosages = inspect_dosages(&out_vcf, 1);
 
     // Check markers in different population regions
-    assert!(dosages[48][0] < 0.1, "Marker 48 should be 0, got {}", dosages[48][0]);
-    assert!(dosages[52][0] > 1.9, "Marker 52 should be 2, got {}", dosages[52][0]);
-    
+    assert!(
+        dosages[48][0] < 0.1,
+        "Marker 48 should be 0, got {}",
+        dosages[48][0]
+    );
+    assert!(
+        dosages[52][0] > 1.9,
+        "Marker 52 should be 2, got {}",
+        dosages[52][0]
+    );
+
     // DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Population structure test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
-    
+    println!(
+        "Population structure test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
+
     // STRICT: DR2 values must be in valid range
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
@@ -612,7 +709,11 @@ fn test_population_structure() {
         }
     }
     // STRICT: Reasonable DR2 expected for population structure test
-    assert!(mean_dr2 > 0.4, "Mean DR2 too low for population structure test: {:.4} (expected > 0.4)", mean_dr2);
+    assert!(
+        mean_dr2 > 0.4,
+        "Mean DR2 too low for population structure test: {:.4} (expected > 0.4)",
+        mean_dr2
+    );
 }
 
 #[test]
@@ -670,19 +771,35 @@ fn test_hotspot_switching() {
     let out_vcf = temp_dir.path().join("output_hotspot.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 1);
 
-    assert!(dosages[39][0] < 0.1, "Marker 39 should be 0, got {}", dosages[39][0]);
-    assert!(dosages[42][0] > 1.9, "Marker 42 should be 2, got {}", dosages[42][0]);
-    
+    assert!(
+        dosages[39][0] < 0.1,
+        "Marker 39 should be 0, got {}",
+        dosages[39][0]
+    );
+    assert!(
+        dosages[42][0] > 1.9,
+        "Marker 42 should be 2, got {}",
+        dosages[42][0]
+    );
+
     // DR2 validation for hotspot test
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Hotspot test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    println!(
+        "Hotspot test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
         }
     }
-    assert!(mean_dr2 > 0.3, "Mean DR2 too low for hotspot test: {:.4}", mean_dr2);
+    assert!(
+        mean_dr2 > 0.3,
+        "Mean DR2 too low for hotspot test: {:.4}",
+        mean_dr2
+    );
 }
 
 #[test]
@@ -741,11 +858,15 @@ fn test_phase_switch_torture() {
     }
 
     assert!(switches < 5, "Too many phase switches: {}", switches);
-    
+
     // DR2 validation for phase torture test (note: this is phasing, may not have imputed markers)
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Phase torture test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    println!(
+        "Phase torture test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
@@ -794,25 +915,36 @@ fn test_error_injection() {
     let dosages = inspect_dosages(&out_vcf, 1);
 
     // Marker 25 should be corrected toward 0
-    assert!(dosages[25][0] < 1.0, "Error not corrected! Got {}", dosages[25][0]);
-    
+    assert!(
+        dosages[25][0] < 1.0,
+        "Error not corrected! Got {}",
+        dosages[25][0]
+    );
+
     // DR2 validation for error correction
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    
-    println!("Error injection test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
-    
+
+    println!(
+        "Error injection test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
+
     // STRICT: All DR2 values must be valid
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
         }
     }
-    
+
     // STRICT: With monomorphic reference (all 0s), DR2 should be high (near 1.0)
     // since there's no uncertainty in the imputation
-    assert!(mean_dr2 > 0.7, 
-        "Mean DR2 should be high for monomorphic reference, got {:.4}", mean_dr2);
+    assert!(
+        mean_dr2 > 0.7,
+        "Mean DR2 should be high for monomorphic reference, got {:.4}",
+        mean_dr2
+    );
 }
 
 #[test]
@@ -874,26 +1006,34 @@ fn test_rare_variant() {
 
     // The dosage should be non-negative (valid)
     assert!(dosage >= 0.0 && dosage <= 2.0, "Invalid dosage: {}", dosage);
-    
+
     // DR2 validation for rare variant
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    
-    println!("Rare variant test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
-    
+
+    println!(
+        "Rare variant test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
+
     // STRICT: All DR2 values must be in valid range [0, 1]
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
         }
     }
-    
-    // The rare variant site (marker 25) should have lower DR2 
+
+    // The rare variant site (marker 25) should have lower DR2
     // since rare variants are harder to impute with certainty
     if dr2_values.len() > 25 && dr2_values[25] >= 0.0 {
         println!("  Rare variant marker 25 DR2: {:.4}", dr2_values[25]);
         // STRICT: DR2 for rare variant should still be valid
-        assert!(dr2_values[25] <= 1.0, "DR2 for rare variant out of range: {:.4}", dr2_values[25]);
+        assert!(
+            dr2_values[25] <= 1.0,
+            "DR2 for rare variant out of range: {:.4}",
+            dr2_values[25]
+        );
     }
 }
 
@@ -954,34 +1094,45 @@ fn test_dr2_validation() {
     // Comprehensive DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    
+
     println!("DR2 validation test:");
     println!("  Total markers: {}", dr2_values.len());
     println!("  Mean DR2: {:.4}", mean_dr2);
-    
+
     // Count valid and invalid DR2 values
     let valid_count = dr2_values.iter().filter(|&&x| x >= 0.0 && x <= 1.0).count();
     let invalid_count = dr2_values.iter().filter(|&&x| x > 1.0).count();
-    
+
     println!("  Valid DR2 values: {}", valid_count);
     println!("  Invalid DR2 values (>1): {}", invalid_count);
-    
+
     // STRICT: DR2 should be produced for most/all markers
-    assert!(dr2_values.len() == n_markers, 
-        "DR2 count ({}) != marker count ({})", dr2_values.len(), n_markers);
-    
+    assert!(
+        dr2_values.len() == n_markers,
+        "DR2 count ({}) != marker count ({})",
+        dr2_values.len(),
+        n_markers
+    );
+
     // STRICT: No DR2 values should exceed 1.0 (by definition)
-    assert!(invalid_count == 0, 
-        "Found {} DR2 values > 1.0, which is invalid", invalid_count);
-    
+    assert!(
+        invalid_count == 0,
+        "Found {} DR2 values > 1.0, which is invalid",
+        invalid_count
+    );
+
     // STRICT: All valid DR2 values must be non-negative
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
-            assert!(dr2 >= 0.0 && dr2 <= 1.0, 
-                "DR2 at marker {} out of valid range [0, 1]: {:.4}", i, dr2);
+            assert!(
+                dr2 >= 0.0 && dr2 <= 1.0,
+                "DR2 at marker {} out of valid range [0, 1]: {:.4}",
+                i,
+                dr2
+            );
         }
     }
-    
+
     // With multiple samples and mixed genotyped/missing pattern,
     // DR2 should be computable. Check that values are in valid range.
     // Note: Mean can be 0 if all imputed values are identical across samples.
@@ -1003,9 +1154,11 @@ fn test_phasing_perfect_ld() {
         .unphased()
         .allele_generator(|_, h| {
             let s = h / 2;
-            if s < 10 { 0 }
-            else if s < 20 { 1 }
-            else {
+            if s < 10 {
+                0
+            } else if s < 20 {
+                1
+            } else {
                 if h % 2 == 0 { 0 } else { 1 }
             }
         })
@@ -1035,7 +1188,11 @@ fn test_phasing_perfect_ld() {
     for m in 1..n_markers {
         let gt = &gts[m][20];
         let allele = gt.chars().nth(0).unwrap();
-        assert_eq!(allele, first_allele, "Marker {} switched phase relative to marker 0", m);
+        assert_eq!(
+            allele, first_allele,
+            "Marker {} switched phase relative to marker 0",
+            m
+        );
     }
 }
 
@@ -1055,9 +1212,17 @@ fn test_singleton_imputation() {
     let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
         .positions(positions.clone())
         .allele_generator(|m, h| {
-            if m == 5 && h == 0 { 1 } // Singleton on haplotype 0
-            else if m != 5 && h < 10 { 1 } // Some variation on other markers
-            else { 0 }
+            if m == 5 && h == 0 {
+                1
+            }
+            // Singleton on haplotype 0
+            else if m != 5 && h < 10 {
+                1
+            }
+            // Some variation on other markers
+            else {
+                0
+            }
         })
         .build();
 
@@ -1097,12 +1262,20 @@ fn test_singleton_imputation() {
 
     // This is a STRICT test - if we correctly track IBS, we should see elevated dosage
     // Note: this test may fail, which is useful information!
-    assert!(singleton_dosage > 0.01, "Singleton should have elevated dosage given matching background, got {}", singleton_dosage);
-    
+    assert!(
+        singleton_dosage > 0.01,
+        "Singleton should have elevated dosage given matching background, got {}",
+        singleton_dosage
+    );
+
     // DR2 validation for singleton imputation
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Singleton test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    println!(
+        "Singleton test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
     // Singleton sites typically have lower DR2 due to uncertainty
     if dr2_values.len() > 5 && dr2_values[5] >= 0.0 {
         println!("  Singleton marker 5 DR2: {:.4}", dr2_values[5]);
@@ -1154,7 +1327,9 @@ fn test_high_recombination_stress() {
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
-    pipeline.run().expect("Pipeline should not crash with high recombination");
+    pipeline
+        .run()
+        .expect("Pipeline should not crash with high recombination");
 
     let out_vcf = temp_dir.path().join("output_high_recomb.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 5);
@@ -1162,15 +1337,24 @@ fn test_high_recombination_stress() {
     // Verify dosages are valid (between 0 and 2)
     for (m, marker_dosages) in dosages.iter().enumerate() {
         for (s, ds) in marker_dosages.iter().enumerate() {
-            assert!(*ds >= 0.0 && *ds <= 2.0,
-                "Dosage out of range at marker {}, sample {}: {} (should be 0-2)", m, s, ds);
+            assert!(
+                *ds >= 0.0 && *ds <= 2.0,
+                "Dosage out of range at marker {}, sample {}: {} (should be 0-2)",
+                m,
+                s,
+                ds
+            );
         }
     }
-    
+
     // DR2 validation for high recombination stress test
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("High recomb stress test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    println!(
+        "High recomb stress test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
@@ -1220,7 +1404,9 @@ fn test_ultra_dense_markers() {
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
-    pipeline.run().expect("Pipeline should handle ultra-dense markers");
+    pipeline
+        .run()
+        .expect("Pipeline should handle ultra-dense markers");
 
     let out_vcf = temp_dir.path().join("output_dense.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 2);
@@ -1238,19 +1424,31 @@ fn test_ultra_dense_markers() {
     let avg_dosage = sum_dosage / count as f32;
     println!("Average dosage: {}", avg_dosage);
     // Target matches haplotype group 0, so average dosage should be LOW
-    assert!(avg_dosage < 0.5, "Average dosage should be low for matching haplotype group, got {}", avg_dosage);
-    
+    assert!(
+        avg_dosage < 0.5,
+        "Average dosage should be low for matching haplotype group, got {}",
+        avg_dosage
+    );
+
     // DR2 validation for ultra-dense markers test
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Ultra-dense test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    println!(
+        "Ultra-dense test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
         }
     }
     // With strong LD, DR2 should be high
-    assert!(mean_dr2 > 0.5, "Mean DR2 should be high with strong LD, got {:.4}", mean_dr2);
+    assert!(
+        mean_dr2 > 0.5,
+        "Mean DR2 should be high with strong LD, got {:.4}",
+        mean_dr2
+    );
 }
 
 /// Test imputation with diverse reference panel where target has some mismatch
@@ -1297,7 +1495,9 @@ fn test_diverse_reference_with_mismatch() {
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
-    pipeline.run().expect("Pipeline should handle diverse reference");
+    pipeline
+        .run()
+        .expect("Pipeline should handle diverse reference");
 
     let out_vcf = temp_dir.path().join("output_diverse.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 2);
@@ -1315,21 +1515,32 @@ fn test_diverse_reference_with_mismatch() {
     }
 
     let extreme_pct = extreme_count as f64 / total as f64;
-    println!("Diverse reference: {} extreme predictions out of {} ({:.1}%)",
-             extreme_count, total, extreme_pct * 100.0);
+    println!(
+        "Diverse reference: {} extreme predictions out of {} ({:.1}%)",
+        extreme_count,
+        total,
+        extreme_pct * 100.0
+    );
 
     // Should have valid dosages in range [0, 2]
     for marker_dosages in &dosages {
         for ds in marker_dosages {
-            assert!(*ds >= 0.0 && *ds <= 2.0,
-                "Dosage {} out of valid range [0, 2]", ds);
+            assert!(
+                *ds >= 0.0 && *ds <= 2.0,
+                "Dosage {} out of valid range [0, 2]",
+                ds
+            );
         }
     }
-    
+
     // DR2 validation for diverse reference test
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!("Diverse reference test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
+    println!(
+        "Diverse reference test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
@@ -1412,12 +1623,20 @@ fn test_microarray_vs_wgs_imputation() {
                     let allele0 = {
                         let hap_group = h0 / 2;
                         let base = ((block + hap_group) % 2) as f32;
-                        if (m % 10 == 3 || m % 10 == 7) && h0 % 3 == 0 { 1.0 - base } else { base }
+                        if (m % 10 == 3 || m % 10 == 7) && h0 % 3 == 0 {
+                            1.0 - base
+                        } else {
+                            base
+                        }
                     };
                     let allele1 = {
                         let hap_group = h1 / 2;
                         let base = ((block + hap_group) % 2) as f32;
-                        if (m % 10 == 3 || m % 10 == 7) && h1 % 3 == 0 { 1.0 - base } else { base }
+                        if (m % 10 == 3 || m % 10 == 7) && h1 % 3 == 0 {
+                            1.0 - base
+                        } else {
+                            base
+                        }
                     };
                     allele0 + allele1
                 })
@@ -1446,7 +1665,13 @@ fn test_microarray_vs_wgs_imputation() {
     let mut correct = 0;
     let mut total = 0;
     for (&est, &truth) in imputed_est.iter().zip(imputed_true.iter()) {
-        let est_geno = if est < 0.5 { 0 } else if est < 1.5 { 1 } else { 2 };
+        let est_geno = if est < 0.5 {
+            0
+        } else if est < 1.5 {
+            1
+        } else {
+            2
+        };
         let true_geno = truth.round() as i32;
         if est_geno == true_geno {
             correct += 1;
@@ -1457,27 +1682,51 @@ fn test_microarray_vs_wgs_imputation() {
     println!("Microarray vs WGS Concordance: {:.2}%", concordance * 100.0);
 
     // R² should be reasonably high for well-imputed data
-    assert!(r_squared > 0.5, "R² too low for microarray imputation: {:.4}", r_squared);
-    assert!(concordance > 0.7, "Concordance too low: {:.2}%", concordance * 100.0);
-    
+    assert!(
+        r_squared > 0.5,
+        "R² too low for microarray imputation: {:.4}",
+        r_squared
+    );
+    assert!(
+        concordance > 0.7,
+        "Concordance too low: {:.2}%",
+        concordance * 100.0
+    );
+
     // DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    
-    println!("Microarray test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
-    
+
+    println!(
+        "Microarray test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
+
     // STRICT: DR2 count should match marker count
-    assert!(dr2_values.len() == n_ref_markers, 
-        "DR2 count ({}) != marker count ({})", dr2_values.len(), n_ref_markers);
-    
+    assert!(
+        dr2_values.len() == n_ref_markers,
+        "DR2 count ({}) != marker count ({})",
+        dr2_values.len(),
+        n_ref_markers
+    );
+
     // STRICT: All DR2 values must be in valid range [0, 1]
     let invalid_dr2 = dr2_values.iter().filter(|&&x| x > 1.0).count();
-    assert!(invalid_dr2 == 0, "Found {} invalid DR2 values > 1.0", invalid_dr2);
-    
-    // STRICT: DR2 should correlate with actual imputation R² 
+    assert!(
+        invalid_dr2 == 0,
+        "Found {} invalid DR2 values > 1.0",
+        invalid_dr2
+    );
+
+    // STRICT: DR2 should correlate with actual imputation R²
     // High R² imputation should have high mean DR2
-    assert!(mean_dr2 > 0.3, 
-        "Mean DR2 ({:.4}) too low for microarray test with R²={:.4}", mean_dr2, r_squared);
+    assert!(
+        mean_dr2 > 0.3,
+        "Mean DR2 ({:.4}) too low for microarray test with R²={:.4}",
+        mean_dr2,
+        r_squared
+    );
 }
 
 /// Test with lower-density genotyping array
@@ -1507,11 +1756,7 @@ fn test_high_density_array_imputation() {
         .allele_generator(|m, h| {
             let val = (m * 7 + h * 13) % 10;
             let true_allele = if val < 4 { 1u8 } else { 0 };
-            if m % 5 == 0 {
-                true_allele
-            } else {
-                255
-            }
+            if m % 5 == 0 { true_allele } else { 255 }
         })
         .build();
 
@@ -1538,8 +1783,16 @@ fn test_high_density_array_imputation() {
                 .map(|s| {
                     let h0 = s * 2;
                     let h1 = s * 2 + 1;
-                    let a0 = if (m * 7 + h0 * 13) % 10 < 4 { 1.0f32 } else { 0.0 };
-                    let a1 = if (m * 7 + h1 * 13) % 10 < 4 { 1.0f32 } else { 0.0 };
+                    let a0 = if (m * 7 + h0 * 13) % 10 < 4 {
+                        1.0f32
+                    } else {
+                        0.0
+                    };
+                    let a1 = if (m * 7 + h1 * 13) % 10 < 4 {
+                        1.0f32
+                    } else {
+                        0.0
+                    };
                     a0 + a1
                 })
                 .collect()
@@ -1563,21 +1816,33 @@ fn test_high_density_array_imputation() {
 
     // This test checks imputation works with moderate density
     // R² > 0 means there's some correlation
-    assert!(r_squared > 0.1, "R² too low for array imputation: {:.4}", r_squared);
-    
+    assert!(
+        r_squared > 0.1,
+        "R² too low for array imputation: {:.4}",
+        r_squared
+    );
+
     // DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);
     let mean_dr2 = compute_mean_dr2(&dr2_values);
-    
-    println!("High-density array test - Mean DR2: {:.4}, count: {}", mean_dr2, dr2_values.len());
-    
+
+    println!(
+        "High-density array test - Mean DR2: {:.4}, count: {}",
+        mean_dr2,
+        dr2_values.len()
+    );
+
     // STRICT: DR2 values must be in valid range
     for (i, &dr2) in dr2_values.iter().enumerate() {
         if dr2 >= 0.0 {
             assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
         }
     }
-    
+
     // STRICT: Mean DR2 should be positive
-    assert!(mean_dr2 > 0.0, "Mean DR2 should be positive, got {:.4}", mean_dr2);
+    assert!(
+        mean_dr2 > 0.0,
+        "Mean DR2 should be positive, got {:.4}",
+        mean_dr2
+    );
 }

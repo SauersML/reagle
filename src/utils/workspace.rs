@@ -73,11 +73,11 @@ impl ImpWorkspace {
         self.cluster_base_scores.reserve(n_clusters_hint);
 
         if self.row_buffer.len() < n_states {
-             self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
+            self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
         }
         let block_fwd_size = (CHECKPOINT_INTERVAL + 1) * n_states;
         if self.block_fwd.len() < block_fwd_size {
-             self.block_fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(block_fwd_size));
+            self.block_fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(block_fwd_size));
         }
     }
 }
@@ -159,7 +159,11 @@ impl ThreadWorkspace {
     pub fn resize_for_states(&mut self, n_states: usize) {
         if n_states > self.n_states {
             // Only resize if we need more states, not for window size
-            let current_interval = if self.n_states > 0 { self.fwd.len() / self.n_states } else { 64 };
+            let current_interval = if self.n_states > 0 {
+                self.fwd.len() / self.n_states
+            } else {
+                64
+            };
             let new_size = current_interval * n_states;
 
             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));

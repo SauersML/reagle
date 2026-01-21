@@ -48,9 +48,7 @@ pub fn infer_n_alleles_from_pl_len(len: usize) -> Option<usize> {
     if len == 0 {
         return None;
     }
-    let disc = 8usize
-        .checked_mul(len)
-        .and_then(|x| x.checked_add(1))? as f64;
+    let disc = 8usize.checked_mul(len).and_then(|x| x.checked_add(1))? as f64;
     let n = (((disc.sqrt() - 1.0) / 2.0).floor() as usize).max(1);
     if n * (n + 1) / 2 == len {
         Some(n)

@@ -5,8 +5,8 @@
 
 use bitvec::prelude::*;
 
-use crate::data::marker::bits_per_allele;
 use crate::data::HapIdx;
+use crate::data::marker::bits_per_allele;
 
 /// Dense bit-packed storage for genotype data
 #[derive(Clone, Debug)]
@@ -111,7 +111,7 @@ impl DenseColumn {
     /// Count of ALT alleles (for biallelic)
     pub fn alt_count(&self) -> usize {
         if self.bits_per_allele == 1 {
-            // bits.count_ones() includes bits that might have been set for missing data 
+            // bits.count_ones() includes bits that might have been set for missing data
             // if we didn't clear them. But our set/from_alleles clears them.
             // Still, it's safer and clearer to use the iter or bit-parallel logic that respects 'missing'.
             self.iter().filter(|&a| a > 0 && a != 255).count()
@@ -127,11 +127,10 @@ impl DenseColumn {
 
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
-        self.bits.as_raw_slice().len() * std::mem::size_of::<u64>() 
+        self.bits.as_raw_slice().len() * std::mem::size_of::<u64>()
             + self.missing.as_raw_slice().len() * std::mem::size_of::<u64>()
             + std::mem::size_of::<Self>()
     }
-
 }
 
 #[cfg(test)]
@@ -163,5 +162,4 @@ mod tests {
             assert_eq!(col.get(HapIdx::new(i as u32)), expected);
         }
     }
-
 }

@@ -8,15 +8,15 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use noodles::bgzf::io as bgzf_io;
 use flate2::read::GzDecoder;
+use noodles::bgzf::io as bgzf_io;
 use noodles::vcf::Header;
 use tracing::info_span;
 
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
 use crate::data::storage::matrix::PlMatrix;
+use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
 use crate::error::{ReagleError, Result};
 use crate::utils::telemetry::TelemetryBlackboard;
 
@@ -32,11 +32,7 @@ pub(crate) fn parse_pl(pl_str: &str) -> Option<Vec<u16>> {
         let v = s.parse::<u32>().ok()?;
         out.push(v.min(u16::MAX as u32) as u16);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 pub(crate) fn gl_to_pl(gl_str: &str) -> Option<Vec<u16>> {
@@ -99,12 +95,14 @@ impl MarkerImputationStats {
         }
     }
 
-
     /// Add a biallelic sample's data with compact representation (no heap allocation).
     /// p1 = P(ALT) for haplotype 1, p2 = P(ALT) for haplotype 2.
     #[inline]
     pub fn add_sample_biallelic(&mut self, p1: f32, p2: f32) {
-        assert!(self.sum_p.len() == 2, "add_sample_biallelic requires biallelic marker");
+        assert!(
+            self.sum_p.len() == 2,
+            "add_sample_biallelic requires biallelic marker"
+        );
         self.n_haps += 2;
 
         let p_sum = p1 + p2;
@@ -128,7 +126,6 @@ impl MarkerImputationStats {
         if sum == 0.0 || (sum - n).abs() <= 1e-8 {
             return 1.0;
         }
-
 
         let sum_sq = self.sum_p_sq[allele];
 
@@ -265,7 +262,9 @@ impl VcfReader {
             let reader: Box<dyn BufRead + Send> = match ext {
                 "bgz" | "bgzf" => {
                     if !Self::detect_bgzf(&mut file)? {
-                        return Err(anyhow::anyhow!("Expected BGZF file for extension .{}", ext).into());
+                        return Err(
+                            anyhow::anyhow!("Expected BGZF file for extension .{}", ext).into()
+                        );
                     }
                     Box::new(BufReader::new(bgzf_io::Reader::new(file)))
                 }
@@ -288,43 +287,46 @@ impl VcfReader {
     ) -> Result<(Self, Box<dyn BufRead + Send>)> {
         info_span!("vcf_from_reader").in_scope(|| {
             // Read header
-        let mut header_str = String::new();
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line)?;
-            if bytes_read == 0 {
-                break;
-            }
-            if line.starts_with('#') {
-                header_str.push_str(&line);
-                if line.starts_with("#CHROM") {
+            let mut header_str = String::new();
+            loop {
+                let mut line = String::new();
+                let bytes_read = reader.read_line(&mut line)?;
+                if bytes_read == 0 {
                     break;
                 }
-            } else {
-                break;
+                if line.starts_with('#') {
+                    header_str.push_str(&line);
+                    if line.starts_with("#CHROM") {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
-        }
 
-        let header: Header = header_str
-            .parse()
-            .map_err(|e| ReagleError::vcf(format!("{}", e)))?;
+            let header: Header = header_str
+                .parse()
+                .map_err(|e| ReagleError::vcf(format!("{}", e)))?;
 
-        // Extract sample names
-        let sample_names: Vec<String> = header
-            .sample_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+            // Extract sample names
+            let sample_names: Vec<String> = header
+                .sample_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
 
-        let samples = Arc::new(Samples::from_ids(sample_names));
+            let samples = Arc::new(Samples::from_ids(sample_names));
 
-        Ok((Self {
-            samples,
-            include_sample_indices: None,
-            exclude_marker_ids: None,
-            sample_ploidy: None,
-            all_phased: true,
-        }, reader))
+            Ok((
+                Self {
+                    samples,
+                    include_sample_indices: None,
+                    exclude_marker_ids: None,
+                    sample_ploidy: None,
+                    all_phased: true,
+                },
+                reader,
+            ))
         })
     }
 
@@ -339,7 +341,8 @@ impl VcfReader {
         }
 
         // Build list of sample indices to INCLUDE (those NOT in exclude list)
-        let include_indices: Vec<usize> = self.samples
+        let include_indices: Vec<usize> = self
+            .samples
             .ids()
             .iter()
             .enumerate()
@@ -377,112 +380,124 @@ impl VcfReader {
     /// Read all records into a GenotypeMatrix
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
         info_span!("vcf_read_all").in_scope(|| {
-        let mut markers = Markers::new();
-        let mut columns = Vec::new();
-        let n_samples = self.samples.len();
-        // Accumulate per-marker confidence scores (one Vec<u8> per marker, indexed by sample)
-        let mut all_confidences: Vec<Option<Vec<u8>>> = Vec::new();
-        let mut has_any_confidence = false;
-        let mut all_likelihoods_pl: Vec<Option<Vec<Vec<u16>>>> = Vec::new();
-        let mut has_any_likelihoods = false;
+            let mut markers = Markers::new();
+            let mut columns = Vec::new();
+            let n_samples = self.samples.len();
+            // Accumulate per-marker confidence scores (one Vec<u8> per marker, indexed by sample)
+            let mut all_confidences: Vec<Option<Vec<u8>>> = Vec::new();
+            let mut has_any_confidence = false;
+            let mut all_likelihoods_pl: Vec<Option<Vec<Vec<u16>>>> = Vec::new();
+            let mut has_any_likelihoods = false;
 
-        let mut line = String::new();
-        let mut line_num = 0usize;
+            let mut line = String::new();
+            let mut line_num = 0usize;
 
-        // Buffers for batch processing (Dictionary Compression)
-        const BATCH_SIZE: usize = 64;
-        let mut batch_markers: Vec<Marker> = Vec::with_capacity(BATCH_SIZE);
-        let mut batch_alleles: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
-        let mut batch_n_alleles: Vec<usize> = Vec::with_capacity(BATCH_SIZE);
+            // Buffers for batch processing (Dictionary Compression)
+            const BATCH_SIZE: usize = 64;
+            let mut batch_markers: Vec<Marker> = Vec::with_capacity(BATCH_SIZE);
+            let mut batch_alleles: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+            let mut batch_n_alleles: Vec<usize> = Vec::with_capacity(BATCH_SIZE);
 
-        loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line)?;
-            if bytes_read == 0 {
-                break;
-            }
-            line_num += 1;
-
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // Parse VCF record
-            let (marker, mut alleles, is_phased, mut confidences, mut likelihoods_pl) =
-                self.parse_record(line, &mut markers, line_num)?;
-
-            // Track if any marker is unphased
-            if !is_phased {
-                self.all_phased = false;
-            }
-
-            // Check marker exclusion filter
-            if let Some(ref exclude_ids) = self.exclude_marker_ids {
-                if let Some(ref id) = marker.id {
-                    if exclude_ids.contains(id.as_ref()) {
-                        continue; // Skip this marker
-                    }
+            loop {
+                line.clear();
+                let bytes_read = reader.read_line(&mut line)?;
+                if bytes_read == 0 {
+                    break;
                 }
-            }
+                line_num += 1;
 
-            // Apply sample filtering if set
-            if let Some(ref include_indices) = self.include_sample_indices {
-                // Filter alleles to only include non-excluded samples
-                let mut filtered_alleles = Vec::with_capacity(include_indices.len() * 2);
-                for &sample_idx in include_indices {
-                    let hap1_idx = sample_idx * 2;
-                    let hap2_idx = sample_idx * 2 + 1;
-                    if hap1_idx < alleles.len() && hap2_idx < alleles.len() {
-                        filtered_alleles.push(alleles[hap1_idx]);
-                        filtered_alleles.push(alleles[hap2_idx]);
-                    }
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
                 }
-                alleles = filtered_alleles;
 
-                // Also filter confidence scores if present
-                if let Some(ref conf) = confidences {
-                    let mut filtered_conf = Vec::with_capacity(include_indices.len());
-                    for &sample_idx in include_indices {
-                        if sample_idx < conf.len() {
-                            filtered_conf.push(conf[sample_idx]);
+                // Parse VCF record
+                let (marker, mut alleles, is_phased, mut confidences, mut likelihoods_pl) =
+                    self.parse_record(line, &mut markers, line_num)?;
+
+                // Track if any marker is unphased
+                if !is_phased {
+                    self.all_phased = false;
+                }
+
+                // Check marker exclusion filter
+                if let Some(ref exclude_ids) = self.exclude_marker_ids {
+                    if let Some(ref id) = marker.id {
+                        if exclude_ids.contains(id.as_ref()) {
+                            continue; // Skip this marker
                         }
                     }
-                    confidences = Some(filtered_conf);
                 }
 
-                if let Some(ref pl) = likelihoods_pl {
-                    let mut filtered_pl = Vec::with_capacity(include_indices.len());
+                // Apply sample filtering if set
+                if let Some(ref include_indices) = self.include_sample_indices {
+                    // Filter alleles to only include non-excluded samples
+                    let mut filtered_alleles = Vec::with_capacity(include_indices.len() * 2);
                     for &sample_idx in include_indices {
-                        if sample_idx < pl.len() {
-                            filtered_pl.push(pl[sample_idx].clone());
+                        let hap1_idx = sample_idx * 2;
+                        let hap2_idx = sample_idx * 2 + 1;
+                        if hap1_idx < alleles.len() && hap2_idx < alleles.len() {
+                            filtered_alleles.push(alleles[hap1_idx]);
+                            filtered_alleles.push(alleles[hap2_idx]);
                         }
                     }
-                    likelihoods_pl = Some(filtered_pl);
+                    alleles = filtered_alleles;
+
+                    // Also filter confidence scores if present
+                    if let Some(ref conf) = confidences {
+                        let mut filtered_conf = Vec::with_capacity(include_indices.len());
+                        for &sample_idx in include_indices {
+                            if sample_idx < conf.len() {
+                                filtered_conf.push(conf[sample_idx]);
+                            }
+                        }
+                        confidences = Some(filtered_conf);
+                    }
+
+                    if let Some(ref pl) = likelihoods_pl {
+                        let mut filtered_pl = Vec::with_capacity(include_indices.len());
+                        for &sample_idx in include_indices {
+                            if sample_idx < pl.len() {
+                                filtered_pl.push(pl[sample_idx].clone());
+                            }
+                        }
+                        likelihoods_pl = Some(filtered_pl);
+                    }
+                }
+
+                // Store confidence scores
+                if confidences.is_some() {
+                    has_any_confidence = true;
+                }
+                all_confidences.push(confidences);
+
+                if likelihoods_pl.is_some() {
+                    has_any_likelihoods = true;
+                }
+                all_likelihoods_pl.push(likelihoods_pl);
+
+                // Calculate actual number of alleles: 1 REF + N ALT
+                let n_alleles = 1 + marker.alt_alleles.len();
+
+                // Buffer the marker data
+                batch_markers.push(marker);
+                batch_alleles.push(alleles);
+                batch_n_alleles.push(n_alleles);
+
+                // Process batch if full
+                if batch_markers.len() >= BATCH_SIZE {
+                    Self::flush_batch(
+                        &mut markers,
+                        &mut columns,
+                        &mut batch_markers,
+                        &mut batch_alleles,
+                        &mut batch_n_alleles,
+                    );
                 }
             }
 
-            // Store confidence scores
-            if confidences.is_some() {
-                has_any_confidence = true;
-            }
-            all_confidences.push(confidences);
-
-            if likelihoods_pl.is_some() {
-                has_any_likelihoods = true;
-            }
-            all_likelihoods_pl.push(likelihoods_pl);
-
-            // Calculate actual number of alleles: 1 REF + N ALT
-            let n_alleles = 1 + marker.alt_alleles.len();
-
-            // Buffer the marker data
-            batch_markers.push(marker);
-            batch_alleles.push(alleles);
-            batch_n_alleles.push(n_alleles);
-
-            // Process batch if full
-            if batch_markers.len() >= BATCH_SIZE {
+            // Process remaining markers
+            if !batch_markers.is_empty() {
                 Self::flush_batch(
                     &mut markers,
                     &mut columns,
@@ -491,80 +506,77 @@ impl VcfReader {
                     &mut batch_n_alleles,
                 );
             }
-        }
 
-        // Process remaining markers
-        if !batch_markers.is_empty() {
-            Self::flush_batch(
-                &mut markers,
-                &mut columns,
-                &mut batch_markers,
-                &mut batch_alleles,
-                &mut batch_n_alleles,
-            );
-        }
+            // Update Samples with detected ploidy information
+            self.finalize_samples();
 
-        // Update Samples with detected ploidy information
-        self.finalize_samples();
+            let confidence_opt = if has_any_confidence && all_confidences.len() == columns.len() {
+                Some(
+                    all_confidences
+                        .into_iter()
+                        .map(|c| c.unwrap_or_else(|| vec![255; n_samples]))
+                        .collect(),
+                )
+            } else {
+                None
+            };
 
-        let confidence_opt = if has_any_confidence && all_confidences.len() == columns.len() {
-            Some(
-                all_confidences
-                    .into_iter()
-                    .map(|c| c.unwrap_or_else(|| vec![255; n_samples]))
-                    .collect(),
-            )
-        } else {
-            None
-        };
-
-        let matrix = if has_any_likelihoods && all_likelihoods_pl.len() == columns.len() {
-            let mut marker_strides: Vec<u16> = Vec::with_capacity(all_likelihoods_pl.len());
-            let mut marker_blocks: Vec<Vec<u16>> = Vec::with_capacity(all_likelihoods_pl.len());
-            for pl_opt in all_likelihoods_pl.into_iter() {
-                if let Some(pl_by_sample) = pl_opt {
-                    let stride = pl_by_sample
-                        .get(0)
-                        .map(|v| v.len())
-                        .unwrap_or(0)
-                        .min(u16::MAX as usize) as u16;
-                    if stride == 0 {
-                        marker_strides.push(0);
-                        marker_blocks.push(Vec::new());
-                        continue;
-                    }
-
-                    let stride_usize = stride as usize;
-                    let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
-                    for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
-                        if pls.len() != stride_usize {
+            let matrix = if has_any_likelihoods && all_likelihoods_pl.len() == columns.len() {
+                let mut marker_strides: Vec<u16> = Vec::with_capacity(all_likelihoods_pl.len());
+                let mut marker_blocks: Vec<Vec<u16>> = Vec::with_capacity(all_likelihoods_pl.len());
+                for pl_opt in all_likelihoods_pl.into_iter() {
+                    if let Some(pl_by_sample) = pl_opt {
+                        let stride = pl_by_sample
+                            .get(0)
+                            .map(|v| v.len())
+                            .unwrap_or(0)
+                            .min(u16::MAX as usize) as u16;
+                        if stride == 0 {
+                            marker_strides.push(0);
+                            marker_blocks.push(Vec::new());
                             continue;
                         }
-                        let start = s * stride_usize;
-                        block[start..start + stride_usize].copy_from_slice(&pls);
-                    }
-                    marker_strides.push(stride);
-                    marker_blocks.push(block);
-                } else {
-                    marker_strides.push(0);
-                    marker_blocks.push(Vec::new());
-                }
-            }
 
-            let pl = Arc::new(PlMatrix::from_marker_blocks(n_samples, marker_strides, marker_blocks));
-            GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
-                markers,
-                columns,
-                Arc::clone(&self.samples),
-                confidence_opt,
-                pl,
-            )
-        } else if let Some(conf) = confidence_opt {
-            GenotypeMatrix::new_unphased_with_confidence(markers, columns, Arc::clone(&self.samples), conf)
-        } else {
-            GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
-        };
-        Ok(matrix)
+                        let stride_usize = stride as usize;
+                        let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                        for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
+                            if pls.len() != stride_usize {
+                                continue;
+                            }
+                            let start = s * stride_usize;
+                            block[start..start + stride_usize].copy_from_slice(&pls);
+                        }
+                        marker_strides.push(stride);
+                        marker_blocks.push(block);
+                    } else {
+                        marker_strides.push(0);
+                        marker_blocks.push(Vec::new());
+                    }
+                }
+
+                let pl = Arc::new(PlMatrix::from_marker_blocks(
+                    n_samples,
+                    marker_strides,
+                    marker_blocks,
+                ));
+                GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
+                    markers,
+                    columns,
+                    Arc::clone(&self.samples),
+                    confidence_opt,
+                    pl,
+                )
+            } else if let Some(conf) = confidence_opt {
+                GenotypeMatrix::new_unphased_with_confidence(
+                    markers,
+                    columns,
+                    Arc::clone(&self.samples),
+                    conf,
+                )
+            } else {
+                GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
+            };
+            Ok(matrix)
         })
     }
 
@@ -635,7 +647,13 @@ impl VcfReader {
         line: &str,
         markers: &mut Markers,
         line_num: usize,
-    ) -> Result<(Marker, Vec<u8>, bool, Option<Vec<u8>>, Option<Vec<Vec<u16>>>)> {
+    ) -> Result<(
+        Marker,
+        Vec<u8>,
+        bool,
+        Option<Vec<u8>>,
+        Option<Vec<Vec<u16>>>,
+    )> {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 10 {
             return Err(ReagleError::parse(
@@ -674,9 +692,7 @@ impl VcfReader {
             // Avoid Vec allocation by using iterator directly
             info_field
                 .split(';')
-                .filter_map(|kv| {
-                    kv.strip_prefix("END=").and_then(|v| v.parse().ok())
-                })
+                .filter_map(|kv| kv.strip_prefix("END=").and_then(|v| v.parse().ok()))
                 .next()
         } else {
             None
@@ -685,7 +701,8 @@ impl VcfReader {
         // Parse FORMAT to find GT position and optionally GL position
         // Avoid Vec allocation by using position() directly on iterator
         let format = fields[8];
-        let gt_idx = format.split(':')
+        let gt_idx = format
+            .split(':')
             .position(|f| f == "GT")
             .ok_or_else(|| ReagleError::parse(line_num, "No GT field in FORMAT"))?;
         let gl_idx = format.split(':').position(|f| f == "GL");
@@ -756,7 +773,8 @@ impl VcfReader {
             // Parse GL field if present and compute confidence
             if let Some(gl_i) = gl_idx {
                 if let Some(conf_vec) = confidences.as_mut() {
-                    let confidence = sample_field.split(':')
+                    let confidence = sample_field
+                        .split(':')
                         .nth(gl_i)
                         .and_then(|gl_str| compute_gl_confidence(gl_str, a1, a2))
                         .unwrap_or(255); // Default to full confidence if GL missing/unparseable
@@ -776,13 +794,11 @@ impl VcfReader {
     /// with accurate ploidy information detected during parsing.
     pub fn finalize_samples(&mut self) {
         if let Some(ref ploidy) = self.sample_ploidy {
-            let sample_ids: Vec<String> = self.samples.ids().iter()
-                .map(|s| s.to_string())
-                .collect();
+            let sample_ids: Vec<String> =
+                self.samples.ids().iter().map(|s| s.to_string()).collect();
             self.samples = Arc::new(Samples::from_ids_with_ploidy(sample_ids, ploidy.clone()));
         }
     }
-
 }
 
 /// Parse a genotype field (e.g., "0|1", "0/1", ".")
@@ -952,19 +968,17 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     // C = 255 * (2W - 1)
     //
     // Proof of optimality:
-    // This formulation is optimal because it creates a mathematically exact alignment 
-    // between the data likelihoods and the HMM's internal state. It replaces 
-    // the previous heuristic curve-fit with a principled Bayesian mapping, ensuring 
+    // This formulation is optimal because it creates a mathematically exact alignment
+    // between the data likelihoods and the HMM's internal state. It replaces
+    // the previous heuristic curve-fit with a principled Bayesian mapping, ensuring
     // that a genotype with probability W is weighted correctly relative to the
     // transition priors in the HMM.
 
     // 1. Compute true posterior W using softmax (with max subtraction for stability)
     // W = 10^(GL_call - GL_max) / sum(10^(GL_i - GL_max))
-    
+
     let numerator = 10.0f64.powf(called_gl - max_gl);
-    let denominator: f64 = gls.iter()
-        .map(|&gl| 10.0f64.powf(gl - max_gl))
-        .sum();
+    let denominator: f64 = gls.iter().map(|&gl| 10.0f64.powf(gl - max_gl)).sum();
 
     if denominator <= 0.0 {
         return None;
@@ -1008,9 +1022,8 @@ impl VcfWriter {
 
     /// Write VCF header for phased output
     pub fn write_header(&mut self, markers: &Markers) -> Result<()> {
-        info_span!("vcf_write_header").in_scope(|| {
-        self.write_header_extended(markers, false, false, false)
-        })
+        info_span!("vcf_write_header")
+            .in_scope(|| self.write_header_extended(markers, false, false, false))
     }
 
     /// Write VCF header with optional GP/AP fields
@@ -1100,39 +1113,39 @@ impl VcfWriter {
         end_marker: usize,
     ) -> Result<()> {
         info_span!("vcf_write_phased", n_markers = end_marker - start_marker).in_scope(|| {
-        for m in start_marker..end_marker {
-            let marker_idx = MarkerIdx::new(m as u32);
-            let marker = matrix.marker(marker_idx);
-            let column = matrix.column(marker_idx);
+            for m in start_marker..end_marker {
+                let marker_idx = MarkerIdx::new(m as u32);
+                let marker = matrix.marker(marker_idx);
+                let column = matrix.column(marker_idx);
 
-            // Write fixed fields
-            write!(
-                self.writer,
-                "{}\t{}\t{}\t{}\t{}\t.\tPASS\t.\tGT",
-                matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
-                marker.pos,
-                marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
-                marker.ref_allele,
-                marker
-                    .alt_alleles
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )?;
+                // Write fixed fields
+                write!(
+                    self.writer,
+                    "{}\t{}\t{}\t{}\t{}\t.\tPASS\t.\tGT",
+                    matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
+                    marker.pos,
+                    marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
+                    marker.ref_allele,
+                    marker
+                        .alt_alleles
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )?;
 
-            // Write genotypes
-            for s in 0..self.samples.len() {
-                let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
-                let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
-                let a1 = column.get(hap1);
-                let a2 = column.get(hap2);
-                write!(self.writer, "\t{}|{}", a1, a2)?;
+                // Write genotypes
+                for s in 0..self.samples.len() {
+                    let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
+                    let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
+                    let a1 = column.get(hap1);
+                    let a2 = column.get(hap2);
+                    write!(self.writer, "\t{}|{}", a1, a2)?;
+                }
+                writeln!(self.writer)?;
             }
-            writeln!(self.writer)?;
-        }
 
-        Ok(())
+            Ok(())
         })
     }
 
@@ -1157,15 +1170,26 @@ impl VcfWriter {
         S: PhaseState,
         F: Fn(usize, usize) -> f32,
         B: Fn(usize, usize) -> (u8, u8),
-        G: Fn(usize, usize) -> (crate::pipelines::imputation::AllelePosteriors, crate::pipelines::imputation::AllelePosteriors),
+        G: Fn(
+            usize,
+            usize,
+        ) -> (
+            crate::pipelines::imputation::AllelePosteriors,
+            crate::pipelines::imputation::AllelePosteriors,
+        ),
     {
         let n_samples = self.samples.len();
 
         // Pre-compute format string (same for all markers)
         let format_str = {
             let mut parts = vec!["GT", "DS"];
-            if include_gp { parts.push("GP"); }
-            if include_ap { parts.push("AP1"); parts.push("AP2"); }
+            if include_gp {
+                parts.push("GP");
+            }
+            if include_ap {
+                parts.push("AP1");
+                parts.push("AP2");
+            }
             parts.join(":")
         };
 
@@ -1206,40 +1230,64 @@ impl VcfWriter {
                 if n_alleles > 1 {
                     info_str.push_str("DR2=");
                     for a in 1..n_alleles {
-                        if a > 1 { info_str.push(','); }
+                        if a > 1 {
+                            info_str.push(',');
+                        }
                         let v = format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf);
                         info_str.push_str(&v);
                     }
                     info_str.push_str(";AF=");
                     for a in 1..n_alleles {
-                        if a > 1 { info_str.push(','); }
+                        if a > 1 {
+                            info_str.push(',');
+                        }
                         let v = format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf);
                         info_str.push_str(&v);
                     }
                 }
                 if stats.is_imputed {
-                    if !info_str.is_empty() { info_str.push(';'); }
+                    if !info_str.is_empty() {
+                        info_str.push(';');
+                    }
                     info_str.push_str("IMP");
                 }
-                if info_str.is_empty() { ".".to_string() } else { info_str }
-            } else { ".".to_string() };
+                if info_str.is_empty() {
+                    ".".to_string()
+                } else {
+                    info_str
+                }
+            } else {
+                ".".to_string()
+            };
 
             // Write fixed fields using line buffer
             use std::fmt::Write;
-            write!(line_buf, "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
+            write!(
+                line_buf,
+                "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
                 matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
                 marker.pos,
                 marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
                 marker.ref_allele,
-                marker.alt_alleles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","),
-                info_field, format_str).unwrap();
+                marker
+                    .alt_alleles
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                info_field,
+                format_str
+            )
+            .unwrap();
 
             for s in 0..n_samples {
                 let ds = get_dosage(m, s);
                 let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
                 let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
                     (p1.max_allele(), p2.max_allele())
-                } else { get_best_gt(m, s) };
+                } else {
+                    get_best_gt(m, s)
+                };
 
                 // Format: \t{a1}|{a2}:{ds}
                 line_buf.push('\t');
@@ -1276,10 +1324,15 @@ impl VcfWriter {
                         let mut first = true;
                         for i2 in 0..n_alleles {
                             for i1 in 0..=i2 {
-                                if !first { line_buf.push(','); }
+                                if !first {
+                                    line_buf.push(',');
+                                }
                                 first = false;
-                                let prob = if i1 == i2 { p1.prob(i1) * p2.prob(i2) }
-                                    else { p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1) };
+                                let prob = if i1 == i2 {
+                                    p1.prob(i1) * p2.prob(i2)
+                                } else {
+                                    p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1)
+                                };
                                 let v = format_f32_4dp(prob, &mut ryu_buf);
                                 line_buf.push_str(&v);
                             }
@@ -1288,7 +1341,9 @@ impl VcfWriter {
                         // n_alleles * (n_alleles + 1) / 2 zeros
                         let n_gp = n_alleles * (n_alleles + 1) / 2;
                         for i in 0..n_gp {
-                            if i > 0 { line_buf.push(','); }
+                            if i > 0 {
+                                line_buf.push(',');
+                            }
                             line_buf.push_str("0.00");
                         }
                     }
@@ -1298,28 +1353,40 @@ impl VcfWriter {
                     if let Some((ref p1, ref p2)) = posteriors {
                         line_buf.push(':');
                         for a in 1..n_alleles {
-                            if a > 1 { line_buf.push(','); }
+                            if a > 1 {
+                                line_buf.push(',');
+                            }
                             let v = format_f32_4dp(p1.prob(a), &mut ryu_buf);
                             line_buf.push_str(&v);
                         }
-                        if n_alleles <= 1 { line_buf.push_str("0.00"); }
+                        if n_alleles <= 1 {
+                            line_buf.push_str("0.00");
+                        }
                         line_buf.push(':');
                         for a in 1..n_alleles {
-                            if a > 1 { line_buf.push(','); }
+                            if a > 1 {
+                                line_buf.push(',');
+                            }
                             let v = format_f32_4dp(p2.prob(a), &mut ryu_buf);
                             line_buf.push_str(&v);
                         }
-                        if n_alleles <= 1 { line_buf.push_str("0.00"); }
+                        if n_alleles <= 1 {
+                            line_buf.push_str("0.00");
+                        }
                     } else {
                         let n_ap = n_alleles.saturating_sub(1).max(1);
                         line_buf.push(':');
                         for i in 0..n_ap {
-                            if i > 0 { line_buf.push(','); }
+                            if i > 0 {
+                                line_buf.push(',');
+                            }
                             line_buf.push_str("0.00");
                         }
                         line_buf.push(':');
                         for i in 0..n_ap {
-                            if i > 0 { line_buf.push(','); }
+                            if i > 0 {
+                                line_buf.push(',');
+                            }
                             line_buf.push_str("0.00");
                         }
                     }
@@ -1350,8 +1417,6 @@ impl Drop for VcfWriter {
         let _ = self.flush();
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

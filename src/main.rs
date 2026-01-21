@@ -38,15 +38,15 @@ fn main() {
 
 /// Initialize tracing subscriber for hierarchical profiling output
 fn init_profiling() {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
     use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     tracing_subscriber::registry()
         .with(
             fmt::layer()
                 .with_span_events(FmtSpan::CLOSE)
                 .with_target(false)
-                .with_timer(fmt::time::uptime())
+                .with_timer(fmt::time::uptime()),
         )
         .init();
 }
@@ -75,10 +75,7 @@ fn run() -> Result<()> {
 
     // Initialize telemetry blackboard and heartbeat thread
     let telemetry = TelemetryBlackboard::new();
-    let heartbeat = HeartbeatHandle::spawn(
-        telemetry.clone(),
-        HeartbeatConfig::default(),
-    );
+    let heartbeat = HeartbeatHandle::spawn(telemetry.clone(), HeartbeatConfig::default());
 
     telemetry.set_stage(Stage::LoadingData);
 
