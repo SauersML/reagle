@@ -168,7 +168,7 @@ impl ClusterStateProbs {
                 let prob_p1 = probs_p1[j];
                 let fa = prob * decay_a + noise_a;
                 let fb = prob_p1 * decay_b + noise_b;
-                let p = fa * fb;
+                let p = (fa * fb).sqrt();
                 out_probs.push(p.max(0.0));
             }
         }
@@ -266,26 +266,19 @@ impl ClusterStateProbs {
                     } else {
                         let missing_mass = self.missing_mass(haps.len(), noise_a, noise_b);
                         let base_freq = self.base_allele_freqs(column, 2, map_ref_to_targ);
-                        for seq_idx in 0..cache.seq_probs.len() {
-                            let count = cache.seq_counts[seq_idx] as f32;
-                            if count == 0.0 {
-                                continue;
-                            }
-                            let sum_a = cache.seq_probs[seq_idx];
-                            let sum_b = cache.seq_probs_p1[seq_idx];
-                            let sum_ab = cache.seq_probs_ab[seq_idx];
-                            let group_mass = decay_a * decay_b * sum_ab
-                                + decay_a * noise_b * sum_a
-                                + decay_b * noise_a * sum_b
-                                + noise_a * noise_b * count;
-                            if group_mass == 0.0 {
-                                continue;
-                            }
-                            let allele = map_allele(map_ref_to_targ, seq_alleles[seq_idx]);
-                            if allele == 1 {
-                                p_alt += group_mass;
-                            } else if allele == 0 {
-                                p_ref += group_mass;
+                        for (j, &hap) in haps.iter().enumerate() {
+                            let idx = hap as usize;
+                            if idx < hap_to_seq.len() {
+                                let seq_idx = hap_to_seq[idx] as usize;
+                                let allele = map_allele(map_ref_to_targ, seq_alleles[seq_idx]);
+                                let fa = probs[j] * decay_a + noise_a;
+                                let fb = probs_p1[j] * decay_b + noise_b;
+                                let p = (fa * fb).sqrt();
+                                if allele == 1 {
+                                    p_alt += p;
+                                } else if allele == 0 {
+                                    p_ref += p;
+                                }
                             }
                         }
                         p_alt += missing_mass * base_freq[1];
@@ -309,24 +302,17 @@ impl ClusterStateProbs {
                     } else {
                         let missing_mass = self.missing_mass(haps.len(), noise_a, noise_b);
                         let base_freq = self.base_allele_freqs(column, n_alleles, map_ref_to_targ);
-                        for seq_idx in 0..cache.seq_probs.len() {
-                            let count = cache.seq_counts[seq_idx] as f32;
-                            if count == 0.0 {
-                                continue;
-                            }
-                            let sum_a = cache.seq_probs[seq_idx];
-                            let sum_b = cache.seq_probs_p1[seq_idx];
-                            let sum_ab = cache.seq_probs_ab[seq_idx];
-                            let group_mass = decay_a * decay_b * sum_ab
-                                + decay_a * noise_b * sum_a
-                                + decay_b * noise_a * sum_b
-                                + noise_a * noise_b * count;
-                            if group_mass == 0.0 {
-                                continue;
-                            }
-                            let allele = map_allele(map_ref_to_targ, seq_alleles[seq_idx]);
-                            if allele != 255 && (allele as usize) < n_alleles {
-                                al_probs[allele as usize] += group_mass;
+                        for (j, &hap) in haps.iter().enumerate() {
+                            let idx = hap as usize;
+                            if idx < hap_to_seq.len() {
+                                let seq_idx = hap_to_seq[idx] as usize;
+                                let allele = map_allele(map_ref_to_targ, seq_alleles[seq_idx]);
+                                let fa = probs[j] * decay_a + noise_a;
+                                let fb = probs_p1[j] * decay_b + noise_b;
+                                let p = (fa * fb).sqrt();
+                                if allele != 255 && (allele as usize) < n_alleles {
+                                    al_probs[allele as usize] += p;
+                                }
                             }
                         }
                         for i in 0..n_alleles {
@@ -389,27 +375,22 @@ impl ClusterStateProbs {
                     } else {
                         let missing_mass = self.missing_mass(haps.len(), noise_a, noise_b);
                         let base_freq = self.base_allele_freqs(column, 2, map_ref_to_targ);
-                        for pat_idx in 0..n_patterns {
-                            let count = cache.dict_counts[pat_idx] as f32;
-                            if count == 0.0 {
-                                continue;
-                            }
-                            let sum_a = cache.dict_probs[pat_idx];
-                            let sum_b = cache.dict_probs_p1[pat_idx];
-                            let sum_ab = cache.dict_probs_ab[pat_idx];
-                            let group_mass = decay_a * decay_b * sum_ab
-                                + decay_a * noise_b * sum_a
-                                + decay_b * noise_a * sum_b
-                                + noise_a * noise_b * count;
-                            if group_mass == 0.0 {
-                                continue;
-                            }
-                            let allele =
-                                map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
-                            if allele == 1 {
-                                p_alt += group_mass;
-                            } else if allele == 0 {
-                                p_ref += group_mass;
+                        for (j, &hap) in haps.iter().enumerate() {
+                            let idx = hap as usize;
+                            if idx < hap_to_pattern.len() {
+                                let pat_idx = hap_to_pattern[idx] as usize;
+                                let allele = map_allele(
+                                    map_ref_to_targ,
+                                    col.pattern_allele(*offset, pat_idx),
+                                );
+                                let fa = probs[j] * decay_a + noise_a;
+                                let fb = probs_p1[j] * decay_b + noise_b;
+                                let p = (fa * fb).sqrt();
+                                if allele == 1 {
+                                    p_alt += p;
+                                } else if allele == 0 {
+                                    p_ref += p;
+                                }
                             }
                         }
                         p_alt += missing_mass * base_freq[1];
@@ -434,25 +415,20 @@ impl ClusterStateProbs {
                     } else {
                         let missing_mass = self.missing_mass(haps.len(), noise_a, noise_b);
                         let base_freq = self.base_allele_freqs(column, n_alleles, map_ref_to_targ);
-                        for pat_idx in 0..n_patterns {
-                            let count = cache.dict_counts[pat_idx] as f32;
-                            if count == 0.0 {
-                                continue;
-                            }
-                            let sum_a = cache.dict_probs[pat_idx];
-                            let sum_b = cache.dict_probs_p1[pat_idx];
-                            let sum_ab = cache.dict_probs_ab[pat_idx];
-                            let group_mass = decay_a * decay_b * sum_ab
-                                + decay_a * noise_b * sum_a
-                                + decay_b * noise_a * sum_b
-                                + noise_a * noise_b * count;
-                            if group_mass == 0.0 {
-                                continue;
-                            }
-                            let allele =
-                                map_allele(map_ref_to_targ, col.pattern_allele(*offset, pat_idx));
-                            if allele != 255 && (allele as usize) < n_alleles {
-                                al_probs[allele as usize] += group_mass;
+                        for (j, &hap) in haps.iter().enumerate() {
+                            let idx = hap as usize;
+                            if idx < hap_to_pattern.len() {
+                                let pat_idx = hap_to_pattern[idx] as usize;
+                                let allele = map_allele(
+                                    map_ref_to_targ,
+                                    col.pattern_allele(*offset, pat_idx),
+                                );
+                                let fa = probs[j] * decay_a + noise_a;
+                                let fb = probs_p1[j] * decay_b + noise_b;
+                                let p = (fa * fb).sqrt();
+                                if allele != 255 && (allele as usize) < n_alleles {
+                                    al_probs[allele as usize] += p;
+                                }
                             }
                         }
                         for i in 0..n_alleles {
@@ -507,7 +483,7 @@ impl ClusterStateProbs {
                             let allele = map_allele(map_ref_to_targ, col.get(HapIdx::new(hap)));
                             let fa = probs[j] * decay_a + noise_a;
                             let fb = probs_p1[j] * decay_b + noise_b;
-                            let p = fa * fb;
+                            let p = (fa * fb).sqrt();
                             if allele != 255 && (allele as usize) < n_alleles {
                                 al_probs[allele as usize] += p;
                             }
@@ -564,7 +540,7 @@ impl ClusterStateProbs {
                             let allele = map_allele(map_ref_to_targ, col.get(HapIdx::new(hap)));
                             let fa = probs[j] * decay_a + noise_a;
                             let fb = probs_p1[j] * decay_b + noise_b;
-                            let p = fa * fb;
+                            let p = (fa * fb).sqrt();
                             if allele != 255 && (allele as usize) < n_alleles {
                                 al_probs[allele as usize] += p;
                             }
@@ -656,7 +632,7 @@ impl ClusterStateProbs {
             0.0
         } else {
             let missing = (self.n_states - listed) as f32;
-            missing * noise_a * noise_b
+            missing * (noise_a * noise_b).sqrt()
         }
     }
 
@@ -732,7 +708,7 @@ impl ClusterStateProbs {
                 } else {
                     let fa = prob * decay_a + noise_a;
                     let fb = probs_p1[idx + lane] * decay_b + noise_b;
-                    fa * fb
+                    (fa * fb).sqrt()
                 };
                 p_arr[lane] = p;
                 if allele == 1 {
@@ -756,7 +732,7 @@ impl ClusterStateProbs {
             } else {
                 let fa = prob * decay_a + noise_a;
                 let fb = probs_p1[j] * decay_b + noise_b;
-                fa * fb
+                (fa * fb).sqrt()
             };
             if allele == 1 {
                 p_alt += p;
