@@ -404,19 +404,13 @@ fn get_vm_usage_mb() -> (Option<u64>, Option<u64>) {
 }
 
 /// Get process CPU time (user+system) in clock ticks (Linux only)
+#[cfg(target_os = "linux")]
 fn get_cpu_ticks() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let content = std::fs::read_to_string("/proc/self/stat").ok()?;
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        let utime = parts.get(13)?.parse::<u64>().ok()?;
-        let stime = parts.get(14)?.parse::<u64>().ok()?;
-        Some(utime + stime)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    let content = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    let utime = parts.get(13)?.parse::<u64>().ok()?;
+    let stime = parts.get(14)?.parse::<u64>().ok()?;
+    Some(utime + stime)
 }
 
 /// Format duration in human-readable form
@@ -488,7 +482,7 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
     #[cfg(target_os = "linux")]
     let mut last_cpu_ticks = get_cpu_ticks();
     #[cfg(not(target_os = "linux"))]
-    let mut last_cpu_ticks: Option<u64> = None;
+    let last_cpu_ticks: Option<u64> = None;
     #[cfg(not(target_os = "linux"))]
     let _ = &last_cpu_ticks;
 

@@ -20,6 +20,7 @@ pub mod storage;
 pub use haplotype::{HapIdx, SampleIdx};
 pub use marker::MarkerIdx;
 
+
 use serde::{Deserialize, Serialize};
 
 /// Chromosome identifier (0-based index into chromosome name table)

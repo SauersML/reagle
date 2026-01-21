@@ -585,6 +585,32 @@ impl ClusterStateProbs {
         }
     }
 
+    /// Compute allele posteriors in REFERENCE space (for VCF output).
+    ///
+    /// This is the type-safe version that guarantees output is in Reference encoding.
+    /// No allele remapping is applied - probabilities directly reflect Reference allele indices.
+    /// Use this for all output paths (VCF writing, dosage calculation).
+    ///
+    /// # Arguments
+    /// * `ref_marker` - Reference marker index
+    /// * `n_alleles` - Number of alleles at this marker
+    /// * `column` - Reference genotype column (already in Reference encoding)
+    /// * `cache` - Posterior cache for efficiency
+    ///
+    /// # Returns
+    /// AllelePosteriors where index 0 = P(Ref REF), index 1 = P(Ref ALT), etc.
+    #[inline]
+    pub fn ref_posteriors_for_column_cached(
+        &self,
+        ref_marker: usize,
+        n_alleles: usize,
+        column: &GenotypeColumn,
+        cache: &mut AllelePosteriorCache,
+    ) -> AllelePosteriors {
+        // Call the base implementation with no mapping - stays in Reference space
+        self.allele_posteriors_for_column_cached(ref_marker, n_alleles, column, None, cache)
+    }
+
     #[inline]
     fn bridge_terms(&self, ref_marker: usize) -> (usize, bool, f32, f32, f32, f32) {
         let cluster = *self.marker_cluster.get(ref_marker).unwrap_or(&0);

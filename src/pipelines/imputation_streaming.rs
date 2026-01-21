@@ -1197,21 +1197,10 @@ target_samples={} target_bytes={}",
                 gen_maps.gen_pos(chrom, pos)
             })
             .collect();
-        let ref_marker_maps: Vec<Option<Vec<i8>>> = (0..n_ref_markers)
-            .map(|ref_m| {
-                alignment.target_marker(ref_m).and_then(|target_m| {
-                    alignment
-                        .allele_mappings
-                        .get(target_m)
-                        .and_then(|m| m.as_ref())
-                        .map(|m| m.ref_to_targ.clone())
-                })
-            })
-            .collect();
         // Memory Optimization: We removed the massive ref_alt_mask/ref_missing_mask allocation (approx 350MB).
-        // Instead, we will use the polymorphic `allele_posteriors_for_column_cached` for all markers,
-        // which leverages the compressed storage (BREF3/Bit-packed) directly.
-        // The `ref_alt_freq` calculation is also skipped as it was only used for the biallelic path.
+        // The `allele_posteriors_for_column_cached` leverages compressed storage (BREF3/Bit-packed) directly.
+        // Note: The ref_marker_maps that was previously here is no longer needed because output
+        // uses Reference-space posteriors directly (no allele remapping for VCF output).
 
         let genotyped_markers: Vec<usize> = alignment
             .ref_to_target
@@ -1555,19 +1544,20 @@ target_samples={} target_bytes={}",
 
                             let (p1, p2, post1_opt, post2_opt) = {
                                 let column = ref_win.column(MarkerIdx::new(marker_idx as u32));
-                                let map_ref_to_targ = ref_marker_maps[marker_idx].as_deref();
-                                let post1 = hap1_probs.allele_posteriors_for_column_cached(
+                                // Use Reference-space posteriors for output.
+                                // The VCF uses Reference allele definitions, so DS must be
+                                // P(Ref ALT). The mapping is only needed when comparing
+                                // against target genotypes (in the locking section above).
+                                let post1 = hap1_probs.ref_posteriors_for_column_cached(
                                     marker_idx,
                                     n_alleles,
                                     column,
-                                    map_ref_to_targ,
                                     &mut cache1,
                                 );
-                                let post2 = hap2_probs.allele_posteriors_for_column_cached(
+                                let post2 = hap2_probs.ref_posteriors_for_column_cached(
                                     marker_idx,
                                     n_alleles,
                                     column,
-                                    map_ref_to_targ,
                                     &mut cache2,
                                 );
                                 let p1 = post1.prob(1);
