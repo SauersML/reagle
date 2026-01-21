@@ -397,6 +397,98 @@ def calculate_dosage(gt):
     return gt[0] + gt[1]
 
 
+def _parse_ds_field(ds_str):
+    """Parse DS which may be a single float (biallelic) or comma-separated list (multiallelic).
+
+    Returns a single float representing total non-reference dosage.
+    """
+    if ds_str is None or ds_str == ".":
+        return None
+    try:
+        if "," in ds_str:
+            parts = [p for p in ds_str.split(",") if p and p != "."]
+            vals = [float(p) for p in parts]
+            return float(sum(vals))
+        return float(ds_str)
+    except Exception:
+        return None
+
+
+def _gt_nonref_dosage(gt):
+    """Total non-reference dosage for diploid GT (counts alleles != 0)."""
+    if gt is None:
+        return None
+    a0, a1 = gt
+    if a0 is None or a1 is None:
+        return None
+    if a0 == 255 or a1 == 255:
+        return None
+    return float((1 if a0 != 0 else 0) + (1 if a1 != 0 else 0))
+
+
+def _gt_class_nonref(gt):
+    """3-class genotype class in a non-ref sense (works for biallelic and multiallelic).
+
+    0 = homref (0/0)
+    1 = het (one ref, one non-ref)
+    2 = hom-nonref (both alleles non-ref, possibly different)
+    """
+    if gt is None:
+        return None
+    a0, a1 = gt
+    if a0 == 255 or a1 == 255:
+        return None
+    if a0 == 0 and a1 == 0:
+        return 0
+    if a0 != 0 and a1 != 0:
+        return 2
+    return 1
+
+
+def _split_alleles(ref, alt_str):
+    alts = []
+    if alt_str and alt_str != ".":
+        alts = str(alt_str).split(",")
+    return [str(ref)] + [a for a in alts if a]
+
+
+def _normalize_imputed_to_truth_multiallelic(t_ref, t_alt, i_ref, i_alt, i_gt, i_dos, i_gp):
+    """Normalize imputed alleles into truth allele order for multi-allelic sites.
+
+    We only handle allele *re-ordering* (same allele set). No strand/complement logic.
+    We return a normalized GT and a normalized total non-ref dosage.
+    """
+    t_alleles = _split_alleles(t_ref, t_alt)
+    i_alleles = _split_alleles(i_ref, i_alt)
+
+    if set(t_alleles) != set(i_alleles):
+        return False, i_gt, i_dos, i_gp
+
+    # Map imputed allele index -> truth allele index by nucleotide string.
+    imputed_to_truth = {}
+    for i_idx, base in enumerate(i_alleles):
+        try:
+            t_idx = t_alleles.index(base)
+        except ValueError:
+            return False, i_gt, i_dos, i_gp
+        imputed_to_truth[i_idx] = t_idx
+
+    # Remap GT allele indices.
+    if i_gt is not None:
+        a0, a1 = i_gt
+        if a0 in imputed_to_truth and a1 in imputed_to_truth:
+            i_gt = (imputed_to_truth[a0], imputed_to_truth[a1])
+        else:
+            return False, i_gt, i_dos, i_gp
+
+    # Normalize DS: for multiallelic, treat DS as total non-ref dosage (sum over ALTs).
+    # If DS was a list, summing is already allele-order invariant.
+    # If DS was scalar (some tools), keep as-is.
+    # Also disable GP usage for multiallelic in our current harness.
+    i_gp = None
+    return True, i_gt, i_dos, i_gp
+
+
 def _normalize_imputed_to_truth_alleles(t_ref, t_alt, i_ref, i_alt, i_gt, i_dos, i_gp):
     """Normalize imputed GT/DS/GP into the truth REF/ALT orientation for biallelic sites.
 
@@ -466,7 +558,11 @@ def _parse_truth_line(line, samples):
             gt_field = gt_str.split(':')[0]
             gt = parse_genotype(gt_field)
             is_phased = '|' in gt_field
-            sample_data[samples[i]] = (gt, calculate_dosage(gt) if gt is not None else None, is_phased)
+            sample_data[samples[i]] = (
+                gt,
+                _gt_nonref_dosage(gt) if gt is not None else None,
+                is_phased,
+            )
     return key, sample_data, is_multiallelic
 
 
@@ -492,12 +588,9 @@ def _parse_imputed_line(line, samples):
             ds = None
             gp = None
             
-            # Parse DS (Estimated Dosage)
+            # Parse DS (Estimated Dosage) - may be multiallelic (comma-separated)
             if len(fields) > 1 and fields[1] != '.':
-                try:
-                    ds = float(fields[1])
-                except ValueError:
-                    pass
+                ds = _parse_ds_field(fields[1])
             
             # Parse GP (Genotype Probabilities)
             if len(fields) > 2 and fields[2] != '.':
@@ -508,9 +601,9 @@ def _parse_imputed_line(line, samples):
                 except:
                     pass
             
-            # Fallback to hard-call dosage if DS missing
+            # Fallback to hard-call nonref dosage if DS missing
             if ds is None and gt is not None:
-                ds = calculate_dosage(gt)
+                ds = _gt_nonref_dosage(gt)
 
             sample_data[samples[i]] = (gt, ds, is_phased, gp)
     return key, sample_data, is_multiallelic
@@ -739,6 +832,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     ref_alt_mismatch_examples = 0
     ref_alt_swapped_examples = 0
     multiallelic_sites = 0
+    multiallelic_reordered_ok = 0
+    multiallelic_mismatch = 0
 
     # For N50 Phasing Block Length
     # sample -> list of block lengths (in bp)
@@ -853,17 +948,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     print("Streaming and comparing...")
     
     # Merge-join loop
-    def is_biallelic_gt(gt):
-        return gt is not None and all(a in (0, 1) for a in gt)
-
     def gt_class(gt):
-        if not is_biallelic_gt(gt):
-            return None
-        if gt[0] == 0 and gt[1] == 0:
-            return 0
-        if gt[0] == 1 and gt[1] == 1:
-            return 2
-        return 1
+        return _gt_class_nonref(gt)
 
     def mask_pick(chrom, pos, maf_bin):
         if input_sites is None:
@@ -893,6 +979,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                 truth_site = truth_data
                 imputed_site = imp_data
                 swapped_site = False
+                multiallelic_reordered = False
                 if t_ref != i_ref or t_alt != i_alt:
                     # Try to handle biallelic REF/ALT swaps instead of discarding the site.
                     if ("," not in str(t_alt)) and ("," not in str(i_alt)) and (t_ref == i_alt and t_alt == i_ref):
@@ -904,26 +991,42 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                                 f"[ALLELE SWAP] {t_chrom}:{t_pos} truth {t_ref}>{t_alt} imputed {i_ref}>{i_alt}"
                             )
                     else:
-                        ref_alt_mismatch += 1
-                        if ref_alt_mismatch_examples < 5:
-                            ref_alt_mismatch_examples += 1
-                            print(
-                                f"[ALLELE MISMATCH] {t_chrom}:{t_pos} truth {t_ref}>{t_alt} imputed {i_ref}>{i_alt}"
-                            )
-                        truth_key, truth_data, truth_multiallelic = get_next_truth()
-                        imp_key, imp_data, imp_multiallelic = get_next_imputed()
-                        continue
+                        # If multi-allelic, try to allow allele re-ordering (same allele set).
+                        t_is_multi = "," in str(t_alt)
+                        i_is_multi = "," in str(i_alt)
+                        if t_is_multi or i_is_multi:
+                            t_alleles = _split_alleles(t_ref, t_alt)
+                            i_alleles = _split_alleles(i_ref, i_alt)
+                            if set(t_alleles) == set(i_alleles):
+                                multiallelic_reordered = True
+                            else:
+                                multiallelic_mismatch += 1
+                                if ref_alt_mismatch_examples < 5:
+                                    ref_alt_mismatch_examples += 1
+                                    print(
+                                        f"[MULTIALLELIC MISMATCH] {t_chrom}:{t_pos} truth {t_ref}>{t_alt} imputed {i_ref}>{i_alt}"
+                                    )
+                                truth_key, truth_data, truth_multiallelic = get_next_truth()
+                                imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                                continue
+                        else:
+                            ref_alt_mismatch += 1
+                            if ref_alt_mismatch_examples < 5:
+                                ref_alt_mismatch_examples += 1
+                                print(
+                                    f"[ALLELE MISMATCH] {t_chrom}:{t_pos} truth {t_ref}>{t_alt} imputed {i_ref}>{i_alt}"
+                                )
+                            truth_key, truth_data, truth_multiallelic = get_next_truth()
+                            imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                            continue
                 if truth_multiallelic or imp_multiallelic:
                     multiallelic_sites += 1
-                    truth_key, truth_data, truth_multiallelic = get_next_truth()
-                    imp_key, imp_data, imp_multiallelic = get_next_imputed()
-                    continue
                 common_sites_count += 1
                 is_input_site = input_sites is not None and truth_key in input_sites
 
                 # --- METRICS CALCULATION LOGIC (same as before) ---
                 
-                # Calculate MAF from truth
+                # Calculate non-ref AF/MAF from truth (works for biallelic and multiallelic)
                 alt_count = 0
                 allele_count = 0
                 for sample in common_samples_list:
@@ -931,8 +1034,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                     if t_entry is None:
                         continue
                     t_gt = t_entry[0]
-                    if is_biallelic_gt(t_gt):
-                        alt_count += t_gt[0] + t_gt[1]
+                    if t_gt is not None and t_gt[0] != 255 and t_gt[1] != 255:
+                        alt_count += (1 if t_gt[0] != 0 else 0) + (1 if t_gt[1] != 0 else 0)
                         allele_count += 2
                 if allele_count > 0:
                     af = alt_count / allele_count
@@ -956,6 +1059,13 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                             t_ref, t_alt, i_ref, i_alt, i_gt, i_dos, i_gp
                         )
 
+                    if multiallelic_reordered:
+                        ok, i_gt, i_dos, i_gp = _normalize_imputed_to_truth_multiallelic(
+                            t_ref, t_alt, i_ref, i_alt, i_gt, i_dos, i_gp
+                        )
+                        if ok:
+                            multiallelic_reordered_ok += 1
+
                     if t_gt is None:
                         missing_truth += 1
                     if i_gt is None:
@@ -972,13 +1082,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                     if i_class is None and i_gt is not None:
                         continue
 
-                    # Hellinger score
-                    if i_gp is not None and t_class is not None:
+                    # Hellinger score (biallelic only in this harness)
+                    if i_gp is not None and t_class is not None and len(i_gp) == 3:
                         t_gp = (1.0, 0.0, 0.0) if t_class == 0 else ((0.0, 1.0, 0.0) if t_class == 1 else (0.0, 0.0, 1.0))
                         bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
                         hellinger_dist = math.sqrt(max(0, 1 - bc))
-                        h_score = 1 - hellinger_dist
-                        hellinger_sum += h_score
+                        hellinger_sum += hellinger_dist
                         hellinger_count += 1
 
                     total_compared += 1
