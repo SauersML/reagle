@@ -265,8 +265,7 @@ def main():
         "- You are encouraged to proactively search the web for Rust documentation.\n"
         "- DO NOT modify 'rust-toolchain.toml' if it exists - the Rust version may be pinned.\n"
         "- Focus ONLY on src/*.rs files and Cargo.toml for improvements.\n"
-        "- This is a port of BEAGLE (genotype phasing/imputation) to Rust.\n"
-        "- Reference the Java/ directory for the original implementation if needed.\n"
+        "- This is genotype phasing/imputation to Rust.\n"
         "- Always try to improve something--commit and finish. No further instruction will be given.\n"
         "- Run 'cargo check' and 'cargo test' to verify your changes compile.\n"
     )
@@ -286,7 +285,6 @@ def main():
         "- Commit and push frequently if code compiles, even with failing tests.\n"
         "- Correctness matters: this code affects real health outcomes via polygenic scores.\n"
         "- No 'for now' thinking. Do the proper fix, not a hack.\n"
-        "- Reference Java/ for correct behavior, but Rust can take better approaches.\n"
     )
 
     if conclusion == "success":
@@ -321,11 +319,9 @@ def main():
         )
     else:
         prompt = (
-            f"The Rust build failed to compile.\n"
+            f"The code needs some work.\n"
             f"Logs:\n\n{logs}\n\n"
-            "Fix the compilation errors. Reference Java/ if needed to understand intent. "
-            "This is a port of BEAGLE (genotype phasing/imputation) from Java to Rust. "
-            "Once it compiles, push to main even if tests fail - compilation is progress."
+            "This is genotype phasing/imputation in Rust. "
             + philosophy
             + version_restriction
         )
