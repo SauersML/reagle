@@ -939,7 +939,10 @@ pub fn compute_state_probs(
     let threshold = if n_clusters <= 1000 {
         0.0
     } else {
-        (0.9999f32 / n_states as f32).min(0.005f32)
+        // Use a fixed small threshold (matching Java Beagle's minProb = 1e-5)
+        // to prevent aggressive pruning of low-probability states.
+        // Previous dynamic threshold (1/N) was too aggressive and caused dosage decay.
+        1e-5f32
     };
 
     let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) = run_hmm_forward_backward_to_sparse(
