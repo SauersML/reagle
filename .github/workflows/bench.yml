@@ -1,14 +1,8 @@
 name: Benchmarks
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'README.md'
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - 'README.md'
+  schedule:
+    - cron: '0 */2 * * *'
   workflow_dispatch:
 
 env:
