@@ -30,7 +30,7 @@ use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::pl_emission::PlProvider;
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
-use crate::pipelines::imputation::{AllelePosteriorCache, AllelePosteriors};
+use crate::pipelines::imputation::AllelePosteriors;
 use crate::utils::workspace::ImpWorkspace;
 
 fn push_unique(dst: &mut Vec<String>, value: String) {
@@ -1417,7 +1417,6 @@ target_samples={} target_bytes={}",
                                 local_idx == 0,
                             );
 
-                            let mut posterior_cache = AllelePosteriorCache::default();
                             let mut locked = obs_hap1.clone();
                             for &ref_m in sample_genotyped {
                                 if let Some(target_m) = alignment.target_marker(ref_m) {
@@ -1437,7 +1436,6 @@ target_samples={} target_bytes={}",
                                         2,
                                         column,
                                         map_ref_to_targ,
-                                        &mut posterior_cache,
                                     );
                                     locked[target_m] = p.max_allele();
                                 }
@@ -1536,8 +1534,6 @@ target_samples={} target_bytes={}",
                         let mut hap1_posteriors = Vec::with_capacity(output_markers);
                         let mut hap2_posteriors = Vec::with_capacity(output_markers);
 
-                        let mut cache1 = AllelePosteriorCache::default();
-                        let mut cache2 = AllelePosteriorCache::default();
                         for marker_idx in output_start..output_end {
                             let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
                             let n_alleles = 1 + marker.alt_alleles.len();
@@ -1552,13 +1548,11 @@ target_samples={} target_bytes={}",
                                     marker_idx,
                                     n_alleles,
                                     column,
-                                    &mut cache1,
                                 );
                                 let post2 = hap2_probs.ref_posteriors_for_column_cached(
                                     marker_idx,
                                     n_alleles,
                                     column,
-                                    &mut cache2,
                                 );
                                 let p1 = post1.prob(1);
                                 let p2 = post2.prob(1);
