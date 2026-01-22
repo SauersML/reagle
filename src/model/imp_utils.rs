@@ -936,11 +936,7 @@ pub fn compute_state_probs(
         trace,
     );
 
-    let threshold = if n_clusters <= 1000 {
-        0.0
-    } else {
-        (0.9999f32 / n_states as f32).min(0.005f32)
-    };
+    let threshold = 1e-5;
 
     let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) = run_hmm_forward_backward_to_sparse(
         &workspace.diff_vals,
