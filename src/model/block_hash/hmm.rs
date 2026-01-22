@@ -7,8 +7,8 @@
 //! or compressed patterns. We compute emissions for unique patterns and call
 //! the existing `HmmUpdater` for vectorized updates.
 
-use super::micro_window_v2::MicroWindow;
-use super::transition_v2::TransitionBridge;
+use super::micro_window::MicroWindow;
+use super::transition::TransitionBridge;
 use super::types::PatternId;
 use crate::model::hmm::HmmUpdater;
 

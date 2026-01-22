@@ -8,7 +8,7 @@ use crate::data::marker::MarkerIdx;
 use crate::data::storage::dictionary::DictionaryColumn;
 use crate::data::storage::matrix::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
-use super::micro_window_v2::MicroWindow;
+use super::micro_window::MicroWindow;
 use std::ops::Range;
 use std::sync::Arc;
 
