@@ -447,6 +447,11 @@ fn emission_prob(
         // Pattern uses exact allele matching
         let ref_allele = block.get_pattern_allele(pattern_id, marker_in_window);
 
+        // Missing reference allele - neutral (1.0), not a mismatch
+        if ref_allele == 255 {
+            return 1.0;
+        }
+
         if target_allele == ref_allele {
             match_prob
         } else {

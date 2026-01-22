@@ -90,8 +90,15 @@ pub struct HaplotypePriors {
 }
 
 impl HaplotypePriors {
-    /// Create new priors with invariant enforcement (sorting)
+    /// Create new priors with invariant enforcement (validation, sorting, normalization)
     pub fn new(hap_ids: Vec<u32>, probs: Vec<f32>) -> Self {
+        // Length validation
+        assert_eq!(
+            hap_ids.len(),
+            probs.len(),
+            "HaplotypePriors: hap_ids and probs must have the same length"
+        );
+
         if hap_ids.is_empty() {
             return Self {
                 hap_ids: Vec::new(),
@@ -99,10 +106,37 @@ impl HaplotypePriors {
             };
         }
 
-        // enforce invariant: sorted by hap_id
+        // Validate probabilities
+        for &p in &probs {
+            assert!(
+                p.is_finite() && p >= 0.0,
+                "HaplotypePriors: all probabilities must be finite and non-negative"
+            );
+        }
+
+        // Sort by hap_id and check for duplicates
         let mut pairs: Vec<_> = hap_ids.into_iter().zip(probs).collect();
         pairs.sort_unstable_by_key(|(id, _)| *id);
-        let (ids, ps): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+
+        // Check for duplicate hap_ids
+        for i in 1..pairs.len() {
+            assert_ne!(
+                pairs[i - 1].0,
+                pairs[i].0,
+                "HaplotypePriors: duplicate haplotype ID {}",
+                pairs[i].0
+            );
+        }
+
+        let (ids, mut ps): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+
+        // Normalize to sum to 1.0
+        let sum: f32 = ps.iter().sum();
+        if sum > 0.0 {
+            for p in &mut ps {
+                *p /= sum;
+            }
+        }
 
         Self { hap_ids: ids, probs: ps }
     }

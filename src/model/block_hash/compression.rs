@@ -23,7 +23,8 @@ use std::sync::Arc;
 /// * `ref_data` - Reference panel genotype matrix
 /// * `marker_range` - Range of markers to include in this window
 /// * `max_states` - Maximum number of unique patterns to track (0 = no limit)
-/// * `recomb_rates` - Vector of recombination rates [marker_in_window]. Size should match marker_range.len().
+/// * `recomb_rates` - Vector of interval recombination rates. Length = marker_range.len() - 1.
+///                    Rate[i] is the recombination rate between marker i and i+1.
 ///
 /// # Returns
 /// CompressedBlock with only immutable reference data (no per-sample HMM state)
@@ -38,7 +39,12 @@ pub(crate) fn build_compressed_block(
     let n_markers = marker_range.len();
     let n_haplotypes = ref_data.n_haplotypes();
 
-    assert_eq!(recomb_rates.len(), n_markers, "Recombination rates must match window size");
+    // Recombination rates are per-interval: N markers have N-1 intervals between them
+    assert_eq!(
+        recomb_rates.len(),
+        n_markers.saturating_sub(1),
+        "Recombination rates must be interval rates (length = n_markers - 1)"
+    );
     let local_recomb_rates = recomb_rates.to_vec();
 
     // Build column access closures for DictionaryColumn::compress
@@ -62,15 +68,17 @@ pub(crate) fn build_compressed_block(
     
     for marker_idx in marker_range {
          let marker = MarkerIdx::new(marker_idx as u32);
-         let mut max_allele_at_marker = 0u8;
+         let mut alleles_seen = std::collections::HashSet::new();
          for hap_idx in 0..n_haplotypes {
              let allele = ref_data.allele(marker, HapIdx::new(hap_idx as u32));
              if allele != 255 {
-                 max_allele_at_marker = max_allele_at_marker.max(allele);
+                 alleles_seen.insert(allele);
              }
          }
+         let n_distinct = alleles_seen.len().max(1) as u8; // At least 1 to avoid division by zero
+         let max_allele_at_marker = *alleles_seen.iter().max().unwrap_or(&0);
          max_allele_overall = max_allele_overall.max(max_allele_at_marker);
-         marker_n_alleles.push(max_allele_at_marker + 1);
+         marker_n_alleles.push(n_distinct);
     }
     
     let bits_per_allele = if max_allele_overall < 2 {
