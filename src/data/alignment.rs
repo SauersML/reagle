@@ -140,11 +140,8 @@ impl MarkerAlignment {
         }
     }
 
-    /// Check if a target marker has non-identity allele mapping (strand flip or swap)
-    ///
-    /// Returns true if the marker needs allele remapping, false if identity mapping applies.
-    /// Most biallelic markers have identity mapping (no flips/swaps).
-    #[inline]
+    /// Check if a marker has allele mapping
+    #[allow(unused)]
     pub fn has_allele_mapping(&self, target_marker: usize) -> bool {
         self.allele_mappings
             .get(target_marker)

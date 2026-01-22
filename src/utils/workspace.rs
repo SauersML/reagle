@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # Workspace Pattern for HMM Buffers
 //!
 //! Pre-allocated buffers for HMM computations to avoid repeated allocations

@@ -54,21 +54,7 @@ impl BlockHmmWorkspace {
         }
     }
 
-    /// Get forward history for a specific marker in the block
-    #[inline]
-    pub fn fwd_history_at(&self, marker_idx: usize) -> &[f32] {
-        let stride = self.max_states + 1;
-        let start = marker_idx * stride;
-        &self.fwd_history[start..start + stride]
-    }
 
-    /// Get mutable forward history for a specific marker in the block
-    #[inline]
-    pub fn fwd_history_at_mut(&mut self, marker_idx: usize) -> &mut [f32] {
-        let stride = self.max_states + 1;
-        let start = marker_idx * stride;
-        &mut self.fwd_history[start..start + stride]
-    }
 
     /// Reset workspace for a new sample
     pub fn reset(&mut self, n_patterns: usize) {

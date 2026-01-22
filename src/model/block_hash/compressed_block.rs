@@ -102,6 +102,7 @@ impl CompressedBlock {
     }
 
     /// Sample a global haplotype ID from a pattern (for MCMC)
+    #[allow(unused)]
     pub fn sample_global_from_pattern<R: rand::Rng>(
         &self,
         pattern_id: PatternId,

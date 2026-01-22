@@ -40,11 +40,7 @@ mod compression;
 mod hmm;
 
 // Public API exports
-pub use types::{GlobalId, PatternId};
+pub use types::GlobalId;
 pub use compressed_block::CompressedBlock;
 pub use workspace::BlockHmmWorkspace;
 pub use reference_map::ReferenceMap;
-pub use compression::{
-    build_compressed_block, CompressionStats,
-    DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES
-};

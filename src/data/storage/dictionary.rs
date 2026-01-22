@@ -109,7 +109,8 @@ impl DictionaryColumn {
         &self.hap_to_pattern
     }
 
-    #[inline]
+    /// Get allele from a pattern (pre-decompressed)
+    #[allow(unused)]
     pub fn pattern_allele(&self, marker_offset: usize, pattern_idx: usize) -> u8 {
         if pattern_idx >= self.patterns.len() {
             return 255;
