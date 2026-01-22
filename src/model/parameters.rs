@@ -73,7 +73,9 @@ impl ModelParams {
         // Formula from Java PhaseData constructor
         let recomb_intensity = 0.04 * ne / n_haps as f32;
 
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
+        // Default to fixed 0.0001 if not specified (matches Beagle default),
+        // instead of Li-Stephens approximation.
+        let p_mismatch = err.unwrap_or(0.0001);
 
         Self {
             p_mismatch,
@@ -104,7 +106,8 @@ impl ModelParams {
         err: Option<f32>,
     ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
+        // Default to fixed 0.0001 if not specified (matches Beagle default).
+        let p_mismatch = err.unwrap_or(0.0001);
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 
