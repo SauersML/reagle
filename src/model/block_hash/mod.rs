@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! # Block-Hash Clade HMM
 //!
 //! This module implements the Adaptive Full-Panel Block-Hash Clade HMM to fix
@@ -40,7 +41,11 @@ mod compression;
 mod hmm;
 
 // Public API exports
-pub use types::GlobalId;
+pub use types::{GlobalId, PatternId};
 pub use compressed_block::CompressedBlock;
 pub use workspace::BlockHmmWorkspace;
 pub use reference_map::ReferenceMap;
+pub use compression::{
+    build_compressed_block, CompressionStats,
+    DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES
+};
