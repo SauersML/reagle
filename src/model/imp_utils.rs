@@ -179,16 +179,23 @@ pub fn compute_cluster_mismatches_into_workspace(
 
             let geno1 = geno_a1[target_m];
             let geno2 = geno_a2[target_m];
-            if geno1 == 255 || geno2 == 255 {
+
+            // Allow processing if we have PL provider, even if hard calls are missing
+            let has_pl = pl_provider
+                .and_then(|plp| plp.pl(target_m))
+                .map(|pl| !pl.is_empty())
+                .unwrap_or(false);
+
+            if (geno1 == 255 || geno2 == 255) && !has_pl {
                 continue;
             }
 
-            let targ_allele = targ_alleles[target_m];
+            let mut targ_allele = targ_alleles[target_m];
             let partner_allele = partner_alleles.map(|p| p[target_m]).unwrap_or(255);
 
             let target_marker_idx = MarkerIdx::new(target_m as u32);
             let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
-            if confidence <= 0.0 {
+            if confidence <= 0.0 && !has_pl {
                 continue;
             }
 
@@ -207,6 +214,16 @@ pub fn compute_cluster_mismatches_into_workspace(
                         allele_probs_uncond_from_pl(pl, &mut allele_probs)
                     };
                     if maybe_n == Some(2) {
+                        // If target allele is missing but we have PLs, infer most likely allele
+                        // to serve as the pivot for match/mismatch logic.
+                        if targ_allele == 255 && allele_probs.len() >= 2 {
+                            if allele_probs[0] >= allele_probs[1] {
+                                targ_allele = 0;
+                            } else {
+                                targ_allele = 1;
+                            }
+                        }
+
                         let req = if partner != 255 {
                             if partner == geno1 {
                                 geno2
