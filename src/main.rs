@@ -16,18 +16,11 @@
 
 use std::time::Instant;
 
-mod config;
-mod data;
-mod error;
-mod io;
-mod model;
-mod pipelines;
-mod utils;
-
-use config::Config;
-use error::Result;
-use pipelines::{ImputationPipeline, PhasingPipeline};
-use utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
+use reagle::config::Config;
+use reagle::error::Result;
+use reagle::pipelines::{ImputationPipeline, PhasingPipeline};
+use reagle::utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() {
     if let Err(e) = run() {
@@ -39,7 +32,6 @@ fn main() {
 /// Initialize tracing subscriber for hierarchical profiling output
 fn init_profiling() {
     use tracing_subscriber::fmt::format::FmtSpan;
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     tracing_subscriber::registry()
         .with(
@@ -107,7 +99,7 @@ fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use reagle::{config, data, error, io, model, pipelines};
 
     #[test]
     fn test_module_imports() {
