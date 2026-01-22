@@ -87,6 +87,8 @@ pub(crate) fn forward_pass_within_window(
 }
 
 /// Compute emission probability for a pattern at a marker
+///
+/// Handles multiallelic variants correctly by comparing alleles directly
 #[inline]
 fn emission_prob(
     window: &MicroWindow,
@@ -95,20 +97,33 @@ fn emission_prob(
     target_allele: u8,
     error_rate: f32,
 ) -> f32 {
+    // Missing data - uniform probability
+    if target_allele == 255 {
+        return 0.5;
+    }
+
     let ref_allele = window.pattern_allele(pattern_id, marker_in_window);
 
-    match target_allele {
-        0 => {
-            // Target is REF
-            (1.0 - ref_allele / 255.0) * (1.0 - error_rate) + (ref_allele / 255.0) * error_rate
+    // For reservoir, ref_allele is a frequency [0.0, 1.0] representing P(ALT)
+    // For patterns, ref_allele is the actual allele value {0, 1, 2, 3, ...}
+    if pattern_id.is_reservoir() {
+        // Reservoir uses allele frequency
+        // ref_allele here is already a probability
+        if target_allele == 0 {
+            (1.0 - ref_allele) * (1.0 - error_rate) + ref_allele * error_rate
+        } else {
+            ref_allele * (1.0 - error_rate) + (1.0 - ref_allele) * error_rate
         }
-        1 => {
-            // Target is ALT
-            (ref_allele / 255.0) * (1.0 - error_rate) + (1.0 - ref_allele / 255.0) * error_rate
-        }
-        _ => {
-            // Missing data - uniform
-            0.5
+    } else {
+        // Pattern uses exact allele matching (handles multiallelic)
+        let ref_allele_int = ref_allele.round() as u8;
+
+        if target_allele == ref_allele_int {
+            // Match: high probability
+            1.0 - error_rate
+        } else {
+            // Mismatch: error probability
+            error_rate
         }
     }
 }
