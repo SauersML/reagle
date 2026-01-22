@@ -43,6 +43,7 @@
 //! phasing and imputation.
 
 pub mod allele_lookup;
+// mod block_hash; // Will be enabled when integrated into imputation pipeline
 pub mod hmm;
 pub mod ibs2;
 pub mod imp_utils;
