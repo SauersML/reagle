@@ -1,0 +1,52 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.73s
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-d565f0d9aae215c5)
+
+running 1 test
+test test_diverse_mask_scenarios ... FAILED
+
+failures:
+
+---- test_diverse_mask_scenarios stdout ----
+
+============================================================
+=== Scenario: Light masking (10%) ===
+============================================================
+Masked 130 genotypes (10%)
+Running: java -jar /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar [("ref", "/tmp/.tmpRPpNVm/ref.vcf.gz"), ("gt", "/tmp/.tmpRPpNVm/masked.vcf.gz"), ("out", "/tmp/.tmpRPpNVm/java_imputed"), ("seed", "42"), ("gp", "true")]
+Streaming imputation: 362 ref haplotypes, 10 target samples (target_bytes=65565)
+Writing output to "/tmp/.tmpRPpNVm/rust_imputed.vcf.gz"
+Phase 2: Streaming imputation...
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (135 markers, pos 20000086..20099941)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 1356 (global 0..1356)
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 135
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+  Imputing Window 1 (135 markers, ref global 0..1356, output 0..1356)
+[OUTPUT CHECK] Window 1 | Marker 0 | Genotyped: false | Input: . | Calc DS: 0.0000
+[OUTPUT CHECK] Window 1 | Marker 1000 | Genotyped: false | Input: . | Calc DS: 0.0000
+Streaming imputation complete: 1356 markers
+
+Metric                            Java         Rust
+------------------------- ------------ ------------
+Concordance                     98.46%       95.38%
+Brier Score                     0.0308       0.0636
+
+thread 'test_diverse_mask_scenarios' (9916) panicked at tests/beagle_reference.rs:2686:9:
+Light masking (10%): Rust concordance (95.3846%) worse than Java (98.4615%)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_diverse_mask_scenarios
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 26 filtered out; finished in 48.96s
+
+error: test failed, to rerun pass `--test beagle_reference`
