@@ -220,29 +220,16 @@ impl ReferenceMap {
         // Pre-allocate posteriors with default values to enable direct slicing
         let mut posteriors = vec![AllelePosteriors::Biallelic(0.0); target_genotypes.len()];
 
-        // Initialize backward uniform
+        // Initialize backward to neutral likelihood (1.0)
+        // Standard HMM backward pass: beta_T(i) = 1.0 for all states
         if let Some(last_block) = self.blocks.last() {
              let n_patterns = last_block.n_patterns();
-             let uniform = 1.0 / n_patterns as f32;
-             ws.bwd[..n_patterns].fill(uniform);
-             
-             // Fix: Initialize reservoir prob to uniform/neutral if it exists
+             ws.bwd[..n_patterns].fill(1.0);
+
+             // Initialize reservoir to 1.0 (neutral likelihood)
+             // Do NOT weight by reservoir_count - backward variables are likelihoods, not mass
              if last_block.reservoir_count > 0 {
-                  // Reservoir is one "state". 
-                  // If we treat all patterns + reservoir as uniform prior:
-                  // 1.0 / (n_patterns + 1)
-                  // But code above uses 1/n_patterns.
-                  // Existing logic seems to treat pattern states as primary.
-                  // If we want "neutral", 1.0 is often safest for log-space, but here we are in probability space.
-                  // Let's match the pattern initialization logic or just 1.0.
-                  // Given `normalize_bwd` handles scaling, setting to 1.0 (or uniform) is fine.
-                  // Let's set to uniform to be safe/consistent.
-                  // Weight reservoir probability by its cardinality to match Forward/Stationary distribution
-                  // If we treat every haplotype as equiprobable:
-                  // p(reservoir) = reservoir_count / n_ref_haps
-                  // This ensures mass conservation and symmetry with forward.
-                  let prob_per_hap = 1.0 / last_block.n_ref_haps() as f32;
-                  ws.reservoir_prob_bwd = prob_per_hap * last_block.reservoir_count as f32; 
+                 ws.reservoir_prob_bwd = 1.0;
              } else {
                  ws.reservoir_prob_bwd = 0.0;
              }

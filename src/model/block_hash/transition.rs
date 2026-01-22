@@ -263,12 +263,10 @@ impl TransitionBridge {
             let pat_a = self.transpose_rows[k]; // Dest in backward (A)
             let weight = self.bwd_weights[k];
 
-            // Treat bwd as per-haplotype likelihood, accumulate mass for the previous block
-            // Converting B -> A
-            // bwd[A] += bwd[B] * count(A->B)
-            // effective_weight = weight * count(A) = (count(A->B)/count(A)) * count(A) = count(A->B)
-            let count_a = window_a.pattern_counts[pat_a.as_usize()];
-            ws.emissions[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight * count_a;
+            // Backward pass: beta[A] += beta[B] * P(B|A)
+            // weight already encodes P(B|A) = Flow(A->B) / Count(A)
+            // Do NOT multiply by count_a - that would incorrectly scale by cluster size
+            ws.emissions[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight;
         }
         
         // Reservoir transitions
