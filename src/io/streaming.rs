@@ -217,9 +217,6 @@ pub struct StreamWindow {
     /// Phased genotypes from overlap region of previous window
     /// These should be used to constrain/seed the current window's phasing
     pub phased_overlap: Option<PhasedOverlap>,
-    /// Recombination rate at the boundary between this window's effective end and the next window
-    /// This is the rate between `output_end - 1` and `output_end` (relative to window).
-    pub boundary_recomb_rate: Option<f32>,
 }
 
 impl StreamWindow {
@@ -598,18 +595,6 @@ impl StreamingVcfReader {
             // So we need the rate for the last marker in the overlap region.
             // That rate connects to the marker *after* the overlap.
             // So looking at `self.buffer[window_end]` is correct.
-            // Calculate boundary recombination rate
-            let boundary_recomb_rate = if window_end < self.buffer.len() {
-                let m1 = &self.buffer[window_end - 1];
-                let m2 = &self.buffer[window_end];
-                let dist_cm = (m2.gen_pos - m1.gen_pos).abs();
-                // Haldane map function approx
-                let rate = (1.0 - (-2.0 * dist_cm / 100.0).exp()) * 0.5;
-                Some(rate as f32)
-            } else {
-                None
-            };
-
             let window = StreamWindow {
                 genotypes,
                 global_start: self.global_marker_idx,
@@ -618,7 +603,6 @@ impl StreamingVcfReader {
                 output_end,
                 is_first: self.window_num == 0,
                 phased_overlap: None, // Caller will set this from previous window's phased output
-                boundary_recomb_rate,
             };
 
             // Remove processed markers from buffer (keep overlap)
@@ -797,7 +781,6 @@ impl StreamingVcfReader {
             output_end: n_markers,
             is_first: self.window_num == 0,
             phased_overlap: None,
-            boundary_recomb_rate: None,
         };
 
         while self

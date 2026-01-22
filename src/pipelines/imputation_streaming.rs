@@ -276,7 +276,6 @@ impl crate::pipelines::ImputationPipeline {
                         output_end: 0,
                         is_first: window_count == 1,
                         phased_overlap: None,
-                        boundary_recomb_rate: None,
                     }
                 };
                 if let Some(bb) = &pipeline.telemetry {
@@ -858,10 +857,11 @@ target_samples={} target_bytes={}",
                     let mut ws_opt = cell.borrow_mut();
                     
                     // Check if workspace needs resizing
+                    // Use max_observed_states instead of configured max_states to prevent thrashing
                     let needs_resize = if let Some(ws) = ws_opt.as_ref() {
                         ws.checkpoints.len() < ref_map.blocks.len() ||
-                        ws.max_states < ref_map.max_states ||
-                        ws.fwd_history.len() < (ref_map.max_states + 1) * ref_map.window_size
+                        ws.max_states < ref_map.max_observed_states ||
+                        ws.fwd_history.len() < (ref_map.max_observed_states + 1) * ref_map.window_size
                     } else {
                         true
                     };

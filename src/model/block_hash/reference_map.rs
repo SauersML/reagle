@@ -29,8 +29,11 @@ pub struct ReferenceMap {
     /// Window size in markers
     pub window_size: usize,
 
-    /// Maximum states per block
+    /// Maximum states per block (Configured limit)
     pub max_states: usize,
+
+    /// Actual maximum states observed in any block
+    pub max_observed_states: usize,
 }
 
 impl ReferenceMap {
@@ -116,11 +119,19 @@ impl ReferenceMap {
             bridges.push(Arc::new(bridge));
         }
 
+        // Calculate actual max states
+        let max_observed_states = blocks
+            .iter()
+            .map(|b| b.n_patterns())
+            .max()
+            .unwrap_or(0);
+
         Arc::new(Self {
             blocks,
             bridges,
             window_size,
             max_states,
+            max_observed_states,
         })
     }
 
@@ -134,11 +145,7 @@ impl ReferenceMap {
 
     /// Calculate the actual maximum number of states required by any block
     pub fn max_observed_patterns(&self) -> usize {
-        self.blocks
-            .iter()
-            .map(|b| b.n_patterns())
-            .max()
-            .unwrap_or(0) // Handle empty map case
+        self.max_observed_states
     }
 
     /// Run forward pass up to a specific marker index
