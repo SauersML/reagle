@@ -91,6 +91,75 @@ pub fn forward_within_block(
     }
 }
 
+/// Run forward pass up to a specific marker within a block
+///
+/// Used for extracting state at arbitrary positions (e.g. for priors handoff).
+/// Returns state after observing `stop_marker_in_window`.
+pub fn forward_to_marker_in_block(
+    block: &CompressedBlock,
+    target_genotypes: &[u8],
+    error_rate: f32,
+    ws: &mut BlockHmmWorkspace,
+    stop_marker_in_window: usize,
+) {
+    let n_patterns = block.n_patterns();
+    let window_size = block.window_size();
+
+    assert!(stop_marker_in_window < window_size);
+    assert_eq!(target_genotypes.len(), window_size);
+
+    for marker_in_window in 0..=stop_marker_in_window {
+        let target_allele = target_genotypes[marker_in_window];
+        let recomb_rate = if marker_in_window == 0 {
+            0.0
+        } else {
+            block.local_recomb_rates[marker_in_window - 1]
+        };
+
+        let emissions = &mut ws.emissions;
+        
+        for pattern_idx in 0..n_patterns {
+            let pattern_id = PatternId::new(pattern_idx as u16);
+            emissions[pattern_idx] = emission_prob(
+                block,
+                pattern_id,
+                marker_in_window,
+                target_allele,
+                error_rate,
+            );
+        }
+
+        let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
+
+        HmmUpdater::fwd_update_emissions(
+            &mut ws.fwd,
+            fwd_sum,
+            recomb_rate,
+            emissions,
+            n_patterns,
+        );
+
+        if block.reservoir_count > 0 {
+            let reservoir_emission = emission_prob(
+                block,
+                PatternId::RESERVOIR,
+                marker_in_window,
+                target_allele,
+                error_rate,
+            );
+
+            let total_mass = fwd_sum;
+            let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
+            let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
+
+            ws.reservoir_prob_fwd =
+                reservoir_emission * (stay + background * block.reservoir_count as f32);
+        }
+
+        ws.normalize_forward(n_patterns);
+    }
+}
+
 /// Backward pass within block AND emit posteriors
 ///
 /// Combines forward probabilities (from checkpoint) with backward probabilities

@@ -103,6 +103,43 @@ impl ReferenceMap {
         BlockHmmWorkspace::new(self.max_states, self.blocks.len(), self.window_size)
     }
 
+    /// Run forward pass up to a specific marker index
+    ///
+    /// Restores the checkpoint of the containing block and advances to the target marker.
+    /// Used for extracting HMM state for priors handoff.
+    pub fn forward_to_marker(
+        &self,
+        target_genotypes: &[u8],
+        error_rate: f32,
+        ws: &mut BlockHmmWorkspace,
+        marker_idx: usize,
+    ) {
+        // Find block containing marker_idx
+        let block_idx = self.blocks.partition_point(|b| b.end_marker <= marker_idx);
+        
+        if block_idx < self.blocks.len() {
+            let block = &self.blocks[block_idx];
+            
+            // Restore checkpoint
+            ws.restore_checkpoint(block_idx, block.n_patterns());
+            
+            // Extract genotypes for this block
+            let block_genotypes =
+                &target_genotypes[block.start_marker..block.end_marker.min(target_genotypes.len())];
+            
+            let local_marker = marker_idx - block.start_marker;
+            
+            // Run forward partial
+            super::hmm::forward_to_marker_in_block(
+                block,
+                block_genotypes,
+                error_rate,
+                ws,
+                local_marker
+            );
+        }
+    }
+
     /// Run forward pass with checkpointing
     ///
     /// Saves forward state at the start of each block for later combination.
