@@ -150,6 +150,66 @@ impl HmmUpdater {
         }
     }
 
+    /// Forward update using on-the-fly emission calculation (from mismatches).
+    ///
+    /// Updates forward values in place and returns the new sum.
+    #[inline]
+    pub fn fwd_update(
+        fwd: &mut [f32],
+        fwd_sum: f32,
+        p_switch: f32,
+        emit_probs: &[f32; 2],
+        mismatches: &[u8],
+        n_states: usize,
+    ) -> f32 {
+        let shift = p_switch / n_states as f32;
+        let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
+
+        let shift_vec = f32x8::splat(shift);
+        let scale_vec = f32x8::splat(scale);
+        let mut sum_vec = f32x8::splat(0.0);
+
+        let p0 = emit_probs[0];
+        let p1 = emit_probs[1];
+        let diff = p1 - p0;
+
+        let mut k = 0;
+        while k + 8 <= n_states {
+            let mut fwd_arr = [0.0f32; 8];
+            fwd_arr.copy_from_slice(&fwd[k..k + 8]);
+            let fwd_chunk = f32x8::from(fwd_arr);
+
+            let m_chunk = &mismatches[k..k + 8];
+            let emit_arr = [
+                p0 + (m_chunk[0] as f32) * diff,
+                p0 + (m_chunk[1] as f32) * diff,
+                p0 + (m_chunk[2] as f32) * diff,
+                p0 + (m_chunk[3] as f32) * diff,
+                p0 + (m_chunk[4] as f32) * diff,
+                p0 + (m_chunk[5] as f32) * diff,
+                p0 + (m_chunk[6] as f32) * diff,
+                p0 + (m_chunk[7] as f32) * diff,
+            ];
+            let emit_vec = f32x8::from(emit_arr);
+
+            let res = emit_vec * (scale_vec * fwd_chunk + shift_vec);
+
+            let res_arr: [f32; 8] = res.into();
+            fwd[k..k + 8].copy_from_slice(&res_arr);
+
+            sum_vec += res;
+            k += 8;
+        }
+
+        let mut new_sum = sum_vec.reduce_add();
+        for i in k..n_states {
+            let emission = emit_probs[mismatches[i] as usize];
+            fwd[i] = emission * (scale * fwd[i] + shift);
+            new_sum += fwd[i];
+        }
+        new_sum
+    }
+
     /// Backward update using precomputed per-state emission probabilities.
     #[inline]
     pub fn bwd_update_emissions(
@@ -694,6 +754,7 @@ impl<'a> BeagleHmm<'a> {
         let mut fwd = vec![1.0f32 / n_states as f32; n_states];
         let mut fwd_sums = vec![1.0f32; n_markers];
         let mut last_fwd_sum = 1.0f32;
+        let mut mismatches = vec![0u8; n_states];
 
         for m in 0..n_markers {
             cursor.advance_with_history(m, threaded_haps, &mut history);
@@ -702,35 +763,34 @@ impl<'a> BeagleHmm<'a> {
             let targ_al = target_alleles[m];
             let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0);
 
-            if m > 0 {
-                let shift = p_switch / n_states as f32;
-                let scale = (1.0 - p_switch) / last_fwd_sum;
+            for k in 0..n_states {
+                let ref_al = self
+                    .ref_gt
+                    .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                mismatches[k] = if ref_al == targ_al { 0 } else { 1 };
+            }
 
-                let mut sum = 0.0f32;
-                for k in 0..n_states {
-                    let ref_al = self
-                        .ref_gt
-                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
-                    let is_mismatch = ref_al != targ_al;
-                    let em = if is_mismatch { p_err } else { p_no_err };
-                    fwd[k] = em * (scale * fwd[k] + shift);
-                    sum += fwd[k];
-                }
-                last_fwd_sum = sum.max(1e-30);
+            if m > 0 {
+                last_fwd_sum = HmmUpdater::fwd_update(
+                    &mut fwd,
+                    last_fwd_sum,
+                    p_switch,
+                    &emit_probs,
+                    &mismatches,
+                    n_states,
+                );
             } else {
                 // First marker: uniform prior * emission
-                let prior = 1.0 / n_states as f32;
-                let mut sum = 0.0f32;
-                for k in 0..n_states {
-                    let ref_al = self
-                        .ref_gt
-                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
-                    let is_mismatch = ref_al != targ_al;
-                    let em = if is_mismatch { p_err } else { p_no_err };
-                    fwd[k] = em * prior;
-                    sum += fwd[k];
-                }
-                last_fwd_sum = sum.max(1e-30);
+                // Use fwd_update with p_switch=1.0 which sets scale=0, shift=1/N
+                // Result is emission * (1/N)
+                last_fwd_sum = HmmUpdater::fwd_update(
+                    &mut fwd,
+                    1.0,
+                    1.0,
+                    &emit_probs,
+                    &mismatches,
+                    n_states,
+                );
             }
 
             fwd_sums[m] = last_fwd_sum;
@@ -746,7 +806,6 @@ impl<'a> BeagleHmm<'a> {
         // 2. Combined backward pass with forward recomputation and stats accumulation
         // Process in reverse order, recomputing forward from checkpoints as needed
         let mut bwd = vec![1.0f32; n_states];
-        let mut mismatches = vec![0u8; n_states];
         let mut fwd_recomp = vec![0.0f32; n_states];
 
         let h_factor = n_states as f32 / (n_states - 1) as f32;
@@ -784,21 +843,35 @@ impl<'a> BeagleHmm<'a> {
                 let recomp_marker_idx = MarkerIdx::new(recomp_m as u32);
                 let recomp_targ_al = target_alleles[recomp_m];
                 let p_switch = self.p_recomb.get(recomp_m).copied().unwrap_or(0.0);
-                let shift = p_switch / n_states as f32;
-                let scale = (1.0 - p_switch) / recomp_sum.max(1e-30);
 
-                let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = self.ref_gt.allele(
                         recomp_marker_idx,
                         HapIdx::new(recomp_cursor.active_haps()[k]),
                     );
-                    let is_mismatch = ref_al != recomp_targ_al;
-                    let em = if is_mismatch { p_err } else { p_no_err };
-                    fwd_recomp[k] = em * (scale * fwd_recomp[k] + shift);
-                    sum += fwd_recomp[k];
+                    mismatches[k] = if ref_al == recomp_targ_al { 0 } else { 1 };
                 }
-                recomp_sum = sum.max(1e-30);
+
+                recomp_sum = HmmUpdater::fwd_update(
+                    &mut fwd_recomp,
+                    recomp_sum,
+                    p_switch,
+                    &emit_probs,
+                    &mismatches,
+                    n_states,
+                );
+            }
+
+            // If we hit a checkpoint exactly, the loop above didn't run, so mismatches is stale.
+            // Populate it now for statistics calculation.
+            if m == checkpoint_start {
+                for k in 0..n_states {
+                    let ref_al = self.ref_gt.allele(
+                        marker_idx,
+                        HapIdx::new(cursor.active_haps()[k]),
+                    );
+                    mismatches[k] = if ref_al == targ_al { 0 } else { 1 };
+                }
             }
 
             // Now fwd_recomp contains forward values at marker m
@@ -814,11 +887,9 @@ impl<'a> BeagleHmm<'a> {
             let mut mismatch_sum = 0.0f32;
 
             for k in 0..n_states {
-                let ref_al = self
-                    .ref_gt
-                    .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
-                let is_mismatch = ref_al != targ_al;
-                let em = if is_mismatch { p_err } else { p_no_err };
+                // Use pre-computed mismatches (from recompute loop or explicit check above)
+                let is_mismatch = mismatches[k] != 0;
+                let em = emit_probs[mismatches[k] as usize];
 
                 // Use fwd values from before emission update for joint probability
                 let fwd_prior_k = if m > 0 {
