@@ -169,20 +169,24 @@ pub fn forward_to_marker_in_block(
 /// Combines forward probabilities (from checkpoint) with backward probabilities
 /// to compute posterior probabilities for each allele.
 ///
-/// # Returns
-/// Allele posteriors for markers in this block (in genomic order)
+/// # Arguments
+/// * `output` - Mutable slice to write posteriors into (must be same length as window_size)
 pub fn backward_and_emit_block(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
-) -> Vec<AllelePosteriors> {
+    output: &mut [AllelePosteriors],
+) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
     
-    // We compute posteriors in reverse order (because backward pass is reverse),
-    // but return them in genomic order. We will reverse at end.
-    let mut posteriors_rev = Vec::with_capacity(window_size);
+    assert_eq!(output.len(), window_size, "Output slice size mismatch");
+    
+    // We compute posteriors in reverse order (because backward pass is reverse).
+    // The `output` slice corresponds to markers [start..end]. 
+    // We will write into `output[marker_idx]` directly.
+    // Care needed: backward loop is `(0..window_size).rev()`.
 
     // Re-run Forward and store history into pre-allocated workspace buffer
     for marker_idx in 0..window_size {
@@ -192,6 +196,7 @@ pub fn backward_and_emit_block(
         } else {
             block.local_recomb_rates[marker_idx - 1]
         };
+        let n_alleles = block.n_alleles(marker_idx);
         
         let emissions = &mut ws.emissions;
         for pattern_idx in 0..n_patterns {
@@ -201,6 +206,7 @@ pub fn backward_and_emit_block(
                 marker_idx,
                 target_allele,
                 error_rate,
+                n_alleles,
             );
         }
         
@@ -223,6 +229,7 @@ pub fn backward_and_emit_block(
                 marker_idx,
                 target_allele,
                 error_rate,
+                n_alleles,
             );
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
@@ -272,17 +279,17 @@ pub fn backward_and_emit_block(
             }
         }
         
-        // Reservoir state
+        // Reservoir state (Mixed alleles)
         let res_p = current_fwd[n_patterns] * ws.reservoir_prob_bwd;
         if res_p > 0.0 {
             total_prob += res_p;
-            // Reservoir contributes based on allele frequency (mean)
-            let mean = block.pattern_allele(PatternId::RESERVOIR, marker_idx);
-            let p1 = mean.clamp(0.0, 1.0);
-            let p0 = 1.0 - p1;
-            
-            if 0 < n_alleles { allele_probs[0] += res_p * p0; }
-            if 1 < n_alleles { allele_probs[1] += res_p * p1; }
+            // Iterate all alleles to distribute probability based on frequency
+            for allele in 0..n_alleles {
+                let freq = block.reservoir_freq(marker_idx, allele as u8);
+                if freq > 0.0 {
+                    allele_probs[allele] += res_p * freq;
+                }
+            }
         }
         
         // Normalize
@@ -294,9 +301,9 @@ pub fn backward_and_emit_block(
         }
         
         if n_alleles == 2 {
-            posteriors_rev.push(AllelePosteriors::Biallelic(allele_probs[1]));
+            output[marker_idx] = AllelePosteriors::Biallelic(allele_probs[1]);
         } else {
-            posteriors_rev.push(AllelePosteriors::Multiallelic(allele_probs));
+            output[marker_idx] = AllelePosteriors::Multiallelic(allele_probs);
         }
         
         // Update bwd to t-1
@@ -308,6 +315,7 @@ pub fn backward_and_emit_block(
                 marker_idx,
                 target_allele,
                 error_rate,
+                n_alleles,
             );
         }
         
@@ -322,6 +330,7 @@ pub fn backward_and_emit_block(
             marker_idx,
             target_allele,
             error_rate,
+            n_alleles,
         );
         ws.reservoir_prob_bwd *= reservoir_emission;
         
@@ -345,12 +354,11 @@ pub fn backward_and_emit_block(
         
         ws.normalize_bwd(n_patterns);
     }
-    
-    posteriors_rev.reverse();
-    posteriors_rev
 }
 
 /// Compute emission probability for a pattern at a marker
+///
+/// Implements Split Error Model: Mismatch probability is split among all non-matching alleles.
 #[inline]
 fn emission_prob(
     block: &CompressedBlock,
@@ -358,30 +366,42 @@ fn emission_prob(
     marker_in_window: usize,
     target_allele: u8,
     error_rate: f32,
+    n_alleles: usize,
 ) -> f32 {
     // Missing data - neutral (1.0)
     if target_allele == 255 {
         return 1.0;
     }
 
-    let ref_allele = block.pattern_allele(pattern_id, marker_in_window);
+    // Split error model: epsilon / (K - 1)
+    // If K=1 (monomorphic), mismatch is impossible (or probability 0).
+    // We clamp divisor to 1.0 to avoid NaN, but logically K=1 should match always or error if observed is different.
+    let mismatch_prob = if n_alleles > 1 {
+        error_rate / (n_alleles - 1) as f32
+    } else {
+        error_rate // Fallback, though K=1 implies no variation
+    };
+
+    let match_prob = 1.0 - error_rate;
 
     if pattern_id.is_reservoir() {
         // Reservoir uses allele frequency
-        if target_allele == 0 {
-            (1.0 - ref_allele) * (1.0 - error_rate) + ref_allele * error_rate
-        } else {
-            ref_allele * (1.0 - error_rate) + (1.0 - ref_allele) * error_rate
-        }
+        // P(obs | Res) = sum_k [ P(obs | k) * P(k | Res) ]
+        //              = P(match) * freq[obs] + sum_{k != obs} [ P(obs | k) * freq[k] ]
+        //              = match_prob * freq[obs] + mismatch_prob * (1 - freq[obs])
+        
+        let freq_obs = block.reservoir_freq(marker_in_window, target_allele);
+        match_prob * freq_obs + mismatch_prob * (1.0 - freq_obs)
     } else {
-        // Pattern uses exact allele matching (handles multiallelic)
-        // pattern_allele returns f32 (0.0, 1.0, 2.0...), convert to u8
-        let ref_allele_int = ref_allele as u8;
+        // Pattern uses exact allele matching
+        // pattern_allele returns f32, convert to u8. 
+        // Note: pattern_allele call is safe for non-reservoir patterns.
+        let ref_allele = block.pattern_allele(pattern_id, marker_in_window) as u8;
 
-        if target_allele == ref_allele_int {
-            1.0 - error_rate
+        if target_allele == ref_allele {
+            match_prob
         } else {
-            error_rate
+            mismatch_prob
         }
     }
 }

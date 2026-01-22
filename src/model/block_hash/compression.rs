@@ -145,10 +145,11 @@ pub fn build_compressed_block(
             let reservoir_count = reservoir_globals.len() as u32;
 
             // Compute reservoir allele frequencies
-            let reservoir_allele_freqs = if reservoir_count > 0 {
-                compute_reservoir_freqs(&storage, &reservoir_globals, n_markers)
+            let (reservoir_freqs, reservoir_freq_offsets) = if reservoir_count > 0 {
+                compute_reservoir_freqs(&storage, &reservoir_globals, n_markers, &marker_n_alleles)
             } else {
-                vec![0.5; n_markers]
+                // Empty placeholders
+                (Vec::new(), vec![0; n_markers])
             };
 
             // Filter/Reorder pattern_counts and pattern_to_globals
@@ -163,7 +164,8 @@ pub fn build_compressed_block(
                 pattern_to_globals,
                 reservoir_count,
                 reservoir_globals,
-                reservoir_allele_freqs,
+                reservoir_freqs,
+                reservoir_freq_offsets,
                 hap_to_state,
             )
         } else {
@@ -178,7 +180,8 @@ pub fn build_compressed_block(
                 pattern_to_globals,
                 0,
                 Vec::new(),
-                vec![0.5; n_markers],
+                Vec::new(),
+                vec![0; n_markers],
                 hap_to_state,
             )
         };
@@ -186,6 +189,7 @@ pub fn build_compressed_block(
     // Pre-unpack alleles for all kept patterns
     // Flattened: [pattern_idx * n_markers + marker_idx]
     let n_kept_patterns = pattern_counts.len();
+    // Pre-fill with 255 (missing) or 0? 0 is safer default, but data should overwrite.
     let mut unpacked_alleles = vec![0u8; n_kept_patterns * n_markers];
 
     // Note: pattern_to_globals is now indexed by usage rank
@@ -207,40 +211,67 @@ pub fn build_compressed_block(
         pattern_to_globals,
         reservoir_count,
         reservoir_globals,
-        reservoir_allele_freqs,
+        reservoir_freqs,
+        reservoir_freq_offsets,
         unpacked_alleles,
         local_recomb_rates,
         marker_n_alleles,
     }
 }
 
-/// Compute allele frequencies for reservoir haplotypes
+/// Compute allele frequencies for reservoir haplotypes (Multiallelic)
 fn compute_reservoir_freqs(
     storage: &Arc<DictionaryColumn>,
     reservoir_globals: &[GlobalId],
     window_size: usize,
-) -> Vec<f32> {
+    marker_n_alleles: &[u8],
+) -> (Vec<f32>, Vec<usize>) {
     let n_reservoir = reservoir_globals.len();
     if n_reservoir == 0 {
-        return vec![0.5; window_size];
+        return (Vec::new(), vec![0; window_size]);
     }
 
-    let mut allele_sums = vec![0u32; window_size];
+    // Calculate total size and offsets
+    let mut offsets = Vec::with_capacity(window_size);
+    let mut current_offset = 0;
+    for &n in marker_n_alleles {
+        offsets.push(current_offset);
+        current_offset += n as usize;
+    }
+    let total_slots = current_offset;
+    
+    let mut counts = vec![0u32; total_slots];
 
     for &global_id in reservoir_globals {
         let hap = HapIdx::new(global_id.as_u32());
-        for marker_offset in 0..window_size {
-            let allele = storage.get(marker_offset, hap);
-            if allele != 255 && allele > 0 {
-                allele_sums[marker_offset] += 1;
+        for marker_idx in 0..window_size {
+            let allele = storage.get(marker_idx, hap);
+            // Skip missing data in frequency calculation? 
+            // Or treat as "no info"?
+            // Usually we only count observed alleles.
+            // If allele is 255, we ignore it.
+            if allele != 255 {
+                let n_alleles = marker_n_alleles[marker_idx] as usize;
+                if (allele as usize) < n_alleles {
+                    let offset = offsets[marker_idx];
+                    counts[offset + allele as usize] += 1;
+                }
             }
         }
     }
 
-    allele_sums
+    let freqs: Vec<f32> = counts
         .iter()
-        .map(|&sum| sum as f32 / n_reservoir as f32)
-        .collect()
+        .map(|&c| {
+            if n_reservoir > 0 {
+                c as f32 / n_reservoir as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    (freqs, offsets)
 }
 
 /// Compression statistics for logging/debugging
@@ -294,10 +325,8 @@ impl CompressionStats {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
 
-    #[test]
     use crate::data::marker::Markers;
     use crate::data::storage::GenotypeColumn;
     use crate::data::storage::phase_state::Phased;
@@ -310,9 +339,6 @@ mod tests {
         // Hap 2: (1, 1)
         // Hap 3: (1, 1)
         
-        let markers = Markers::new();
-        // (Mocking markers unnecessary for simple compression logic if not checked)
-        let n_haps = 4;
         let col0 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
         let col1 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
         
@@ -321,7 +347,8 @@ mod tests {
         // The public API requires Samples, Markers etc. 
         // Let's create a minimal valid GenotypeMatrix.
         use crate::data::haplotype::Samples;
-        use crate::data::marker::{Marker, Allele, ChromIdx};
+        use crate::data::marker::{Marker, Allele};
+        use crate::data::ChromIdx;
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
         let mut m = Markers::new();
         let chr = m.add_chrom("chr1");

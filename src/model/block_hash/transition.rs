@@ -169,10 +169,12 @@ impl TransitionBridge {
     pub(crate) fn apply_forward(&self, window_a: &CompressedBlock, window_b: &CompressedBlock, ws: &mut super::workspace::BlockHmmWorkspace) {
         let n_patterns_b = window_b.n_patterns();
 
-        // Initialize new forward probabilities in a temporary buffer (or use emissions buffer if unused)
-        let mut new_fwd = std::mem::replace(&mut ws.emissions, AVec::from_iter(32, std::iter::repeat(0.0).take(ws.fwd.len())));
-        new_fwd.fill(0.0);
-        // new_fwd.resize(ws.fwd.len(), 0.0); // Ensure size - assume max_states is consistent
+        // reuse emissions buffer as scratch space for new_fwd
+        // ensure it has enough capacity
+        ws.emissions.fill(0.0);
+        if ws.emissions.len() < ws.fwd.len() {
+             ws.emissions.resize(ws.fwd.len(), 0.0);
+        }
 
         let mut new_reservoir_prob = 0.0f32;
 
@@ -183,14 +185,14 @@ impl TransitionBridge {
             let weight = self.weights[i];
 
             let prob = ws.fwd[from.as_usize()];
-            new_fwd[to.as_usize()] += prob * weight;
+            ws.emissions[to.as_usize()] += prob * weight;
         }
 
         // Reservoir → Pattern transitions
         for i in 0..self.reservoir_to_pattern_ids.len() {
             let to = self.reservoir_to_pattern_ids[i];
             let weight = self.reservoir_to_pattern_weights[i];
-            new_fwd[to.as_usize()] += ws.reservoir_prob_fwd * weight;
+            ws.emissions[to.as_usize()] += ws.reservoir_prob_fwd * weight;
         }
 
         // Pattern → Reservoir transitions
@@ -211,19 +213,16 @@ impl TransitionBridge {
         // Distribute recombination mass proportionally to pattern counts in B
         for pattern_idx in 0..n_patterns_b {
             let count = window_b.pattern_counts[pattern_idx];
-            new_fwd[pattern_idx] += background_per_hap * count;
+            ws.emissions[pattern_idx] += background_per_hap * count;
         }
 
         // Reservoir also receives recombination mass proportional to its cardinality
         new_reservoir_prob += background_per_hap * (window_b.reservoir_count as f32);
 
-        // Update workspace
-        // Copy new_fwd back to ws.fwd
-        ws.fwd.copy_from_slice(&new_fwd);
+        // Swap buffers: ws.emissions becomes the new ws.fwd
+        // The old ws.fwd moves to ws.emissions to be reused as scratch next time
+        std::mem::swap(&mut ws.fwd, &mut ws.emissions);
         ws.reservoir_prob_fwd = new_reservoir_prob;
-        
-        // Restore emissions buffer
-        ws.emissions = new_fwd;
 
         // Normalize to prevent drift
         ws.normalize_forward(n_patterns_b);
@@ -235,10 +234,11 @@ impl TransitionBridge {
         let n_patterns_a = window_a.n_patterns();
         let n_patterns_b = window_b.n_patterns();
 
-        // ws.bwd holds values for B. We want to compute values for A.
-        let mut new_bwd = std::mem::replace(&mut ws.emissions, AVec::from_iter(32, std::iter::repeat(0.0).take(ws.bwd.len())));
-        new_bwd.fill(0.0);
-        // new_bwd.resize(ws.bwd.len(), 0.0);
+        // ws.bwd holds values for B. We want to compute values for A into ws.emissions (reused buffer).
+        ws.emissions.fill(0.0);
+        if ws.emissions.len() < ws.bwd.len() {
+             ws.emissions.resize(ws.bwd.len(), 0.0);
+        }
         
         // Background recombination contribution (Gather from all B)
         let mut recomb_sum = 0.0f32;
@@ -251,7 +251,7 @@ impl TransitionBridge {
         
         // Initialize A with recomb term
         for i in 0..n_patterns_a {
-            new_bwd[i] = recomb_term;
+            ws.emissions[i] = recomb_term;
         }
         // Use recomb_term directly instead of redundant init
         let mut new_reservoir_prob = recomb_term;
@@ -264,7 +264,7 @@ impl TransitionBridge {
             let pat_a = self.transpose_rows[k]; // Dest in backward (A)
             let weight = self.bwd_weights[k];
             
-            new_bwd[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight;
+            ws.emissions[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight;
         }
         
         // Reservoir transitions
@@ -281,16 +281,15 @@ impl TransitionBridge {
         for k in 0..self.pattern_to_reservoir_ids.len() {
             let pat_a = self.pattern_to_reservoir_ids[k]; // Pattern in A
             let weight = self.pattern_to_reservoir_weights[k];
-            new_bwd[pat_a.as_usize()] += ws.reservoir_prob_bwd * weight;
+            ws.emissions[pat_a.as_usize()] += ws.reservoir_prob_bwd * weight;
         }
         
         // Reservoir -> Reservoir
         new_reservoir_prob += ws.reservoir_prob_bwd * self.reservoir_to_reservoir;
 
-        // Update workspace
-        ws.bwd.copy_from_slice(&new_bwd);
+        // Swap buffers: emissions becomes new bwd
+        std::mem::swap(&mut ws.bwd, &mut ws.emissions);
         ws.reservoir_prob_bwd = new_reservoir_prob;
-        ws.emissions = new_bwd; // Return buffer
     }
 }
 
@@ -373,7 +372,6 @@ fn aggregate_reservoir_transitions(
 
 #[cfg(test)]
 mod tests {
-    #[test]
     use super::*;
     use crate::data::marker::Markers;
     use crate::data::haplotype::Samples;

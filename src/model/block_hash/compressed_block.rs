@@ -35,26 +35,18 @@ pub struct CompressedBlock {
     /// Global IDs of haplotypes in the reservoir
     pub reservoir_globals: Vec<GlobalId>,
 
-    /// Allele frequencies of reservoir haplotypes [marker_in_window]
-    /// Used for emission probabilities
-    pub reservoir_allele_freqs: Vec<f32>,
+    /// Allele frequencies of reservoir haplotypes [flattened for all markers]
+    /// Layout: [marker0_allele0, marker0_allele1, ..., marker1_allele0...]
+    pub reservoir_freqs: Vec<f32>,
+
+    /// Offsets into reservoir_freqs for each marker [marker_in_window]
+    pub reservoir_freq_offsets: Vec<usize>,
 
     /// Unpacked alleles for fast emission calculation [pattern_idx * window_size + marker_in_window]
     /// Avoids bit-unpacking overhead in hot loops
     pub unpacked_alleles: Vec<u8>,
 
     /// Recombination rates for each marker interval in the window [marker_in_window]
-    /// Rate at index i is the probability of recombination between i and i+1?
-    /// Or between i-1 and i?
-    /// Standard HMM: Transition from t-1 to t uses rate[t-1]?
-    /// We will store rate[i] = P(recomb between i and i+1).
-    /// The last marker's rate is used for transition to next block.
-    /// Wait, `TransitionBridge` handles block-to-block.
-    /// Inside block, we use rates for transitions i -> i+1.
-    /// So size is window_size (last one unused? or used for bridge?).
-    /// Bridge uses its own rate.
-    /// So we need rates for 0..window_size-1.
-    /// Let's store full vector size `window_size` for simplicity, last element might be unused or passed to bridge.
     pub local_recomb_rates: Vec<f32>,
 
     /// Number of alleles at each marker (2 for biallelic, >2 for multiallelic)
@@ -92,11 +84,38 @@ impl CompressedBlock {
         self.hap_to_state[global_id.as_usize()]
     }
 
+    /// Get frequency of a specific allele in the reservoir
+    #[inline]
+    pub fn reservoir_freq(&self, marker_in_window: usize, allele: u8) -> f32 {
+        let offset = self.reservoir_freq_offsets[marker_in_window];
+        // If allele is out of bounds (shouldn't happen with valid data), return 0.0
+        // But for safety/speed we assume caller passes valid allele < n_alleles
+        // We can add a debug_assert.
+        let n_alleles = self.marker_n_alleles[marker_in_window] as usize;
+        if (allele as usize) < n_alleles {
+            self.reservoir_freqs[offset + allele as usize]
+        } else {
+            0.0
+        }
+    }
+
     /// Get allele at a specific marker for a pattern
+    /// Note: For reservoir, this returns the frequency of allele 1 (for compatibility with existing logic?)
+    /// WARNING: This old API returned f32. If strictly biallelic, it returned freq(1).
+    /// But for multiallelic, "allele" isn't a single scalar.
+    /// This method is deprecated/dangerous for multiallelic reservoir.
+    /// We should probably remove it or only use it for non-reservoir.
+    /// However, `hmm.rs` might rely on it. Let's see...
+    /// `hmm.rs` uses `pattern_allele` to get REF allele.
+    /// If reservoir, it was using it to get "ref_allele" which was actually frequency.
+    /// The `emission_prob` updates will fix the usage site to use `reservoir_freq` directly.
+    /// So this method should only be used for NON-reservoir patterns where it returns the exact allele (as f32).
     #[inline]
     pub fn pattern_allele(&self, pattern_id: PatternId, marker_in_window: usize) -> f32 {
         if pattern_id.is_reservoir() {
-            self.reservoir_allele_freqs[marker_in_window]
+            // Fallback for legacy calls (biallelic logic): return freq of allele 1
+            // This preserves behavior for K=2 but is meaningless for K>2
+            self.reservoir_freq(marker_in_window, 1)
         } else {
             // Fast lookup from unpacked buffer
             let idx = pattern_id.as_usize() * self.window_size() + marker_in_window;

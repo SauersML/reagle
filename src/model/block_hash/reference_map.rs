@@ -188,37 +188,60 @@ impl ReferenceMap {
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
     ) -> Vec<AllelePosteriors> {
-        let mut posteriors = Vec::with_capacity(target_genotypes.len());
+        // Pre-allocate posteriors with default values to enable direct slicing
+        let mut posteriors = vec![AllelePosteriors::Biallelic(0.0); target_genotypes.len()];
 
         // Initialize backward uniform
         if let Some(last_block) = self.blocks.last() {
-            let n_patterns = last_block.n_patterns();
-            let uniform = 1.0 / n_patterns as f32;
-            ws.bwd[..n_patterns].fill(uniform);
-            ws.reservoir_prob_bwd = 0.0;
+             let n_patterns = last_block.n_patterns();
+             let uniform = 1.0 / n_patterns as f32;
+             ws.bwd[..n_patterns].fill(uniform);
+             
+             // Fix: Initialize reservoir prob to uniform/neutral if it exists
+             if last_block.reservoir_count > 0 {
+                  // Reservoir is one "state". 
+                  // If we treat all patterns + reservoir as uniform prior:
+                  // 1.0 / (n_patterns + 1)
+                  // But code above uses 1/n_patterns.
+                  // Existing logic seems to treat pattern states as primary.
+                  // If we want "neutral", 1.0 is often safest for log-space, but here we are in probability space.
+                  // Let's match the pattern initialization logic or just 1.0.
+                  // Given `normalize_bwd` handles scaling, setting to 1.0 (or uniform) is fine.
+                  // Let's set to uniform to be safe/consistent.
+                  ws.reservoir_prob_bwd = 1.0 / (n_patterns + 1) as f32; // Rough guess
+                  // Actually, let's just use 1.0 for everything and let normalize handle it?
+                  // No, `normalize_bwd` expects some distribution.
+                  // Let's enable reservoir survival:
+                  ws.reservoir_prob_bwd = uniform; 
+             } else {
+                 ws.reservoir_prob_bwd = 0.0;
+             }
         }
 
         // Backward pass in reverse order
         for block_idx in (0..self.blocks.len()).rev() {
             let block = &self.blocks[block_idx];
 
+            let start = block.start_marker;
+            let end = block.end_marker.min(target_genotypes.len());
+            
             // Extract target genotypes for this block
-            let block_genotypes =
-                &target_genotypes[block.start_marker..block.end_marker.min(target_genotypes.len())];
+            let block_genotypes = &target_genotypes[start..end];
 
             // Restore forward checkpoint for this block
             ws.restore_checkpoint(block_idx, block.n_patterns());
 
-            // Run backward and emit posteriors for this block
-            let block_posteriors = super::hmm::backward_and_emit_block(
+            // Run backward and emit posteriors directly into the pre-allocated slice
+            // Slice range in `posteriors` is `start..end`
+            let output_slice = &mut posteriors[start..end];
+            
+            super::hmm::backward_and_emit_block(
                 block,
                 block_genotypes,
                 error_rate,
                 ws,
+                output_slice,
             );
-
-            // Prepend to posteriors (we're going backwards)
-            posteriors.splice(0..0, block_posteriors);
 
             // Apply inverse transition to previous block
             if block_idx > 0 {
@@ -244,7 +267,7 @@ impl ReferenceMap {
     ) -> Vec<AllelePosteriors> {
         // Reset workspace
         if let Some(first_block) = self.blocks.first() {
-            ws.reset(first_block.n_patterns());
+            ws.reset_from_block(first_block);
         }
 
         // Forward pass with checkpointing
