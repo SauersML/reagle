@@ -34,7 +34,13 @@ pub fn forward_within_block(
     // For each marker in the window
     for marker_in_window in 0..window_size {
         let target_allele = target_genotypes[marker_in_window];
-        let recomb_rate = block.local_recomb_rates[marker_in_window];
+        // Fix: Marker 0 uses 0.0 rate (prior already transitioned by Bridge).
+        // Markers > 0 use rate[m-1] (transition from m-1 to m).
+        let recomb_rate = if marker_in_window == 0 {
+            0.0
+        } else {
+            block.local_recomb_rates[marker_in_window - 1]
+        };
 
         // Compute emission probabilities for all patterns
         // Use ws.emissions as temp buffer
@@ -102,16 +108,17 @@ pub fn backward_and_emit_block(
     let window_size = block.window_size();
     
     // We compute posteriors in reverse order (because backward pass is reverse),
-    // but return them in genomic order. We will reverse at end or insert at front.
-    // Insert at front is O(N^2). Pre-allocate and fill in reverse?
-    // Vec doesn't support filling from back easily.
-    // We'll collect in reverse and then reverse the vector.
+    // but return them in genomic order. We will reverse at end.
     let mut posteriors_rev = Vec::with_capacity(window_size);
 
     // Re-run Forward and store history into pre-allocated workspace buffer
     for marker_idx in 0..window_size {
         let target_allele = target_genotypes[marker_idx];
-        let recomb_rate = block.local_recomb_rates[marker_idx];
+        let recomb_rate = if marker_idx == 0 {
+            0.0
+        } else {
+            block.local_recomb_rates[marker_idx - 1]
+        };
         
         let emissions = &mut ws.emissions;
         for pattern_idx in 0..n_patterns {
@@ -163,7 +170,11 @@ pub fn backward_and_emit_block(
     // Now Backward (reverse)
     for marker_idx in (0..window_size).rev() {
         let target_allele = target_genotypes[marker_idx];
-        let recomb_rate = block.local_recomb_rates[marker_idx];
+        let recomb_rate = if marker_idx == 0 {
+            0.0
+        } else {
+            block.local_recomb_rates[marker_idx - 1]
+        };
         let n_alleles = block.n_alleles(marker_idx);
         
         // Accumulate allele probabilities
@@ -190,18 +201,13 @@ pub fn backward_and_emit_block(
         let res_p = current_fwd[n_patterns] * ws.reservoir_prob_bwd;
         if res_p > 0.0 {
             total_prob += res_p;
-            // Reservoir contributes based on allele frequency
-            // Assume biallelic distribution for reservoir if multiallelic?
-            // block.reservoir_allele_freqs[marker_idx] is mean value.
+            // Reservoir contributes based on allele frequency (mean)
             let mean = block.pattern_allele(PatternId::RESERVOIR, marker_idx);
-            // Distribute mean between 0 and 1 (clamped)
             let p1 = mean.clamp(0.0, 1.0);
             let p0 = 1.0 - p1;
             
             if 0 < n_alleles { allele_probs[0] += res_p * p0; }
             if 1 < n_alleles { allele_probs[1] += res_p * p1; }
-            // For >2 alleles, we ignore reservoir contribution to alleles >1 
-            // (limitation of current reservoir compression)
         }
         
         // Normalize
@@ -267,10 +273,6 @@ pub fn backward_and_emit_block(
     posteriors_rev
 }
 
-fn pattern_idx_to_id(idx: usize) -> PatternId {
-    PatternId::new(idx as u16)
-}
-
 /// Compute emission probability for a pattern at a marker
 #[inline]
 fn emission_prob(
@@ -305,4 +307,8 @@ fn emission_prob(
             error_rate
         }
     }
+}
+
+fn pattern_idx_to_id(idx: usize) -> PatternId {
+    PatternId::new(idx as u16)
 }
