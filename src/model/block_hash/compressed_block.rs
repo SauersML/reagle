@@ -6,7 +6,6 @@
 use super::types::{GlobalId, PatternId};
 use super::types::{GlobalId, PatternId};
 // storage removed
-use std::sync::Arc;
 
 /// Immutable compressed reference data for a window
 ///

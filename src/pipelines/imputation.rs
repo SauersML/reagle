@@ -766,6 +766,7 @@ impl ImputationPipeline {
 // ... existing tests ...
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     // Tests for imputation pipeline

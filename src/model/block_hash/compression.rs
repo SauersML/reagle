@@ -9,7 +9,7 @@ use crate::data::storage::dictionary::DictionaryColumn;
 use crate::data::storage::matrix::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
 use super::compressed_block::CompressedBlock;
-use super::types::GlobalId;
+use super::types::{GlobalId, PatternId};
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -294,10 +294,74 @@ impl CompressionStats {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
+    use crate::data::marker::Markers;
+    use crate::data::storage::GenotypeColumn;
+    use crate::data::storage::phase_state::Phased;
+
+    #[test]
     fn test_build_compressed_block() {
-        // Integration test - requires full GenotypeMatrix setup
+        // Setup simple scenario: 4 haplotypes, 2 markers
+        // Hap 0: (0, 0)
+        // Hap 1: (0, 0)
+        // Hap 2: (1, 1)
+        // Hap 3: (1, 1)
+        
+        let markers = Markers::new();
+        // (Mocking markers unnecessary for simple compression logic if not checked)
+        let n_haps = 4;
+        let col0 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
+        let col1 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
+        
+        // Mock GenotypeMatrix wrapper equivalent
+        // Since GenotypeMatrix is complex to mock, we'll implement a minimal verified fake or use public API if feasible.
+        // The public API requires Samples, Markers etc. 
+        // Let's create a minimal valid GenotypeMatrix.
+        use crate::data::haplotype::Samples;
+        use crate::data::marker::{Marker, Allele, ChromIdx};
+        let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
+        let mut m = Markers::new();
+        let chr = m.add_chrom("chr1");
+        m.push(Marker::new(chr, 100, None, Allele::Base(0), vec![Allele::Base(1)]));
+         m.push(Marker::new(chr, 200, None, Allele::Base(0), vec![Allele::Base(1)]));
+
+        let gt = GenotypeMatrix::new_phased(
+            m,
+            vec![col0, col1],
+            samples,
+        );
+
+        let recomb_rates = vec![0.01, 0.01];
+        let block = build_compressed_block(&gt, 0..2, 0, &recomb_rates);
+
+        // Verify compression
+        // Haps 0,1 should be Pattern A
+        // Haps 2,3 should be Pattern B
+        assert_eq!(block.n_patterns(), 2);
+        assert_eq!(block.n_ref_haps(), 4);
+        
+        let p0 = block.pattern_for_haplotype(GlobalId::new(0));
+        let p1 = block.pattern_for_haplotype(GlobalId::new(1));
+        let p2 = block.pattern_for_haplotype(GlobalId::new(2));
+        let p3 = block.pattern_for_haplotype(GlobalId::new(3));
+
+        assert_eq!(p0, p1);
+        assert_eq!(p2, p3);
+        assert_ne!(p0, p2);
+
+        // Check counts
+        assert_eq!(block.pattern_counts[p0.as_usize()], 2.0);
+        assert_eq!(block.pattern_counts[p2.as_usize()], 2.0);
+
+        // Check unpacked alleles
+        // Pattern 0: (0, 0)
+        assert_eq!(block.pattern_allele(p0, 0), 0.0);
+        assert_eq!(block.pattern_allele(p0, 1), 0.0);
+        // Pattern 1: (1, 1)
+        assert_eq!(block.pattern_allele(p2, 0), 1.0);
+        assert_eq!(block.pattern_allele(p2, 1), 1.0);
     }
 }

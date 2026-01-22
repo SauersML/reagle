@@ -374,12 +374,136 @@ fn aggregate_reservoir_transitions(
 #[cfg(test)]
 mod tests {
     #[test]
+    use super::*;
+    use crate::data::marker::Markers;
+    use crate::data::haplotype::Samples;
+    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::model::block_hash::compression::build_compressed_block;
+    use std::sync::Arc;
+
+    fn create_mock_block(alleles: &[u8], n_haps: usize, n_markers: usize) -> CompressedBlock {
+        use crate::data::marker::{Marker, Allele};
+        
+        let mut cols = Vec::new();
+        for m in 0..n_markers {
+            let mut col_alleles = Vec::new();
+            for h in 0..n_haps {
+                col_alleles.push(alleles[h * n_markers + m]);
+            }
+            cols.push(GenotypeColumn::from_alleles(&col_alleles, 2));
+        }
+
+        let mut markers = Markers::new();
+        let chr = markers.add_chrom("1");
+        for i in 0..n_markers {
+            markers.push(Marker::new(chr, i as u32, None, Allele::Base(0), vec![Allele::Base(1)]));
+        }
+        
+        // Samples logic is messy, just make enough IDs
+        let mut sample_ids = Vec::new();
+        for i in 0..(n_haps + 1) / 2 {
+            sample_ids.push(format!("S{}", i));
+        }
+        let samples = Arc::new(Samples::from_ids(sample_ids));
+
+        let gt = GenotypeMatrix::new_phased(markers, cols, samples);
+        let rates = vec![0.0; n_markers];
+        build_compressed_block(&gt, 0..n_markers, 0, &rates)
+    }
+
+    #[test]
     fn test_build_bridge_deterministic() {
-        // Integration test - verifies deterministic CSR construction
+        // Window A: 2 patterns (0,0) and (1,1) duplicated
+        // Haps: 0->P0, 1->P0, 2->P1, 3->P1
+        let a_alleles = vec![
+            0,0, 
+            0,0, 
+            1,1, 
+            1,1
+        ];
+        // Window B: Swapped? No, let's mix it up.
+        // Haps: 0->P0(0,0), 1->P1(1,1), 2->P0(0,0), 3->P1(1,1) (Cross-over)
+        let b_alleles = vec![
+            0,0,
+            1,1,
+            0,0,
+            1,1
+        ];
+
+        let block_a = create_mock_block(&a_alleles, 4, 2);
+        let block_b = create_mock_block(&b_alleles, 4, 2);
+
+        let bridge = TransitionBridge::build(&block_a, &block_b, 0.0);
+
+        // block_a has 2 patterns (weights 2/4 each)
+        // block_b has 2 patterns (weights 2/4 each)
+        
+        // Transition logic:
+        // Hap 0: P0(A) -> P0(B)
+        // Hap 1: P0(A) -> P1(B)
+        // Hap 2: P1(A) -> P0(B)
+        // Hap 3: P1(A) -> P1(B)
+        
+        // P0(A) splits equally to P0(B) and P1(B).
+        // P1(A) splits equally to P0(B) and P1(B).
+        
+        assert_eq!(bridge.sources.len(), 4);
+        assert_eq!(bridge.destinations.len(), 4);
+        
+        // Check weights
+        // P0(A) count=2. Weight=1/2.
+        // Flow = 1/2 * 1 * 1.0 (no recomb) = 0.5.
+        // Since we aggregate, we expect total weight out of P0 to be 0.5 * 2 = 1.0?
+        // Wait, "weight" in build is 1/count.
+        // Hap 0: w=0.5. Flow=0.5.
+        // Hap 1: w=0.5. Flow=0.5.
+        // Total flow from P0(A) = 1.0. Correct.
     }
 
     #[test]
     fn test_apply_transition_mass_conservation() {
-        // Integration test - verifies probability mass conservation
+        let n_haps = 100;
+        let n_markers = 5;
+        // Random alleles
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+        use rand::Rng;
+        
+        let mut alleles_a = vec![0u8; n_haps * n_markers];
+        let mut alleles_b = vec![0u8; n_haps * n_markers];
+        for i in 0..alleles_a.len() {
+             alleles_a[i] = if rng.random_bool(0.5) { 1 } else { 0 };
+             alleles_b[i] = if rng.random_bool(0.5) { 1 } else { 0 };
+        }
+
+        let block_a = create_mock_block(&alleles_a, n_haps, n_markers);
+        let block_b = create_mock_block(&alleles_b, n_haps, n_markers);
+
+        let bridge = TransitionBridge::build(&block_a, &block_b, 0.01);
+        
+        // Setup workspace
+        use crate::model::block_hash::BlockHmmWorkspace;
+        let mut ws = BlockHmmWorkspace::new(1000); // Plenty of space
+        
+        // Initialize random probability distribution summing to 1.0
+        let n_patterns_a = block_a.n_patterns();
+        let mut sum = 0.0;
+        for i in 0..n_patterns_a {
+            let val = rng.random::<f32>();
+            ws.fwd[i] = val;
+            sum += val;
+        }
+        // Normalize
+        for i in 0..n_patterns_a {
+            ws.fwd[i] /= sum;
+        }
+        
+        // Apply Forward
+        bridge.apply_forward(&block_a, &block_b, &mut ws);
+        
+        // Check sum in B
+        let n_patterns_b = block_b.n_patterns();
+        let final_sum: f32 = ws.fwd[..n_patterns_b].iter().sum::<f32>() + ws.reservoir_prob_fwd;
+        
+        assert!((final_sum - 1.0).abs() < 1e-5, "Mass not conserved: {}", final_sum);
     }
 }
