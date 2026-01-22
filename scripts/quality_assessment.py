@@ -30,7 +30,7 @@ def run_benchmark(person, file_path, format):
     # 3. Run Beagle
     print("=== Running Beagle ===")
     beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
-    run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=chr22", "nthreads=2", "gp=true"])
+    run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=chr22", "nthreads=4", "gp=true"])
 
     # 4. Run Metrics using the Python integration test
     print("=== Calculating Metrics ===")
@@ -78,7 +78,6 @@ def run_benchmark(person, file_path, format):
     run_cmd(["python3", "tests/integration_test.py", "metrics"])
 
 if __name__ == "__main__":
-    print("Quality Assessment Script v1.1")
     parser = argparse.ArgumentParser()
     parser.add_argument("--person", required=True)
     parser.add_argument("--file", required=True)
