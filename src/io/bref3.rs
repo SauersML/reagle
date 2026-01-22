@@ -641,6 +641,12 @@ impl StreamingBref3WindowReader {
         let chrom_name = self.current_chrom.as_deref().unwrap_or("UNKNOWN");
         let window_chrom_idx = markers.add_chrom(chrom_name);
 
+        let next_window_start_pos = if window_end < self.buffer.len() {
+            Some(self.buffer[window_end].marker.pos)
+        } else {
+            None
+        };
+
         for i in 0..window_end {
             let bm = &self.buffer[i];
             let mut marker = bm.marker.clone();
@@ -658,6 +664,7 @@ impl StreamingBref3WindowReader {
             output_end,
             is_first: self.window_num == 0,
             is_last,
+            next_window_start_pos,
         };
 
         for _ in 0..output_end {
@@ -770,6 +777,8 @@ pub struct RefWindow {
     pub is_first: bool,
     /// Whether this is the last window
     pub is_last: bool,
+    /// Position of the first marker in the NEXT window (if known)
+    pub next_window_start_pos: Option<u32>,
 }
 
 /// Unified reference panel reader that supports both BREF3 (streaming) and VCF (in-memory)
@@ -829,6 +838,7 @@ impl InMemoryRefReader {
             output_end: n_markers,
             is_first: true,
             is_last: true,
+            next_window_start_pos: None,
         }))
     }
 }
@@ -1009,6 +1019,12 @@ impl StreamingRefVcfReader {
         let mut markers = Markers::new();
         let mut columns = Vec::with_capacity(window_end);
 
+        let next_window_start_pos = if window_end < self.buffer.len() {
+            Some(self.buffer[window_end].marker.pos)
+        } else {
+            None
+        };
+
         for i in 0..window_end {
             let bm = &self.buffer[i];
             let chrom_name = self
@@ -1031,6 +1047,7 @@ impl StreamingRefVcfReader {
             output_end,
             is_first: self.window_num == 0,
             is_last,
+            next_window_start_pos,
         };
 
         for _ in 0..output_end {

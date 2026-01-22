@@ -148,19 +148,23 @@ impl HmmUpdater {
         }
     }
 
-    /// Backward update using precomputed per-state emission probabilities.
+    /// Backward update with constant term C for Li-Stephens model
+    ///
+    /// beta[i] = (1.0 - r) * emissions[i] * beta[i] + r * C
+    /// where C = sum(emissions[j] * beta[j]) over all j
     #[inline]
-    pub fn bwd_update_emissions(
+    pub fn bwd_update_constant(
         bwd: &mut [f32],
-        p_switch: f32,
+        p_switch: f32, // r
         emissions: &[f32],
+        constant_term: f32, // C
         n_states: usize,
     ) {
-        let shift = p_switch / n_states as f32;
-        let scale = 1.0 - p_switch;
+        let r_const = p_switch * constant_term; // r * C
+        let scale = 1.0 - p_switch; // 1 - r
 
-        let shift_vec = f32x8::splat(shift);
         let scale_vec = f32x8::splat(scale);
+        let const_vec = f32x8::splat(r_const);
 
         let mut k = 0;
         while k + 8 <= n_states {
@@ -172,14 +176,16 @@ impl HmmUpdater {
             emit_arr.copy_from_slice(&emissions[k..k + 8]);
             let emit_vec = f32x8::from(emit_arr);
 
-            let res = emit_vec * (scale_vec * bwd_chunk + shift_vec);
+            // res = (scale * emit * bwd) + const
+            let res = (scale_vec * emit_vec * bwd_chunk) + const_vec;
+            
             let res_arr: [f32; 8] = res.into();
             bwd[k..k + 8].copy_from_slice(&res_arr);
             k += 8;
         }
 
         for i in k..n_states {
-            bwd[i] = emissions[i] * (scale * bwd[i] + shift);
+            bwd[i] = scale * emissions[i] * bwd[i] + r_const;
         }
     }
 }
@@ -446,10 +452,18 @@ impl<'a> BeagleHmm<'a> {
                 bwd[curr_row + k] = bwd[next_row + k];
             }
 
-            HmmUpdater::bwd_update_emissions(
+            // Calculate constant term C = sum_k (bwd[k] * output_prob[k])
+            let mut constant_term = 0.0f32;
+            let current_bwd = &bwd[curr_row..curr_row + n_states];
+            for k in 0..n_states {
+                constant_term += current_bwd[k] * emissions[k];
+            }
+
+            HmmUpdater::bwd_update_constant(
                 &mut bwd[curr_row..curr_row + n_states],
                 p_recomb_next,
                 &emissions,
+                constant_term,
                 n_states,
             );
         }
@@ -649,10 +663,18 @@ impl<'a> BeagleHmm<'a> {
                 bwd[curr_row + k] = bwd[next_row + k];
             }
 
-            HmmUpdater::bwd_update_emissions(
+            // Calculate constant term C
+            let mut constant_term = 0.0f32;
+            let current_bwd = &bwd[curr_row..curr_row + n_states];
+            for k in 0..n_states {
+                constant_term += current_bwd[k] * emissions[k];
+            }
+
+            HmmUpdater::bwd_update_constant(
                 &mut bwd[curr_row..curr_row + n_states],
                 p_recomb_next,
                 &emissions,
+                constant_term,
                 n_states,
             );
         }

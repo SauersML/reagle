@@ -140,14 +140,6 @@ impl MarkerAlignment {
         }
     }
 
-    /// Check if a marker has allele mapping
-    pub fn has_allele_mapping(&self, target_marker: usize) -> bool {
-        self.allele_mappings
-            .get(target_marker)
-            .and_then(|m| m.as_ref())
-            .is_some()
-    }
-
     /// Get the number of markers that were successfully aligned
     pub fn n_aligned(&self) -> usize {
         self.ref_to_target.iter().filter(|&&x| x >= 0).count()

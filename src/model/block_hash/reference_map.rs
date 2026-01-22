@@ -54,7 +54,7 @@ impl ReferenceMap {
         let n_markers = ref_data.n_markers();
         let n_windows = (n_markers + window_size - 1) / window_size;
 
-        assert_eq!(recomb_rates.len(), n_markers, "Recombination rates must length must match n_markers");
+        assert_eq!(recomb_rates.len(), n_markers - 1, "Recombination rates length must match n_markers - 1");
 
         // Build all compressed blocks
         let mut blocks = Vec::with_capacity(n_windows);
@@ -62,8 +62,30 @@ impl ReferenceMap {
         for win_idx in 0..n_windows {
             let start = win_idx * window_size;
             let end = (start + window_size).min(n_markers);
-            
-            let block_rates = &recomb_rates[start..end];
+
+            // Recombination rates:
+            // For a block of M markers, we have M-1 internal intervals.
+            // The `recomb_rates` input has N-1 rates.
+            // We need to slice the rates corresponding to the intervals WITHIN this block.
+            // Interval i connects marker i and i+1.
+            // So for markers [start..end], we need rates [start..end-1].
+            // Careful with the last block which might be smaller.
+            let rate_end = if end == n_markers {
+                // Last marker has no outgoing rate in the global array (it's N-1 length)
+                // But generally rate[i] connects i->i+1.
+                // If end=N, the last interval is N-2 -> N-1.
+                // So we slice up to end-1.
+                end - 1
+            } else {
+                end - 1
+            };
+
+            // range check
+            let block_rates = if start < rate_end {
+                 &recomb_rates[start..rate_end]
+            } else {
+                 &[]
+            };
 
             // Build compressed block (uses existing compression module)
             let block = super::compression::build_compressed_block(
@@ -82,10 +104,14 @@ impl ReferenceMap {
         for i in 0..n_windows.saturating_sub(1) {
             // Rate between block i and i+1
             // Block i ends at `blocks[i].end_marker`.
-            // The last marker in block i is `end_marker - 1`.
-            // The rate at `end_marker - 1` defines transition to `end_marker`.
-            let boundary_rate = recomb_rates[blocks[i].end_marker - 1];
-            
+            // The last marker in block i is at index `end_marker - 1`.
+            // The rate at `end_marker - 1` defines transition to `end_marker` (start of next block).
+            // Since `recomb_rates` is 0-indexed relative to global markers:
+            // rate[k] is transition k -> k+1.
+            // We want transition from (end_marker-1) -> end_marker.
+            // So we need rate[end_marker - 1].
+            let boundary_rate = recomb_rates[blocks[i].end_marker - 1]; // Correct indexing
+
             let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], boundary_rate);
             bridges.push(Arc::new(bridge));
         }
@@ -259,7 +285,7 @@ impl ReferenceMap {
     /// Impute a single sample (combines forward + backward + emit)
     ///
     /// This is the main entry point for imputation.
-    pub fn impute_sample(
+    pub(crate) fn impute_sample(
         &self,
         target_genotypes: &[u8],
         error_rate: f32,

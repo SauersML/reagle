@@ -1487,7 +1487,7 @@ impl PhasingPipeline {
 
                 let conf = &confidence_by_sample[s];
                 SamplePhase::new(
-                    s as u32, n_markers, &alleles1, &alleles2, conf, &unphased, &missing,
+                    n_markers, &alleles1, &alleles2, conf, &unphased, &missing,
                 )
             })
             .collect()
@@ -1530,7 +1530,7 @@ impl PhasingPipeline {
 
                 let conf = &confidence_by_sample[s];
                 SamplePhase::new(
-                    s as u32, n_markers, &alleles1, &alleles2, conf, &unphased, &missing,
+                    n_markers, &alleles1, &alleles2, conf, &unphased, &missing,
                 )
             })
             .collect()

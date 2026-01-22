@@ -86,7 +86,7 @@ impl AllelePosteriors {
 /// This avoids linear interpolation and correctly diffuses to uniform in long gaps.
 /// Uses CSR (Compressed Sparse Row) format to eliminate Vec<Vec<T>> overhead.
 #[derive(Clone, Debug)]
-pub struct ClusterStateProbs {
+pub(crate) struct ClusterStateProbs {
     marker_cluster: std::sync::Arc<Vec<usize>>,
     ref_cluster_end: std::sync::Arc<Vec<usize>>,
     gen_positions: std::sync::Arc<Vec<f64>>,
@@ -101,7 +101,7 @@ pub struct ClusterStateProbs {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct AllelePosteriorCache {
+pub(crate) struct AllelePosteriorCache {
     seq_block_id: usize,
     seq_cluster: usize,
     seq_probs: Vec<f32>,

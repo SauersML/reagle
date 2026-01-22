@@ -84,70 +84,45 @@ impl StateProbs {
 #[derive(Clone, Debug)]
 pub struct HaplotypePriors {
     /// Sorted haplotype IDs (for binary search)
-    pub hap_ids: Vec<u32>,
+    hap_ids: Vec<u32>,
     /// Corresponding probabilities (same order as hap_ids)
-    pub probs: Vec<f32>,
+    probs: Vec<f32>,
 }
 
 impl HaplotypePriors {
-    /// Create empty priors
-    pub fn new() -> Self {
+    /// Create new priors with invariant enforcement (sorting)
+    pub fn new(hap_ids: Vec<u32>, probs: Vec<f32>) -> Self {
+        if hap_ids.is_empty() {
+            return Self {
+                hap_ids: Vec::new(),
+                probs: Vec::new(),
+            };
+        }
+
+        // enforce invariant: sorted by hap_id
+        let mut pairs: Vec<_> = hap_ids.into_iter().zip(probs).collect();
+        pairs.sort_unstable_by_key(|(id, _)| *id);
+        let (ids, ps): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+
+        Self { hap_ids: ids, probs: ps }
+    }
+
+    /// Create empty priors (uniform distribution)
+    pub fn empty() -> Self {
         Self {
             hap_ids: Vec::new(),
             probs: Vec::new(),
         }
     }
 
-    /// Get prior probability for a haplotype.
-    /// Returns uniform prior (1/n_states) if haplotype not seen in previous window.
-    /// Uses binary search for O(log K) lookup with good cache locality.
-    #[inline]
-    pub fn prior(&self, hap_id: u32, n_states: usize) -> f32 {
-        match self.hap_ids.binary_search(&hap_id) {
-            Ok(idx) => self.probs[idx],
-            Err(_) => 1.0 / n_states.max(1) as f32,
-        }
+    /// Get reference to sorted haplotype IDs
+    pub fn ids(&self) -> &[u32] {
+        &self.hap_ids
     }
 
-    /// Set priors from HMM state posteriors at window boundary.
-    /// Uses an adaptive threshold to avoid discarding most mass at high state counts.
-    /// Sorts by hap_id for efficient binary search lookup.
-    pub fn set_from_posteriors(
-        &mut self,
-        hap_indices: &[u32],
-        probs: &[f32],
-        gen_position: f64,
-        window: usize,
-    ) {
-        self.hap_ids.clear();
-        self.probs.clear();
-
-        let _ = (gen_position, window);
-
-        let adaptive_min = (1.0 / hap_indices.len().max(1) as f32) * 0.5;
-        let min_prob = adaptive_min.min(0.001).max(1e-6);
-
-        // Collect significant probabilities
-        let mut pairs: Vec<(u32, f32)> = hap_indices
-            .iter()
-            .zip(probs.iter())
-            .filter(|(_, p)| **p > min_prob)
-            .map(|(&h, &p)| (h, p))
-            .collect();
-
-        // Sort by hap_id for binary search
-        pairs.sort_unstable_by_key(|(h, _)| *h);
-
-        // Split into parallel arrays
-        self.hap_ids.reserve(pairs.len());
-        self.probs.reserve(pairs.len());
-        let total: f32 = pairs.iter().map(|(_, p)| *p).sum();
-        if total > 0.0 {
-            for (h, p) in pairs {
-                self.hap_ids.push(h);
-                self.probs.push(p / total);
-            }
-        }
+    /// Get reference to probabilities aligned with IDs
+    pub fn probs(&self) -> &[f32] {
+        &self.probs
     }
 
     /// Check if we have any priors
@@ -158,7 +133,7 @@ impl HaplotypePriors {
 
 impl Default for HaplotypePriors {
     fn default() -> Self {
-        Self::new()
+        Self::empty()
     }
 }
 
@@ -242,9 +217,9 @@ pub struct StreamWindow {
     /// Phased genotypes from overlap region of previous window
     /// These should be used to constrain/seed the current window's phasing
     pub phased_overlap: Option<PhasedOverlap>,
-    /// Genomic position of the first marker of the NEXT window (if known)
-    /// Used for precise recombination rate calculation at the window boundary
-    pub next_window_start_pos: Option<u32>,
+    /// Recombination rate at the boundary between this window's effective end and the next window
+    /// This is the rate between `output_end - 1` and `output_end` (relative to window).
+    pub boundary_recomb_rate: Option<f32>,
 }
 
 impl StreamWindow {
@@ -623,8 +598,14 @@ impl StreamingVcfReader {
             // So we need the rate for the last marker in the overlap region.
             // That rate connects to the marker *after* the overlap.
             // So looking at `self.buffer[window_end]` is correct.
-            let next_window_start_pos = if window_end < self.buffer.len() {
-                Some(self.buffer[window_end].marker.pos)
+            // Calculate boundary recombination rate
+            let boundary_recomb_rate = if window_end < self.buffer.len() {
+                let m1 = &self.buffer[window_end - 1];
+                let m2 = &self.buffer[window_end];
+                let dist_cm = (m2.gen_pos - m1.gen_pos).abs();
+                // Haldane map function approx
+                let rate = (1.0 - (-2.0 * dist_cm / 100.0).exp()) * 0.5;
+                Some(rate as f32)
             } else {
                 None
             };
@@ -637,7 +618,7 @@ impl StreamingVcfReader {
                 output_end,
                 is_first: self.window_num == 0,
                 phased_overlap: None, // Caller will set this from previous window's phased output
-                next_window_start_pos,
+                boundary_recomb_rate,
             };
 
             // Remove processed markers from buffer (keep overlap)
@@ -814,8 +795,9 @@ impl StreamingVcfReader {
             global_end: self.global_marker_idx + last_idx + 1,
             output_start: 0,
             output_end: n_markers,
+            is_first: self.window_num == 0,
             phased_overlap: None,
-            next_window_start_pos: None,
+            boundary_recomb_rate: None,
         };
 
         while self

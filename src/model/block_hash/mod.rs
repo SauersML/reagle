@@ -40,12 +40,8 @@ mod compression;
 mod hmm;
 mod weighted_kernel;
 
-// Public API exports
-pub use types::{GlobalId, PatternId};
-pub use compressed_block::CompressedBlock;
-pub use workspace::BlockHmmWorkspace;
-pub use reference_map::ReferenceMap;
-pub use compression::{
-    build_compressed_block, CompressionStats,
-    DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES
-};
+// Crate-internal API exports (will become public when integrated)
+pub(crate) use types::GlobalId;
+pub(crate) use compressed_block::CompressedBlock;
+pub(crate) use workspace::BlockHmmWorkspace;
+pub(crate) use reference_map::ReferenceMap;

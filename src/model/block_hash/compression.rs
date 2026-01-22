@@ -14,12 +14,6 @@ use super::types::{GlobalId, PatternId};
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Default window size (can be adjusted based on LD patterns)
-pub const DEFAULT_WINDOW_SIZE: usize = 32;
-
-/// Maximum states before truncation (0 = no limit)
-pub const DEFAULT_MAX_STATES: usize = 0;
-
 /// Build a CompressedBlock from a range of markers (Recommended API)
 ///
 /// This creates immutable, Arc-shareable reference data.
@@ -33,7 +27,7 @@ pub const DEFAULT_MAX_STATES: usize = 0;
 ///
 /// # Returns
 /// CompressedBlock with only immutable reference data (no per-sample HMM state)
-pub fn build_compressed_block(
+pub(crate) fn build_compressed_block(
     ref_data: &GenotypeMatrix<Phased>,
     marker_range: Range<usize>,
     max_states: usize,
@@ -103,17 +97,27 @@ pub fn build_compressed_block(
     let hap_to_pattern = storage.hap_to_pattern();
     let n_unique_patterns = storage.n_patterns();
 
+    // Build initial pattern_counts and pattern_to_globals from storage
+    let mut initial_pattern_counts: Vec<f32> = vec![0.0; n_unique_patterns];
+    let mut initial_pattern_to_globals: Vec<Vec<GlobalId>> = vec![Vec::new(); n_unique_patterns];
+
+    for (hap_idx, &pattern_idx) in hap_to_pattern.iter().enumerate() {
+        let global_id = GlobalId::new(hap_idx as u32);
+        initial_pattern_counts[pattern_idx as usize] += 1.0;
+        initial_pattern_to_globals[pattern_idx as usize].push(global_id);
+    }
+
     // Handle truncation if needed
     // max_states=0 means no limit (use usize::MAX)
     let limit = if max_states == 0 { usize::MAX } else { max_states };
 
-    let (pattern_counts, pattern_to_globals, reservoir_count, reservoir_globals, reservoir_allele_freqs, hap_to_state) =
+    let (pattern_counts, pattern_to_globals, reservoir_count, reservoir_globals, reservoir_allele_freqs, reservoir_freq_offsets, reservoir_obs_fractions, hap_to_state) =
         if n_unique_patterns > limit {
             // Truncate to top max_states by count
             let mut pattern_order: Vec<usize> = (0..n_unique_patterns).collect();
             pattern_order.sort_by(|&a, &b| {
-                pattern_counts[b]
-                    .partial_cmp(&pattern_counts[a])
+                initial_pattern_counts[b]
+                    .partial_cmp(&initial_pattern_counts[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
@@ -136,7 +140,7 @@ pub fn build_compressed_block(
 
             // Build reservoir globals
             let mut reservoir_globals = Vec::new();
-            for (pattern_idx, globals) in pattern_to_globals.iter().enumerate() {
+            for (pattern_idx, globals) in initial_pattern_to_globals.iter().enumerate() {
                 if !kept_patterns_set.contains(&pattern_idx) {
                     reservoir_globals.extend(globals.iter().copied());
                 }
@@ -145,18 +149,18 @@ pub fn build_compressed_block(
             let reservoir_count = reservoir_globals.len() as u32;
 
             // Compute reservoir allele frequencies
-            let (reservoir_freqs, reservoir_freq_offsets) = if reservoir_count > 0 {
+            let (reservoir_freqs, reservoir_freq_offsets, reservoir_obs_fractions) = if reservoir_count > 0 {
                 compute_reservoir_freqs(&storage, &reservoir_globals, n_markers, &marker_n_alleles)
             } else {
                 // Empty placeholders
-                (Vec::new(), vec![0; n_markers])
+                (Vec::new(), vec![0; n_markers], vec![0.0; n_markers])
             };
 
             // Filter/Reorder pattern_counts and pattern_to_globals
-            let pattern_counts = kept_indices.iter().map(|&i| pattern_counts[i]).collect();
-            let pattern_to_globals = kept_indices
+            let pattern_counts: Vec<f32> = kept_indices.iter().map(|&i| initial_pattern_counts[i]).collect();
+            let pattern_to_globals: Vec<Vec<GlobalId>> = kept_indices
                 .iter()
-                .map(|&i| pattern_to_globals[i].clone())
+                .map(|&i| initial_pattern_to_globals[i].clone())
                 .collect();
 
             (
@@ -166,6 +170,7 @@ pub fn build_compressed_block(
                 reservoir_globals,
                 reservoir_freqs,
                 reservoir_freq_offsets,
+                reservoir_obs_fractions,
                 hap_to_state,
             )
         } else {
@@ -176,12 +181,13 @@ pub fn build_compressed_block(
                 .collect();
 
             (
-                pattern_counts,
-                pattern_to_globals,
+                initial_pattern_counts,
+                initial_pattern_to_globals,
                 0,
-                Vec::new(),
-                Vec::new(),
-                vec![0; n_markers],
+                Vec::new(),  // reservoir_globals
+                Vec::new(),  // reservoir_freqs
+                vec![0; n_markers],  // reservoir_freq_offsets
+                vec![0.0; n_markers], // reservoir_obs_fractions
                 hap_to_state,
             )
         };
@@ -195,7 +201,8 @@ pub fn build_compressed_block(
     // Note: pattern_to_globals is now indexed by usage rank
     for (kept_idx, globals) in pattern_to_globals.iter().enumerate() {
         if let Some(first_global) = globals.first() {
-             let hap = HapIdx::new(first_global.as_u32());
+             let hap_u32: u32 = first_global.as_u32();
+             let hap = HapIdx::new(hap_u32);
              for m in 0..n_markers {
                  let allele = storage.get(m, hap);
                  unpacked_alleles[kept_idx * n_markers + m] = allele;
@@ -211,8 +218,9 @@ pub fn build_compressed_block(
         pattern_to_globals,
         reservoir_count,
         reservoir_globals,
-        reservoir_freqs,
+        reservoir_freqs: reservoir_allele_freqs,
         reservoir_freq_offsets,
+        reservoir_obs_fractions,
         unpacked_alleles,
         local_recomb_rates,
         marker_n_alleles,
@@ -225,10 +233,10 @@ fn compute_reservoir_freqs(
     reservoir_globals: &[GlobalId],
     window_size: usize,
     marker_n_alleles: &[u8],
-) -> (Vec<f32>, Vec<usize>) {
+) -> (Vec<f32>, Vec<usize>, Vec<f32>) {
     let n_reservoir = reservoir_globals.len();
     if n_reservoir == 0 {
-        return (Vec::new(), vec![0; window_size]);
+        return (Vec::new(), vec![0; window_size], vec![0.0; window_size]);
     }
 
     // Calculate total size and offsets
@@ -241,6 +249,7 @@ fn compute_reservoir_freqs(
     let total_slots = current_offset;
     
     let mut counts = vec![0u32; total_slots];
+    let mut obs_counts = vec![0u32; window_size];
 
     for &global_id in reservoir_globals {
         let hap = HapIdx::new(global_id.as_u32());
@@ -255,72 +264,37 @@ fn compute_reservoir_freqs(
                 if (allele as usize) < n_alleles {
                     let offset = offsets[marker_idx];
                     counts[offset + allele as usize] += 1;
+                    obs_counts[marker_idx] += 1;
                 }
             }
         }
     }
 
-    let freqs: Vec<f32> = counts
-        .iter()
-        .map(|&c| {
-            if n_reservoir > 0 {
-                c as f32 / n_reservoir as f32
-            } else {
-                0.0
-            }
-        })
+    // frequencies
+    let mut freqs = Vec::with_capacity(counts.len());
+    let mut current_marker = 0;
+    let mut current_end = offsets.get(1).copied().unwrap_or(counts.len());
+    
+    for (i, &c) in counts.iter().enumerate() {
+         while i >= current_end {
+             current_marker += 1;
+             current_end = offsets.get(current_marker + 1).copied().unwrap_or(counts.len());
+         }
+         
+         let n_obs = obs_counts[current_marker];
+         if n_obs > 0 {
+             freqs.push(c as f32 / n_obs as f32);
+         } else {
+             freqs.push(0.0);
+         }
+    }
+    
+    // obs fractions
+    let obs_fractions: Vec<f32> = obs_counts.iter()
+        .map(|&c| if n_reservoir > 0 { c as f32 / n_reservoir as f32 } else { 0.0 })
         .collect();
 
-    (freqs, offsets)
-}
-
-/// Compression statistics for logging/debugging
-#[derive(Debug, Clone)]
-pub struct CompressionStats {
-    pub n_windows: usize,
-    pub total_patterns: usize,
-    pub total_ref_haps: usize,
-    pub avg_compression_ratio: f64,
-    pub max_patterns: usize,
-    pub min_patterns: usize,
-}
-
-impl CompressionStats {
-    pub fn from_blocks(blocks: &[Arc<CompressedBlock>]) -> Self {
-        let n_windows = blocks.len();
-        let total_patterns: usize = blocks.iter().map(|w| w.n_patterns()).sum();
-        let total_ref_haps = blocks.first().map(|w| w.n_ref_haps()).unwrap_or(0);
-
-        let avg_compression_ratio = if n_windows > 0 {
-            total_ref_haps as f64 / (total_patterns as f64 / n_windows as f64)
-        } else {
-            0.0
-        };
-
-        let max_patterns = blocks.iter().map(|w| w.n_patterns()).max().unwrap_or(0);
-        let min_patterns = blocks.iter().map(|w| w.n_patterns()).min().unwrap_or(0);
-
-        Self {
-            n_windows,
-            total_patterns,
-            total_ref_haps,
-            avg_compression_ratio,
-            max_patterns,
-            min_patterns,
-        }
-    }
-
-    pub fn print_summary(&self) {
-        println!("Compression Statistics:");
-        println!("  Windows: {}", self.n_windows);
-        println!("  Total patterns: {}", self.total_patterns);
-        println!("  Reference haplotypes: {}", self.total_ref_haps);
-        println!(
-            "  Avg compression ratio: {:.2}x",
-            self.avg_compression_ratio
-        );
-        println!("  Pattern range: {} - {}", self.min_patterns, self.max_patterns);
-    }
+    (freqs, offsets, obs_fractions)
 }
 
 #[cfg(test)]
@@ -385,10 +359,10 @@ mod tests {
 
         // Check unpacked alleles
         // Pattern 0: (0, 0)
-        assert_eq!(block.pattern_allele(p0, 0), 0.0);
-        assert_eq!(block.pattern_allele(p0, 1), 0.0);
+        assert_eq!(block.get_pattern_allele(p0, 0), 0);
+        assert_eq!(block.get_pattern_allele(p0, 1), 0);
         // Pattern 1: (1, 1)
-        assert_eq!(block.pattern_allele(p2, 0), 1.0);
-        assert_eq!(block.pattern_allele(p2, 1), 1.0);
+        assert_eq!(block.get_pattern_allele(p2, 0), 1);
+        assert_eq!(block.get_pattern_allele(p2, 1), 1);
     }
 }

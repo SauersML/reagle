@@ -276,6 +276,7 @@ impl crate::pipelines::ImputationPipeline {
                         output_end: 0,
                         is_first: window_count == 1,
                         phased_overlap: None,
+                        boundary_recomb_rate: None,
                     }
                 };
                 if let Some(bb) = &pipeline.telemetry {
@@ -698,7 +699,7 @@ target_samples={} target_bytes={}",
         // Each target haplotype gets its own priors map (populated by HMM when state probs are available)
         let n_target_haps = phased.n_haplotypes();
         let hap_priors: Vec<HaplotypePriors> =
-            (0..n_target_haps).map(|_| HaplotypePriors::new()).collect();
+            (0..n_target_haps).map(|_| HaplotypePriors::empty()).collect();
         overlap.set_hap_priors(hap_priors);
 
         overlap
@@ -881,7 +882,7 @@ target_samples={} target_bytes={}",
                                 ws.reservoir_prob_fwd = 0.0;
                                 let mut total_mass = 0.0;
                                 
-                                for (&global_id, &prob) in p.hap_ids.iter().zip(p.probs.iter()) {
+                                for (&global_id, &prob) in p.ids().iter().zip(p.probs().iter()) {
                                     let pid = first_block.pattern_for_haplotype(crate::model::block_hash::GlobalId::new(global_id));
                                     if pid.is_reservoir() {
                                         ws.reservoir_prob_fwd += prob;
@@ -893,7 +894,7 @@ target_samples={} target_bytes={}",
                                 
                                 // Fill remaining mass with uniform?
                                 if total_mass < 0.999 {
-                                    let remaining = (1.0 - total_mass).max(0.0f32);
+                                    let remaining = (1.0f32 - total_mass).max(0.0f32);
                                     let uniform = remaining / first_block.n_ref_haps() as f32;
                                     
                                     for i in 0..first_block.n_patterns() {
@@ -918,7 +919,7 @@ target_samples={} target_bytes={}",
                         
                                                                         // Extract next priors
                         
-                                                                        let mut next_priors = HaplotypePriors::new();
+                                                                        let mut next_priors = HaplotypePriors::empty();
                         
                                                                         
                         
@@ -996,22 +997,17 @@ target_samples={} target_bytes={}",
                         
                                                                             }
                         
-                                                                            
-                        
+
+
                                                                             priors_list.sort_unstable_by_key(|(h, _)| *h);
-                        
-                                                                            for (h, p) in priors_list {
-                        
-                                                                                next_priors.hap_ids.push(h);
-                        
-                                                                                next_priors.probs.push(p);
-                        
-                                                                            }
-                        
+
+                                                                            let (hap_ids, probs): (Vec<u32>, Vec<f32>) = priors_list.into_iter().unzip();
+                                                                            next_priors = HaplotypePriors::new(hap_ids, probs);
+
                                                                         }
-                        
-                                                                        
-                        
+
+
+
                                                                         (posteriors, next_priors)
                         
                                                                     };
@@ -1157,7 +1153,7 @@ target_samples={} target_bytes={}",
             .collect();
             
         let mut all_results = Vec::with_capacity(n_target_samples);
-        let mut next_priors_vec = vec![HaplotypePriors::new(); n_target_samples * 2];
+        let mut next_priors_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
         
         for item in sample_results {
             let sample_idx = item.result.sample_idx;

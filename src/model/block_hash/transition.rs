@@ -9,7 +9,6 @@
 
 use super::types::PatternId;
 use crate::model::block_hash::CompressedBlock;
-use aligned_vec::AVec;
 
 /// Sparse transition matrix in CSR (Compressed Sparse Row) format
 ///
@@ -258,13 +257,18 @@ impl TransitionBridge {
 
         // Transmission Part: beta[i] += beta[j] * (1-r) * weight
         // Iterate over transposed CSR
-        
+
         for k in 0..self.transpose_cols.len() {
             let pat_b = self.transpose_cols[k]; // Source in backward (B)
             let pat_a = self.transpose_rows[k]; // Dest in backward (A)
             let weight = self.bwd_weights[k];
-            
-            ws.emissions[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight;
+
+            // Treat bwd as per-haplotype likelihood, accumulate mass for the previous block
+            // Converting B -> A
+            // bwd[A] += bwd[B] * count(A->B)
+            // effective_weight = weight * count(A) = (count(A->B)/count(A)) * count(A) = count(A->B)
+            let count_a = window_a.pattern_counts[pat_a.as_usize()];
+            ws.emissions[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight * count_a;
         }
         
         // Reservoir transitions
@@ -480,7 +484,7 @@ mod tests {
         
         // Setup workspace
         use crate::model::block_hash::BlockHmmWorkspace;
-        let mut ws = BlockHmmWorkspace::new(1000); // Plenty of space
+        let mut ws = BlockHmmWorkspace::new(1000, 1, n_markers); // Plenty of space
         
         // Initialize random probability distribution summing to 1.0
         let n_patterns_a = block_a.n_patterns();

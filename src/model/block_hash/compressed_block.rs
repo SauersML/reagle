@@ -4,7 +4,6 @@
 //! It is built ONCE per window and shared across all target samples.
 
 use super::types::{GlobalId, PatternId};
-use super::types::{GlobalId, PatternId};
 // storage removed
 
 /// Immutable compressed reference data for a window
@@ -41,6 +40,10 @@ pub struct CompressedBlock {
 
     /// Offsets into reservoir_freqs for each marker [marker_in_window]
     pub reservoir_freq_offsets: Vec<usize>,
+
+    /// Fraction of reservoir haplotypes that are NOT missing at each marker [marker_in_window]
+    /// Needed for proper missingness handling in emission probabilities.
+    pub reservoir_obs_fractions: Vec<f32>,
 
     /// Unpacked alleles for fast emission calculation [pattern_idx * window_size + marker_in_window]
     /// Avoids bit-unpacking overhead in hot loops
@@ -99,43 +102,25 @@ impl CompressedBlock {
         }
     }
 
-    /// Get allele at a specific marker for a pattern
-    /// Note: For reservoir, this returns the frequency of allele 1 (for compatibility with existing logic?)
-    /// WARNING: This old API returned f32. If strictly biallelic, it returned freq(1).
-    /// But for multiallelic, "allele" isn't a single scalar.
-    /// This method is deprecated/dangerous for multiallelic reservoir.
-    /// We should probably remove it or only use it for non-reservoir.
-    /// However, `hmm.rs` might rely on it. Let's see...
-    /// `hmm.rs` uses `pattern_allele` to get REF allele.
-    /// If reservoir, it was using it to get "ref_allele" which was actually frequency.
-    /// The `emission_prob` updates will fix the usage site to use `reservoir_freq` directly.
-    /// So this method should only be used for NON-reservoir patterns where it returns the exact allele (as f32).
+    /// Get allele at a specific marker for a pattern (Non-Reservoir Only)
+    ///
+    /// # Panics
+    /// Panics if called on a reservoir pattern ID.
     #[inline]
-    pub fn pattern_allele(&self, pattern_id: PatternId, marker_in_window: usize) -> f32 {
-        if pattern_id.is_reservoir() {
-            // Fallback for legacy calls (biallelic logic): return freq of allele 1
-            // This preserves behavior for K=2 but is meaningless for K>2
-            self.reservoir_freq(marker_in_window, 1)
-        } else {
-            // Fast lookup from unpacked buffer
-            let idx = pattern_id.as_usize() * self.window_size() + marker_in_window;
-            self.unpacked_alleles[idx] as f32
-        }
+    pub fn get_pattern_allele(&self, pattern_id: PatternId, marker_in_window: usize) -> u8 {
+        assert!(!pattern_id.is_reservoir(), "get_pattern_allele called on reservoir");
+        // Fast lookup from unpacked buffer
+        let idx = pattern_id.as_usize() * self.window_size() + marker_in_window;
+        self.unpacked_alleles[idx]
     }
 
-    /// Sample a global haplotype ID from a pattern (for MCMC)
-    pub fn sample_global_from_pattern<R: rand::Rng>(
-        &self,
-        pattern_id: PatternId,
-        rng: &mut R,
-    ) -> GlobalId {
-        if pattern_id.is_reservoir() {
-            let idx = rng.random_range(0..self.reservoir_globals.len());
-            self.reservoir_globals[idx]
+    /// Get fraction of reservoir haplotypes that are observed (not missing) at this marker
+    #[inline]
+    pub fn get_reservoir_obs_fraction(&self, marker_in_window: usize) -> f32 {
+        if marker_in_window < self.reservoir_obs_fractions.len() {
+             self.reservoir_obs_fractions[marker_in_window]
         } else {
-            let globals = &self.pattern_to_globals[pattern_id.as_usize()];
-            let idx = rng.random_range(0..globals.len());
-            globals[idx]
+             0.0
         }
     }
 }

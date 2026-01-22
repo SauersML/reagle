@@ -280,7 +280,7 @@ pub fn backward_and_emit_block(
             let p = current_fwd[pattern_idx] * ws.bwd[pattern_idx];
             if p > 0.0 {
                 total_prob += p;
-                let allele = block.pattern_allele(pattern_idx_to_id(pattern_idx), marker_idx) as usize;
+                let allele = block.get_pattern_allele(pattern_idx_to_id(pattern_idx), marker_idx) as usize;
                 if allele < n_alleles {
                     allele_probs[allele] += p;
                 }
@@ -342,23 +342,55 @@ pub fn backward_and_emit_block(
         );
         ws.reservoir_prob_bwd *= reservoir_emission;
         
-        // Pure transition step
-        emissions.fill(1.0);
-        let bwd_sum = ws.bwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_bwd;
-        WeightedHmmUpdater::fwd_update_weighted(
-            &mut ws.bwd,
-            bwd_sum,
-            recomb_rate,
-            block.n_ref_haps(),
-            &block.pattern_counts,
-            emissions,
-            n_patterns,
-        );
+        // --- Step-Back with Constant Term (Fix 5) ---
+        // beta_{t}(i) = (1-r) * beta_{t+1}(i) * E_{t+1}(i) + r * C
+        // where C = sum_j (beta_{t+1}(j) * E_{t+1}(j))
+        // Note: our ws.bwd already contains beta_{t+1}(i) * E_{t+1}(i) due to previous multiplication steps!
+        // So we just sum it up.
         
-        let total_mass = bwd_sum;
-        let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
-        let stay = ws.reservoir_prob_bwd * (1.0 - recomb_rate);
-        ws.reservoir_prob_bwd = stay + background * block.reservoir_count as f32;
+        // Calculate weighted sum for constant term
+
+        
+        // The constant term C is effectively bwd_sum here.
+        // We use WeightedHmmUpdater (via bwd_update_constant logic)
+        // HmmUpdater::bwd_update_constant expects `emissions` argument but here we pre-multiplied.
+        // Wait, bwd_update_constant takes `emissions` and `bwd`. It computes `(1-r) * emit * bwd + r * C`.
+        // If we pre-multiplied, we should use a simpler update: `(1-r) * bwd_precalc + r * C`.
+        // BUT WeightedHmmUpdater logic assumes we are passing probabilities to match SIMD layout?
+        // Let's use `HmmUpdater::bwd_update_constant`. But we need to UN-multiply or just not multiply yet?
+        // `HmmUpdater` is in `model::hmm`. We are in `model::block_hash::hmm`.
+        // We generally use `WeightedHmmUpdater` here which handles weights.
+        // But for backward we don't need weights in the standard Li-Stephens recursion, unless we use compressed states?
+        // The compressed states require weighting by counts?
+        // Li-Stephens: P(x_t | x_{t-1}) involves count weighting.
+        // Backward: sum over x_t. beta_{t-1}(i) = sum_j P(x_t=j | x_{t-1}=i) P(emit) beta_t(j).
+        // Transition P(j|i) = (1-r) delta(i,j) + r * (count(j) / N).
+        // So beta_{t-1}(i) = (1-r) emit(i) beta_t(i) + r * sum_j (count(j)/N) emit(j) beta_t(j).
+        // Let C = sum_j (count(j)/N) * emit(j) * beta_t(j).
+        // Then beta_{t-1}(i) = (1-r) emit(i) beta_t(i) + r * C.
+        
+        // So we need to calculate C using pattern_counts.
+        {
+            let n_ref = block.n_ref_haps() as f32;
+            let mut weighted_sum = 0.0f32;
+            for i in 0..n_patterns {
+                weighted_sum += ws.bwd[i] * block.pattern_counts[i]; // bwd[i] is already emit*beta
+            }
+            if block.reservoir_count > 0 {
+                weighted_sum += ws.reservoir_prob_bwd * block.reservoir_count as f32;
+            }
+            let constant_term = weighted_sum / n_ref; // C
+
+            // Now apply update: beta_{new} = (1-r) * beta_{curr} + r * C
+            let stay_prob = 1.0 - recomb_rate;
+            let recomb_prob = recomb_rate;
+            let common_add = recomb_prob * constant_term;
+            
+            for i in 0..n_patterns {
+                ws.bwd[i] = ws.bwd[i] * stay_prob + common_add;
+            }
+            ws.reservoir_prob_bwd = ws.reservoir_prob_bwd * stay_prob + common_add;
+        }
         
         ws.normalize_bwd(n_patterns);
     }
@@ -395,16 +427,25 @@ fn emission_prob(
     if pattern_id.is_reservoir() {
         // Reservoir uses allele frequency
         // P(obs | Res) = sum_k [ P(obs | k) * P(k | Res) ]
-        //              = P(match) * freq[obs] + sum_{k != obs} [ P(obs | k) * freq[k] ]
-        //              = match_prob * freq[obs] + mismatch_prob * (1 - freq[obs])
+        //              = P(match) * freq[obs] + mismatch_prob * (1 - freq[obs])
+        // BUT we must account for missingness in the reservoir itself.
+        // P(k | Res) is not uniform if some haps are missing.
+        // Formula:
+        // P(obs | Res) = P_{obs} * [ P(match) * freq_{obs} + P(mismatch) * (1 - freq_{obs}) ] + P_{miss} * 1.0
         
-        let freq_obs = block.reservoir_freq(marker_in_window, target_allele);
-        match_prob * freq_obs + mismatch_prob * (1.0 - freq_obs)
+        let obs_fraction = block.get_reservoir_obs_fraction(marker_in_window);
+        
+        if obs_fraction > 0.0 {
+            let freq_obs = block.reservoir_freq(marker_in_window, target_allele);
+            let p_given_observed = match_prob * freq_obs + mismatch_prob * (1.0 - freq_obs);
+            
+            p_given_observed * obs_fraction + 1.0 * (1.0 - obs_fraction)
+        } else {
+            1.0
+        }
     } else {
         // Pattern uses exact allele matching
-        // pattern_allele returns f32, convert to u8. 
-        // Note: pattern_allele call is safe for non-reservoir patterns.
-        let ref_allele = block.pattern_allele(pattern_id, marker_in_window) as u8;
+        let ref_allele = block.get_pattern_allele(pattern_id, marker_in_window);
 
         if target_allele == ref_allele {
             match_prob
@@ -464,7 +505,7 @@ mod tests {
         let p1 = block.pattern_for_haplotype(crate::model::block_hash::GlobalId::new(1)); // 0,1
         let p2 = block.pattern_for_haplotype(crate::model::block_hash::GlobalId::new(2)); // 1,1
         
-        let mut ws = BlockHmmWorkspace::new(10);
+        let mut ws = BlockHmmWorkspace::new(10, 1, 2);
         // Start uniform
         ws.fwd.fill(0.0);
         ws.fwd[p0.as_usize()] = 1.0/3.0;

@@ -101,17 +101,17 @@ impl SeqCodedColumn {
     }
 
     #[inline]
-    pub fn hap_to_seq(&self) -> &[u16] {
+    pub(crate) fn hap_to_seq(&self) -> &[u16] {
         &self.block.hap_to_seq
     }
 
     #[inline]
-    pub fn seq_alleles(&self) -> &[u8] {
+    pub(crate) fn seq_alleles(&self) -> &[u8] {
         &self.block.seq_to_allele[self.marker_offset]
     }
 
     #[inline]
-    pub fn block_id(&self) -> usize {
+    pub(crate) fn block_id(&self) -> usize {
         Arc::as_ptr(&self.block) as usize
     }
 

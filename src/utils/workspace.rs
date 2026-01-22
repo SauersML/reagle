@@ -8,7 +8,7 @@ use aligned_vec::{AVec, ConstAlign};
 
 /// Workspace for imputation HMM computations
 #[derive(Debug)]
-pub struct ImpWorkspace {
+pub(crate) struct ImpWorkspace {
     /// Forward probabilities
     pub fwd: AVec<f32, ConstAlign<32>>,
     /// Backward probabilities
