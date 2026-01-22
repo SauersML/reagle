@@ -966,7 +966,21 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Check if mapping is partial (some target alleles map to -1/missing in reference)
+                    // If so, mark as imputed because we cannot represent the full target genotype
+                    // using reference alleles, so we must infer the best reference state.
+                    let is_partial = alignment
+                        .allele_mappings
+                        .get(target_idx as usize)
+                        .and_then(|m| m.as_ref())
+                        .map(|m| m.targ_to_ref.iter().any(|&x| x < 0))
+                        .unwrap_or(false);
+
+                    if is_partial {
+                        window_quality.set_imputed(ref_m, true);
+                    } else {
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 }
             }
 
