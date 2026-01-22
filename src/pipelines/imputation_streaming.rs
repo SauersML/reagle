@@ -1312,8 +1312,8 @@ target_samples={} target_bytes={}",
                         }
                         
                         // Run HMM
-                        ref_map.forward_pass(&input, self.params.error_rate, ws);
-                        let dosages = ref_map.backward_and_emit_dosages(&input, self.params.error_rate, ws);
+                        ref_map.forward_pass(&input, self.params.p_mismatch, ws);
+                        let dosages = ref_map.backward_and_emit_dosages(&input, self.params.p_mismatch, ws);
                         
                         // Extract next priors
                         let mut next_priors = HaplotypePriors::new();

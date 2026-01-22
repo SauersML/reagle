@@ -3,19 +3,21 @@
 //! This module defines the mutable workspace for HMM probability calculations.
 //! Each sample gets its own workspace (thread-local or pooled).
 
+use aligned_vec::{AVec, ConstAlign};
+
 /// Mutable workspace for block-hash HMM calculations
 ///
 /// This is allocated per-sample and contains the dynamic HMM state.
 /// Separated from CompressedBlock to enable parallel processing.
 pub struct BlockHmmWorkspace {
     /// Forward probabilities (sized to max_states, e.g., 4096)
-    pub fwd: Vec<f32>,
+    pub fwd: AVec<f32, ConstAlign<32>>,
 
     /// Backward probabilities (sized to max_states)
-    pub bwd: Vec<f32>,
+    pub bwd: AVec<f32, ConstAlign<32>>,
 
     /// Emission probabilities (temporary buffer, sized to max_states)
-    pub emissions: Vec<f32>,
+    pub emissions: AVec<f32, ConstAlign<32>>,
 
     /// Reservoir probability (forward)
     pub reservoir_prob_fwd: f32,
@@ -41,9 +43,9 @@ impl BlockHmmWorkspace {
     /// Create a new workspace for a given maximum number of states
     pub fn new(max_states: usize, n_blocks: usize, window_size: usize) -> Self {
         Self {
-            fwd: vec![0.0; max_states],
-            bwd: vec![0.0; max_states],
-            emissions: vec![0.0; max_states],
+            fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
+            bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
+            emissions: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
             reservoir_prob_fwd: 0.0,
             reservoir_prob_bwd: 0.0,
             checkpoints: vec![(vec![0.0; max_states], 0.0); n_blocks],

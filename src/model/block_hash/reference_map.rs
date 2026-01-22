@@ -120,7 +120,7 @@ impl ReferenceMap {
                 &target_genotypes[block.start_marker..block.end_marker.min(target_genotypes.len())];
 
             // Run forward within block
-            super::hmm::forward_within_block(block, block_genotypes, error_rate, self.recomb_rate, ws);
+            super::hmm::forward_within_block(block, block_genotypes, error_rate, ws);
 
             // Apply transition to next block
             if block_idx < self.bridges.len() {
@@ -164,7 +164,6 @@ impl ReferenceMap {
                 block,
                 block_genotypes,
                 error_rate,
-                self.recomb_rate,
                 ws,
             );
 
