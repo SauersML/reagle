@@ -62,15 +62,15 @@ impl From<usize> for GlobalId {
 /// Patterns are local to each window and may have different meanings across windows.
 /// The special RESERVOIR value indicates patterns that were truncated.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PatternId(pub u16);
+pub struct PatternId(pub u32);
 
 impl PatternId {
     /// Sentinel value indicating a haplotype is in the reservoir (truncated)
-    pub const RESERVOIR: Self = PatternId(u16::MAX);
+    pub const RESERVOIR: Self = PatternId(u32::MAX);
 
     #[inline]
-    pub fn new(id: u16) -> Self {
-        assert!(id != u16::MAX, "Use PatternId::RESERVOIR for sentinel value");
+    pub fn new(id: u32) -> Self {
+        assert!(id != u32::MAX, "Use PatternId::RESERVOIR for sentinel value");
         Self(id)
     }
 
@@ -85,7 +85,7 @@ impl PatternId {
     }
 
     #[inline]
-    pub fn as_u16(self) -> u16 {
+    pub fn as_u32(self) -> u32 {
         self.0
     }
 }
@@ -110,9 +110,9 @@ impl fmt::Display for PatternId {
     }
 }
 
-impl From<u16> for PatternId {
-    fn from(id: u16) -> Self {
-        if id == u16::MAX {
+impl From<u32> for PatternId {
+    fn from(id: u32) -> Self {
+        if id == u32::MAX {
             Self::RESERVOIR
         } else {
             Self(id)
@@ -122,8 +122,8 @@ impl From<u16> for PatternId {
 
 impl From<usize> for PatternId {
     fn from(id: usize) -> Self {
-        assert!(id <= u16::MAX as usize, "PatternId overflow");
-        Self(id as u16)
+        assert!(id <= u32::MAX as usize, "PatternId overflow");
+        Self(id as u32)
     }
 }
 
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn test_pattern_id_basic() {
         let pid = PatternId::new(10);
-        assert_eq!(pid.as_u16(), 10);
+        assert_eq!(pid.as_u32(), 10);
         assert_eq!(pid.as_usize(), 10);
         assert!(!pid.is_reservoir());
     }
@@ -193,7 +193,7 @@ mod tests {
     fn test_reservoir_sentinel() {
         let reservoir = PatternId::RESERVOIR;
         assert!(reservoir.is_reservoir());
-        assert_eq!(reservoir.as_u16(), u16::MAX);
+        assert_eq!(reservoir.as_u32(), u32::MAX);
     }
 
     #[test]
@@ -222,6 +222,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "Use PatternId::RESERVOIR for sentinel value")]
     fn test_pattern_id_new_rejects_max() {
-        PatternId::new(u16::MAX);
+        PatternId::new(u32::MAX);
     }
 }

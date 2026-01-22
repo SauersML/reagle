@@ -71,9 +71,9 @@ impl TransitionBridge {
             "Windows must have same reference panel size"
         );
 
-        // Get the hap→pattern mappings from both windows
-        let map_a = window_a.storage.hap_to_pattern();
-        let map_b = window_b.storage.hap_to_pattern();
+        // Get the hap→state mappings directly (already remapped/truncated)
+        let map_a = &window_a.hap_to_state;
+        let map_b = &window_b.hap_to_state;
 
         // Collect all transitions in COO format (coordinate list)
         // We store (src, dst, weight)
@@ -84,19 +84,8 @@ impl TransitionBridge {
         let mut reservoir_to_reservoir = 0.0f32;
 
         // Zip the two mappings to track how each haplotype transitions
-        for (&pat_a_raw, &pat_b_raw) in map_a.iter().zip(map_b.iter()) {
-            // Convert to local pattern IDs (accounting for truncation)
-            let pat_a = if (pat_a_raw as usize) < window_a.n_patterns() {
-                PatternId::new(pat_a_raw as u16)
-            } else {
-                PatternId::RESERVOIR
-            };
-
-            let pat_b = if (pat_b_raw as usize) < window_b.n_patterns() {
-                PatternId::new(pat_b_raw as u16)
-            } else {
-                PatternId::RESERVOIR
-            };
+        for (&pat_a, &pat_b) in map_a.iter().zip(map_b.iter()) {
+            // No truncation logic needed here - hap_to_state already handles it!
 
             // Calculate per-haplotype weight (cardinality-aware)
             let weight = if pat_a.is_reservoir() {

@@ -4,7 +4,8 @@
 //! It is built ONCE per window and shared across all target samples.
 
 use super::types::{GlobalId, PatternId};
-use crate::data::storage::dictionary::DictionaryColumn;
+use super::types::{GlobalId, PatternId};
+// storage removed
 use std::sync::Arc;
 
 /// Immutable compressed reference data for a window
@@ -17,9 +18,9 @@ pub struct CompressedBlock {
     pub start_marker: usize,
     pub end_marker: usize,
 
-    /// Compressed storage with unique patterns and hap→pattern mapping
-    /// Arc-wrapped for zero-cost sharing across threads
-    pub storage: Arc<DictionaryColumn>,
+    /// Final mapping from global haplotype ID to state ID (PatternId or RESERVOIR)
+    /// This resolves the remapping issues by pre-calculating the exact state for each hap.
+    pub hap_to_state: Vec<PatternId>,
 
     /// Cardinality of each pattern (how many haplotypes have this pattern)
     /// Required for correct transition weight calculations
@@ -83,19 +84,13 @@ impl CompressedBlock {
     /// Total number of reference haplotypes
     #[inline]
     pub fn n_ref_haps(&self) -> usize {
-        self.storage.n_haplotypes()
+        self.hap_to_state.len()
     }
 
     /// Get pattern ID for a global haplotype
+    #[inline]
     pub fn pattern_for_haplotype(&self, global_id: GlobalId) -> PatternId {
-        let hap_to_pattern = self.storage.hap_to_pattern();
-        let storage_pattern_id = hap_to_pattern[global_id.as_usize()];
-
-        if (storage_pattern_id as usize) < self.n_patterns() {
-            PatternId::new(storage_pattern_id as u16)
-        } else {
-            PatternId::RESERVOIR
-        }
+        self.hap_to_state[global_id.as_usize()]
     }
 
     /// Get allele at a specific marker for a pattern

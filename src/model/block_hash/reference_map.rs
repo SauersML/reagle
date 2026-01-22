@@ -99,8 +99,20 @@ impl ReferenceMap {
     }
 
     /// Allocate a workspace for this reference map
+    ///
+    /// Uses the ACTUAL observed max patterns, not the theoretical config limit.
+    /// This prevents over-allocation and ensures safety even if max_states=0 (no limit).
     pub fn create_workspace(&self) -> BlockHmmWorkspace {
-        BlockHmmWorkspace::new(self.max_states, self.blocks.len(), self.window_size)
+        BlockHmmWorkspace::new(self.max_observed_patterns(), self.blocks.len(), self.window_size)
+    }
+
+    /// Calculate the actual maximum number of states required by any block
+    pub fn max_observed_patterns(&self) -> usize {
+        self.blocks
+            .iter()
+            .map(|b| b.n_patterns())
+            .max()
+            .unwrap_or(0) // Handle empty map case
     }
 
     /// Run forward pass up to a specific marker index

@@ -41,16 +41,20 @@ pub struct BlockHmmWorkspace {
 
 impl BlockHmmWorkspace {
     /// Create a new workspace for a given maximum number of states
-    pub fn new(max_states: usize, n_blocks: usize, window_size: usize) -> Self {
+    pub fn new(required_patterns: usize, n_blocks: usize, window_size: usize) -> Self {
+        // Ensure we at least have space for 1 pattern to avoid empty-vec panics
+        // in edge cases, though logical flow should prevent usage if empty.
+        let capacity = required_patterns.max(1);
+
         Self {
-            fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
-            bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
-            emissions: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
+            fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(capacity)),
+            bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(capacity)),
+            emissions: AVec::from_iter(32, std::iter::repeat(0.0).take(capacity)),
             reservoir_prob_fwd: 0.0,
             reservoir_prob_bwd: 0.0,
-            checkpoints: vec![(vec![0.0; max_states], 0.0); n_blocks],
-            fwd_history: vec![0.0; (max_states + 1) * window_size],
-            max_states,
+            checkpoints: vec![(vec![0.0; capacity], 0.0); n_blocks],
+            fwd_history: vec![0.0; (capacity + 1) * window_size],
+            max_states: capacity,
         }
     }
 

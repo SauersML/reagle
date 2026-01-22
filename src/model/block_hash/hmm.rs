@@ -47,7 +47,7 @@ pub fn forward_within_block(
         let emissions = &mut ws.emissions;
         
         for pattern_idx in 0..n_patterns {
-            let pattern_id = PatternId::new(pattern_idx as u16);
+            let pattern_id = PatternId::new(pattern_idx as u32);
             emissions[pattern_idx] = emission_prob(
                 block,
                 pattern_id,
@@ -119,7 +119,7 @@ pub fn forward_to_marker_in_block(
         let emissions = &mut ws.emissions;
         
         for pattern_idx in 0..n_patterns {
-            let pattern_id = PatternId::new(pattern_idx as u16);
+            let pattern_id = PatternId::new(pattern_idx as u32);
             emissions[pattern_idx] = emission_prob(
                 block,
                 pattern_id,
@@ -193,7 +193,7 @@ pub fn backward_and_emit_block(
         for pattern_idx in 0..n_patterns {
             emissions[pattern_idx] = emission_prob(
                 block,
-                PatternId::new(pattern_idx as u16),
+                PatternId::new(pattern_idx as u32),
                 marker_idx,
                 target_allele,
                 error_rate,
@@ -298,7 +298,7 @@ pub fn backward_and_emit_block(
         for pattern_idx in 0..n_patterns {
             emissions[pattern_idx] = emission_prob(
                 block,
-                PatternId::new(pattern_idx as u16),
+                PatternId::new(pattern_idx as u32),
                 marker_idx,
                 target_allele,
                 error_rate,
