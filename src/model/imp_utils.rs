@@ -85,11 +85,17 @@ pub fn build_marker_cluster_index(ref_cluster_start: &[usize], n_ref_markers: us
 }
 
 #[inline]
-pub fn get_log_probs(conf: f32, p_err: f32) -> (f32, f32) {
+pub fn get_log_probs(conf: f32, p_err: f32, n_alleles: usize) -> (f32, f32) {
     let p_no_err = 1.0 - p_err;
-    let half_compl = (1.0 - conf) * 0.5;
-    let match_prob = conf * p_no_err + half_compl;
-    let mismatch_prob = conf * p_err + half_compl;
+    // Random guess probability = 1/K
+    let p_random = if n_alleles > 0 { 1.0 / n_alleles as f32 } else { 0.5 };
+    
+    // Mix "High Confidence" model with "Random Noise" model
+    // If conf=1.0 -> p_no_err vs p_err
+    // If conf=0.0 -> p_random vs p_random
+    let match_prob = conf * p_no_err + (1.0 - conf) * p_random;
+    let mismatch_prob = conf * p_err + (1.0 - conf) * p_random;
+    
     (match_prob.ln(), mismatch_prob.ln())
 }
 

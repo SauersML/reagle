@@ -478,10 +478,7 @@ mod tests {
         //
         // Target: (0, 0)
         // Error rate: 0.01
-        
-        let n_haps = 3;
-        // let n_markers = 2; // Unused
-        
+
         let col0 = GenotypeColumn::from_alleles(&[0, 0, 1], 2);
         let col1 = GenotypeColumn::from_alleles(&[0, 1, 1], 2);
         

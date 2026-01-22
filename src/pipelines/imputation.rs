@@ -766,8 +766,6 @@ impl ImputationPipeline {
 // ... existing tests ...
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Tests for imputation pipeline
 
     #[test]

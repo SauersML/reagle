@@ -303,7 +303,6 @@ mod tests {
 
     use crate::data::marker::Markers;
     use crate::data::storage::GenotypeColumn;
-    use crate::data::storage::phase_state::Phased;
 
     #[test]
     fn test_build_compressed_block() {
@@ -312,17 +311,16 @@ mod tests {
         // Hap 1: (0, 0)
         // Hap 2: (1, 1)
         // Hap 3: (1, 1)
-        
+
         let col0 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
         let col1 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
-        
+
         // Mock GenotypeMatrix wrapper equivalent
         // Since GenotypeMatrix is complex to mock, we'll implement a minimal verified fake or use public API if feasible.
-        // The public API requires Samples, Markers etc. 
+        // The public API requires Samples, Markers etc.
         // Let's create a minimal valid GenotypeMatrix.
         use crate::data::haplotype::Samples;
         use crate::data::marker::{Marker, Allele};
-        use crate::data::ChromIdx;
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
         let mut m = Markers::new();
         let chr = m.add_chrom("chr1");
