@@ -177,75 +177,139 @@ pub fn compute_cluster_mismatches_into_workspace(
             }
             let target_m = target_m_idx as usize;
 
-            let geno1 = geno_a1[target_m];
-            let geno2 = geno_a2[target_m];
-            if geno1 == 255 || geno2 == 255 {
+            let mut geno1 = geno_a1[target_m];
+            let mut geno2 = geno_a2[target_m];
+            let missing_gt = geno1 == 255 || geno2 == 255;
+
+            // If GT is missing, we usually skip, UNLESS we have PL/GL data we can use.
+            if missing_gt && pl_provider.is_none() {
                 continue;
             }
 
-            let targ_allele = targ_alleles[target_m];
+            let mut targ_allele = targ_alleles[target_m];
             let partner_allele = partner_alleles.map(|p| p[target_m]).unwrap_or(255);
 
             let target_marker_idx = MarkerIdx::new(target_m as u32);
             let confidence = target_gt.sample_confidence_f32(target_marker_idx, sample_idx);
-            if confidence <= 0.0 {
+
+            // If GT is missing, confidence is meaningless (usually 0.0 or 255 depending on parsing),
+            // but if we have PL, we ignore confidence.
+            if !missing_gt && confidence <= 0.0 {
                 continue;
             }
 
             // Prefer PL-derived emission when available and biallelic.
             let log_match: f32;
             let log_mism: f32;
+            let mut used_pl = false;
+
             if let Some(plp) = pl_provider {
                 let pl = plp.pl(target_m).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
                     // Only do exact PL-based emissions for biallelic (0/1).
-                    // For multi-allelic, fall back to confidence-based approximation.
+                    // For multi-allelic, fall back to confidence-based approximation (if GT present).
                     let partner = partner_allele;
                     let maybe_n = if partner != 255 {
                         allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
                     } else {
                         allele_probs_uncond_from_pl(pl, &mut allele_probs)
                     };
+
                     if maybe_n == Some(2) {
-                        let req = if partner != 255 {
-                            if partner == geno1 {
-                                geno2
-                            } else if partner == geno2 {
-                                geno1
-                            } else {
-                                255
-                            }
-                        } else {
-                            targ_allele
-                        };
-                        if req < 2 {
-                            let p_req = allele_probs
-                                .get(req as usize)
-                                .copied()
-                                .unwrap_or(0.0)
-                                .clamp(0.0, 1.0);
+                        // If GT is missing, we treat allele 0 as "match" and allele 1 as "mismatch"
+                        // effectively setting the emission probs for State=0 and State=1.
+                        // We must fake 'targ_allele' and 'geno1/geno2' to allow the loop to apply these scores.
+                        if missing_gt {
+                            // P(Obs | State=0) -> log_match
+                            // P(Obs | State=1) -> log_mism
+                            let p0 = allele_probs.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            let p1 = allele_probs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+
+                            // Apply error model if needed, but PL probs already include uncertainty.
+                            // We mix in small error to avoid log(0).
                             let p_no_err = 1.0 - p_err;
-                            // For biallelic, the "other" probability is 1 - p_req.
-                            let emit_match = (p_no_err * p_req + p_err * (1.0 - p_req)).max(1e-30);
-                            let emit_mism = (p_no_err * (1.0 - p_req) + p_err * p_req).max(1e-30);
-                            log_match = emit_match.ln();
-                            log_mism = emit_mism.ln();
+                            let emit0 = (p_no_err * p0 + p_err * (1.0 - p0)).max(1e-30);
+                            let emit1 = (p_no_err * p1 + p_err * (1.0 - p1)).max(1e-30);
+
+                            log_match = emit0.ln();
+                            log_mism = emit1.ln();
+
+                            // Setup fake target state to map State=0 -> Match, State=1 -> Mismatch
+                            targ_allele = 0;
+
+                            // For phasing logic (partner known), we need geno1/geno2 to make 'required' logic work.
+                            if partner != 255 {
+                                // Logic: required = (partner == geno1) ? geno2 : geno1
+                                // We want: if State != required, apply penalty.
+                                // If partner is known, p0 and p1 are conditional.
+                                // p0 = P(Obs | 0, partner), p1 = P(Obs | 1, partner)
+                                // If State=0 (matches fake targ_allele=0), we want score log_match.
+                                // If State=1, we want score log_mism.
+                                //
+                                // If we set geno1=partner, geno2=0.
+                                // Then required = 0.
+                                // If State=0 (Ref=0): FinalRef=0 == required -> Match (score 0 penalty + base) -> base=log_match.
+                                // If State=1 (Ref=1): FinalRef=1 != required -> Mismatch (score hard_log_diff + base).
+                                // Score(1) = log_match + hard_log_diff.
+                                // We want Score(1) = log_mism.
+                                // So hard_log_diff must be log_mism - log_match.
+                                geno1 = partner;
+                                geno2 = 0;
+                            }
+                            used_pl = true;
                         } else {
-                            (log_match, log_mism) = get_log_probs(confidence, p_err);
+                            // GT is present
+                            let req = if partner != 255 {
+                                if partner == geno1 {
+                                    geno2
+                                } else if partner == geno2 {
+                                    geno1
+                                } else {
+                                    255
+                                }
+                            } else {
+                                targ_allele
+                            };
+
+                            if req < 2 {
+                                let p_req = allele_probs
+                                    .get(req as usize)
+                                    .copied()
+                                    .unwrap_or(0.0)
+                                    .clamp(0.0, 1.0);
+                                let p_no_err = 1.0 - p_err;
+                                // For biallelic, the "other" probability is 1 - p_req.
+                                let emit_match = (p_no_err * p_req + p_err * (1.0 - p_req)).max(1e-30);
+                                let emit_mism = (p_no_err * (1.0 - p_req) + p_err * p_req).max(1e-30);
+                                log_match = emit_match.ln();
+                                log_mism = emit_mism.ln();
+                                used_pl = true;
+                            } else {
+                                (log_match, log_mism) = get_log_probs(confidence, p_err);
+                            }
                         }
                     } else {
+                        // Not biallelic PL
+                        if missing_gt { continue; }
                         (log_match, log_mism) = get_log_probs(confidence, p_err);
                     }
                 } else {
+                    // No PL
+                    if missing_gt { continue; }
                     (log_match, log_mism) = get_log_probs(confidence, p_err);
                 }
             } else {
+                // No PL provider
+                if missing_gt { continue; }
                 (log_match, log_mism) = get_log_probs(confidence, p_err);
             }
 
             let log_diff = log_mism - log_match;
-            let hard_log_mism = (1e-9f32).ln();
-            let hard_log_diff = hard_log_mism - log_match;
+            // Increased penalty for hard mismatches to enforce stricter adherence to known genotypes.
+            // Matches legacy behavior (1e-12) which performed better on high-confidence data.
+            // For PL-based emissions, we use the calculated difference.
+            let hard_log_mism = (1e-12f32).ln();
+            let hard_log_diff = if used_pl { log_diff } else { hard_log_mism - log_match };
 
             if !printed_hmm_trace
                 && c == 0
@@ -936,11 +1000,10 @@ pub fn compute_state_probs(
         trace,
     );
 
-    let threshold = if n_clusters <= 1000 {
-        0.0
-    } else {
-        (0.9999f32 / n_states as f32).min(0.005f32)
-    };
+    // Fixed threshold matching Java Beagle's minProb (1e-5).
+    // This ensures consistent pruning of low-probability paths, improving stickiness
+    // and reducing noise even in small windows.
+    let threshold = 1e-5f32;
 
     let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) = run_hmm_forward_backward_to_sparse(
         &workspace.diff_vals,
