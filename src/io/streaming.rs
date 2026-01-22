@@ -84,9 +84,9 @@ impl StateProbs {
 #[derive(Clone, Debug)]
 pub struct HaplotypePriors {
     /// Sorted haplotype IDs (for binary search)
-    hap_ids: Vec<u32>,
+    pub hap_ids: Vec<u32>,
     /// Corresponding probabilities (same order as hap_ids)
-    probs: Vec<f32>,
+    pub probs: Vec<f32>,
 }
 
 impl HaplotypePriors {

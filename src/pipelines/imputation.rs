@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # Imputation Pipeline
 //!
 //! Orchestrates the imputation workflow:

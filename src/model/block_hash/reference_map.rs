@@ -183,24 +183,5 @@ impl ReferenceMap {
         dosages
     }
 
-    /// Impute a single sample (combines forward + backward + emit)
-    ///
-    /// This is the main entry point for imputation.
-    pub fn impute_sample(
-        &self,
-        target_genotypes: &[u8],
-        error_rate: f32,
-        ws: &mut BlockHmmWorkspace,
-    ) -> Vec<f32> {
-        // Reset workspace
-        if let Some(first_block) = self.blocks.first() {
-            ws.reset(first_block.n_patterns());
-        }
 
-        // Forward pass with checkpointing
-        self.forward_pass(target_genotypes, error_rate, ws);
-
-        // Backward pass and emit dosages
-        self.backward_and_emit_dosages(target_genotypes, error_rate, ws)
-    }
 }

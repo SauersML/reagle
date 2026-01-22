@@ -108,11 +108,11 @@ impl CompressedBlock {
         rng: &mut R,
     ) -> GlobalId {
         if pattern_id.is_reservoir() {
-            let idx = rng.gen_range(0..self.reservoir_globals.len());
+            let idx = rng.random_range(0..self.reservoir_globals.len());
             self.reservoir_globals[idx]
         } else {
             let globals = &self.pattern_to_globals[pattern_id.as_usize()];
-            let idx = rng.gen_range(0..globals.len());
+            let idx = rng.random_range(0..globals.len());
             globals[idx]
         }
     }

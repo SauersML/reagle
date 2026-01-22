@@ -7,8 +7,9 @@
 //! mapping via `hap_to_pattern()`. We zip these mappings and build a
 //! deterministic sparse transition matrix.
 
-use super::micro_window::MicroWindow;
 use super::types::PatternId;
+use crate::model::block_hash::CompressedBlock;
+use aligned_vec::AVec;
 
 /// Sparse transition matrix in CSR (Compressed Sparse Row) format
 ///
@@ -26,215 +27,31 @@ pub struct TransitionBridge {
 
     /// Backward: Destination pattern IDs (sorted for deterministic iteration)
     /// Used for propagating probability from B to A (backward pass)
-    bwd_dests: Vec<PatternId>, // Actually Source IDs
+    /// Renamed to transpose_rows to indicate these are the row indices (destination) in the transposed matrix A <- B
+    transpose_rows: Vec<PatternId>, // Pattern A
 
-    /// Backward: Source pattern IDs (parallel to bwd_dests)
-    /// Used for propagating probability from B to A (backward pass)
-    bwd_sources: Vec<PatternId>, // Actually Dest IDs
+    /// Backward: Source pattern IDs (parallel to transpose_rows)
+    /// Renamed to transpose_cols to indicate these are the column indices (source) in the transposed matrix A <- B
+    transpose_cols: Vec<PatternId>, // Pattern B
 
-    /// Backward: Transition weights (parallel to bwd_dests/bwd_sources)
-    /// These are P(Source|Dest) = P(Dest|Source) * P(Source) / P(Dest)
-    /// Actually, for the backward pass we just need the transpose of the transition matrix.
-    /// The transition probability is P(next|prev).
-    /// In backward pass: beta[prev] = sum( beta[next] * P(next|prev) )
-    /// So we need to iterate over 'next' for each 'prev'.
-    /// Wait, standard forward is: alpha[next] = sum( alpha[prev] * P(next|prev) )
-    /// Standard backward is: beta[prev] = sum( P(next|prev) * beta[next] * emission[next] )
-    ///
-    /// My `apply_backward` function takes `block_a` (prev) and `block_b` (next) and computes `block_a.bwd_probs`.
-    /// `block_b` already has `bwd_probs` computed (from future).
-    /// So we need to compute:
-    /// block_a.bwd[i] = sum_j ( P(j|i) * block_b.bwd[j] )
-    ///
-    /// This requires iterating over all j connected to i.
-    /// This is EXACTLY the same structure as Forward: source-major order.
-    /// We iterate over i (source), and for each j (dest), we add contribution to i.
-    ///
-    /// Wait, no.
-    /// Forward: iterate over i, push to j. (Scatter)
-    /// OR: iterate over j, pull from i. (Gather)
-    /// My current implementation iterates over (i, j) pairs sorted by i.
-    /// This allows streaming through i.
-    /// For Forward: alpha[j] += alpha[i] * w. This is scatter.
-    /// It requires sorting by i?
-    /// If I sort by i, I can iterate i once, and update multiple j's.
-    ///
-    /// For Backward: beta[i] += beta[j] * w.
-    /// This is GATHER into i.
-    /// If I sort by i, I can iterate i once, and pull from multiple j's.
-    /// So I can reuse the exact same `sources`, `destinations`, `weights` vectors!
-    ///
-    /// Let's verify.
-    /// Forward (Scatter):
-    /// for (i, j, w) in transitions (sorted by i):
-    ///    alpha[j] += alpha[i] * w
-    ///
-    /// Backward (Gather):
-    /// for (i, j, w) in transitions (sorted by i):
-    ///    beta[i] += beta[j] * w
-    ///
-    /// Yes! If I sort by i (source), I can do both efficiently if random access to beta[j] is fine.
-    /// Since j is random access into a small vector (4096 floats), it is cache friendly enough.
-    /// The `sources` vector is sequential access.
-    ///
-    /// HOWEVER, the user specifically asked for "Reverse Adjacency List" / "Backward CSR".
-    /// "For the Backward pass, you need the Transpose: you need to map destinations -> sources".
-    /// Why?
-    /// If I use the Forward list (sorted by Source):
-    /// I iterate i=0, 1, 2...
-    /// For i=0, I see list of j's. I compute beta[0] = sum(beta[j] * w).
-    /// This is perfect for cache locality of `beta[i]` (write) but random read of `beta[j]`.
-    ///
-    /// If I use Backward list (sorted by Dest):
-    /// I iterate j=0, 1, 2...
-    /// For j=0, I see list of i's. I update beta[i] += beta[0] * w.
-    /// This is random write of `beta[i]` and sequential read of `beta[j]`.
-    ///
-    /// Usually, we want sequential write.
-    /// So sorting by Source (current `sources`) is actually BETTER for Backward pass (Gather) too!
-    /// Because we are computing beta[source].
-    ///
-    /// Let's re-read the user's critique.
-    /// "The TransitionBridge struct in the diff is optimized only for the Forward pass. It stores sources -> destinations. For the Backward pass, you need the Transpose: you need to map destinations -> sources to propagate probability from the future back to the past."
-    ///
-    /// User might be thinking of "Pull" vs "Push".
-    /// Forward Push: Iterate i, update j. (Random write j).
-    /// Forward Pull: Iterate j, sum from i. (Random read i).
-    /// Backward Push: Iterate j, update i. (Random write i).
-    /// Backward Pull: Iterate i, sum from j. (Random read j).
-    ///
-    /// My `apply_forward` does:
-    /// for (i, j, w) in sorted_by_i:
-    ///    new_fwd[j] += old_fwd[i] * w
-    /// This is Forward Push (Scatter). Random write to `new_fwd`.
-    ///
-    /// For Backward, I want to compute `bwd[i]`.
-    /// If I iterate (i, j, w) in sorted_by_i:
-    ///    bwd[i] += bwd[j] * w
-    /// This is Backward Pull (Gather). Sequential write to `bwd[i]`. Random read `bwd[j]`.
-    ///
-    /// So technically, I don't NEED the transpose if I implement Backward Pull.
-    /// BUT, my `apply_forward` implementation actually sorts by `sources` (i).
-    /// So it iterates i sequentially, and scatters to j.
-    ///
-    /// If the user explicitly asked for "Backward CSR", they might want to support the "Push" pattern or they believe it's necessary.
-    /// Or maybe they think I'm doing Forward Pull?
-    ///
-    /// Let's look at `apply_forward`:
-    /// ```rust
-    /// for i in 0..self.sources.len() {
-    ///     let from = self.sources[i];
-    ///     let to = self.destinations[i];
-    ///     let weight = self.weights[i];
-    ///     new_fwd[to.as_usize()] += window_a.fwd_probs[from.as_usize()] * weight;
-    /// }
-    /// ```
-    /// This reads `from` (mostly sequential if sorted by from) and writes `to` (random).
-    ///
-    /// For backward `apply_backward(block_a, block_b, ws)`:
-    /// We want to update `block_a.bwd` using `block_b.bwd`.
-    /// `block_a.bwd[i] += block_b.bwd[j] * weight`.
-    ///
-    /// If I use `sources` (sorted by i):
-    /// I read `i` sequentially. I write `block_a.bwd[i]`.
-    /// I read `block_b.bwd[j]` (random).
-    /// This is actually quite good.
-    ///
-    /// Why did the user say I need the transpose?
-    /// Maybe to allow "Push" style?
-    /// Or maybe they thought I was sorting by Destination?
-    ///
-    /// Actually, if I have `sources` sorted, I can group them.
-    /// `start_idx[i] .. end_idx[i]` gives all transitions from i.
-    /// Then `bwd[i] = sum( w * bwd[j] )`.
-    /// This avoids repeated writes to `bwd[i]`.
-    ///
-    /// But my CSR is just coordinate list (COO) sorted by source.
-    /// So I have multiple entries for same `i`.
-    /// `bwd[i] += ...` happens multiple times.
-    ///
-    /// If I use Transpose (sorted by j):
-    /// I iterate j sequentially.
-    /// `val = bwd[j]`.
-    /// for each i connected to j:
-    ///     bwd[i] += val * w.
-    /// This is Scatter into `bwd[i]`. Random write.
-    ///
-    /// So:
-    /// Sorted by Source (i):
-    ///   Forward: Read i (seq), Write j (rnd). (Scatter)
-    ///   Backward: Write i (seq), Read j (rnd). (Gather)
-    ///
-    /// Sorted by Dest (j):
-    ///   Forward: Write j (seq), Read i (rnd). (Gather)
-    ///   Backward: Read j (seq), Write i (rnd). (Scatter)
-    ///
-    /// The user asked for "Backward CSR" which usually implies sorting by Destination (if we consider time flowing A->B).
-    /// But wait, "backward weights vector (CSR format for the reverse direction)".
-    /// Reverse direction: B -> A.
-    /// Source in reverse is B (j). Dest in reverse is A (i).
-    /// So "Backward CSR" means sorted by j.
-    ///
-    /// If I have "Backward CSR" (sorted by j):
-    /// I can do Backward Push (Scatter) or Forward Pull (Gather).
-    ///
-    /// I will implement what the user asked: Transpose.
-    /// This gives me flexibility.
-    /// And specifically, `bwd_dests` (i) and `bwd_sources` (j).
-    ///
-    /// Wait, naming.
-    /// Forward: A -> B.
-    /// Backward: B -> A.
-    ///
-    /// `bwd_sources`: Patterns in B (j).
-    /// `bwd_dests`: Patterns in A (i).
-    /// `bwd_weights`: P(j|i) same as forward? Or P(i|j)?
-    /// The transition is P(j|i).
-    /// In backward pass: beta[i] = sum_j beta[j] * P(j|i).
-    /// The weight is still P(j|i).
-    ///
-    /// So `bwd_weights` should store P(j|i).
-    ///
-    /// So I will store:
-    /// `bwd_sources` = j (sorted)
-    /// `bwd_dests` = i
-    /// `bwd_weights` = P(j|i)
-    ///
-    /// Then `apply_backward`:
-    /// for k in 0..len:
-    ///    j = bwd_sources[k]
-    ///    i = bwd_dests[k]
-    ///    w = bwd_weights[k]
-    ///    beta[i] += beta[j] * w
-    ///
-    /// This is Scatter into i.
-    ///
-    /// If I stick to `sources` (sorted by i):
-    /// for k in 0..len:
-    ///    i = sources[k]
-    ///    j = destinations[k]
-    ///    w = weights[k]
-    ///    beta[i] += beta[j] * w
-    ///
-    /// This is Gather into i. Sequential write.
-    /// This seems better for CPU cache (write combining).
-    ///
-    /// However, strictly following the user's plan is safer.
-    /// "The Fix: The TransitionBridge must build a backward_weights vector (CSR format for the reverse direction) at construction time."
-    ///
-    /// I will add `bwd_sources` (j), `bwd_dests` (i), `bwd_weights` (P(j|i)).
-    /// And I will use them in `apply_backward`.
+    /// Backward: Transition weights (parallel to transpose_rows/transpose_cols)
+    bwd_weights: Vec<f32>,
 
+    /// Reservoir → specific pattern transitions
     reservoir_to_pattern_ids: Vec<PatternId>,
     reservoir_to_pattern_weights: Vec<f32>,
 
+    /// Specific pattern → Reservoir transitions
     pattern_to_reservoir_ids: Vec<PatternId>,
     pattern_to_reservoir_weights: Vec<f32>,
 
+    /// Reservoir → Reservoir transition weight
     reservoir_to_reservoir: f32,
 
+    /// Recombination rate for this transition
     recomb_rate: f32,
 
+    /// Total number of reference haplotypes (for background recombination)
     n_ref_haps: usize,
 }
 
@@ -314,37 +131,22 @@ impl TransitionBridge {
 
         // Sort and aggregate for Forward (sorted by Source)
         transitions.sort_by_key(|(from, to, _)| (*from, *to));
-        let (sources, destinations, weights) = aggregate_transitions(&transitions);
+        let (sources, destinations, weights) = aggregate_transitions(transitions.clone());
 
         // Sort and aggregate for Backward (sorted by Dest)
-        // We can reuse the transitions vector, just re-sort
         let mut bwd_transitions = transitions; // Move
         bwd_transitions.sort_by_key(|(from, to, _)| (*to, *from));
-        // aggregate_transitions expects (from, to, weight) but handles any sorting.
-        // However, we want to extract (j, i, w) where j is primary sort key.
-        // aggregate_transitions implementation aggregates if (from, to) matches.
-        // Since we sorted by (to, from), duplicates will be adjacent.
-        // So we can reuse the same function!
-        // The output will be: sources=from, destinations=to, weights=w.
-        // But the order will be grouped by 'to'.
-        // So `bwd_sources` will contain `from` (i), `bwd_dests` will contain `to` (j).
-        // Wait, my struct definition said:
-        // bwd_dests: Vec<PatternId>, // Actually Source IDs
-        // bwd_sources: Vec<PatternId>, // Actually Dest IDs
-        // Let's stick to that naming to avoid confusion or swap them.
-        // I want `apply_backward` to iterate over B -> A.
-        // So I want to iterate j (in B) and update i (in A).
-        // If I sort by `to` (j), I iterate j.
-        // So I should call the sorted arrays `bwd_sources` (j) and `bwd_dests` (i).
         
-        let (bwd_i, bwd_j, bwd_w) = aggregate_transitions(&bwd_transitions);
+        let (bwd_i, bwd_j, bwd_w) = aggregate_transitions(bwd_transitions);
         // aggregate returns (from, to, w).
         // Since we sorted by (to, from):
         // `bwd_i` is 'from' (i), `bwd_j` is 'to' (j).
         // And it is sorted by `bwd_j`.
-        // So I will store:
-        let bwd_sources = bwd_j; // j (sorted)
-        let bwd_dests = bwd_i;   // i
+        // We want to iterate j (cols of A<-B) and scatter to i (rows of A<-B).
+        // bwd_sources (j) -> bwd_dests (i).
+        // Renaming to transpose_cols -> transpose_rows.
+        let transpose_cols = bwd_j; // j (sorted)
+        let transpose_rows = bwd_i;   // i
         let bwd_weights = bwd_w;
 
         // Reservoir → Pattern (sort for determinism)
@@ -361,8 +163,8 @@ impl TransitionBridge {
             sources,
             destinations,
             weights,
-            bwd_dests,
-            bwd_sources,
+            transpose_rows,
+            transpose_cols,
             bwd_weights,
             reservoir_to_pattern_ids,
             reservoir_to_pattern_weights,
@@ -379,16 +181,9 @@ impl TransitionBridge {
         let n_patterns_b = window_b.n_patterns();
 
         // Initialize new forward probabilities in a temporary buffer (or use emissions buffer if unused)
-        // We can't overwrite ws.fwd directly because we need window_a values (which are in ws.fwd if sequential).
-        // But wait, ws.fwd holds current state. `apply` updates state.
-        // If we are doing A -> B, we read from ws.fwd (A) and write to new buffer (B).
-        // Since A and B are different blocks, do they share ws.fwd?
-        // Workspace has one fwd buffer.
-        // So we definitely need a temp buffer.
-        // ws.emissions is available and sized to max_states. We can use it as temp.
-        let mut new_fwd = std::mem::take(&mut ws.emissions);
+        let mut new_fwd = std::mem::replace(&mut ws.emissions, AVec::from_iter(32, std::iter::repeat(0.0).take(ws.fwd.len())));
         new_fwd.fill(0.0);
-        new_fwd.resize(ws.fwd.len(), 0.0); // Ensure size
+        // new_fwd.resize(ws.fwd.len(), 0.0); // Ensure size - assume max_states is consistent
 
         let mut new_reservoir_prob = 0.0f32;
 
@@ -452,26 +247,11 @@ impl TransitionBridge {
         let n_patterns_b = window_b.n_patterns();
 
         // ws.bwd holds values for B. We want to compute values for A.
-        // Using ws.emissions as temp buffer for A.
-        let mut new_bwd = std::mem::take(&mut ws.emissions);
+        let mut new_bwd = std::mem::replace(&mut ws.emissions, AVec::from_iter(32, std::iter::repeat(0.0).take(ws.bwd.len())));
         new_bwd.fill(0.0);
-        new_bwd.resize(ws.bwd.len(), 0.0);
+        // new_bwd.resize(ws.bwd.len(), 0.0);
         
-        let mut new_reservoir_prob = 0.0f32;
-
         // Background recombination contribution (Gather from all B)
-        // beta_back[i] += sum_j ( beta[j] * P(recomb) * count[j] / N )
-        // All i get the same background contribution because P(recomb to any j) is uniform-ish?
-        // No.
-        // P(j|i) = (1-r)*W + r*count[j]/N.
-        // beta[i] = sum_j beta[j] * P(j|i)
-        //         = sum_j beta[j] * ( (1-r)W_ij + r*count[j]/N )
-        //         = sum_j beta[j]*(1-r)W_ij  +  sum_j beta[j]*r*count[j]/N
-        //         = (Transmission Part)      +  (Recombination Part)
-        //
-        // The Recombination Part is: (r/N) * sum_j (beta[j] * count[j])
-        // This is a constant added to ALL i (including reservoir).
-        
         let mut recomb_sum = 0.0f32;
         for j in 0..n_patterns_b {
             recomb_sum += ws.bwd[j] * window_b.pattern_counts[j];
@@ -484,22 +264,17 @@ impl TransitionBridge {
         for i in 0..n_patterns_a {
             new_bwd[i] = recomb_term;
         }
-        new_reservoir_prob = recomb_term;
+        // Use recomb_term directly instead of redundant init
+        let mut new_reservoir_prob = recomb_term;
 
         // Transmission Part: beta[i] += beta[j] * (1-r) * weight
-        // Note: self.weights already includes (1-r).
-        // We use the Backward CSR (sorted by Dest=Source=j)?
-        // Wait, bwd_sources = j. bwd_dests = i.
-        // We iterate k. j = bwd_sources[k]. i = bwd_dests[k].
-        // beta[i] += beta[j] * w.
+        // Iterate over transposed CSR
         
-        for k in 0..self.bwd_sources.len() {
-            let pat_b = self.bwd_sources[k];
-            let pat_a = self.bwd_dests[k];
+        for k in 0..self.transpose_cols.len() {
+            let pat_b = self.transpose_cols[k]; // Source in backward (B)
+            let pat_a = self.transpose_rows[k]; // Dest in backward (A)
             let weight = self.bwd_weights[k];
             
-            // new_bwd is state A (destination of backward flow)
-            // ws.bwd is state B (source of backward flow)
             new_bwd[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight;
         }
         

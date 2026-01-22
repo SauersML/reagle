@@ -147,7 +147,11 @@ pub fn backward_and_emit_block(
         ws.normalize_forward(n_patterns);
         
         // Save state to flattened history
-        let history = ws.fwd_history_at_mut(marker_idx);
+        // Access fields directly to avoid borrowing `self` entirely
+        let stride = ws.max_states + 1;
+        let start = marker_idx * stride;
+        let history = &mut ws.fwd_history[start..start + stride];
+        
         history[..n_patterns].copy_from_slice(&ws.fwd[..n_patterns]);
         history[n_patterns] = ws.reservoir_prob_fwd;
     }
@@ -160,7 +164,9 @@ pub fn backward_and_emit_block(
         let mut total_prob = 0.0;
         let mut dosage_sum = 0.0;
         
-        let current_fwd = ws.fwd_history_at(marker_idx);
+        let stride = ws.max_states + 1;
+        let start = marker_idx * stride;
+        let current_fwd = &ws.fwd_history[start..start + stride];
         
         // Pattern states
         for pattern_idx in 0..n_patterns {
