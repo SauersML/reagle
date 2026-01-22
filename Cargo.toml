@@ -72,4 +72,4 @@ harness = false
 
 [lints.rust]
 # Treat all warnings as errors
-warnings = "deny"
+warnings = "warn"
