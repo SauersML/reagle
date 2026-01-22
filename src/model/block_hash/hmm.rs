@@ -14,13 +14,11 @@ use crate::model::hmm::HmmUpdater;
 /// * `block` - The CompressedBlock (immutable reference data)
 /// * `target_genotypes` - Target genotypes for this block [marker_in_window]
 /// * `error_rate` - Genotyping error rate
-/// * `recomb_rate` - Recombination rate per marker
 /// * `ws` - Mutable workspace
 pub fn forward_within_block(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
-    recomb_rate: f32,
     ws: &mut BlockHmmWorkspace,
 ) {
     let n_patterns = block.n_patterns();
@@ -35,6 +33,7 @@ pub fn forward_within_block(
     // For each marker in the window
     for marker_in_window in 0..window_size {
         let target_allele = target_genotypes[marker_in_window];
+        let recomb_rate = block.local_recomb_rates[marker_in_window];
 
         // Compute emission probabilities for all patterns
         // Use ws.emissions as temp buffer
@@ -96,7 +95,6 @@ pub fn backward_and_emit_block(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
-    recomb_rate: f32,
     ws: &mut BlockHmmWorkspace,
 ) -> Vec<f32> {
     let n_patterns = block.n_patterns();
@@ -109,6 +107,7 @@ pub fn backward_and_emit_block(
     // Re-run Forward and store history into pre-allocated workspace buffer
     for marker_idx in 0..window_size {
         let target_allele = target_genotypes[marker_idx];
+        let recomb_rate = block.local_recomb_rates[marker_idx];
         
         let emissions = &mut ws.emissions;
         for pattern_idx in 0..n_patterns {
@@ -156,6 +155,7 @@ pub fn backward_and_emit_block(
     // Now Backward (reverse)
     for marker_idx in (0..window_size).rev() {
         let target_allele = target_genotypes[marker_idx];
+        let recomb_rate = block.local_recomb_rates[marker_idx];
         
         let mut total_prob = 0.0;
         let mut dosage_sum = 0.0;
@@ -243,9 +243,9 @@ fn emission_prob(
     target_allele: u8,
     error_rate: f32,
 ) -> f32 {
-    // Missing data - uniform probability
+    // Missing data - neutral (1.0)
     if target_allele == 255 {
-        return 0.5;
+        return 1.0;
     }
 
     let ref_allele = block.pattern_allele(pattern_id, marker_in_window);

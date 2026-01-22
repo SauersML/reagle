@@ -30,6 +30,7 @@ pub const DEFAULT_MAX_STATES: usize = 4096;
 /// * `ref_data` - Reference panel genotype matrix
 /// * `marker_range` - Range of markers to include in this window
 /// * `max_states` - Maximum number of unique patterns to track (0 = no limit)
+/// * `recomb_rates` - Vector of recombination rates [marker_in_window]. Size should match marker_range.len().
 ///
 /// # Returns
 /// CompressedBlock with only immutable reference data (no per-sample HMM state)
@@ -37,11 +38,15 @@ pub fn build_compressed_block(
     ref_data: &GenotypeMatrix<Phased>,
     marker_range: Range<usize>,
     max_states: usize,
+    recomb_rates: &[f32],
 ) -> CompressedBlock {
     let start_marker = marker_range.start;
     let end_marker = marker_range.end;
     let n_markers = marker_range.len();
     let n_haplotypes = ref_data.n_haplotypes();
+
+    assert_eq!(recomb_rates.len(), n_markers, "Recombination rates must match window size");
+    let local_recomb_rates = recomb_rates.to_vec();
 
     // Build column access closures for DictionaryColumn::compress
     let columns: Vec<Box<dyn Fn(HapIdx) -> u8>> = marker_range
@@ -185,6 +190,7 @@ pub fn build_compressed_block(
         reservoir_globals,
         reservoir_allele_freqs,
         unpacked_alleles,
+        local_recomb_rates,
     }
 }
 

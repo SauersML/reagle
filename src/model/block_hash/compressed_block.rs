@@ -42,6 +42,20 @@ pub struct CompressedBlock {
     /// Unpacked alleles for fast emission calculation [pattern_idx * window_size + marker_in_window]
     /// Avoids bit-unpacking overhead in hot loops
     pub unpacked_alleles: Vec<u8>,
+
+    /// Recombination rates for each marker interval in the window [marker_in_window]
+    /// Rate at index i is the probability of recombination between i and i+1?
+    /// Or between i-1 and i?
+    /// Standard HMM: Transition from t-1 to t uses rate[t-1]?
+    /// We will store rate[i] = P(recomb between i and i+1).
+    /// The last marker's rate is used for transition to next block.
+    /// Wait, `TransitionBridge` handles block-to-block.
+    /// Inside block, we use rates for transitions i -> i+1.
+    /// So size is window_size (last one unused? or used for bridge?).
+    /// Bridge uses its own rate.
+    /// So we need rates for 0..window_size-1.
+    /// Let's store full vector size `window_size` for simplicity, last element might be unused or passed to bridge.
+    pub local_recomb_rates: Vec<f32>,
 }
 
 impl CompressedBlock {

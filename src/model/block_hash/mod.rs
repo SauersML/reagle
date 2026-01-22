@@ -39,10 +39,6 @@ mod transition;
 mod compression;
 mod hmm;
 
-// Legacy compatibility (deprecated - use ReferenceMap instead)
-
-mod micro_window;
-
 // Public API exports
 pub use types::{GlobalId, PatternId};
 pub use compressed_block::CompressedBlock;
@@ -52,7 +48,3 @@ pub use compression::{
     build_compressed_block, CompressionStats,
     DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES
 };
-
-// Legacy exports (deprecated)
-
-pub use micro_window::MicroWindow;

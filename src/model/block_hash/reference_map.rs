@@ -30,9 +30,6 @@ pub struct ReferenceMap {
 
     /// Maximum states per block
     pub max_states: usize,
-
-    /// Recombination rate per marker
-    pub recomb_rate: f32,
 }
 
 impl ReferenceMap {
@@ -42,7 +39,8 @@ impl ReferenceMap {
     /// * `ref_data` - Reference panel genotype matrix
     /// * `window_size` - Size of each window in markers
     /// * `max_states` - Maximum unique patterns per window
-    /// * `recomb_rate_per_marker` - Recombination rate for transition bridges
+    /// * `recomb_rates` - Recombination rates between markers [marker_idx].
+    ///                    Rate at i is between marker i and i+1.
     ///
     /// # Returns
     /// Arc-wrapped ReferenceMap ready for parallel sample processing
@@ -50,10 +48,12 @@ impl ReferenceMap {
         ref_data: &GenotypeMatrix<Phased>,
         window_size: usize,
         max_states: usize,
-        recomb_rate_per_marker: f32,
+        recomb_rates: &[f32],
     ) -> Arc<Self> {
         let n_markers = ref_data.n_markers();
         let n_windows = (n_markers + window_size - 1) / window_size;
+
+        assert_eq!(recomb_rates.len(), n_markers, "Recombination rates must length must match n_markers");
 
         // Build all compressed blocks
         let mut blocks = Vec::with_capacity(n_windows);
@@ -61,12 +61,15 @@ impl ReferenceMap {
         for win_idx in 0..n_windows {
             let start = win_idx * window_size;
             let end = (start + window_size).min(n_markers);
+            
+            let block_rates = &recomb_rates[start..end];
 
             // Build compressed block (uses existing compression module)
             let block = super::compression::build_compressed_block(
                 ref_data,
                 start..end,
                 max_states,
+                block_rates,
             );
 
             blocks.push(Arc::new(block));
@@ -76,7 +79,13 @@ impl ReferenceMap {
         let mut bridges = Vec::with_capacity(n_windows.saturating_sub(1));
 
         for i in 0..n_windows.saturating_sub(1) {
-            let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], recomb_rate_per_marker);
+            // Rate between block i and i+1
+            // Block i ends at `blocks[i].end_marker`.
+            // The last marker in block i is `end_marker - 1`.
+            // The rate at `end_marker - 1` defines transition to `end_marker`.
+            let boundary_rate = recomb_rates[blocks[i].end_marker - 1];
+            
+            let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], boundary_rate);
             bridges.push(Arc::new(bridge));
         }
 
@@ -85,7 +94,6 @@ impl ReferenceMap {
             bridges,
             window_size,
             max_states,
-            recomb_rate: recomb_rate_per_marker,
         })
     }
 

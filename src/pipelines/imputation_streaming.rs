@@ -1184,22 +1184,38 @@ target_samples={} target_bytes={}",
             bb.set_samples_processed(0);
         }
 
-        // Calculate recombination rate
-        let recomb_rate = if n_ref_markers > 1 {
-            let chrom = ref_win.marker(MarkerIdx::new(0)).chrom;
-            let start_pos = ref_win.marker(MarkerIdx::new(0)).pos;
-            let end_pos = ref_win.marker(MarkerIdx::new((n_ref_markers - 1) as u32)).pos;
-            let start_cm = gen_maps.gen_pos(chrom, start_pos);
-            let end_cm = gen_maps.gen_pos(chrom, end_pos);
-            let dist_cm = (end_cm - start_cm).abs();
-            let avg_dist = dist_cm / (n_ref_markers - 1) as f64;
-            self.params.p_recomb(avg_dist)
-        } else {
-            0.0001
-        };
+        // Calculate recombination rates
+        let chrom_idx = ref_win.marker(MarkerIdx::new(0)).chrom;
+        let chrom_name = ref_win.markers().chrom_name(chrom_idx).unwrap_or("chr1");
+        
+        let mut recomb_rates = Vec::with_capacity(n_ref_markers);
+        for m in 0..n_ref_markers {
+            let pos_curr = ref_win.marker(MarkerIdx::new(m as u32)).pos;
+            // For the last marker, we need rate to next marker. 
+            // If next marker is not in window, we can estimate or use default.
+            // But ReferenceMap uses `boundary_rate = recomb_rates[end - 1]`.
+            // So we need a valid rate at the last index.
+            // We can use the rate from m-1 to m as a proxy for m to m+1.
+            let dist_cm = if m + 1 < n_ref_markers {
+                let pos_next = ref_win.marker(MarkerIdx::new((m + 1) as u32)).pos;
+                let cm_curr = gen_maps.gen_pos(chrom_idx, pos_curr);
+                let cm_next = gen_maps.gen_pos(chrom_idx, pos_next);
+                (cm_next - cm_curr).abs()
+            } else if m > 0 {
+                // Use previous interval for last marker
+                let pos_prev = ref_win.marker(MarkerIdx::new((m - 1) as u32)).pos;
+                let cm_prev = gen_maps.gen_pos(chrom_idx, pos_prev);
+                let cm_curr = gen_maps.gen_pos(chrom_idx, pos_curr);
+                (cm_curr - cm_prev).abs()
+            } else {
+                0.0001 // Fallback for single-marker window
+            };
+            
+            recomb_rates.push(self.params.p_recomb(dist_cm));
+        }
 
         // Build ReferenceMap for this window
-        let ref_map = ReferenceMap::build(ref_win, 64, 4096, recomb_rate);
+        let ref_map = ReferenceMap::build(ref_win, 64, 4096, &recomb_rates);
         
         let ref_is_biallelic: Vec<bool> = (0..n_ref_markers)
             .map(|m| ref_win.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
