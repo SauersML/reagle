@@ -846,7 +846,17 @@ target_samples={} target_bytes={}",
 
                 LOCAL_WORKSPACE.with(|cell| {
                     let mut ws_opt = cell.borrow_mut();
-                    if ws_opt.is_none() {
+                    
+                    // Check if workspace needs resizing
+                    let needs_resize = if let Some(ws) = ws_opt.as_ref() {
+                        ws.checkpoints.len() < ref_map.blocks.len() ||
+                        ws.max_states < ref_map.max_states ||
+                        ws.fwd_history.len() < (ref_map.max_states + 1) * ref_map.window_size
+                    } else {
+                        true
+                    };
+
+                    if needs_resize {
                         *ws_opt = Some(ref_map.create_workspace());
                     }
                     let ws = ws_opt.as_mut().unwrap();
