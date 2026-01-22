@@ -670,7 +670,7 @@ fn test_population_structure() {
     config.gt = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 50;
+    config.imp_states = 200; // Increase states to ensure switch target is available
     config.ne = 10000.0;
     config.window = 20.0;
     config.nthreads = Some(1);
@@ -760,7 +760,7 @@ fn test_hotspot_switching() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.map = Some(map_path);
     config.out = out_prefix.clone();
-    config.imp_states = 50;
+    config.imp_states = 200; // Increase states to ensure switch target is available
     config.ne = 10000.0;
     config.window = 100.0;
     config.nthreads = Some(1);
