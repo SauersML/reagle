@@ -138,11 +138,12 @@ fn compute_dosage_and_best_gt(
             .clamp(0.0, 1.0);
 
         if a1 < 2 && a2 < 2 {
-            // Use HMM posterior probabilities for dosage.
-            // This properly reflects uncertainty and allows genotype refinement
-            // guided by the reference panel, while the HMM itself is already
-            // constrained by the input genotype likelihoods/confidence.
-            let dosage = p1 + p2;
+            // For genotyped markers, preserve the input dosage to maintain high fidelity
+            // to the input scaffold, which is critical for downstream accuracy metrics.
+            // While HMM refinement is theoretically useful, unconditionally replacing
+            // input dosages with HMM posteriors causes significant regression in
+            // correlation with truth for high-quality input data.
+            let dosage = (a1 as f32) + (a2 as f32);
 
             let gt = if conf >= 0.99 {
                 (a1, a2)
@@ -173,7 +174,15 @@ fn compute_dosage_and_best_gt(
         }
 
         let dosage = if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-            p1 + p2
+            if a1 != 255 && a2 != 255 {
+                // If alleles are present but multiallelic (>1), use input dosage to maintain fidelity
+                // for genotyped markers, similar to biallelic logic.
+                let d1 = if a1 != 0 { 1.0 } else { 0.0 };
+                let d2 = if a2 != 0 { 1.0 } else { 0.0 };
+                d1 + d2
+            } else {
+                p1 + p2
+            }
         } else {
             let is_het = a1 != a2;
             let (l00, l01, l11) = if is_het {
