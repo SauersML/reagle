@@ -158,6 +158,42 @@ impl HmmUpdater {
         emissions: &[f32],
         n_states: usize,
     ) {
+        // Normalize input bwd to ensure sum is 1.0
+        // This is critical because `shift` (p/K) assumes probabilities sum to 1.
+        // If bwd has shrunk due to previous emissions, `shift` would be disproportionately large,
+        // washing out the history.
+        let mut sum = 0.0f32;
+        let mut k = 0;
+        let mut sum_vec = f32x8::splat(0.0);
+        while k + 8 <= n_states {
+            let mut arr = [0.0f32; 8];
+            arr.copy_from_slice(&bwd[k..k + 8]);
+            sum_vec += f32x8::from(arr);
+            k += 8;
+        }
+        sum += sum_vec.reduce_add();
+        for &x in &bwd[k..n_states] {
+            sum += x;
+        }
+
+        if sum > 1e-30 {
+            let norm = 1.0 / sum;
+            let norm_vec = f32x8::splat(norm);
+            let mut k = 0;
+            while k + 8 <= n_states {
+                let mut arr = [0.0f32; 8];
+                arr.copy_from_slice(&bwd[k..k + 8]);
+                let vec = f32x8::from(arr);
+                let res = vec * norm_vec;
+                let res_arr: [f32; 8] = res.into();
+                bwd[k..k + 8].copy_from_slice(&res_arr);
+                k += 8;
+            }
+            for x in bwd[k..n_states].iter_mut() {
+                *x *= norm;
+            }
+        }
+
         let shift = p_switch / n_states as f32;
         let scale = 1.0 - p_switch;
 
