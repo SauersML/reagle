@@ -64,22 +64,28 @@ pub fn build_compressed_block(
         .collect();
 
     // Determine max allele to set bits_per_allele dynamically
-    let mut max_allele = 0u8;
+    // Also compute number of alleles per marker
+    let mut max_allele_overall = 0u8;
+    let mut marker_n_alleles = Vec::with_capacity(n_markers);
+    
     for marker_idx in marker_range {
          let marker = MarkerIdx::new(marker_idx as u32);
+         let mut max_allele_at_marker = 0u8;
          for hap_idx in 0..n_haplotypes {
              let allele = ref_data.allele(marker, HapIdx::new(hap_idx as u32));
              if allele != 255 {
-                 max_allele = max_allele.max(allele);
+                 max_allele_at_marker = max_allele_at_marker.max(allele);
              }
          }
+         max_allele_overall = max_allele_overall.max(max_allele_at_marker);
+         marker_n_alleles.push(max_allele_at_marker + 1);
     }
     
-    let bits_per_allele = if max_allele < 2 {
+    let bits_per_allele = if max_allele_overall < 2 {
         1
-    } else if max_allele < 4 {
+    } else if max_allele_overall < 4 {
         2
-    } else if max_allele < 16 {
+    } else if max_allele_overall < 16 {
         4
     } else {
         8
@@ -192,6 +198,7 @@ pub fn build_compressed_block(
         reservoir_allele_freqs,
         unpacked_alleles,
         local_recomb_rates,
+        marker_n_alleles,
     }
 }
 

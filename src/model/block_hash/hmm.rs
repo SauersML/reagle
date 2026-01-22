@@ -7,6 +7,7 @@ use super::compressed_block::CompressedBlock;
 use super::workspace::BlockHmmWorkspace;
 use super::types::PatternId;
 use crate::model::hmm::HmmUpdater;
+use crate::pipelines::imputation::AllelePosteriors;
 
 /// Run forward pass within a single block using existing SIMD kernel
 ///
@@ -84,25 +85,28 @@ pub fn forward_within_block(
     }
 }
 
-/// Backward pass within block AND emit dosages
+/// Backward pass within block AND emit posteriors
 ///
 /// Combines forward probabilities (from checkpoint) with backward probabilities
-/// to compute posterior dosages.
+/// to compute posterior probabilities for each allele.
 ///
 /// # Returns
-/// Dosages for markers in this block (in genomic order)
+/// Allele posteriors for markers in this block (in genomic order)
 pub fn backward_and_emit_block(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
-) -> Vec<f32> {
+) -> Vec<AllelePosteriors> {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
     
-    // We compute dosages in reverse order (because backward pass is reverse),
-    // but return them in genomic order.
-    let mut dosages = vec![0.0; window_size];
+    // We compute posteriors in reverse order (because backward pass is reverse),
+    // but return them in genomic order. We will reverse at end or insert at front.
+    // Insert at front is O(N^2). Pre-allocate and fill in reverse?
+    // Vec doesn't support filling from back easily.
+    // We'll collect in reverse and then reverse the vector.
+    let mut posteriors_rev = Vec::with_capacity(window_size);
 
     // Re-run Forward and store history into pre-allocated workspace buffer
     for marker_idx in 0..window_size {
@@ -160,9 +164,11 @@ pub fn backward_and_emit_block(
     for marker_idx in (0..window_size).rev() {
         let target_allele = target_genotypes[marker_idx];
         let recomb_rate = block.local_recomb_rates[marker_idx];
+        let n_alleles = block.n_alleles(marker_idx);
         
+        // Accumulate allele probabilities
+        let mut allele_probs = vec![0.0f32; n_alleles];
         let mut total_prob = 0.0;
-        let mut dosage_sum = 0.0;
         
         let stride = ws.max_states + 1;
         let start = marker_idx * stride;
@@ -173,8 +179,10 @@ pub fn backward_and_emit_block(
             let p = current_fwd[pattern_idx] * ws.bwd[pattern_idx];
             if p > 0.0 {
                 total_prob += p;
-                let allele = block.pattern_allele(PatternId::new(pattern_idx as u16), marker_idx);
-                dosage_sum += p * allele;
+                let allele = block.pattern_allele(pattern_idx_to_id(pattern_idx), marker_idx) as usize;
+                if allele < n_alleles {
+                    allele_probs[allele] += p;
+                }
             }
         }
         
@@ -182,14 +190,32 @@ pub fn backward_and_emit_block(
         let res_p = current_fwd[n_patterns] * ws.reservoir_prob_bwd;
         if res_p > 0.0 {
             total_prob += res_p;
-            let allele_exp = block.pattern_allele(PatternId::RESERVOIR, marker_idx);
-            dosage_sum += res_p * allele_exp;
+            // Reservoir contributes based on allele frequency
+            // Assume biallelic distribution for reservoir if multiallelic?
+            // block.reservoir_allele_freqs[marker_idx] is mean value.
+            let mean = block.pattern_allele(PatternId::RESERVOIR, marker_idx);
+            // Distribute mean between 0 and 1 (clamped)
+            let p1 = mean.clamp(0.0, 1.0);
+            let p0 = 1.0 - p1;
+            
+            if 0 < n_alleles { allele_probs[0] += res_p * p0; }
+            if 1 < n_alleles { allele_probs[1] += res_p * p1; }
+            // For >2 alleles, we ignore reservoir contribution to alleles >1 
+            // (limitation of current reservoir compression)
         }
         
+        // Normalize
         if total_prob > 0.0 {
-            dosages[marker_idx] = dosage_sum / total_prob;
+            let scale = 1.0 / total_prob;
+            for p in &mut allele_probs {
+                *p *= scale;
+            }
+        }
+        
+        if n_alleles == 2 {
+            posteriors_rev.push(AllelePosteriors::Biallelic(allele_probs[1]));
         } else {
-            dosages[marker_idx] = 0.0;
+            posteriors_rev.push(AllelePosteriors::Multiallelic(allele_probs));
         }
         
         // Update bwd to t-1
@@ -237,7 +263,12 @@ pub fn backward_and_emit_block(
         ws.normalize_bwd(n_patterns);
     }
     
-    dosages
+    posteriors_rev.reverse();
+    posteriors_rev
+}
+
+fn pattern_idx_to_id(idx: usize) -> PatternId {
+    PatternId::new(idx as u16)
 }
 
 /// Compute emission probability for a pattern at a marker

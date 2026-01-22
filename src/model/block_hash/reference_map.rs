@@ -11,6 +11,7 @@ use super::transition::TransitionBridge;
 use super::workspace::BlockHmmWorkspace;
 use crate::data::storage::matrix::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
+use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
 /// Pre-computed reference map for block-hash HMM
@@ -129,16 +130,20 @@ impl ReferenceMap {
         }
     }
 
-    /// Run backward pass and emit dosages
+use crate::pipelines::imputation::AllelePosteriors;
+
+// ...
+
+    /// Run backward pass and emit posteriors
     ///
-    /// Combines saved forward state with backward probabilities to compute dosages.
-    pub fn backward_and_emit_dosages(
+    /// Combines saved forward state with backward probabilities to compute posteriors.
+    pub fn backward_and_emit_posteriors(
         &self,
         target_genotypes: &[u8],
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
-    ) -> Vec<f32> {
-        let mut dosages = Vec::with_capacity(target_genotypes.len());
+    ) -> Vec<AllelePosteriors> {
+        let mut posteriors = Vec::with_capacity(target_genotypes.len());
 
         // Initialize backward uniform
         if let Some(last_block) = self.blocks.last() {
@@ -159,16 +164,16 @@ impl ReferenceMap {
             // Restore forward checkpoint for this block
             ws.restore_checkpoint(block_idx, block.n_patterns());
 
-            // Run backward and emit dosages for this block
-            let block_dosages = super::hmm::backward_and_emit_block(
+            // Run backward and emit posteriors for this block
+            let block_posteriors = super::hmm::backward_and_emit_block(
                 block,
                 block_genotypes,
                 error_rate,
                 ws,
             );
 
-            // Prepend to dosages (we're going backwards)
-            dosages.splice(0..0, block_dosages);
+            // Prepend to posteriors (we're going backwards)
+            posteriors.splice(0..0, block_posteriors);
 
             // Apply inverse transition to previous block
             if block_idx > 0 {
@@ -180,7 +185,29 @@ impl ReferenceMap {
             }
         }
 
-        dosages
+        posteriors
+    }
+
+    /// Impute a single sample (combines forward + backward + emit)
+    ///
+    /// This is the main entry point for imputation.
+    #[allow(unused)] // Kept for API completeness, but pipeline uses manual steps
+    pub fn impute_sample(
+        &self,
+        target_genotypes: &[u8],
+        error_rate: f32,
+        ws: &mut BlockHmmWorkspace,
+    ) -> Vec<AllelePosteriors> {
+        // Reset workspace
+        if let Some(first_block) = self.blocks.first() {
+            ws.reset(first_block.n_patterns());
+        }
+
+        // Forward pass with checkpointing
+        self.forward_pass(target_genotypes, error_rate, ws);
+
+        // Backward pass and emit posteriors
+        self.backward_and_emit_posteriors(target_genotypes, error_rate, ws)
     }
 
 

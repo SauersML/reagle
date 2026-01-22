@@ -56,6 +56,9 @@ pub struct CompressedBlock {
     /// So we need rates for 0..window_size-1.
     /// Let's store full vector size `window_size` for simplicity, last element might be unused or passed to bridge.
     pub local_recomb_rates: Vec<f32>,
+
+    /// Number of alleles at each marker (2 for biallelic, >2 for multiallelic)
+    pub marker_n_alleles: Vec<u8>,
 }
 
 impl CompressedBlock {
@@ -63,6 +66,12 @@ impl CompressedBlock {
     #[inline]
     pub fn n_patterns(&self) -> usize {
         self.pattern_counts.len()
+    }
+
+    /// Number of alleles at a specific marker
+    #[inline]
+    pub fn n_alleles(&self, marker_in_window: usize) -> usize {
+        self.marker_n_alleles[marker_in_window] as usize
     }
 
     /// Window size in markers

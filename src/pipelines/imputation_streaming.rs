@@ -889,81 +889,105 @@ target_samples={} target_bytes={}",
                             }
                         }
                         
-                        // Run HMM
-                        ref_map.forward_pass(&input, self.params.p_mismatch, ws);
-                        let dosages = ref_map.backward_and_emit_dosages(&input, self.params.p_mismatch, ws);
+                                                // Run HMM
+                                                ref_map.forward_pass(&input, self.params.p_mismatch, ws);
+                                                let posteriors = ref_map.backward_and_emit_posteriors(&input, self.params.p_mismatch, ws);
+                                                
+                                                // Extract next priors
+                                                let mut next_priors = HaplotypePriors::new();
+                                                let block_idx = ref_map.blocks.partition_point(|b| b.end_marker < output_end);
+                                                if block_idx < ref_map.blocks.len() {
+                                                    let (fwd, res_prob) = &ws.checkpoints[block_idx];
+                                                    let block = &ref_map.blocks[block_idx];
+                                                    
+                                                    let threshold = 1e-4;
+                                                    let mut priors_list: Vec<(u32, f32)> = Vec::new();
+                                                    
+                                                    for (pat_idx, &prob) in fwd.iter().enumerate().take(block.n_patterns()) {
+                                                        if prob > threshold {
+                                                            let count = block.pattern_counts[pat_idx];
+                                                            let global_prob = prob / count;
+                                                            for &global_id in &block.pattern_to_globals[pat_idx] {
+                                                                priors_list.push((global_id.as_u32(), global_prob));
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if *res_prob > threshold && block.reservoir_count > 0 {
+                                                        let global_prob = *res_prob / block.reservoir_count as f32;
+                                                        for &global_id in &block.reservoir_globals {
+                                                            priors_list.push((global_id.as_u32(), global_prob));
+                                                        }
+                                                    }
+                                                    
+                                                    priors_list.sort_unstable_by_key(|(h, _)| *h);
+                                                    for (h, p) in priors_list {
+                                                        next_priors.hap_ids.push(h);
+                                                        next_priors.probs.push(p);
+                                                    }
+                                                }
+                                                
+                                                (posteriors, next_priors)
+                                            };
                         
-                        // Extract next priors
-                        let mut next_priors = HaplotypePriors::new();
-                        // Find block for output_end
-                        let block_idx = ref_map.blocks.partition_point(|b| b.end_marker < output_end);
-                        if block_idx < ref_map.blocks.len() {
-                            // Use checkpoint at start of this block
-                            let (fwd, res_prob) = &ws.checkpoints[block_idx];
-                            let block = &ref_map.blocks[block_idx];
-                            
-                            // Convert to Global priors
-                            let threshold = 1e-4;
-                            let mut priors_list: Vec<(u32, f32)> = Vec::new();
-                            
-                            for (pat_idx, &prob) in fwd.iter().enumerate().take(block.n_patterns()) {
-                                if prob > threshold {
-                                    let count = block.pattern_counts[pat_idx];
-                                    let global_prob = prob / count;
-                                    for &global_id in &block.pattern_to_globals[pat_idx] {
-                                        priors_list.push((global_id.as_u32(), global_prob));
-                                    }
-                                }
-                            }
-                            
-                            if *res_prob > threshold && block.reservoir_count > 0 {
-                                let global_prob = *res_prob / block.reservoir_count as f32;
-                                for &global_id in &block.reservoir_globals {
-                                    priors_list.push((global_id.as_u32(), global_prob));
-                                }
-                            }
-                            
-                            // Sort and split
-                            priors_list.sort_unstable_by_key(|(h, _)| *h);
-                            for (h, p) in priors_list {
-                                next_priors.hap_ids.push(h);
-                                next_priors.probs.push(p);
-                            }
-                        }
-                        
-                        (dosages, next_priors)
-                    };
-
-                    let (d1_full, p1_out) = process_haplotype(h1_idx, priors_h1);
-                    let (d2_full, p2_out) = process_haplotype(h2_idx, priors_h2);
-                    
-                    // Combine results
-                    let output_len = output_end.saturating_sub(output_start);
-                    let mut dosages = Vec::with_capacity(output_len);
-                    let mut best_gt = Vec::with_capacity(output_len);
-                    
-                    for m in output_start..output_end {
-                        let d1 = d1_full[m];
-                        let d2 = d2_full[m];
-                        let dosage = d1 + d2;
-                        
-                        let g1 = if d1 > 0.5 { 1 } else { 0 };
-                        let g2 = if d2 > 0.5 { 1 } else { 0 };
-                        best_gt.push((g1, g2));
-                        dosages.push(dosage);
-                    }
-                    
-                    ImputeResult {
-                        result: SampleImputationResult {
-                            sample_idx: s,
-                            dosages,
-                            best_gt,
-                            hap_alt_probs: None,
-                            hap_posteriors: None,
-                        },
-                        priors: Some((p1_out, p2_out)),
-                    }
-                })
+                                            let (post1_full, p1_out) = process_haplotype(h1_idx, priors_h1);
+                                            let (post2_full, p2_out) = process_haplotype(h2_idx, priors_h2);
+                                            
+                                            // Combine results
+                                            let output_len = output_end.saturating_sub(output_start);
+                                            let mut dosages = Vec::with_capacity(output_len);
+                                            let mut best_gt = Vec::with_capacity(output_len);
+                                            
+                                            // Optional outputs
+                                            let include_posteriors = self.config.gp || self.config.ap;
+                                            let mut hap1_alt = if !include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
+                                            let mut hap2_alt = if !include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
+                                            let mut hap1_posts = if include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
+                                            let mut hap2_posts = if include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
+                                            
+                                            for m in output_start..output_end {
+                                                let p1 = &post1_full[m];
+                                                let p2 = &post2_full[m];
+                                                
+                                                let (d1, g1, prob1) = match p1 {
+                                                    AllelePosteriors::Biallelic(p) => (*p, if *p > 0.5 { 1 } else { 0 }, *p),
+                                                    AllelePosteriors::Multiallelic(probs) => {
+                                                        let dosage = probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
+                                                        let (best_allele, _) = probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap_or((0, &0.0));
+                                                        let p_alt = if probs.len() > 1 { probs[1] } else { 0.0 };
+                                                        (dosage, best_allele as u8, p_alt)
+                                                    }
+                                                };
+                                                
+                                                let (d2, g2, prob2) = match p2 {
+                                                    AllelePosteriors::Biallelic(p) => (*p, if *p > 0.5 { 1 } else { 0 }, *p),
+                                                    AllelePosteriors::Multiallelic(probs) => {
+                                                        let dosage = probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
+                                                        let (best_allele, _) = probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap_or((0, &0.0));
+                                                        let p_alt = if probs.len() > 1 { probs[1] } else { 0.0 };
+                                                        (dosage, best_allele as u8, p_alt)
+                                                    }
+                                                };
+                                                
+                                                best_gt.push((g1, g2));
+                                                dosages.push(d1 + d2);
+                                                
+                                                if let Some(v) = hap1_alt.as_mut() { v.push(prob1); }
+                                                if let Some(v) = hap2_alt.as_mut() { v.push(prob2); }
+                                                if let Some(v) = hap1_posts.as_mut() { v.push(p1.clone()); }
+                                                if let Some(v) = hap2_posts.as_mut() { v.push(p2.clone()); }
+                                            }
+                                            
+                                            ImputeResult {
+                                                result: SampleImputationResult {
+                                                    sample_idx: s,
+                                                    dosages,
+                                                    best_gt,
+                                                    hap_alt_probs: if !include_posteriors { Some((hap1_alt.unwrap(), hap2_alt.unwrap())) } else { None },
+                                                    hap_posteriors: if include_posteriors { Some((hap1_posts.unwrap(), hap2_posts.unwrap())) } else { None },
+                                                },
+                                                priors: Some((p1_out, p2_out)),
+                                            }                })
             })
             .collect();
             
