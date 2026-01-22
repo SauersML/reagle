@@ -13,7 +13,7 @@ use std::fmt;
 /// It remains stable throughout the entire chromosome and enables tracking
 /// probability flow through the correct physical DNA molecules.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct GlobalId(pub u32);
+pub struct GlobalId(pub u32);
 
 impl GlobalId {
     #[inline]
@@ -62,7 +62,7 @@ impl From<usize> for GlobalId {
 /// Patterns are local to each window and may have different meanings across windows.
 /// The special RESERVOIR value indicates patterns that were truncated.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct PatternId(pub u16);
+pub struct PatternId(pub u16);
 
 impl PatternId {
     /// Sentinel value indicating a haplotype is in the reservoir (truncated)

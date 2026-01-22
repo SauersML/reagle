@@ -13,10 +13,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 /// Default window size (can be adjusted based on LD patterns)
-pub(crate) const DEFAULT_WINDOW_SIZE: usize = 32;
+pub const DEFAULT_WINDOW_SIZE: usize = 32;
 
 /// Maximum states before truncation (4096 unique patterns should cover most scenarios)
-pub(crate) const DEFAULT_MAX_STATES: usize = 4096;
+pub const DEFAULT_MAX_STATES: usize = 4096;
 
 /// Build a MicroWindow from a range of markers in the reference panel
 ///
@@ -27,7 +27,7 @@ pub(crate) const DEFAULT_MAX_STATES: usize = 4096;
 ///
 /// # Returns
 /// Fully initialized MicroWindow with compressed storage and HMM state
-pub(crate) fn build_micro_window(
+pub fn build_micro_window(
     ref_data: &GenotypeMatrix<Phased>,
     marker_range: Range<usize>,
     max_states: usize,
@@ -81,7 +81,7 @@ pub(crate) fn build_micro_window(
 ///
 /// # Returns
 /// Vector of MicroWindows covering the entire chromosome
-pub(crate) fn build_all_windows(
+pub fn build_all_windows(
     ref_data: &GenotypeMatrix<Phased>,
     window_size: usize,
     max_states: usize,
@@ -104,7 +104,7 @@ pub(crate) fn build_all_windows(
 
 /// Compression statistics for logging/debugging
 #[derive(Debug, Clone)]
-pub(crate) struct CompressionStats {
+pub struct CompressionStats {
     pub n_windows: usize,
     pub total_patterns: usize,
     pub total_ref_haps: usize,

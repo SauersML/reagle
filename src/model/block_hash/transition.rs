@@ -14,7 +14,7 @@ use super::types::PatternId;
 ///
 /// This is deterministic and cache-friendly compared to HashMap.
 #[derive(Clone, Debug)]
-pub(crate) struct TransitionBridge {
+pub struct TransitionBridge {
     /// Source pattern IDs (sorted for deterministic iteration)
     sources: Vec<PatternId>,
 

@@ -19,7 +19,7 @@ use crate::model::hmm::HmmUpdater;
 /// * `target_genotypes` - Target genotypes for this window [marker_in_window]
 /// * `error_rate` - Genotyping error rate
 /// * `recomb_rate` - Recombination rate per marker
-pub(crate) fn forward_pass_within_window(
+pub fn forward_pass_within_window(
     window: &mut MicroWindow,
     target_genotypes: &[u8],
     error_rate: f32,
@@ -135,7 +135,7 @@ fn emission_prob(
 /// * `target_genotypes` - Target genotypes for all markers
 /// * `error_rate` - Genotyping error rate
 /// * `recomb_rate_per_marker` - Recombination rate per marker
-pub(crate) fn forward_pass_all_windows(
+pub fn forward_pass_all_windows(
     windows: &mut [MicroWindow],
     target_genotypes: &[u8],
     error_rate: f32,
@@ -183,7 +183,7 @@ pub(crate) fn forward_pass_all_windows(
 /// Backward pass for posterior probability calculation
 ///
 /// Uses same SIMD kernel approach as forward pass
-pub(crate) fn backward_pass_all_windows(
+pub fn backward_pass_all_windows(
     windows: &mut [MicroWindow],
     target_genotypes: &[u8],
     error_rate: f32,

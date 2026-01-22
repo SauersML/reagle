@@ -31,15 +31,17 @@
 //! - High Performance: SIMD-friendly execution on compressed states
 //! - Code Reuse: Leverages ~2,000 lines of existing, tested infrastructure
 
-pub(crate) mod types;
-pub(crate) mod micro_window;
-pub(crate) mod transition;
-pub(crate) mod compression;
-pub(crate) mod hmm;
+mod types;
+mod micro_window;
+mod transition;
+mod compression;
+mod hmm;
 
-// Re-exports will be added when the implementation is integrated into the pipeline
-// pub use micro_window::MicroWindow;
-// pub use transition::TransitionBridge;
-// pub use types::{GlobalId, PatternId};
-// pub use compression::{build_micro_window, build_all_windows, CompressionStats, DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES};
-// pub use hmm::{forward_pass_within_window, forward_pass_all_windows};
+// Public API exports
+pub use micro_window::MicroWindow;
+pub use types::{GlobalId, PatternId};
+pub use compression::{
+    build_micro_window, build_all_windows, CompressionStats,
+    DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES
+};
+pub use hmm::{forward_pass_within_window, forward_pass_all_windows, backward_pass_all_windows};

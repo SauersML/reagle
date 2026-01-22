@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 /// A micro-window with HMM state for compressed haplotype patterns
 #[derive(Clone, Debug)]
-pub(crate) struct MicroWindow {
+pub struct MicroWindow {
     /// Genomic position range
     pub start_marker: usize,
     pub end_marker: usize,
