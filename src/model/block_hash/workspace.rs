@@ -27,11 +27,19 @@ pub struct BlockHmmWorkspace {
     /// Used for forward-backward combination during dosage emission
     /// checkpoints[block_idx] = (fwd_probs, reservoir_prob)
     pub checkpoints: Vec<(Vec<f32>, f32)>,
+
+    /// History buffer for intra-block forward pass
+    /// Flattened [marker_idx * (max_states + 1) + pattern_idx]
+    /// The +1 is for the reservoir state.
+    pub fwd_history: Vec<f32>,
+
+    /// Maximum states capacity (excluding reservoir)
+    pub max_states: usize,
 }
 
 impl BlockHmmWorkspace {
     /// Create a new workspace for a given maximum number of states
-    pub fn new(max_states: usize, n_blocks: usize) -> Self {
+    pub fn new(max_states: usize, n_blocks: usize, window_size: usize) -> Self {
         Self {
             fwd: vec![0.0; max_states],
             bwd: vec![0.0; max_states],
@@ -39,7 +47,25 @@ impl BlockHmmWorkspace {
             reservoir_prob_fwd: 0.0,
             reservoir_prob_bwd: 0.0,
             checkpoints: vec![(vec![0.0; max_states], 0.0); n_blocks],
+            fwd_history: vec![0.0; (max_states + 1) * window_size],
+            max_states,
         }
+    }
+
+    /// Get forward history for a specific marker in the block
+    #[inline]
+    pub fn fwd_history_at(&self, marker_idx: usize) -> &[f32] {
+        let stride = self.max_states + 1;
+        let start = marker_idx * stride;
+        &self.fwd_history[start..start + stride]
+    }
+
+    /// Get mutable forward history for a specific marker in the block
+    #[inline]
+    pub fn fwd_history_at_mut(&mut self, marker_idx: usize) -> &mut [f32] {
+        let stride = self.max_states + 1;
+        let start = marker_idx * stride;
+        &mut self.fwd_history[start..start + stride]
     }
 
     /// Reset workspace for a new sample

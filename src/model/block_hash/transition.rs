@@ -494,28 +494,30 @@ impl TransitionBridge {
         // beta[i] += beta[j] * w.
         
         for k in 0..self.bwd_sources.len() {
-            let j = self.bwd_sources[k];
-            let i = self.bwd_dests[k];
+            let pat_b = self.bwd_sources[k];
+            let pat_a = self.bwd_dests[k];
             let weight = self.bwd_weights[k];
             
-            new_bwd[i.as_usize()] += ws.bwd[j.as_usize()] * weight;
+            // new_bwd is state A (destination of backward flow)
+            // ws.bwd is state B (source of backward flow)
+            new_bwd[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight;
         }
         
         // Reservoir transitions
         // Reservoir -> Pattern (A->B)
         // beta[res_A] += beta[pat_B] * weight
         for k in 0..self.reservoir_to_pattern_ids.len() {
-             let j = self.reservoir_to_pattern_ids[k]; // Pattern in B
+             let pat_b = self.reservoir_to_pattern_ids[k]; // Pattern in B
              let weight = self.reservoir_to_pattern_weights[k];
-             new_reservoir_prob += ws.bwd[j.as_usize()] * weight;
+             new_reservoir_prob += ws.bwd[pat_b.as_usize()] * weight;
         }
         
         // Pattern -> Reservoir (A->B)
         // beta[pat_A] += beta[res_B] * weight
         for k in 0..self.pattern_to_reservoir_ids.len() {
-            let i = self.pattern_to_reservoir_ids[k]; // Pattern in A
+            let pat_a = self.pattern_to_reservoir_ids[k]; // Pattern in A
             let weight = self.pattern_to_reservoir_weights[k];
-            new_bwd[i.as_usize()] += ws.reservoir_prob_bwd * weight;
+            new_bwd[pat_a.as_usize()] += ws.reservoir_prob_bwd * weight;
         }
         
         // Reservoir -> Reservoir

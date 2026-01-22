@@ -30,6 +30,9 @@ pub struct ReferenceMap {
 
     /// Maximum states per block
     pub max_states: usize,
+
+    /// Recombination rate per marker
+    pub recomb_rate: f32,
 }
 
 impl ReferenceMap {
@@ -82,12 +85,13 @@ impl ReferenceMap {
             bridges,
             window_size,
             max_states,
+            recomb_rate: recomb_rate_per_marker,
         })
     }
 
     /// Allocate a workspace for this reference map
     pub fn create_workspace(&self) -> BlockHmmWorkspace {
-        BlockHmmWorkspace::new(self.max_states, self.blocks.len())
+        BlockHmmWorkspace::new(self.max_states, self.blocks.len(), self.window_size)
     }
 
     /// Run forward pass with checkpointing
@@ -108,7 +112,7 @@ impl ReferenceMap {
                 &target_genotypes[block.start_marker..block.end_marker.min(target_genotypes.len())];
 
             // Run forward within block
-            super::hmm::forward_within_block(block, block_genotypes, error_rate, 0.0, ws);
+            super::hmm::forward_within_block(block, block_genotypes, error_rate, self.recomb_rate, ws);
 
             // Apply transition to next block
             if block_idx < self.bridges.len() {
@@ -152,6 +156,7 @@ impl ReferenceMap {
                 block,
                 block_genotypes,
                 error_rate,
+                self.recomb_rate,
                 ws,
             );
 
