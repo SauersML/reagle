@@ -32,16 +32,27 @@
 //! - Code Reuse: Leverages ~2,000 lines of existing, tested infrastructure
 
 mod types;
-mod micro_window;
+mod compressed_block;
+mod workspace;
+mod reference_map;
 mod transition;
 mod compression;
 mod hmm;
 
+// Legacy compatibility (deprecated - use ReferenceMap instead)
+
+mod micro_window;
+
 // Public API exports
-pub use micro_window::MicroWindow;
 pub use types::{GlobalId, PatternId};
+pub use compressed_block::CompressedBlock;
+pub use workspace::BlockHmmWorkspace;
+pub use reference_map::ReferenceMap;
 pub use compression::{
-    build_micro_window, build_all_windows, CompressionStats,
+    build_compressed_block, CompressionStats,
     DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES
 };
-pub use hmm::{forward_pass_within_window, forward_pass_all_windows, backward_pass_all_windows};
+
+// Legacy exports (deprecated)
+
+pub use micro_window::MicroWindow;
