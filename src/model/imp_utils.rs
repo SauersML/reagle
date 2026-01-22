@@ -244,7 +244,7 @@ pub fn compute_cluster_mismatches_into_workspace(
             }
 
             let log_diff = log_mism - log_match;
-            let hard_log_mism = (1e-12f32).ln();
+            let hard_log_mism = (1e-9f32).ln();
             let hard_log_diff = hard_log_mism - log_match;
 
             if !printed_hmm_trace
