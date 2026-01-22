@@ -36,7 +36,6 @@ pub(crate) mod micro_window_v2;
 pub(crate) mod transition_v2;
 pub(crate) mod compression;
 pub(crate) mod hmm;
-pub(crate) mod fingerprint;
 
 // Re-exports will be added when the implementation is integrated into the pipeline
 // pub use micro_window_v2::MicroWindow;
