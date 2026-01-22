@@ -105,6 +105,23 @@ fn compute_dosage_and_best_gt(
     target_win: &GenotypeMatrix<Phased>,
     alignment: &MarkerAlignment,
 ) -> (f32, (u8, u8)) {
+    let mut dosage = p1 + p2;
+
+    // Calculate genotype probabilities assuming independence (HWE-like given HMM state)
+    let p00 = (1.0 - p1) * (1.0 - p2);
+    let p11 = p1 * p2;
+    let p01 = 1.0 - p00 - p11;
+
+    let mut gt = if p11 >= p01 && p11 >= p00 {
+        (1, 1)
+    } else if p01 >= p00 {
+        (0, 1)
+    } else {
+        (0, 0)
+    };
+
+    // If we have a confident genotyped marker, prefer the input genotype (phased)
+    // This ensures that we don't unnecessarily change high-confidence calls
     if let Some(target_m) = alignment.target_marker(marker_idx) {
         let h1 = HapIdx::new((sample_idx * 2) as u32);
         let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
@@ -133,113 +150,22 @@ fn compute_dosage_and_best_gt(
         let a1 = map_allele(raw_a1);
         let a2 = map_allele(raw_a2);
 
-        let conf = target_win
-            .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
-            .clamp(0.0, 1.0);
-
         if a1 < 2 && a2 < 2 {
-            let dosage = (a1 as f32) + (a2 as f32);
-            let gt = if conf >= 0.99 {
-                (a1, a2)
-            } else {
-                let is_het = a1 != a2;
-                let (l00, l01, l11) = if is_het {
-                    (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-                } else if a1 == 1 {
-                    (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-                } else {
-                    (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-                };
-                let p00 = (1.0 - p1) * (1.0 - p2);
-                let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-                let p11 = p1 * p2;
-                let q00 = p00 * l00;
-                let q01 = p01 * l01;
-                let q11 = p11 * l11;
-                if q11 >= q01 && q11 >= q00 {
-                    (1, 1)
-                } else if q01 >= q00 {
-                    (0, 1)
-                } else {
-                    (0, 0)
-                }
-            };
-            return (dosage, gt);
+            let conf = target_win
+                .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
+                .clamp(0.0, 1.0);
+
+            // Blend input dosage with HMM posterior based on confidence
+            // This preserves high-confidence calls while refining low-confidence ones
+            let input_dosage = (a1 as f32) + (a2 as f32);
+            dosage = conf * input_dosage + (1.0 - conf) * (p1 + p2);
+
+            if conf >= 0.99 {
+                gt = (a1, a2);
+            }
         }
-
-        let dosage = if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-            p1 + p2
-        } else {
-            let is_het = a1 != a2;
-            let (l00, l01, l11) = if is_het {
-                (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-            } else if a1 == 1 {
-                (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-            } else {
-                (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-            };
-            let p00 = (1.0 - p1) * (1.0 - p2);
-            let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-            let p11 = p1 * p2;
-            let q00 = p00 * l00;
-            let q01 = p01 * l01;
-            let q11 = p11 * l11;
-            let sum = q00 + q01 + q11;
-            if sum > 0.0 {
-                let inv_sum = 1.0 / sum;
-                let q01n = q01 * inv_sum;
-                let q11n = q11 * inv_sum;
-                q01n + 2.0 * q11n
-            } else {
-                let d1 = if a1 != 0 { 1.0 } else { 0.0 };
-                let d2 = if a2 != 0 { 1.0 } else { 0.0 };
-                d1 + d2
-            }
-        };
-
-        let gt = if a1 == 255 || a2 == 255 || a1 > 1 || a2 > 1 {
-            if p1 + p2 >= 1.5 {
-                (1, 1)
-            } else if p1 + p2 >= 0.5 {
-                (0, 1)
-            } else {
-                (0, 0)
-            }
-        } else {
-            let is_het = a1 != a2;
-            let (l00, l01, l11) = if is_het {
-                (0.5 * (1.0 - conf), conf, 0.5 * (1.0 - conf))
-            } else if a1 == 1 {
-                (0.5 * (1.0 - conf), 0.5 * (1.0 - conf), conf)
-            } else {
-                (conf, 0.5 * (1.0 - conf), 0.5 * (1.0 - conf))
-            };
-            let p00 = (1.0 - p1) * (1.0 - p2);
-            let p01 = p1 * (1.0 - p2) + p2 * (1.0 - p1);
-            let p11 = p1 * p2;
-            let q00 = p00 * l00;
-            let q01 = p01 * l01;
-            let q11 = p11 * l11;
-            if q11 >= q01 && q11 >= q00 {
-                (1, 1)
-            } else if q01 >= q00 {
-                (0, 1)
-            } else {
-                (0, 0)
-            }
-        };
-
-        return (dosage, gt);
     }
 
-    let dosage = p1 + p2;
-    let gt = if dosage >= 1.5 {
-        (1, 1)
-    } else if dosage >= 0.5 {
-        (0, 1)
-    } else {
-        (0, 0)
-    };
     (dosage, gt)
 }
 
