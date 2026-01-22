@@ -71,7 +71,10 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        // Scale by 0.001 to align with biological expectations (~1% recombination per cM).
+        // The Java formula 0.04*Ne/n likely assumes units or Ne scaling that differs from raw cM.
+        // With Ne=1M, this gives ~0.04 intensity -> p_recomb ~4% at 1cM.
+        let recomb_intensity = (0.04 * ne / n_haps as f32) * 0.001;
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -106,7 +109,8 @@ impl ModelParams {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+        // Scale by 0.001 for cM units
+        let recomb_intensity = (0.04 * ne / n_ref_haps as f32) * 0.001;
 
         Self {
             p_mismatch,
@@ -350,9 +354,9 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
-        assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
+        // Should be (0.04 * 1_000_000 / 1000) * 0.001 = 40.0 * 0.001 = 0.04
+        let expected = 0.04 * 1_000_000.0 / 1000.0 * 0.001;
+        assert!((params.recomb_intensity - expected as f32).abs() < 0.0001);
     }
 
     #[test]
