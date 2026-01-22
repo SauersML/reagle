@@ -273,26 +273,6 @@ impl ReferenceMap {
         posteriors
     }
 
-    /// Impute a single sample (combines forward + backward + emit)
-    ///
-    /// This is the main entry point for imputation.
-    pub(crate) fn impute_sample(
-        &self,
-        target_genotypes: &[u8],
-        error_rate: f32,
-        ws: &mut BlockHmmWorkspace,
-    ) -> Vec<AllelePosteriors> {
-        // Reset workspace
-        if let Some(first_block) = self.blocks.first() {
-            ws.reset_from_block(first_block);
-        }
-
-        // Forward pass with checkpointing
-        self.forward_pass(target_genotypes, error_rate, ws);
-
-        // Backward pass and emit posteriors
-        self.backward_and_emit_posteriors(target_genotypes, error_rate, ws)
-    }
 
 
 }

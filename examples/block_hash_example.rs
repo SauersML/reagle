@@ -9,7 +9,8 @@
 //!
 //! Run with: cargo run --example block_hash_example
 
-use reagle::model::block_hash::{DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES};
+const DEFAULT_WINDOW_SIZE: usize = 32;
+const DEFAULT_MAX_STATES: usize = 4096;
 
 fn main() {
     println!("Block-Hash Clade HMM Example");

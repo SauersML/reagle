@@ -109,27 +109,6 @@ impl DictionaryColumn {
         &self.hap_to_pattern
     }
 
-    /// Get allele from a pattern (pre-decompressed)
-    pub fn pattern_allele(&self, marker_offset: usize, pattern_idx: usize) -> u8 {
-        if pattern_idx >= self.patterns.len() {
-            return 255;
-        }
-        let pattern = &self.patterns[pattern_idx];
-        let bits_per_marker = self.bits_per_allele as usize + 1;
-        let start = marker_offset * bits_per_marker;
-
-        if pattern[start + bits_per_marker - 1] {
-            return 255;
-        }
-
-        let mut allele = 0u8;
-        for b in 0..self.bits_per_allele as usize {
-            if pattern[start + b] {
-                allele |= 1 << b;
-            }
-        }
-        allele
-    }
 
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {

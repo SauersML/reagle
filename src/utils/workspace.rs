@@ -6,81 +6,6 @@
 
 use aligned_vec::{AVec, ConstAlign};
 
-/// Workspace for imputation HMM computations
-#[derive(Debug)]
-pub(crate) struct ImpWorkspace {
-    /// Forward probabilities
-    pub fwd: AVec<f32, ConstAlign<32>>,
-    /// Backward probabilities
-    pub bwd: AVec<f32, ConstAlign<32>>,
-    // --- CSR Storage for Mismatches ---
-    // --- CSR Storage for Log-Likelihood Differences ---
-    /// Non-zero difference values (log_mismatch - log_match) or (-log_match for missing ref)
-    pub diff_vals: Vec<f32>,
-    /// Column indices for diffs (state indices)
-    pub diff_cols: Vec<u16>,
-    /// Row offsets for diffs (indexes into vals/cols)
-    /// Length = n_clusters + 1
-    pub diff_row_offsets: Vec<usize>,
-
-    /// Base Log-Score per cluster (Sum of log(match_prob) for all markers)
-    pub cluster_base_scores: Vec<f32>,
-
-    /// Reusable row buffer for accumulation
-    pub row_buffer: AVec<f32, ConstAlign<32>>,
-
-    /// Block forward buffer for checkpoint recomputation (L2 cache sized)
-    /// Stores forward probabilities for one block (CHECKPOINT_INTERVAL markers)
-    /// Size: (CHECKPOINT_INTERVAL + 1) * n_states ~ 416KB for K=1600, I=64
-    pub block_fwd: AVec<f32, ConstAlign<32>>,
-}
-
-impl ImpWorkspace {
-    /// Create a new imputation workspace
-    pub fn new(n_states: usize) -> Self {
-        Self {
-            fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
-            bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
-            diff_vals: Vec::new(),
-            diff_cols: Vec::new(),
-            diff_row_offsets: vec![0],
-            cluster_base_scores: Vec::new(),
-            row_buffer: AVec::from_iter(32, std::iter::repeat(0.0).take(n_states)),
-            block_fwd: AVec::new(32),
-        }
-    }
-
-    /// Clear all buffers for reuse
-    pub fn clear(&mut self) {
-        self.diff_vals.clear();
-        self.diff_cols.clear();
-        self.diff_row_offsets.clear();
-        self.diff_row_offsets.push(0);
-        self.cluster_base_scores.clear();
-    }
-
-    /// Ensure cluster buffers are ready for accumulation
-    pub fn reset_and_ensure_capacity(&mut self, n_clusters_hint: usize, n_states: usize) {
-        const CHECKPOINT_INTERVAL: usize = 64;
-
-        self.diff_vals.clear();
-        self.diff_cols.clear();
-        self.diff_row_offsets.clear();
-        self.diff_row_offsets.reserve(n_clusters_hint + 1);
-        self.diff_row_offsets.push(0);
-
-        self.cluster_base_scores.clear();
-        self.cluster_base_scores.reserve(n_clusters_hint);
-
-        if self.row_buffer.len() < n_states {
-            self.row_buffer = AVec::from_iter(32, std::iter::repeat(0.0).take(n_states));
-        }
-        let block_fwd_size = (CHECKPOINT_INTERVAL + 1) * n_states;
-        if self.block_fwd.len() < block_fwd_size {
-            self.block_fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(block_fwd_size));
-        }
-    }
-}
 
 /// Workspace for phasing HMM computations
 #[derive(Debug)]
@@ -225,8 +150,3 @@ impl ThreadWorkspace {
     }
 }
 
-impl Default for ImpWorkspace {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}

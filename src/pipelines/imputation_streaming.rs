@@ -81,8 +81,6 @@ struct StreamingPayload {
     ref_output_start: usize,
     /// Reference window output range end
     ref_output_end: usize,
-    /// Position of the first marker in the NEXT reference window (for boundary rate calculation)
-    ref_next_start_pos: Option<u32>,
 }
 
 struct SampleImputationResult {
@@ -443,7 +441,6 @@ impl crate::pipelines::ImputationPipeline {
                         ref_global_start,
                         ref_output_start,
                         ref_output_end,
-                        ref_next_start_pos: ref_window.next_window_start_pos,
                     })
                 } else {
                     tx.send(StreamingPayload {
@@ -456,7 +453,6 @@ impl crate::pipelines::ImputationPipeline {
                         ref_global_start,
                         ref_output_start,
                         ref_output_end,
-                        ref_next_start_pos: ref_window.next_window_start_pos,
                     })
                 };
                 if let Ok(()) = send_result {
@@ -513,7 +509,6 @@ target_samples={} target_bytes={}",
                 ref_global_start,
                 ref_output_start,
                 ref_output_end,
-                ref_next_start_pos,
             } = payload;
             let _ = (output_start, output_end);
 
@@ -606,7 +601,6 @@ target_samples={} target_bytes={}",
                     window_idx,
                     ref_output_start,
                     ref_output_end,
-                    ref_next_start_pos,
                 )?
             } else {
                 self.run_imputation_window_streaming(
@@ -620,7 +614,6 @@ target_samples={} target_bytes={}",
                     window_idx,
                     ref_output_start,
                     ref_output_end,
-                    ref_next_start_pos,
                 )?
             };
 
@@ -735,7 +728,6 @@ target_samples={} target_bytes={}",
         window_idx: usize,
         output_start: usize,
         output_end: usize,
-        ref_next_start_pos: Option<u32>,
     ) -> Result<Option<Vec<HaplotypePriors>>> {
         use crate::model::block_hash::{ReferenceMap, BlockHmmWorkspace};
         
@@ -793,18 +785,6 @@ target_samples={} target_bytes={}",
             let dist_cm = (gen_maps.gen_pos(chrom_idx, next.pos) - gen_maps.gen_pos(chrom_idx, curr.pos)).abs();
             recomb_rates.push(self.params.p_recomb(dist_cm));
         }
-
-        // 2. Handle the final marker (index N-1)
-        // Rate should be distance to the *first marker of next window*
-        let last_marker = ref_win.marker(MarkerIdx::new((n_ref_markers - 1) as u32));
-        let dist_to_next_block = if let Some(next_pos) = ref_next_start_pos {
-            (gen_maps.gen_pos(chrom_idx, next_pos) - gen_maps.gen_pos(chrom_idx, last_marker.pos)).abs()
-        } else {
-            // EOF or no next window: negligible rate (0.0001 cM ~ 0 rate)
-            // This prevents index out of bounds or referring to previous markers
-            0.0001 
-        };
-        recomb_rates.push(self.params.p_recomb(dist_to_next_block));
 
         // Build ReferenceMap for this window
         let ref_map = ReferenceMap::build(ref_win, 64, 4096, &recomb_rates);
@@ -883,7 +863,7 @@ target_samples={} target_bytes={}",
                                 let mut total_mass = 0.0;
                                 
                                 for (&global_id, &prob) in p.ids().iter().zip(p.probs().iter()) {
-                                    let pid = first_block.pattern_for_haplotype(crate::model::block_hash::GlobalId::new(global_id));
+                                    let pid = first_block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(global_id));
                                     if pid.is_reservoir() {
                                         ws.reservoir_prob_fwd += prob;
                                     } else {

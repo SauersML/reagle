@@ -503,9 +503,9 @@ mod tests {
         // 0,1 -> P1 (count 1)
         // 1,1 -> P2 (count 1)
         assert_eq!(block.n_patterns(), 3);
-        let p0 = block.pattern_for_haplotype(crate::model::block_hash::GlobalId::new(0)); // 0,0
-        let p1 = block.pattern_for_haplotype(crate::model::block_hash::GlobalId::new(1)); // 0,1
-        let p2 = block.pattern_for_haplotype(crate::model::block_hash::GlobalId::new(2)); // 1,1
+        let p0 = block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(0)); // 0,0
+        let p1 = block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(1)); // 0,1
+        let p2 = block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(2)); // 1,1
         
         let mut ws = BlockHmmWorkspace::new(10, 1, 2);
         // Start uniform
