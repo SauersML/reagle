@@ -158,7 +158,7 @@ pub fn compute_cluster_mismatches_into_workspace(
             partner_allele: u8,
             log_diff: f32,
             hard_log_diff: f32,
-            // log_match removed (unused)
+            log_missing_penalty: f32,
             ref_marker_idx: MarkerIdx,
             map_alleles: bool,
         }
@@ -244,8 +244,12 @@ pub fn compute_cluster_mismatches_into_workspace(
             }
 
             let log_diff = log_mism - log_match;
-            let hard_log_mism = (1e-9f32).ln();
+            let hard_log_mism = (1e-12f32).ln();
             let hard_log_diff = hard_log_mism - log_match;
+            // When reference allele is missing (255), we treat it as neutral (prob 0.5)
+            // relative to a match (prob match_prob).
+            // penalty = ln(0.5) - ln(match_prob)
+            let log_missing_penalty = (0.5f32).ln() - log_match;
 
             if !printed_hmm_trace
                 && c == 0
@@ -303,7 +307,7 @@ pub fn compute_cluster_mismatches_into_workspace(
                 partner_allele,
                 log_diff,
                 hard_log_diff,
-                // log_match: 0.0,
+                log_missing_penalty,
                 ref_marker_idx: MarkerIdx::new(ref_m as u32),
                 map_alleles: alignment.has_allele_mapping(target_m),
             });
@@ -378,9 +382,9 @@ pub fn compute_cluster_mismatches_into_workspace(
 
                         // Logic identical to scalar, but unrolled
                         if final_ref == 255 {
-                            if ref_allele != 255 {
-                                acc[k] += m_props.log_diff;
-                            }
+                            // Reference is missing (either explicitly or via mapping failure).
+                            // Treat as neutral emission (prob 0.5).
+                            acc[k] += m_props.log_missing_penalty;
                         } else if m_props.partner_allele != 255 {
                             let required = if m_props.partner_allele == m_props.geno1 {
                                 m_props.geno2
@@ -424,9 +428,7 @@ pub fn compute_cluster_mismatches_into_workspace(
                         };
 
                         if final_ref == 255 {
-                            if ref_allele != 255 {
-                                acc_penalty += m_props.log_diff;
-                            }
+                            acc_penalty += m_props.log_missing_penalty;
                         } else if m_props.partner_allele != 255 {
                             let required = if m_props.partner_allele == m_props.geno1 {
                                 m_props.geno2
