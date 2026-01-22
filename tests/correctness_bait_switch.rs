@@ -82,6 +82,18 @@ fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
         let parsed = match val {
             Some(Value::Float(f)) => f as f64,
             Some(Value::String(s)) => s.parse::<f64>().expect("parse DS"),
+            Some(Value::Array(arr)) => {
+                // Hack: noodles 0.104+ Array access is tricky, parse debug string
+                let s = format!("{:?}", arr);
+                // Expected format: "[Ok(Some(0.0002))]"
+                let inner = s
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim_start_matches("Ok(Some(")
+                    .trim_end_matches("))")
+                    .trim();
+                inner.parse::<f64>().expect("parse DS from Array debug string")
+            }
             Some(other) => panic!("Unexpected DS value: {other:?}"),
             None => panic!("Missing DS"),
         };

@@ -1,0 +1,38 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.06s
+     Running tests/correctness_bait_switch.rs (target/debug/deps/correctness_bait_switch-f823f043121da1ca)
+
+running 1 test
+test test_state_index_stability_bait_and_switch ... FAILED
+
+failures:
+
+---- test_state_index_stability_bait_and_switch stdout ----
+Streaming imputation: 4 ref haplotypes, 1 target samples (target_bytes=396)
+Writing output to "/tmp/.tmpfpY96U/bait_switch.vcf.gz"
+Phase 2: Streaming imputation...
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (5 markers, pos 1..400001)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 5 (global 0..5)
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 5
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+Streaming imputation complete: 5 markers
+
+thread 'test_state_index_stability_bait_and_switch' (7274) panicked at tests/correctness_bait_switch.rs:85:28:
+Unexpected DS value: Array([Ok(Some(0.0002))])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_state_index_stability_bait_and_switch
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test correctness_bait_switch`
