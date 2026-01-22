@@ -462,7 +462,7 @@ impl DeadCodeCollector {
 
         let file_name = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
-            "\n❌ ERROR: Found {} #[allow(dead_code)] attributes in {}:\n",
+            "\n❌ ERROR: Found {} forbidden 'allow(unused...)' attributes in {}:\n",
             self.violations.len(),
             file_name
         );
@@ -472,10 +472,13 @@ impl DeadCodeCollector {
         }
 
         error_msg.push_str(
-            "\n⚠️ #[allow(dead_code)] attributes are STRICTLY FORBIDDEN in this project.\n",
+            "\n⚠️ The following attributes are STRICTLY FORBIDDEN in this project:\n",
         );
-        error_msg
-            .push_str("   Either use the code (removing the attribute) or remove it completely.\n");
+        error_msg.push_str("   - #[allow(dead_code)]\n");
+        error_msg.push_str("   - #[allow(unused)] / #![allow(unused)]\n");
+        error_msg.push_str("   - #[allow(unused_imports)]\n");
+        error_msg.push_str("   - #[allow(unused_variables)]\n");
+        error_msg.push_str("\n   Do not suppress these warnings. Delete or use the unused code/imports instead.\n");
 
         Some(error_msg)
     }
@@ -2273,8 +2276,14 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 }
 
 fn scan_for_allow_dead_code() -> Vec<String> {
-    // Regex pattern to find #[allow(dead_code)] attributes
-    let pattern = r"#\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]";
+    // Regex pattern to find forbidden allow attributes.
+    // Matches:
+    // - #[allow(dead_code)] or #![allow(dead_code)]
+    // - #[allow(unused)]
+    // - #[allow(unused_imports)]
+    // - #[allow(unused_variables)]
+    // - #[allow(..., unused, ...)] (inside lists)
+    let pattern = r"#!?\s*\[\s*allow\s*\([^)]*\b(dead_code|unused|unused_imports|unused_variables)\b[^)]*\)\s*\]";
     let mut all_violations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
