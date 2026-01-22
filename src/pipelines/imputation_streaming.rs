@@ -966,7 +966,21 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Check if mapping is complete (all target alleles map to reference)
+                    // If partial mismatch (e.g. target has ALT not in ref), we treat as imputed
+                    let is_partial = if let Some(Some(mapping)) =
+                        alignment.allele_mappings.get(target_idx as usize)
+                    {
+                        mapping.targ_to_ref.iter().any(|&r| r < 0)
+                    } else {
+                        false // Identity mapping is complete
+                    };
+
+                    if is_partial {
+                        window_quality.set_imputed(ref_m, true);
+                    } else {
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 }
             }
 
