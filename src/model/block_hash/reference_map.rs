@@ -29,9 +29,6 @@ pub struct ReferenceMap {
     /// Window size in markers
     pub window_size: usize,
 
-    /// Maximum states per block (Configured limit)
-    pub max_states: usize,
-
     /// Actual maximum states observed in any block
     pub max_observed_states: usize,
 }
@@ -130,7 +127,6 @@ impl ReferenceMap {
             blocks,
             bridges,
             window_size,
-            max_states,
             max_observed_states,
         })
     }
