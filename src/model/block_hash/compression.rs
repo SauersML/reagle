@@ -341,7 +341,7 @@ mod tests {
             samples,
         );
 
-        let recomb_rates = vec![0.01, 0.01];
+        let recomb_rates = vec![0.01];
         let block = build_compressed_block(&gt, 0..2, 0, &recomb_rates);
 
         // Verify compression

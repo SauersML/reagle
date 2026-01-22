@@ -495,7 +495,7 @@ mod tests {
         let samples = Arc::new(Samples::from_ids(vec!["H0".to_string(), "H1".to_string()])); // Dummy
         let gt = GenotypeMatrix::new_phased(markers, vec![col0, col1], samples);
         
-        let rates = vec![0.0, 0.0]; // No recombination to isolate emissions
+        let rates = vec![0.0]; // No recombination to isolate emissions
         let block = build_compressed_block(&gt, 0..2, 0, &rates);
         
         // Haps are distinct, so we expect 3 patterns?

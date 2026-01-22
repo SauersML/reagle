@@ -241,7 +241,7 @@ mod tests {
         let unphased = vec![2usize];
         let missing = vec![3usize];
 
-        let sp = SamplePhase::new(0, &hap1, &hap2, &conf, &unphased, &missing);
+        let sp = SamplePhase::new(4, &hap1, &hap2, &conf, &unphased, &missing);
 
         assert!(!sp.is_unphased(0)); // homozygous
         assert!(!sp.is_unphased(1)); // phased
@@ -309,7 +309,7 @@ mod tests {
         let hap2 = vec![1, 0, 2];
         let conf = vec![1.0; 3];
 
-        let mut sp = SamplePhase::new(0, &hap1, &hap2, &conf, &[], &[]);
+        let mut sp = SamplePhase::new(3, &hap1, &hap2, &conf, &[], &[]);
 
         sp.swap_alleles(1);
 

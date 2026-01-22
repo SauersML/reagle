@@ -407,7 +407,7 @@ mod tests {
         let samples = Arc::new(Samples::from_ids(sample_ids));
 
         let gt = GenotypeMatrix::new_phased(markers, cols, samples);
-        let rates = vec![0.0; n_markers];
+        let rates = vec![0.0; n_markers.saturating_sub(1)];
         build_compressed_block(&gt, 0..n_markers, 0, &rates)
     }
 
