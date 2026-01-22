@@ -138,7 +138,11 @@ fn compute_dosage_and_best_gt(
             .clamp(0.0, 1.0);
 
         if a1 < 2 && a2 < 2 {
-            let dosage = (a1 as f32) + (a2 as f32);
+            // Blend input dosage with HMM probabilities based on confidence
+            let input_dosage = (a1 as f32) + (a2 as f32);
+            let hmm_dosage = p1 + p2;
+            let dosage = conf * input_dosage + (1.0 - conf) * hmm_dosage;
+
             let gt = if conf >= 0.99 {
                 (a1, a2)
             } else {
