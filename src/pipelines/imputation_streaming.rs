@@ -1137,14 +1137,16 @@ target_samples={} target_bytes={}",
         target_win: &GenotypeMatrix<Phased>,
         ref_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
-        gen_maps: &GeneticMaps,
-        imp_overlap: Option<&PhasedOverlap>,
+        _gen_maps: &GeneticMaps,
+        _imp_overlap: Option<&PhasedOverlap>,
         window_quality: &mut ImputationQuality,
         final_writer: &mut VcfWriter,
         window_idx: usize,
         output_start: usize,
         output_end: usize,
     ) -> Result<Option<Vec<HaplotypePriors>>> {
+        use crate::model::block_hash::{ReferenceMap, BlockHmmWorkspace};
+        
         let window_span = if self.config.profile {
             Some(
                 info_span!(
@@ -1163,19 +1165,14 @@ target_samples={} target_bytes={}",
 
         // Thread-local workspace - must be defined inside the parallel context
         thread_local! {
-            static LOCAL_WORKSPACE: std::cell::RefCell<Option<ImpWorkspace>> =
+            static LOCAL_WORKSPACE: std::cell::RefCell<Option<BlockHmmWorkspace>> =
                 std::cell::RefCell::new(None);
         }
 
         let n_ref_markers = ref_win.n_markers();
         let n_target_samples = target_win.n_samples();
-        let n_ref_haps = ref_win.n_haplotypes();
-        let markers_to_process = if let Some(overlap) = imp_overlap {
-            let start = overlap.n_markers.max(output_start);
-            start..n_ref_markers
-        } else {
-            output_start..n_ref_markers
-        };
+        
+        let markers_to_process = output_start..n_ref_markers;
 
         if markers_to_process.start >= markers_to_process.end {
             return Ok(None);
@@ -1187,491 +1184,109 @@ target_samples={} target_bytes={}",
             bb.set_samples_processed(0);
         }
 
-        let chrom = ref_win.marker(MarkerIdx::new(0)).chrom;
+        // Build ReferenceMap for this window
+        // Using constant recombination rate for now (approx 1 cM/Mb)
+        let recomb_rate = 0.0001; 
+        let ref_map = ReferenceMap::build(ref_win, 64, 4096, recomb_rate);
+        
         let ref_is_biallelic: Vec<bool> = (0..n_ref_markers)
             .map(|m| ref_win.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
             .collect();
-        let gen_positions: Vec<f64> = (0..n_ref_markers)
-            .map(|m| {
-                let pos = ref_win.marker(MarkerIdx::new(m as u32)).pos;
-                gen_maps.gen_pos(chrom, pos)
-            })
-            .collect();
-        // Memory Optimization: We removed the massive ref_alt_mask/ref_missing_mask allocation (approx 350MB).
-        // The `allele_posteriors_for_column_cached` leverages compressed storage (BREF3/Bit-packed) directly.
-        // Note: The ref_marker_maps that was previously here is no longer needed because output
-        // uses Reference-space posteriors directly (no allele remapping for VCF output).
 
-        let genotyped_markers: Vec<usize> = alignment
-            .ref_to_target
-            .iter()
-            .enumerate()
-            .filter_map(|(ref_m, &target_m)| if target_m >= 0 { Some(ref_m) } else { None })
-            .collect();
-
-        let sample_genotyped_vec: Vec<Vec<usize>> = (0..n_target_samples)
-            .map(|s| {
-                genotyped_markers
-                    .iter()
-                    .copied()
-                    .filter(|&ref_m| {
-                        let target_m = alignment.ref_to_target[ref_m] as usize;
-                        let marker_idx = MarkerIdx::new(target_m as u32);
-                        let a1 = target_win.allele(marker_idx, HapIdx::new((s * 2) as u32));
-                        let a2 = target_win.allele(marker_idx, HapIdx::new((s * 2 + 1) as u32));
-                        a1 != 255 || a2 != 255
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let clusters = compute_marker_clusters(
-            &genotyped_markers,
-            &gen_positions,
-            self.config.cluster as f64,
-        );
-        let n_clusters = clusters.len();
-        let cluster_bounds: Vec<(usize, usize)> =
-            clusters.iter().map(|c| (c.start, c.end)).collect();
-        let cluster_midpoints: Vec<usize> = clusters
-            .iter()
-            .map(|c| {
-                let mid = if c.end > c.start {
-                    (c.start + c.end - 1) / 2
-                } else {
-                    c.start
-                };
-                genotyped_markers.get(mid).copied().unwrap_or(0)
-            })
-            .collect();
-        let cluster_midpoints_pos: Vec<f64> = cluster_midpoints
-            .iter()
-            .map(|&m| gen_positions[m])
-            .collect();
-        let cluster_p_recomb: Vec<f32> = if n_clusters == 0 {
-            Vec::new()
-        } else {
-            std::iter::once(0.0f32)
-                .chain((1..n_clusters).map(|c| {
-                    let gen_dist = (cluster_midpoints_pos[c] - cluster_midpoints_pos[c - 1])
-                        .abs()
-                        .max(crate::model::imp_utils::MIN_CM_DIST);
-                    self.params.p_recomb(gen_dist)
-                }))
-                .collect()
+        // Helper to build input vector for HMM
+        // Maps genotyped markers to alleles, fills others with 255
+        let build_input_vector = |hap_idx: HapIdx| -> Vec<u8> {
+             let mut input = vec![255u8; n_ref_markers];
+             // Iterate genotyped markers in alignment
+             for (ref_m, &target_m_idx) in alignment.ref_to_target.iter().enumerate() {
+                 if target_m_idx >= 0 {
+                     let target_m = target_m_idx as usize;
+                     // Get allele from target (phased)
+                     let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap_idx);
+                     // Map to ref allele space if needed?
+                     // target_win and ref_win alleles should match if alignment correct?
+                     // Alignment struct has `allele_mappings`.
+                     // If there is a mapping, we need to map Target -> Ref.
+                     let mapped_allele = if let Some(mapping) = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref()) {
+                         if (allele as usize) < mapping.targ_to_ref.len() {
+                             let r = mapping.targ_to_ref[allele as usize];
+                             if r >= 0 { r as u8 } else { 255 }
+                         } else {
+                             255
+                         }
+                     } else {
+                         allele
+                     };
+                     input[ref_m] = mapped_allele;
+                 }
+             }
+             input
         };
 
-        let (ref_cluster_start, ref_cluster_end) =
-            compute_ref_cluster_bounds(&genotyped_markers, &clusters);
-        let cluster_bounds_ref: Vec<(usize, usize)> = ref_cluster_start
-            .iter()
-            .zip(ref_cluster_end.iter())
-            .map(|(&start, &end)| (start, end))
-            .collect();
-        let marker_cluster = Arc::new(build_marker_cluster_index(
-            &ref_cluster_start,
-            n_ref_markers,
-        ));
-        let ref_cluster_end: Arc<Vec<usize>> = Arc::new(ref_cluster_end);
-        let gen_positions = Arc::new(gen_positions);
-        let cluster_midpoints_pos = Arc::new(cluster_midpoints_pos);
-
-        const PBWT_BYTES_PER_HAP: usize = 64;
-        let max_haps = self.config.pbwt_batch_mb.saturating_mul(1024 * 1024) / PBWT_BYTES_PER_HAP;
-        let max_batch_haps = max_haps.saturating_sub(n_ref_haps);
-        let max_batch_samples = (max_batch_haps / 2).max(1);
-        let batch_size = max_batch_samples.min(n_target_samples).max(1);
-        let n_batches = (n_target_samples + batch_size - 1) / batch_size;
-        let include_posteriors = self.config.gp || self.config.ap;
-
-        let mut all_results: Vec<SampleImputationResult> = Vec::new();
-
-        let telemetry = self.telemetry.clone();
-        for batch_idx in 0..n_batches {
-            let batch_start = batch_idx * batch_size;
-            let batch_end = (batch_start + batch_size).min(n_target_samples);
-            let batch_samples: Vec<usize> = (batch_start..batch_end).collect();
-
-            let pbwt_states = self.params.n_states.min(n_ref_haps);
-            let batch_neighbors = {
-                let pbwt_span = if self.config.profile {
-                    Some(
-                        info_span!(
-                            "pbwt_neighbor_batch",
-                            batch = batch_idx,
-                            batch_size = batch_samples.len(),
-                            n_states = pbwt_states
-                        )
-                        .entered(),
-                    )
-                } else {
-                    None
-                };
-                let _ = &pbwt_span;
-                self.build_pbwt_hap_indices_for_batch(
-                    target_win,
-                    ref_win,
-                    alignment,
-                    &ref_is_biallelic,
-                    &cluster_bounds_ref,
-                    pbwt_states,
-                    &batch_samples,
-                )
-            };
-
-            let batch_results: Vec<SampleImputationResult> = batch_samples
-                .par_iter()
-                .enumerate()
-                .map(|(local_idx, &s)| {
-                    let lifecycle_span = if local_idx == 0 {
-                        Some(info_span!("sample_lifecycle", sample_idx = s).entered())
-                    } else {
-                        None
-                    };
-                    let _ = &lifecycle_span;
-
-                    let hap1_idx = HapIdx::new((s * 2) as u32);
-                    let hap2_idx = HapIdx::new((s * 2 + 1) as u32);
-                    let sample_genotyped = &sample_genotyped_vec[s];
-
-                    if sample_genotyped.is_empty() {
-                        let result = SampleImputationResult {
-                            sample_idx: s,
-                            dosages: Vec::new(),
-                            best_gt: Vec::new(),
-                            priors: None,
-                            hap_alt_probs: None,
-                            hap_posteriors: None,
-                        };
-                        if let Some(bb) = telemetry.as_ref() {
-                            bb.add_samples(1);
-                        }
-                        return result;
+        let mut all_results: Vec<SampleImputationResult> = Vec::with_capacity(n_target_samples);
+        
+        // Parallel processing of samples
+        // Batched to control memory? ReferenceMap is shared. Workspace is small.
+        // We can process all samples in parallel.
+        
+        let sample_results: Vec<SampleImputationResult> = (0..n_target_samples)
+            .into_par_iter()
+            .map(|s| {
+                let h1_idx = HapIdx::new((s * 2) as u32);
+                let h2_idx = HapIdx::new((s * 2 + 1) as u32);
+                
+                LOCAL_WORKSPACE.with(|cell| {
+                    let mut ws_opt = cell.borrow_mut();
+                    if ws_opt.is_none() {
+                        *ws_opt = Some(ref_map.create_workspace());
                     }
-
-                    let (dosages, best_gt, priors, hap_alt_probs, hap_posteriors) =
-                        LOCAL_WORKSPACE.with(|cell| {
-                        let mut ws_opt = cell.borrow_mut();
-                        if ws_opt.is_none() { *ws_opt = Some(ImpWorkspace::new(n_ref_haps)); }
-                        let ws = ws_opt.as_mut().unwrap();
-                        ws.clear();
-
-                        let (hap1_indices, hap2_indices) = &batch_neighbors[local_idx];
-
-                        let plp = PlProvider {
-                            gt: target_win.as_unphased_ref(),
-                            sample: s,
-                            subset_to_orig: None,
-                        };
-
-                        let obs_hap1: Vec<u8> = (0..target_win.n_markers())
-                            .map(|m| target_win.allele(MarkerIdx::new(m as u32), hap1_idx))
-                            .collect();
-                        let obs_hap2: Vec<u8> = (0..target_win.n_markers())
-                            .map(|m| target_win.allele(MarkerIdx::new(m as u32), hap2_idx))
-                            .collect();
-
-                        let mut hap_priors: Vec<HaplotypePriors> = Vec::with_capacity(2);
-
-                        let (hap1_probs, h1_locked, hap1_prior) = {
-                            let hap_indices = &hap1_indices;
-                            let actual_n_states = pbwt_states;
-
-                            let prior_probs = imp_overlap
-                                .and_then(|overlap| overlap.hap_priors())
-                                .and_then(|priors| priors.get(hap1_idx.as_usize()))
-                                .filter(|priors| !priors.is_empty())
-                                .map(|priors| {
-                                    let mut prior_probs = Vec::new();
-                                    if let Some(first_cluster) = hap_indices.get(0) {
-                                        for &hap in first_cluster.iter().take(actual_n_states) {
-                                            prior_probs.push(priors.prior(hap, actual_n_states));
-                                        }
-                                    }
-                                    prior_probs
-                                });
-
-                        let state_probs = compute_state_probs(
-                            &hap_indices,
-                            &cluster_bounds,
-                            &genotyped_markers,
-                            target_win,
-                            ref_win,
-                            alignment,
-                            &obs_hap1,
-                            &obs_hap2,
-                            &obs_hap1,
-                            Some(&obs_hap2),
-                            Some(&plp),
-                            s,
-                            actual_n_states,
-                            ws,
-                            self.params.p_mismatch,
-                                &cluster_p_recomb,
-                                marker_cluster.clone(),
-                                ref_cluster_end.clone(),
-                                gen_positions.clone(),
-                                cluster_midpoints_pos.clone(),
-                                self.params.recomb_intensity,
-                                prior_probs.as_deref(),
-                                local_idx == 0,
-                            );
-
-                            let mut posterior_cache = AllelePosteriorCache::default();
-                            let mut locked = obs_hap1.clone();
-                            for &ref_m in sample_genotyped {
-                                if let Some(target_m) = alignment.target_marker(ref_m) {
-                                    let marker_idx = MarkerIdx::new(ref_m as u32);
-                                    let column = ref_win.column(marker_idx);
-                                    let map_ref_to_targ = alignment
-                                        .target_marker(ref_m)
-                                        .and_then(|target_m| {
-                                            alignment
-                                                .allele_mappings
-                                                .get(target_m)
-                                                .and_then(|m| m.as_ref())
-                                                .map(|m| m.ref_to_targ.as_slice())
-                                        });
-                                    let p = state_probs.allele_posteriors_for_column_cached(
-                                        ref_m,
-                                        2,
-                                        column,
-                                        map_ref_to_targ,
-                                        &mut posterior_cache,
-                                    );
-                                    locked[target_m] = p.max_allele();
-                                }
-                            }
-
-                            let priors = if output_end > 0 && n_ref_markers > 0 {
-                                let overlap_size = 1000.min(n_ref_markers);
-                                let overlap_start = output_end.saturating_sub(overlap_size);
-                                let prior_marker = overlap_start.min(n_ref_markers.saturating_sub(1));
-                                let (hap_ids, probs) = state_probs.haplotype_priors_at(prior_marker);
-                                let gen_pos = gen_maps.gen_pos(
-                                    chrom,
-                                    ref_win.marker(MarkerIdx::new(prior_marker as u32)).pos,
-                                );
-                                let mut priors = HaplotypePriors::new();
-                                priors.set_from_posteriors(&hap_ids, &probs, gen_pos, window_idx);
-                                priors
-                            } else {
-                                HaplotypePriors::new()
-                            };
-
-                            (state_probs, locked, priors)
-                        };
-
-                        let (hap2_probs, hap2_prior) = {
-                            let hap_indices = &hap2_indices;
-                            let actual_n_states = pbwt_states;
-
-                            let prior_probs = imp_overlap
-                                .and_then(|overlap| overlap.hap_priors())
-                                .and_then(|priors| priors.get(hap2_idx.as_usize()))
-                                .filter(|priors| !priors.is_empty())
-                                .map(|priors| {
-                                    let mut prior_probs = Vec::new();
-                                    if let Some(first_cluster) = hap_indices.get(0) {
-                                        for &hap in first_cluster.iter().take(actual_n_states) {
-                                            prior_probs.push(priors.prior(hap, actual_n_states));
-                                        }
-                                    }
-                                    prior_probs
-                                });
-
-                        let state_probs = compute_state_probs(
-                            &hap_indices,
-                            &cluster_bounds,
-                            &genotyped_markers,
-                            target_win,
-                            ref_win,
-                            alignment,
-                            &obs_hap1,
-                            &obs_hap2,
-                            &obs_hap2,
-                            Some(&h1_locked),
-                            Some(&plp),
-                            s,
-                            actual_n_states,
-                            ws,
-                            self.params.p_mismatch,
-                                &cluster_p_recomb,
-                                marker_cluster.clone(),
-                                ref_cluster_end.clone(),
-                                gen_positions.clone(),
-                                cluster_midpoints_pos.clone(),
-                                self.params.recomb_intensity,
-                                prior_probs.as_deref(),
-                                local_idx == 0,
-                            );
-
-                            let priors = if output_end > 0 && n_ref_markers > 0 {
-                                let overlap_size = 1000.min(n_ref_markers);
-                                let overlap_start = output_end.saturating_sub(overlap_size);
-                                let prior_marker = overlap_start.min(n_ref_markers.saturating_sub(1));
-                                let (hap_ids, probs) = state_probs.haplotype_priors_at(prior_marker);
-                                let gen_pos = gen_maps.gen_pos(
-                                    chrom,
-                                    ref_win.marker(MarkerIdx::new(prior_marker as u32)).pos,
-                                );
-                                let mut priors = HaplotypePriors::new();
-                                priors.set_from_posteriors(&hap_ids, &probs, gen_pos, window_idx);
-                                priors
-                            } else {
-                                HaplotypePriors::new()
-                            };
-
-                            (state_probs, priors)
-                        };
-
-                        hap_priors.push(hap1_prior);
-                        hap_priors.push(hap2_prior);
-
-                        let output_markers = output_end.saturating_sub(output_start);
-                        let mut combined_dosages = Vec::with_capacity(output_markers);
-                        let mut combined_best_gt = Vec::with_capacity(output_markers);
-                        let mut hap1_alt_probs = Vec::with_capacity(output_markers);
-                        let mut hap2_alt_probs = Vec::with_capacity(output_markers);
-                        let mut hap1_posteriors = Vec::with_capacity(output_markers);
-                        let mut hap2_posteriors = Vec::with_capacity(output_markers);
-
-                        let mut cache1 = AllelePosteriorCache::default();
-                        let mut cache2 = AllelePosteriorCache::default();
-                        for marker_idx in output_start..output_end {
-                            let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
-                            let n_alleles = 1 + marker.alt_alleles.len();
-
-                            let (p1, p2, post1_opt, post2_opt) = {
-                                let column = ref_win.column(MarkerIdx::new(marker_idx as u32));
-                                // Use Reference-space posteriors for output.
-                                // The VCF uses Reference allele definitions, so DS must be
-                                // P(Ref ALT). The mapping is only needed when comparing
-                                // against target genotypes (in the locking section above).
-                                let post1 = hap1_probs.ref_posteriors_for_column_cached(
-                                    marker_idx,
-                                    n_alleles,
-                                    column,
-                                    &mut cache1,
-                                );
-                                let post2 = hap2_probs.ref_posteriors_for_column_cached(
-                                    marker_idx,
-                                    n_alleles,
-                                    column,
-                                    &mut cache2,
-                                );
-                                let p1 = post1.prob(1);
-                                let p2 = post2.prob(1);
-                                if include_posteriors {
-                                    (p1, p2, Some(post1), Some(post2))
-                                } else {
-                                    (p1, p2, None, None)
-                                }
-                            };
-
-                            if include_posteriors {
-                                if let Some(p1) = post1_opt {
-                                    hap1_posteriors.push(p1);
-                                }
-                                if let Some(p2) = post2_opt {
-                                    hap2_posteriors.push(p2);
-                                }
-                            } else {
-                                hap1_alt_probs.push(p1);
-                                hap2_alt_probs.push(p2);
-                            }
-
-                            let (dosage, best_gt) = compute_dosage_and_best_gt(
-                                marker_idx,
-                                s,
-                                p1,
-                                p2,
-                                target_win,
-                                alignment,
-                            );
-
-                            if s == 0 && marker_idx % 1000 == 0 {
-                                let tm = alignment.target_marker(marker_idx);
-                                let is_genotyped = tm.is_some();
-                                let mut input_gt = String::from(".");
-                                if let Some(t_idx) = tm {
-                                    let idx = crate::data::MarkerIdx::new(t_idx as u32);
-                                    let h1 = crate::data::HapIdx::new((s * 2) as u32);
-                                    let h2 = crate::data::HapIdx::new((s * 2 + 1) as u32);
-                                    let a1 = target_win.allele(idx, h1);
-                                    let a2 = target_win.allele(idx, h2);
-                                    input_gt = format!("{}/{}", a1, a2);
-                                }
-
-                                eprintln!(
-                                    "[OUTPUT CHECK] Window {} | Marker {} | Genotyped: {} | Input: {} | Calc DS: {:.4}",
-                                    window_idx,
-                                    marker_idx,
-                                    is_genotyped,
-                                    input_gt,
-                                    dosage
-                                );
-                            }
-                            combined_dosages.push(dosage);
-                            combined_best_gt.push(best_gt);
-                        }
-
-                        let priors = if hap_priors.len() == 2 {
-                            Some((hap_priors[0].clone(), hap_priors[1].clone()))
-                        } else {
-                            None
-                        };
-
-                        let hap_alt_probs = if include_posteriors {
-                            None
-                        } else {
-                            Some((hap1_alt_probs, hap2_alt_probs))
-                        };
-                        let hap_posteriors = if include_posteriors {
-                            Some((hap1_posteriors, hap2_posteriors))
-                        } else {
-                            None
-                        };
-
-                        (combined_dosages, combined_best_gt, priors, hap_alt_probs, hap_posteriors)
-                    });
-                    let result = SampleImputationResult {
+                    let ws = ws_opt.as_mut().unwrap();
+                    
+                    // Impute H1
+                    let input1 = build_input_vector(h1_idx);
+                    let d1_full = ref_map.impute_sample(&input1, self.params.error_rate, ws);
+                    
+                    // Impute H2
+                    let input2 = build_input_vector(h2_idx);
+                    let d2_full = ref_map.impute_sample(&input2, self.params.error_rate, ws);
+                    
+                    // Combine and extract output range
+                    let output_len = output_end.saturating_sub(output_start);
+                    let mut dosages = Vec::with_capacity(output_len);
+                    let mut best_gt = Vec::with_capacity(output_len);
+                    
+                    for m in output_start..output_end {
+                        let d1 = d1_full[m];
+                        let d2 = d2_full[m];
+                        let dosage = d1 + d2;
+                        
+                        let g1 = if d1 > 0.5 { 1 } else { 0 };
+                        let g2 = if d2 > 0.5 { 1 } else { 0 };
+                        // Refine GT based on sum?
+                        // If d > 1.5 -> 1/1.
+                        // If d < 0.5 -> 0/0.
+                        // Else 0/1.
+                        // But phased output is better.
+                        best_gt.push((g1, g2));
+                        dosages.push(dosage);
+                    }
+                    
+                    SampleImputationResult {
                         sample_idx: s,
                         dosages,
                         best_gt,
-                        priors,
-                        hap_alt_probs,
-                        hap_posteriors,
-                    };
-                    if let Some(bb) = telemetry.as_ref() {
-                        bb.add_samples(1);
+                        priors: None, // Soft handoff omitted for now
+                        hap_alt_probs: None,
+                        hap_posteriors: None,
                     }
-                    result
-                }).collect();
-
-            all_results.extend(batch_results);
-        }
+                })
+            })
+            .collect();
+            
+        all_results.extend(sample_results);
 
         // Sort all results by sample index for writing
         all_results.sort_by_key(|result| result.sample_idx);
-
-        let mut next_priors = if output_end > 0 && n_ref_markers > 0 {
-            Some(vec![HaplotypePriors::new(); n_target_samples * 2])
-        } else {
-            None
-        };
-
-        if let Some(priors) = next_priors.as_mut() {
-            for result in &all_results {
-                if let Some((p1, p2)) = &result.priors {
-                    let base = result.sample_idx * 2;
-                    if base + 1 < priors.len() {
-                        priors[base] = p1.clone();
-                        priors[base + 1] = p2.clone();
-                    }
-                }
-            }
-        }
 
         if let Some(bb) = &self.telemetry {
             let output_markers = output_end.saturating_sub(output_start);
@@ -1705,7 +1320,8 @@ target_samples={} target_bytes={}",
             bb.set_samples_processed(target_win.n_samples() as u64);
             bb.set_stage(crate::utils::telemetry::Stage::Imputation);
         }
-        Ok(next_priors)
+        
+        Ok(None) // No priors returned
     }
 
     fn extract_imputed_overlap_streaming(

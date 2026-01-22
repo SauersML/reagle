@@ -85,4 +85,22 @@ impl BlockHmmWorkspace {
             self.reservoir_prob_fwd = 0.0;
         }
     }
+
+    /// Normalize backward probabilities
+    pub fn normalize_bwd(&mut self, n_patterns: usize) {
+        let total: f32 = self.bwd[..n_patterns].iter().sum::<f32>() + self.reservoir_prob_bwd;
+
+        if total > 1e-30 {
+            let scale = 1.0 / total;
+            for prob in &mut self.bwd[..n_patterns] {
+                *prob *= scale;
+            }
+            self.reservoir_prob_bwd *= scale;
+        } else {
+            // Underflow - reinitialize to uniform
+            let uniform = 1.0 / n_patterns as f32;
+            self.bwd[..n_patterns].fill(uniform);
+            self.reservoir_prob_bwd = 0.0;
+        }
+    }
 }

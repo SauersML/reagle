@@ -57,8 +57,29 @@ pub fn build_compressed_block(
         })
         .collect();
 
-    // Compress using DictionaryColumn (2 bits per allele for multiallelic)
-    let bits_per_allele = 2;
+    // Determine max allele to set bits_per_allele dynamically
+    let mut max_allele = 0u8;
+    for marker_idx in marker_range.clone() {
+         let marker = MarkerIdx::new(marker_idx as u32);
+         for hap_idx in 0..n_haplotypes {
+             let allele = ref_data.allele(marker, HapIdx::new(hap_idx as u32));
+             if allele != 255 {
+                 max_allele = max_allele.max(allele);
+             }
+         }
+    }
+    
+    let bits_per_allele = if max_allele < 2 {
+        1
+    } else if max_allele < 4 {
+        2
+    } else if max_allele < 16 {
+        4
+    } else {
+        8
+    };
+
+    // Compress using DictionaryColumn
     let dict_column = DictionaryColumn::compress(
         &columns.iter().map(|f| |h| f(h)).collect::<Vec<_>>(),
         n_markers,
@@ -139,6 +160,21 @@ pub fn build_compressed_block(
             )
         };
 
+    // Pre-unpack alleles for all kept patterns to avoid bit-unpacking in hot loops
+    // Flattened: [pattern_idx * n_markers + marker_idx]
+    let n_kept_patterns = pattern_counts.len();
+    let mut unpacked_alleles = vec![0u8; n_kept_patterns * n_markers];
+
+    for (kept_idx, globals) in pattern_to_globals.iter().enumerate() {
+        if let Some(first_global) = globals.first() {
+             let hap = HapIdx::new(first_global.as_u32());
+             for m in 0..n_markers {
+                 let allele = storage.get(m, hap);
+                 unpacked_alleles[kept_idx * n_markers + m] = allele;
+             }
+        }
+    }
+
     CompressedBlock {
         start_marker,
         end_marker,
@@ -148,6 +184,7 @@ pub fn build_compressed_block(
         reservoir_count,
         reservoir_globals,
         reservoir_allele_freqs,
+        unpacked_alleles,
     }
 }
 

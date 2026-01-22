@@ -38,6 +38,10 @@ pub struct CompressedBlock {
     /// Allele frequencies of reservoir haplotypes [marker_in_window]
     /// Used for emission probabilities
     pub reservoir_allele_freqs: Vec<f32>,
+
+    /// Unpacked alleles for fast emission calculation [pattern_idx * window_size + marker_in_window]
+    /// Avoids bit-unpacking overhead in hot loops
+    pub unpacked_alleles: Vec<u8>,
 }
 
 impl CompressedBlock {
@@ -77,8 +81,9 @@ impl CompressedBlock {
         if pattern_id.is_reservoir() {
             self.reservoir_allele_freqs[marker_in_window]
         } else {
-            self.storage
-                .pattern_allele(marker_in_window, pattern_id.as_usize()) as f32
+            // Fast lookup from unpacked buffer
+            let idx = pattern_id.as_usize() * self.window_size() + marker_in_window;
+            self.unpacked_alleles[idx] as f32
         }
     }
 

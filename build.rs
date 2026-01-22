@@ -369,8 +369,8 @@ impl ForbiddenCommentCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CRITICAL', 'CORRECTED', 'FIX', 'FIXES', 'NEW', 'CHANGED', 'CHANGES', 'CHANGE', 'MODIFIED', 'MODIFIES', 'MODIFY', 'UPDATED', 'UPDATES', or 'UPDATE' are STRICTLY FORBIDDEN in this project.\n");
-        error_msg.push_str("   These comments will cause compilation to fail. Remove them completely rather than commenting them out.\n");
+        error_msg.push_str("\n⚠️ Comments containing 'DEPRECATED', 'FIXED', 'CRITICAL', 'CORRECTED', 'FIX', 'FIXES', 'NEW', 'CHANGED', 'CHANGES', 'CHANGE', 'MODIFIED', 'MODIFIES', 'MODIFY', 'UPDATED', 'UPDATES', or 'UPDATE' are STRICTLY FORBIDDEN in this project.\n");
+        error_msg.push_str("   Simply remove it instead of depreciating something.\n");
         error_msg.push_str("   The '**' pattern is not allowed in regular comments (but is allowed in doc comments).\n");
         error_msg.push_str(
             "   Comments where over 80% of alphabetic characters are uppercase are not allowed.\n",
@@ -775,10 +775,7 @@ impl DeprecatedCollector {
 
         error_msg
             .push_str("\n⚠️ #[deprecated] ATTRIBUTES ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n");
-        error_msg.push_str("   Deprecated code keeps dead API surface area alive unnecessarily.\n");
-        error_msg.push_str(
-            "   If code is no longer needed, DELETE it completely. Do not deprecate it.\n",
-        );
+        error_msg.push_str("   Simply remove it instead of depreciating something.\n");
 
         Some(error_msg)
     }
@@ -2130,7 +2127,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
     // Split into separate patterns for clarity and reliability
     // 1. Pattern to catch forbidden words in comments
-    let forbidden_words_pattern = r"(//|/\*|///).*(?:CRITICAL|FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
+    let forbidden_words_pattern = r"(//|/\*|///).*(?:DEPRECATED|CRITICAL|FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
     // 2. Pattern to catch ** in comments (excluding doc comments)
     let stars_pattern = r"(//|/\*).*\*\*";
     // 3. Pattern to catch comments for uppercase ratio enforcement
