@@ -3433,8 +3433,8 @@ fn test_dosage_by_distance_from_genotyped() {
             imputed_count += bucket.len();
         }
 
-        let status = if mean_mad > 0.06 { " FAIL" } else { "" };
-        if mean_mad > 0.06 {
+        let status = if mean_mad > 0.05 { " FAIL" } else { "" };
+        if mean_mad > 0.05 {
             any_bucket_failed = true;
         }
 
@@ -3461,10 +3461,10 @@ fn test_dosage_by_distance_from_genotyped() {
         imputed_mad - genotyped_mad
     );
 
-    // Strict: No bucket should have mean MAD > 0.06
+    // Strict: No bucket should have mean MAD > 0.05
     assert!(
         !any_bucket_failed,
-        "DISTANCE TEST FAIL: At least one distance bucket has mean MAD > 0.06"
+        "DISTANCE TEST FAIL: At least one distance bucket has mean MAD > 0.05"
     );
 }
 
