@@ -46,6 +46,8 @@ pub fn forward_within_block(
         // Use ws.emissions as temp buffer
         let emissions = &mut ws.emissions;
         
+        let n_alleles = block.n_alleles(marker_in_window);
+        
         for pattern_idx in 0..n_patterns {
             let pattern_id = PatternId::new(pattern_idx as u32);
             emissions[pattern_idx] = emission_prob(
@@ -54,6 +56,7 @@ pub fn forward_within_block(
                 marker_in_window,
                 target_allele,
                 error_rate,
+                n_alleles,
             );
         }
 
@@ -78,6 +81,7 @@ pub fn forward_within_block(
                 marker_in_window,
                 target_allele,
                 error_rate,
+                n_alleles,
             );
 
             let total_mass = fwd_sum;
@@ -120,6 +124,8 @@ pub fn forward_to_marker_in_block(
 
         let emissions = &mut ws.emissions;
         
+        let n_alleles = block.n_alleles(marker_in_window);
+        
         for pattern_idx in 0..n_patterns {
             let pattern_id = PatternId::new(pattern_idx as u32);
             emissions[pattern_idx] = emission_prob(
@@ -128,6 +134,7 @@ pub fn forward_to_marker_in_block(
                 marker_in_window,
                 target_allele,
                 error_rate,
+                n_alleles,
             );
         }
 
@@ -150,6 +157,7 @@ pub fn forward_to_marker_in_block(
                 marker_in_window,
                 target_allele,
                 error_rate,
+                n_alleles,
             );
 
             let total_mass = fwd_sum;

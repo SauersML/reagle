@@ -784,9 +784,12 @@ target_samples={} target_bytes={}",
         
         // 1. Iterate safely over windows(2) for the first N-1 intervals
         // This ensures semantic consistency for indexes 0..N-2
-        for pair in ref_win.markers().windows(2) {
-            let curr = &pair[0];
-            let next = &pair[1];
+        // 1. Iterate safely over windows(2) for the first N-1 intervals
+        // This ensures semantic consistency for indexes 0..N-2
+        let n_markers = ref_win.n_markers();
+        for i in 0..n_markers.saturating_sub(1) {
+            let curr = ref_win.marker(crate::data::MarkerIdx::new(i as u32));
+            let next = ref_win.marker(crate::data::MarkerIdx::new(i as u32 + 1));
             let dist_cm = (gen_maps.gen_pos(chrom_idx, next.pos) - gen_maps.gen_pos(chrom_idx, curr.pos)).abs();
             recomb_rates.push(self.params.p_recomb(dist_cm));
         }
@@ -901,7 +904,7 @@ target_samples={} target_bytes={}",
                                 
                                 ws.normalize_forward(first_block.n_patterns());
                             } else {
-                                ws.reset(first_block.n_patterns());
+                                ws.reset_from_block(first_block);
                             }
                         }
                         
