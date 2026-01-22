@@ -184,10 +184,12 @@ impl ModelParams {
     /// Update recombination intensity (for EM estimation)
     ///
     /// From Java `PhaseData.updateRecombIntensity`:
-    /// Only update if new value is valid and positive
-    pub fn update_recomb_intensity(&mut self, new_intensity: f32) {
-        if new_intensity.is_finite() && new_intensity > 0.0 {
-            self.recomb_intensity = new_intensity;
+    /// Only update if new value is present, valid and positive
+    pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
+        if let Some(r) = new_intensity {
+            if r.is_finite() && r > 0.0 {
+                self.recomb_intensity = r;
+            }
         }
     }
 
@@ -263,11 +265,12 @@ impl ParamEstimates {
     /// From Java `ParamEstimates.recombIntensity()`:
     /// Returns ratio of expected switches to total genetic distance
     /// λ = Σ(expected_switches) / Σ(genetic_distances)
-    pub fn recomb_intensity(&self) -> f32 {
-        if self.sum_gen_dist <= 0.0 {
-            return 1.0;
+    /// Returns None if total genetic distance is too small (avoid division by zero or default 1.0)
+    pub fn recomb_intensity(&self) -> Option<f32> {
+        if self.sum_gen_dist <= 1e-9 {
+            return None;
         }
-        (self.sum_expected_switches / self.sum_gen_dist) as f32
+        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
     }
 
     /// Estimate mismatch probability

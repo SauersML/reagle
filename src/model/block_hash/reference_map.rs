@@ -234,11 +234,12 @@ impl ReferenceMap {
                   // Let's match the pattern initialization logic or just 1.0.
                   // Given `normalize_bwd` handles scaling, setting to 1.0 (or uniform) is fine.
                   // Let's set to uniform to be safe/consistent.
-                  ws.reservoir_prob_bwd = 1.0 / (n_patterns + 1) as f32; // Rough guess
-                  // Actually, let's just use 1.0 for everything and let normalize handle it?
-                  // No, `normalize_bwd` expects some distribution.
-                  // Let's enable reservoir survival:
-                  ws.reservoir_prob_bwd = uniform; 
+                  // Fix 9: Weight reservoir probability by its cardinality to match Forward/Stationary distribution
+                  // If we treat every haplotype as equiprobable:
+                  // p(reservoir) = reservoir_count / n_ref_haps
+                  // This ensures mass conservation and symmetry with forward.
+                  let prob_per_hap = 1.0 / block.n_ref_haps() as f32;
+                  ws.reservoir_prob_bwd = prob_per_hap * block.reservoir_count as f32; 
              } else {
                  ws.reservoir_prob_bwd = 0.0;
              }

@@ -237,16 +237,17 @@ pub fn compute_cluster_mismatches_into_workspace(
                             log_match = emit_match.ln();
                             log_mism = emit_mism.ln();
                         } else {
-                            (log_match, log_mism) = get_log_probs(confidence, p_err);
+                            (log_match, log_mism) = get_log_probs(confidence, p_err, 2);
                         }
                     } else {
-                        (log_match, log_mism) = get_log_probs(confidence, p_err);
+                        (log_match, log_mism) = get_log_probs(confidence, p_err, 2);
                     }
                 } else {
-                    (log_match, log_mism) = get_log_probs(confidence, p_err);
+                    (log_match, log_mism) = get_log_probs(confidence, p_err, 2);
                 }
             } else {
-                (log_match, log_mism) = get_log_probs(confidence, p_err);
+                let n_alleles = target_gt.column(target_marker_idx).n_alleles();
+                (log_match, log_mism) = get_log_probs(confidence, p_err, n_alleles);
             }
 
             let log_diff = log_mism - log_match;

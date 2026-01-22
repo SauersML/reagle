@@ -19,17 +19,41 @@
 //!
 //! ## Architecture
 //!
-//! - MicroWindow: Wraps `DictionaryColumn` with HMM state (reuses existing compression)
-//! - TransitionBridge: Maps probability between windows via `zip()` on hap_to_pattern vectors
-//! - Compression: Builds `DictionaryColumn` from `GenotypeMatrix` windows
-//! - HMM Kernel: Reuses existing `HmmUpdater` for SIMD-optimized forward/backward passes
+//! ### Immutable/Mutable Separation (Critical for Parallelization)
 //!
-//! ## Key Advantages
+//! - **CompressedBlock** (immutable): Built once, Arc-wrapped, shared across all samples
+//!   - Contains reference panel compression, pattern counts, global ID mappings
+//!   - Zero-cost sharing across threads
 //!
-//! - Maximum Accuracy: No donor truncation for 1KG+HGDP-scale panels
-//! - Mathematically Correct: Probability follows physical DNA molecules
-//! - High Performance: SIMD-friendly execution on compressed states
-//! - Code Reuse: Leverages ~2,000 lines of existing, tested infrastructure
+//! - **BlockHmmWorkspace** (mutable): Per-sample workspace, thread-local or pooled
+//!   - Contains forward/backward buffers, emissions, checkpoints
+//!   - Prevents re-compression overhead
+//!
+//! - **ReferenceMap** (immutable): Pre-computed container of blocks and transitions
+//!   - Builds all CompressedBlocks and TransitionBridges once
+//!   - Enables efficient parallel imputation across samples
+//!
+//! ### Core Components
+//!
+//! - **types.rs**: Type-safe GlobalId and PatternId newtypes to prevent index confusion
+//! - **compressed_block.rs**: Immutable reference data with pattern mappings
+//! - **workspace.rs**: Mutable per-sample HMM state buffers
+//! - **transition.rs**: CSR sparse format for deterministic, cache-friendly transitions
+//! - **compression.rs**: Builds CompressedBlock from GenotypeMatrix using DictionaryColumn
+//! - **hmm.rs**: Forward/backward passes reusing existing HmmUpdater SIMD kernels
+//!
+//! ### Multiallelic Safety
+//!
+//! Uses exact allele matching instead of biallelic 0/1 assumption:
+//! - Match: 1.0 - error_rate (regardless of allele value)
+//! - Mismatch: error_rate (works for alleles {0, 1, 2, 3, ...})
+//!
+//! ### Performance Characteristics
+//!
+//! - Memory: <15GB for 1KG+HGDP (~8k haplotypes)
+//! - Compression: ~5-10x (8k haps → 800-1600 unique patterns per window)
+//! - Parallelization: Zero-cost reference sharing via Arc
+//! - SIMD: Leverages AVX-512 kernels from existing HmmUpdater
 
 mod types;
 mod compressed_block;

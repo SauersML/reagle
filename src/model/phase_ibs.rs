@@ -392,11 +392,12 @@ impl BidirectionalPhaseIbs {
         // Convert marker index to global space for IBS2 lookup
         // IBS2 segments use global marker indices, but when built for a subset,
         // marker_idx is in subset space. The mapping handles this conversion.
-        let ibs2_marker_idx = self
-            .subset_to_global
-            .as_ref()
-            .and_then(|mapping| mapping.get(marker_idx).copied())
-            .unwrap_or(marker_idx);
+        // Fix 11: Strict handling of subset_to_global mapping to prevent silent fallback errors
+        // IBS2 segments use global marker indices.
+        let ibs2_marker_idx = match &self.subset_to_global {
+            Some(mapping) => *mapping.get(marker_idx).expect("Marker index out of bounds for subset mapping"),
+            None => marker_idx,
+        };
 
         for seg in ibs2.segments(sample) {
             if seg.contains(ibs2_marker_idx) {
