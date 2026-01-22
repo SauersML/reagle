@@ -70,8 +70,12 @@ impl ModelParams {
     /// * `ne` - Effective population size (from CLI or default)
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
-        // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        // Formula from Java PhaseData constructor: 0.04 * ne / nHaps
+        // This gives recombination intensity per Morgan.
+        // Rust uses cM internally (from GeneticMaps).
+        // To convert per-Morgan intensity to per-cM, we divide by 100.
+        // (1 Morgan = 100 cM).
+        let recomb_intensity = (0.04 * ne / n_haps as f32) * 0.01;
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -106,7 +110,9 @@ impl ModelParams {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+        // This gives recombination intensity per Morgan.
+        // Rust uses cM internally. Convert to per-cM by dividing by 100.
+        let recomb_intensity = (0.04 * ne / n_ref_haps as f32) * 0.01;
 
         Self {
             p_mismatch,
@@ -350,26 +356,30 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
-        assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
+        // Should be (0.04 * 1_000_000 / 1000) * 0.01 = 40.0 * 0.01 = 0.4
+        let expected = (0.04 * 1_000_000.0 / 1000.0) * 0.01;
+        assert!((params.recomb_intensity - expected as f32).abs() < 0.001);
     }
 
     #[test]
     fn test_p_recomb() {
-        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
+        // Use default params (R=1.0 per cM?) No, new() uses 1.0.
+        // Let's create from for_phasing to get scale right.
+        // ne=100000, n_haps=100.
+        // R_morgans = 0.04 * 100000 / 100 = 40.0.
+        // R_cm = 40.0 * 0.01 = 0.4.
+        let params = ModelParams::for_phasing(100, 100_000.0, None);
+        assert!((params.recomb_intensity - 0.4).abs() < 0.001);
 
-        // No distance -> no recomb
-        let p0 = params.p_recomb(0.0);
-        assert!(p0.abs() < 0.0001);
+        // Distance 1 cM.
+        // p = 1 - exp(-0.4 * 1.0) = 1 - exp(-0.4) = 1 - 0.6703 = 0.3297
+        let p1 = params.p_recomb(1.0);
+        assert!((p1 - 0.3297).abs() < 0.001);
 
-        // Small distance -> small prob
-        let p1 = params.p_recomb(0.001);
-        assert!(p1 > 0.0 && p1 < 0.5);
-
-        // Larger distance -> higher prob
+        // Distance 0.01 cM.
+        // p = 1 - exp(-0.4 * 0.01) = 1 - exp(-0.004) = 0.00399
         let p2 = params.p_recomb(0.01);
-        assert!(p2 > p1);
+        assert!((p2 - 0.00399).abs() < 0.0001);
     }
 
     #[test]
