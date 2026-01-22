@@ -99,11 +99,12 @@ impl ModelParams {
     /// - pRecomb: uses refGT.nHaps() (ref only)
     pub fn for_imputation(
         n_ref_haps: usize,
-        n_total_haps: usize,
+        _n_total_haps: usize,
         ne: f32,
         err: Option<f32>,
     ) -> Self {
-        // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
+        // Error rate is fixed at 0.0001 to match Beagle 5.4 behavior.
+        // (Beagle 4 used sample-size dependent Li-Stephens approximation)
         let p_mismatch = err.unwrap_or(0.0001);
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = (0.04 * ne / n_ref_haps as f32) * 0.01;
