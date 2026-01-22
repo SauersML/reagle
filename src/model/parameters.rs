@@ -165,10 +165,24 @@ impl ModelParams {
     /// pRecomb[m] = -Math.expm1(c * genDist.get(m))
     /// ```
     ///
-    /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
+    /// Calculate recombination probability from genetic distance
+    ///
+    /// From Java `MarkerMap.pRecomb`:
+    /// ```java
+    /// double c = -recombIntensity;
+    /// pRecomb[m] = -Math.expm1(c * genDist.get(m))
+    /// ```
+    ///
+    /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable.
+    ///
+    /// IMPORTANT: `gen_dist_cm` must be in **Morgans** for the standard formula to work
+    /// if `recomb_intensity` is scaled as 40000/N.
+    /// Java Beagle uses Morgans internally for `genDist`.
+    /// Rust `GeneticMaps` returns cM. We must convert cM to Morgans here (div by 100).
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
+        let gen_dist_morgans = gen_dist_cm * 0.01;
         let c = -(self.recomb_intensity as f64);
-        (-f64::exp_m1(c * gen_dist_cm)) as f32
+        (-f64::exp_m1(c * gen_dist_morgans)) as f32
     }
 
     /// Update mismatch probability (for EM estimation)
