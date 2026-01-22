@@ -787,7 +787,7 @@ target_samples={} target_bytes={}",
         }
 
         // Build ReferenceMap for this window
-        let ref_map = ReferenceMap::build(ref_win, 64, 4096, &recomb_rates);
+        let ref_map = ReferenceMap::build(ref_win, 64, 4096, &recomb_rates[..n_ref_markers.saturating_sub(1)]);
         
         let ref_is_biallelic: Vec<bool> = (0..n_ref_markers)
             .map(|m| ref_win.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
