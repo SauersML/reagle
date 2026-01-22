@@ -46,7 +46,7 @@ pub mod allele_lookup;
 pub mod block_hash;
 pub mod hmm;
 pub mod ibs2;
-pub mod imp_utils;
+
 pub mod parameters;
 pub mod pbwt;
 pub mod pbwt_streaming;

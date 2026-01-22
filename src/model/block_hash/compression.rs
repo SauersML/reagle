@@ -219,8 +219,8 @@ fn compute_reservoir_freqs(
         let hap = HapIdx::new(global_id.as_u32());
         for marker_offset in 0..window_size {
             let allele = storage.get(marker_offset, hap);
-            if allele != 255 {
-                allele_sums[marker_offset] += allele as u32;
+            if allele != 255 && allele > 0 {
+                allele_sums[marker_offset] += 1;
             }
         }
     }

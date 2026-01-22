@@ -370,7 +370,7 @@ impl ForbiddenCommentCollector {
         }
 
         error_msg.push_str("\n⚠️ Comments containing 'DEPRECATED', 'FIXED', 'CRITICAL', 'CORRECTED', 'FIX', 'FIXES', 'NEW', 'CHANGED', 'CHANGES', 'CHANGE', 'MODIFIED', 'MODIFIES', 'MODIFY', 'UPDATED', 'UPDATES', or 'UPDATE' are STRICTLY FORBIDDEN in this project.\n");
-        error_msg.push_str("   Simply remove it instead of depreciating something.\n");
+        error_msg.push_str("   Simply remove it instead of deprecating something.\n");
         error_msg.push_str("   The '**' pattern is not allowed in regular comments (but is allowed in doc comments).\n");
         error_msg.push_str(
             "   Comments where over 80% of alphabetic characters are uppercase are not allowed.\n",
@@ -778,7 +778,7 @@ impl DeprecatedCollector {
 
         error_msg
             .push_str("\n⚠️ #[deprecated] ATTRIBUTES ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n");
-        error_msg.push_str("   Simply remove it instead of depreciating something.\n");
+        error_msg.push_str("   Simply remove it instead of deprecating something.\n");
 
         Some(error_msg)
     }
