@@ -936,11 +936,10 @@ pub fn compute_state_probs(
         trace,
     );
 
-    let threshold = if n_clusters <= 1000 {
-        0.0
-    } else {
-        (0.9999f32 / n_states as f32).min(0.005f32)
-    };
+    // Fixed threshold matching Java Beagle's minProb (1e-5).
+    // This ensures consistent pruning of low-probability paths, improving stickiness
+    // and reducing noise even in small windows.
+    let threshold = 1e-5f32;
 
     let (offsets, sparse_haps, sparse_probs, sparse_probs_p1) = run_hmm_forward_backward_to_sparse(
         &workspace.diff_vals,
