@@ -138,7 +138,12 @@ fn compute_dosage_and_best_gt(
             .clamp(0.0, 1.0);
 
         if a1 < 2 && a2 < 2 {
-            let dosage = (a1 as f32) + (a2 as f32);
+            // Use HMM posterior probabilities for dosage.
+            // This properly reflects uncertainty and allows genotype refinement
+            // guided by the reference panel, while the HMM itself is already
+            // constrained by the input genotype likelihoods/confidence.
+            let dosage = p1 + p2;
+
             let gt = if conf >= 0.99 {
                 (a1, a2)
             } else {
