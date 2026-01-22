@@ -650,7 +650,7 @@ def get_vcf_samples(vcf_path):
     return samples
 
 
-def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
+def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, reference_vcf=None):
     """
     Calculate comprehensive imputation accuracy metrics.
 
@@ -782,6 +782,62 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
     input_sites = load_input_sites(input_vcf)
     if input_sites is not None:
         print(f"Input genotyped sites: {len(input_sites)}")
+
+    # Reference panel AF/MAF (required for meaningful MAF stratification)
+    ref_key = None
+    ref_afs = None
+    ref_iter = None
+
+    def _parse_ref_af_line(line):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 5:
+            return None, None
+        chrom, pos_s, ref, alt, af_s = parts[0], parts[1], parts[2], parts[3], parts[4]
+        try:
+            pos = int(pos_s)
+        except ValueError:
+            return None, None
+
+        afs = []
+        if af_s and af_s != ".":
+            for tok in af_s.split(","):
+                if tok and tok != ".":
+                    try:
+                        afs.append(float(tok))
+                    except ValueError:
+                        continue
+        # Key by (CHROM, POS) so we can still stratify even if REF/ALT representation differs.
+        return (chrom, pos), (ref, alt, afs)
+
+    def _maf_from_afs(afs):
+        if not afs:
+            return None
+        alt_sum = sum(afs)
+        ref_f = 1.0 - alt_sum
+        all_freqs = [ref_f] + list(afs)
+        maf = min(all_freqs)
+        if maf < 0.0:
+            maf = 0.0
+        if maf > 0.5:
+            maf = 0.5
+        return maf
+
+    if not reference_vcf or not os.path.exists(reference_vcf):
+        raise RuntimeError("reference_vcf is required for MAF stratification but was not provided or does not exist")
+
+    try:
+        ref_cmd = (
+            f"bcftools +fill-tags {reference_vcf} -Ou -- -t AF "
+            f"| bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n'"
+        )
+        ref_iter = _stream_vcf_lines(ref_cmd)
+        try:
+            first_line = next(ref_iter)
+            ref_key, ref_afs = _parse_ref_af_line(first_line)
+        except StopIteration:
+            raise RuntimeError(f"Reference VCF AF stream was empty: {reference_vcf}")
+    except Exception as e:
+        raise RuntimeError(f"Could not initialize reference AF stream from {reference_vcf}: {e}")
 
     # Calculate metrics
     unphased_concordant = 0  # Genotype match ignoring phase (0|1 == 1|0)
@@ -1026,23 +1082,32 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
 
                 # --- METRICS CALCULATION LOGIC (same as before) ---
                 
-                # Calculate non-ref AF/MAF from truth (works for biallelic and multiallelic)
-                alt_count = 0
-                allele_count = 0
-                for sample in common_samples_list:
-                    t_entry = truth_site.get(sample)
-                    if t_entry is None:
-                        continue
-                    t_gt = t_entry[0]
-                    if t_gt is not None and t_gt[0] != 255 and t_gt[1] != 255:
-                        alt_count += (1 if t_gt[0] != 0 else 0) + (1 if t_gt[1] != 0 else 0)
-                        allele_count += 2
-                if allele_count > 0:
-                    af = alt_count / allele_count
-                    maf = min(af, 1 - af)
-                else:
-                    af = 0
-                    maf = 0
+                # Calculate AF/MAF for stratification from the reference panel.
+                maf = None
+                af = None
+                site_key = (t_chrom, t_pos)
+                while ref_key is not None and ref_key < site_key:
+                    try:
+                        ref_key, ref_afs = _parse_ref_af_line(next(ref_iter))
+                    except StopIteration:
+                        ref_key, ref_afs = None, None
+                        break
+
+                if ref_key != site_key:
+                    raise RuntimeError(
+                        f"Reference AF not found for site {t_chrom}:{t_pos}. "
+                        f"MAF stratification requires the site to be present in reference_vcf ({reference_vcf})."
+                    )
+
+                ref_ref, ref_alt, ref_af_list = ref_afs
+                maf = _maf_from_afs(ref_af_list)
+                if ref_af_list and len(ref_af_list) == 1:
+                    af = ref_af_list[0]
+
+                if maf is None:
+                    raise RuntimeError(
+                        f"Reference AF/MAF missing or invalid for site {t_chrom}:{t_pos} in {reference_vcf}"
+                    )
 
                 maf_bin = get_maf_bin(maf)
                 site_concordant = 0
@@ -1218,7 +1283,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None):
                             ece_bins[bin_idx]["count"] += 1
 
                 # IQS Calculation
-                if site_total > 0 and maf > 0 and maf < 1:
+                if site_total > 0 and maf > 0 and maf < 1 and af is not None:
                     p = af
                     q = 1 - p
                     expected_conc = (q*q)**2 + (2*p*q)**2 + (p*p)**2
@@ -2185,7 +2250,8 @@ def stage_metrics():
             metrics = calculate_metrics(
                 str(paths['truth_vcf']),
                 vcf,
-                str(paths['data_dir'] / f"{name}")
+                str(paths['data_dir'] / f"{name}"),
+                reference_vcf=str(paths['ref_vcf']) if paths['ref_vcf'].exists() else None
             )
             all_metrics[name] = metrics
         else:
@@ -2800,7 +2866,13 @@ def stage_metrics_chr(chrom):
             print(f"Calculating metrics for {prefix.upper()}")
             print("=" * 40)
             try:
-                calculate_metrics(truth_vcf, str(imputed_path), str(data_dir / prefix), input_vcf=str(paths['input_vcf']))
+                calculate_metrics(
+                    truth_vcf,
+                    str(imputed_path),
+                    str(data_dir / prefix),
+                    input_vcf=str(paths['input_vcf']),
+                    reference_vcf=str(paths['ref_vcf']) if paths['ref_vcf'].exists() else None
+                )
             except Exception as e:
                 print(f"Error: {e}")
 

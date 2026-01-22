@@ -13,8 +13,8 @@ def run_cmd(cmd, shell=False):
 def run_benchmark(person, file_path, format):
     # 1. Prepare Data
     print(f"=== Preparing data for {person} ({file_path}) ===")
-    run_cmd(["python3", "scripts/prepare_data.py", "array", file_path, "target.vcf.gz"])
     run_cmd(["python3", "scripts/prepare_data.py", "reference", "ref.vcf.gz"])
+    run_cmd(["python3", "scripts/prepare_data.py", "array", file_path, "target.vcf.gz"])
     
     truth_dir = "data/kat_suricata" if person == "Kat" else "data/christopher_smith"
     run_cmd(["python3", "scripts/prepare_data.py", "truth", truth_dir, "truth.vcf.gz"])

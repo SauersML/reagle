@@ -9,8 +9,8 @@ def _resolve_local_panel_path():
     candidates = [
         "ref.vcf.gz",
         os.path.join("tests", "data", "ref.vcf.gz"),
-        os.path.join("tests", "fixtures", "gnomad_hgdp", "ref.vcf.gz"),
     ]
+
     for p in candidates:
         if os.path.exists(p):
             return p
@@ -169,6 +169,32 @@ def prepare_truth(source, output_vcf):
     print("Indexing Truth VCF...")
     subprocess.check_call(["bcftools", "index", "-t", source_vcf])
 
+    panel_path = _resolve_local_panel_path()
+    if not panel_path:
+        raise RuntimeError(
+            "HGDP+1KG panel VCF not found locally (expected one of: ref.vcf.gz, tests/data/ref.vcf.gz)."
+        )
+
+    install_convert_genome()
+
+    ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    truth_hg38_vcf = "truth_hg38.vcf.gz"
+
+    cmd = [
+        "convert_genome",
+        source_vcf,
+        ref_hg38_url,
+        truth_hg38_vcf,
+        "--assembly", "GRCh38",
+        "--format", "vcf",
+        "--standardize",
+        "--panel", panel_path,
+    ]
+
+    print(f"Running: {' '.join(cmd)}")
+    subprocess.check_call(cmd)
+    subprocess.check_call(["bcftools", "index", "-f", truth_hg38_vcf])
+
     # Rename chroms (22 -> chr22) to match reference panel which uses chr22 notation
     with open("chr_map.txt", "w") as f:
         f.write("22\tchr22\n")
@@ -176,7 +202,7 @@ def prepare_truth(source, output_vcf):
     print("Filtering Truth to Chr22...")
     # Filter FIRST using index (regions 22 or chr22), then rename to chr22
     cmd = (
-        f"bcftools view {source_vcf} --regions 22,chr22 -Ou | "
+        f"bcftools view {truth_hg38_vcf} --regions 22,chr22 -Ou | "
         f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
     )
     subprocess.check_call(cmd, shell=True)
@@ -184,6 +210,10 @@ def prepare_truth(source, output_vcf):
     
     if os.path.exists(source_vcf):
         os.remove(source_vcf)
+    if os.path.exists(truth_hg38_vcf):
+        os.remove(truth_hg38_vcf)
+    if os.path.exists(truth_hg38_vcf + ".csi"):
+        os.remove(truth_hg38_vcf + ".csi")
     if os.path.exists("chr_map.txt"):
         os.remove("chr_map.txt")
     print(f"Truth prepared: {output_vcf}")
@@ -202,7 +232,7 @@ def run_conversion(input_path, output_vcf):
     panel_path = _resolve_local_panel_path()
     if not panel_path:
         raise RuntimeError(
-            "HGDP+1KG panel VCF not found locally (expected one of: ref.vcf.gz, tests/data/ref.vcf.gz, tests/fixtures/gnomad_hgdp/ref.vcf.gz)."
+            "HGDP+1KG panel VCF not found locally (expected one of: ref.vcf.gz, tests/data/ref.vcf.gz)."
         )
 
     cmd = [
