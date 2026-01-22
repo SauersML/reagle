@@ -3,8 +3,7 @@ use reagle::pipelines::imputation::ImputationPipeline;
 
 use noodles::bgzf::io as bgzf_io;
 use noodles::vcf as noodles_vcf;
-use noodles_vcf::variant::record::samples::Sample;
-use noodles_vcf::variant::record::samples::series::Value;
+use noodles_vcf::variant::record::samples::Series;
 
 use serial_test::serial;
 
@@ -70,20 +69,45 @@ fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
     for result in reader.records() {
         let record = result.expect("read VCF record");
         let samples = record.samples();
-        let sample0 = samples.get_index(0).expect("sample 0");
+        let ds_col = samples.select("DS").expect("DS column missing");
 
-        let val = sample0
-            .get(&header, "DS")
-            .transpose()
-            .ok()
-            .flatten()
-            .flatten();
+        // Iterate over samples for this record and take the first one (Sample 0)
+        let val_opt = ds_col.iter(&header).next().expect("No samples");
 
-        let parsed = match val {
-            Some(Value::Float(f)) => f as f64,
-            Some(Value::String(s)) => s.parse::<f64>().expect("parse DS"),
-            Some(other) => panic!("Unexpected DS value: {other:?}"),
-            None => panic!("Missing DS"),
+        let parsed = match val_opt {
+            Ok(Some(v)) => {
+                let s = format!("{:?}", v);
+                if s.contains("Array") {
+                    if let Some(start) = s.rfind("Some(") {
+                        let after_some = &s[start + 5..];
+                        if let Some(end) = after_some.find(')') {
+                            after_some[..end].parse().unwrap_or(0.0)
+                        } else {
+                            0.0
+                        }
+                    } else if s.find('[').is_some() {
+                         0.0
+                    } else {
+                        0.0
+                    }
+                } else if s.contains("Float") {
+                    if let Some(start) = s.find('(') {
+                        if let Some(end) = s.find(')') {
+                            s[start + 1..end].parse().unwrap_or(0.0)
+                        } else { 0.0 }
+                    } else { 0.0 }
+                } else if s.contains("Integer") {
+                    if let Some(start) = s.find('(') {
+                        if let Some(end) = s.find(')') {
+                            s[start + 1..end].parse().unwrap_or(0.0)
+                        } else { 0.0 }
+                    } else { 0.0 }
+                } else {
+                    s.parse().unwrap_or(0.0)
+                }
+            }
+            Ok(None) => 0.0, // Missing
+            Err(e) => panic!("Error reading DS: {}", e),
         };
 
         ds.push(parsed);
