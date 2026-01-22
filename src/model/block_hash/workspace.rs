@@ -19,9 +19,6 @@ pub struct BlockHmmWorkspace {
     /// Emission probabilities (temporary buffer, sized to max_states)
     pub emissions: AVec<f32, ConstAlign<32>>,
 
-    /// Scratch buffer for vector operations (sized to max_states)
-    pub scratch: AVec<f32, ConstAlign<32>>,
-
     /// Reservoir probability (forward)
     pub reservoir_prob_fwd: f32,
 
@@ -49,7 +46,6 @@ impl BlockHmmWorkspace {
             fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
             bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
             emissions: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
-            scratch: AVec::from_iter(32, std::iter::repeat(0.0).take(max_states)),
             reservoir_prob_fwd: 0.0,
             reservoir_prob_bwd: 0.0,
             checkpoints: vec![(vec![0.0; max_states], 0.0); n_blocks],

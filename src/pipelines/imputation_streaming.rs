@@ -851,7 +851,7 @@ target_samples={} target_bytes={}",
                     }
                     let ws = ws_opt.as_mut().unwrap();
                     
-                    let mut process_haplotype = |hap_idx: HapIdx, priors: Option<&HaplotypePriors>| -> (Vec<f32>, HaplotypePriors) {
+                    let mut process_haplotype = |hap_idx: HapIdx, priors: Option<&HaplotypePriors>| -> (Vec<AllelePosteriors>, HaplotypePriors) {
                         let input = build_input_vector(hap_idx);
                         
                         // Initialize workspace

@@ -130,11 +130,7 @@ impl ReferenceMap {
         }
     }
 
-use crate::pipelines::imputation::AllelePosteriors;
 
-// ...
-
-    /// Run backward pass and emit posteriors
     ///
     /// Combines saved forward state with backward probabilities to compute posteriors.
     pub fn backward_and_emit_posteriors(
