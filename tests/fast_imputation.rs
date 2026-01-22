@@ -362,6 +362,97 @@ fn default_test_config() -> Config {
 
 #[test]
 #[serial]
+fn test_dynamic_phasing_continuity_stress() {
+    use rand::{Rng, SeedableRng};
+
+    let n_markers = 200;
+    let positions: Vec<usize> = (0..n_markers).map(|m| m * 10_000 + 1).collect();
+
+    let n_ref_samples = 50; // 100 haplotypes
+    let n_target_samples = 1;
+
+    // Reference:
+    // - hap 0 is all 0s (anchor)
+    // - hap 1 is all 1s (complement)
+    // - remaining haplotypes are deterministic noise to induce state churn
+    let ref_file = SyntheticVcfBuilder::new(n_markers, n_ref_samples)
+        .positions(positions.clone())
+        .allele_generator(|m, h| {
+            if h == 0 {
+                0
+            } else if h == 1 {
+                1
+            } else {
+                let seed = (h as u64)
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(m as u64)
+                    .wrapping_add(0xD1A5_7E55);
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                if rng.random_bool(0.5) { 1 } else { 0 }
+            }
+        })
+        .build();
+
+    // Target:
+    // - heterozygous 0/1 at every site, unphased.
+    // Correct long-range phasing should be stable (not flip-flopping marker-to-marker).
+    let target_file = SyntheticVcfBuilder::new(n_markers, n_target_samples)
+        .positions(positions)
+        .unphased()
+        .allele_generator(|_, h| if h % 2 == 0 { 0 } else { 1 })
+        .build();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("output_dynamic_stress");
+
+    let mut config = default_test_config();
+    config.gt = target_file.path().to_path_buf();
+    config.r#ref = Some(ref_file.path().to_path_buf());
+    config.out = out_prefix.clone();
+
+    config.dynamic_mcmc = true;
+    config.phase_states = 20;
+    config.ne = 10_000.0;
+    config.burnin = 2;
+    config.iterations = 3;
+    config.mcmc_burnin = 1;
+    config.mcmc_steps = 3;
+    config.window = 40.0;
+    config.overlap = 2.0;
+    config.nthreads = Some(1);
+
+    let mut pipeline = PhasingPipeline::new(config, None);
+    pipeline.run().expect("Phasing run success");
+
+    let out_vcf = temp_dir.path().join("output_dynamic_stress.vcf.gz");
+    assert!(out_vcf.exists());
+
+    let gts = inspect_gt_phasing(&out_vcf);
+
+    // Count phase switches by tracking the allele on haplotype A across markers.
+    // Allow some noise, but frequent flipping indicates continuity is broken.
+    let mut switches = 0usize;
+    let mut prev: Option<char> = None;
+    for m in 0..n_markers {
+        let gt = &gts[m][0];
+        let allele = gt.chars().next().expect("GT string");
+        if let Some(p) = prev {
+            if allele != p {
+                switches += 1;
+            }
+        }
+        prev = Some(allele);
+    }
+
+    assert!(
+        switches < (n_markers / 10),
+        "Too many phase switches under dynamic MCMC continuity stress: {}",
+        switches
+    );
+}
+
+#[test]
+#[serial]
 fn test_synthetic_slam_dunk() {
     let n_markers = 50;
 
