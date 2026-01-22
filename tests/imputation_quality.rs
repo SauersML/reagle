@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Functions may be used externally or via env-var triggered tests
 
 use std::fs::File;
 use std::io::BufReader;

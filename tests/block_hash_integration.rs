@@ -15,7 +15,7 @@ fn test_type_safety_compile_time() {
     let pattern_id = PatternId::new(5);
 
     assert_eq!(global_id.as_u32(), 42);
-    assert_eq!(pattern_id.as_u16(), 5);
+    assert_eq!(pattern_id.as_u32(), 5);
 
     // This test exists to ensure the types exist and have basic methods
     // The real type safety is enforced at compile time by the type system
@@ -47,18 +47,18 @@ fn test_pattern_id_conversions() {
     let id1 = PatternId::new(50);
     assert_eq!(id1.as_usize(), 50);
 
-    let id2 = PatternId::from(100u16);
-    assert_eq!(id2.as_u16(), 100);
+    let id2 = PatternId::from(100u32);
+    assert_eq!(id2.as_u32(), 100);
 
     // RESERVOIR sentinel
-    let id3 = PatternId::from(u16::MAX);
+    let id3 = PatternId::from(u32::MAX);
     assert!(id3.is_reservoir());
 }
 
 #[test]
 #[should_panic(expected = "Use PatternId::RESERVOIR for sentinel value")]
 fn test_pattern_id_rejects_sentinel_in_new() {
-    PatternId::new(u16::MAX);
+    PatternId::new(u32::MAX);
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn test_default_constants() {
     use reagle::model::block_hash::{DEFAULT_WINDOW_SIZE, DEFAULT_MAX_STATES};
 
     assert_eq!(DEFAULT_WINDOW_SIZE, 32);
-    assert_eq!(DEFAULT_MAX_STATES, 4096);
+    assert_eq!(DEFAULT_MAX_STATES, 0);
 }
 
 // Note: Full integration tests with GenotypeMatrix would go here

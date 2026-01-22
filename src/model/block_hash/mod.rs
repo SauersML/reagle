@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 //! # Block-Hash Clade HMM
 //!
 //! This module implements the Adaptive Full-Panel Block-Hash Clade HMM to fix
@@ -39,6 +38,7 @@ mod reference_map;
 mod transition;
 mod compression;
 mod hmm;
+mod weighted_kernel;
 
 // Public API exports
 pub use types::{GlobalId, PatternId};

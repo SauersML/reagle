@@ -141,7 +141,6 @@ impl MarkerAlignment {
     }
 
     /// Check if a marker has allele mapping
-    #[allow(unused)]
     pub fn has_allele_mapping(&self, target_marker: usize) -> bool {
         self.allele_mappings
             .get(target_marker)

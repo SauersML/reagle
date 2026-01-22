@@ -236,7 +236,6 @@ impl ReferenceMap {
     /// Impute a single sample (combines forward + backward + emit)
     ///
     /// This is the main entry point for imputation.
-    #[allow(unused)] // Kept for API completeness, but pipeline uses manual steps
     pub fn impute_sample(
         &self,
         target_genotypes: &[u8],

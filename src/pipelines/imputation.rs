@@ -1,4 +1,3 @@
-#![allow(unused)]
 //! # Imputation Pipeline
 //!
 //! Orchestrates the imputation workflow:
@@ -767,7 +766,6 @@ impl ImputationPipeline {
 // ... existing tests ...
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
 
     // Tests for imputation pipeline

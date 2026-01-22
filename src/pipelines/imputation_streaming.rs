@@ -81,6 +81,8 @@ struct StreamingPayload {
     ref_output_start: usize,
     /// Reference window output range end
     ref_output_end: usize,
+    /// Position of the first marker in the NEXT reference window (for boundary rate calculation)
+    ref_next_start_pos: Option<u32>,
 }
 
 struct SampleImputationResult {
@@ -441,6 +443,7 @@ impl crate::pipelines::ImputationPipeline {
                         ref_global_start,
                         ref_output_start,
                         ref_output_end,
+                        ref_next_start_pos: ref_window.next_window_start_pos,
                     })
                 } else {
                     tx.send(StreamingPayload {
@@ -453,6 +456,7 @@ impl crate::pipelines::ImputationPipeline {
                         ref_global_start,
                         ref_output_start,
                         ref_output_end,
+                        ref_next_start_pos: ref_window.next_window_start_pos,
                     })
                 };
                 if let Ok(()) = send_result {
@@ -509,6 +513,7 @@ target_samples={} target_bytes={}",
                 ref_global_start,
                 ref_output_start,
                 ref_output_end,
+                ref_next_start_pos,
             } = payload;
             let _ = (output_start, output_end);
 
@@ -601,6 +606,7 @@ target_samples={} target_bytes={}",
                     window_idx,
                     ref_output_start,
                     ref_output_end,
+                    ref_next_start_pos,
                 )?
             } else {
                 self.run_imputation_window_streaming(
@@ -614,6 +620,7 @@ target_samples={} target_bytes={}",
                     window_idx,
                     ref_output_start,
                     ref_output_end,
+                    ref_next_start_pos,
                 )?
             };
 
@@ -728,6 +735,7 @@ target_samples={} target_bytes={}",
         window_idx: usize,
         output_start: usize,
         output_end: usize,
+        ref_next_start_pos: Option<u32>,
     ) -> Result<Option<Vec<HaplotypePriors>>> {
         use crate::model::block_hash::{ReferenceMap, BlockHmmWorkspace};
         
@@ -772,30 +780,28 @@ target_samples={} target_bytes={}",
         let chrom_idx = ref_win.marker(MarkerIdx::new(0)).chrom;
         
         let mut recomb_rates = Vec::with_capacity(n_ref_markers);
-        for m in 0..n_ref_markers {
-            let pos_curr = ref_win.marker(MarkerIdx::new(m as u32)).pos;
-            // For the last marker, we need rate to next marker. 
-            // If next marker is not in window, we can estimate or use default.
-            // But ReferenceMap uses `boundary_rate = recomb_rates[end - 1]`.
-            // So we need a valid rate at the last index.
-            // We can use the rate from m-1 to m as a proxy for m to m+1.
-            let dist_cm = if m + 1 < n_ref_markers {
-                let pos_next = ref_win.marker(MarkerIdx::new((m + 1) as u32)).pos;
-                let cm_curr = gen_maps.gen_pos(chrom_idx, pos_curr);
-                let cm_next = gen_maps.gen_pos(chrom_idx, pos_next);
-                (cm_next - cm_curr).abs()
-            } else if m > 0 {
-                // Use previous interval for last marker
-                let pos_prev = ref_win.marker(MarkerIdx::new((m - 1) as u32)).pos;
-                let cm_prev = gen_maps.gen_pos(chrom_idx, pos_prev);
-                let cm_curr = gen_maps.gen_pos(chrom_idx, pos_curr);
-                (cm_curr - cm_prev).abs()
-            } else {
-                0.0001 // Fallback for single-marker window
-            };
-            
+
+        
+        // 1. Iterate safely over windows(2) for the first N-1 intervals
+        // This ensures semantic consistency for indexes 0..N-2
+        for pair in ref_win.markers().windows(2) {
+            let curr = &pair[0];
+            let next = &pair[1];
+            let dist_cm = (gen_maps.gen_pos(chrom_idx, next.pos) - gen_maps.gen_pos(chrom_idx, curr.pos)).abs();
             recomb_rates.push(self.params.p_recomb(dist_cm));
         }
+
+        // 2. Handle the final marker (index N-1)
+        // Rate should be distance to the *first marker of next window*
+        let last_marker = ref_win.marker(MarkerIdx::new((n_ref_markers - 1) as u32));
+        let dist_to_next_block = if let Some(next_pos) = ref_next_start_pos {
+            (gen_maps.gen_pos(chrom_idx, next_pos) - gen_maps.gen_pos(chrom_idx, last_marker.pos)).abs()
+        } else {
+            // EOF or no next window: negligible rate (0.0001 cM ~ 0 rate)
+            // This prevents index out of bounds or referring to previous markers
+            0.0001 
+        };
+        recomb_rates.push(self.params.p_recomb(dist_to_next_block));
 
         // Build ReferenceMap for this window
         let ref_map = ReferenceMap::build(ref_win, 64, 4096, &recomb_rates);

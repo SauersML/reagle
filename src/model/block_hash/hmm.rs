@@ -7,6 +7,7 @@ use super::compressed_block::CompressedBlock;
 use super::workspace::BlockHmmWorkspace;
 use super::types::PatternId;
 use crate::model::hmm::HmmUpdater;
+use super::weighted_kernel::WeightedHmmUpdater;
 use crate::pipelines::imputation::AllelePosteriors;
 
 /// Run forward pass within a single block using existing SIMD kernel
@@ -57,13 +58,15 @@ pub fn forward_within_block(
             );
         }
 
-        // REUSE: Call existing AVX-512 optimized HmmUpdater
+        // REUSE: Use new weighted kernel
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
 
-        HmmUpdater::fwd_update_emissions(
+        WeightedHmmUpdater::fwd_update_weighted(
             &mut ws.fwd,
             fwd_sum,
             recomb_rate,
+            block.n_ref_haps(),
+            &block.pattern_counts,
             emissions,
             n_patterns,
         );
@@ -131,10 +134,12 @@ pub fn forward_to_marker_in_block(
 
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
 
-        HmmUpdater::fwd_update_emissions(
+        WeightedHmmUpdater::fwd_update_weighted(
             &mut ws.fwd,
             fwd_sum,
             recomb_rate,
+            block.n_ref_haps(),
+            &block.pattern_counts,
             emissions,
             n_patterns,
         );
@@ -202,10 +207,12 @@ pub fn backward_and_emit_block(
         
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
         
-        HmmUpdater::fwd_update_emissions(
+        WeightedHmmUpdater::fwd_update_weighted(
             &mut ws.fwd,
             fwd_sum,
             recomb_rate,
+            block.n_ref_haps(),
+            &block.pattern_counts,
             emissions,
             n_patterns,
         );
@@ -322,10 +329,12 @@ pub fn backward_and_emit_block(
         // Pure transition step
         emissions.fill(1.0);
         let bwd_sum = ws.bwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_bwd;
-        HmmUpdater::fwd_update_emissions(
+        WeightedHmmUpdater::fwd_update_weighted(
             &mut ws.bwd,
             bwd_sum,
             recomb_rate,
+            block.n_ref_haps(),
+            &block.pattern_counts,
             emissions,
             n_patterns,
         );
@@ -379,5 +388,5 @@ fn emission_prob(
 }
 
 fn pattern_idx_to_id(idx: usize) -> PatternId {
-    PatternId::new(idx as u16)
+    PatternId::new(idx as u32)
 }

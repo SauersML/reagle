@@ -102,7 +102,6 @@ impl HaplotypePriors {
     /// Returns uniform prior (1/n_states) if haplotype not seen in previous window.
     /// Uses binary search for O(log K) lookup with good cache locality.
     #[inline]
-    #[allow(unused)]
     pub fn prior(&self, hap_id: u32, n_states: usize) -> f32 {
         match self.hap_ids.binary_search(&hap_id) {
             Ok(idx) => self.probs[idx],
@@ -113,7 +112,6 @@ impl HaplotypePriors {
     /// Set priors from HMM state posteriors at window boundary.
     /// Uses an adaptive threshold to avoid discarding most mass at high state counts.
     /// Sorts by hap_id for efficient binary search lookup.
-    #[allow(unused)]
     pub fn set_from_posteriors(
         &mut self,
         hap_indices: &[u32],
@@ -244,6 +242,9 @@ pub struct StreamWindow {
     /// Phased genotypes from overlap region of previous window
     /// These should be used to constrain/seed the current window's phasing
     pub phased_overlap: Option<PhasedOverlap>,
+    /// Genomic position of the first marker of the NEXT window (if known)
+    /// Used for precise recombination rate calculation at the window boundary
+    pub next_window_start_pos: Option<u32>,
 }
 
 impl StreamWindow {
@@ -607,6 +608,28 @@ impl StreamingVcfReader {
                 GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
             };
 
+            };
+
+            // Peek ahead to find next window start position (if available)
+            // window_end is the index of the first marker NOT in the current output+overlap set.
+            // But wait, window_end was calculated based on `full_window_gen`.
+            // The "next window" in terms of processing logic starts at `output_end` of THIS window?
+            // No, `output_end` is where we stop WRITING.
+            // The next window effectively picks up where this one left off in terms of coverage.
+            // To calculate the rate for the *last output marker*, we need the distance to the *next available marker*.
+            // That marker is strictly at index `window_end` in the buffer (if it exists).
+            // Actually, `window_end` is the end of the OVERLAP. The rate at the very end of overlap doesn't matter much.
+            // But `ReferenceMap` needs rates for all markers in the Reference Window.
+            // The Reference Window includes overlap.
+            // So we need the rate for the last marker in the overlap region.
+            // That rate connects to the marker *after* the overlap.
+            // So looking at `self.buffer[window_end]` is correct.
+            let next_window_start_pos = if window_end < self.buffer.len() {
+                Some(self.buffer[window_end].marker.pos)
+            } else {
+                None
+            };
+
             let window = StreamWindow {
                 genotypes,
                 global_start: self.global_marker_idx,
@@ -615,6 +638,7 @@ impl StreamingVcfReader {
                 output_end,
                 is_first: self.window_num == 0,
                 phased_overlap: None, // Caller will set this from previous window's phased output
+                next_window_start_pos,
             };
 
             // Remove processed markers from buffer (keep overlap)
@@ -791,8 +815,8 @@ impl StreamingVcfReader {
             global_end: self.global_marker_idx + last_idx + 1,
             output_start: 0,
             output_end: n_markers,
-            is_first: self.window_num == 0,
             phased_overlap: None,
+            next_window_start_pos: None,
         };
 
         while self

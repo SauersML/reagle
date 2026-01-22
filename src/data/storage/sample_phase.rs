@@ -57,7 +57,6 @@ impl SamplePhase {
     ///
     /// # Panics
     /// Panics if allele slices don't match n_markers or indices are invalid.
-    #[allow(unused_variables)]
     pub fn new(
         sample: u32,
         n_markers: usize,

@@ -100,19 +100,16 @@ impl SeqCodedColumn {
         self.block.get(self.marker_offset, hap)
     }
 
-    #[allow(unused)]
     #[inline]
     pub fn hap_to_seq(&self) -> &[u16] {
         &self.block.hap_to_seq
     }
 
-    #[allow(unused)]
     #[inline]
     pub fn seq_alleles(&self) -> &[u8] {
         &self.block.seq_to_allele[self.marker_offset]
     }
 
-    #[allow(unused)]
     #[inline]
     pub fn block_id(&self) -> usize {
         Arc::as_ptr(&self.block) as usize

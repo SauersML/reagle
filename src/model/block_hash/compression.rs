@@ -15,11 +15,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 /// Default window size (can be adjusted based on LD patterns)
-#[allow(unused)]
 pub const DEFAULT_WINDOW_SIZE: usize = 32;
 
 /// Maximum states before truncation (0 = no limit)
-#[allow(unused)]
 pub const DEFAULT_MAX_STATES: usize = 0;
 
 /// Build a CompressedBlock from a range of markers (Recommended API)
@@ -247,7 +245,6 @@ fn compute_reservoir_freqs(
 
 /// Compression statistics for logging/debugging
 #[derive(Debug, Clone)]
-#[allow(unused)]
 pub struct CompressionStats {
     pub n_windows: usize,
     pub total_patterns: usize,
@@ -257,7 +254,6 @@ pub struct CompressionStats {
     pub min_patterns: usize,
 }
 
-#[allow(unused)]
 impl CompressionStats {
     pub fn from_blocks(blocks: &[Arc<CompressedBlock>]) -> Self {
         let n_windows = blocks.len();
@@ -297,7 +293,6 @@ impl CompressionStats {
 }
 
 #[cfg(test)]
-#[allow(unused_imports)]
 mod tests {
     use super::*;
 
