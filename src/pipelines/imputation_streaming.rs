@@ -966,7 +966,17 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Check if alignment is partial (some target alleles don't map to ref)
+                    // If partial, we flag as imputed because we cannot preserve the exact
+                    // input genotypes/dosages for all alleles.
+                    let is_partial = alignment
+                        .allele_mappings
+                        .get(target_idx as usize)
+                        .and_then(|m| m.as_ref())
+                        .map(|m| m.targ_to_ref.iter().any(|&r| r < 0))
+                        .unwrap_or(false);
+
+                    window_quality.set_imputed(ref_m, is_partial);
                 }
             }
 
