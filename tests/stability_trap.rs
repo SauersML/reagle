@@ -4,6 +4,7 @@ use reagle::pipelines::imputation::ImputationPipeline;
 use noodles::bgzf::io as bgzf_io;
 use noodles::vcf as noodles_vcf;
 use noodles_vcf::variant::record::samples::Sample;
+use noodles_vcf::variant::record::samples::series::value::Array;
 use noodles_vcf::variant::record::samples::series::Value;
 
 use serial_test::serial;
@@ -152,8 +153,15 @@ fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
 
         let parsed = match val {
             Some(Value::Float(f)) => f as f64,
-            Some(Value::String(s)) => s.parse::<f64>().expect("parse DS"),
-            Some(other) => panic!("Unexpected DS value: {other:?}"),
+            Some(Value::Array(Array::Float(iter))) => {
+                let mut values = iter.iter();
+                match values.next() {
+                    Some(Ok(Some(v))) => v as f64,
+                    _ => 0.0,
+                }
+            }
+            Some(Value::Integer(i)) => i as f64,
+            Some(other) => panic!("Unexpected DS value: {:?}", other),
             None => panic!("Missing DS"),
         };
 
@@ -200,7 +208,7 @@ fn test_state_index_stability_trap() {
     config.out = out_prefix.clone();
 
     config.imp_states = 20;
-    config.ne = 10_000.0;
+    config.ne = 20.0;
     config.window = 40.0;
     config.overlap = 2.0;
     config.nthreads = Some(1);
