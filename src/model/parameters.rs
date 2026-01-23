@@ -134,7 +134,8 @@ impl ModelParams {
         }
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
-        (theta / (2.0 * (theta + n))) as f32
+        let p = (theta / (2.0 * (theta + n))) as f32;
+        p.max(1e-8)
     }
 
     /// Calculate LR threshold for a given iteration
