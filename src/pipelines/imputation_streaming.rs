@@ -550,7 +550,20 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Also mark as imputed if the alignment is partial/mismatched
+                    // This ensures we don't treat markers with missing reference mappings as "genotyped"
+                    let is_mismatched = alignment
+                        .allele_mappings
+                        .get(target_idx as usize)
+                        .and_then(|m| m.as_ref())
+                        .map(|m| m.targ_to_ref.iter().any(|&x| x < 0))
+                        .unwrap_or(false);
+
+                    if is_mismatched {
+                        window_quality.set_imputed(ref_m, true);
+                    } else {
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 }
             }
 
