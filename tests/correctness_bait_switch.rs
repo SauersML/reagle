@@ -4,6 +4,7 @@ use reagle::pipelines::imputation::ImputationPipeline;
 use noodles::bgzf::io as bgzf_io;
 use noodles::vcf as noodles_vcf;
 use noodles_vcf::variant::record::samples::Sample;
+use noodles_vcf::variant::record::samples::series::value::Array;
 use noodles_vcf::variant::record::samples::series::Value;
 
 use serial_test::serial;
@@ -82,6 +83,9 @@ fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
         let parsed = match val {
             Some(Value::Float(f)) => f as f64,
             Some(Value::String(s)) => s.parse::<f64>().expect("parse DS"),
+            Some(Value::Array(Array::Float(mut values))) => {
+                values.next().transpose().unwrap().flatten().unwrap() as f64
+            }
             Some(other) => panic!("Unexpected DS value: {other:?}"),
             None => panic!("Missing DS"),
         };

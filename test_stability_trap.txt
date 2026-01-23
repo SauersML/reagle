@@ -1,0 +1,39 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.67s
+     Running tests/stability_trap.rs (target/debug/deps/stability_trap-8ea53023e840b4d4)
+
+running 1 test
+test test_state_index_stability_trap ... FAILED
+
+failures:
+
+---- test_state_index_stability_trap stdout ----
+Streaming imputation: 200 ref haplotypes, 1 target samples (target_bytes=7998)
+Writing output to "/tmp/.tmpBRLC18/trap_output.vcf.gz"
+Phase 2: Streaming imputation...
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (200 markers, pos 1..19900001)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 200 (global 0..200)
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 200
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+  Imputing Window 1 (200 markers, ref global 0..200, output 0..200)
+Streaming imputation complete: 200 markers
+
+thread 'test_state_index_stability_trap' (12423) panicked at tests/stability_trap.rs:156:28:
+Unexpected DS value: Array([Ok(Some(0.0001))])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_state_index_stability_trap
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+
+error: test failed, to rerun pass `--test stability_trap`

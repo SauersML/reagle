@@ -1,0 +1,102 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.49s
+     Running tests/fast_imputation.rs (target/debug/deps/fast_imputation-1ad7290964cd284f)
+
+running 17 tests
+test test_diverse_reference_with_mismatch ... ok
+test test_error_injection ... ok
+test test_dr2_validation ... ok
+test test_dynamic_phasing_continuity_stress ... ok
+test test_high_density_array_imputation ... ok
+test test_high_recombination_stress ... ok
+test test_hotspot_switching ... ok
+test test_microarray_vs_wgs_imputation ... ok
+test test_phase_switch_torture ... ok
+test test_phasing_perfect_ld ... ok
+test test_population_structure ... ok
+test test_rare_variant ... ok
+test test_simulated_chip_density ... FAILED
+test test_synthetic_recombination ... ok
+test test_synthetic_slam_dunk ... FAILED
+test test_singleton_imputation ... ok
+test test_ultra_dense_markers ... FAILED
+
+failures:
+
+---- test_simulated_chip_density stdout ----
+Streaming imputation: 100 ref haplotypes, 2 target samples (target_bytes=634)
+Writing output to "/tmp/.tmpPsyoXK/output_chip.vcf.gz"
+Phase 2: Streaming imputation...
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (10 markers, pos 1..9990001)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 1000 (global 0..1000)
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 10
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+Streaming imputation complete: 1000 markers
+
+thread 'test_simulated_chip_density' (11686) panicked at tests/fast_imputation.rs:703:5:
+Sample 0 at Marker 50 should be 0, got 0.7346
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- test_synthetic_slam_dunk stdout ----
+Streaming imputation: 100 ref haplotypes, 1 target samples (target_bytes=1999)
+Writing output to "/tmp/.tmpgue1xR/output_slam.vcf.gz"
+Phase 2: Streaming imputation...
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (50 markers, pos 1..49001)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 50 (global 0..50)
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 50
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+Streaming imputation complete: 50 markers
+Slam dunk test - Mean DR2: 0.5000, count: 50
+
+thread 'test_synthetic_slam_dunk' (11691) panicked at tests/fast_imputation.rs:510:5:
+Mean DR2 too low for slam dunk test: 0.5000
+
+---- test_ultra_dense_markers stdout ----
+Streaming imputation: 20 ref haplotypes, 2 target samples (target_bytes=3912)
+Writing output to "/tmp/.tmpfzNRsD/output_dense.vcf.gz"
+Phase 2: Streaming imputation...
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (100 markers, pos 1..100)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 100 (global 0..100)
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 100
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+  Imputing Window 1 (100 markers, ref global 0..100, output 0..100)
+Streaming imputation complete: 100 markers
+Average dosage: 0.00009000001
+Ultra-dense test - Mean DR2: 0.1000, count: 100
+
+thread 'test_ultra_dense_markers' (11693) panicked at tests/fast_imputation.rs:1538:5:
+Mean DR2 should be high with strong LD, got 0.1000
+
+
+failures:
+    test_simulated_chip_density
+    test_synthetic_slam_dunk
+    test_ultra_dense_markers
+
+test result: FAILED. 14 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.58s
+
+error: test failed, to rerun pass `--test fast_imputation`

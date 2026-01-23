@@ -1,0 +1,27 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.77s
+     Running tests/block_hash_integration.rs (target/debug/deps/block_hash_integration-b4c1b09068f20d70)
+
+running 7 tests
+test test_default_constants ... ok
+test test_global_id_conversions ... ok
+test test_pattern_id_rejects_sentinel_in_new - should panic ... ok
+test test_pattern_id_conversions ... ok
+test test_pattern_id_reservoir_sentinel ... ok
+test test_readme_documentation_exists ... FAILED
+test test_type_safety_compile_time ... ok
+
+failures:
+
+---- test_readme_documentation_exists stdout ----
+
+thread 'test_readme_documentation_exists' (10161) panicked at tests/block_hash_integration.rs:80:5:
+README.md should exist
+
+
+failures:
+    test_readme_documentation_exists
+
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test block_hash_integration`
