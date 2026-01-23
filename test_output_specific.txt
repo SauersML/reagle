@@ -1,0 +1,40 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.59s
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-bf15c1affa8f30af)
+
+running 1 test
+test test_perfect_ld_trap_rare_variants_aggregate ... FAILED
+
+failures:
+
+---- test_perfect_ld_trap_rare_variants_aggregate stdout ----
+Running: java -jar /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar [("ref", "/app/tests/fixtures/beagle_reference/ref.27Feb25.75f.vcf.gz"), ("gt", "/app/tests/fixtures/beagle_reference/target_sparse.27Feb25.75f.vcf.gz"), ("out", "/tmp/.tmpTLX2S4/java_imp"), ("seed", "12345"), ("gp", "true")]
+Streaming imputation: 362 ref haplotypes, 10 target samples (target_bytes=65565)
+Writing output to "/tmp/.tmpTLX2S4/rust_imp.vcf.gz"
+Phase 2: Streaming imputation...
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (135 markers, pos 20000086..20099941)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 1356 (global 0..1356)
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 135
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+  Imputing Window 1 (135 markers, ref global 0..1356, output 0..1356)
+Streaming imputation complete: 1356 markers
+
+thread 'test_perfect_ld_trap_rare_variants_aggregate' (11778) panicked at tests/beagle_reference.rs:4508:5:
+Too few high-LD rare variants found: 0 (adjust criteria if needed)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_perfect_ld_trap_rare_variants_aggregate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 26 filtered out; finished in 43.73s
+
+error: test failed, to rerun pass `--test beagle_reference`
