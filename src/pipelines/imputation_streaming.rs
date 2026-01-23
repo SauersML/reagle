@@ -549,6 +549,15 @@ target_samples={} target_bytes={}",
             for (ref_m, &target_idx) in alignment.ref_to_target.iter().enumerate() {
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
+                } else if let Some(Some(mapping)) =
+                    alignment.allele_mappings.get(target_idx as usize)
+                {
+                    // Check for partial/mismatched mappings
+                    if mapping.targ_to_ref.iter().any(|&x| x < 0) {
+                        window_quality.set_imputed(ref_m, true);
+                    } else {
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 } else {
                     window_quality.set_imputed(ref_m, false);
                 }
@@ -1294,12 +1303,65 @@ target_samples={} target_bytes={}",
             None
         };
 
+        // Pre-calculate is_imputed to avoid borrowing issues in closure
+        let is_imputed_vec: Vec<bool> = (output_start..output_end)
+            .map(|m| quality.get(m).map(|s| s.is_imputed).unwrap_or(true))
+            .collect();
+
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
+        let samples = target_win.samples_arc();
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
+            let is_imputed = is_imputed_vec.get(local_m).copied().unwrap_or(true);
+
+            if !is_imputed {
+                if let Some(target_m) = alignment.target_marker(marker_idx) {
+                    let h1 = HapIdx::new((sample_idx * 2) as u32);
+                    let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                    let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                    let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                    if a1 != 255 && a2 != 255 {
+                        let mapping = alignment
+                            .allele_mappings
+                            .get(target_m)
+                            .and_then(|m| m.as_ref());
+
+                        let map_val = |a: u8| -> f32 {
+                            if let Some(m) = mapping {
+                                if (a as usize) < m.targ_to_ref.len() {
+                                    let r = m.targ_to_ref[a as usize];
+                                    if r > 0 {
+                                        return 1.0;
+                                    }
+                                }
+                            } else if a > 0 {
+                                return 1.0;
+                            }
+                            0.0
+                        };
+
+                        let d1 = map_val(a1);
+                        let d2 = map_val(a2);
+                        let dosage = d1 + d2;
+
+                        if samples.is_diploid(crate::data::SampleIdx::new(sample_idx as u32)) {
+                            return dosage;
+                        } else {
+                            return dosage * 0.5;
+                        }
+                    }
+                }
+            }
+
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
+                let dosage = result.dosages.get(local_m).copied().unwrap_or(0.0);
+                if samples.is_diploid(crate::data::SampleIdx::new(sample_idx as u32)) {
+                    dosage
+                } else {
+                    dosage * 0.5
+                }
             } else {
                 0.0
             }
