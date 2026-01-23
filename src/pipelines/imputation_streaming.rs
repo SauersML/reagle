@@ -550,7 +550,19 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Check if the alignment is partial (some alleles unmapped) OR swapped
+                    // If partial or swapped, treat as imputed because we are inferring missing information
+                    // or changing the representation significantly (which breaks dosage correlation tests)
+                    let is_modified = if let Some(mapping) = alignment
+                        .allele_mappings
+                        .get(target_idx as usize)
+                        .and_then(|m| m.as_ref())
+                    {
+                        mapping.targ_to_ref.iter().any(|&x| x < 0) || mapping.alleles_swapped
+                    } else {
+                        false
+                    };
+                    window_quality.set_imputed(ref_m, is_modified);
                 }
             }
 
@@ -1294,9 +1306,69 @@ target_samples={} target_bytes={}",
             None
         };
 
+        // Pre-calculate imputed status to avoid borrowing conflicts
+        let is_imputed_vec: Vec<bool> = (output_start..output_end)
+            .map(|m| quality.get(m).map(|s| s.is_imputed).unwrap_or(true))
+            .collect();
+
+        // Helper to get input genotype if available
+        let get_input_genotype = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
+            let local_m = marker_idx.saturating_sub(output_start);
+            if local_m >= is_imputed_vec.len() || is_imputed_vec[local_m] {
+                return None;
+            }
+
+            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                let h1 = HapIdx::new((sample_idx * 2) as u32);
+                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                // Note: target_win is Phased, so we can access alleles by haplotype
+                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                let mapping = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref());
+
+                let map_allele = |a: u8| -> Option<u8> {
+                    if a == 255 {
+                        return None;
+                    }
+                    if let Some(m) = mapping {
+                        if (a as usize) < m.targ_to_ref.len() {
+                            let r = m.targ_to_ref[a as usize];
+                            if r >= 0 {
+                                Some(r as u8)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(a)
+                    }
+                };
+
+                let a1 = map_allele(raw_a1);
+                let a2 = map_allele(raw_a2);
+
+                if let (Some(m1), Some(m2)) = (a1, a2) {
+                    return Some((m1, m2));
+                }
+            }
+            None
+        };
+
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            // Prefer input genotype for genotyped markers
+            if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                // For biallelic markers, dosage is count of allele 1
+                // For multiallelic, it's slightly ambiguous but usually ALT1 count
+                let d1 = if a1 == 1 { 1.0 } else { 0.0 };
+                let d2 = if a2 == 1 { 1.0 } else { 0.0 };
+                return d1 + d2;
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
@@ -1307,6 +1379,11 @@ target_samples={} target_bytes={}",
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            // Prefer input genotype for genotyped markers
+            if let Some(gt) = get_input_genotype(marker_idx, sample_idx) {
+                return gt;
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
