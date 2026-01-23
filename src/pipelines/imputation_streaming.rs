@@ -550,7 +550,25 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Even if aligned, check if the mapping is partial (some alleles don't map)
+                    // If so, we treat it as imputed because we'll fallback to HMM dosage
+                    // for unmapped alleles, so it's not a pure "genotyped" marker anymore.
+                    let mapping = alignment
+                        .allele_mappings
+                        .get(target_idx as usize)
+                        .and_then(|m| m.as_ref());
+
+                    if let Some(m) = mapping {
+                        if m.targ_to_ref.iter().any(|&x| x < 0) {
+                            window_quality.set_imputed(ref_m, true);
+                        } else {
+                            window_quality.set_imputed(ref_m, false);
+                        }
+                    } else {
+                        // aligned but no mapping? should imply identity, but if we are here
+                        // it implies aligned, so assume genotyped.
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 }
             }
 
@@ -1246,6 +1264,11 @@ target_samples={} target_bytes={}",
         };
         let _ = &write_span;
 
+        // Pre-calculate imputed status for markers in range to avoid mutable borrow conflict
+        let imputed_flags: Vec<bool> = (output_start..output_end)
+            .map(|m| quality.get(m).map(|s| s.is_imputed).unwrap_or(true))
+            .collect();
+
         let include_posteriors = include_gp || include_ap;
         let n_samples = target_win.n_samples();
         let mut result_by_sample: Vec<Option<&SampleImputationResult>> = vec![None; n_samples];
@@ -1298,6 +1321,47 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
+
+            // If genotyped (not imputed), prioritize input dosage
+            if local_m < imputed_flags.len() && !imputed_flags[local_m] {
+                if let Some(target_m) = alignment.target_marker(marker_idx) {
+                    let h1 = HapIdx::new((sample_idx * 2) as u32);
+                    let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                    let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                    let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                    if raw_a1 != 255 && raw_a2 != 255 {
+                        let mapping = alignment
+                            .allele_mappings
+                            .get(target_m)
+                            .and_then(|m| m.as_ref());
+
+                        let map_allele_to_ds = |a: u8| -> f32 {
+                            if let Some(m) = mapping {
+                                if (a as usize) < m.targ_to_ref.len() {
+                                    let r = m.targ_to_ref[a as usize];
+                                    if r == 1 {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                if a == 1 {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                        };
+
+                        return map_allele_to_ds(raw_a1) + map_allele_to_ds(raw_a2);
+                    }
+                }
+            }
+
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
