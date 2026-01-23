@@ -37,6 +37,9 @@ pub struct BlockHmmWorkspace {
 
     /// Maximum states capacity (excluding reservoir)
     pub max_states: usize,
+
+    /// Temp buffer for allele probabilities (e.g. from PLs)
+    pub allele_probs: Vec<f32>,
 }
 
 impl BlockHmmWorkspace {
@@ -55,6 +58,7 @@ impl BlockHmmWorkspace {
             checkpoints: vec![(vec![0.0; capacity], 0.0); n_blocks],
             fwd_history: vec![0.0; (capacity + 1) * window_size],
             max_states: capacity,
+            allele_probs: Vec::new(),
         }
     }
 

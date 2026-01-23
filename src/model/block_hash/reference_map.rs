@@ -9,8 +9,9 @@
 use super::compressed_block::CompressedBlock;
 use super::transition::TransitionBridge;
 use super::workspace::BlockHmmWorkspace;
+use super::hmm::EmissionProvider;
 use crate::data::storage::matrix::GenotypeMatrix;
-use crate::data::storage::phase_state::Phased;
+use crate::data::storage::phase_state::{PhaseState, Phased};
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
@@ -148,12 +149,13 @@ impl ReferenceMap {
     ///
     /// Restores the checkpoint of the containing block and advances to the target marker.
     /// Used for extracting HMM state for priors handoff.
-    pub fn forward_to_marker(
+    pub fn forward_to_marker<S: PhaseState>(
         &self,
         target_genotypes: &[u8],
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
         marker_idx: usize,
+        emission_provider: Option<&EmissionProvider<S>>,
     ) {
         // Find block containing marker_idx
         let block_idx = self.blocks.partition_point(|b| b.end_marker <= marker_idx);
@@ -176,7 +178,8 @@ impl ReferenceMap {
                 block_genotypes,
                 error_rate,
                 ws,
-                local_marker
+                local_marker,
+                emission_provider
             );
         }
     }
@@ -184,11 +187,12 @@ impl ReferenceMap {
     /// Run forward pass with checkpointing
     ///
     /// Saves forward state at the start of each block for later combination.
-    pub fn forward_pass(
+    pub fn forward_pass<S: PhaseState>(
         &self,
         target_genotypes: &[u8],
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
+        emission_provider: Option<&EmissionProvider<S>>,
     ) {
         for (block_idx, block) in self.blocks.iter().enumerate() {
             // Save checkpoint at start of this block
@@ -199,7 +203,7 @@ impl ReferenceMap {
                 &target_genotypes[block.start_marker..block.end_marker.min(target_genotypes.len())];
 
             // Run forward within block
-            super::hmm::forward_within_block(block, block_genotypes, error_rate, ws);
+            super::hmm::forward_within_block(block, block_genotypes, error_rate, ws, emission_provider);
 
             // Apply transition to next block
             if block_idx < self.bridges.len() {
@@ -211,11 +215,12 @@ impl ReferenceMap {
 
     ///
     /// Combines saved forward state with backward probabilities to compute posteriors.
-    pub fn backward_and_emit_posteriors(
+    pub fn backward_and_emit_posteriors<S: PhaseState>(
         &self,
         target_genotypes: &[u8],
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
+        emission_provider: Option<&EmissionProvider<S>>,
     ) -> Vec<AllelePosteriors> {
         // Pre-allocate posteriors with default values to enable direct slicing
         let mut posteriors = vec![AllelePosteriors::Biallelic(0.0); target_genotypes.len()];
@@ -258,6 +263,7 @@ impl ReferenceMap {
                 error_rate,
                 ws,
                 output_slice,
+                emission_provider
             );
 
             // Apply inverse transition to previous block
