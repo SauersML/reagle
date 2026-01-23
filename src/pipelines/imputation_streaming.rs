@@ -550,7 +550,17 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Check if alignment is partial (some alleles don't map)
+                    let is_partial = alignment.allele_mappings[target_idx as usize]
+                        .as_ref()
+                        .map(|m| m.targ_to_ref.iter().any(|&x| x < 0))
+                        .unwrap_or(false);
+
+                    if is_partial {
+                        window_quality.set_imputed(ref_m, true);
+                    } else {
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 }
             }
 
@@ -1294,24 +1304,42 @@ target_samples={} target_bytes={}",
             None
         };
 
-        // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
-        // Dosages array is indexed from 0 for markers starting at output_start
-        let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
-            } else {
-                0.0
-            }
-        };
+        // Helper to retrieve and map input genotype for non-imputed markers
+        let get_input_genotype = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
+            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                let mapping = alignment
+                    .allele_mappings
+                    .get(target_m)
+                    .and_then(|m| m.as_ref());
 
-        // Closure to get best genotype
-        let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
-            let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+                let map_allele = |a: u8| -> u8 {
+                    if a == 255 {
+                        return 255;
+                    }
+                    if let Some(m) = mapping {
+                        if (a as usize) < m.targ_to_ref.len() {
+                            let r = m.targ_to_ref[a as usize];
+                            if r >= 0 {
+                                r as u8
+                            } else {
+                                255
+                            }
+                        } else {
+                            255
+                        }
+                    } else {
+                        a
+                    }
+                };
+
+                let h1 = HapIdx::new((sample_idx * 2) as u32);
+                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                Some((map_allele(a1), map_allele(a2)))
             } else {
-                (0, 0)
+                None
             }
         };
 
@@ -1341,33 +1369,7 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(target_m) = alignment.target_marker(marker_idx) {
-                                let h1 = HapIdx::new((s * 2) as u32);
-                                let h2 = HapIdx::new((s * 2 + 1) as u32);
-                                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-
-                                let mapping = alignment
-                                    .allele_mappings
-                                    .get(target_m)
-                                    .and_then(|m| m.as_ref());
-                                let map_allele = |a: u8| -> u8 {
-                                    if a == 255 {
-                                        return 255;
-                                    }
-                                    if let Some(m) = mapping {
-                                        if (a as usize) < m.targ_to_ref.len() {
-                                            let r = m.targ_to_ref[a as usize];
-                                            if r >= 0 { r as u8 } else { 255 }
-                                        } else {
-                                            255
-                                        }
-                                    } else {
-                                        a
-                                    }
-                                };
-                                let a1 = map_allele(raw_a1);
-                                let a2 = map_allele(raw_a2);
+                            if let Some((a1, a2)) = get_input_genotype(marker_idx, s) {
                                 if a1 < 2 && a2 < 2 {
                                     v1 = a1 as f32;
                                     v2 = a2 as f32;
@@ -1387,33 +1389,7 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(target_m) = alignment.target_marker(marker_idx) {
-                                let h1 = HapIdx::new((s * 2) as u32);
-                                let h2 = HapIdx::new((s * 2 + 1) as u32);
-                                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-
-                                let mapping = alignment
-                                    .allele_mappings
-                                    .get(target_m)
-                                    .and_then(|m| m.as_ref());
-                                let map_allele = |a: u8| -> u8 {
-                                    if a == 255 {
-                                        return 255;
-                                    }
-                                    if let Some(m) = mapping {
-                                        if (a as usize) < m.targ_to_ref.len() {
-                                            let r = m.targ_to_ref[a as usize];
-                                            if r >= 0 { r as u8 } else { 255 }
-                                        } else {
-                                            255
-                                        }
-                                    } else {
-                                        a
-                                    }
-                                };
-                                let a1 = map_allele(raw_a1);
-                                let a2 = map_allele(raw_a2);
+                            if let Some((a1, a2)) = get_input_genotype(marker_idx, s) {
                                 if a1 < 2 && a2 < 2 {
                                     v1 = a1 as f32;
                                     v2 = a2 as f32;
@@ -1425,6 +1401,63 @@ target_samples={} target_bytes={}",
                 }
             }
         }
+
+        // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
+        // Dosages array is indexed from 0 for markers starting at output_start
+        let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            // Check if genotyped (not imputed)
+            let use_input = if let Some(stats) = quality.get(marker_idx) {
+                !stats.is_imputed
+            } else {
+                false
+            };
+
+            if use_input {
+                if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                    if a1 != 255 && a2 != 255 {
+                        let mut ds = 0.0;
+                        if a1 == 1 {
+                            ds += 1.0;
+                        }
+                        if a2 == 1 {
+                            ds += 1.0;
+                        }
+                        return ds;
+                    }
+                }
+            }
+
+            let local_m = marker_idx.saturating_sub(output_start);
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                result.dosages.get(local_m).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        };
+
+        // Closure to get best genotype
+        let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            let use_input = if let Some(stats) = quality.get(marker_idx) {
+                !stats.is_imputed
+            } else {
+                false
+            };
+
+            if use_input {
+                if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                    if a1 != 255 && a2 != 255 {
+                        return (a1, a2);
+                    }
+                }
+            }
+
+            let local_m = marker_idx.saturating_sub(output_start);
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+            } else {
+                (0, 0)
+            }
+        };
 
         writer.write_imputed_streaming(
             ref_win,
