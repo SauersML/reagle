@@ -1,16 +1,13 @@
 use reagle::config::Config;
 use reagle::pipelines::imputation::ImputationPipeline;
 
-use noodles::bgzf::io as bgzf_io;
-use noodles::vcf as noodles_vcf;
-use noodles_vcf::variant::record::samples::Sample;
-use noodles_vcf::variant::record::samples::series::Value;
-
 use serial_test::serial;
 
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+
+mod common;
 
 fn write_trap_vcfs(
     n_markers: usize,
@@ -128,41 +125,6 @@ fn allele_for_hap(
     }
 }
 
-fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
-    let file = File::open(path).expect("open output VCF");
-    let decoder = bgzf_io::Reader::new(file);
-    let mut reader = noodles_vcf::io::Reader::new(decoder);
-
-    let header = reader.read_header().expect("read VCF header");
-    assert!(header.formats().contains_key("DS"), "DS missing from output");
-
-    let mut ds = Vec::new();
-
-    for result in reader.records() {
-        let record = result.expect("read VCF record");
-        let samples = record.samples();
-        let sample0 = samples.get_index(0).expect("sample 0");
-
-        let val = sample0
-            .get(&header, "DS")
-            .transpose()
-            .ok()
-            .flatten()
-            .flatten();
-
-        let parsed = match val {
-            Some(Value::Float(f)) => f as f64,
-            Some(Value::String(s)) => s.parse::<f64>().expect("parse DS"),
-            Some(other) => panic!("Unexpected DS value: {other:?}"),
-            None => panic!("Missing DS"),
-        };
-
-        ds.push(parsed);
-    }
-
-    ds
-}
-
 #[test]
 #[serial]
 fn test_state_index_stability_trap() {
@@ -211,7 +173,7 @@ fn test_state_index_stability_trap() {
     let out_vcf = temp_dir.path().join("trap_output.vcf.gz");
     assert!(out_vcf.exists(), "expected output VCF to exist");
 
-    let ds = read_single_sample_ds_by_record_index(&out_vcf);
+    let ds = common::read_single_sample_ds(&out_vcf);
     assert_eq!(ds.len(), n_markers);
 
     for &idx in &masked {
