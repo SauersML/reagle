@@ -134,7 +134,8 @@ impl ModelParams {
         }
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
-        (theta / (2.0 * (theta + n))) as f32
+        let p = (theta / (2.0 * (theta + n))) as f32;
+        p.max(0.0001)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -409,5 +410,22 @@ mod tests {
 
         assert!((e1.sum_gen_dist - 0.8).abs() < 0.0001);
         assert_eq!(e1.n_switch_obs(), 2);
+    }
+
+    #[test]
+    fn test_li_stephens_p_mismatch_clamping() {
+        // Test with a large number of haplotypes that would produce very small probability
+        let n_haps = 1_000_000;
+        let p = ModelParams::li_stephens_p_mismatch(n_haps);
+        
+        // Without clamping, this would be ~3.5e-8
+        // With clamping, it should be 0.0001
+        assert!((p - 0.0001).abs() < 1e-10, "Should clamp to 0.0001, got {}", p);
+        
+        // Verify clamping for n=1 (handled by existing logic)
+        assert_eq!(ModelParams::li_stephens_p_mismatch(1), 0.0001);
+        
+        // Verify clamping for n=0 (handled by existing logic)
+        assert_eq!(ModelParams::li_stephens_p_mismatch(0), 0.0001);
     }
 }
