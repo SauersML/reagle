@@ -547,11 +547,23 @@ target_samples={} target_bytes={}",
 
             // Mark imputed markers
             for (ref_m, &target_idx) in alignment.ref_to_target.iter().enumerate() {
-                if target_idx < 0 {
-                    window_quality.set_imputed(ref_m, true);
-                } else {
-                    window_quality.set_imputed(ref_m, false);
+                let mut is_imputed = target_idx < 0;
+
+                // Also treat partial/mismatching alignments as imputed
+                if !is_imputed {
+                    let t_idx = target_idx as usize;
+                    if let Some(mapping) = alignment
+                        .allele_mappings
+                        .get(t_idx)
+                        .and_then(|m| m.as_ref())
+                    {
+                        if mapping.targ_to_ref.iter().any(|&x| x < 0) {
+                            is_imputed = true;
+                        }
+                    }
                 }
+
+                window_quality.set_imputed(ref_m, is_imputed);
             }
 
             // Check if we have haplotype priors from previous window for soft-information handoff
@@ -1246,6 +1258,11 @@ target_samples={} target_bytes={}",
         };
         let _ = &write_span;
 
+        // Pre-calculate imputed status to avoid borrowing quality in closures
+        let is_imputed_vec: Vec<bool> = (output_start..output_end)
+            .map(|m| quality.get(m).map(|s| s.is_imputed).unwrap_or(true))
+            .collect();
+
         let include_posteriors = include_gp || include_ap;
         let n_samples = target_win.n_samples();
         let mut result_by_sample: Vec<Option<&SampleImputationResult>> = vec![None; n_samples];
@@ -1294,9 +1311,73 @@ target_samples={} target_bytes={}",
             None
         };
 
+        // Helper to get input genotype (Type 2 imputation)
+        let get_input_genotype = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
+            let target_m_idx = alignment.ref_to_target.get(marker_idx).copied()?;
+            if target_m_idx < 0 {
+                return None;
+            }
+
+            // Check if imputed (includes partial/mismatching alignments)
+            let local_m = marker_idx.saturating_sub(output_start);
+            if local_m < is_imputed_vec.len() && is_imputed_vec[local_m] {
+                return None;
+            }
+
+            let t_m_idx = target_m_idx as usize;
+            let mapping = alignment
+                .allele_mappings
+                .get(t_m_idx)
+                .and_then(|m| m.as_ref())?;
+
+            let h1 = crate::data::HapIdx::new((sample_idx * 2) as u32);
+            let h2 = crate::data::HapIdx::new((sample_idx * 2 + 1) as u32);
+
+            let t_marker_idx = crate::data::MarkerIdx::new(t_m_idx as u32);
+            let a1 = target_win.allele(t_marker_idx, h1);
+            let a2 = target_win.allele(t_marker_idx, h2);
+
+            let map_allele = |a: u8| -> u8 {
+                if a == 255 {
+                    return 255;
+                }
+                if (a as usize) < mapping.targ_to_ref.len() {
+                    let r = mapping.targ_to_ref[a as usize];
+                    if r >= 0 {
+                        r as u8
+                    } else {
+                        255
+                    }
+                } else {
+                    255
+                }
+            };
+
+            Some((map_allele(a1), map_allele(a2)))
+        };
+
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            // Type 2 imputation: use input genotype if available and not imputed
+            if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                let d1 = if a1 == 1 {
+                    1.0
+                } else if a1 > 1 {
+                    0.0
+                } else {
+                    0.0
+                };
+                let d2 = if a2 == 1 {
+                    1.0
+                } else if a2 > 1 {
+                    0.0
+                } else {
+                    0.0
+                };
+                return d1 + d2;
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
@@ -1307,6 +1388,11 @@ target_samples={} target_bytes={}",
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            // Type 2 imputation: use input genotype if available and not imputed
+            if let Some(gt) = get_input_genotype(marker_idx, sample_idx) {
+                return gt;
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
