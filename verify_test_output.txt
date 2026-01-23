@@ -1,0 +1,5 @@
+error: unexpected argument 'test_genotyped_dosage_matches_hard_call' found
+
+Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
+
+For more information, try '--help'.
