@@ -5,6 +5,7 @@ use reagle::pipelines::phasing::PhasingPipeline;
 // Serialize tests to prevent OOM from parallel execution
 use ::noodles::bgzf::io as bgzf_io;
 use ::noodles::vcf as noodles_vcf;
+use noodles_vcf::variant::record::samples::series::{value::Array, Value};
 use noodles_vcf::Record;
 use noodles_vcf::variant::record::samples::Series;
 use serial_test::serial;
@@ -149,54 +150,19 @@ fn inspect_dosages(path: &std::path::Path, _: usize) -> Vec<Vec<f32>> {
         for value in ds_col.iter(&header) {
             match value {
                 Ok(Some(v)) => {
-                    // Check debug string since path to Value enum is unstable/private
-                    let s = format!("{:?}", v);
-
-                    // Handle various formats:
-                    // - Float(1.94) -> 1.94
-                    // - Array([Ok(Some(1.94))]) -> 1.94
-                    // - Integer(1) -> 1.0
-
-                    let parsed = if s.contains("Array") {
-                        // Format: Array([Ok(Some(1.94))])
-                        // Extract the innermost number
-                        if let Some(start) = s.rfind("Some(") {
-                            let after_some = &s[start + 5..];
-                            if let Some(end) = after_some.find(')') {
-                                after_some[..end].parse().unwrap_or(0.0)
-                            } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        }
-                    } else if s.contains("Float") {
-                        // Format: Float(0.9)
-                        if let Some(start) = s.find('(') {
-                            if let Some(end) = s.find(')') {
-                                s[start + 1..end].parse().unwrap_or(0.0)
-                            } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        }
-                    } else if s.contains("Integer") {
-                        // Format: Integer(1)
-                        if let Some(start) = s.find('(') {
-                            if let Some(end) = s.find(')') {
-                                s[start + 1..end].parse().unwrap_or(0.0)
-                            } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        // Maybe it's just a raw number?
-                        s.parse().unwrap_or(0.0)
+                    let parsed = match v {
+                        Value::Float(f) => f,
+                        Value::Array(Array::Float(values)) => values
+                            .iter()
+                            .next()
+                            .transpose()
+                            .ok()
+                            .flatten()
+                            .flatten()
+                            .unwrap_or(0.0),
+                        Value::Integer(i) => i as f32,
+                        _ => 0.0,
                     };
-
                     site_dosages.push(parsed);
                 }
                 Ok(None) => site_dosages.push(-1.0), // Mark missing as -1.0
