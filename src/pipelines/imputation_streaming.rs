@@ -1272,8 +1272,71 @@ target_samples={} target_bytes={}",
             }
         };
 
+        let exact_posteriors = |marker_idx: usize, allele: u8| -> AllelePosteriors {
+            let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
+            let n_alleles = 1 + marker.alt_alleles.len();
+            if n_alleles == 2 {
+                AllelePosteriors::Biallelic(if allele == 1 { 1.0 } else { 0.0 })
+            } else {
+                let mut probs = vec![0.0f32; n_alleles];
+                if (allele as usize) < n_alleles {
+                    probs[allele as usize] = 1.0;
+                }
+                AllelePosteriors::Multiallelic(probs)
+            }
+        };
+
+        let get_input_alleles = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
+            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                let h1 = HapIdx::new((sample_idx * 2) as u32);
+                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                let mapping = alignment
+                    .allele_mappings
+                    .get(target_m)
+                    .and_then(|m| m.as_ref());
+
+                let map_allele = |a: u8| -> u8 {
+                    if a == 255 {
+                        return 255;
+                    }
+                    if let Some(m) = mapping {
+                        if (a as usize) < m.targ_to_ref.len() {
+                            let r = m.targ_to_ref[a as usize];
+                            if r >= 0 {
+                                r as u8
+                            } else {
+                                255
+                            }
+                        } else {
+                            255
+                        }
+                    } else {
+                        a
+                    }
+                };
+
+                let a1 = map_allele(raw_a1);
+                let a2 = map_allele(raw_a2);
+
+                if a1 != 255 && a2 != 255 {
+                    return Some((a1, a2));
+                }
+            }
+            None
+        };
+
         let get_posteriors_for_writer = if include_posteriors {
             Some(|marker_idx: usize, sample_idx: usize| {
+                if let Some((a1, a2)) = get_input_alleles(marker_idx, sample_idx) {
+                    if a1 < 2 && a2 < 2 {
+                        // For biallelic genotyped markers, return exact posteriors
+                        return (exact_posteriors(marker_idx, a1), exact_posteriors(marker_idx, a2));
+                    }
+                }
+
                 let local_m = marker_idx.saturating_sub(output_start);
                 if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                     if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
@@ -1297,6 +1360,12 @@ target_samples={} target_bytes={}",
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            if let Some((a1, a2)) = get_input_alleles(marker_idx, sample_idx) {
+                if a1 < 2 && a2 < 2 {
+                    return (a1 + a2) as f32;
+                }
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
@@ -1307,6 +1376,10 @@ target_samples={} target_bytes={}",
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            if let Some((a1, a2)) = get_input_alleles(marker_idx, sample_idx) {
+                return (a1, a2);
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
@@ -1316,6 +1389,12 @@ target_samples={} target_bytes={}",
         };
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
+            if let Some((a1, a2)) = get_input_alleles(marker_idx, sample_idx) {
+                if a1 < 2 && a2 < 2 {
+                    return (a1 as f32, a2 as f32);
+                }
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
