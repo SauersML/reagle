@@ -1,0 +1,10 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.31s
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-a9ac6e2c20d42b1a)
+
+running 1 test
+test test_diverse_mask_scenarios has been running for over 60 seconds
+test test_diverse_mask_scenarios ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 126.32s
+
