@@ -550,7 +550,25 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Even if aligned, check if the mapping is partial (some alleles don't map)
+                    // If so, we treat it as imputed because we'll fallback to HMM dosage
+                    // for unmapped alleles, so it's not a pure "genotyped" marker anymore.
+                    let mapping = alignment
+                        .allele_mappings
+                        .get(target_idx as usize)
+                        .and_then(|m| m.as_ref());
+
+                    if let Some(m) = mapping {
+                        if m.targ_to_ref.iter().any(|&x| x < 0) {
+                            window_quality.set_imputed(ref_m, true);
+                        } else {
+                            window_quality.set_imputed(ref_m, false);
+                        }
+                    } else {
+                        // aligned but no mapping? should imply identity, but if we are here
+                        // it implies aligned, so assume genotyped.
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 }
             }
 
