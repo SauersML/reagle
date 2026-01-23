@@ -550,7 +550,17 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Check if alignment is partial (some alleles don't map)
+                    let is_partial = alignment.allele_mappings[target_idx as usize]
+                        .as_ref()
+                        .map(|m| m.targ_to_ref.iter().any(|&x| x < 0))
+                        .unwrap_or(false);
+
+                    if is_partial {
+                        window_quality.set_imputed(ref_m, true);
+                    } else {
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 }
             }
 
