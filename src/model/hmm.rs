@@ -1219,4 +1219,32 @@ mod tests {
             assert!(val.is_finite(), "fwd[{}] should be finite, got {}", k, val);
         }
     }
+
+    #[test]
+    fn test_bwd_update_constant_normalization() {
+        // Test that the constant term C is correctly normalized by n_states
+        // Formula: bwd[i] = (1-r)*e[i]*bwd[i] + (r/N)*C
+        let n_states = 2;
+        let mut bwd = vec![1.0, 1.0];
+        let p_switch = 0.1;
+        let emissions = vec![1.0, 1.0];
+        
+        // Constant term C = sum(bwd * emissions) = 1*1 + 1*1 = 2
+        let constant_term = 2.0;
+
+        // Expected result:
+        // bwd[i] = (1-0.1)*1*1 + (0.1/2)*2 
+        //        = 0.9 + 0.1 
+        //        = 1.0
+        HmmUpdater::bwd_update_constant(&mut bwd, p_switch, &emissions, constant_term, n_states);
+
+        // With the bug (missing /N), it would be:
+        // bwd[i] = 0.9 + 0.1*2 = 1.1
+
+        assert!(
+            (bwd[0] - 1.0).abs() < 1e-6, 
+            "Expected 1.0, got {}. The constant term must be normalized by n_states.", 
+            bwd[0]
+        );
+    }
 }
