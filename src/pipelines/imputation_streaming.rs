@@ -1282,28 +1282,6 @@ target_samples={} target_bytes={}",
             }
         };
 
-        let get_posteriors_for_writer = if include_posteriors {
-            Some(|marker_idx: usize, sample_idx: usize| {
-                let local_m = marker_idx.saturating_sub(output_start);
-                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                    if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
-                        let post1 = p1
-                            .get(local_m)
-                            .cloned()
-                            .unwrap_or_else(|| default_posteriors(marker_idx).0);
-                        let post2 = p2
-                            .get(local_m)
-                            .cloned()
-                            .unwrap_or_else(|| default_posteriors(marker_idx).1);
-                        return (post1, post2);
-                    }
-                }
-                default_posteriors(marker_idx)
-            })
-        } else {
-            None
-        };
-
         // Helper to retrieve and map input genotype for non-imputed markers
         let get_input_genotype = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
             if let Some(target_m) = alignment.target_marker(marker_idx) {
@@ -1341,6 +1319,56 @@ target_samples={} target_bytes={}",
             } else {
                 None
             }
+        };
+
+        let get_posteriors_for_writer = if include_posteriors {
+            Some(|marker_idx: usize, sample_idx: usize| {
+                // Prioritize input genotype if available
+                if let Some(stats) = quality.get(marker_idx) {
+                    if !stats.is_imputed {
+                        if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                            let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
+                            let n_alleles = 1 + marker.alt_alleles.len();
+
+                            let make_posterior = |allele: u8| -> AllelePosteriors {
+                                if n_alleles == 2 {
+                                    if allele == 1 {
+                                        AllelePosteriors::Biallelic(1.0)
+                                    } else {
+                                        AllelePosteriors::Biallelic(0.0)
+                                    }
+                                } else {
+                                    let mut probs = vec![0.0f32; n_alleles];
+                                    if (allele as usize) < n_alleles {
+                                        probs[allele as usize] = 1.0;
+                                    }
+                                    AllelePosteriors::Multiallelic(probs)
+                                }
+                            };
+
+                            return (make_posterior(a1), make_posterior(a2));
+                        }
+                    }
+                }
+
+                let local_m = marker_idx.saturating_sub(output_start);
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
+                        let post1 = p1
+                            .get(local_m)
+                            .cloned()
+                            .unwrap_or_else(|| default_posteriors(marker_idx).0);
+                        let post2 = p2
+                            .get(local_m)
+                            .cloned()
+                            .unwrap_or_else(|| default_posteriors(marker_idx).1);
+                        return (post1, post2);
+                    }
+                }
+                default_posteriors(marker_idx)
+            })
+        } else {
+            None
         };
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
