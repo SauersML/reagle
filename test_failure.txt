@@ -1,0 +1,57 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.92s
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-bf15c1affa8f30af)
+
+running 1 test
+test test_genotyped_dosage_matches_hard_call ... FAILED
+
+failures:
+
+---- test_genotyped_dosage_matches_hard_call stdout ----
+
+======================================================================
+=== Genotyped Marker: Dosage vs Hard Call ===
+======================================================================
+Running: java -jar /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar [("ref", "/tmp/.tmpeR7W9e/ref.vcf.gz"), ("gt", "/tmp/.tmpeR7W9e/target_sparse.vcf.gz"), ("out", "/tmp/.tmpeR7W9e/java_out"), ("seed", "42"), ("gp", "true")]
+Streaming imputation: 362 ref haplotypes, 10 target samples (target_bytes=65565)
+Writing output to "/tmp/.tmpeR7W9e/rust_out.vcf.gz"
+Phase 2: Streaming imputation...
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (135 markers, pos 20000086..20099941)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 1356 (global 0..1356)
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 135
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+  Imputing Window 1 (135 markers, ref global 0..1356, output 0..1356)
+Streaming imputation complete: 1356 markers
+
+Genotyped samples analyzed: 1350
+
+Mismatches (DS != GT):
+  Java: 0 (0.00%)
+  Rust: 2 (0.15%)
+
+Rust mismatch examples (pos, GT, expected DS, actual DS):
+  pos=20001219: GT=0|1, expected=1.00, actual=0.79
+  pos=20085705: GT=0|0, expected=1.00, actual=0.00
+
+Conclusion:
+  Rust has MORE mismatches than Java - this is a bug!
+
+thread 'test_genotyped_dosage_matches_hard_call' (10369) panicked at tests/beagle_reference.rs:3787:5:
+GENOTYPED DOSAGE BUG: Rust has 2 mismatches (DS != GT), Java has 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_genotyped_dosage_matches_hard_call
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 26 filtered out; finished in 41.10s
+
+error: test failed, to rerun pass `--test beagle_reference`
