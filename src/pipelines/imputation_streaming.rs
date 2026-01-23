@@ -27,6 +27,7 @@ use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::model::block_hash::hmm::EmissionProvider;
 
 fn push_unique(dst: &mut Vec<String>, value: String) {
     if !dst.iter().any(|v| v == &value) {
@@ -854,6 +855,13 @@ target_samples={} target_bytes={}",
                     let mut process_haplotype = |hap_idx: HapIdx, priors: Option<&HaplotypePriors>| -> (Vec<AllelePosteriors>, HaplotypePriors) {
                         let input = build_input_vector(hap_idx);
                         
+                        let sample_idx = hap_idx.as_usize() / 2;
+                        let emission_provider = EmissionProvider {
+                            gt: target_win,
+                            sample: sample_idx,
+                            alignment,
+                        };
+
                         // Initialize workspace
                         if let Some(first_block) = ref_map.blocks.first() {
                             if let Some(p) = priors {
@@ -891,9 +899,9 @@ target_samples={} target_bytes={}",
                         
                                                                         // Run HMM
                         
-                                                                        ref_map.forward_pass(&input, self.params.p_mismatch, ws);
+                                                                        ref_map.forward_pass(&input, self.params.p_mismatch, ws, Some(&emission_provider));
                         
-                                                                        let posteriors = ref_map.backward_and_emit_posteriors(&input, self.params.p_mismatch, ws);
+                                                                        let posteriors = ref_map.backward_and_emit_posteriors(&input, self.params.p_mismatch, ws, Some(&emission_provider));
                         
                                                                         
                         
@@ -917,7 +925,7 @@ target_samples={} target_bytes={}",
                         
                                                                         // Run forward pass up to prior_marker_idx
                         
-                                                                        ref_map.forward_to_marker(&input, self.params.p_mismatch, ws, prior_marker_idx);
+                                                                        ref_map.forward_to_marker(&input, self.params.p_mismatch, ws, prior_marker_idx, Some(&emission_provider));
                         
                                                                         
                         

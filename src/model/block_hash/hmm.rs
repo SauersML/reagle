@@ -8,19 +8,91 @@ use super::workspace::BlockHmmWorkspace;
 use super::types::PatternId;
 use super::weighted_kernel::WeightedHmmUpdater;
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::data::storage::GenotypeMatrix;
+use crate::data::storage::phase_state::PhaseState;
+use crate::data::marker::MarkerIdx;
+use crate::data::alignment::MarkerAlignment;
+use crate::model::pl_emission::{allele_probs_uncond_from_pl, emit_from_allele_probs};
+
+/// Provides per-marker emission probabilities
+pub struct EmissionProvider<'a, S: PhaseState> {
+    pub gt: &'a GenotypeMatrix<S>,
+    pub sample: usize,
+    pub alignment: &'a MarkerAlignment,
+}
+
+impl<'a, S: PhaseState> EmissionProvider<'a, S> {}
+
+/// Helper for pre-computing emissions
+fn compute_allele_emission_cache<S: PhaseState>(
+    provider: &EmissionProvider<S>,
+    global_marker: usize,
+    target_allele: u8,
+    n_alleles: usize,
+    error_rate: f32,
+    allele_probs_buffer: &mut Vec<f32>,
+) -> Option<Vec<f32>> {
+    let mut per_allele_emissions = vec![0.0; n_alleles];
+    let mut using_provider = false;
+
+    let target_marker_idx = provider.alignment.target_marker(global_marker);
+    if let Some(t_idx) = target_marker_idx {
+        let pl = provider.gt.sample_pl(MarkerIdx::new(t_idx as u32), provider.sample);
+        if let Some(pl_values) = pl {
+             if !pl_values.is_empty() {
+                 if allele_probs_uncond_from_pl(pl_values, allele_probs_buffer).is_some() {
+                     let p_no_err = 1.0 - error_rate;
+                     let p_err_other = if allele_probs_buffer.len() > 1 {
+                         error_rate / (allele_probs_buffer.len() as f32 - 1.0)
+                     } else {
+                         0.0
+                     };
+
+                     for r in 0..n_alleles {
+                         let target_a = provider.alignment.reverse_map_allele(t_idx, r as u8);
+                         per_allele_emissions[r] = emit_from_allele_probs(target_a, allele_probs_buffer, p_no_err, p_err_other);
+                     }
+                     using_provider = true;
+                 }
+             }
+        }
+
+        if !using_provider {
+            // Try confidence
+            let conf = provider.gt.sample_confidence_f32(MarkerIdx::new(t_idx as u32), provider.sample);
+            if conf < 0.999 {
+                let random_prob = if n_alleles > 0 { 1.0 / n_alleles as f32 } else { 0.5 };
+                let mismatch_prob = if n_alleles > 1 { error_rate / (n_alleles - 1) as f32 } else { error_rate };
+
+                for r in 0..n_alleles {
+                    let base_prob = if r as u8 == target_allele { 1.0 - error_rate } else { mismatch_prob };
+                    per_allele_emissions[r] = base_prob * conf + random_prob * (1.0 - conf);
+                }
+                using_provider = true;
+            }
+        }
+    }
+
+    if using_provider {
+        Some(per_allele_emissions)
+    } else {
+        None
+    }
+}
 
 /// Run forward pass within a single block using existing SIMD kernel
 ///
 /// # Arguments
 /// * `block` - The CompressedBlock (immutable reference data)
-/// * `target_genotypes` - Target genotypes for this block [marker_in_window]
+/// * `target_genotypes` - Target genotypes for this block (Hard calls, Ref-encoded)
 /// * `error_rate` - Genotyping error rate
 /// * `ws` - Mutable workspace
-pub fn forward_within_block(
+pub fn forward_within_block<S: PhaseState>(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
+    emission_provider: Option<&EmissionProvider<S>>,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
@@ -34,20 +106,30 @@ pub fn forward_within_block(
     // For each marker in the window
     for marker_in_window in 0..window_size {
         let target_allele = target_genotypes[marker_in_window];
-        // Fix: Marker 0 uses 0.0 rate (prior already transitioned by Bridge).
-        // Markers > 0 use rate[m-1] (transition from m-1 to m).
         let recomb_rate = if marker_in_window == 0 {
             0.0
         } else {
             block.local_recomb_rates[marker_in_window - 1]
         };
 
-        // Compute emission probabilities for all patterns
-        // Use ws.emissions as temp buffer
         let emissions = &mut ws.emissions;
         
         let n_alleles = block.n_alleles(marker_in_window);
         
+        let allele_emission_cache = if let Some(ep) = emission_provider {
+            compute_allele_emission_cache(
+                ep,
+                block.start_marker + marker_in_window,
+                target_allele,
+                n_alleles,
+                error_rate,
+                &mut ws.allele_probs,
+            )
+        } else {
+            None
+        };
+        let emission_cache = allele_emission_cache.as_deref();
+
         for pattern_idx in 0..n_patterns {
             let pattern_id = PatternId::new(pattern_idx as u32);
             emissions[pattern_idx] = emission_prob(
@@ -57,10 +139,10 @@ pub fn forward_within_block(
                 target_allele,
                 error_rate,
                 n_alleles,
+                emission_cache
             );
         }
 
-        // REUSE: Use new weighted kernel
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
 
         WeightedHmmUpdater::fwd_update_weighted(
@@ -73,7 +155,6 @@ pub fn forward_within_block(
             n_patterns,
         );
 
-        // Handle reservoir separately (not part of SIMD kernel)
         if block.reservoir_count > 0 {
             let reservoir_emission = emission_prob(
                 block,
@@ -82,6 +163,7 @@ pub fn forward_within_block(
                 target_allele,
                 error_rate,
                 n_alleles,
+                emission_cache
             );
 
             let total_mass = fwd_sum;
@@ -92,21 +174,18 @@ pub fn forward_within_block(
                 reservoir_emission * (stay + background * block.reservoir_count as f32);
         }
 
-        // Normalize to prevent underflow
         ws.normalize_forward(n_patterns);
     }
 }
 
 /// Run forward pass up to a specific marker within a block
-///
-/// Used for extracting state at arbitrary positions (e.g. for priors handoff).
-/// Returns state after observing `stop_marker_in_window`.
-pub fn forward_to_marker_in_block(
+pub fn forward_to_marker_in_block<S: PhaseState>(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
     stop_marker_in_window: usize,
+    emission_provider: Option<&EmissionProvider<S>>,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
@@ -126,6 +205,20 @@ pub fn forward_to_marker_in_block(
         
         let n_alleles = block.n_alleles(marker_in_window);
         
+        let allele_emission_cache = if let Some(ep) = emission_provider {
+            compute_allele_emission_cache(
+                ep,
+                block.start_marker + marker_in_window,
+                target_allele,
+                n_alleles,
+                error_rate,
+                &mut ws.allele_probs,
+            )
+        } else {
+            None
+        };
+        let emission_cache = allele_emission_cache.as_deref();
+
         for pattern_idx in 0..n_patterns {
             let pattern_id = PatternId::new(pattern_idx as u32);
             emissions[pattern_idx] = emission_prob(
@@ -135,6 +228,7 @@ pub fn forward_to_marker_in_block(
                 target_allele,
                 error_rate,
                 n_alleles,
+                emission_cache
             );
         }
 
@@ -158,6 +252,7 @@ pub fn forward_to_marker_in_block(
                 target_allele,
                 error_rate,
                 n_alleles,
+                emission_cache
             );
 
             let total_mass = fwd_sum;
@@ -173,39 +268,39 @@ pub fn forward_to_marker_in_block(
 }
 
 /// Backward pass within block AND emit posteriors
-///
-/// Combines forward probabilities (from checkpoint) with backward probabilities
-/// to compute posterior probabilities for each allele.
-///
-/// # Arguments
-/// * `output` - Mutable slice to write posteriors into (must be same length as window_size)
-pub fn backward_and_emit_block(
+pub fn backward_and_emit_block<S: PhaseState>(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
     output: &mut [AllelePosteriors],
+    emission_provider: Option<&EmissionProvider<S>>,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
     
     assert_eq!(output.len(), window_size, "Output slice size mismatch");
     
-    // We compute posteriors in reverse order (because backward pass is reverse).
-    // The `output` slice corresponds to markers [start..end]. 
-    // We will write into `output[marker_idx]` directly.
-    // Care needed: backward loop is `(0..window_size).rev()`.
-
-    // Re-run Forward and store history into pre-allocated workspace buffer
+    // Re-run Forward
     for marker_idx in 0..window_size {
         let target_allele = target_genotypes[marker_idx];
-        let recomb_rate = if marker_idx == 0 {
-            0.0
-        } else {
-            block.local_recomb_rates[marker_idx - 1]
-        };
+        let recomb_rate = if marker_idx == 0 { 0.0 } else { block.local_recomb_rates[marker_idx - 1] };
         let n_alleles = block.n_alleles(marker_idx);
         
+        let allele_emission_cache = if let Some(ep) = emission_provider {
+            compute_allele_emission_cache(
+                ep,
+                block.start_marker + marker_idx,
+                target_allele,
+                n_alleles,
+                error_rate,
+                &mut ws.allele_probs,
+            )
+        } else {
+            None
+        };
+        let emission_cache = allele_emission_cache.as_deref();
+
         let emissions = &mut ws.emissions;
         for pattern_idx in 0..n_patterns {
             emissions[pattern_idx] = emission_prob(
@@ -215,6 +310,7 @@ pub fn backward_and_emit_block(
                 target_allele,
                 error_rate,
                 n_alleles,
+                emission_cache
             );
         }
         
@@ -238,6 +334,7 @@ pub fn backward_and_emit_block(
                 target_allele,
                 error_rate,
                 n_alleles,
+                emission_cache
             );
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
@@ -248,11 +345,9 @@ pub fn backward_and_emit_block(
         ws.normalize_forward(n_patterns);
         
         // Save state to flattened history
-        // Access fields directly to avoid borrowing `self` entirely
         let stride = ws.max_states + 1;
         let start = marker_idx * stride;
         let history = &mut ws.fwd_history[start..start + stride];
-        
         history[..n_patterns].copy_from_slice(&ws.fwd[..n_patterns]);
         history[n_patterns] = ws.reservoir_prob_fwd;
     }
@@ -260,13 +355,24 @@ pub fn backward_and_emit_block(
     // Now Backward (reverse)
     for marker_idx in (0..window_size).rev() {
         let target_allele = target_genotypes[marker_idx];
-        let recomb_rate = if marker_idx == 0 {
-            0.0
-        } else {
-            block.local_recomb_rates[marker_idx - 1]
-        };
+        let recomb_rate = if marker_idx == 0 { 0.0 } else { block.local_recomb_rates[marker_idx - 1] };
         let n_alleles = block.n_alleles(marker_idx);
         
+        // Compute emission cache again
+        let allele_emission_cache = if let Some(ep) = emission_provider {
+            compute_allele_emission_cache(
+                ep,
+                block.start_marker + marker_idx,
+                target_allele,
+                n_alleles,
+                error_rate,
+                &mut ws.allele_probs,
+            )
+        } else {
+            None
+        };
+        let emission_cache = allele_emission_cache.as_deref();
+
         // Accumulate allele probabilities
         let mut allele_probs = vec![0.0f32; n_alleles];
         let mut total_prob = 0.0;
@@ -275,7 +381,6 @@ pub fn backward_and_emit_block(
         let start = marker_idx * stride;
         let current_fwd = &ws.fwd_history[start..start + stride];
         
-        // Pattern states
         for pattern_idx in 0..n_patterns {
             let p = current_fwd[pattern_idx] * ws.bwd[pattern_idx];
             if p > 0.0 {
@@ -287,11 +392,9 @@ pub fn backward_and_emit_block(
             }
         }
         
-        // Reservoir state (Mixed alleles)
         let res_p = current_fwd[n_patterns] * ws.reservoir_prob_bwd;
         if res_p > 0.0 {
             total_prob += res_p;
-            // Iterate all alleles to distribute probability based on frequency
             for allele in 0..n_alleles {
                 let freq = block.reservoir_freq(marker_idx, allele as u8);
                 if freq > 0.0 {
@@ -300,12 +403,9 @@ pub fn backward_and_emit_block(
             }
         }
         
-        // Normalize
         if total_prob > 0.0 {
             let scale = 1.0 / total_prob;
-            for p in &mut allele_probs {
-                *p *= scale;
-            }
+            for p in &mut allele_probs { *p *= scale; }
         }
         
         if n_alleles == 2 {
@@ -324,13 +424,11 @@ pub fn backward_and_emit_block(
                 target_allele,
                 error_rate,
                 n_alleles,
+                emission_cache
             );
         }
         
-        // beta = beta * emit
-        for i in 0..n_patterns {
-            ws.bwd[i] *= emissions[i];
-        }
+        for i in 0..n_patterns { ws.bwd[i] *= emissions[i]; }
         
         let reservoir_emission = emission_prob(
             block,
@@ -339,49 +437,21 @@ pub fn backward_and_emit_block(
             target_allele,
             error_rate,
             n_alleles,
+            emission_cache
         );
         ws.reservoir_prob_bwd *= reservoir_emission;
         
-        // --- Step-Back with Constant Term (Fix 5) ---
-        // beta_{t}(i) = (1-r) * beta_{t+1}(i) * E_{t+1}(i) + r * C
-        // where C = sum_j (beta_{t+1}(j) * E_{t+1}(j))
-        // Note: our ws.bwd already contains beta_{t+1}(i) * E_{t+1}(i) due to previous multiplication steps!
-        // So we just sum it up.
-        
-        // Calculate weighted sum for constant term
-
-        
-        // The constant term C is effectively bwd_sum here.
-        // We use WeightedHmmUpdater (via bwd_update_constant logic)
-        // HmmUpdater::bwd_update_constant expects `emissions` argument but here we pre-multiplied.
-        // Wait, bwd_update_constant takes `emissions` and `bwd`. It computes `(1-r) * emit * bwd + r * C`.
-        // If we pre-multiplied, we should use a simpler update: `(1-r) * bwd_precalc + r * C`.
-        // BUT WeightedHmmUpdater logic assumes we are passing probabilities to match SIMD layout?
-        // Let's use `HmmUpdater::bwd_update_constant`. But we need to UN-multiply or just not multiply yet?
-        // `HmmUpdater` is in `model::hmm`. We are in `model::block_hash::hmm`.
-        // We generally use `WeightedHmmUpdater` here which handles weights.
-        // But for backward we don't need weights in the standard Li-Stephens recursion, unless we use compressed states?
-        // The compressed states require weighting by counts?
-        // Li-Stephens: P(x_t | x_{t-1}) involves count weighting.
-        // Backward: sum over x_t. beta_{t-1}(i) = sum_j P(x_t=j | x_{t-1}=i) P(emit) beta_t(j).
-        // Transition P(j|i) = (1-r) delta(i,j) + r * (count(j) / N).
-        // So beta_{t-1}(i) = (1-r) emit(i) beta_t(i) + r * sum_j (count(j)/N) emit(j) beta_t(j).
-        // Let C = sum_j (count(j)/N) * emit(j) * beta_t(j).
-        // Then beta_{t-1}(i) = (1-r) emit(i) beta_t(i) + r * C.
-        
-        // So we need to calculate C using pattern_counts.
         {
             let n_ref = block.n_ref_haps() as f32;
             let mut weighted_sum = 0.0f32;
             for i in 0..n_patterns {
-                weighted_sum += ws.bwd[i] * block.pattern_counts[i]; // bwd[i] is already emit*beta
+                weighted_sum += ws.bwd[i] * block.pattern_counts[i];
             }
             if block.reservoir_count > 0 {
                 weighted_sum += ws.reservoir_prob_bwd * block.reservoir_count as f32;
             }
-            let constant_term = weighted_sum / n_ref; // C
+            let constant_term = weighted_sum / n_ref;
 
-            // Now apply update: beta_{new} = (1-r) * beta_{curr} + r * C
             let stay_prob = 1.0 - recomb_rate;
             let recomb_prob = recomb_rate;
             let common_add = recomb_prob * constant_term;
@@ -397,8 +467,6 @@ pub fn backward_and_emit_block(
 }
 
 /// Compute emission probability for a pattern at a marker
-///
-/// Implements Split Error Model: Mismatch probability is split among all non-matching alleles.
 #[inline]
 fn emission_prob(
     block: &CompressedBlock,
@@ -407,32 +475,56 @@ fn emission_prob(
     target_allele: u8,
     error_rate: f32,
     n_alleles: usize,
+    emission_cache: Option<&[f32]>,
 ) -> f32 {
+    // If we have pre-computed emissions (from PL or Confidence), use them
+    if let Some(cache) = emission_cache {
+        if pattern_id.is_reservoir() {
+            // Weighted average based on reservoir frequencies
+            // P(obs | Res) = sum_k P(obs | k) * P(k | Res)
+            // = sum_k cache[k] * freq[k]
+
+            let obs_fraction = block.get_reservoir_obs_fraction(marker_in_window);
+            if obs_fraction > 0.0 {
+                let mut p = 0.0f32;
+                for a in 0..n_alleles {
+                    let freq = block.reservoir_freq(marker_in_window, a as u8);
+                    if freq > 0.0 {
+                        p += cache.get(a).copied().unwrap_or(0.0) * freq;
+                    }
+                }
+                // Account for missingness: P(miss|Res) = 1.0?
+                // cache[k] is P(obs | k).
+                // If reservoir has missing data, we assume missing matches (1.0).
+                // Mixed: obs_fraction * (sum...) + (1-obs_fraction) * 1.0
+                return p * obs_fraction + 1.0 * (1.0 - obs_fraction);
+            } else {
+                return 1.0;
+            }
+        } else {
+            let ref_allele = block.get_pattern_allele(pattern_id, marker_in_window);
+            if ref_allele == 255 {
+                return 1.0;
+            }
+            return cache.get(ref_allele as usize).copied().unwrap_or(error_rate);
+        }
+    }
+
+    // Fallback to Hard-Call logic
     // Missing data - neutral (1.0)
     if target_allele == 255 {
         return 1.0;
     }
 
-    // Split error model: epsilon / (K - 1)
-    // If K=1 (monomorphic), mismatch is impossible (or probability 0).
-    // We clamp divisor to 1.0 to avoid NaN, but logically K=1 should match always or error if observed is different.
     let mismatch_prob = if n_alleles > 1 {
         error_rate / (n_alleles - 1) as f32
     } else {
-        error_rate // Fallback, though K=1 implies no variation
+        error_rate
     };
 
     let match_prob = 1.0 - error_rate;
 
     if pattern_id.is_reservoir() {
-        // Reservoir uses allele frequency
-        // P(obs | Res) = sum_k [ P(obs | k) * P(k | Res) ]
-        //              = P(match) * freq[obs] + mismatch_prob * (1 - freq[obs])
-        // BUT we must account for missingness in the reservoir itself.
-        // P(k | Res) is not uniform if some haps are missing.
-        // Formula:
-        // P(obs | Res) = P_{obs} * [ P(match) * freq_{obs} + P(mismatch) * (1 - freq_{obs}) ] + P_{miss} * 1.0
-        
         let obs_fraction = block.get_reservoir_obs_fraction(marker_in_window);
         
         if obs_fraction > 0.0 {
@@ -444,10 +536,8 @@ fn emission_prob(
             1.0
         }
     } else {
-        // Pattern uses exact allele matching
         let ref_allele = block.get_pattern_allele(pattern_id, marker_in_window);
 
-        // Missing reference allele - neutral (1.0), not a mismatch
         if ref_allele == 255 {
             return 1.0;
         }
@@ -471,6 +561,7 @@ mod tests {
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Marker, Allele, Markers};
+    use crate::data::storage::phase_state::Phased;
     use std::sync::Arc;
 
     /// Ported/Adapted from deleted `test_compute_cluster_mismatches_accumulation`
@@ -519,8 +610,9 @@ mod tests {
         let match_prob = 1.0 - error;
         let mismatch_prob = error;
         
-        // Run forward pass
-        forward_within_block(&block, &target_genotypes, error, &mut ws);
+        // Run forward pass with NO emission provider (Hard Call logic)
+        let provider: Option<&EmissionProvider<Phased>> = None;
+        forward_within_block(&block, &target_genotypes, error, &mut ws, provider);
         
         // Expected probs (ignoring normalization for a moment, or rather checking ratios)
         // P0 (0 mismatches): Init * match * match
