@@ -50,10 +50,14 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum mismatch probability to prevent "Perfect LD Trap"
+    /// (haplotype decimation when target is monomorphic)
+    pub const MIN_MISMATCH_PROB: f32 = 0.0001;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
-            p_mismatch: 0.0001,
+            p_mismatch: Self::MIN_MISMATCH_PROB,
             recomb_intensity: 1.0,
             n_states: Self::DEFAULT_PHASE_STATES,
             burnin: Self::DEFAULT_BURNIN,
@@ -130,11 +134,12 @@ impl ModelParams {
     /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
         if n_haps <= 1 {
-            return 0.0001;
+            return Self::MIN_MISMATCH_PROB;
         }
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
-        (theta / (2.0 * (theta + n))) as f32
+        let p = (theta / (2.0 * (theta + n))) as f32;
+        p.max(Self::MIN_MISMATCH_PROB)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -337,16 +342,26 @@ mod tests {
 
     #[test]
     fn test_li_stephens_p_mismatch() {
-        let p = ModelParams::li_stephens_p_mismatch(1000);
-        assert!(p > 0.0 && p < 0.01);
+        // Test with small N where p > MIN_MISMATCH_PROB
+        let p_small = ModelParams::li_stephens_p_mismatch(100);
+        let p_medium = ModelParams::li_stephens_p_mismatch(200);
+        assert!(p_small > ModelParams::MIN_MISMATCH_PROB);
+        assert!(p_medium > ModelParams::MIN_MISMATCH_PROB);
+        // More haplotypes -> lower mismatch probability (when above floor)
+        assert!(p_medium < p_small);
 
-        // More haplotypes -> lower mismatch probability
-        let p2 = ModelParams::li_stephens_p_mismatch(10000);
-        assert!(p2 < p);
+        // Test with large N where p would be < MIN_MISMATCH_PROB
+        // With N=1000, p approx 6e-5, should be clamped to 1e-4
+        let p_large = ModelParams::li_stephens_p_mismatch(1000);
+        assert!((p_large - ModelParams::MIN_MISMATCH_PROB).abs() < 1e-9);
+
+        // With N=10000, p should also be clamped
+        let p_very_large = ModelParams::li_stephens_p_mismatch(10000);
+        assert!((p_very_large - ModelParams::MIN_MISMATCH_PROB).abs() < 1e-9);
 
         // Edge case
         let p0 = ModelParams::li_stephens_p_mismatch(0);
-        assert_eq!(p0, 0.0001);
+        assert_eq!(p0, ModelParams::MIN_MISMATCH_PROB);
     }
 
     #[test]
