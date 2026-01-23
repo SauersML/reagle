@@ -1074,7 +1074,11 @@ target_samples={} target_bytes={}",
                         
                                                                         best_gt.push((g1, g2));
                         
-                                                                        dosages.push(d1 + d2);
+                                                                        let mut total_dosage = d1 + d2;
+                                                                        if !target_win.samples().is_diploid(crate::data::SampleIdx::new(s as u32)) {
+                                                                            total_dosage *= 0.5;
+                                                                        }
+                                                                        dosages.push(total_dosage);
                         
                                                                         
                         
