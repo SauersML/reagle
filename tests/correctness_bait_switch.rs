@@ -1,3 +1,4 @@
+use noodles::vcf::variant::record::samples::series::value::Array;
 use reagle::config::Config;
 use reagle::pipelines::imputation::ImputationPipeline;
 
@@ -82,6 +83,9 @@ fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
         let parsed = match val {
             Some(Value::Float(f)) => f as f64,
             Some(Value::String(s)) => s.parse::<f64>().expect("parse DS"),
+            Some(Value::Array(Array::Float(values))) => {
+                values.iter().next().transpose().expect("io error").flatten().expect("missing value") as f64
+            }
             Some(other) => panic!("Unexpected DS value: {other:?}"),
             None => panic!("Missing DS"),
         };
