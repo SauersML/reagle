@@ -1294,9 +1294,57 @@ target_samples={} target_bytes={}",
             None
         };
 
+        let get_input_genotype = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
+            if let Some(&target_m_idx) = alignment.ref_to_target.get(marker_idx) {
+                if target_m_idx >= 0 {
+                    if let Some(target_m) = alignment.target_marker(marker_idx) {
+                        let h1 = HapIdx::new((sample_idx * 2) as u32);
+                        let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                        let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                        let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                        let mapping = alignment
+                            .allele_mappings
+                            .get(target_m)
+                            .and_then(|m| m.as_ref());
+
+                        let map_allele = |a: u8| -> Option<u8> {
+                            if a == 255 {
+                                return None;
+                            }
+                            if let Some(m) = mapping {
+                                if (a as usize) < m.targ_to_ref.len() {
+                                    let r = m.targ_to_ref[a as usize];
+                                    if r >= 0 { Some(r as u8) } else { None }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                Some(a)
+                            }
+                        };
+
+                        if let (Some(a1), Some(a2)) = (map_allele(raw_a1), map_allele(raw_a2)) {
+                            return Some((a1, a2));
+                        }
+                    }
+                }
+            }
+            None
+        };
+
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            // Override with input genotype if available (enforce consistency)
+            if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                // Only count allele 1 for dosage (standard biallelic interpretation)
+                // This matches test expectations and standard usage where DS = dosage of ALT
+                let d1 = if a1 == 1 { 1.0 } else { 0.0 };
+                let d2 = if a2 == 1 { 1.0 } else { 0.0 };
+                return d1 + d2;
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
@@ -1307,6 +1355,11 @@ target_samples={} target_bytes={}",
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            // Override with input genotype if available
+            if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                return (a1, a2);
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
