@@ -550,7 +550,21 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    window_quality.set_imputed(ref_m, false);
+                    // Also mark as imputed if the alignment is partial/mismatching
+                    // (i.e. some target alleles don't map to reference alleles)
+                    let is_partial = if let Some(mapping) =
+                        alignment.allele_mappings.get(target_idx as usize).and_then(|m| m.as_ref())
+                    {
+                        mapping.targ_to_ref.iter().any(|&x| x < 0)
+                    } else {
+                        false
+                    };
+
+                    if is_partial {
+                        window_quality.set_imputed(ref_m, true);
+                    } else {
+                        window_quality.set_imputed(ref_m, false);
+                    }
                 }
             }
 
@@ -1073,8 +1087,51 @@ target_samples={} target_bytes={}",
                                                                         
                         
                                                                         best_gt.push((g1, g2));
-                        
-                                                                        dosages.push(d1 + d2);
+
+                                                                        // Prioritize input dosage for genotyped markers
+                                                                        let mut final_dosage = d1 + d2;
+                                                                        if let Some(target_m_idx) = alignment.target_marker(m) {
+                                                                            let t_m = MarkerIdx::new(target_m_idx as u32);
+                                                                            // Access input alleles
+                                                                            let a1_in = target_win.allele(t_m, h1_idx);
+                                                                            let a2_in = target_win.allele(t_m, h2_idx);
+
+                                                                            if a1_in != 255 && a2_in != 255 {
+                                                                                // Map alleles to reference
+                                                                                let mapping = alignment
+                                                                                    .allele_mappings
+                                                                                    .get(target_m_idx as usize)
+                                                                                    .and_then(|m| m.as_ref());
+
+                                                                                let map_allele = |a: u8| -> Option<u8> {
+                                                                                    if let Some(m) = mapping {
+                                                                                        if (a as usize) < m.targ_to_ref.len() {
+                                                                                            let r = m.targ_to_ref[a as usize];
+                                                                                            if r >= 0 {
+                                                                                                Some(r as u8)
+                                                                                            } else {
+                                                                                                None
+                                                                                            }
+                                                                                        } else {
+                                                                                            None
+                                                                                        }
+                                                                                    } else {
+                                                                                        Some(a)
+                                                                                    }
+                                                                                };
+
+                                                                                if let (Some(r1), Some(r2)) =
+                                                                                    (map_allele(a1_in), map_allele(a2_in))
+                                                                                {
+                                                                                    // Both alleles map to valid reference alleles
+                                                                                    // Dosage is count of ALT alleles (index > 0)
+                                                                                    let d_in = (if r1 > 0 { 1.0 } else { 0.0 })
+                                                                                        + (if r2 > 0 { 1.0 } else { 0.0 });
+                                                                                    final_dosage = d_in;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        dosages.push(final_dosage);
                         
                                                                         
                         
