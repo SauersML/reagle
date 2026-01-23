@@ -153,6 +153,9 @@ fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
         let parsed = match val {
             Some(Value::Float(f)) => f as f64,
             Some(Value::String(s)) => s.parse::<f64>().expect("parse DS"),
+            Some(Value::Array(noodles_vcf::variant::record::samples::series::value::Array::Float(values))) => {
+                values.iter().next().expect("DS array empty").expect("DS value error").expect("DS value missing") as f64
+            }
             Some(other) => panic!("Unexpected DS value: {other:?}"),
             None => panic!("Missing DS"),
         };
