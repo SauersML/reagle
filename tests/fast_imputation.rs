@@ -685,7 +685,9 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    // Lower Ne to 200.0 to simulate strong LD suitable for 1 Mb (1 cM) imputation gaps.
+    // With Ne=10000, Li-Stephens switch probability over 1 cM is >30%, destroying signal.
+    config.ne = 200.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
