@@ -8,6 +8,100 @@ use super::workspace::BlockHmmWorkspace;
 use super::types::PatternId;
 use super::weighted_kernel::WeightedHmmUpdater;
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::model::pl_emission::{PlProvider, allele_probs_uncond_from_pl, emit_from_allele_probs};
+
+/// Helper to compute emissions for all patterns + reservoir
+/// Returns reservoir emission probability
+#[inline(always)]
+fn compute_emissions(
+    emissions_buf: &mut [f32],
+    block: &CompressedBlock,
+    marker_in_window: usize,
+    global_m: usize,
+    target_allele: u8,
+    error_rate: f32,
+    p_no_err_pl: f32,
+    pl_provider: Option<&PlProvider>,
+    allele_probs_scratch: &mut Vec<f32>,
+) -> f32 {
+    let n_patterns = block.n_patterns();
+    let n_alleles = block.n_alleles(marker_in_window);
+
+    // Fetch PLs and compute allele probabilities if available
+    let pl = pl_provider.and_then(|p| p.pl(global_m));
+    let pl_n_alleles = if let Some(pl) = pl {
+        if !pl.is_empty() {
+            allele_probs_uncond_from_pl(pl, allele_probs_scratch)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let p_err_pl = if let Some(n) = pl_n_alleles {
+        if n > 1 {
+            error_rate / (n as f32 - 1.0)
+        } else {
+            error_rate
+        }
+    } else {
+        error_rate
+    };
+
+    if pl_n_alleles.is_some() {
+        for pattern_idx in 0..n_patterns {
+            let ref_allele = block.get_pattern_allele(PatternId::new(pattern_idx as u32), marker_in_window);
+            emissions_buf[pattern_idx] = emit_from_allele_probs(
+                ref_allele,
+                allele_probs_scratch,
+                p_no_err_pl,
+                p_err_pl,
+            );
+        }
+    } else {
+        for pattern_idx in 0..n_patterns {
+            emissions_buf[pattern_idx] = emission_prob(
+                block,
+                PatternId::new(pattern_idx as u32),
+                marker_in_window,
+                target_allele,
+                error_rate,
+                n_alleles,
+            );
+        }
+    }
+
+    // Reservoir emission
+    if block.reservoir_count > 0 {
+        if pl_n_alleles.is_some() {
+            let mut p_emit = 0.0;
+            // For reservoir, we integrate over all possible alleles weighted by their frequency in reservoir
+            for a in 0..n_alleles {
+                let freq = block.reservoir_freq(marker_in_window, a as u8);
+                if freq > 0.0 {
+                    p_emit += freq * emit_from_allele_probs(a as u8, allele_probs_scratch, p_no_err_pl, p_err_pl);
+                }
+            }
+            let obs_frac = block.get_reservoir_obs_fraction(marker_in_window);
+            if obs_frac < 1.0 {
+                p_emit = p_emit * obs_frac + (1.0 - obs_frac) * 1.0;
+            }
+            p_emit
+        } else {
+            emission_prob(
+                block,
+                PatternId::RESERVOIR,
+                marker_in_window,
+                target_allele,
+                error_rate,
+                n_alleles,
+            )
+        }
+    } else {
+        0.0
+    }
+}
 
 /// Run forward pass within a single block using existing SIMD kernel
 ///
@@ -21,6 +115,8 @@ pub fn forward_within_block(
     target_genotypes: &[u8],
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
+    pl_provider: Option<&PlProvider>,
+    start_marker: usize,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
@@ -31,34 +127,31 @@ pub fn forward_within_block(
         "Target genotypes must match block size"
     );
 
+    let p_no_err_pl = 1.0 - error_rate;
+
     // For each marker in the window
     for marker_in_window in 0..window_size {
+        let global_m = start_marker + marker_in_window;
         let target_allele = target_genotypes[marker_in_window];
-        // Fix: Marker 0 uses 0.0 rate (prior already transitioned by Bridge).
-        // Markers > 0 use rate[m-1] (transition from m-1 to m).
+
         let recomb_rate = if marker_in_window == 0 {
             0.0
         } else {
             block.local_recomb_rates[marker_in_window - 1]
         };
 
-        // Compute emission probabilities for all patterns
-        // Use ws.emissions as temp buffer
-        let emissions = &mut ws.emissions;
-        
-        let n_alleles = block.n_alleles(marker_in_window);
-        
-        for pattern_idx in 0..n_patterns {
-            let pattern_id = PatternId::new(pattern_idx as u32);
-            emissions[pattern_idx] = emission_prob(
-                block,
-                pattern_id,
-                marker_in_window,
-                target_allele,
-                error_rate,
-                n_alleles,
-            );
-        }
+        // Compute emission probabilities
+        let reservoir_emission = compute_emissions(
+            &mut ws.emissions,
+            block,
+            marker_in_window,
+            global_m,
+            target_allele,
+            error_rate,
+            p_no_err_pl,
+            pl_provider,
+            &mut ws.allele_probs,
+        );
 
         // REUSE: Use new weighted kernel
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
@@ -69,21 +162,12 @@ pub fn forward_within_block(
             recomb_rate,
             block.n_ref_haps(),
             &block.pattern_counts,
-            emissions,
+            &ws.emissions,
             n_patterns,
         );
 
         // Handle reservoir separately (not part of SIMD kernel)
         if block.reservoir_count > 0 {
-            let reservoir_emission = emission_prob(
-                block,
-                PatternId::RESERVOIR,
-                marker_in_window,
-                target_allele,
-                error_rate,
-                n_alleles,
-            );
-
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
             let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
@@ -98,15 +182,14 @@ pub fn forward_within_block(
 }
 
 /// Run forward pass up to a specific marker within a block
-///
-/// Used for extracting state at arbitrary positions (e.g. for priors handoff).
-/// Returns state after observing `stop_marker_in_window`.
 pub fn forward_to_marker_in_block(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
     stop_marker_in_window: usize,
+    pl_provider: Option<&PlProvider>,
+    start_marker: usize,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
@@ -114,7 +197,10 @@ pub fn forward_to_marker_in_block(
     assert!(stop_marker_in_window < window_size);
     assert_eq!(target_genotypes.len(), window_size);
 
+    let p_no_err_pl = 1.0 - error_rate;
+
     for marker_in_window in 0..=stop_marker_in_window {
+        let global_m = start_marker + marker_in_window;
         let target_allele = target_genotypes[marker_in_window];
         let recomb_rate = if marker_in_window == 0 {
             0.0
@@ -122,21 +208,17 @@ pub fn forward_to_marker_in_block(
             block.local_recomb_rates[marker_in_window - 1]
         };
 
-        let emissions = &mut ws.emissions;
-        
-        let n_alleles = block.n_alleles(marker_in_window);
-        
-        for pattern_idx in 0..n_patterns {
-            let pattern_id = PatternId::new(pattern_idx as u32);
-            emissions[pattern_idx] = emission_prob(
-                block,
-                pattern_id,
-                marker_in_window,
-                target_allele,
-                error_rate,
-                n_alleles,
-            );
-        }
+        let reservoir_emission = compute_emissions(
+            &mut ws.emissions,
+            block,
+            marker_in_window,
+            global_m,
+            target_allele,
+            error_rate,
+            p_no_err_pl,
+            pl_provider,
+            &mut ws.allele_probs,
+        );
 
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
 
@@ -146,20 +228,11 @@ pub fn forward_to_marker_in_block(
             recomb_rate,
             block.n_ref_haps(),
             &block.pattern_counts,
-            emissions,
+            &ws.emissions,
             n_patterns,
         );
 
         if block.reservoir_count > 0 {
-            let reservoir_emission = emission_prob(
-                block,
-                PatternId::RESERVOIR,
-                marker_in_window,
-                target_allele,
-                error_rate,
-                n_alleles,
-            );
-
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
             let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
@@ -173,50 +246,43 @@ pub fn forward_to_marker_in_block(
 }
 
 /// Backward pass within block AND emit posteriors
-///
-/// Combines forward probabilities (from checkpoint) with backward probabilities
-/// to compute posterior probabilities for each allele.
-///
-/// # Arguments
-/// * `output` - Mutable slice to write posteriors into (must be same length as window_size)
 pub fn backward_and_emit_block(
     block: &CompressedBlock,
     target_genotypes: &[u8],
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
     output: &mut [AllelePosteriors],
+    pl_provider: Option<&PlProvider>,
+    start_marker: usize,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
     
     assert_eq!(output.len(), window_size, "Output slice size mismatch");
     
-    // We compute posteriors in reverse order (because backward pass is reverse).
-    // The `output` slice corresponds to markers [start..end]. 
-    // We will write into `output[marker_idx]` directly.
-    // Care needed: backward loop is `(0..window_size).rev()`.
+    let p_no_err_pl = 1.0 - error_rate;
 
     // Re-run Forward and store history into pre-allocated workspace buffer
     for marker_idx in 0..window_size {
+        let global_m = start_marker + marker_idx;
         let target_allele = target_genotypes[marker_idx];
         let recomb_rate = if marker_idx == 0 {
             0.0
         } else {
             block.local_recomb_rates[marker_idx - 1]
         };
-        let n_alleles = block.n_alleles(marker_idx);
         
-        let emissions = &mut ws.emissions;
-        for pattern_idx in 0..n_patterns {
-            emissions[pattern_idx] = emission_prob(
-                block,
-                PatternId::new(pattern_idx as u32),
-                marker_idx,
-                target_allele,
-                error_rate,
-                n_alleles,
-            );
-        }
+        let reservoir_emission = compute_emissions(
+            &mut ws.emissions,
+            block,
+            marker_idx,
+            global_m,
+            target_allele,
+            error_rate,
+            p_no_err_pl,
+            pl_provider,
+            &mut ws.allele_probs,
+        );
         
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
         
@@ -226,19 +292,11 @@ pub fn backward_and_emit_block(
             recomb_rate,
             block.n_ref_haps(),
             &block.pattern_counts,
-            emissions,
+            &ws.emissions,
             n_patterns,
         );
 
         if block.reservoir_count > 0 {
-             let reservoir_emission = emission_prob(
-                block,
-                PatternId::RESERVOIR,
-                marker_idx,
-                target_allele,
-                error_rate,
-                n_alleles,
-            );
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
             let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
@@ -248,7 +306,6 @@ pub fn backward_and_emit_block(
         ws.normalize_forward(n_patterns);
         
         // Save state to flattened history
-        // Access fields directly to avoid borrowing `self` entirely
         let stride = ws.max_states + 1;
         let start = marker_idx * stride;
         let history = &mut ws.fwd_history[start..start + stride];
@@ -259,6 +316,7 @@ pub fn backward_and_emit_block(
     
     // Now Backward (reverse)
     for marker_idx in (0..window_size).rev() {
+        let global_m = start_marker + marker_idx;
         let target_allele = target_genotypes[marker_idx];
         let recomb_rate = if marker_idx == 0 {
             0.0
@@ -314,62 +372,27 @@ pub fn backward_and_emit_block(
             output[marker_idx] = AllelePosteriors::Multiallelic(allele_probs);
         }
         
-        // Update bwd to t-1
-        let emissions = &mut ws.emissions;
-        for pattern_idx in 0..n_patterns {
-            emissions[pattern_idx] = emission_prob(
-                block,
-                PatternId::new(pattern_idx as u32),
-                marker_idx,
-                target_allele,
-                error_rate,
-                n_alleles,
-            );
-        }
-        
-        // beta = beta * emit
-        for i in 0..n_patterns {
-            ws.bwd[i] *= emissions[i];
-        }
-        
-        let reservoir_emission = emission_prob(
+        // Compute emissions for backward update
+        let reservoir_emission = compute_emissions(
+            &mut ws.emissions,
             block,
-            PatternId::RESERVOIR,
             marker_idx,
+            global_m,
             target_allele,
             error_rate,
-            n_alleles,
+            p_no_err_pl,
+            pl_provider,
+            &mut ws.allele_probs,
         );
+
+        // beta = beta * emit
+        for i in 0..n_patterns {
+            ws.bwd[i] *= ws.emissions[i];
+        }
         ws.reservoir_prob_bwd *= reservoir_emission;
         
         // --- Step-Back with Constant Term (Fix 5) ---
-        // beta_{t}(i) = (1-r) * beta_{t+1}(i) * E_{t+1}(i) + r * C
-        // where C = sum_j (beta_{t+1}(j) * E_{t+1}(j))
-        // Note: our ws.bwd already contains beta_{t+1}(i) * E_{t+1}(i) due to previous multiplication steps!
-        // So we just sum it up.
-        
-        // Calculate weighted sum for constant term
-
-        
-        // The constant term C is effectively bwd_sum here.
-        // We use WeightedHmmUpdater (via bwd_update_constant logic)
-        // HmmUpdater::bwd_update_constant expects `emissions` argument but here we pre-multiplied.
-        // Wait, bwd_update_constant takes `emissions` and `bwd`. It computes `(1-r) * emit * bwd + r * C`.
-        // If we pre-multiplied, we should use a simpler update: `(1-r) * bwd_precalc + r * C`.
-        // BUT WeightedHmmUpdater logic assumes we are passing probabilities to match SIMD layout?
-        // Let's use `HmmUpdater::bwd_update_constant`. But we need to UN-multiply or just not multiply yet?
-        // `HmmUpdater` is in `model::hmm`. We are in `model::block_hash::hmm`.
-        // We generally use `WeightedHmmUpdater` here which handles weights.
-        // But for backward we don't need weights in the standard Li-Stephens recursion, unless we use compressed states?
-        // The compressed states require weighting by counts?
-        // Li-Stephens: P(x_t | x_{t-1}) involves count weighting.
-        // Backward: sum over x_t. beta_{t-1}(i) = sum_j P(x_t=j | x_{t-1}=i) P(emit) beta_t(j).
-        // Transition P(j|i) = (1-r) delta(i,j) + r * (count(j) / N).
-        // So beta_{t-1}(i) = (1-r) emit(i) beta_t(i) + r * sum_j (count(j)/N) emit(j) beta_t(j).
-        // Let C = sum_j (count(j)/N) * emit(j) * beta_t(j).
-        // Then beta_{t-1}(i) = (1-r) emit(i) beta_t(i) + r * C.
-        
-        // So we need to calculate C using pattern_counts.
+        // Calculate weighted sum for constant term C
         {
             let n_ref = block.n_ref_haps() as f32;
             let mut weighted_sum = 0.0f32;
@@ -414,25 +437,15 @@ fn emission_prob(
     }
 
     // Split error model: epsilon / (K - 1)
-    // If K=1 (monomorphic), mismatch is impossible (or probability 0).
-    // We clamp divisor to 1.0 to avoid NaN, but logically K=1 should match always or error if observed is different.
     let mismatch_prob = if n_alleles > 1 {
         error_rate / (n_alleles - 1) as f32
     } else {
-        error_rate // Fallback, though K=1 implies no variation
+        error_rate
     };
 
     let match_prob = 1.0 - error_rate;
 
     if pattern_id.is_reservoir() {
-        // Reservoir uses allele frequency
-        // P(obs | Res) = sum_k [ P(obs | k) * P(k | Res) ]
-        //              = P(match) * freq[obs] + mismatch_prob * (1 - freq[obs])
-        // BUT we must account for missingness in the reservoir itself.
-        // P(k | Res) is not uniform if some haps are missing.
-        // Formula:
-        // P(obs | Res) = P_{obs} * [ P(match) * freq_{obs} + P(mismatch) * (1 - freq_{obs}) ] + P_{miss} * 1.0
-        
         let obs_fraction = block.get_reservoir_obs_fraction(marker_in_window);
         
         if obs_fraction > 0.0 {
@@ -520,7 +533,7 @@ mod tests {
         let mismatch_prob = error;
         
         // Run forward pass
-        forward_within_block(&block, &target_genotypes, error, &mut ws);
+        forward_within_block(&block, &target_genotypes, error, &mut ws, None, 0);
         
         // Expected probs (ignoring normalization for a moment, or rather checking ratios)
         // P0 (0 mismatches): Init * match * match

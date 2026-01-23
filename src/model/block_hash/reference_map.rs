@@ -12,6 +12,7 @@ use super::workspace::BlockHmmWorkspace;
 use crate::data::storage::matrix::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::model::pl_emission::PlProvider;
 use std::sync::Arc;
 
 /// Pre-computed reference map for block-hash HMM
@@ -154,6 +155,7 @@ impl ReferenceMap {
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
         marker_idx: usize,
+        pl_provider: Option<&PlProvider>,
     ) {
         // Find block containing marker_idx
         let block_idx = self.blocks.partition_point(|b| b.end_marker <= marker_idx);
@@ -176,7 +178,9 @@ impl ReferenceMap {
                 block_genotypes,
                 error_rate,
                 ws,
-                local_marker
+                local_marker,
+                pl_provider,
+                block.start_marker,
             );
         }
     }
@@ -189,6 +193,7 @@ impl ReferenceMap {
         target_genotypes: &[u8],
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
+        pl_provider: Option<&PlProvider>,
     ) {
         for (block_idx, block) in self.blocks.iter().enumerate() {
             // Save checkpoint at start of this block
@@ -199,7 +204,14 @@ impl ReferenceMap {
                 &target_genotypes[block.start_marker..block.end_marker.min(target_genotypes.len())];
 
             // Run forward within block
-            super::hmm::forward_within_block(block, block_genotypes, error_rate, ws);
+            super::hmm::forward_within_block(
+                block,
+                block_genotypes,
+                error_rate,
+                ws,
+                pl_provider,
+                block.start_marker,
+            );
 
             // Apply transition to next block
             if block_idx < self.bridges.len() {
@@ -216,6 +228,7 @@ impl ReferenceMap {
         target_genotypes: &[u8],
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
+        pl_provider: Option<&PlProvider>,
     ) -> Vec<AllelePosteriors> {
         // Pre-allocate posteriors with default values to enable direct slicing
         let mut posteriors = vec![AllelePosteriors::Biallelic(0.0); target_genotypes.len()];
@@ -258,6 +271,8 @@ impl ReferenceMap {
                 error_rate,
                 ws,
                 output_slice,
+                pl_provider,
+                block.start_marker,
             );
 
             // Apply inverse transition to previous block

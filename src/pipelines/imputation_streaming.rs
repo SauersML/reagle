@@ -890,10 +890,16 @@ target_samples={} target_bytes={}",
                         }
                         
                                                                         // Run HMM
+                                                                        let sample_idx = hap_idx.as_usize() / 2;
+                                                                        let pl_provider = crate::model::pl_emission::PlProvider {
+                                                                            gt: target_win.as_unphased_ref(),
+                                                                            sample: sample_idx,
+                                                                            subset_to_orig: None,
+                                                                        };
                         
-                                                                        ref_map.forward_pass(&input, self.params.p_mismatch, ws);
+                                                                        ref_map.forward_pass(&input, self.params.p_mismatch, ws, Some(&pl_provider));
                         
-                                                                        let posteriors = ref_map.backward_and_emit_posteriors(&input, self.params.p_mismatch, ws);
+                                                                        let posteriors = ref_map.backward_and_emit_posteriors(&input, self.params.p_mismatch, ws, Some(&pl_provider));
                         
                                                                         
                         
@@ -917,7 +923,7 @@ target_samples={} target_bytes={}",
                         
                                                                         // Run forward pass up to prior_marker_idx
                         
-                                                                        ref_map.forward_to_marker(&input, self.params.p_mismatch, ws, prior_marker_idx);
+                                                                        ref_map.forward_to_marker(&input, self.params.p_mismatch, ws, prior_marker_idx, Some(&pl_provider));
                         
                                                                         
                         
