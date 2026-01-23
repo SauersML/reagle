@@ -50,10 +50,13 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum mismatch probability to prevent Perfect LD Trap
+    pub const MIN_MISMATCH_PROB: f32 = 0.0001;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
-            p_mismatch: 0.0001,
+            p_mismatch: Self::MIN_MISMATCH_PROB,
             recomb_intensity: 1.0,
             n_states: Self::DEFAULT_PHASE_STATES,
             burnin: Self::DEFAULT_BURNIN,
@@ -130,11 +133,12 @@ impl ModelParams {
     /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
         if n_haps <= 1 {
-            return 0.0001;
+            return Self::MIN_MISMATCH_PROB;
         }
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
-        (theta / (2.0 * (theta + n))) as f32
+        let p = (theta / (2.0 * (theta + n))) as f32;
+        p.max(Self::MIN_MISMATCH_PROB)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -177,7 +181,7 @@ impl ModelParams {
     /// Only update if new value is valid and greater than current
     pub fn update_p_mismatch(&mut self, new_p: f32) {
         if new_p.is_finite() && new_p > self.p_mismatch && new_p < 0.5 {
-            self.p_mismatch = new_p;
+            self.p_mismatch = new_p.max(Self::MIN_MISMATCH_PROB);
         }
     }
 
@@ -280,9 +284,9 @@ impl ParamEstimates {
     pub fn p_mismatch(&self) -> f32 {
         let total = self.sum_match_probs + self.sum_mismatch_probs;
         if total <= 0.0 {
-            return 0.0001;
+            return ModelParams::MIN_MISMATCH_PROB;
         }
-        (self.sum_mismatch_probs / total) as f32
+        ((self.sum_mismatch_probs / total) as f32).max(ModelParams::MIN_MISMATCH_PROB)
     }
 
     /// Number of switch observations
@@ -341,12 +345,22 @@ mod tests {
         assert!(p > 0.0 && p < 0.01);
 
         // More haplotypes -> lower mismatch probability
+        // BUT clamped to MIN_MISMATCH_PROB
         let p2 = ModelParams::li_stephens_p_mismatch(10000);
-        assert!(p2 < p);
+        // If 10000 haps yields < 1e-4 without clamping, this assertion checks logic.
+        // Actually for 10000, p ~ 5e-6, so it SHOULD be clamped.
+        assert_eq!(p2, ModelParams::MIN_MISMATCH_PROB);
 
         // Edge case
         let p0 = ModelParams::li_stephens_p_mismatch(0);
-        assert_eq!(p0, 0.0001);
+        assert_eq!(p0, ModelParams::MIN_MISMATCH_PROB);
+    }
+
+    #[test]
+    fn test_li_stephens_p_mismatch_clamping() {
+        // Very large number of haplotypes should clamp
+        let p = ModelParams::li_stephens_p_mismatch(1_000_000);
+        assert_eq!(p, ModelParams::MIN_MISMATCH_PROB);
     }
 
     #[test]
