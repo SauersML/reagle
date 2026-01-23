@@ -160,7 +160,7 @@ impl HmmUpdater {
         constant_term: f32, // C
         n_states: usize,
     ) {
-        let r_const = p_switch * constant_term; // r * C
+        let r_const = p_switch * constant_term / n_states as f32; // r * C / N
         let scale = 1.0 - p_switch; // 1 - r
 
         let scale_vec = f32x8::splat(scale);
