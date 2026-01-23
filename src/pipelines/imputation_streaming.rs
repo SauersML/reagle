@@ -1296,10 +1296,16 @@ target_samples={} target_bytes={}",
 
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
+        let samples = target_win.samples_arc();
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
+                let dosage = result.dosages.get(local_m).copied().unwrap_or(0.0);
+                if samples.is_diploid(crate::data::SampleIdx::new(sample_idx as u32)) {
+                    dosage
+                } else {
+                    dosage * 0.5
+                }
             } else {
                 0.0
             }
