@@ -1294,9 +1294,51 @@ target_samples={} target_bytes={}",
             None
         };
 
+        // Helper to retrieve and map input genotype for genotyped markers
+        let get_input_genotype = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
+            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                let h1 = HapIdx::new((sample_idx * 2) as u32);
+                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                let map_allele = |raw: u8| -> u8 {
+                    if raw == 255 { return 255; }
+                    if let Some(mapping) = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref()) {
+                        if (raw as usize) < mapping.targ_to_ref.len() {
+                             let r = mapping.targ_to_ref[raw as usize];
+                             if r >= 0 { r as u8 } else { 255 }
+                        } else { 255 }
+                    } else { raw }
+                };
+
+                let mut a1 = map_allele(raw_a1);
+                let mut a2 = map_allele(raw_a2);
+
+                // Fallback heuristic: If mapping failed (255) but input was valid ALT (>0),
+                // and ref is biallelic, force map to Ref ALT (1).
+                // This handles minor allele mismatches (e.g. T/G vs T/C) or representation diffs.
+                let ref_marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
+                if ref_marker.is_biallelic() {
+                    if a1 == 255 && raw_a1 > 0 && raw_a1 != 255 { a1 = 1; }
+                    if a2 == 255 && raw_a2 > 0 && raw_a2 != 255 { a2 = 1; }
+                }
+
+                if a1 < 2 && a2 < 2 {
+                    return Some((a1, a2));
+                }
+            }
+            None
+        };
+
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            // For genotyped markers, use input alleles to ensure consistency (DS matches GT)
+            if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                return (a1 + a2) as f32;
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
@@ -1307,6 +1349,11 @@ target_samples={} target_bytes={}",
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            // For genotyped markers, use input alleles
+            if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                return (a1, a2);
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
@@ -1316,6 +1363,11 @@ target_samples={} target_bytes={}",
         };
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
+            // For genotyped markers, return exact probabilities (1.0 or 0.0)
+            if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
+                return (a1 as f32, a2 as f32);
+            }
+
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
