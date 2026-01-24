@@ -50,6 +50,9 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum recombination probability to prevent Perfect LD traps
+    pub const MIN_RECOMB_PROB: f32 = 1e-12;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -169,7 +172,8 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        (-f64::exp_m1(c * gen_dist_cm)) as f32
+        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        p.max(Self::MIN_RECOMB_PROB)
     }
 
     /// Update mismatch probability (for EM estimation)
