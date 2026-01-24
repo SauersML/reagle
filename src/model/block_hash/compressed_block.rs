@@ -24,9 +24,12 @@ pub struct CompressedBlock {
     /// Required for correct transition weight calculations
     pub pattern_counts: Vec<f32>,
 
-    /// Reverse mapping: for each pattern, which global haplotypes have it
-    /// Required for MCMC sampling in phasing pipeline
-    pub pattern_to_globals: Vec<Vec<GlobalId>>,
+    /// Flattened reverse mapping: concatenated global haplotype IDs for all patterns
+    pub pattern_globals: Vec<GlobalId>,
+
+    /// Offsets into pattern_globals per pattern (len = n_patterns + 1)
+    /// Globals for pattern i are pattern_globals[offsets[i]..offsets[i+1]]
+    pub pattern_globals_offsets: Vec<usize>,
 
     /// Number of haplotypes in the reservoir (truncated patterns)
     pub reservoir_count: u32,
@@ -85,6 +88,14 @@ impl CompressedBlock {
     #[inline]
     pub fn pattern_for_haplotype(&self, global_id: GlobalId) -> PatternId {
         self.hap_to_state[global_id.as_usize()]
+    }
+
+    /// Get global haplotypes for a pattern
+    #[inline]
+    pub fn pattern_globals(&self, pattern_idx: usize) -> &[GlobalId] {
+        let start = self.pattern_globals_offsets[pattern_idx];
+        let end = self.pattern_globals_offsets[pattern_idx + 1];
+        &self.pattern_globals[start..end]
     }
 
     /// Get frequency of a specific allele in the reservoir

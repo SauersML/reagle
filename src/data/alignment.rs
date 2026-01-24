@@ -98,6 +98,76 @@ impl MarkerAlignment {
         }
     }
 
+    /// Create alignment against reference markers without reference genotypes.
+    pub fn new_with_ref_markers<S: PhaseState>(
+        target_gt: &GenotypeMatrix<S>,
+        ref_markers: &crate::data::marker::Markers,
+    ) -> Self {
+        use crate::data::marker::compute_allele_mapping;
+
+        let n_ref_markers = ref_markers.len();
+        let n_target_markers = target_gt.n_markers();
+
+        let mut target_pos_map: HashMap<(String, u32), usize> = HashMap::new();
+        for m in 0..n_target_markers {
+            let marker = target_gt.marker(MarkerIdx::new(m as u32));
+            let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
+            let chrom_norm = normalize_chrom(chrom_name).to_string();
+            target_pos_map.insert((chrom_norm, marker.pos), m);
+        }
+
+        let mut ref_to_target = vec![-1i32; n_ref_markers];
+        let mut target_to_ref = vec![0usize; n_target_markers];
+        let mut allele_mappings: Vec<Option<AlleleMapping>> = vec![None; n_target_markers];
+
+        let mut n_strand_flipped = 0usize;
+        let mut n_allele_swapped = 0usize;
+
+        for m in 0..n_ref_markers {
+            let ref_marker = ref_markers.marker(MarkerIdx::new(m as u32));
+            let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
+            let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
+            if let Some(&target_idx) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
+                let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
+
+                if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
+                    if mapping.is_valid() {
+                        ref_to_target[m] = target_idx as i32;
+                        target_to_ref[target_idx] = m;
+
+                        if mapping.strand_flipped {
+                            n_strand_flipped += 1;
+                            if crate::data::marker::is_strand_ambiguous(target_marker) {
+                                eprintln!(
+                                    "  Warning: Strand-ambiguous marker at pos {} (A/T or C/G SNV) was strand-flipped",
+                                    target_marker.pos
+                                );
+                            }
+                        }
+                        if mapping.alleles_swapped {
+                            n_allele_swapped += 1;
+                        }
+
+                        allele_mappings[target_idx] = Some(mapping);
+                    }
+                }
+            }
+        }
+
+        if n_strand_flipped > 0 || n_allele_swapped > 0 {
+            eprintln!(
+                "  Allele alignment: {} strand-flipped, {} allele-swapped markers",
+                n_strand_flipped, n_allele_swapped
+            );
+        }
+
+        Self {
+            ref_to_target,
+            target_to_ref,
+            allele_mappings,
+        }
+    }
+
     /// Get target marker index for a reference marker (returns None if not genotyped)
     #[inline]
     pub fn target_marker(&self, ref_marker: usize) -> Option<usize> {

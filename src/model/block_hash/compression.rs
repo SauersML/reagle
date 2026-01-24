@@ -4,15 +4,200 @@
 //! from ranges of markers in a `GenotypeMatrix`.
 
 use crate::data::haplotype::HapIdx;
-use crate::data::marker::MarkerIdx;
+use crate::data::marker::{Marker, MarkerIdx};
 use crate::data::storage::dictionary::DictionaryColumn;
 use crate::data::storage::matrix::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
+use crate::data::storage::GenotypeColumn;
 use super::compressed_block::CompressedBlock;
 use super::types::{GlobalId, PatternId};
 
 use std::ops::Range;
 use std::sync::Arc;
+
+fn flatten_pattern_globals(pattern_to_globals: &[Vec<GlobalId>]) -> (Vec<GlobalId>, Vec<usize>) {
+    let mut offsets = Vec::with_capacity(pattern_to_globals.len() + 1);
+    let mut flat = Vec::new();
+    let mut current = 0usize;
+
+    for globals in pattern_to_globals {
+        offsets.push(current);
+        flat.extend(globals.iter().copied());
+        current = flat.len();
+    }
+    offsets.push(current);
+
+    (flat, offsets)
+}
+
+fn build_compressed_block_with_accessor<F>(
+    start_marker: usize,
+    n_markers: usize,
+    n_haplotypes: usize,
+    marker_n_alleles: Vec<u8>,
+    max_states: usize,
+    recomb_rates: &[f32],
+    get_allele: F,
+) -> CompressedBlock
+where
+    F: Fn(usize, HapIdx) -> u8,
+{
+    assert_eq!(
+        recomb_rates.len(),
+        n_markers.saturating_sub(1),
+        "Recombination rates must be interval rates (length = n_markers - 1)"
+    );
+    let local_recomb_rates = recomb_rates.to_vec();
+
+    let mut max_allele_overall = 0u8;
+    for &n_alleles in &marker_n_alleles {
+        if n_alleles > 0 {
+            max_allele_overall = max_allele_overall.max((n_alleles - 1) as u8);
+        }
+    }
+
+    let bits_per_allele = if max_allele_overall < 2 {
+        1
+    } else if max_allele_overall < 4 {
+        2
+    } else if max_allele_overall < 16 {
+        4
+    } else {
+        8
+    };
+
+    let dict_column = DictionaryColumn::compress(get_allele, n_markers, n_haplotypes, bits_per_allele);
+    let storage = Arc::new(dict_column);
+
+    let hap_to_pattern = storage.hap_to_pattern();
+    let n_unique_patterns = storage.n_patterns();
+
+    let mut initial_pattern_counts: Vec<f32> = vec![0.0; n_unique_patterns];
+    let mut initial_pattern_to_globals: Vec<Vec<GlobalId>> = vec![Vec::new(); n_unique_patterns];
+
+    for (hap_idx, &pattern_idx) in hap_to_pattern.iter().enumerate() {
+        let global_id = GlobalId::new(hap_idx as u32);
+        initial_pattern_counts[pattern_idx as usize] += 1.0;
+        initial_pattern_to_globals[pattern_idx as usize].push(global_id);
+    }
+
+    let limit = if max_states == 0 { usize::MAX } else { max_states };
+
+    let (
+        pattern_counts,
+        pattern_to_globals,
+        reservoir_count,
+        reservoir_globals,
+        reservoir_allele_freqs,
+        reservoir_freq_offsets,
+        reservoir_obs_fractions,
+        hap_to_state,
+    ) = if n_unique_patterns > limit {
+        let mut pattern_order: Vec<usize> = (0..n_unique_patterns).collect();
+        pattern_order.sort_by(|&a, &b| {
+            initial_pattern_counts[b]
+                .partial_cmp(&initial_pattern_counts[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let kept_indices = &pattern_order[..limit];
+        let kept_patterns_set: std::collections::HashSet<usize> =
+            kept_indices.iter().copied().collect();
+
+        let mut old_to_new = vec![PatternId::RESERVOIR; n_unique_patterns];
+        for (new_idx, &old_idx) in kept_indices.iter().enumerate() {
+            old_to_new[old_idx] = PatternId::new(new_idx as u32);
+        }
+
+        let hap_to_state: Vec<PatternId> = hap_to_pattern
+            .iter()
+            .map(|&old_idx| old_to_new[old_idx as usize])
+            .collect();
+
+        let mut reservoir_globals = Vec::new();
+        for (pattern_idx, globals) in initial_pattern_to_globals.iter().enumerate() {
+            if !kept_patterns_set.contains(&pattern_idx) {
+                reservoir_globals.extend(globals.iter().copied());
+            }
+        }
+
+        let reservoir_count = reservoir_globals.len() as u32;
+
+        let (reservoir_freqs, reservoir_freq_offsets, reservoir_obs_fractions) =
+            if reservoir_count > 0 {
+                compute_reservoir_freqs(&storage, &reservoir_globals, n_markers, &marker_n_alleles)
+            } else {
+                (Vec::new(), vec![0; n_markers], vec![0.0; n_markers])
+            };
+
+        let pattern_counts: Vec<f32> =
+            kept_indices.iter().map(|&i| initial_pattern_counts[i]).collect();
+        let pattern_to_globals: Vec<Vec<GlobalId>> = kept_indices
+            .iter()
+            .map(|&i| initial_pattern_to_globals[i].clone())
+            .collect();
+
+        (
+            pattern_counts,
+            pattern_to_globals,
+            reservoir_count,
+            reservoir_globals,
+            reservoir_freqs,
+            reservoir_freq_offsets,
+            reservoir_obs_fractions,
+            hap_to_state,
+        )
+    } else {
+        let hap_to_state: Vec<PatternId> = hap_to_pattern
+            .iter()
+            .map(|&idx| PatternId::new(idx as u32))
+            .collect();
+
+        (
+            initial_pattern_counts,
+            initial_pattern_to_globals,
+            0,
+            Vec::new(),
+            Vec::new(),
+            vec![0; n_markers],
+            vec![0.0; n_markers],
+            hap_to_state,
+        )
+    };
+
+    let n_kept_patterns = pattern_counts.len();
+    let mut unpacked_alleles = vec![0u8; n_kept_patterns * n_markers];
+
+    for (kept_idx, globals) in pattern_to_globals.iter().enumerate() {
+        if let Some(first_global) = globals.first() {
+            let hap_u32: u32 = first_global.as_u32();
+            let hap = HapIdx::new(hap_u32);
+            for m in 0..n_markers {
+                let allele = storage.get(m, hap);
+                unpacked_alleles[kept_idx * n_markers + m] = allele;
+            }
+        }
+    }
+
+    let (pattern_globals, pattern_globals_offsets) = flatten_pattern_globals(&pattern_to_globals);
+
+    CompressedBlock {
+        start_marker,
+        end_marker: start_marker + n_markers,
+        hap_to_state,
+        pattern_counts,
+        pattern_globals,
+        pattern_globals_offsets,
+        reservoir_count,
+        reservoir_globals,
+        reservoir_freqs: reservoir_allele_freqs,
+        reservoir_freq_offsets,
+        reservoir_obs_fractions,
+        unpacked_alleles,
+        local_recomb_rates,
+        marker_n_alleles,
+    }
+}
 
 /// Build a CompressedBlock from a range of markers (Recommended API)
 ///
@@ -38,201 +223,51 @@ pub(crate) fn build_compressed_block(
     let end_marker = marker_range.end;
     let n_markers = marker_range.len();
     let n_haplotypes = ref_data.n_haplotypes();
-
-    // Recombination rates are per-interval: N markers have N-1 intervals between them
-    assert_eq!(
-        recomb_rates.len(),
-        n_markers.saturating_sub(1),
-        "Recombination rates must be interval rates (length = n_markers - 1)"
-    );
-    let local_recomb_rates = recomb_rates.to_vec();
-
-    // Build column access closures for DictionaryColumn::compress
-    let columns: Vec<Box<dyn Fn(HapIdx) -> u8>> = marker_range.clone()
-        .map(|marker_idx| {
-            let marker = MarkerIdx::new(marker_idx as u32);
-
-            // Pre-fetch alleles into a vector
-            let alleles: Vec<u8> = (0..n_haplotypes)
-                .map(|hap_idx| ref_data.allele(marker, HapIdx::new(hap_idx as u32)))
-                .collect();
-
-            Box::new(move |hap: HapIdx| alleles[hap.as_usize()]) as Box<dyn Fn(HapIdx) -> u8>
-        })
-        .collect();
-
-    // Determine max allele to set bits_per_allele dynamically
-    // Also compute number of alleles per marker
-    let mut max_allele_overall = 0u8;
     let mut marker_n_alleles = Vec::with_capacity(n_markers);
-    
-    for marker_idx in marker_range {
-         let marker = MarkerIdx::new(marker_idx as u32);
-         let mut alleles_seen = std::collections::HashSet::new();
-         for hap_idx in 0..n_haplotypes {
-             let allele = ref_data.allele(marker, HapIdx::new(hap_idx as u32));
-             if allele != 255 {
-                 alleles_seen.insert(allele);
-             }
-         }
-         let n_distinct = alleles_seen.len().max(1) as u8; // At least 1 to avoid division by zero
-         let max_allele_at_marker = *alleles_seen.iter().max().unwrap_or(&0);
-         max_allele_overall = max_allele_overall.max(max_allele_at_marker);
-         marker_n_alleles.push(n_distinct);
-    }
-    
-    let bits_per_allele = if max_allele_overall < 2 {
-        1
-    } else if max_allele_overall < 4 {
-        2
-    } else if max_allele_overall < 16 {
-        4
-    } else {
-        8
-    };
 
-    // Compress using DictionaryColumn
-    let dict_column = DictionaryColumn::compress(
-        &columns.iter().map(|f| |h| f(h)).collect::<Vec<_>>(),
+    for marker_idx in marker_range.clone() {
+        let marker = ref_data.marker(MarkerIdx::new(marker_idx as u32));
+        let n_alleles = marker.n_alleles().max(1);
+        marker_n_alleles.push(n_alleles.min(u8::MAX as usize) as u8);
+    }
+
+    build_compressed_block_with_accessor(
+        start_marker,
         n_markers,
         n_haplotypes,
-        bits_per_allele,
-    );
-
-    let storage = Arc::new(dict_column);
-
-    // Extract pattern metadata from DictionaryColumn
-    let hap_to_pattern = storage.hap_to_pattern();
-    let n_unique_patterns = storage.n_patterns();
-
-    // Build initial pattern_counts and pattern_to_globals from storage
-    let mut initial_pattern_counts: Vec<f32> = vec![0.0; n_unique_patterns];
-    let mut initial_pattern_to_globals: Vec<Vec<GlobalId>> = vec![Vec::new(); n_unique_patterns];
-
-    for (hap_idx, &pattern_idx) in hap_to_pattern.iter().enumerate() {
-        let global_id = GlobalId::new(hap_idx as u32);
-        initial_pattern_counts[pattern_idx as usize] += 1.0;
-        initial_pattern_to_globals[pattern_idx as usize].push(global_id);
-    }
-
-    // Handle truncation if needed
-    // max_states=0 means no limit (use usize::MAX)
-    let limit = if max_states == 0 { usize::MAX } else { max_states };
-
-    let (pattern_counts, pattern_to_globals, reservoir_count, reservoir_globals, reservoir_allele_freqs, reservoir_freq_offsets, reservoir_obs_fractions, hap_to_state) =
-        if n_unique_patterns > limit {
-            // Truncate to top max_states by count
-            let mut pattern_order: Vec<usize> = (0..n_unique_patterns).collect();
-            pattern_order.sort_by(|&a, &b| {
-                initial_pattern_counts[b]
-                    .partial_cmp(&initial_pattern_counts[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            // Keep top limit
-            let kept_indices = &pattern_order[..limit];
-            let kept_patterns_set: std::collections::HashSet<usize> =
-                kept_indices.iter().copied().collect();
-            
-            // Build old_id -> new_id map
-            let mut old_to_new = vec![PatternId::RESERVOIR; n_unique_patterns];
-            for (new_idx, &old_idx) in kept_indices.iter().enumerate() {
-                old_to_new[old_idx] = PatternId::new(new_idx as u32);
-            }
-
-            // Build hap_to_state
-            let hap_to_state: Vec<PatternId> = hap_to_pattern
-                .iter()
-                .map(|&old_idx| old_to_new[old_idx as usize])
-                .collect();
-
-            // Build reservoir globals
-            let mut reservoir_globals = Vec::new();
-            for (pattern_idx, globals) in initial_pattern_to_globals.iter().enumerate() {
-                if !kept_patterns_set.contains(&pattern_idx) {
-                    reservoir_globals.extend(globals.iter().copied());
-                }
-            }
-
-            let reservoir_count = reservoir_globals.len() as u32;
-
-            // Compute reservoir allele frequencies
-            let (reservoir_freqs, reservoir_freq_offsets, reservoir_obs_fractions) = if reservoir_count > 0 {
-                compute_reservoir_freqs(&storage, &reservoir_globals, n_markers, &marker_n_alleles)
-            } else {
-                // Empty placeholders
-                (Vec::new(), vec![0; n_markers], vec![0.0; n_markers])
-            };
-
-            // Filter/Reorder pattern_counts and pattern_to_globals
-            let pattern_counts: Vec<f32> = kept_indices.iter().map(|&i| initial_pattern_counts[i]).collect();
-            let pattern_to_globals: Vec<Vec<GlobalId>> = kept_indices
-                .iter()
-                .map(|&i| initial_pattern_to_globals[i].clone())
-                .collect();
-
-            (
-                pattern_counts,
-                pattern_to_globals,
-                reservoir_count,
-                reservoir_globals,
-                reservoir_freqs,
-                reservoir_freq_offsets,
-                reservoir_obs_fractions,
-                hap_to_state,
-            )
-        } else {
-            // No truncation needed
-            let hap_to_state: Vec<PatternId> = hap_to_pattern
-                .iter()
-                .map(|&idx| PatternId::new(idx as u32))
-                .collect();
-
-            (
-                initial_pattern_counts,
-                initial_pattern_to_globals,
-                0,
-                Vec::new(),  // reservoir_globals
-                Vec::new(),  // reservoir_freqs
-                vec![0; n_markers],  // reservoir_freq_offsets
-                vec![0.0; n_markers], // reservoir_obs_fractions
-                hap_to_state,
-            )
-        };
-
-    // Pre-unpack alleles for all kept patterns
-    // Flattened: [pattern_idx * n_markers + marker_idx]
-    let n_kept_patterns = pattern_counts.len();
-    // Pre-fill with 255 (missing) or 0? 0 is safer default, but data should overwrite.
-    let mut unpacked_alleles = vec![0u8; n_kept_patterns * n_markers];
-
-    // Note: pattern_to_globals is now indexed by usage rank
-    for (kept_idx, globals) in pattern_to_globals.iter().enumerate() {
-        if let Some(first_global) = globals.first() {
-             let hap_u32: u32 = first_global.as_u32();
-             let hap = HapIdx::new(hap_u32);
-             for m in 0..n_markers {
-                 let allele = storage.get(m, hap);
-                 unpacked_alleles[kept_idx * n_markers + m] = allele;
-             }
-        }
-    }
-
-    CompressedBlock {
-        start_marker,
-        end_marker,
-        hap_to_state, // Replaces storage
-        pattern_counts,
-        pattern_to_globals,
-        reservoir_count,
-        reservoir_globals,
-        reservoir_freqs: reservoir_allele_freqs,
-        reservoir_freq_offsets,
-        reservoir_obs_fractions,
-        unpacked_alleles,
-        local_recomb_rates,
         marker_n_alleles,
-    }
+        max_states,
+        recomb_rates,
+        |m, h| {
+            let marker = MarkerIdx::new((start_marker + m) as u32);
+            ref_data.allele(marker, h)
+        },
+    )
+}
+
+pub(crate) fn build_compressed_block_from_columns(
+    markers: &[Marker],
+    columns: &[GenotypeColumn],
+    start_marker: usize,
+    max_states: usize,
+    recomb_rates: &[f32],
+) -> CompressedBlock {
+    let n_markers = markers.len();
+    let n_haplotypes = columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
+    let marker_n_alleles: Vec<u8> = markers
+        .iter()
+        .map(|m| (1 + m.alt_alleles.len()).min(u8::MAX as usize) as u8)
+        .collect();
+
+    build_compressed_block_with_accessor(
+        start_marker,
+        n_markers,
+        n_haplotypes,
+        marker_n_alleles,
+        max_states,
+        recomb_rates,
+        |m, h| columns[m].get(h),
+    )
 }
 
 /// Compute allele frequencies for reservoir haplotypes (Multiallelic)

@@ -131,6 +131,43 @@ impl ReferenceMap {
         })
     }
 
+    /// Build a ReferenceMap from pre-compressed blocks and boundary rates.
+    ///
+    /// # Arguments
+    /// * `blocks` - Compressed blocks in window order.
+    /// * `boundary_rates` - Recombination rates between consecutive blocks.
+    /// * `window_size` - Block size used for workspace sizing.
+    pub fn build_from_blocks(
+        blocks: Vec<Arc<CompressedBlock>>,
+        boundary_rates: &[f32],
+        window_size: usize,
+    ) -> Arc<Self> {
+        assert_eq!(
+            boundary_rates.len(),
+            blocks.len().saturating_sub(1),
+            "boundary_rates must have len = blocks.len() - 1"
+        );
+
+        let mut bridges = Vec::with_capacity(blocks.len().saturating_sub(1));
+        for i in 0..blocks.len().saturating_sub(1) {
+            let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], boundary_rates[i]);
+            bridges.push(Arc::new(bridge));
+        }
+
+        let max_observed_states = blocks
+            .iter()
+            .map(|b| b.n_patterns())
+            .max()
+            .unwrap_or(0);
+
+        Arc::new(Self {
+            blocks,
+            bridges,
+            window_size,
+            max_observed_states,
+        })
+    }
+
     /// Allocate a workspace for this reference map
     ///
     /// Uses the ACTUAL observed max patterns, not the theoretical config limit.

@@ -19,7 +19,7 @@
 //!
 //! Reference: Java's bref/Bref3Reader.java, bref/AsIsBref3Writer.java
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -37,6 +37,10 @@ use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, SeqCodedBlock, SeqCodedColumn};
+use crate::model::block_hash::{CompressedBlock, ReferenceMap};
+use crate::model::parameters::ModelParams;
+
+pub type TargetMarkerIndex = HashMap<String, HashSet<u32>>;
 
 /// BREF3 magic number (big-endian integer: 2055763188)
 const BREF3_MAGIC: i32 = 2055763188;
@@ -204,15 +208,12 @@ impl Bref3Reader {
         let pos = read_be_i32(&mut self.reader)? as u32;
 
         let n_ids = read_byte(&mut self.reader)? as usize;
-        let id = if n_ids == 0 {
-            None
-        } else {
-            let mut ids = Vec::with_capacity(n_ids);
+        if n_ids > 0 {
             for _ in 0..n_ids {
-                ids.push(read_utf8_string(&mut self.reader)?);
+                let _ = read_utf8_string(&mut self.reader)?;
             }
-            Some(Arc::from(ids.join(";")))
-        };
+        }
+        let id = None;
 
         let allele_code = read_byte(&mut self.reader)? as i8;
         let (ref_allele, alt_alleles, end) = if allele_code == -1 {
@@ -292,6 +293,26 @@ fn parse_alleles(allele_strs: &[String], end: Option<u32>) -> (Allele, Vec<Allel
         .collect();
 
     (ref_allele, alt_alleles, end)
+}
+
+fn normalize_chrom(name: &str) -> &str {
+    if name.len() >= 3 && name[..3].eq_ignore_ascii_case("chr") {
+        &name[3..]
+    } else {
+        name
+    }
+}
+
+fn marker_in_target(
+    chrom_name: &str,
+    pos: u32,
+    target_positions: Option<&TargetMarkerIndex>,
+) -> bool {
+    let Some(map) = target_positions else {
+        return false;
+    };
+    let norm = normalize_chrom(chrom_name);
+    map.get(norm).is_some_and(|set| set.contains(&pos))
 }
 
 /// Read a big-endian i32
@@ -603,104 +624,189 @@ impl StreamingBref3WindowReader {
         &mut self,
         config: &crate::io::streaming::StreamingConfig,
         gen_maps: &GeneticMaps,
+        params: &ModelParams,
+        block_size: usize,
+        max_states: usize,
+        target_positions: Option<&TargetMarkerIndex>,
     ) -> Result<Option<RefWindow>> {
-        if self.eof && self.buffer.is_empty() {
+        if self.eof && self.buffer.is_empty() && self.pending_block.is_none() {
             return Ok(None);
         }
 
-        self.fill_buffer_to_window(config, gen_maps)?;
-        if self.buffer.is_empty() {
-            return Ok(None);
-        }
-
-        let window_start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
-        let target_end_gen = window_start_gen + config.window_cm as f64;
-        let full_window_gen = target_end_gen + config.overlap_cm as f64;
-
-        let window_end = self
-            .buffer
-            .iter()
-            .position(|m| m.gen_pos >= full_window_gen)
-            .unwrap_or(self.buffer.len())
-            .min(config.max_markers);
-
-        let is_last = self.eof && window_end >= self.buffer.len();
-        let output_start = 0;
-        let output_end = if is_last {
-            window_end
-        } else {
-            self.buffer
-                .iter()
-                .take(window_end)
-                .position(|m| m.gen_pos >= target_end_gen)
-                .unwrap_or(window_end)
-        };
-
+        let mut carryover = std::mem::take(&mut self.buffer);
         let mut markers = Markers::new();
-        let mut columns = Vec::with_capacity(window_end);
-        let chrom_name = self.current_chrom.as_deref().unwrap_or("UNKNOWN");
-        let window_chrom_idx = markers.add_chrom(chrom_name);
+        let mut phasing_markers = Markers::new();
+        let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
+        let mut window_gen_pos: Vec<f64> = Vec::new();
+        let mut blocks: Vec<Arc<CompressedBlock>> = Vec::new();
+        let mut block_markers: Vec<Marker> = Vec::with_capacity(block_size);
+        let mut block_columns: Vec<GenotypeColumn> = Vec::with_capacity(block_size);
+        let mut block_gen_pos: Vec<f64> = Vec::with_capacity(block_size);
+        let mut next_overlap: VecDeque<Bref3BufferedMarker> = VecDeque::new();
 
+        let mut window_start_gen: Option<f64> = None;
+        let mut target_end_gen = 0.0;
+        let mut full_window_gen = 0.0;
+        let mut output_end: Option<usize> = None;
+        let mut window_size = 0usize;
+        let mut window_chrom_idx: Option<ChromIdx> = None;
+        let mut phasing_chrom_idx: Option<ChromIdx> = None;
+        let mut end_of_chrom = false;
 
-        for i in 0..window_end {
-            let bm = &self.buffer[i];
-            let mut marker = bm.marker.clone();
-            marker.chrom = window_chrom_idx;
-            markers.push(marker);
-            columns.push(bm.column.clone());
-        }
+        loop {
+            if window_size >= config.max_markers {
+                break;
+            }
 
-        let genotypes = GenotypeMatrix::new_phased(markers, columns, self.inner.samples_arc());
-        let window = RefWindow {
-            genotypes,
-            global_start: self.global_marker_idx,
-            global_end: self.global_marker_idx + window_end,
-            output_start,
-            output_end,
-            is_first: self.window_num == 0,
-            is_last,
-        };
+            let next_marker = if let Some(m) = carryover.pop_front() {
+                Some(m)
+            } else {
+                self.read_next_marker(gen_maps, window_size > 0)?
+            };
 
-        for _ in 0..output_end {
-            self.buffer.pop_front();
-        }
-        self.global_marker_idx += output_end;
-        self.window_num += 1;
+            let Some(marker) = next_marker else {
+                end_of_chrom = true;
+                break;
+            };
 
-        Ok(Some(window))
-    }
+            if window_start_gen.is_none() {
+                window_start_gen = Some(marker.gen_pos);
+                target_end_gen = marker.gen_pos + config.window_cm as f64;
+                full_window_gen = target_end_gen + config.overlap_cm as f64;
+                let chrom_name = self.current_chrom.as_deref().unwrap_or("UNKNOWN");
+                window_chrom_idx = Some(markers.add_chrom(chrom_name));
+            }
 
-    fn fill_buffer_to_window(
-        &mut self,
-        config: &crate::io::streaming::StreamingConfig,
-        gen_maps: &GeneticMaps,
-    ) -> Result<()> {
-        if self.eof {
-            return Ok(());
-        }
+            if marker.gen_pos >= full_window_gen {
+                next_overlap.push_front(marker);
+                break;
+            }
 
-        let target_cm = config.window_cm + config.overlap_cm + config.buffer_cm;
-        let start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
-        let target_gen = start_gen + target_cm as f64;
+            if output_end.is_none() && marker.gen_pos >= target_end_gen {
+                output_end = Some(window_size);
+            }
 
-        while !self.eof {
-            if let Some(last) = self.buffer.back() {
-                if last.gen_pos >= target_gen || self.buffer.len() >= config.max_markers {
-                    break;
+            let mut window_marker = marker.marker.clone();
+            if let Some(idx) = window_chrom_idx {
+                window_marker.chrom = idx;
+            }
+            markers.push(window_marker.clone());
+            window_gen_pos.push(marker.gen_pos);
+
+            if let Some(ref_chrom) = self.current_chrom.as_deref() {
+                if marker_in_target(ref_chrom, marker.marker.pos, target_positions) {
+                    if phasing_chrom_idx.is_none() {
+                        phasing_chrom_idx = Some(phasing_markers.add_chrom(ref_chrom));
+                    }
+                    let mut phasing_marker = window_marker.clone();
+                    if let Some(idx) = phasing_chrom_idx {
+                        phasing_marker.chrom = idx;
+                    }
+                    phasing_markers.push(phasing_marker);
+                    phasing_columns.push(marker.column.clone());
                 }
             }
 
-            if let Some(next_marker) = self.read_next_marker(gen_maps)? {
-                self.buffer.push_back(next_marker);
-            } else {
-                break;
+            if output_end.is_some() {
+                next_overlap.push_back(marker.clone());
+            }
+
+            block_markers.push(window_marker);
+            block_columns.push(marker.column.clone());
+            block_gen_pos.push(marker.gen_pos);
+            window_size += 1;
+
+            if block_markers.len() == block_size {
+                let mut recomb_rates = Vec::with_capacity(block_markers.len().saturating_sub(1));
+                for i in 0..block_gen_pos.len().saturating_sub(1) {
+                    let dist_cm = (block_gen_pos[i + 1] - block_gen_pos[i]).abs();
+                    recomb_rates.push(params.p_recomb(dist_cm));
+                }
+                let start_marker = window_size - block_markers.len();
+                let block = crate::model::block_hash::compression::build_compressed_block_from_columns(
+                    &block_markers,
+                    &block_columns,
+                    start_marker,
+                    max_states,
+                    &recomb_rates,
+                );
+                blocks.push(Arc::new(block));
+                block_markers.clear();
+                block_columns.clear();
+                block_gen_pos.clear();
             }
         }
 
-        Ok(())
+        if block_markers.is_empty() && window_size == 0 {
+            self.buffer = carryover;
+            return Ok(None);
+        }
+
+        if !block_markers.is_empty() {
+            let mut recomb_rates = Vec::with_capacity(block_markers.len().saturating_sub(1));
+            for i in 0..block_gen_pos.len().saturating_sub(1) {
+                let dist_cm = (block_gen_pos[i + 1] - block_gen_pos[i]).abs();
+                recomb_rates.push(params.p_recomb(dist_cm));
+            }
+            let start_marker = window_size - block_markers.len();
+            let block = crate::model::block_hash::compression::build_compressed_block_from_columns(
+                &block_markers,
+                &block_columns,
+                start_marker,
+                max_states,
+                &recomb_rates,
+            );
+            blocks.push(Arc::new(block));
+        }
+
+        let mut boundary_rates = Vec::with_capacity(blocks.len().saturating_sub(1));
+        for i in 0..blocks.len().saturating_sub(1) {
+            let left_idx = blocks[i].end_marker - 1;
+            let right_idx = blocks[i + 1].start_marker;
+            let dist_cm = (window_gen_pos[right_idx] - window_gen_pos[left_idx]).abs();
+            boundary_rates.push(params.p_recomb(dist_cm));
+        }
+
+        let ref_map = ReferenceMap::build_from_blocks(blocks, &boundary_rates, block_size);
+        let output_end = output_end.unwrap_or(window_size);
+        let ref_genotypes = if phasing_columns.is_empty() {
+            None
+        } else {
+            Some(GenotypeMatrix::new_phased(
+                phasing_markers,
+                phasing_columns,
+                self.inner.samples_arc(),
+            ))
+        };
+
+        if carryover.is_empty() {
+            self.buffer = next_overlap;
+        } else {
+            carryover.extend(next_overlap);
+            self.buffer = carryover;
+        }
+        self.global_marker_idx += output_end;
+        let is_first = self.window_num == 0;
+        self.window_num += 1;
+
+        Ok(Some(RefWindow {
+            markers,
+            ref_map,
+            ref_genotypes,
+            global_start: self.global_marker_idx - output_end,
+            global_end: (self.global_marker_idx - output_end) + window_size,
+            output_start: 0,
+            output_end,
+            is_first,
+            is_last: end_of_chrom,
+        }))
     }
 
-    fn read_next_marker(&mut self, gen_maps: &GeneticMaps) -> Result<Option<Bref3BufferedMarker>> {
+    fn read_next_marker(
+        &mut self,
+        gen_maps: &GeneticMaps,
+        has_window_data: bool,
+    ) -> Result<Option<Bref3BufferedMarker>> {
         loop {
             if let Some((block, idx)) = self.current_block.as_mut() {
                 if *idx < block.markers.len() {
@@ -735,7 +841,7 @@ impl StreamingBref3WindowReader {
 
             let block_chrom: Arc<str> = Arc::from(block.chrom.as_str());
             if let Some(cur) = self.current_chrom.as_ref() {
-                if cur.as_ref() != block_chrom.as_ref() && !self.buffer.is_empty() {
+                if cur.as_ref() != block_chrom.as_ref() && has_window_data {
                     self.pending_block = Some(block);
                     return Ok(None);
                 }
@@ -757,8 +863,12 @@ impl StreamingBref3WindowReader {
 #[derive(Clone, Debug)]
 /// A window of reference data accumulated from multiple blocks
 pub struct RefWindow {
-    /// Genotype matrix for this window (phased reference data)
-    pub genotypes: GenotypeMatrix<crate::data::storage::phase_state::Phased>,
+    /// Marker metadata for this window
+    pub markers: Markers,
+    /// Compressed reference map for this window
+    pub ref_map: Arc<ReferenceMap>,
+    /// Optional phased reference genotypes (used for reference-guided phasing)
+    pub ref_genotypes: Option<GenotypeMatrix<crate::data::storage::phase_state::Phased>>,
     /// Global start marker index
     pub global_start: usize,
     /// Global end marker index (exclusive)
@@ -788,11 +898,31 @@ impl RefPanelReader {
         &mut self,
         config: &crate::io::streaming::StreamingConfig,
         gen_maps: &GeneticMaps,
+        params: &ModelParams,
+        block_size: usize,
+        max_states: usize,
+        target_positions: Option<&TargetMarkerIndex>,
     ) -> Result<Option<RefWindow>> {
         match self {
-            RefPanelReader::Bref3(r) => r.next_window(config, gen_maps),
-            RefPanelReader::InMemory(r) => r.next_window(),
-            RefPanelReader::StreamingVcf(r) => r.next_window(config, gen_maps),
+            RefPanelReader::Bref3(r) => r.next_window(
+                config,
+                gen_maps,
+                params,
+                block_size,
+                max_states,
+                target_positions,
+            ),
+            RefPanelReader::InMemory(r) => {
+                r.next_window(gen_maps, params, block_size, max_states, target_positions)
+            }
+            RefPanelReader::StreamingVcf(r) => r.next_window(
+                config,
+                gen_maps,
+                params,
+                block_size,
+                max_states,
+                target_positions,
+            ),
         }
     }
 }
@@ -815,15 +945,67 @@ impl InMemoryRefReader {
         }
     }
 
-    pub fn next_window(&mut self) -> Result<Option<RefWindow>> {
+    pub fn next_window(
+        &mut self,
+        gen_maps: &GeneticMaps,
+        params: &ModelParams,
+        block_size: usize,
+        max_states: usize,
+        target_positions: Option<&TargetMarkerIndex>,
+    ) -> Result<Option<RefWindow>> {
         if self.window_num > 0 {
             return Ok(None);
         }
         let n_markers = self.genotypes.n_markers();
         let genotypes = (*self.genotypes).clone();
+        let mut recomb_rates = Vec::with_capacity(n_markers.saturating_sub(1));
+        for i in 0..n_markers.saturating_sub(1) {
+            let curr = genotypes.marker(MarkerIdx::new(i as u32));
+            let next = genotypes.marker(MarkerIdx::new(i as u32 + 1));
+            let dist_cm =
+                (gen_maps.gen_pos(curr.chrom, next.pos) - gen_maps.gen_pos(curr.chrom, curr.pos))
+                    .abs();
+            recomb_rates.push(params.p_recomb(dist_cm));
+        }
+
+        let ref_map = ReferenceMap::build(&genotypes, block_size, max_states, &recomb_rates);
+        let markers = genotypes.markers().clone();
+        let ref_genotypes = if let Some(target_positions) = target_positions {
+            let mut filtered_markers = Markers::new();
+            let mut filtered_columns = Vec::new();
+            let mut filtered_chrom: Option<ChromIdx> = None;
+            for idx in 0..markers.len() {
+                let marker = markers.marker(MarkerIdx::new(idx as u32));
+                let chrom_name = markers.chrom_name(marker.chrom).unwrap_or("");
+                if marker_in_target(chrom_name, marker.pos, Some(target_positions)) {
+                    if filtered_chrom.is_none() {
+                        filtered_chrom = Some(filtered_markers.add_chrom(chrom_name));
+                    }
+                    let mut filtered_marker = marker.clone();
+                    if let Some(chrom_idx) = filtered_chrom {
+                        filtered_marker.chrom = chrom_idx;
+                    }
+                    filtered_markers.push(filtered_marker);
+                    filtered_columns.push(genotypes.column(MarkerIdx::new(idx as u32)).clone());
+                }
+            }
+            if filtered_columns.is_empty() {
+                None
+            } else {
+                Some(GenotypeMatrix::new_phased(
+                    filtered_markers,
+                    filtered_columns,
+                    genotypes.samples_arc(),
+                ))
+            }
+        } else {
+            Some(genotypes.clone())
+        };
         self.window_num += 1;
         Ok(Some(RefWindow {
-            genotypes,
+            markers,
+            ref_map,
+            ref_genotypes,
             global_start: 0,
             global_end: n_markers,
             output_start: 0,
@@ -974,121 +1156,204 @@ impl StreamingRefVcfReader {
         &mut self,
         config: &crate::io::streaming::StreamingConfig,
         gen_maps: &GeneticMaps,
+        params: &ModelParams,
+        block_size: usize,
+        max_states: usize,
+        target_positions: Option<&TargetMarkerIndex>,
     ) -> Result<Option<RefWindow>> {
-        if self.eof && self.buffer.is_empty() {
+        if self.eof && self.buffer.is_empty() && self.pending_marker.is_none() {
             return Ok(None);
         }
 
-        self.fill_buffer_to_window(config, gen_maps)?;
-        if self.buffer.is_empty() {
-            return Ok(None);
-        }
-
-        let window_start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
-        let target_end_gen = window_start_gen + config.window_cm as f64;
-        let full_window_gen = target_end_gen + config.overlap_cm as f64;
-
-        let window_end = self
-            .buffer
-            .iter()
-            .position(|m| m.gen_pos >= full_window_gen)
-            .unwrap_or(self.buffer.len())
-            .min(config.max_markers);
-
-        let is_last = self.eof && window_end >= self.buffer.len();
-        let output_start = 0;
-        let output_end = if is_last {
-            window_end
-        } else {
-            self.buffer
-                .iter()
-                .take(window_end)
-                .position(|m| m.gen_pos >= target_end_gen)
-                .unwrap_or(window_end)
-        };
-
+        let mut carryover = std::mem::take(&mut self.buffer);
         let mut markers = Markers::new();
-        let mut columns = Vec::with_capacity(window_end);
+        let mut phasing_markers = Markers::new();
+        let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
+        let mut window_gen_pos: Vec<f64> = Vec::new();
+        let mut blocks: Vec<Arc<CompressedBlock>> = Vec::new();
+        let mut block_markers: Vec<Marker> = Vec::with_capacity(block_size);
+        let mut block_columns: Vec<GenotypeColumn> = Vec::with_capacity(block_size);
+        let mut block_gen_pos: Vec<f64> = Vec::with_capacity(block_size);
+        let mut next_overlap: VecDeque<RefPanelMarker> = VecDeque::new();
 
+        let mut window_start_gen: Option<f64> = None;
+        let mut target_end_gen = 0.0;
+        let mut full_window_gen = 0.0;
+        let mut output_end: Option<usize> = None;
+        let mut window_size = 0usize;
+        let mut window_chrom_idx: Option<ChromIdx> = None;
+        let mut phasing_chrom_idx: Option<ChromIdx> = None;
+        let mut end_of_chrom = false;
 
-        for i in 0..window_end {
-            let bm = &self.buffer[i];
-            let chrom_name = self
-                .markers
-                .chrom_name(bm.marker.chrom)
-                .unwrap_or("UNKNOWN");
-            let window_chrom_idx = markers.add_chrom(chrom_name);
-            let mut marker = bm.marker.clone();
-            marker.chrom = window_chrom_idx;
-            markers.push(marker);
-            columns.push(bm.column.clone());
-        }
-
-        let genotypes = GenotypeMatrix::new_phased(markers, columns, Arc::clone(&self.samples));
-        let window = RefWindow {
-            genotypes,
-            global_start: self.global_marker_idx,
-            global_end: self.global_marker_idx + window_end,
-            output_start,
-            output_end,
-            is_first: self.window_num == 0,
-            is_last,
-        };
-
-        for _ in 0..output_end {
-            self.buffer.pop_front();
-        }
-        self.global_marker_idx += output_end;
-        self.window_num += 1;
-
-        Ok(Some(window))
-    }
-
-    fn fill_buffer_to_window(
-        &mut self,
-        config: &crate::io::streaming::StreamingConfig,
-        gen_maps: &GeneticMaps,
-    ) -> Result<()> {
-        if self.eof {
-            return Ok(());
-        }
-
-        let target_cm = config.window_cm + config.overlap_cm + config.buffer_cm;
-        let start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
-        let target_gen = start_gen + target_cm as f64;
-
-        while !self.eof {
-            if let Some(last) = self.buffer.back() {
-                if last.gen_pos >= target_gen || self.buffer.len() >= config.max_markers {
-                    break;
-                }
+        loop {
+            if window_size >= config.max_markers {
+                break;
             }
 
-            let next_marker = if let Some(pending) = self.pending_marker.take() {
-                pending
-            } else if let Some(marker) = self.read_next_marker_with_gen(gen_maps)? {
-                marker
+            let next_marker = if let Some(m) = carryover.pop_front() {
+                Some(m)
+            } else if let Some(pending) = self.pending_marker.take() {
+                Some(pending)
             } else {
+                self.read_next_marker_with_gen(gen_maps)?
+            };
+
+            let Some(marker) = next_marker else {
+                end_of_chrom = true;
                 break;
             };
 
             let marker_chrom = self
                 .markers
-                .chrom_name(next_marker.marker.chrom)
+                .chrom_name(marker.marker.chrom)
                 .unwrap_or("");
             if let Some(cur) = self.current_chrom.as_ref() {
                 if marker_chrom != cur.as_ref() {
-                    self.pending_marker = Some(next_marker);
-                    break;
+                    if window_size == 0 {
+                        self.current_chrom = Some(Arc::from(marker_chrom));
+                        self.window_num = 0;
+                        self.global_marker_idx = 0;
+                    } else {
+                        self.pending_marker = Some(marker);
+                        end_of_chrom = true;
+                        break;
+                    }
                 }
             } else {
                 self.current_chrom = Some(Arc::from(marker_chrom));
             }
 
-            self.buffer.push_back(next_marker);
+            if window_start_gen.is_none() {
+                window_start_gen = Some(marker.gen_pos);
+                target_end_gen = marker.gen_pos + config.window_cm as f64;
+                full_window_gen = target_end_gen + config.overlap_cm as f64;
+                let chrom_name = self.current_chrom.as_deref().unwrap_or("UNKNOWN");
+                window_chrom_idx = Some(markers.add_chrom(chrom_name));
+            }
+
+            if marker.gen_pos >= full_window_gen {
+                self.pending_marker = Some(marker);
+                break;
+            }
+
+            if output_end.is_none() && marker.gen_pos >= target_end_gen {
+                output_end = Some(window_size);
+            }
+
+            let mut window_marker = marker.marker.clone();
+            if let Some(idx) = window_chrom_idx {
+                window_marker.chrom = idx;
+            }
+            markers.push(window_marker.clone());
+            window_gen_pos.push(marker.gen_pos);
+
+            if let Some(chrom_name) = self.current_chrom.as_deref() {
+                if marker_in_target(chrom_name, marker.marker.pos, target_positions) {
+                    if phasing_chrom_idx.is_none() {
+                        phasing_chrom_idx = Some(phasing_markers.add_chrom(chrom_name));
+                    }
+                    let mut phasing_marker = window_marker.clone();
+                    if let Some(idx) = phasing_chrom_idx {
+                        phasing_marker.chrom = idx;
+                    }
+                    phasing_markers.push(phasing_marker);
+                    phasing_columns.push(marker.column.clone());
+                }
+            }
+
+            if output_end.is_some() {
+                next_overlap.push_back(marker.clone());
+            }
+
+            block_markers.push(window_marker);
+            block_columns.push(marker.column.clone());
+            block_gen_pos.push(marker.gen_pos);
+            window_size += 1;
+
+            if block_markers.len() == block_size {
+                let mut recomb_rates = Vec::with_capacity(block_markers.len().saturating_sub(1));
+                for i in 0..block_gen_pos.len().saturating_sub(1) {
+                    let dist_cm = (block_gen_pos[i + 1] - block_gen_pos[i]).abs();
+                    recomb_rates.push(params.p_recomb(dist_cm));
+                }
+                let start_marker = window_size - block_markers.len();
+                let block = crate::model::block_hash::compression::build_compressed_block_from_columns(
+                    &block_markers,
+                    &block_columns,
+                    start_marker,
+                    max_states,
+                    &recomb_rates,
+                );
+                blocks.push(Arc::new(block));
+                block_markers.clear();
+                block_columns.clear();
+                block_gen_pos.clear();
+            }
         }
 
-        Ok(())
+        if block_markers.is_empty() && window_size == 0 {
+            self.buffer = carryover;
+            return Ok(None);
+        }
+
+        if !block_markers.is_empty() {
+            let mut recomb_rates = Vec::with_capacity(block_markers.len().saturating_sub(1));
+            for i in 0..block_gen_pos.len().saturating_sub(1) {
+                let dist_cm = (block_gen_pos[i + 1] - block_gen_pos[i]).abs();
+                recomb_rates.push(params.p_recomb(dist_cm));
+            }
+            let start_marker = window_size - block_markers.len();
+            let block = crate::model::block_hash::compression::build_compressed_block_from_columns(
+                &block_markers,
+                &block_columns,
+                start_marker,
+                max_states,
+                &recomb_rates,
+            );
+            blocks.push(Arc::new(block));
+        }
+
+        let mut boundary_rates = Vec::with_capacity(blocks.len().saturating_sub(1));
+        for i in 0..blocks.len().saturating_sub(1) {
+            let left_idx = blocks[i].end_marker - 1;
+            let right_idx = blocks[i + 1].start_marker;
+            let dist_cm = (window_gen_pos[right_idx] - window_gen_pos[left_idx]).abs();
+            boundary_rates.push(params.p_recomb(dist_cm));
+        }
+
+        let ref_map = ReferenceMap::build_from_blocks(blocks, &boundary_rates, block_size);
+        let output_end = output_end.unwrap_or(window_size);
+        let ref_genotypes = if phasing_columns.is_empty() {
+            None
+        } else {
+            Some(GenotypeMatrix::new_phased(
+                phasing_markers,
+                phasing_columns,
+                Arc::clone(&self.samples),
+            ))
+        };
+
+        if carryover.is_empty() {
+            self.buffer = next_overlap;
+        } else {
+            carryover.extend(next_overlap);
+            self.buffer = carryover;
+        }
+        self.global_marker_idx += output_end;
+        let is_first = self.window_num == 0;
+        self.window_num += 1;
+
+        Ok(Some(RefWindow {
+            markers,
+            ref_map,
+            ref_genotypes,
+            global_start: self.global_marker_idx - output_end,
+            global_end: (self.global_marker_idx - output_end) + window_size,
+            output_start: 0,
+            output_end,
+            is_first,
+            is_last: end_of_chrom,
+        }))
     }
 
     fn read_next_marker_with_gen(
@@ -1125,11 +1390,7 @@ impl StreamingRefVcfReader {
         let pos: u32 = fields[1].parse().context("Invalid POS")?;
 
         // Parse ID
-        let id = if fields[2] == "." {
-            None
-        } else {
-            Some(fields[2].into())
-        };
+        let id = None;
 
         // Parse REF
         let ref_allele = Allele::from_str(fields[3]);

@@ -27,12 +27,15 @@ pub struct DictionaryColumn {
 
 impl DictionaryColumn {
     /// Compress a set of marker columns into a dictionary block
-    pub fn compress(
-        columns: &[impl Fn(HapIdx) -> u8],
+    pub fn compress<F>(
+        get_allele: F,
         n_markers: usize,
         n_haplotypes: usize,
         bits_per_allele: u8,
-    ) -> Self {
+    ) -> Self
+    where
+        F: Fn(usize, HapIdx) -> u8,
+    {
         // Build pattern for each haplotype
         // We use (bits_per_allele + 1) bits per marker. The last bit is the missing flag.
         let bits_per_marker = bits_per_allele as usize + 1;
@@ -47,7 +50,7 @@ impl DictionaryColumn {
             let mut pattern = bitvec![u64, Lsb0; 0; pattern_bits];
 
             for m in 0..n_markers {
-                let allele = columns[m](hap);
+                let allele = get_allele(m, hap);
                 let start = m * bits_per_marker;
                 if allele == 255 {
                     // Set the missing bit (the last bit of this marker's segment)
@@ -173,16 +176,8 @@ mod tests {
             vec![0u8, 0, 1, 1], // Marker 2
         ];
 
-        let columns: Vec<Box<dyn Fn(HapIdx) -> u8>> = data
-            .iter()
-            .map(|col| {
-                let col = col.clone();
-                Box::new(move |h: HapIdx| col[h.as_usize()]) as Box<dyn Fn(HapIdx) -> u8>
-            })
-            .collect();
-
         let dict = DictionaryColumn::compress(
-            &columns.iter().map(|f| |h| f(h)).collect::<Vec<_>>(),
+            |m, h| data[m][h.as_usize()],
             3,
             4,
             1,

@@ -14,7 +14,7 @@
 //!
 //! Instead of dynamic neighbor selection, we:
 //! 1. Compress the ENTIRE reference panel into unique patterns per window
-//! 2. Track probability via Global Haplotype IDs (not local pattern indices)
+//! 2. Track probability per pattern (plus reservoir), while retaining global IDs for mapping/bridging
 //! 3. Use TransitionBridge to correctly map probability between windows
 //!
 //! ## Architecture

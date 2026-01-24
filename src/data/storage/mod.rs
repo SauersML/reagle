@@ -181,18 +181,7 @@ where
         return None;
     }
 
-    // Build closures for each marker
-    let columns: Vec<Box<dyn Fn(HapIdx) -> u8>> = (0..n_markers)
-        .map(|m| {
-            let get_allele_ref = &get_allele;
-            Box::new(move |h: HapIdx| get_allele_ref(m, h)) as Box<dyn Fn(HapIdx) -> u8>
-        })
-        .collect();
-
-    // Create wrapper closures that the compress function can use
-    let column_fns: Vec<_> = columns.iter().map(|f| |h: HapIdx| f(h)).collect();
-
-    let dict = DictionaryColumn::compress(&column_fns, n_markers, n_haplotypes, bits_per_allele);
+    let dict = DictionaryColumn::compress(get_allele, n_markers, n_haplotypes, bits_per_allele);
 
     // Only use if compression ratio is favorable (< 0.5 = 2x compression)
     if dict.compression_ratio() < 0.5 {

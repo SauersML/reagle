@@ -955,6 +955,7 @@ impl PhasingPipeline {
         let streaming_config = StreamingConfig {
             window_cm: self.config.window,
             overlap_cm: self.config.overlap,
+            max_markers: self.config.window_markers,
             ..Default::default()
         };
 
@@ -5644,7 +5645,7 @@ mod tests {
             err: None,
             em: false, // Disable EM for unit test to avoid complexity
             window: 40.0,
-            window_markers: 4000000,
+            window_markers: 100000,
             overlap: 2.0,
             seed: 12345,
             nthreads: None,
@@ -5730,7 +5731,7 @@ mod tests {
             err: None,
             em: false,
             window: 40.0,
-            window_markers: 4000000,
+            window_markers: 100000,
             overlap: 2.0,
             seed: 12345,
             nthreads: Some(2),

@@ -252,8 +252,12 @@ impl TransitionBridge {
         for i in 0..n_patterns_a {
             ws.emissions[i] = recomb_term;
         }
-        // Use recomb_term directly instead of redundant init
-        let mut new_reservoir_prob = recomb_term;
+        // Use recomb_term directly instead of redundant init (only if A has reservoir)
+        let mut new_reservoir_prob = if window_a.reservoir_count > 0 {
+            recomb_term
+        } else {
+            0.0
+        };
 
         // Transmission Part: beta[i] += beta[j] * (1-r) * weight
         // Iterate over transposed CSR
@@ -269,13 +273,15 @@ impl TransitionBridge {
             ws.emissions[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight;
         }
         
-        // Reservoir transitions
+        // Reservoir transitions (only if A has reservoir)
         // Reservoir -> Pattern (A->B)
         // beta[res_A] += beta[pat_B] * weight
-        for k in 0..self.reservoir_to_pattern_ids.len() {
-             let pat_b = self.reservoir_to_pattern_ids[k]; // Pattern in B
-             let weight = self.reservoir_to_pattern_weights[k];
-             new_reservoir_prob += ws.bwd[pat_b.as_usize()] * weight;
+        if window_a.reservoir_count > 0 {
+            for k in 0..self.reservoir_to_pattern_ids.len() {
+                let pat_b = self.reservoir_to_pattern_ids[k]; // Pattern in B
+                let weight = self.reservoir_to_pattern_weights[k];
+                new_reservoir_prob += ws.bwd[pat_b.as_usize()] * weight;
+            }
         }
         
         // Pattern -> Reservoir (A->B)
@@ -287,7 +293,9 @@ impl TransitionBridge {
         }
         
         // Reservoir -> Reservoir
-        new_reservoir_prob += ws.reservoir_prob_bwd * self.reservoir_to_reservoir;
+        if window_a.reservoir_count > 0 {
+            new_reservoir_prob += ws.reservoir_prob_bwd * self.reservoir_to_reservoir;
+        }
 
         // Swap buffers: emissions becomes new bwd
         std::mem::swap(&mut ws.bwd, &mut ws.emissions);

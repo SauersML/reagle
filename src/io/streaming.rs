@@ -47,7 +47,7 @@ impl Default for StreamingConfig {
             window_cm: 40.0,
             overlap_cm: 2.0,
             buffer_cm: 1.0,
-            max_markers: 4_000_000,
+            max_markers: 100_000,
         }
     }
 }
@@ -132,10 +132,12 @@ impl HaplotypePriors {
 
         // Normalize to sum to 1.0
         let sum: f32 = ps.iter().sum();
-        if sum > 0.0 {
-            for p in &mut ps {
-                *p /= sum;
-            }
+        assert!(
+            sum > 0.0,
+            "HaplotypePriors: sum of probabilities must be > 0"
+        );
+        for p in &mut ps {
+            *p /= sum;
         }
 
         Self { hap_ids: ids, probs: ps }

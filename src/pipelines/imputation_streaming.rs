@@ -4,6 +4,7 @@
 //! Uses a producer-consumer model with MPSC channel to pipe phased matrices
 //! directly to imputation in-memory.
 
+use std::io::BufRead;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -15,14 +16,15 @@ use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::{Phased, Unphased};
-use crate::data::{HapIdx, MarkerIdx};
+use crate::data::{HapIdx, MarkerIdx, SampleIdx};
 use crate::error::ReagleError;
 use crate::error::Result;
-use crate::io::bref3::RefPanelReader;
+use crate::io::bref3::{RefPanelReader, TargetMarkerIndex};
 use crate::io::streaming::{
     HaplotypePriors, PhasedOverlap, StreamWindow, StreamingConfig, StreamingVcfReader,
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
+use crate::model::block_hash::ReferenceMap;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
@@ -52,25 +54,67 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
     candidates
 }
 
-fn should_stream_ref_vcf(path: &Path, window_markers: usize) -> Option<u64> {
+fn should_stream_ref_vcf(path: &Path) -> Option<u64> {
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if file_size == 0 {
         return None;
     }
+    Some(file_size / 100)
+}
 
-    let estimated_markers = file_size / 100;
-    let threshold = std::cmp::min(window_markers as u64, 500_000);
-    if estimated_markers > threshold {
-        Some(estimated_markers)
+fn normalize_chrom_local(name: &str) -> &str {
+    if name.len() >= 3 && name[..3].eq_ignore_ascii_case("chr") {
+        &name[3..]
     } else {
-        None
+        name
     }
+}
+
+fn collect_target_positions(path: &Path) -> Result<(TargetMarkerIndex, usize)> {
+    let (_reader, mut reader) = crate::io::vcf::VcfReader::open(path)?;
+    let mut positions: TargetMarkerIndex = std::collections::HashMap::new();
+    let mut total = 0usize;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let chrom = match parts.next() {
+            Some(c) => c,
+            None => continue,
+        };
+        let pos_str = match parts.next() {
+            Some(p) => p,
+            None => continue,
+        };
+        let pos: u32 = match pos_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let norm = normalize_chrom_local(chrom);
+        positions
+            .entry(norm.to_string())
+            .or_insert_with(std::collections::HashSet::new)
+            .insert(pos);
+        total += 1;
+    }
+
+    Ok((positions, total))
 }
 
 /// Payload passed from Phasing (Producer) to Imputation (Consumer)
 struct StreamingPayload {
     phased_target: GenotypeMatrix<Phased>,
-    ref_window: GenotypeMatrix<Phased>,
+    ref_markers: crate::data::marker::Markers,
+    ref_map: Arc<ReferenceMap>,
+    ref_genotypes: Option<GenotypeMatrix<Phased>>,
     alignment: MarkerAlignment,
     output_start: usize,
     output_end: usize,
@@ -104,7 +148,7 @@ impl crate::pipelines::ImputationPipeline {
             window_cm: self.config.window,
             overlap_cm: self.config.overlap,
             buffer_cm: 1.0,
-            max_markers: 100_000,
+            max_markers: self.config.window_markers,
         };
 
         // Load genetic maps
@@ -126,6 +170,16 @@ impl crate::pipelines::ImputationPipeline {
         if let Some(bb) = &self.telemetry {
             bb.set_total_samples(n_target_samples as u64);
             bb.set_samples_processed(0);
+        }
+
+        let (target_positions, target_marker_count) = collect_target_positions(&self.config.gt)?;
+        let target_positions = if target_marker_count == 0 {
+            None
+        } else {
+            Some(Arc::new(target_positions))
+        };
+        if let Some(count) = target_positions.as_ref().map(|_| target_marker_count) {
+            eprintln!("Target marker index: {} positions", count);
         }
 
         // Load reference panel
@@ -163,6 +217,9 @@ impl crate::pipelines::ImputationPipeline {
             n_ref_haps, n_target_samples, target_bytes
         );
 
+        let ref_block_size = 64;
+        let ref_max_states = 4096;
+
         // Create output writer
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
@@ -180,6 +237,7 @@ impl crate::pipelines::ImputationPipeline {
         let producer_params = self.params.clone();
         let producer_maps = gen_maps.clone();
         let producer_telemetry = self.telemetry.clone();
+        let producer_target_positions = target_positions.clone();
 
         // Spawn Producer (Phasing)
         let producer_handle = thread::spawn(move || -> Result<()> {
@@ -196,26 +254,20 @@ impl crate::pipelines::ImputationPipeline {
                 streaming_config.clone(),
             )?;
 
-            let use_streaming_vcf =
-                should_stream_ref_vcf(&ref_path_clone, pipeline.config.window_markers);
             let mut ref_reader: RefPanelReader = if is_bref3 {
                 let stream_reader = crate::io::bref3::StreamingBref3Reader::open(&ref_path_clone)?;
                 let windowed = crate::io::bref3::StreamingBref3WindowReader::new(stream_reader);
                 RefPanelReader::Bref3(windowed)
-            } else if let Some(estimated_markers) = use_streaming_vcf {
-                eprintln!(
-                    "Auto-detected large reference (~{} markers), using streaming VCF reader",
-                    estimated_markers
-                );
-                // Streaming VCF for memory-constrained environments
+            } else {
+                if let Some(estimated_markers) = should_stream_ref_vcf(&ref_path_clone) {
+                    eprintln!(
+                        "Using streaming VCF reference reader (~{} markers)",
+                        estimated_markers
+                    );
+                }
                 RefPanelReader::StreamingVcf(crate::io::bref3::StreamingRefVcfReader::open(
                     &ref_path_clone,
                 )?)
-            } else {
-                // In-memory VCF (default, safer for correctness)
-                let (mut vcf_reader, vcf_file) = crate::io::vcf::VcfReader::open(&ref_path_clone)?;
-                let ref_gt = Arc::new(vcf_reader.read_all(vcf_file)?.into_phased());
-                RefPanelReader::InMemory(crate::io::bref3::InMemoryRefReader::new(ref_gt))
             };
 
             let mut window_count = 0;
@@ -228,26 +280,39 @@ impl crate::pipelines::ImputationPipeline {
                 let ref_window = if pipeline.config.profile {
                     let span_guard = info_span!("io_read_ref_window").entered();
                     let _ = &span_guard;
-                    ref_reader.next_window(&streaming_config, &producer_maps)?
+                    ref_reader.next_window(
+                        &streaming_config,
+                        &producer_maps,
+                        &pipeline.params,
+                        ref_block_size,
+                        ref_max_states,
+                        producer_target_positions.as_deref(),
+                    )?
                 } else {
-                    ref_reader.next_window(&streaming_config, &producer_maps)?
+                    ref_reader.next_window(
+                        &streaming_config,
+                        &producer_maps,
+                        &pipeline.params,
+                        ref_block_size,
+                        ref_max_states,
+                        producer_target_positions.as_deref(),
+                    )?
                 };
                 let ref_window = match ref_window {
                     Some(window) => window,
                     None => break,
                 };
                 window_count += 1;
-                let n_ref_markers = ref_window.genotypes.n_markers();
-                let ref_chrom_idx = ref_window.genotypes.marker(MarkerIdx::new(0)).chrom;
+                let n_ref_markers = ref_window.markers.len();
+                let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
                 let ref_chrom = ref_window
-                    .genotypes
-                    .markers()
+                    .markers
                     .chrom_name(ref_chrom_idx)
                     .ok_or_else(|| anyhow::anyhow!("Invalid reference chromosome index"))?;
                 let chrom_candidates = chrom_variants(ref_chrom);
-                let start_pos = ref_window.genotypes.marker(MarkerIdx::new(0)).pos;
+                let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
                 let end_pos = ref_window
-                    .genotypes
+                    .markers
                     .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
                     .pos;
 
@@ -328,21 +393,26 @@ impl crate::pipelines::ImputationPipeline {
                     eprintln!("    (Last reference window)");
                 }
                 let ref_global_start = ref_window.global_start;
-                // ref_global_end used implicitly via ref_window_gt.n_markers()
+                // ref_global_end used implicitly via ref markers length
                 let ref_output_start = ref_window.output_start;
                 let ref_output_end = ref_window.output_end;
                 // Only log ref markers for significant windows
                 if should_log {
                     eprintln!(
                         "    Ref markers: {} (global {}..{})",
-                        ref_window.genotypes.n_markers(),
+                        ref_window.markers.len(),
                         ref_global_start,
                         ref_window.global_end
                     );
                 }
-                let ref_window_gt = ref_window.genotypes;
-
-                let alignment = MarkerAlignment::new(&target_window.genotypes, &ref_window_gt);
+                let alignment = MarkerAlignment::new_with_ref_markers(
+                    &target_window.genotypes,
+                    &ref_window.markers,
+                );
+                let phasing_alignment = ref_window
+                    .ref_genotypes
+                    .as_ref()
+                    .map(|ref_gt| MarkerAlignment::new(&target_window.genotypes, ref_gt));
 
                 if window_count == 1 {
                     let mut counts = [0usize; 5];
@@ -366,8 +436,9 @@ impl crate::pipelines::ImputationPipeline {
                                     .genotypes
                                     .marker(crate::data::MarkerIdx::new(t_idx as u32));
                                 let r_idx = alignment.target_to_ref[t_idx];
-                                let r_marker =
-                                    ref_window_gt.marker(crate::data::MarkerIdx::new(r_idx as u32));
+                                let r_marker = ref_window
+                                    .markers
+                                    .marker(crate::data::MarkerIdx::new(r_idx as u32));
                                 eprintln!(
                                     "[ALIGN-WARN] Partial match at pos {}: Target={:?}/{:?} Ref={:?}/{:?}",
                                     t_marker.pos,
@@ -402,14 +473,35 @@ impl crate::pipelines::ImputationPipeline {
                         None
                     };
                     let _ = &phase_guard;
-                    pipeline.phase_window_streaming(
-                        &target_window.genotypes,
-                        &ref_window_gt,
-                        &alignment,
-                        &producer_maps,
-                        phased_overlap.as_ref(),
-                        pbwt_state.as_ref(),
-                    )?
+                    match ref_window.ref_genotypes.as_ref() {
+                        Some(ref_gt) => {
+                            let phase_alignment =
+                                phasing_alignment.as_ref().unwrap_or(&alignment);
+                            pipeline.phase_window_streaming(
+                                &target_window.genotypes,
+                                Some(ref_gt),
+                                phase_alignment,
+                                &producer_maps,
+                                phased_overlap.as_ref(),
+                                pbwt_state.as_ref(),
+                            )?
+                        }
+                        None => {
+                            if window_count == 1 {
+                                eprintln!(
+                                    "  Warning: Reference-guided phasing disabled (no overlapping ref markers)"
+                                );
+                            }
+                            pipeline.phase_window_streaming(
+                                &target_window.genotypes,
+                                None,
+                                &alignment,
+                                &producer_maps,
+                                phased_overlap.as_ref(),
+                                pbwt_state.as_ref(),
+                            )?
+                        }
+                    }
                 };
                 if let Some(bb) = &pipeline.telemetry {
                     bb.set_samples_processed(target_window.genotypes.n_samples() as u64);
@@ -433,7 +525,9 @@ impl crate::pipelines::ImputationPipeline {
                     let _ = &span_guard;
                     tx.send(StreamingPayload {
                         phased_target: phased,
-                        ref_window: ref_window_gt,
+                        ref_markers: ref_window.markers,
+                        ref_map: ref_window.ref_map,
+                        ref_genotypes: ref_window.ref_genotypes,
                         alignment,
                         output_start: target_window.output_start,
                         output_end: target_window.output_end,
@@ -445,7 +539,9 @@ impl crate::pipelines::ImputationPipeline {
                 } else {
                     tx.send(StreamingPayload {
                         phased_target: phased,
-                        ref_window: ref_window_gt,
+                        ref_markers: ref_window.markers,
+                        ref_map: ref_window.ref_map,
+                        ref_genotypes: ref_window.ref_genotypes,
                         alignment,
                         output_start: target_window.output_start,
                         output_end: target_window.output_end,
@@ -501,7 +597,9 @@ target_samples={} target_bytes={}",
             }
             let StreamingPayload {
                 phased_target,
-                ref_window,
+                ref_markers,
+                ref_map,
+                ref_genotypes,
                 alignment,
                 output_start,
                 output_end,
@@ -514,7 +612,7 @@ target_samples={} target_bytes={}",
 
             if !header_written {
                 writer.write_header_extended(
-                    ref_window.markers(),
+                    &ref_markers,
                     true,
                     self.config.gp,
                     self.config.ap,
@@ -530,16 +628,16 @@ target_samples={} target_bytes={}",
                     window_idx,
                     phased_target.n_markers(),
                     ref_global_start,
-                    ref_global_start + ref_window.n_markers(),
+                    ref_global_start + ref_markers.len(),
                     ref_output_start,
                     ref_output_end
                 );
             }
 
             // Initialize quality for this window
-            let n_alleles_per_marker: Vec<usize> = (0..ref_window.n_markers())
+            let n_alleles_per_marker: Vec<usize> = (0..ref_markers.len())
                 .map(|m| {
-                    let marker = ref_window.marker(MarkerIdx::new(m as u32));
+                    let marker = ref_markers.marker(MarkerIdx::new(m as u32));
                     1 + marker.alt_alleles.len()
                 })
                 .collect();
@@ -550,17 +648,7 @@ target_samples={} target_bytes={}",
                 if target_idx < 0 {
                     window_quality.set_imputed(ref_m, true);
                 } else {
-                    // Check if alignment is partial (some alleles don't map)
-                    let is_partial = alignment.allele_mappings[target_idx as usize]
-                        .as_ref()
-                        .map(|m| m.targ_to_ref.iter().any(|&x| x < 0))
-                        .unwrap_or(false);
-
-                    if is_partial {
-                        window_quality.set_imputed(ref_m, true);
-                    } else {
-                        window_quality.set_imputed(ref_m, false);
-                    }
+                    window_quality.set_imputed(ref_m, false);
                 }
             }
 
@@ -584,7 +672,7 @@ target_samples={} target_bytes={}",
                     info_span!(
                         "imputation_window",
                         window = window_idx,
-                        ref_markers = ref_window.n_markers(),
+                        ref_markers = ref_markers.len(),
                         target_markers = phased_target.n_markers(),
                         output_start = ref_output_start,
                         output_end = ref_output_end,
@@ -602,9 +690,10 @@ target_samples={} target_bytes={}",
                 let _ = &span_guard;
                 self.run_imputation_window_streaming(
                     &phased_target,
-                    &ref_window,
+                    &ref_markers,
+                    &ref_map,
+                    ref_genotypes.as_ref(),
                     &alignment,
-                    &gen_maps,
                     imp_overlap.as_ref(),
                     &mut window_quality,
                     &mut writer,
@@ -615,9 +704,10 @@ target_samples={} target_bytes={}",
             } else {
                 self.run_imputation_window_streaming(
                     &phased_target,
-                    &ref_window,
+                    &ref_markers,
+                    &ref_map,
+                    ref_genotypes.as_ref(),
                     &alignment,
-                    &gen_maps,
                     imp_overlap.as_ref(),
                     &mut window_quality,
                     &mut writer,
@@ -631,7 +721,7 @@ target_samples={} target_bytes={}",
 
             let mut next_overlap = self.extract_imputed_overlap_streaming(
                 &phased_target,
-                &ref_window,
+                &ref_markers,
                 &alignment,
                 ref_output_end,
             );
@@ -663,7 +753,7 @@ target_samples={} target_bytes={}",
     fn phase_window_streaming(
         &self,
         target_gt: &GenotypeMatrix<Unphased>,
-        ref_gt: &GenotypeMatrix<Phased>,
+        ref_gt: Option<&GenotypeMatrix<Phased>>,
         alignment: &MarkerAlignment,
         gen_maps: &GeneticMaps,
         phased_overlap: Option<&PhasedOverlap>,
@@ -671,8 +761,10 @@ target_samples={} target_bytes={}",
     ) -> Result<GenotypeMatrix<Phased>> {
         let mut phasing =
             crate::pipelines::PhasingPipeline::new(self.config.clone(), self.telemetry.clone());
-        let ref_gt_arc = Arc::new(ref_gt.clone());
-        phasing.set_reference(ref_gt_arc, alignment.clone());
+        if let Some(ref_gt) = ref_gt {
+            let ref_gt_arc = Arc::new(ref_gt.clone());
+            phasing.set_reference(ref_gt_arc, alignment.clone());
+        }
         phasing.phase_window_with_pbwt_handoff(target_gt, gen_maps, phased_overlap, pbwt_state)
     }
 
@@ -729,9 +821,10 @@ target_samples={} target_bytes={}",
     fn run_imputation_window_streaming(
         &self,
         target_win: &GenotypeMatrix<Phased>,
-        ref_win: &GenotypeMatrix<Phased>,
+        ref_markers: &crate::data::marker::Markers,
+        ref_map: &Arc<ReferenceMap>,
+        ref_genotypes: Option<&GenotypeMatrix<Phased>>,
         alignment: &MarkerAlignment,
-        gen_maps: &GeneticMaps,
         imp_overlap: Option<&PhasedOverlap>,
         window_quality: &mut ImputationQuality,
         final_writer: &mut VcfWriter,
@@ -739,13 +832,13 @@ target_samples={} target_bytes={}",
         output_start: usize,
         output_end: usize,
     ) -> Result<Option<Vec<HaplotypePriors>>> {
-        use crate::model::block_hash::{ReferenceMap, BlockHmmWorkspace};
+        use crate::model::block_hash::BlockHmmWorkspace;
         
         let window_span = if self.config.profile {
             Some(
                 info_span!(
                     "imputation_window_compute",
-                    ref_markers = ref_win.n_markers(),
+                    ref_markers = ref_markers.len(),
                     target_markers = target_win.n_markers(),
                     output_start,
                     output_end
@@ -763,7 +856,7 @@ target_samples={} target_bytes={}",
                 std::cell::RefCell::new(None);
         }
 
-        let n_ref_markers = ref_win.n_markers();
+        let n_ref_markers = ref_markers.len();
         let n_target_samples = target_win.n_samples();
         
         let markers_to_process = output_start..n_ref_markers;
@@ -778,29 +871,8 @@ target_samples={} target_bytes={}",
             bb.set_samples_processed(0);
         }
 
-        // Calculate recombination rates
-        let chrom_idx = ref_win.marker(MarkerIdx::new(0)).chrom;
-        
-        let mut recomb_rates = Vec::with_capacity(n_ref_markers);
-
-        
-        // 1. Iterate safely over windows(2) for the first N-1 intervals
-        // This ensures semantic consistency for indexes 0..N-2
-        // 1. Iterate safely over windows(2) for the first N-1 intervals
-        // This ensures semantic consistency for indexes 0..N-2
-        let n_markers = ref_win.n_markers();
-        for i in 0..n_markers.saturating_sub(1) {
-            let curr = ref_win.marker(crate::data::MarkerIdx::new(i as u32));
-            let next = ref_win.marker(crate::data::MarkerIdx::new(i as u32 + 1));
-            let dist_cm = (gen_maps.gen_pos(chrom_idx, next.pos) - gen_maps.gen_pos(chrom_idx, curr.pos)).abs();
-            recomb_rates.push(self.params.p_recomb(dist_cm));
-        }
-
-        // Build ReferenceMap for this window
-        let ref_map = ReferenceMap::build(ref_win, 64, 4096, &recomb_rates[..n_ref_markers.saturating_sub(1)]);
-        
         let ref_is_biallelic: Vec<bool> = (0..n_ref_markers)
-            .map(|m| ref_win.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
+            .map(|m| ref_markers.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
             .collect();
 
         // Helper to build input vector for HMM
@@ -963,7 +1035,7 @@ target_samples={} target_bytes={}",
                         
                                                                                     let global_prob = prob / count;
                         
-                                                                                    for &global_id in &block.pattern_to_globals[pat_idx] {
+                                                                                    for &global_id in block.pattern_globals(pat_idx) {
                         
                                                                                         priors_list.push((global_id.as_u32(), global_prob));
                         
@@ -1173,7 +1245,8 @@ target_samples={} target_bytes={}",
             ));
         }
         self.write_imputed_window_streaming(
-            ref_win,
+            ref_markers,
+            ref_genotypes,
             target_win,
             alignment,
             final_writer,
@@ -1199,11 +1272,11 @@ target_samples={} target_bytes={}",
     fn extract_imputed_overlap_streaming(
         &self,
         target_win: &GenotypeMatrix<Phased>,
-        ref_win: &GenotypeMatrix<Phased>,
+        ref_markers: &crate::data::marker::Markers,
         alignment: &MarkerAlignment,
         output_end: usize,
     ) -> PhasedOverlap {
-        let overlap_size = 1000.min(ref_win.n_markers());
+        let overlap_size = 1000.min(ref_markers.len());
         let start = output_end.saturating_sub(overlap_size);
         let end = output_end;
         let n_haps = target_win.n_haplotypes();
@@ -1222,7 +1295,8 @@ target_samples={} target_bytes={}",
     /// Write imputed window results to VCF
     fn write_imputed_window_streaming(
         &self,
-        ref_win: &GenotypeMatrix<Phased>,
+        ref_markers: &crate::data::marker::Markers,
+        ref_genotypes: Option<&GenotypeMatrix<Phased>>,
         target_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
         writer: &mut VcfWriter,
@@ -1266,7 +1340,7 @@ target_samples={} target_bytes={}",
         }
 
         let default_posteriors = |marker_idx: usize| -> (AllelePosteriors, AllelePosteriors) {
-            let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
+            let marker = ref_markers.marker(MarkerIdx::new(marker_idx as u32));
             let n_alleles = 1 + marker.alt_alleles.len();
             if n_alleles == 2 {
                 (
@@ -1282,75 +1356,8 @@ target_samples={} target_bytes={}",
             }
         };
 
-        // Helper to retrieve and map input genotype for non-imputed markers
-        let get_input_genotype = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
-            if let Some(target_m) = alignment.target_marker(marker_idx) {
-                let mapping = alignment
-                    .allele_mappings
-                    .get(target_m)
-                    .and_then(|m| m.as_ref());
-
-                let map_allele = |a: u8| -> u8 {
-                    if a == 255 {
-                        return 255;
-                    }
-                    if let Some(m) = mapping {
-                        if (a as usize) < m.targ_to_ref.len() {
-                            let r = m.targ_to_ref[a as usize];
-                            if r >= 0 {
-                                r as u8
-                            } else {
-                                255
-                            }
-                        } else {
-                            255
-                        }
-                    } else {
-                        a
-                    }
-                };
-
-                let h1 = HapIdx::new((sample_idx * 2) as u32);
-                let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                let a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                let a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-
-                Some((map_allele(a1), map_allele(a2)))
-            } else {
-                None
-            }
-        };
-
         let get_posteriors_for_writer = if include_posteriors {
             Some(|marker_idx: usize, sample_idx: usize| {
-                // Prioritize input genotype if available
-                if let Some(stats) = quality.get(marker_idx) {
-                    if !stats.is_imputed {
-                        if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
-                            let marker = ref_win.marker(MarkerIdx::new(marker_idx as u32));
-                            let n_alleles = 1 + marker.alt_alleles.len();
-
-                            let make_posterior = |allele: u8| -> AllelePosteriors {
-                                if n_alleles == 2 {
-                                    if allele == 1 {
-                                        AllelePosteriors::Biallelic(1.0)
-                                    } else {
-                                        AllelePosteriors::Biallelic(0.0)
-                                    }
-                                } else {
-                                    let mut probs = vec![0.0f32; n_alleles];
-                                    if (allele as usize) < n_alleles {
-                                        probs[allele as usize] = 1.0;
-                                    }
-                                    AllelePosteriors::Multiallelic(probs)
-                                }
-                            };
-
-                            return (make_posterior(a1), make_posterior(a2));
-                        }
-                    }
-                }
-
                 let local_m = marker_idx.saturating_sub(output_start);
                 if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                     if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
@@ -1369,6 +1376,35 @@ target_samples={} target_bytes={}",
             })
         } else {
             None
+        };
+
+        let samples = target_win.samples_arc();
+
+        // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
+        // Dosages array is indexed from 0 for markers starting at output_start
+        let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+            let local_m = marker_idx.saturating_sub(output_start);
+            let dosage = if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                result.dosages.get(local_m).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                dosage
+            } else {
+                dosage * 0.5
+            }
+        };
+
+        // Closure to get best genotype
+        let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            let local_m = marker_idx.saturating_sub(output_start);
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+            } else {
+                (0, 0)
+            }
         };
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
@@ -1397,7 +1433,33 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some((a1, a2)) = get_input_genotype(marker_idx, s) {
+                            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                                let h1 = HapIdx::new((s * 2) as u32);
+                                let h2 = HapIdx::new((s * 2 + 1) as u32);
+                                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                                let mapping = alignment
+                                    .allele_mappings
+                                    .get(target_m)
+                                    .and_then(|m| m.as_ref());
+                                let map_allele = |a: u8| -> u8 {
+                                    if a == 255 {
+                                        return 255;
+                                    }
+                                    if let Some(m) = mapping {
+                                        if (a as usize) < m.targ_to_ref.len() {
+                                            let r = m.targ_to_ref[a as usize];
+                                            if r >= 0 { r as u8 } else { 255 }
+                                        } else {
+                                            255
+                                        }
+                                    } else {
+                                        a
+                                    }
+                                };
+                                let a1 = map_allele(raw_a1);
+                                let a2 = map_allele(raw_a2);
                                 if a1 < 2 && a2 < 2 {
                                     v1 = a1 as f32;
                                     v2 = a2 as f32;
@@ -1417,7 +1479,33 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some((a1, a2)) = get_input_genotype(marker_idx, s) {
+                            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                                let h1 = HapIdx::new((s * 2) as u32);
+                                let h2 = HapIdx::new((s * 2 + 1) as u32);
+                                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
+                                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
+
+                                let mapping = alignment
+                                    .allele_mappings
+                                    .get(target_m)
+                                    .and_then(|m| m.as_ref());
+                                let map_allele = |a: u8| -> u8 {
+                                    if a == 255 {
+                                        return 255;
+                                    }
+                                    if let Some(m) = mapping {
+                                        if (a as usize) < m.targ_to_ref.len() {
+                                            let r = m.targ_to_ref[a as usize];
+                                            if r >= 0 { r as u8 } else { 255 }
+                                        } else {
+                                            255
+                                        }
+                                    } else {
+                                        a
+                                    }
+                                };
+                                let a1 = map_allele(raw_a1);
+                                let a2 = map_allele(raw_a2);
                                 if a1 < 2 && a2 < 2 {
                                     v1 = a1 as f32;
                                     v2 = a2 as f32;
@@ -1430,65 +1518,20 @@ target_samples={} target_bytes={}",
             }
         }
 
-        // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
-        // Dosages array is indexed from 0 for markers starting at output_start
-        let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            // Check if genotyped (not imputed)
-            let use_input = if let Some(stats) = quality.get(marker_idx) {
-                !stats.is_imputed
-            } else {
-                false
-            };
-
-            if use_input {
-                if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
-                    if a1 != 255 && a2 != 255 {
-                        let mut ds = 0.0;
-                        if a1 == 1 {
-                            ds += 1.0;
-                        }
-                        if a2 == 1 {
-                            ds += 1.0;
-                        }
-                        return ds;
-                    }
-                }
-            }
-
-            let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
-            } else {
-                0.0
-            }
-        };
-
-        // Closure to get best genotype
-        let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
-            let use_input = if let Some(stats) = quality.get(marker_idx) {
-                !stats.is_imputed
-            } else {
-                false
-            };
-
-            if use_input {
-                if let Some((a1, a2)) = get_input_genotype(marker_idx, sample_idx) {
-                    if a1 != 255 && a2 != 255 {
-                        return (a1, a2);
-                    }
-                }
-            }
-
-            let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
-            } else {
-                (0, 0)
-            }
+        let marker_matrix;
+        let marker_matrix_ref = if let Some(ref_gt) = ref_genotypes {
+            ref_gt
+        } else {
+            let samples = target_win.samples_arc();
+            let columns: Vec<crate::data::storage::GenotypeColumn> = (0..ref_markers.len())
+                .map(|_| crate::data::storage::GenotypeColumn::default())
+                .collect();
+            marker_matrix = GenotypeMatrix::new_phased(ref_markers.clone(), columns, samples);
+            &marker_matrix
         };
 
         writer.write_imputed_streaming(
-            ref_win,
+            marker_matrix_ref,
             get_dosage,
             get_best_gt,
             get_posteriors_for_writer,
@@ -1510,6 +1553,7 @@ mod tests {
     use crate::data::marker::{Allele, Marker, Markers};
     use crate::data::storage::GenotypeColumn;
     use crate::io::bref3::InMemoryRefReader;
+    use crate::model::parameters::ModelParams;
 
     fn build_markers(chrom: ChromIdx, positions: &[u32]) -> Markers {
         let mut markers = Markers::new();
@@ -1570,8 +1614,9 @@ mod tests {
         let mut ref_reader = RefPanelReader::InMemory(InMemoryRefReader::new(ref_gt.clone()));
         let config = StreamingConfig::default();
         let gen_maps = GeneticMaps::default();
+        let params = ModelParams::new();
         let ref_window = ref_reader
-            .next_window(&config, &gen_maps)
+            .next_window(&config, &gen_maps, &params, 64, 4096, None)
             .expect("ref window load failed")
             .expect("no ref window found");
 
