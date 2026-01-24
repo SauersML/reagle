@@ -1521,7 +1521,22 @@ target_samples={} target_bytes={}",
 
         let marker_matrix;
         let marker_matrix_ref = if let Some(ref_gt) = ref_genotypes {
-            ref_gt
+            if ref_gt.n_markers() == ref_markers.len() {
+                ref_gt
+            } else {
+                warn!(
+                    ref_markers = ref_markers.len(),
+                    ref_genotypes = ref_gt.n_markers(),
+                    "Reference genotypes length mismatch; falling back to marker-only matrix"
+                );
+                let samples = target_win.samples_arc();
+                let columns: Vec<crate::data::storage::GenotypeColumn> =
+                    (0..ref_markers.len())
+                        .map(|_| crate::data::storage::GenotypeColumn::default())
+                        .collect();
+                marker_matrix = GenotypeMatrix::new_phased(ref_markers.clone(), columns, samples);
+                &marker_matrix
+            }
         } else {
             let samples = target_win.samples_arc();
             let columns: Vec<crate::data::storage::GenotypeColumn> = (0..ref_markers.len())
@@ -1549,13 +1564,18 @@ target_samples={} target_bytes={}",
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::data::alignment::MarkerAlignment;
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
     use crate::data::storage::GenotypeColumn;
     use crate::io::bref3::StreamingRefVcfReader;
+    use crate::io::vcf::{ImputationQuality, VcfWriter};
+    use crate::pipelines::ImputationPipeline;
     use std::io::{BufReader, Cursor};
     use crate::model::parameters::ModelParams;
+    use tempfile::NamedTempFile;
 
     fn build_markers(chrom: ChromIdx, positions: &[u32]) -> Markers {
         let mut markers = Markers::new();
@@ -1620,5 +1640,66 @@ mod tests {
         assert_eq!(target_gt.n_markers(), target_positions.len());
         assert_eq!(ref_window.global_start, 0);
         assert_eq!(ref_window.global_end, ref_positions.len());
+    }
+
+    #[test]
+    fn test_write_imputed_window_ignores_short_ref_genotypes() {
+        let chrom = ChromIdx::new(0);
+        let ref_markers = build_markers(chrom, &[10, 20, 30]);
+        let short_ref_markers = build_markers(chrom, &[10]);
+        let target_markers = build_markers(chrom, &[10]);
+
+        let ref_genotypes = build_unphased_matrix(short_ref_markers, 1).into_phased();
+        let target_win = build_unphased_matrix(target_markers, 1).into_phased();
+
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![-1; ref_markers.len()],
+            target_to_ref: vec![0; target_win.n_markers()],
+            allele_mappings: vec![None; target_win.n_markers()],
+        };
+
+        let n_alleles_per_marker: Vec<usize> = (0..ref_markers.len())
+            .map(|m| {
+                let marker = ref_markers.marker(MarkerIdx::new(m as u32));
+                1 + marker.alt_alleles.len()
+            })
+            .collect();
+        let mut quality = ImputationQuality::new(&n_alleles_per_marker);
+
+        let output_start = 0;
+        let output_end = ref_markers.len();
+        let dosages = vec![0.0; output_end - output_start];
+        let best_gt = vec![(0, 0); output_end - output_start];
+        let all_results = vec![SampleImputationResult {
+            sample_idx: 0,
+            dosages,
+            best_gt,
+            hap_alt_probs: None,
+            hap_posteriors: None,
+        }];
+
+        let tmp = NamedTempFile::new().expect("temp vcf");
+        let mut writer =
+            VcfWriter::create(tmp.path(), target_win.samples_arc()).expect("writer");
+
+        let pipeline = ImputationPipeline::new(Config::default(), None);
+        let ref_is_biallelic = vec![true; ref_markers.len()];
+
+        let result = pipeline.write_imputed_window_streaming(
+            &ref_markers,
+            Some(&ref_genotypes),
+            &target_win,
+            &alignment,
+            &mut writer,
+            &mut quality,
+            &ref_is_biallelic,
+            output_start,
+            output_end,
+            output_start,
+            &all_results,
+            false,
+            false,
+        );
+        assert!(result.is_ok());
     }
 }
