@@ -253,6 +253,7 @@ impl<'a> BeagleHmm<'a> {
         partner_alleles: &[u8],
         target_conf: Option<&[f32]>,
         pl_provider: Option<&PlProvider>,
+        init_prior: Option<&[f32]>,
         threaded_haps: &ThreadedHaps,
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
@@ -368,10 +369,26 @@ impl<'a> BeagleHmm<'a> {
 
             let row_offset = m * n_states;
             if m == 0 {
-                let init_val = 1.0 / n_states as f32;
+                let mut prior_sum = 0.0f32;
+                if let Some(prior) = init_prior {
+                    if prior.len() == n_states {
+                        prior_sum = prior.iter().copied().sum();
+                    }
+                }
+                let use_prior = prior_sum > 0.0;
+                let init_val = if use_prior {
+                    1.0 / prior_sum
+                } else {
+                    1.0 / n_states as f32
+                };
                 fwd_sum = 0.0;
                 for k in 0..n_states {
-                    let val = init_val * emissions[k];
+                    let base = if use_prior {
+                        init_prior.and_then(|p| p.get(k)).copied().unwrap_or(0.0) * init_val
+                    } else {
+                        init_val
+                    };
+                    let val = base * emissions[k];
                     fwd[row_offset + k] = val;
                     fwd_sum += val;
                 }
@@ -481,6 +498,7 @@ impl<'a> BeagleHmm<'a> {
         partner_alleles: &[u8],
         target_conf: Option<&[f32]>,
         pl_provider: Option<&PlProvider>,
+        init_prior: Option<&[f32]>,
         lookup: &RefAlleleLookup,
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
@@ -588,10 +606,26 @@ impl<'a> BeagleHmm<'a> {
 
             let row_offset = m * n_states;
             if m == 0 {
-                let init_val = 1.0 / n_states as f32;
+                let mut prior_sum = 0.0f32;
+                if let Some(prior) = init_prior {
+                    if prior.len() == n_states {
+                        prior_sum = prior.iter().copied().sum();
+                    }
+                }
+                let use_prior = prior_sum > 0.0;
+                let init_val = if use_prior {
+                    1.0 / prior_sum
+                } else {
+                    1.0 / n_states as f32
+                };
                 fwd_sum = 0.0;
                 for k in 0..n_states {
-                    let val = init_val * emissions[k];
+                    let base = if use_prior {
+                        init_prior.and_then(|p| p.get(k)).copied().unwrap_or(0.0) * init_val
+                    } else {
+                        init_val
+                    };
+                    let val = base * emissions[k];
                     fwd[row_offset + k] = val;
                     fwd_sum += val;
                 }
@@ -993,6 +1027,7 @@ mod tests {
             &target_alleles,
             &target_alleles,
             &target_alleles,
+            None,
             None,
             None,
             &threaded_haps,

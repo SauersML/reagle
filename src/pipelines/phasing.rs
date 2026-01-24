@@ -3010,6 +3010,26 @@ impl PhasingPipeline {
 
                     let mut fwd1 = Vec::new();
                     let mut bwd1 = Vec::new();
+                    let mut init_prior1: Option<&[f32]> = None;
+                    let mut init_prior2: Option<&[f32]> = None;
+                    if let Some(overlap) = previous_overlap {
+                        if let Some(ref left_state_probs) = overlap.state_probs {
+                            if left_state_probs.n_states == n_states {
+                                let h1_idx = s * 2;
+                                let h2_idx = s * 2 + 1;
+                                if h1_idx < left_state_probs.data.len() {
+                                    init_prior1 = left_state_probs.data[h1_idx]
+                                        .first()
+                                        .map(|v| v.as_slice());
+                                }
+                                if h2_idx < left_state_probs.data.len() {
+                                    init_prior2 = left_state_probs.data[h2_idx]
+                                        .first()
+                                        .map(|v| v.as_slice());
+                                }
+                            }
+                        }
+                    }
                     let use_lookup = self.reference_gt.is_some() && self.alignment.is_some();
                     let mut lookup = None;
                     if use_lookup {
@@ -3040,6 +3060,7 @@ impl PhasingPipeline {
                             &seq2,
                             Some(&seq_conf),
                             Some(&plp),
+                            init_prior1,
                             lookup,
                             &mut fwd1,
                             &mut bwd1,
@@ -3051,6 +3072,7 @@ impl PhasingPipeline {
                             &seq2,
                             Some(&seq_conf),
                             Some(&plp),
+                            init_prior1,
                             &threaded_haps,
                             &mut fwd1,
                             &mut bwd1,
@@ -3066,6 +3088,7 @@ impl PhasingPipeline {
                             &seq1,
                             Some(&seq_conf),
                             Some(&plp),
+                            init_prior2,
                             lookup,
                             &mut fwd2,
                             &mut bwd2,
@@ -3077,6 +3100,7 @@ impl PhasingPipeline {
                             &seq1,
                             Some(&seq_conf),
                             Some(&plp),
+                            init_prior2,
                             &threaded_haps,
                             &mut fwd2,
                             &mut bwd2,
