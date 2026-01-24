@@ -685,7 +685,9 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    // Use low Ne for this test because the data is generated with PERFECT LD blocks (infinite length).
+    // Ne=10000 implies high recombination which breaks the perfect blocks in the model.
+    config.ne = 200.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
