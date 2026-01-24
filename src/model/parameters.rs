@@ -50,6 +50,9 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum mismatch probability (prevents Perfect LD Trap)
+    pub const MIN_MISMATCH_PROB: f32 = 1e-9;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -104,7 +107,12 @@ impl ModelParams {
         err: Option<f32>,
     ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
+        // Default to MIN_MISMATCH_PROB to avoid "Perfect LD Trap" where rare variants
+        // are missed because the model prefers the common haplotype (penalty = p_mismatch)
+        // over switching to the rare haplotype (penalty = p_recomb).
+        // By making p_mismatch extremely small, we force the model to respect observed rare alleles.
+        let p_mismatch = err.unwrap_or(Self::MIN_MISMATCH_PROB);
+
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 
@@ -135,7 +143,7 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        val.max(Self::MIN_MISMATCH_PROB)
     }
 
     /// Calculate LR threshold for a given iteration
