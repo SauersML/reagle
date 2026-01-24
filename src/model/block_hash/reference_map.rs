@@ -9,8 +9,6 @@
 use super::compressed_block::CompressedBlock;
 use super::transition::TransitionBridge;
 use super::workspace::BlockHmmWorkspace;
-use crate::data::storage::matrix::GenotypeMatrix;
-use crate::data::storage::phase_state::Phased;
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
@@ -18,6 +16,7 @@ use std::sync::Arc;
 ///
 /// Contains all immutable reference data and pre-computed transitions.
 /// Built once, shared across all target samples via Arc.
+#[derive(Debug)]
 pub struct ReferenceMap {
     /// Compressed blocks (immutable, Arc-wrapped)
     pub blocks: Vec<Arc<CompressedBlock>>,
@@ -34,103 +33,6 @@ pub struct ReferenceMap {
 }
 
 impl ReferenceMap {
-    /// Build a ReferenceMap from a reference panel
-    ///
-    /// # Arguments
-    /// * `ref_data` - Reference panel genotype matrix
-    /// * `window_size` - Size of each window in markers
-    /// * `max_states` - Maximum unique patterns per window
-    /// * `recomb_rates` - Recombination rates between markers [marker_idx].
-    ///                    Rate at i is between marker i and i+1.
-    ///
-    /// # Returns
-    /// Arc-wrapped ReferenceMap ready for parallel sample processing
-    pub fn build(
-        ref_data: &GenotypeMatrix<Phased>,
-        window_size: usize,
-        max_states: usize,
-        recomb_rates: &[f32],
-    ) -> Arc<Self> {
-        let n_markers = ref_data.n_markers();
-        let n_windows = (n_markers + window_size - 1) / window_size;
-
-        assert_eq!(recomb_rates.len(), n_markers - 1, "Recombination rates length must match n_markers - 1");
-
-        // Build all compressed blocks
-        let mut blocks = Vec::with_capacity(n_windows);
-
-        for win_idx in 0..n_windows {
-            let start = win_idx * window_size;
-            let end = (start + window_size).min(n_markers);
-
-            // Recombination rates:
-            // For a block of M markers, we have M-1 internal intervals.
-            // The `recomb_rates` input has N-1 rates.
-            // We need to slice the rates corresponding to the intervals WITHIN this block.
-            // Interval i connects marker i and i+1.
-            // So for markers [start..end], we need rates [start..end-1].
-            // Careful with the last block which might be smaller.
-            let rate_end = if end == n_markers {
-                // Last marker has no outgoing rate in the global array (it's N-1 length)
-                // But generally rate[i] connects i->i+1.
-                // If end=N, the last interval is N-2 -> N-1.
-                // So we slice up to end-1.
-                end - 1
-            } else {
-                end - 1
-            };
-
-            // range check
-            let block_rates = if start < rate_end {
-                 &recomb_rates[start..rate_end]
-            } else {
-                 &[]
-            };
-
-            // Build compressed block (uses existing compression module)
-            let block = super::compression::build_compressed_block(
-                ref_data,
-                start..end,
-                max_states,
-                block_rates,
-            );
-
-            blocks.push(Arc::new(block));
-        }
-
-        // Pre-compute all transition bridges
-        let mut bridges = Vec::with_capacity(n_windows.saturating_sub(1));
-
-        for i in 0..n_windows.saturating_sub(1) {
-            // Rate between block i and i+1
-            // Block i ends at `blocks[i].end_marker`.
-            // The last marker in block i is at index `end_marker - 1`.
-            // The rate at `end_marker - 1` defines transition to `end_marker` (start of next block).
-            // Since `recomb_rates` is 0-indexed relative to global markers:
-            // rate[k] is transition k -> k+1.
-            // We want transition from (end_marker-1) -> end_marker.
-            // So we need rate[end_marker - 1].
-            let boundary_rate = recomb_rates[blocks[i].end_marker - 1]; // Correct indexing
-
-            let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], boundary_rate);
-            bridges.push(Arc::new(bridge));
-        }
-
-        // Calculate actual max states
-        let max_observed_states = blocks
-            .iter()
-            .map(|b| b.n_patterns())
-            .max()
-            .unwrap_or(0);
-
-        Arc::new(Self {
-            blocks,
-            bridges,
-            window_size,
-            max_observed_states,
-        })
-    }
-
     /// Build a ReferenceMap from pre-compressed blocks and boundary rates.
     ///
     /// # Arguments

@@ -4,15 +4,12 @@
 //! from ranges of markers in a `GenotypeMatrix`.
 
 use crate::data::haplotype::HapIdx;
-use crate::data::marker::{Marker, MarkerIdx};
+use crate::data::marker::Marker;
 use crate::data::storage::dictionary::DictionaryColumn;
-use crate::data::storage::matrix::GenotypeMatrix;
-use crate::data::storage::phase_state::Phased;
 use crate::data::storage::GenotypeColumn;
 use super::compressed_block::CompressedBlock;
 use super::types::{GlobalId, PatternId};
 
-use std::ops::Range;
 use std::sync::Arc;
 
 fn flatten_pattern_globals(pattern_to_globals: &[Vec<GlobalId>]) -> (Vec<GlobalId>, Vec<usize>) {
@@ -213,38 +210,6 @@ where
 ///
 /// # Returns
 /// CompressedBlock with only immutable reference data (no per-sample HMM state)
-pub(crate) fn build_compressed_block(
-    ref_data: &GenotypeMatrix<Phased>,
-    marker_range: Range<usize>,
-    max_states: usize,
-    recomb_rates: &[f32],
-) -> CompressedBlock {
-    let start_marker = marker_range.start;
-    let end_marker = marker_range.end;
-    let n_markers = marker_range.len();
-    let n_haplotypes = ref_data.n_haplotypes();
-    let mut marker_n_alleles = Vec::with_capacity(n_markers);
-
-    for marker_idx in marker_range.clone() {
-        let marker = ref_data.marker(MarkerIdx::new(marker_idx as u32));
-        let n_alleles = marker.n_alleles().max(1);
-        marker_n_alleles.push(n_alleles.min(u8::MAX as usize) as u8);
-    }
-
-    build_compressed_block_with_accessor(
-        start_marker,
-        n_markers,
-        n_haplotypes,
-        marker_n_alleles,
-        max_states,
-        recomb_rates,
-        |m, h| {
-            let marker = MarkerIdx::new((start_marker + m) as u32);
-            ref_data.allele(marker, h)
-        },
-    )
-}
-
 pub(crate) fn build_compressed_block_from_columns(
     markers: &[Marker],
     columns: &[GenotypeColumn],
@@ -358,26 +323,19 @@ mod tests {
         let col0 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
         let col1 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
 
-        // Mock GenotypeMatrix wrapper equivalent
-        // Since GenotypeMatrix is complex to mock, we'll implement a minimal verified fake or use public API if feasible.
-        // The public API requires Samples, Markers etc.
-        // Let's create a minimal valid GenotypeMatrix.
-        use crate::data::haplotype::Samples;
-        use crate::data::marker::{Marker, Allele};
-        let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
+        use crate::data::marker::{Allele, Marker};
         let mut m = Markers::new();
         let chr = m.add_chrom("chr1");
         m.push(Marker::new(chr, 100, None, Allele::Base(0), vec![Allele::Base(1)]));
-         m.push(Marker::new(chr, 200, None, Allele::Base(0), vec![Allele::Base(1)]));
+        m.push(Marker::new(chr, 200, None, Allele::Base(0), vec![Allele::Base(1)]));
 
-        let gt = GenotypeMatrix::new_phased(
-            m,
-            vec![col0, col1],
-            samples,
-        );
+        let markers: Vec<Marker> = (0..m.len())
+            .map(|i| m[crate::data::marker::MarkerIdx::new(i as u32)].clone())
+            .collect();
+        let columns = vec![col0, col1];
 
         let recomb_rates = vec![0.01];
-        let block = build_compressed_block(&gt, 0..2, 0, &recomb_rates);
+        let block = build_compressed_block_from_columns(&markers, &columns, 0, 0, &recomb_rates);
 
         // Verify compression
         // Haps 0,1 should be Pattern A

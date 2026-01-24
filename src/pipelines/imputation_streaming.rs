@@ -71,7 +71,8 @@ fn normalize_chrom_local(name: &str) -> &str {
 }
 
 fn collect_target_positions(path: &Path) -> Result<(TargetMarkerIndex, usize)> {
-    let (_reader, mut reader) = crate::io::vcf::VcfReader::open(path)?;
+    let (vcf_reader, mut reader) = crate::io::vcf::VcfReader::open(path)?;
+    let _ = vcf_reader.samples_arc();
     let mut positions: TargetMarkerIndex = std::collections::HashMap::new();
     let mut total = 0usize;
     let mut line = String::new();
@@ -1552,7 +1553,8 @@ mod tests {
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers};
     use crate::data::storage::GenotypeColumn;
-    use crate::io::bref3::InMemoryRefReader;
+    use crate::io::bref3::StreamingRefVcfReader;
+    use std::io::{BufReader, Cursor};
     use crate::model::parameters::ModelParams;
 
     fn build_markers(chrom: ChromIdx, positions: &[u32]) -> Markers {
@@ -1569,20 +1571,6 @@ mod tests {
             markers.push(marker);
         }
         markers
-    }
-
-    fn build_phased_matrix(markers: Markers, n_samples: usize) -> GenotypeMatrix<Phased> {
-        let samples = Arc::new(Samples::from_ids(
-            (0..n_samples).map(|i| format!("s{i}")).collect(),
-        ));
-        let n_haps = n_samples * 2;
-        let columns: Vec<GenotypeColumn> = (0..markers.len())
-            .map(|_| {
-                let bytes: Vec<u8> = vec![0u8; n_haps];
-                GenotypeColumn::from_alleles(&bytes, 2)
-            })
-            .collect();
-        GenotypeMatrix::new_phased(markers, columns, samples)
     }
 
     fn build_unphased_matrix(markers: Markers, n_samples: usize) -> GenotypeMatrix<Unphased> {
@@ -1605,13 +1593,21 @@ mod tests {
         let ref_positions: Vec<u32> = (0..3000).collect();
         let target_positions: Vec<u32> = vec![1500, 1501, 1502];
 
-        let ref_markers = build_markers(chrom, &ref_positions);
         let target_markers = build_markers(chrom, &target_positions);
-
-        let ref_gt = Arc::new(build_phased_matrix(ref_markers, 2));
         let target_gt = build_unphased_matrix(target_markers, 2);
 
-        let mut ref_reader = RefPanelReader::InMemory(InMemoryRefReader::new(ref_gt.clone()));
+        let mut vcf_data = String::new();
+        vcf_data.push_str("##fileformat=VCFv4.2\n");
+        vcf_data.push_str("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts0\ts1\n");
+        for pos in &ref_positions {
+            vcf_data.push_str(&format!(
+                "chr1\t{}\t.\tA\tC\t.\tPASS\t.\tGT\t0|0\t0|0\n",
+                pos
+            ));
+        }
+        let reader = Box::new(BufReader::new(Cursor::new(vcf_data.into_bytes())));
+        let ref_reader = StreamingRefVcfReader::from_reader(reader).expect("ref reader");
+        let mut ref_reader = RefPanelReader::StreamingVcf(ref_reader);
         let config = StreamingConfig::default();
         let gen_maps = GeneticMaps::default();
         let params = ModelParams::new();
@@ -1623,6 +1619,6 @@ mod tests {
         // Desired behavior: sparse target data should not truncate the reference region.
         assert_eq!(target_gt.n_markers(), target_positions.len());
         assert_eq!(ref_window.global_start, 0);
-        assert_eq!(ref_window.global_end, ref_gt.n_markers());
+        assert_eq!(ref_window.global_end, ref_positions.len());
     }
 }

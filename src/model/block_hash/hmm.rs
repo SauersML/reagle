@@ -45,6 +45,7 @@ pub fn forward_within_block(
         // Compute emission probabilities for all patterns
         let emissions = &mut ws.emissions;
         fill_emissions_for_marker(block, marker_in_window, target_allele, error_rate, emissions);
+        let n_alleles = block.n_alleles(marker_in_window);
 
         // REUSE: Use new weighted kernel
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
@@ -477,10 +478,10 @@ fn pattern_idx_to_id(idx: usize) -> PatternId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::block_hash::compression::build_compressed_block;
+    use crate::model::block_hash::compression::build_compressed_block_from_columns;
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
     use crate::data::haplotype::Samples;
-    use crate::data::marker::{Marker, Allele, Markers};
+    use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
     use std::sync::Arc;
 
     /// Ported/Adapted from deleted `test_compute_cluster_mismatches_accumulation`
@@ -506,7 +507,13 @@ mod tests {
         let gt = GenotypeMatrix::new_phased(markers, vec![col0, col1], samples);
         
         let rates = vec![0.0]; // No recombination to isolate emissions
-        let block = build_compressed_block(&gt, 0..2, 0, &rates);
+        let marker_vec: Vec<Marker> = (0..gt.n_markers())
+            .map(|i| gt.marker(MarkerIdx::new(i as u32)).clone())
+            .collect();
+        let columns: Vec<GenotypeColumn> = (0..gt.n_markers())
+            .map(|i| gt.column(MarkerIdx::new(i as u32)).clone())
+            .collect();
+        let block = build_compressed_block_from_columns(&marker_vec, &columns, 0, 0, &rates);
         
         // Haps are distinct, so we expect 3 patterns?
         // 0,0 -> P0 (count 1)

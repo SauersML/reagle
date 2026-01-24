@@ -384,10 +384,8 @@ fn aggregate_reservoir_transitions(
 mod tests {
     use super::*;
     use crate::data::marker::Markers;
-    use crate::data::haplotype::Samples;
-    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
-    use crate::model::block_hash::compression::build_compressed_block;
-    use std::sync::Arc;
+    use crate::data::storage::GenotypeColumn;
+    use crate::model::block_hash::compression::build_compressed_block_from_columns;
 
     fn create_mock_block(alleles: &[u8], n_haps: usize, n_markers: usize) -> CompressedBlock {
         use crate::data::marker::{Marker, Allele};
@@ -407,16 +405,11 @@ mod tests {
             markers.push(Marker::new(chr, i as u32, None, Allele::Base(0), vec![Allele::Base(1)]));
         }
         
-        // Samples logic is messy, just make enough IDs
-        let mut sample_ids = Vec::new();
-        for i in 0..(n_haps + 1) / 2 {
-            sample_ids.push(format!("S{}", i));
-        }
-        let samples = Arc::new(Samples::from_ids(sample_ids));
-
-        let gt = GenotypeMatrix::new_phased(markers, cols, samples);
+        let markers: Vec<Marker> = (0..markers.len())
+            .map(|i| markers[crate::data::marker::MarkerIdx::new(i as u32)].clone())
+            .collect();
         let rates = vec![0.0; n_markers.saturating_sub(1)];
-        build_compressed_block(&gt, 0..n_markers, 0, &rates)
+        build_compressed_block_from_columns(&markers, &cols, 0, 0, &rates)
     }
 
     #[test]

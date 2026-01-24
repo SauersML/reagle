@@ -588,6 +588,7 @@ impl StreamingBref3Reader {
     }
 }
 
+#[derive(Clone)]
 struct Bref3BufferedMarker {
     marker: Marker,
     column: GenotypeColumn,
@@ -887,8 +888,6 @@ pub struct RefWindow {
 pub enum RefPanelReader {
     /// Streaming BREF3 reader
     Bref3(StreamingBref3WindowReader),
-    /// In-memory VCF reader
-    InMemory(InMemoryRefReader),
     /// Streaming VCF reader
     StreamingVcf(StreamingRefVcfReader),
 }
@@ -912,9 +911,6 @@ impl RefPanelReader {
                 max_states,
                 target_positions,
             ),
-            RefPanelReader::InMemory(r) => {
-                r.next_window(gen_maps, params, block_size, max_states, target_positions)
-            }
             RefPanelReader::StreamingVcf(r) => r.next_window(
                 config,
                 gen_maps,
@@ -927,96 +923,8 @@ impl RefPanelReader {
     }
 }
 
-/// In-memory reference panel reader for VCF files
-///
-/// Provides the same interface as WindowedBref3Reader but backed by
-/// an in-memory GenotypeMatrix. Used for VCF reference panels.
-pub struct InMemoryRefReader {
-    genotypes: Arc<GenotypeMatrix<crate::data::storage::phase_state::Phased>>,
-    window_num: usize,
-}
-
-impl InMemoryRefReader {
-    /// Create a new in-memory reader from a loaded reference panel
-    pub fn new(genotypes: Arc<GenotypeMatrix<crate::data::storage::phase_state::Phased>>) -> Self {
-        Self {
-            genotypes,
-            window_num: 0,
-        }
-    }
-
-    pub fn next_window(
-        &mut self,
-        gen_maps: &GeneticMaps,
-        params: &ModelParams,
-        block_size: usize,
-        max_states: usize,
-        target_positions: Option<&TargetMarkerIndex>,
-    ) -> Result<Option<RefWindow>> {
-        if self.window_num > 0 {
-            return Ok(None);
-        }
-        let n_markers = self.genotypes.n_markers();
-        let genotypes = (*self.genotypes).clone();
-        let mut recomb_rates = Vec::with_capacity(n_markers.saturating_sub(1));
-        for i in 0..n_markers.saturating_sub(1) {
-            let curr = genotypes.marker(MarkerIdx::new(i as u32));
-            let next = genotypes.marker(MarkerIdx::new(i as u32 + 1));
-            let dist_cm =
-                (gen_maps.gen_pos(curr.chrom, next.pos) - gen_maps.gen_pos(curr.chrom, curr.pos))
-                    .abs();
-            recomb_rates.push(params.p_recomb(dist_cm));
-        }
-
-        let ref_map = ReferenceMap::build(&genotypes, block_size, max_states, &recomb_rates);
-        let markers = genotypes.markers().clone();
-        let ref_genotypes = if let Some(target_positions) = target_positions {
-            let mut filtered_markers = Markers::new();
-            let mut filtered_columns = Vec::new();
-            let mut filtered_chrom: Option<ChromIdx> = None;
-            for idx in 0..markers.len() {
-                let marker = markers.marker(MarkerIdx::new(idx as u32));
-                let chrom_name = markers.chrom_name(marker.chrom).unwrap_or("");
-                if marker_in_target(chrom_name, marker.pos, Some(target_positions)) {
-                    if filtered_chrom.is_none() {
-                        filtered_chrom = Some(filtered_markers.add_chrom(chrom_name));
-                    }
-                    let mut filtered_marker = marker.clone();
-                    if let Some(chrom_idx) = filtered_chrom {
-                        filtered_marker.chrom = chrom_idx;
-                    }
-                    filtered_markers.push(filtered_marker);
-                    filtered_columns.push(genotypes.column(MarkerIdx::new(idx as u32)).clone());
-                }
-            }
-            if filtered_columns.is_empty() {
-                None
-            } else {
-                Some(GenotypeMatrix::new_phased(
-                    filtered_markers,
-                    filtered_columns,
-                    genotypes.samples_arc(),
-                ))
-            }
-        } else {
-            Some(genotypes.clone())
-        };
-        self.window_num += 1;
-        Ok(Some(RefWindow {
-            markers,
-            ref_map,
-            ref_genotypes,
-            global_start: 0,
-            global_end: n_markers,
-            output_start: 0,
-            output_end: n_markers,
-            is_first: true,
-            is_last: true,
-        }))
-    }
-}
-
 /// A marker buffered for streaming VCF reading
+#[derive(Clone)]
 struct RefPanelMarker {
     marker: Marker,
     column: GenotypeColumn,
