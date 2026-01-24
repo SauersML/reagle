@@ -166,10 +166,15 @@ impl ModelParams {
     /// pRecomb[m] = -Math.expm1(c * genDist.get(m))
     /// ```
     ///
+    /// Minimum recombination probability to prevent zero transition probabilities
+    /// in Perfect LD scenarios (zero genetic distance).
+    pub const MIN_RECOMB_PROB: f32 = 1e-9;
+
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        (-f64::exp_m1(c * gen_dist_cm)) as f32
+        let val = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        val.max(Self::MIN_RECOMB_PROB)
     }
 
     /// Update mismatch probability (for EM estimation)
