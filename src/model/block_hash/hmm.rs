@@ -60,6 +60,7 @@ pub fn forward_within_block_probs(
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
+    let n_states = n_patterns + if block.reservoir_count > 0 { 1 } else { 0 };
 
     // For each marker in the window
     for marker_in_window in 0..window_size {
@@ -85,10 +86,9 @@ pub fn forward_within_block_probs(
             &mut ws.fwd,
             fwd_sum,
             recomb_rate,
-            block.n_ref_haps(),
-            &block.pattern_counts,
             emissions,
             n_patterns,
+            n_states,
         );
 
         if block.reservoir_count > 0 {
@@ -102,11 +102,11 @@ pub fn forward_within_block_probs(
             );
 
             let total_mass = fwd_sum;
-            let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
+            // Uniform transition: r / K
+            let background = total_mass * recomb_rate / n_states as f32;
             let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
 
-            ws.reservoir_prob_fwd =
-                reservoir_emission * (stay + background * block.reservoir_count as f32);
+            ws.reservoir_prob_fwd = reservoir_emission * (stay + background);
         }
 
         ws.normalize_forward(n_patterns);
@@ -123,6 +123,7 @@ pub fn forward_to_marker_in_block_probs(
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
+    let n_states = n_patterns + if block.reservoir_count > 0 { 1 } else { 0 };
 
     assert!(stop_marker_in_window < window_size);
 
@@ -149,10 +150,9 @@ pub fn forward_to_marker_in_block_probs(
             &mut ws.fwd,
             fwd_sum,
             recomb_rate,
-            block.n_ref_haps(),
-            &block.pattern_counts,
             emissions,
             n_patterns,
+            n_states,
         );
 
         if block.reservoir_count > 0 {
@@ -166,11 +166,10 @@ pub fn forward_to_marker_in_block_probs(
             );
 
             let total_mass = fwd_sum;
-            let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
+            let background = total_mass * recomb_rate / n_states as f32;
             let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
 
-            ws.reservoir_prob_fwd =
-                reservoir_emission * (stay + background * block.reservoir_count as f32);
+            ws.reservoir_prob_fwd = reservoir_emission * (stay + background);
         }
 
         ws.normalize_forward(n_patterns);
@@ -187,6 +186,7 @@ pub fn backward_and_emit_block_probs(
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
+    let n_states = n_patterns + if block.reservoir_count > 0 { 1 } else { 0 };
 
     assert_eq!(output.len(), window_size, "Output slice size mismatch");
 
@@ -208,10 +208,9 @@ pub fn backward_and_emit_block_probs(
             &mut ws.fwd,
             fwd_sum,
             recomb_rate,
-            block.n_ref_haps(),
-            &block.pattern_counts,
             emissions,
             n_patterns,
+            n_states,
         );
 
         if block.reservoir_count > 0 {
@@ -224,10 +223,9 @@ pub fn backward_and_emit_block_probs(
                 n_alleles,
             );
             let total_mass = fwd_sum;
-            let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
+            let background = total_mass * recomb_rate / n_states as f32;
             let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
-            ws.reservoir_prob_fwd =
-                reservoir_emission * (stay + background * block.reservoir_count as f32);
+            ws.reservoir_prob_fwd = reservoir_emission * (stay + background);
         }
 
         ws.normalize_forward(n_patterns);
@@ -327,15 +325,14 @@ pub fn backward_and_emit_block_probs(
         ws.reservoir_prob_bwd *= reservoir_emission;
 
         {
-            let n_ref = block.n_ref_haps() as f32;
-            let mut weighted_sum = 0.0f32;
+            let mut sum = 0.0f32;
             for i in 0..n_patterns {
-                weighted_sum += ws.bwd[i] * block.pattern_counts[i];
+                sum += ws.bwd[i]; // uniform weight
             }
             if block.reservoir_count > 0 {
-                weighted_sum += ws.reservoir_prob_bwd * block.reservoir_count as f32;
+                sum += ws.reservoir_prob_bwd; // uniform weight
             }
-            let constant_term = weighted_sum / n_ref;
+            let constant_term = sum / n_states as f32;
 
             let stay_prob = 1.0 - recomb_rate;
             let recomb_prob = recomb_rate;
