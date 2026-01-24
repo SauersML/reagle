@@ -50,6 +50,12 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum recombination probability to avoid zero transition probabilities
+    pub const MIN_RECOMB_PROB: f32 = 1e-9;
+
+    /// Minimum mismatch probability for numerical stability
+    pub const MIN_MISMATCH_PROB: f32 = 1e-9;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -135,7 +141,7 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        val.max(Self::MIN_MISMATCH_PROB)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -169,7 +175,8 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        (-f64::exp_m1(c * gen_dist_cm)) as f32
+        let val = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        val.max(Self::MIN_RECOMB_PROB)
     }
 
     /// Update mismatch probability (for EM estimation)
@@ -348,6 +355,10 @@ mod tests {
         // Edge case
         let p0 = ModelParams::li_stephens_p_mismatch(0);
         assert_eq!(p0, 0.0001);
+
+        // Ensure never drops below min
+        let p_huge = ModelParams::li_stephens_p_mismatch(1_000_000_000);
+        assert!(p_huge >= ModelParams::MIN_MISMATCH_PROB);
     }
 
     #[test]
@@ -363,13 +374,13 @@ mod tests {
     fn test_p_recomb() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // No distance -> no recomb
+        // No distance -> should be MIN_RECOMB_PROB
         let p0 = params.p_recomb(0.0);
-        assert!(p0.abs() < 0.0001);
+        assert!((p0 - ModelParams::MIN_RECOMB_PROB).abs() < 1e-10);
 
         // Small distance -> small prob
         let p1 = params.p_recomb(0.001);
-        assert!(p1 > 0.0 && p1 < 0.5);
+        assert!(p1 > ModelParams::MIN_RECOMB_PROB && p1 < 0.5);
 
         // Larger distance -> higher prob
         let p2 = params.p_recomb(0.01);
