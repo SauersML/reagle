@@ -3053,6 +3053,8 @@ impl PhasingPipeline {
                             )
                         }));
                     }
+                    let allele_freqs_stage1: Vec<f32> =
+                        hi_freq_markers.iter().map(|&m| maf[m]).collect();
                     if let Some(ref lookup) = lookup {
                         hmm.conditioned_forward_backward_with_lookup(
                             &seq1,
@@ -3060,6 +3062,7 @@ impl PhasingPipeline {
                             &seq2,
                             Some(&seq_conf),
                             Some(&plp),
+                            Some(&allele_freqs_stage1),
                             init_prior1,
                             lookup,
                             &mut fwd1,
@@ -3072,6 +3075,7 @@ impl PhasingPipeline {
                             &seq2,
                             Some(&seq_conf),
                             Some(&plp),
+                            Some(&allele_freqs_stage1),
                             init_prior1,
                             &threaded_haps,
                             &mut fwd1,
@@ -3088,6 +3092,7 @@ impl PhasingPipeline {
                             &seq1,
                             Some(&seq_conf),
                             Some(&plp),
+                            Some(&allele_freqs_stage1),
                             init_prior2,
                             lookup,
                             &mut fwd2,
@@ -3100,6 +3105,7 @@ impl PhasingPipeline {
                             &seq1,
                             Some(&seq_conf),
                             Some(&plp),
+                            Some(&allele_freqs_stage1),
                             init_prior2,
                             &threaded_haps,
                             &mut fwd2,
@@ -3817,11 +3823,11 @@ fn build_fwd_checkpoints(
         let mut pl_n_alleles: Option<usize> = None;
         if let Some(pl) = pl {
             if use_combined {
-                pl_n_alleles = allele_probs_uncond_from_pl(pl, allele_probs);
+                pl_n_alleles = allele_probs_uncond_from_pl(pl, None, allele_probs);
             } else {
                 let partner = hap2_allele[m];
-                pl_n_alleles = allele_probs_cond_from_pl(pl, partner, allele_probs)
-                    .or_else(|| allele_probs_uncond_from_pl(pl, allele_probs));
+                pl_n_alleles = allele_probs_cond_from_pl(pl, partner, None, allele_probs)
+                    .or_else(|| allele_probs_uncond_from_pl(pl, None, allele_probs));
             }
         }
         let p_no_err_pl = 1.0 - p_err;
@@ -4136,11 +4142,11 @@ fn sample_path_from_checkpoints(
             let mut pl_n_alleles: Option<usize> = None;
             if let Some(pl) = pl {
                 if use_combined {
-                    pl_n_alleles = allele_probs_uncond_from_pl(pl, allele_probs);
+                    pl_n_alleles = allele_probs_uncond_from_pl(pl, None, allele_probs);
                 } else {
                     let partner = hap2_allele[m];
-                    pl_n_alleles = allele_probs_cond_from_pl(pl, partner, allele_probs)
-                        .or_else(|| allele_probs_uncond_from_pl(pl, allele_probs));
+                    pl_n_alleles = allele_probs_cond_from_pl(pl, partner, None, allele_probs)
+                        .or_else(|| allele_probs_uncond_from_pl(pl, None, allele_probs));
                 }
             }
             let p_no_err_pl = 1.0 - p_err;
@@ -4786,6 +4792,35 @@ fn sample_dynamic_mcmc(
 
     mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
 
+    let collect_dynamic_neighbors =
+        |path_ref: &[u32], sample_idx: u32| -> Vec<u32> {
+            let stride = (n_markers / 8).max(1);
+            let mut anchors: Vec<usize> = (0..n_markers).step_by(stride).collect();
+            if anchors.last().copied() != Some(n_markers.saturating_sub(1)) {
+                anchors.push(n_markers.saturating_sub(1));
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut out: Vec<u32> = Vec::new();
+
+            for &m in &anchors {
+                let ref_hap = path_ref.get(m).copied().unwrap_or(0);
+                if (ref_hap as usize) < phase_ibs.n_haps() {
+                    let mut local =
+                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, n_states);
+                    local.push(ref_hap);
+                    for h in local {
+                        if h == hap1_idx || h == hap1_idx + 1 {
+                            continue;
+                        }
+                        if seen.insert(h) {
+                            out.push(h);
+                        }
+                    }
+                }
+            }
+            out
+        };
+
     // MCMC loop: Gibbs sampling alternating between H1 and H2
     for step in 0..n_mcmc_steps {
         // === Sample H1 | (G, H2_fixed) ===
@@ -4798,10 +4833,10 @@ fn sample_dynamic_mcmc(
         } else {
             n_markers / 2
         };
+        neighbors = collect_dynamic_neighbors(&path1_ref, sample_idx);
         let ref_hap = path1_ref.get(center_marker).copied().unwrap_or(0);
-        if (ref_hap as usize) < phase_ibs.n_haps() {
-            neighbors =
-                phase_ibs.find_neighbors_of_state(ref_hap, center_marker, sample_idx, n_states);
+        if (ref_hap as usize) < phase_ibs.n_haps() && !neighbors.contains(&ref_hap) {
+            neighbors.push(ref_hap);
         }
         if neighbors.is_empty() {
             continue;
@@ -4865,10 +4900,10 @@ fn sample_dynamic_mcmc(
         // === Sample H2 | (G, H1_new) ===
 
         // 1. Select neighbors for H2 using H2's own latent state (not H1's!)
+        neighbors = collect_dynamic_neighbors(&path2_ref, sample_idx);
         let ref_hap = path2_ref.get(center_marker).copied().unwrap_or(0);
-        if (ref_hap as usize) < phase_ibs.n_haps() {
-            neighbors =
-                phase_ibs.find_neighbors_of_state(ref_hap, center_marker, sample_idx, n_states);
+        if (ref_hap as usize) < phase_ibs.n_haps() && !neighbors.contains(&ref_hap) {
+            neighbors.push(ref_hap);
         }
         if neighbors.is_empty() {
             continue;

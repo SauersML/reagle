@@ -253,6 +253,7 @@ impl<'a> BeagleHmm<'a> {
         partner_alleles: &[u8],
         target_conf: Option<&[f32]>,
         pl_provider: Option<&PlProvider>,
+        allele_freqs: Option<&[f32]>,
         init_prior: Option<&[f32]>,
         threaded_haps: &ThreadedHaps,
         fwd: &mut Vec<f32>,
@@ -335,11 +336,35 @@ impl<'a> BeagleHmm<'a> {
                 let partner = partner_alleles.get(m).copied().unwrap_or(255);
                 let pl = plp.pl(m).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
+                    let biallelic_freqs = allele_freqs
+                        .and_then(|f| f.get(m).copied())
+                        .and_then(|f| {
+                            if (0.0..=1.0).contains(&f) {
+                                Some([1.0 - f, f])
+                            } else {
+                                None
+                            }
+                        });
                     let n = if partner != 255 {
-                        allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
-                            .or_else(|| allele_probs_uncond_from_pl(pl, &mut allele_probs))
+                        allele_probs_cond_from_pl(
+                            pl,
+                            partner,
+                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                            &mut allele_probs,
+                        )
+                        .or_else(|| {
+                            allele_probs_uncond_from_pl(
+                                pl,
+                                biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                                &mut allele_probs,
+                            )
+                        })
                     } else {
-                        allele_probs_uncond_from_pl(pl, &mut allele_probs)
+                        allele_probs_uncond_from_pl(
+                            pl,
+                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                            &mut allele_probs,
+                        )
                     };
                     if let Some(n_alleles) = n {
                         let p_no_err = p_no_err_base;
@@ -431,11 +456,35 @@ impl<'a> BeagleHmm<'a> {
                 let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
                 let pl = plp.pl(m_next).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
+                    let biallelic_freqs = allele_freqs
+                        .and_then(|f| f.get(m_next).copied())
+                        .and_then(|f| {
+                            if (0.0..=1.0).contains(&f) {
+                                Some([1.0 - f, f])
+                            } else {
+                                None
+                            }
+                        });
                     let n = if partner != 255 {
-                        allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
-                            .or_else(|| allele_probs_uncond_from_pl(pl, &mut allele_probs))
+                        allele_probs_cond_from_pl(
+                            pl,
+                            partner,
+                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                            &mut allele_probs,
+                        )
+                        .or_else(|| {
+                            allele_probs_uncond_from_pl(
+                                pl,
+                                biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                                &mut allele_probs,
+                            )
+                        })
                     } else {
-                        allele_probs_uncond_from_pl(pl, &mut allele_probs)
+                        allele_probs_uncond_from_pl(
+                            pl,
+                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                            &mut allele_probs,
+                        )
                     };
                     if let Some(n_alleles) = n {
                         let p_no_err = p_no_err_base;
@@ -498,6 +547,7 @@ impl<'a> BeagleHmm<'a> {
         partner_alleles: &[u8],
         target_conf: Option<&[f32]>,
         pl_provider: Option<&PlProvider>,
+        allele_freqs: Option<&[f32]>,
         init_prior: Option<&[f32]>,
         lookup: &RefAlleleLookup,
         fwd: &mut Vec<f32>,
@@ -572,11 +622,35 @@ impl<'a> BeagleHmm<'a> {
                 let partner = partner_alleles.get(m).copied().unwrap_or(255);
                 let pl = plp.pl(m).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
+                    let biallelic_freqs = allele_freqs
+                        .and_then(|f| f.get(m).copied())
+                        .and_then(|f| {
+                            if (0.0..=1.0).contains(&f) {
+                                Some([1.0 - f, f])
+                            } else {
+                                None
+                            }
+                        });
                     let n = if partner != 255 {
-                        allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
-                            .or_else(|| allele_probs_uncond_from_pl(pl, &mut allele_probs))
+                        allele_probs_cond_from_pl(
+                            pl,
+                            partner,
+                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                            &mut allele_probs,
+                        )
+                        .or_else(|| {
+                            allele_probs_uncond_from_pl(
+                                pl,
+                                biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                                &mut allele_probs,
+                            )
+                        })
                     } else {
-                        allele_probs_uncond_from_pl(pl, &mut allele_probs)
+                        allele_probs_uncond_from_pl(
+                            pl,
+                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                            &mut allele_probs,
+                        )
                     };
                     if let Some(n_alleles) = n {
                         let p_no_err = p_no_err_base;
@@ -660,11 +734,35 @@ impl<'a> BeagleHmm<'a> {
             if let Some(plp) = pl_provider {
                 let pl = plp.pl(m_next).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
+                    let biallelic_freqs = allele_freqs
+                        .and_then(|f| f.get(m_next).copied())
+                        .and_then(|f| {
+                            if (0.0..=1.0).contains(&f) {
+                                Some([1.0 - f, f])
+                            } else {
+                                None
+                            }
+                        });
                     let n = if partner != 255 {
-                        allele_probs_cond_from_pl(pl, partner, &mut allele_probs)
-                            .or_else(|| allele_probs_uncond_from_pl(pl, &mut allele_probs))
+                        allele_probs_cond_from_pl(
+                            pl,
+                            partner,
+                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                            &mut allele_probs,
+                        )
+                        .or_else(|| {
+                            allele_probs_uncond_from_pl(
+                                pl,
+                                biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                                &mut allele_probs,
+                            )
+                        })
                     } else {
-                        allele_probs_uncond_from_pl(pl, &mut allele_probs)
+                        allele_probs_uncond_from_pl(
+                            pl,
+                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                            &mut allele_probs,
+                        )
                     };
                     if let Some(n_alleles) = n {
                         let p_no_err = p_no_err_base;
@@ -1027,6 +1125,7 @@ mod tests {
             &target_alleles,
             &target_alleles,
             &target_alleles,
+            None,
             None,
             None,
             None,

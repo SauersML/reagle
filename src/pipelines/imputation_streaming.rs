@@ -25,9 +25,11 @@ use crate::io::streaming::{
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
 use crate::model::block_hash::ReferenceMap;
+use crate::model::block_hash::hmm::TargetAlleleProbs;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
+use crate::model::pl_emission::allele_probs_uncond_from_pl;
 use crate::pipelines::imputation::AllelePosteriors;
 
 fn push_unique(dst: &mut Vec<String>, value: String) {
@@ -876,27 +878,164 @@ target_samples={} target_bytes={}",
             .map(|m| ref_markers.marker(MarkerIdx::new(m as u32)).alt_alleles.len() == 1)
             .collect();
 
-        // Helper to build input vector for HMM
-        let build_input_vector = |hap_idx: HapIdx| -> Vec<u8> {
-             let mut input = vec![255u8; n_ref_markers];
-             for (ref_m, &target_m_idx) in alignment.ref_to_target.iter().enumerate() {
-                 if target_m_idx >= 0 {
-                     let target_m = target_m_idx as usize;
-                     let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap_idx);
-                     let mapped_allele = if let Some(mapping) = alignment.allele_mappings.get(target_m).and_then(|m| m.as_ref()) {
-                         if (allele as usize) < mapping.targ_to_ref.len() {
-                             let r = mapping.targ_to_ref[allele as usize];
-                             if r >= 0 { r as u8 } else { 255 }
-                         } else {
-                             255
-                         }
-                     } else {
-                         allele
-                     };
-                     input[ref_m] = mapped_allele;
-                 }
-             }
-             input
+        let mut ref_allele_freqs: Vec<Vec<f32>> = vec![Vec::new(); n_ref_markers];
+        for block in ref_map.blocks.iter() {
+            let window_size = block.window_size();
+            for marker_in_window in 0..window_size {
+                let ref_m = block.start_marker + marker_in_window;
+                if ref_m >= n_ref_markers {
+                    continue;
+                }
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(ref_m as u32))
+                    .n_alleles();
+                let freqs = &mut ref_allele_freqs[ref_m];
+                if freqs.is_empty() {
+                    freqs.resize(n_alleles, 0.0);
+                }
+                for pattern_idx in 0..block.n_patterns() {
+                    let ref_allele =
+                        block.unpacked_alleles[pattern_idx * window_size + marker_in_window];
+                    if ref_allele != 255 && (ref_allele as usize) < n_alleles {
+                        freqs[ref_allele as usize] += block.pattern_counts[pattern_idx];
+                    }
+                }
+                if block.reservoir_count > 0 {
+                    for allele in 0..n_alleles {
+                        freqs[allele] += block.reservoir_freq(marker_in_window, allele as u8)
+                            * block.reservoir_count as f32;
+                    }
+                }
+            }
+        }
+
+        for (m, freqs) in ref_allele_freqs.iter_mut().enumerate() {
+            let n_alleles = ref_markers
+                .marker(MarkerIdx::new(m as u32))
+                .n_alleles();
+            if freqs.is_empty() {
+                freqs.resize(n_alleles, 1.0 / n_alleles as f32);
+                continue;
+            }
+            let mut sum = 0.0f32;
+            for f in freqs.iter_mut() {
+                if *f < 0.0 {
+                    *f = 0.0;
+                }
+                sum += *f;
+            }
+            if sum > 0.0 {
+                for f in freqs.iter_mut() {
+                    *f /= sum;
+                }
+            } else {
+                freqs.fill(1.0 / n_alleles as f32);
+            }
+        }
+
+        let normalize_probs = |probs: &mut [f32]| -> bool {
+            let mut sum = 0.0f32;
+            for p in probs.iter_mut() {
+                if *p < 0.0 {
+                    *p = 0.0;
+                }
+                sum += *p;
+            }
+            if sum > 0.0 {
+                for p in probs.iter_mut() {
+                    *p /= sum;
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        let build_input_probs = |hap_idx: HapIdx, sample_idx: usize| -> TargetAlleleProbs {
+            let mut offsets = Vec::with_capacity(n_ref_markers + 1);
+            let mut probs: Vec<f32> = Vec::new();
+            offsets.push(0);
+
+            for (ref_m, &target_m_idx) in alignment.ref_to_target.iter().enumerate() {
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(ref_m as u32))
+                    .n_alleles();
+                let mut base_probs = ref_allele_freqs[ref_m].clone();
+                if base_probs.len() != n_alleles {
+                    base_probs.resize(n_alleles, 1.0 / n_alleles as f32);
+                }
+
+                if target_m_idx >= 0 {
+                    let target_m = target_m_idx as usize;
+                    let conf = target_win.sample_confidence_f32(
+                        MarkerIdx::new(target_m as u32),
+                        sample_idx,
+                    );
+                    let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap_idx);
+
+                    let mapped_allele = if let Some(mapping) = alignment
+                        .allele_mappings
+                        .get(target_m)
+                        .and_then(|m| m.as_ref())
+                    {
+                        if (allele as usize) < mapping.targ_to_ref.len() {
+                            let r = mapping.targ_to_ref[allele as usize];
+                            if r >= 0 { r as u8 } else { 255 }
+                        } else {
+                            255
+                        }
+                    } else {
+                        allele
+                    };
+
+                    let mut pl_probs: Vec<f32> = Vec::new();
+                    let pl = target_win.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
+                    let mut aligned_probs = base_probs.clone();
+                    if let Some(pl) = pl {
+                        if !pl.is_empty() {
+                            if allele_probs_uncond_from_pl(pl, Some(&base_probs), &mut pl_probs)
+                                .is_some()
+                            {
+                                if let Some(mapping) = alignment
+                                    .allele_mappings
+                                    .get(target_m)
+                                    .and_then(|m| m.as_ref())
+                                {
+                                    let mut mapped = vec![0.0f32; n_alleles];
+                                    for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                        if t_idx < mapping.targ_to_ref.len() {
+                                            let r = mapping.targ_to_ref[t_idx];
+                                            if r >= 0 && (r as usize) < n_alleles {
+                                                mapped[r as usize] += p;
+                                            }
+                                        }
+                                    }
+                                    if normalize_probs(&mut mapped) {
+                                        aligned_probs = mapped;
+                                    }
+                                } else if pl_probs.len() == n_alleles {
+                                    aligned_probs = pl_probs;
+                                }
+                            }
+                        }
+                    }
+
+                    if mapped_allele != 255 && (mapped_allele as usize) < n_alleles {
+                        for a in 0..n_alleles {
+                            let hard = if a == mapped_allele as usize { 1.0 } else { 0.0 };
+                            aligned_probs[a] = conf * hard + (1.0 - conf) * aligned_probs[a];
+                        }
+                    }
+                    normalize_probs(&mut aligned_probs);
+                    probs.extend_from_slice(&aligned_probs);
+                } else {
+                    probs.extend_from_slice(&base_probs);
+                }
+
+                offsets.push(probs.len());
+            }
+
+            TargetAlleleProbs::new(offsets, probs)
         };
 
         // Container for next priors (populated in parallel)
@@ -935,7 +1074,7 @@ target_samples={} target_bytes={}",
                     let ws = ws_opt.as_mut().unwrap();
                     
                     let mut process_haplotype = |hap_idx: HapIdx, priors: Option<&HaplotypePriors>| -> (Vec<AllelePosteriors>, HaplotypePriors) {
-                        let input = build_input_vector(hap_idx);
+                        let input_probs = build_input_probs(hap_idx, s);
                         
                         // Initialize workspace
                         if let Some(first_block) = ref_map.blocks.first() {
@@ -974,9 +1113,9 @@ target_samples={} target_bytes={}",
                         
                                                                         // Run HMM
                         
-                                                                        ref_map.forward_pass(&input, self.params.p_mismatch, ws);
+                                                                        ref_map.forward_pass_probs(&input_probs, self.params.p_mismatch, ws);
                         
-                                                                        let posteriors = ref_map.backward_and_emit_posteriors(&input, self.params.p_mismatch, ws);
+                                                                        let posteriors = ref_map.backward_and_emit_posteriors_probs(&input_probs, self.params.p_mismatch, ws);
                         
                                                                         
                         
@@ -1000,7 +1139,7 @@ target_samples={} target_bytes={}",
                         
                                                                         // Run forward pass up to prior_marker_idx
                         
-                                                                        ref_map.forward_to_marker(&input, self.params.p_mismatch, ws, prior_marker_idx);
+                                                                        ref_map.forward_to_marker_probs(&input_probs, self.params.p_mismatch, ws, prior_marker_idx);
                         
                                                                         
                         
