@@ -762,8 +762,14 @@ target_samples={} target_bytes={}",
         phased_overlap: Option<&PhasedOverlap>,
         pbwt_state: Option<&PbwtState>,
     ) -> Result<GenotypeMatrix<Phased>> {
+        let mut config = self.config.clone();
+        // Propagate p_mismatch from global parameters to ensure consistency
+        if config.err.is_none() {
+            config.err = Some(self.params.p_mismatch);
+        }
+
         let mut phasing =
-            crate::pipelines::PhasingPipeline::new(self.config.clone(), self.telemetry.clone());
+            crate::pipelines::PhasingPipeline::new(config, self.telemetry.clone());
         if let Some(ref_gt) = ref_gt {
             let ref_gt_arc = Arc::new(ref_gt.clone());
             phasing.set_reference(ref_gt_arc, alignment.clone());
