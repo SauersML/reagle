@@ -17,24 +17,22 @@ def _resolve_local_panel_path():
     return None
 
 def install_convert_genome():
-    """Installs convert_genome using cargo install (avoids GitHub API rate limits)."""
+    """Installs convert_genome using the official install script (pre-compiled binary)."""
     print("Installing convert_genome...")
     # Only install if not present
     if shutil.which("convert_genome"):
         print("convert_genome already installed.")
         return
 
-    # Use cargo install instead of the bash script to avoid GitHub API rate limits
-    try:
-        subprocess.check_call(["cargo", "install", "convert_genome"])
-    except subprocess.CalledProcessError:
-        # Fallback to git-based install if crates.io version is outdated
-        subprocess.check_call(["cargo", "install", "--git", "https://github.com/SauersML/convert_genome.git"])
-    
-    # Add cargo bin to path for this session
+    # Download and run the install script
+    install_script_url = "https://raw.githubusercontent.com/SauersML/convert_genome/refs/heads/main/install.sh"
+    subprocess.check_call(["bash", "-c", f"curl -fsSL {install_script_url} | bash"])
+
+    # Add install location to PATH for this session
     home = os.path.expanduser("~")
-    bin_path = os.path.join(home, ".cargo", "bin")
-    os.environ["PATH"] += os.pathsep + bin_path
+    local_bin = os.path.join(home, ".local", "bin")
+    if local_bin not in os.environ["PATH"]:
+        os.environ["PATH"] = local_bin + os.pathsep + os.environ["PATH"]
 
 def prepare_input_file(input_path):
     """
