@@ -1762,6 +1762,8 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
     let truth_path = work_dir.path().join("target_full.vcf.gz");
     fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
+    let truth_path = work_dir.path().join("target_full.vcf.gz");
+    fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
 
     // Create a masked version of the sparse target (mask 20% of remaining genotypes)
     let masked_path = work_dir.path().join("masked.vcf");
@@ -2905,6 +2907,10 @@ fn test_per_sample_imputation_accuracy() {
     fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
     let target_path = work_dir.path().join("target_sparse.vcf.gz");
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+    let truth_path = work_dir.path().join("target_full.vcf.gz");
+    fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
+    let truth_path = work_dir.path().join("target_full.vcf.gz");
+    fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
 
     // Create masked version
     let masked_path = work_dir.path().join("masked.vcf");
@@ -3141,10 +3147,6 @@ fn test_dr2_genotyped_vs_imputed() {
     // Parse outputs
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
-    let (_, truth_records) = parse_vcf(&truth_path);
-
-    let truth_map: HashMap<u64, &ParsedRecord> =
-        truth_records.iter().map(|r| (r.pos, r)).collect();
 
     // Separate genotyped and imputed markers
     let mut genotyped_java_dr2: Vec<(u64, f64)> = Vec::new();
@@ -3360,6 +3362,8 @@ fn test_dosage_by_distance_from_genotyped() {
     fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
     let target_path = work_dir.path().join("target_sparse.vcf.gz");
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+    let truth_path = work_dir.path().join("target_full.vcf.gz");
+    fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
 
     // Run Java
     let java_out = work_dir.path().join("java_out");
@@ -3390,6 +3394,9 @@ fn test_dosage_by_distance_from_genotyped() {
     // Parse outputs
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+    let (_, truth_records) = parse_vcf(&truth_path);
+    let truth_map: HashMap<u64, &ParsedRecord> =
+        truth_records.iter().map(|r| (r.pos, r)).collect();
 
     // Find genotyped marker positions
     let genotyped_positions: Vec<u64> = java_records
