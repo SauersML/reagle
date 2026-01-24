@@ -1758,6 +1758,8 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     // Copy sparse target
     let target_path = work_dir.path().join("target_sparse.vcf.gz");
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+    let truth_path = work_dir.path().join("target_full.vcf.gz");
+    fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
 
     // Create a masked version of the sparse target (mask 20% of remaining genotypes)
     let masked_path = work_dir.path().join("masked.vcf");
@@ -2393,11 +2395,13 @@ fn compare_dosages(java_records: &[ParsedRecord], rust_records: &[ParsedRecord],
 /// they don't need to be imputed - we're just passing through the known genotypes.
 fn compare_genotyped_dosages_to_truth(
     rust_records: &[ParsedRecord],
+    java_records: &[ParsedRecord],
     truth_records: &[ParsedRecord],
     name: &str,
 ) {
     // Extract dosages for genotyped (non-imputed) markers only
     let mut rust_genotyped_dosages = Vec::new();
+    let mut java_genotyped_dosages = Vec::new();
     let mut truth_genotyped_dosages = Vec::new();
 
     // Build truth lookup: (chrom, pos) -> record
@@ -2406,7 +2410,7 @@ fn compare_genotyped_dosages_to_truth(
         .map(|r| ((r.chrom.clone(), r.pos), r))
         .collect();
 
-    for rust_rec in rust_records {
+    for (rust_rec, java_rec) in rust_records.iter().zip(java_records.iter()) {
         // Skip imputed markers - only check genotyped ones
         if rust_rec.info.contains_key("IMP") {
             continue;
@@ -2427,10 +2431,15 @@ fn compare_genotyped_dosages_to_truth(
 
             // Get Rust dosage (from DS field if available, otherwise from GT)
             let rust_ds = rust_gt.ds.or_else(|| gt_to_dosage(&rust_gt.gt));
+            let java_ds = java_rec
+                .genotypes
+                .get(sample_idx)
+                .and_then(|g| g.ds.or_else(|| gt_to_dosage(&g.gt)));
             let truth_ds = gt_to_dosage(&truth_rec.genotypes[sample_idx].gt);
 
-            if let (Some(r_ds), Some(t_ds)) = (rust_ds, truth_ds) {
+            if let (Some(r_ds), Some(j_ds), Some(t_ds)) = (rust_ds, java_ds, truth_ds) {
                 rust_genotyped_dosages.push(r_ds);
+                java_genotyped_dosages.push(j_ds);
                 truth_genotyped_dosages.push(t_ds);
             }
         }
@@ -2444,7 +2453,8 @@ fn compare_genotyped_dosages_to_truth(
         return;
     }
 
-    let correlation = dosage_correlation(&rust_genotyped_dosages, &truth_genotyped_dosages);
+    let rust_correlation = dosage_correlation(&rust_genotyped_dosages, &truth_genotyped_dosages);
+    let java_correlation = dosage_correlation(&java_genotyped_dosages, &truth_genotyped_dosages);
 
     // Mean absolute difference
     let mad: f64 = rust_genotyped_dosages
@@ -2459,16 +2469,26 @@ fn compare_genotyped_dosages_to_truth(
         "  Number of genotyped dosages: {}",
         rust_genotyped_dosages.len()
     );
-    println!("  Dosage correlation with truth: {:.6}", correlation);
+    println!(
+        "  Dosage correlation with truth: Rust={:.6} Java={:.6}",
+        rust_correlation, java_correlation
+    );
     println!("  Mean absolute difference: {:.6}", mad);
 
     // Strict: Genotyped markers should have near-perfect correlation with truth (>0.99)
     // These are markers we already know - no imputation needed
     assert!(
-        correlation > 0.99,
+        rust_correlation > 0.99,
         "[{}] Strict FAIL: Genotyped marker dosage correlation with truth too low: {:.6} (expected > 0.99)",
         name,
-        correlation
+        rust_correlation
+    );
+    assert!(
+        rust_correlation >= java_correlation,
+        "[{}] Strict FAIL: Rust genotyped dosage correlation ({:.6}) worse than Java ({:.6})",
+        name,
+        rust_correlation,
+        java_correlation
     );
 }
 
@@ -2478,6 +2498,7 @@ fn test_genotyped_dosage_correlation_with_truth() {
     // Test that genotyped markers (non-imputed) have near-perfect correlation
     // between Rust output dosage and ground truth dosage
     for source in get_all_data_sources() {
+        let files = setup_test_files();
         println!("\n{}", "=".repeat(70));
         println!(
             "=== Genotyped Marker Dosage vs Truth Test: {} ===",
@@ -2493,6 +2514,21 @@ fn test_genotyped_dosage_correlation_with_truth() {
         let target_path = work_dir.path().join("target_sparse.vcf.gz");
         fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
 
+        // Run Java
+        let java_out = work_dir.path().join("java_out");
+        let java_output = run_beagle(
+            &files.beagle_jar,
+            &[
+                ("ref", ref_path.to_str().unwrap()),
+                ("gt", target_path.to_str().unwrap()),
+                ("out", java_out.to_str().unwrap()),
+                ("seed", "42"),
+                ("gp", "true"),
+            ],
+            work_dir.path(),
+        );
+        assert!(java_output.status.success(), "Java BEAGLE failed");
+
         // Run Rust imputation
         let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
         let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
@@ -2507,10 +2543,16 @@ fn test_genotyped_dosage_correlation_with_truth() {
 
         // Parse outputs
         let (_, target_records) = parse_vcf(&target_path);
+        let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
         let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
 
         // Compare genotyped marker dosages to truth
-        compare_genotyped_dosages_to_truth(&rust_records, &target_records, source.name);
+        compare_genotyped_dosages_to_truth(
+            &rust_records,
+            &java_records,
+            &target_records,
+            source.name,
+        );
 
         println!(
             "\n[{}] Genotyped dosage correlation test PASSED!",
@@ -3097,6 +3139,10 @@ fn test_dr2_genotyped_vs_imputed() {
     // Parse outputs
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+    let (_, truth_records) = parse_vcf(&truth_path);
+
+    let truth_map: HashMap<u64, &ParsedRecord> =
+        truth_records.iter().map(|r| (r.pos, r)).collect();
 
     // Separate genotyped and imputed markers
     let mut genotyped_java_dr2: Vec<(u64, f64)> = Vec::new();
@@ -3282,6 +3328,12 @@ fn test_dr2_genotyped_vs_imputed() {
         rust_imp_mean,
         java_imp_mean
     );
+    assert!(
+        worse_imp_count == 0,
+        "IMPUTED DR2 FAIL: Rust worse than Java on {}/{} markers - STRICT FAILURE",
+        worse_imp_count,
+        imputed_gaps.len()
+    );
 
     println!("\n  DR2 test PASSED!");
 }
@@ -3351,8 +3403,8 @@ fn test_dosage_by_distance_from_genotyped() {
     );
 
     // Collect data for ALL markers (genotyped and imputed)
-    // pos, distance, mean_abs_diff per marker
-    let mut distance_data: Vec<(u64, u64, f64)> = Vec::new();
+    // pos, distance, mean_abs_error_java, mean_abs_error_rust per marker
+    let mut distance_data: Vec<(u64, u64, f64, f64)> = Vec::new();
 
     for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
         let is_imputed = j_rec.info.contains_key("IMP");
@@ -3373,17 +3425,41 @@ fn test_dosage_by_distance_from_genotyped() {
             0 // Genotyped marker
         };
 
-        let java_ds: Vec<f64> = j_rec.genotypes.iter().filter_map(|g| g.ds).collect();
-        let rust_ds: Vec<f64> = r_rec.genotypes.iter().filter_map(|g| g.ds).collect();
+        let truth_rec = match truth_map.get(&j_rec.pos) {
+            Some(r) => *r,
+            None => continue,
+        };
 
-        if java_ds.len() == rust_ds.len() && !java_ds.is_empty() {
-            let mean_diff: f64 = java_ds
-                .iter()
-                .zip(&rust_ds)
-                .map(|(j, r)| (j - r).abs())
-                .sum::<f64>()
-                / java_ds.len() as f64;
-            distance_data.push((j_rec.pos, distance, mean_diff));
+        let mut java_err = 0.0;
+        let mut rust_err = 0.0;
+        let mut count = 0usize;
+        for (s, (j_gt, r_gt)) in j_rec
+            .genotypes
+            .iter()
+            .zip(r_rec.genotypes.iter())
+            .enumerate()
+        {
+            if s >= truth_rec.genotypes.len() {
+                continue;
+            }
+            let truth_ds = match gt_to_dosage(&truth_rec.genotypes[s].gt) {
+                Some(ds) => ds,
+                None => continue,
+            };
+            let java_ds = j_gt.ds.or_else(|| gt_to_dosage(&j_gt.gt));
+            let rust_ds = r_gt.ds.or_else(|| gt_to_dosage(&r_gt.gt));
+            let (Some(j_ds), Some(r_ds)) = (java_ds, rust_ds) else {
+                continue;
+            };
+            java_err += (j_ds - truth_ds).abs();
+            rust_err += (r_ds - truth_ds).abs();
+            count += 1;
+        }
+
+        if count > 0 {
+            let java_mean = java_err / count as f64;
+            let rust_mean = rust_err / count as f64;
+            distance_data.push((j_rec.pos, distance, java_mean, rust_mean));
         }
     }
 
@@ -3410,31 +3486,37 @@ fn test_dosage_by_distance_from_genotyped() {
     let mut imputed_count = 0usize;
 
     for (lo, hi, label) in buckets {
-        let bucket: Vec<&(u64, u64, f64)> = distance_data
+        let bucket: Vec<&(u64, u64, f64, f64)> = distance_data
             .iter()
-            .filter(|(_, d, _)| *d >= lo && *d < hi)
+            .filter(|(_, d, _, _)| *d >= lo && *d < hi)
             .collect();
 
         if bucket.is_empty() {
             continue;
         }
 
-        let mean_mad: f64 = bucket.iter().map(|(_, _, m)| m).sum::<f64>() / bucket.len() as f64;
-        let (worst_pos, _, max_mad) = bucket
+        let mean_mad_java: f64 =
+            bucket.iter().map(|(_, _, j, _)| j).sum::<f64>() / bucket.len() as f64;
+        let mean_mad_rust: f64 =
+            bucket.iter().map(|(_, _, _, r)| r).sum::<f64>() / bucket.len() as f64;
+        let (worst_pos, _, max_java, max_rust) = bucket
             .iter()
-            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+            .max_by(|a, b| a.3.partial_cmp(&b.3).unwrap())
             .unwrap();
 
         // Track genotyped vs imputed
         if lo == 0 {
-            genotyped_mad = mean_mad;
+            genotyped_mad = mean_mad_rust;
         } else {
-            imputed_mad += mean_mad * bucket.len() as f64;
+            imputed_mad += mean_mad_rust * bucket.len() as f64;
             imputed_count += bucket.len();
         }
 
-        let status = if mean_mad > 0.05 { " FAIL" } else { "" };
-        if mean_mad > 0.05 {
+        let status = if mean_mad_rust > 0.05 { " FAIL" } else { "" };
+        if mean_mad_rust > 0.05 {
+            any_bucket_failed = true;
+        }
+        if mean_mad_rust > mean_mad_java {
             any_bucket_failed = true;
         }
 
@@ -3442,10 +3524,15 @@ fn test_dosage_by_distance_from_genotyped() {
             "{:>12} {:>8} {:>10.4} {:>10.4} {:>12}{}",
             label,
             bucket.len(),
-            mean_mad,
-            max_mad,
+            mean_mad_rust,
+            max_rust,
             worst_pos,
             status
+        );
+        println!(
+            "  Java mean MAD: {:.4} (max {:.4})",
+            mean_mad_java,
+            max_java
         );
     }
 
@@ -3461,10 +3548,10 @@ fn test_dosage_by_distance_from_genotyped() {
         imputed_mad - genotyped_mad
     );
 
-    // Strict: No bucket should have mean MAD > 0.05
+    // Strict: No bucket should have mean MAD > 0.05 and Rust must not be worse than Java
     assert!(
         !any_bucket_failed,
-        "DISTANCE TEST FAIL: At least one distance bucket has mean MAD > 0.05"
+        "DISTANCE TEST FAIL: Rust bucket MAD worse than Java or above threshold"
     );
 }
 
@@ -3474,6 +3561,7 @@ fn test_dosage_by_distance_from_genotyped() {
 #[serial]
 fn test_posterior_probability_calibration() {
     let source = &get_all_data_sources()[0];
+    let files = setup_test_files();
 
     println!("\n{}", "=".repeat(70));
     println!("=== GP Calibration vs Ground Truth ===");
@@ -3489,6 +3577,21 @@ fn test_posterior_probability_calibration() {
     let truth_path = work_dir.path().join("target_full.vcf.gz");
     fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
 
+    // Run Java
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", sparse_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
     // Run Rust imputation
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&sparse_path, work_dir.path());
@@ -3501,6 +3604,7 @@ fn test_posterior_probability_calibration() {
     );
 
     // Parse outputs
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
     let (_, truth_records) = parse_vcf(&truth_path);
 
@@ -3511,111 +3615,144 @@ fn test_posterior_probability_calibration() {
         truth_map.insert(rec.pos, gts);
     }
 
-    // Evaluate GP accuracy on imputed markers
-    let mut total_calls = 0;
-    let mut correct_max_gp = 0;
-    let mut brier_sum = 0.0;
+    let evaluate_gp = |records: &[ParsedRecord]| -> (usize, usize, f64) {
+        let mut total_calls = 0;
+        let mut correct_max_gp = 0;
+        let mut brier_sum = 0.0;
 
-    for r_rec in &rust_records {
-        // Only check imputed markers (where we had to guess)
-        if !r_rec.info.contains_key("IMP") {
-            continue;
-        }
-
-        // Get ground truth for this position
-        let truth_gts = match truth_map.get(&r_rec.pos) {
-            Some(gts) => gts,
-            None => continue,
-        };
-
-        for (s, r_gt) in r_rec.genotypes.iter().enumerate() {
-            if s >= truth_gts.len() {
+        for r_rec in records {
+            // Only check imputed markers (where we had to guess)
+            if !r_rec.info.contains_key("IMP") {
                 continue;
             }
 
-            let truth_gt = &truth_gts[s];
-            if truth_gt.contains('.') {
-                continue;
-            }
-
-            // Parse truth to genotype class (0, 1, 2)
-            let truth_class = if truth_gt == "0|0" || truth_gt == "0/0" {
-                0
-            } else if truth_gt == "0|1"
-                || truth_gt == "1|0"
-                || truth_gt == "0/1"
-                || truth_gt == "1/0"
-            {
-                1
-            } else if truth_gt == "1|1" || truth_gt == "1/1" {
-                2
-            } else {
-                continue;
+            // Get ground truth for this position
+            let truth_gts = match truth_map.get(&r_rec.pos) {
+                Some(gts) => gts,
+                None => continue,
             };
 
-            if let Some(gp) = &r_gt.gp {
-                if gp.len() < 3 {
+            for (s, r_gt) in r_rec.genotypes.iter().enumerate() {
+                if s >= truth_gts.len() {
                     continue;
                 }
 
-                total_calls += 1;
-
-                // Find predicted class (max GP)
-                let predicted_class = if gp[0] >= gp[1] && gp[0] >= gp[2] {
-                    0
-                } else if gp[1] >= gp[0] && gp[1] >= gp[2] {
-                    1
-                } else {
-                    2
-                };
-
-                if predicted_class == truth_class {
-                    correct_max_gp += 1;
+                let truth_gt = &truth_gts[s];
+                if truth_gt.contains('.') {
+                    continue;
                 }
 
-                // Brier score
-                let actual = [
-                    if truth_class == 0 { 1.0 } else { 0.0 },
-                    if truth_class == 1 { 1.0 } else { 0.0 },
-                    if truth_class == 2 { 1.0 } else { 0.0 },
-                ];
-                brier_sum += (gp[0] - actual[0]).powi(2)
-                    + (gp[1] - actual[1]).powi(2)
-                    + (gp[2] - actual[2]).powi(2);
+                // Parse truth to genotype class (0, 1, 2)
+                let truth_class = if truth_gt == "0|0" || truth_gt == "0/0" {
+                    0
+                } else if truth_gt == "0|1"
+                    || truth_gt == "1|0"
+                    || truth_gt == "0/1"
+                    || truth_gt == "1/0"
+                {
+                    1
+                } else if truth_gt == "1|1" || truth_gt == "1/1" {
+                    2
+                } else {
+                    continue;
+                };
+
+                if let Some(gp) = &r_gt.gp {
+                    if gp.len() < 3 {
+                        continue;
+                    }
+
+                    total_calls += 1;
+
+                    // Find predicted class (max GP)
+                    let predicted_class = if gp[0] >= gp[1] && gp[0] >= gp[2] {
+                        0
+                    } else if gp[1] >= gp[0] && gp[1] >= gp[2] {
+                        1
+                    } else {
+                        2
+                    };
+
+                    if predicted_class == truth_class {
+                        correct_max_gp += 1;
+                    }
+
+                    // Brier score
+                    let actual = [
+                        if truth_class == 0 { 1.0 } else { 0.0 },
+                        if truth_class == 1 { 1.0 } else { 0.0 },
+                        if truth_class == 2 { 1.0 } else { 0.0 },
+                    ];
+                    brier_sum += (gp[0] - actual[0]).powi(2)
+                        + (gp[1] - actual[1]).powi(2)
+                        + (gp[2] - actual[2]).powi(2);
+                }
             }
         }
-    }
 
-    let accuracy = if total_calls > 0 {
-        correct_max_gp as f64 / total_calls as f64
+        let accuracy = if total_calls > 0 {
+            correct_max_gp as f64 / total_calls as f64
+        } else {
+            0.0
+        };
+        let brier = if total_calls > 0 {
+            brier_sum / total_calls as f64
+        } else {
+            1.0
+        };
+        (total_calls, correct_max_gp, brier)
+    };
+
+    let (java_total, java_correct, java_brier) = evaluate_gp(&java_records);
+    let (rust_total, rust_correct, rust_brier) = evaluate_gp(&rust_records);
+    let java_acc = if java_total > 0 {
+        java_correct as f64 / java_total as f64
     } else {
         0.0
     };
-    let brier = if total_calls > 0 {
-        brier_sum / total_calls as f64
+    let rust_acc = if rust_total > 0 {
+        rust_correct as f64 / rust_total as f64
     } else {
-        1.0
+        0.0
     };
 
-    println!("\n  Total imputed genotype calls: {}", total_calls);
+    println!("\n  Total imputed genotype calls: Java={} Rust={}", java_total, rust_total);
     println!(
-        "  Correct by max(GP): {} ({:.2}%)",
-        correct_max_gp,
-        accuracy * 100.0
+        "  Correct by max(GP): Java={} ({:.2}%) Rust={} ({:.2}%)",
+        java_correct,
+        java_acc * 100.0,
+        rust_correct,
+        rust_acc * 100.0
     );
-    println!("  Brier score: {:.4} (lower is better, 0=perfect)", brier);
+    println!(
+        "  Brier score: Java={:.4} Rust={:.4} (lower is better, 0=perfect)",
+        java_brier, rust_brier
+    );
 
     // Assertions - reasonable thresholds for imputation
     assert!(
-        accuracy > 0.80,
+        rust_acc > 0.80,
         "GP ACCURACY FAIL: Only {:.2}% of max(GP) calls match ground truth (need > 80%)",
-        accuracy * 100.0
+        rust_acc * 100.0
     );
 
     assert!(
-        brier < 0.30,
+        rust_brier < 0.30,
         "GP BRIER FAIL: Brier score {:.4} too high (need < 0.30)",
-        brier
+        rust_brier
+    );
+
+    assert!(
+        rust_acc >= java_acc,
+        "GP ACCURACY FAIL: Rust ({:.2}%) worse than Java ({:.2}%)",
+        rust_acc * 100.0,
+        java_acc * 100.0
+    );
+    assert!(
+        rust_brier <= java_brier,
+        "GP BRIER FAIL: Rust ({:.4}) worse than Java ({:.4})",
+        rust_brier,
+        java_brier
     );
 
     println!("\n  GP calibration test PASSED!");
@@ -3811,6 +3948,7 @@ fn test_phasing_sanity_checks() {
         println!("=== Phasing Sanity Checks: {} ===", source.name);
         println!("{}", "=".repeat(70));
 
+        let files = setup_test_files();
         let work_dir = tempfile::tempdir().expect("Create temp dir");
 
         // Copy target to work dir
@@ -3841,6 +3979,25 @@ fn test_phasing_sanity_checks() {
         let rust_vcf = work_dir.path().join("rust_phased.vcf.gz");
         let (output_samples, output_records) = parse_vcf(&rust_vcf);
 
+        // Run Java phasing
+        let java_out = work_dir.path().join("java_phased");
+        let java_output = run_beagle(
+            &files.beagle_jar,
+            &[
+                ("gt", gt_path.to_str().unwrap()),
+                ("out", java_out.to_str().unwrap()),
+                ("seed", "42"),
+            ],
+            work_dir.path(),
+        );
+        assert!(
+            java_output.status.success(),
+            "{}: Java phasing failed",
+            source.name
+        );
+        let java_vcf = work_dir.path().join("java_phased.vcf.gz");
+        let (_, java_records) = parse_vcf(&java_vcf);
+
         // CHECK 1: Same number of markers and samples - Strict
         assert_eq!(
             input_n_markers,
@@ -3861,14 +4018,23 @@ fn test_phasing_sanity_checks() {
 
         // CHECK 2: All genotypes are phased and valid - Strict
         let mut unphased_count = 0;
+        let mut java_unphased_count = 0;
         let mut missing_introduced = 0;
         let mut allele_mismatch = 0;
 
-        for (i, (in_rec, out_rec)) in input_records.iter().zip(output_records.iter()).enumerate() {
-            for (s, (in_gt, out_gt)) in in_rec
+        for (i, (in_rec, out_rec, j_rec)) in input_records
+            .iter()
+            .zip(output_records.iter())
+            .zip(java_records.iter())
+            .map(|((a, b), c)| (a, b, c))
+            .enumerate()
+        {
+            for (s, (in_gt, out_gt, j_gt)) in in_rec
                 .genotypes
                 .iter()
                 .zip(out_rec.genotypes.iter())
+                .zip(j_rec.genotypes.iter())
+                .map(|((a, b), c)| (a, b, c))
                 .enumerate()
             {
                 // Check phasing (should contain |)
@@ -3877,6 +4043,9 @@ fn test_phasing_sanity_checks() {
                     if unphased_count <= 5 {
                         println!("  Unphased at marker {}, sample {}: {}", i, s, out_gt.gt);
                     }
+                }
+                if !j_gt.gt.contains('|') && !j_gt.gt.contains('.') {
+                    java_unphased_count += 1;
                 }
 
                 // Check no missing introduced (if input wasn't missing)
@@ -3907,6 +4076,7 @@ fn test_phasing_sanity_checks() {
 
         println!("\n[{}] Sanity check results:", source.name);
         println!("  Unphased genotypes: {}", unphased_count);
+        println!("  Java unphased genotypes: {}", java_unphased_count);
         println!("  Missing introduced: {}", missing_introduced);
         println!("  Allele mismatches: {}", allele_mismatch);
 
@@ -3925,11 +4095,20 @@ fn test_phasing_sanity_checks() {
         );
         // Strict: Almost all genotypes must be phased (< 1% unphased for non-hom sites)
         let unphased_rate = unphased_count as f64 / (input_n_markers * input_n_samples) as f64;
+        let java_unphased_rate =
+            java_unphased_count as f64 / (input_n_markers * input_n_samples) as f64;
         assert!(
             unphased_rate < 0.01,
             "{}: Too many unphased genotypes: {:.2}% (must be < 1%)",
             source.name,
             unphased_rate * 100.0
+        );
+        assert!(
+            unphased_rate <= java_unphased_rate,
+            "{}: Rust unphased rate {:.2}% worse than Java {:.2}%",
+            source.name,
+            unphased_rate * 100.0,
+            java_unphased_rate * 100.0
         );
 
         println!("\n[{}] Phasing sanity checks PASSED!", source.name);
