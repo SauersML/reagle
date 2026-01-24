@@ -50,6 +50,9 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum mismatch probability to prevent numerical instability
+    pub const MIN_MISMATCH_PROB: f32 = 1e-12;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -104,7 +107,11 @@ impl ModelParams {
         err: Option<f32>,
     ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
+        // Default to 1e-8 instead of Li-Stephens if not specified, to prevent
+        // "Perfect LD Trap" where rare variants are ignored due to insufficient mismatch penalty.
+        // We need p_err * N_common < p_switch * 1 (where 1 is rare hap count).
+        // For N=360, p_err must be < 1e-7. We use 1e-10 to be safe against larger N or smaller r.
+        let p_mismatch = err.unwrap_or(1e-10);
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 
@@ -175,9 +182,9 @@ impl ModelParams {
     /// Update mismatch probability (for EM estimation)
     ///
     /// From Java `PhaseData.updatePMismatch`:
-    /// Only update if new value is valid and greater than current
+    /// Update if new value is valid, within bounds, and greater than minimum
     pub fn update_p_mismatch(&mut self, new_p: f32) {
-        if new_p.is_finite() && new_p > self.p_mismatch && new_p < 0.5 {
+        if new_p.is_finite() && new_p >= Self::MIN_MISMATCH_PROB && new_p < 0.5 {
             self.p_mismatch = new_p;
         }
     }
