@@ -646,11 +646,26 @@ target_samples={} target_bytes={}",
 
             // Mark imputed markers
             for (ref_m, &target_idx) in alignment.ref_to_target.iter().enumerate() {
-                if target_idx < 0 {
-                    window_quality.set_imputed(ref_m, true);
-                } else {
-                    window_quality.set_imputed(ref_m, false);
+                let mut is_imputed = target_idx < 0;
+
+                if !is_imputed {
+                    // Check for partial/imperfect alignment
+                    if let Some(Some(mapping)) = alignment.allele_mappings.get(target_idx as usize) {
+                        // Check for partial match (any target allele maps to -1)
+                        if mapping.targ_to_ref.iter().any(|&x| x < 0) {
+                            is_imputed = true;
+                        }
+                        // Check for swapped/flipped alleles
+                        if mapping.alleles_swapped || mapping.strand_flipped {
+                            is_imputed = true;
+                        }
+                    } else {
+                        // Should not happen if target_idx >= 0, but if mapping is missing, treat as imputed
+                        is_imputed = true;
+                    }
                 }
+
+                window_quality.set_imputed(ref_m, is_imputed);
             }
 
             // Check if we have haplotype priors from previous window for soft-information handoff
