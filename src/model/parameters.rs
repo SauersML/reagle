@@ -50,9 +50,6 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
-    /// Minimum mismatch probability (prevents perfect LD trap)
-    pub const MIN_MISMATCH_PROB: f32 = 0.001;
-
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -133,12 +130,12 @@ impl ModelParams {
     /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
         if n_haps <= 1 {
-            return Self::MIN_MISMATCH_PROB;
+            return 0.0001;
         }
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(Self::MIN_MISMATCH_PROB)
+        val.max(1e-8)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -341,20 +338,16 @@ mod tests {
 
     #[test]
     fn test_li_stephens_p_mismatch() {
-        // Assert that the mismatch probability never drops below MIN_MISMATCH_PROB
-        let min_prob = ModelParams::MIN_MISMATCH_PROB;
         let p = ModelParams::li_stephens_p_mismatch(1000);
-        assert!(p >= min_prob);
-        assert!(p < 0.01);
+        assert!(p > 0.0 && p < 0.01);
 
-        // More haplotypes -> lower mismatch probability (or clamped)
+        // More haplotypes -> lower mismatch probability
         let p2 = ModelParams::li_stephens_p_mismatch(10000);
-        assert!(p2 <= p);
-        assert!(p2 >= min_prob);
+        assert!(p2 < p);
 
         // Edge case
         let p0 = ModelParams::li_stephens_p_mismatch(0);
-        assert_eq!(p0, min_prob);
+        assert_eq!(p0, 0.0001);
     }
 
     #[test]
