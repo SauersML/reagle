@@ -50,6 +50,9 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum mismatch probability (to handle Perfect LD Trap)
+    pub const MIN_MISMATCH_PROB: f32 = 1e-9;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -99,12 +102,14 @@ impl ModelParams {
     /// - pRecomb: uses refGT.nHaps() (ref only)
     pub fn for_imputation(
         n_ref_haps: usize,
-        n_total_haps: usize,
+        _n_total_haps: usize,
         ne: f32,
         err: Option<f32>,
     ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
+        // NOTE: We default to MIN_MISMATCH_PROB instead of Li-Stephens approximation
+        // to avoid the "Perfect LD Trap" where rare variants are missed in strong LD regions
+        let p_mismatch = err.unwrap_or(Self::MIN_MISMATCH_PROB);
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 
@@ -135,7 +140,7 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        val.max(Self::MIN_MISMATCH_PROB)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -344,6 +349,7 @@ mod tests {
         // More haplotypes -> lower mismatch probability
         let p2 = ModelParams::li_stephens_p_mismatch(10000);
         assert!(p2 < p);
+        assert!(p2 >= ModelParams::MIN_MISMATCH_PROB);
 
         // Edge case
         let p0 = ModelParams::li_stephens_p_mismatch(0);
