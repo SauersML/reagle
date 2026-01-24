@@ -38,6 +38,9 @@ impl ModelParams {
     /// Default phase states
     pub const DEFAULT_PHASE_STATES: usize = 280;
 
+    /// Minimum mismatch probability to prevent numerical issues
+    pub const MIN_MISMATCH_PROB: f32 = 1e-6;
+
     /// Default imputation states
     pub const DEFAULT_IMP_STATES: usize = 1600;
 
@@ -103,8 +106,10 @@ impl ModelParams {
         ne: f32,
         err: Option<f32>,
     ) -> Self {
-        // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
+        // Error rate: Use fixed 1e-5 for imputation if not specified.
+        // Li-Stephens formula (approx 1/N) tends to be too high for rare variant imputation
+        // in small/medium reference panels, preventing the model from switching to rare haplotypes.
+        let p_mismatch = err.unwrap_or(1e-5);
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 
