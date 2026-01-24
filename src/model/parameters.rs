@@ -50,6 +50,9 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum recombination probability (prevents zero probability in perfect LD)
+    pub const MIN_RECOMB_PROB: f32 = 1e-9;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -169,7 +172,8 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        (-f64::exp_m1(c * gen_dist_cm)) as f32
+        let val = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        val.max(Self::MIN_RECOMB_PROB)
     }
 
     /// Update mismatch probability (for EM estimation)
@@ -363,9 +367,9 @@ mod tests {
     fn test_p_recomb() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // No distance -> no recomb
+        // No distance -> min recomb
         let p0 = params.p_recomb(0.0);
-        assert!(p0.abs() < 0.0001);
+        assert!((p0 - ModelParams::MIN_RECOMB_PROB).abs() < 1e-10);
 
         // Small distance -> small prob
         let p1 = params.p_recomb(0.001);
