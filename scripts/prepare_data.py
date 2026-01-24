@@ -16,6 +16,34 @@ def _resolve_local_panel_path():
             return p
     return None
 
+def _clean_output_dir(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    for name in ("panel.vcf", "panel.vcf.gz", "genotypes.vcf", "genotypes.vcf.gz"):
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+
+def _find_genotypes_vcf(output_dir):
+    for name in ("genotypes.vcf", "genotypes.vcf.gz"):
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+def _update_panel_if_present(output_dir, panel_path):
+    panel_candidates = [
+        os.path.join(output_dir, "panel.vcf"),
+        os.path.join(output_dir, "panel.vcf.gz"),
+    ]
+    panel_source = next((p for p in panel_candidates if os.path.exists(p)), None)
+    if not panel_source:
+        return False
+
+    print(f"Updated panel detected at {panel_source}, updating {panel_path}...")
+    subprocess.check_call(["bcftools", "view", panel_source, "-Oz", "-o", panel_path])
+    subprocess.check_call(["bcftools", "index", "-f", panel_path])
+    return True
+
 def install_convert_genome():
     """Installs convert_genome using the official install script (pre-compiled binary)."""
     print("Installing convert_genome...")
@@ -176,13 +204,15 @@ def prepare_truth(source, output_vcf):
     install_convert_genome()
 
     ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    truth_output_dir = "convert_genome_truth_out"
+    _clean_output_dir(truth_output_dir)
     truth_hg38_vcf = "truth_hg38.vcf.gz"
 
     cmd = [
         "convert_genome",
         source_vcf,
         ref_hg38_url,
-        truth_hg38_vcf,
+        "--output-dir", truth_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
@@ -191,7 +221,14 @@ def prepare_truth(source, output_vcf):
 
     print(f"Running: {' '.join(cmd)}")
     subprocess.check_call(cmd)
+
+    truth_raw_vcf = _find_genotypes_vcf(truth_output_dir)
+    if not truth_raw_vcf:
+        raise RuntimeError("convert_genome failed to produce genotypes.vcf")
+
+    subprocess.check_call(["bcftools", "view", truth_raw_vcf, "-Oz", "-o", truth_hg38_vcf])
     subprocess.check_call(["bcftools", "index", "-f", truth_hg38_vcf])
+    _update_panel_if_present(truth_output_dir, panel_path)
 
     # Rename chroms (22 -> chr22) to match reference panel which uses chr22 notation
     with open("chr_map.txt", "w") as f:
@@ -225,7 +262,8 @@ def run_conversion(input_path, output_vcf):
     print(f"Converting {raw_file} to GRCh38 VCF...")
 
     ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
-    temp_hg38_vcf = "temp_hg38.vcf"
+    temp_output_dir = "convert_genome_array_out"
+    _clean_output_dir(temp_output_dir)
 
     panel_path = _resolve_local_panel_path()
     if not panel_path:
@@ -237,7 +275,7 @@ def run_conversion(input_path, output_vcf):
         "convert_genome",
         raw_file,
         ref_hg38_url,
-        temp_hg38_vcf,
+        "--output-dir", temp_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
@@ -247,8 +285,9 @@ def run_conversion(input_path, output_vcf):
     print(f"Running: {' '.join(cmd)}")
     subprocess.check_call(cmd)
 
-    if not os.path.exists(temp_hg38_vcf):
-        raise RuntimeError("convert_genome failed to produce temp_hg38.vcf")
+    temp_hg38_vcf = _find_genotypes_vcf(temp_output_dir)
+    if not temp_hg38_vcf:
+        raise RuntimeError("convert_genome failed to produce genotypes.vcf")
 
     print("Finalizing GRCh38 output...")
     print("Filtering invalid records (missing ALT but non-ref GT)...")
@@ -256,11 +295,8 @@ def run_conversion(input_path, output_vcf):
     subprocess.check_call(filter_cmd, shell=True)
     subprocess.check_call(["bcftools", "index", "-f", output_vcf])
     print("Conversion complete.")
+    _update_panel_if_present(temp_output_dir, panel_path)
 
-    # Cleanup
-    if os.path.exists("temp_hg38.vcf"):
-        os.remove("temp_hg38.vcf")
-        
     # Cleanup extracted if it was temp
     if "extracted" in raw_file:
         shutil.rmtree(os.path.dirname(raw_file))
