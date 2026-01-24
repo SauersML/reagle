@@ -50,10 +50,18 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum mismatch probability to prevent "Perfect LD Trap"
+    ///
+    /// If p_mismatch is too low, the HMM may become too confident in a haplotype
+    /// that matches the target perfectly at genotyped sites, but lacks a rare variant
+    /// that is actually present (and in perfect LD). A small floor on the mismatch
+    /// probability allows the HMM to consider other haplotypes.
+    pub const MIN_MISMATCH_PROB: f32 = 0.001;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
-            p_mismatch: 0.0001,
+            p_mismatch: Self::MIN_MISMATCH_PROB,
             recomb_intensity: 1.0,
             n_states: Self::DEFAULT_PHASE_STATES,
             burnin: Self::DEFAULT_BURNIN,
@@ -130,12 +138,12 @@ impl ModelParams {
     /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
         if n_haps <= 1 {
-            return 0.0001;
+            return Self::MIN_MISMATCH_PROB;
         }
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        val.max(Self::MIN_MISMATCH_PROB)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -281,9 +289,9 @@ impl ParamEstimates {
     pub fn p_mismatch(&self) -> f32 {
         let total = self.sum_match_probs + self.sum_mismatch_probs;
         if total <= 0.0 {
-            return 0.0001;
+            return ModelParams::MIN_MISMATCH_PROB;
         }
-        (self.sum_mismatch_probs / total) as f32
+        ((self.sum_mismatch_probs / total) as f32).max(ModelParams::MIN_MISMATCH_PROB)
     }
 
     /// Number of switch observations
@@ -343,11 +351,12 @@ mod tests {
 
         // More haplotypes -> lower mismatch probability
         let p2 = ModelParams::li_stephens_p_mismatch(10000);
-        assert!(p2 < p);
+        assert!(p2 <= p);
+        assert!(p2 >= ModelParams::MIN_MISMATCH_PROB);
 
         // Edge case
         let p0 = ModelParams::li_stephens_p_mismatch(0);
-        assert_eq!(p0, 0.0001);
+        assert_eq!(p0, ModelParams::MIN_MISMATCH_PROB);
     }
 
     #[test]
