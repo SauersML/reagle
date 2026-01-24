@@ -113,7 +113,7 @@ pub struct Config {
 
     // ============ General Parameters ============
     /// Effective population size
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "10000")]
     pub ne: f32,
 
     /// Allele mismatch probability (auto-calculated if not specified)
@@ -175,7 +175,7 @@ impl Default for Config {
             pbwt_batch_mb: 256,
             ap: false,
             gp: false,
-            ne: 100000.0,
+            ne: 10000.0,
             err: None,
             em: true,
             window: 40.0,
