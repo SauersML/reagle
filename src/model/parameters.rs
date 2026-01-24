@@ -50,6 +50,9 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum mismatch probability to ensure numerical stability and avoid zero probability
+    pub const MIN_MISMATCH_PROB: f32 = 1e-9;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -135,7 +138,7 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        val.max(Self::MIN_MISMATCH_PROB)
     }
 
     /// Calculate LR threshold for a given iteration
