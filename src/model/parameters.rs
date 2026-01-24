@@ -50,10 +50,13 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Minimum mismatch probability to prevent Perfect LD Trap
+    pub const MIN_MISMATCH_PROB: f32 = 0.0001;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
-            p_mismatch: 0.0001,
+            p_mismatch: Self::MIN_MISMATCH_PROB,
             recomb_intensity: 1.0,
             n_states: Self::DEFAULT_PHASE_STATES,
             burnin: Self::DEFAULT_BURNIN,
@@ -130,12 +133,12 @@ impl ModelParams {
     /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
         if n_haps <= 1 {
-            return 0.0001;
+            return Self::MIN_MISMATCH_PROB;
         }
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        val.max(Self::MIN_MISMATCH_PROB)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -338,16 +341,26 @@ mod tests {
 
     #[test]
     fn test_li_stephens_p_mismatch() {
-        let p = ModelParams::li_stephens_p_mismatch(1000);
-        assert!(p > 0.0 && p < 0.01);
-
-        // More haplotypes -> lower mismatch probability
-        let p2 = ModelParams::li_stephens_p_mismatch(10000);
-        assert!(p2 < p);
-
-        // Edge case
+        // Small N -> uses MIN_MISMATCH_PROB
         let p0 = ModelParams::li_stephens_p_mismatch(0);
-        assert_eq!(p0, 0.0001);
+        assert_eq!(p0, ModelParams::MIN_MISMATCH_PROB);
+
+        // Medium N -> should be slightly above min?
+        // n=1000 -> val ~ 6.7e-5 -> clamped to 1e-4
+        let p1000 = ModelParams::li_stephens_p_mismatch(1000);
+        assert_eq!(p1000, ModelParams::MIN_MISMATCH_PROB);
+
+        // Huge N -> calculated value is tiny -> clamped to min
+        let p_huge = ModelParams::li_stephens_p_mismatch(1_000_000);
+        assert_eq!(p_huge, ModelParams::MIN_MISMATCH_PROB);
+
+        // Verify it works for small but > 1 N (if formula gives > min)
+        // theta = 1/(ln(2)+0.5) = 1/1.19 = 0.84
+        // val = 0.84 / (2*(0.84+2)) = 0.84 / 5.68 = 0.147
+        // 0.147 > 0.0001
+        let p2 = ModelParams::li_stephens_p_mismatch(2);
+        assert!(p2 > ModelParams::MIN_MISMATCH_PROB);
+        assert!(p2 < 0.2);
     }
 
     #[test]
