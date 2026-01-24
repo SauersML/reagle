@@ -1760,6 +1760,8 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
     let truth_path = work_dir.path().join("target_full.vcf.gz");
     fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
+    let truth_path = work_dir.path().join("target_full.vcf.gz");
+    fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
 
     // Create a masked version of the sparse target (mask 20% of remaining genotypes)
     let masked_path = work_dir.path().join("masked.vcf");
@@ -3690,11 +3692,6 @@ fn test_posterior_probability_calibration() {
             }
         }
 
-        let accuracy = if total_calls > 0 {
-            correct_max_gp as f64 / total_calls as f64
-        } else {
-            0.0
-        };
         let brier = if total_calls > 0 {
             brier_sum / total_calls as f64
         } else {
