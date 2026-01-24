@@ -50,8 +50,8 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
-    /// Minimum mismatch probability to ensure numerical stability and avoid zero probability
-    pub const MIN_MISMATCH_PROB: f32 = 1e-9;
+    /// Minimum recombination probability to avoid the "Perfect LD Trap"
+    pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
     /// Create default parameters
     pub fn new() -> Self {
@@ -138,7 +138,7 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(Self::MIN_MISMATCH_PROB)
+        val.max(1e-8)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -172,7 +172,14 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        (-f64::exp_m1(c * gen_dist_cm)) as f32
+        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        // Apply minimal recombination clamp to avoid "Perfect LD Trap"
+        // If distance > 0, we ensure a minimal probability to allow switching away from bad states
+        if gen_dist_cm > f64::EPSILON {
+            p.max(Self::MIN_RECOMB_PROB)
+        } else {
+            p
+        }
     }
 
     /// Update mismatch probability (for EM estimation)
