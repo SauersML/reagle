@@ -102,6 +102,8 @@ pub struct PhasingPipeline {
     /// Marker alignment between target and reference
     alignment: Option<MarkerAlignment>,
     telemetry: Option<Arc<TelemetryBlackboard>>,
+    /// Preserve externally set parameters (do not overwrite in phase_in_memory)
+    preserve_params: bool,
 }
 
 struct FwdCheckpoints {
@@ -575,7 +577,14 @@ impl PhasingPipeline {
             reference_gt: None,
             alignment: None,
             telemetry,
+            preserve_params: false,
         }
+    }
+
+    /// Set params explicitly and prevent overwriting during phase_in_memory
+    pub fn set_params(&mut self, params: ModelParams) {
+        self.params = params;
+        self.preserve_params = true;
     }
 
     /// Set reference panel for reference-guided phasing
@@ -1181,9 +1190,18 @@ impl PhasingPipeline {
             return Ok((target_gt.clone().into_phased(), None, None));
         }
 
-        self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        if !self.preserve_params {
+            self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
+            self.params
+                .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        } else {
+            // Even when preserving params, ensure n_states doesn't exceed total haplotypes
+            let current_states = self.params.n_states;
+            let max_states = n_total_haps.saturating_sub(2).max(1);
+            if current_states > max_states {
+                self.params.set_n_states(max_states);
+            }
+        }
 
         // Initialize genotypes preserving actual allele values including missing (255)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {

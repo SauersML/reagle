@@ -762,6 +762,7 @@ target_samples={} target_bytes={}",
     ) -> Result<GenotypeMatrix<Phased>> {
         let mut phasing =
             crate::pipelines::PhasingPipeline::new(self.config.clone(), self.telemetry.clone());
+        phasing.set_params(self.params.clone());
         if let Some(ref_gt) = ref_gt {
             let ref_gt_arc = Arc::new(ref_gt.clone());
             phasing.set_reference(ref_gt_arc, alignment.clone());
