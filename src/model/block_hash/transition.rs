@@ -392,6 +392,7 @@ fn aggregate_reservoir_transitions(sorted: Vec<(PatternId, f32)>) -> (Vec<Patter
 mod tests {
     use super::*;
     use crate::data::marker::Markers;
+    use crate::data::marker::Nucleotide;
     use crate::data::storage::GenotypeColumn;
     use crate::model::block_hash::compression::build_compressed_block_from_columns;
 

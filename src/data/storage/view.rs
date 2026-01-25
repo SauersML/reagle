@@ -144,7 +144,7 @@ mod tests {
     use super::*;
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
-    use crate::data::marker::{Allele, Marker};
+    use crate::data::marker::{Allele, Marker, Nucleotide};
     use crate::data::storage::GenotypeColumn;
     use crate::data::storage::phase_state::Phased;
     use std::sync::Arc;

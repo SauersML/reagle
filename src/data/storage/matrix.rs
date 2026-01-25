@@ -433,7 +433,7 @@ impl GenotypeMatrix<Phased> {
 mod tests {
     use super::*;
     use crate::data::ChromIdx;
-    use crate::data::marker::Allele;
+    use crate::data::marker::{Allele, Nucleotide};
 
     fn make_test_matrix_phased() -> GenotypeMatrix<Phased> {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));

@@ -359,7 +359,7 @@ impl GeneticMaps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::marker::{Allele, Marker};
+    use crate::data::marker::{Allele, Marker, Nucleotide};
 
     /// Get the path to the PLINK genetic map fixture
     fn fixture_map_path() -> std::path::PathBuf {

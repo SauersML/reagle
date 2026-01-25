@@ -2344,7 +2344,7 @@ mod tests {
     use crate::data::ChromIdx;
     use crate::data::alignment::MarkerAlignment;
     use crate::data::haplotype::Samples;
-    use crate::data::marker::{Allele, Marker, Markers};
+    use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::storage::GenotypeColumn;
     use crate::io::bref3::StreamingRefVcfReader;
     use crate::io::vcf::{ImputationQuality, VcfWriter};
@@ -2361,8 +2361,8 @@ mod tests {
                 chrom,
                 pos,
                 Some(format!("m{idx}").into()),
-                Allele::Base(b'A'),
-                vec![Allele::Base(b'C')],
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::C)],
             );
             markers.push(marker);
         }

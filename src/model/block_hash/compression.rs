@@ -457,6 +457,7 @@ fn compute_reservoir_ld(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::marker::Nucleotide;
 
     use crate::data::marker::Markers;
     use crate::data::storage::GenotypeColumn;

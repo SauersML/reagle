@@ -1376,6 +1376,7 @@ impl StreamingRefVcfReader {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use crate::data::marker::Nucleotide;
 
     #[test]
     fn test_read_be_i32() {

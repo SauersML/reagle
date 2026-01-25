@@ -1943,7 +1943,7 @@ fn test_high_density_array_imputation() {
 #[test]
 #[serial]
 fn test_phasing_confidence() {
-    use reagle::data::{ChromIdx, MarkerIdx, SampleIdx};
+    use reagle::data::{ChromIdx, MarkerIdx, SampleIdx, HapIdx};
     use reagle::data::genetic_map::GeneticMaps;
     use reagle::data::haplotype::Samples;
     use reagle::data::marker::{Allele, Marker, Markers};
@@ -2130,6 +2130,76 @@ fn test_phasing_confidence() {
     }
     println!("Aligned markers: {} / {}, with allele_mappings: {} / {}",
         aligned_count, n_markers, has_mapping_count, n_markers);
+
+    // TEST 1: Verify target has heterozygotes
+    let mut het_count = 0;
+    for m in 0..5 {
+        let col = target_gt.column(MarkerIdx::new(m as u32));
+        for s in 0..n_target_samples {
+            let si = SampleIdx::new(s as u32);
+            let a1 = col.get(si.hap1());
+            let a2 = col.get(si.hap2());
+            if a1 != a2 {
+                het_count += 1;
+                if het_count <= 3 {
+                    println!("Target: sample {} marker {} = {}/{} (het)", s, m, a1, a2);
+                }
+            }
+        }
+    }
+    assert!(het_count > 0, "Target must have heterozygotes");
+    println!("Target heterozygotes in first 5 markers: {}", het_count);
+
+    // TEST 2: Verify reference has expected patterns
+    let ref_col0 = ref_gt.column(MarkerIdx::new(0));
+    let ref_col20 = ref_gt.column(MarkerIdx::new(20));
+    println!("Ref marker 0 (block 0, expect 0/1 split): hap0={}, hap50={}, hap100={}, hap150={}",
+        ref_col0.get(HapIdx::new(0)),
+        ref_col0.get(HapIdx::new(50)),
+        ref_col0.get(HapIdx::new(100)),
+        ref_col0.get(HapIdx::new(150))
+    );
+    println!("Ref marker 20 (block 1, expect 1/0 split): hap0={}, hap50={}, hap100={}, hap150={}",
+        ref_col20.get(HapIdx::new(0)),
+        ref_col20.get(HapIdx::new(50)),
+        ref_col20.get(HapIdx::new(100)),
+        ref_col20.get(HapIdx::new(150))
+    );
+
+    // TEST 1: Verify target has heterozygotes
+    let mut het_count = 0;
+    for m in 0..5 {
+        let col = target_gt.column(MarkerIdx::new(m as u32));
+        for s in 0..n_target_samples {
+            let si = SampleIdx::new(s as u32);
+            let a1 = col.get(si.hap1());
+            let a2 = col.get(si.hap2());
+            if a1 != a2 {
+                het_count += 1;
+                if het_count <= 3 {
+                    println!("Target: sample {} marker {} = {}/{} (het)", s, m, a1, a2);
+                }
+            }
+        }
+    }
+    assert!(het_count > 0, "Target must have heterozygotes");
+    println!("Target heterozygotes in first 5 markers: {}", het_count);
+
+    // TEST 2: Verify reference has expected patterns
+    let ref_col0 = ref_gt.column(MarkerIdx::new(0));
+    let ref_col20 = ref_gt.column(MarkerIdx::new(20));
+    println!("Ref marker 0 (block 0, expect 0/1 split): hap0={}, hap50={}, hap100={}, hap150={}",
+        ref_col0.get(HapIdx::new(0)),
+        ref_col0.get(HapIdx::new(50)),
+        ref_col0.get(HapIdx::new(100)),
+        ref_col0.get(HapIdx::new(150))
+    );
+    println!("Ref marker 20 (block 1, expect 1/0 split): hap0={}, hap50={}, hap100={}, hap150={}",
+        ref_col20.get(HapIdx::new(0)),
+        ref_col20.get(HapIdx::new(50)),
+        ref_col20.get(HapIdx::new(100)),
+        ref_col20.get(HapIdx::new(150))
+    );
 
     pipeline.set_reference(std::sync::Arc::new(ref_gt), alignment);
 

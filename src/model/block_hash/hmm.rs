@@ -557,7 +557,7 @@ fn pattern_idx_to_id(idx: usize) -> PatternId {
 mod tests {
     use super::*;
     use crate::data::haplotype::Samples;
-    use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
+    use crate::data::marker::{Allele, Marker, MarkerIdx, Markers, Nucleotide};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
     use crate::model::block_hash::compression::build_compressed_block_from_columns;
     use std::sync::Arc;

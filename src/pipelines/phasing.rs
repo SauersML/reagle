@@ -6028,6 +6028,7 @@ mod tests {
 
         let n_markers = 50;
         let n_samples = 10;
+        use crate::data::marker::Nucleotide;
 
         // Mock Markers
         let mut markers = Markers::new();
@@ -6038,8 +6039,8 @@ mod tests {
                 ChromIdx::new(0),
                 i as u32 * 1000,
                 Some(format!("m{}", i).into()),
-                Allele::Base(b'A'),
-                vec![Allele::Base(b'T')],
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::T)],
             );
             markers.push(m);
         }

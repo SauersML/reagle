@@ -1024,7 +1024,7 @@ mod tests {
     use super::*;
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
-    use crate::data::marker::{Allele, Marker, Markers};
+    use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
     use std::sync::Arc;
 
