@@ -2616,17 +2616,9 @@ def stage_prepare_chr(chrom):
         regions_file = data_dir / f"gsa_chr{chrom}.regions"
         create_regions_file(gsa_sites, str(regions_file))
         
-        # Downsample and unphase
-        tmp_phased = data_dir / "input_phased_tmp.vcf.gz"
-        run(f"bcftools view -R {regions_file} {paths['truth_vcf']} -O z -o {tmp_phased}")
-        # Keep phased version for IMPUTE5 (which requires phased input)
-        phased_input = data_dir / "input_phased.vcf.gz"
-        run(f"cp {tmp_phased} {phased_input}")
-        run(f"bcftools index -f {phased_input}")
-        # Create unphased version for Beagle/Reagle
-        run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
+        # Downsample to array sites (keep phased for fair comparison)
+        run(f"bcftools view -R {regions_file} {paths['truth_vcf']} -O z -o {paths['input_vcf']}")
         run(f"bcftools index -f {paths['input_vcf']}")
-        os.remove(tmp_phased)
     
     print(f"Chromosome {chrom} preparation complete.")
 
@@ -2719,16 +2711,13 @@ def run_impute5_chr(chrom, paths):
         try:
             # IMPUTE5 requires an indexed reference and map file usually, but minimal example:
             # --h reference --g input --r region --o output
-            # IMPUTE5 requires PHASED input - use input_phased.vcf.gz
-            phased_input = data_dir / "input_phased.vcf.gz"
-            if not phased_input.exists():
-                raise RuntimeError(f"Phased input not found: {phased_input}. Run stage_prepare_chr first.")
+            # All tools now use phased input for fair comparison
             region_arg = resolve_region_arg(paths, chrom)
             print_tool_help("IMPUTE5", str(impute5_bin))
             print(f"IMPUTE5 region: {region_arg}")
             print(f"IMPUTE5 ref: {paths['ref_vcf']}")
-            print(f"IMPUTE5 input (phased): {phased_input}")
-            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {phased_input} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
+            print(f"IMPUTE5 input (phased): {paths['input_vcf']}")
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
             run(f"bcftools index -f {out}")
         except Exception as e:
             print(f"IMPUTE5 failed on chr{chrom}: {e}")
@@ -3257,6 +3246,8 @@ def stage_summary():
     md_lines.append("# 🧬 Imputation Benchmark Results")
     md_lines.append(f"**{chr_desc}**")
     md_lines.append(f"*Metrics aggregated exactly across all sites (Dosage R²).*")
+    md_lines.append(f"")
+    md_lines.append(f"**Test Setup:** All tools receive pre-phased genotype array data (GSA v2 sites) as input for fair comparison. Reference panel: HGDP+1kG phased haplotypes.")
     
     # Winner badges
     best_r2 = max(final_metrics, key=lambda x: x['r2'])
