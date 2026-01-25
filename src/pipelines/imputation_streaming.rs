@@ -11,6 +11,7 @@ use std::thread;
 
 use rayon::prelude::*;
 use tracing::{info_span, instrument, warn};
+use sysinfo::System;
 
 use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
@@ -29,6 +30,7 @@ use crate::model::block_hash::hmm::TargetAlleleProbs;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
+use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, infer_n_alleles_from_pl_len,
 };
@@ -56,6 +58,286 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
         push_unique(&mut candidates, format!("CHR{}", chrom));
     }
     candidates
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ImputeRefMode {
+    Lossless,
+    PbwtSubset,
+    Truncated,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AutoImputePlan {
+    mode: ImputeRefMode,
+    max_states: usize,
+}
+
+const PBWT_SELECT_BLOCK_CM: f64 = 0.05;
+const PBWT_MIN_PER_HAP: usize = 8;
+const PBWT_MAX_PER_HAP: usize = 256;
+const IMPUTE_RAM_FRACTION: f64 = 0.25;
+
+fn available_memory_bytes() -> Option<u64> {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let avail_kb = sys.available_memory();
+    if avail_kb == 0 {
+        None
+    } else {
+        Some(avail_kb.saturating_mul(1024))
+    }
+}
+
+fn estimate_max_states(
+    available_bytes: u64,
+    n_threads: usize,
+    window_markers: usize,
+    block_size: usize,
+) -> usize {
+    if available_bytes == 0 || n_threads == 0 || window_markers == 0 || block_size == 0 {
+        return 0;
+    }
+    let n_blocks = (window_markers + block_size - 1) / block_size;
+    let per_state_bytes = 4usize.saturating_mul(3 + n_blocks + window_markers);
+    if per_state_bytes == 0 {
+        return 0;
+    }
+    let budget = (available_bytes as f64 * IMPUTE_RAM_FRACTION) as u64;
+    let per_thread = budget / n_threads.max(1) as u64;
+    (per_thread as usize) / per_state_bytes
+}
+
+fn partition_markers_by_cm(gen_positions: &[f64], block_cm: f64) -> Vec<(usize, usize)> {
+    if gen_positions.is_empty() {
+        return Vec::new();
+    }
+    let mut blocks = Vec::new();
+    let mut start = 0usize;
+    let mut start_pos = gen_positions[0];
+    for (i, &pos) in gen_positions.iter().enumerate() {
+        if pos - start_pos >= block_cm {
+            blocks.push((start, i));
+            start = i;
+            start_pos = pos;
+        }
+    }
+    if start < gen_positions.len() {
+        blocks.push((start, gen_positions.len()));
+    }
+    blocks
+}
+
+fn pbwt_select_keep_mask(
+    target_gt: &GenotypeMatrix<Phased>,
+    ref_gt: &GenotypeMatrix<Phased>,
+    alignment: &MarkerAlignment,
+    gen_maps: &GeneticMaps,
+    max_states: usize,
+) -> Option<Vec<bool>> {
+    let n_markers = target_gt.n_markers();
+    let n_ref_haps = ref_gt.n_haplotypes();
+    let n_target_haps = target_gt.n_haplotypes();
+    if n_markers == 0 || n_ref_haps == 0 || n_target_haps == 0 {
+        return None;
+    }
+    if max_states == 0 || max_states >= n_ref_haps {
+        return None;
+    }
+
+    let k_per_hap = (max_states / n_target_haps.max(1))
+        .clamp(PBWT_MIN_PER_HAP, PBWT_MAX_PER_HAP)
+        .min(max_states)
+        .max(1);
+
+    let markers = target_gt.markers();
+    let mut gen_positions = Vec::with_capacity(n_markers);
+    for m in 0..n_markers {
+        let marker = markers.marker(MarkerIdx::new(m as u32));
+        let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
+        gen_positions.push(gen_pos);
+    }
+
+    let donor_blocks = partition_markers_by_cm(&gen_positions, PBWT_SELECT_BLOCK_CM);
+    let mut sampling_points = vec![false; n_markers];
+    if donor_blocks.is_empty() {
+        sampling_points.fill(true);
+    } else {
+        for &(s, e) in &donor_blocks {
+            if s < n_markers {
+                sampling_points[s] = true;
+            }
+            if e > 0 {
+                sampling_points[e - 1] = true;
+            }
+        }
+        sampling_points[n_markers - 1] = true;
+    }
+
+    let mut counts = vec![0u32; n_ref_haps];
+    let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
+    let mut beams_fwd: Vec<RankBeam> = (0..n_target_haps)
+        .map(|_| RankBeam::full(n_ref_haps as u32))
+        .collect();
+    let mut ref_alleles = vec![0u8; n_ref_haps];
+    let mut query_alleles = vec![0u8; n_target_haps];
+
+    for m in 0..n_markers {
+        for h in 0..n_target_haps {
+            query_alleles[h] = target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32));
+        }
+        if let Some(ref_m) = alignment.target_to_ref(m) {
+            for rh in 0..n_ref_haps {
+                let ref_a = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(rh as u32));
+                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
+            }
+        } else {
+            ref_alleles.fill(255);
+        }
+
+        let mut is_biallelic = true;
+        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+            if a >= 2 && a != 255 {
+                is_biallelic = false;
+                break;
+            }
+        }
+        let n_alleles = if is_biallelic { 2 } else { 256 };
+
+        pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
+
+        if sampling_points[m] {
+            for h in 0..n_target_haps {
+                let donors = pbwt_fwd.select_donors(&beams_fwd[h], k_per_hap);
+                for d in donors {
+                    let idx = d as usize;
+                    if idx < counts.len() {
+                        counts[idx] = counts[idx].saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
+    let mut beams_bwd: Vec<RankBeam> = (0..n_target_haps)
+        .map(|_| RankBeam::full(n_ref_haps as u32))
+        .collect();
+    for (rev_step, m) in (0..n_markers).rev().enumerate() {
+        for h in 0..n_target_haps {
+            query_alleles[h] = target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32));
+        }
+        if let Some(ref_m) = alignment.target_to_ref(m) {
+            for rh in 0..n_ref_haps {
+                let ref_a = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(rh as u32));
+                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
+            }
+        } else {
+            ref_alleles.fill(255);
+        }
+
+        let mut is_biallelic = true;
+        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+            if a >= 2 && a != 255 {
+                is_biallelic = false;
+                break;
+            }
+        }
+        let n_alleles = if is_biallelic { 2 } else { 256 };
+
+        pbwt_bwd.advance_with_beams(
+            &ref_alleles,
+            n_alleles,
+            rev_step,
+            &query_alleles,
+            &mut beams_bwd,
+        );
+
+        if sampling_points[m] {
+            for h in 0..n_target_haps {
+                let donors = pbwt_bwd.select_donors(&beams_bwd[h], k_per_hap);
+                for d in donors {
+                    let idx = d as usize;
+                    if idx < counts.len() {
+                        counts[idx] = counts[idx].saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ranked: Vec<(usize, u32)> = counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c > 0)
+        .map(|(i, &c)| (i, c))
+        .collect();
+    if ranked.is_empty() {
+        return None;
+    }
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let keep_n = max_states.min(ranked.len());
+    let mut keep_mask = vec![false; n_ref_haps];
+    for i in 0..keep_n {
+        keep_mask[ranked[i].0] = true;
+    }
+    Some(keep_mask)
+}
+
+fn build_reference_map_with_mask(
+    ref_gt: &GenotypeMatrix<Phased>,
+    markers: &crate::data::marker::Markers,
+    gen_maps: &GeneticMaps,
+    params: &ModelParams,
+    block_size: usize,
+    max_states: usize,
+    keep_mask: Option<&[bool]>,
+) -> Arc<ReferenceMap> {
+    let n_markers = markers.len();
+    let mut gen_positions = Vec::with_capacity(n_markers);
+    for m in 0..n_markers {
+        let marker = markers.marker(MarkerIdx::new(m as u32));
+        let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
+        gen_positions.push(gen_pos);
+    }
+
+    let mut blocks: Vec<Arc<crate::model::block_hash::CompressedBlock>> = Vec::new();
+    let mut start = 0usize;
+    while start < n_markers {
+        let end = (start + block_size).min(n_markers);
+        let mut block_markers: Vec<crate::data::marker::Marker> = Vec::with_capacity(end - start);
+        let mut block_columns: Vec<crate::data::storage::GenotypeColumn> =
+            Vec::with_capacity(end - start);
+        for m in start..end {
+            block_markers.push(markers.marker(MarkerIdx::new(m as u32)).clone());
+            block_columns.push(ref_gt.column(MarkerIdx::new(m as u32)).clone());
+        }
+        let mut recomb_rates = Vec::with_capacity(end.saturating_sub(start + 1));
+        for i in start..end.saturating_sub(1) {
+            let dist_cm = (gen_positions[i + 1] - gen_positions[i]).abs();
+            recomb_rates.push(params.p_recomb(dist_cm));
+        }
+        let block = crate::model::block_hash::compression::build_compressed_block_from_columns_with_mask(
+            &block_markers,
+            &block_columns,
+            start,
+            max_states,
+            &recomb_rates,
+            keep_mask,
+        );
+        blocks.push(Arc::new(block));
+        start = end;
+    }
+
+    let mut boundary_rates = Vec::with_capacity(blocks.len().saturating_sub(1));
+    for i in 0..blocks.len().saturating_sub(1) {
+        let left_idx = blocks[i].end_marker - 1;
+        let right_idx = blocks[i + 1].start_marker;
+        let dist_cm = (gen_positions[right_idx] - gen_positions[left_idx]).abs();
+        boundary_rates.push(params.p_recomb(dist_cm));
+    }
+
+    ReferenceMap::build_from_blocks(blocks, &boundary_rates, block_size)
 }
 
 fn should_stream_ref_vcf(path: &Path) -> Option<u64> {
@@ -214,16 +496,50 @@ impl crate::pipelines::ImputationPipeline {
         let n_total_haps = n_ref_haps + n_target_haps;
         self.params =
             ModelParams::for_imputation(n_ref_haps, n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.imp_states.min(n_ref_haps));
+
+        let n_threads = self
+            .config
+            .nthreads
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        let available_bytes = available_memory_bytes().unwrap_or(0);
+        let window_markers = self.config.window_markers.max(1);
+        let max_states_budget = if available_bytes > 0 {
+            estimate_max_states(available_bytes, n_threads, window_markers, 64)
+        } else {
+            self.config.imp_states.max(1)
+        };
+        let mode = if max_states_budget >= n_ref_haps {
+            ImputeRefMode::Lossless
+        } else if is_bref3 {
+            ImputeRefMode::Truncated
+        } else {
+            ImputeRefMode::PbwtSubset
+        };
+        let max_states = if matches!(mode, ImputeRefMode::Lossless) {
+            n_ref_haps
+        } else {
+            max_states_budget.min(n_ref_haps).max(1)
+        };
+        let auto_plan = AutoImputePlan { mode, max_states };
+        self.params.set_n_states(max_states);
 
         eprintln!(
             "Streaming imputation: {} ref haplotypes, {} target samples (target_bytes={})",
             n_ref_haps, n_target_samples, target_bytes
         );
+        eprintln!(
+            "Imputation state plan: mode={:?}, max_states={}, threads={}, available_mb={}",
+            auto_plan.mode,
+            auto_plan.max_states,
+            n_threads,
+            (available_bytes / (1024 * 1024))
+        );
 
         let ref_block_size = 64;
-        let ref_max_states = 4096;
+        let ref_max_states = match auto_plan.mode {
+            ImputeRefMode::Lossless => 0,
+            ImputeRefMode::PbwtSubset | ImputeRefMode::Truncated => auto_plan.max_states,
+        };
 
         // Create output writer
         let output_path = self.config.out.with_extension("vcf.gz");
@@ -243,6 +559,8 @@ impl crate::pipelines::ImputationPipeline {
         let producer_maps = gen_maps.clone();
         let producer_telemetry = self.telemetry.clone();
         let producer_target_positions = target_positions.clone();
+
+        let auto_plan_for_producer = auto_plan;
 
         // Spawn Producer (Phasing)
         let producer_handle = thread::spawn(move || -> Result<()> {
@@ -521,6 +839,43 @@ impl crate::pipelines::ImputationPipeline {
                 ));
                 pbwt_state = Some(pipeline.extractpbwt_state_streaming(&phased, n_target_markers));
 
+                let mut ref_map = ref_window.ref_map;
+                if matches!(auto_plan_for_producer.mode, ImputeRefMode::PbwtSubset) {
+                    if let Some(ref_gt) = ref_window.ref_genotypes.as_ref() {
+                        if let Some(keep_mask) = pbwt_select_keep_mask(
+                            &phased,
+                            ref_gt,
+                            &alignment,
+                            &producer_maps,
+                            auto_plan_for_producer.max_states,
+                        ) {
+                            ref_map = build_reference_map_with_mask(
+                                ref_gt,
+                                &ref_window.markers,
+                                &producer_maps,
+                                &pipeline.params,
+                                ref_block_size,
+                                0,
+                                Some(&keep_mask),
+                            );
+                        } else {
+                            ref_map = build_reference_map_with_mask(
+                                ref_gt,
+                                &ref_window.markers,
+                                &producer_maps,
+                                &pipeline.params,
+                                ref_block_size,
+                                ref_max_states,
+                                None,
+                            );
+                        }
+                    } else if window_count == 1 {
+                        eprintln!(
+                            "  Warning: PBWT selection unavailable without reference genotypes; falling back to truncation"
+                        );
+                    }
+                }
+
                 // Send to consumer
                 if let Some(bb) = &pipeline.telemetry {
                     bb.set_op("Producer waiting on channel");
@@ -531,7 +886,7 @@ impl crate::pipelines::ImputationPipeline {
                     tx.send(StreamingPayload {
                         phased_target: phased,
                         ref_markers: ref_window.markers,
-                        ref_map: ref_window.ref_map,
+                        ref_map,
                         ref_genotypes: ref_window.ref_genotypes,
                         alignment,
                         output_start: target_window.output_start,
@@ -545,7 +900,7 @@ impl crate::pipelines::ImputationPipeline {
                     tx.send(StreamingPayload {
                         phased_target: phased,
                         ref_markers: ref_window.markers,
-                        ref_map: ref_window.ref_map,
+                        ref_map,
                         ref_genotypes: ref_window.ref_genotypes,
                         alignment,
                         output_start: target_window.output_start,

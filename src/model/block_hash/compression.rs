@@ -34,6 +34,7 @@ fn build_compressed_block_with_accessor<F>(
     marker_n_alleles: Vec<u8>,
     max_states: usize,
     recomb_rates: &[f32],
+    keep_haps: Option<&[bool]>,
     get_allele: F,
 ) -> CompressedBlock
 where
@@ -69,16 +70,80 @@ where
     let hap_to_pattern = storage.hap_to_pattern();
     let n_unique_patterns = storage.n_patterns();
 
+    let use_keep = keep_haps.is_some();
+    let keep_mask = keep_haps.unwrap_or(&[]);
     let mut initial_pattern_counts: Vec<f32> = vec![0.0; n_unique_patterns];
     let mut initial_pattern_to_globals: Vec<Vec<GlobalId>> = vec![Vec::new(); n_unique_patterns];
+    let mut unkept_globals: Vec<GlobalId> = Vec::new();
 
     for (hap_idx, &pattern_idx) in hap_to_pattern.iter().enumerate() {
         let global_id = GlobalId::new(hap_idx as u32);
+        if use_keep && !keep_mask.get(hap_idx).copied().unwrap_or(false) {
+            unkept_globals.push(global_id);
+            continue;
+        }
         initial_pattern_counts[pattern_idx as usize] += 1.0;
         initial_pattern_to_globals[pattern_idx as usize].push(global_id);
     }
 
     let limit = if max_states == 0 { usize::MAX } else { max_states };
+
+    let mut pattern_order: Vec<usize> = (0..n_unique_patterns)
+        .filter(|&i| initial_pattern_counts[i] > 0.0 || !use_keep)
+        .collect();
+    pattern_order.sort_by(|&a, &b| {
+        initial_pattern_counts[b]
+            .partial_cmp(&initial_pattern_counts[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let kept_indices = if pattern_order.len() > limit {
+        pattern_order[..limit].to_vec()
+    } else {
+        pattern_order
+    };
+    let kept_patterns_set: std::collections::HashSet<usize> =
+        kept_indices.iter().copied().collect();
+
+    let mut old_to_new = vec![PatternId::RESERVOIR; n_unique_patterns];
+    for (new_idx, &old_idx) in kept_indices.iter().enumerate() {
+        old_to_new[old_idx] = PatternId::new(new_idx as u32);
+    }
+
+    let hap_to_state: Vec<PatternId> = hap_to_pattern
+        .iter()
+        .enumerate()
+        .map(|(hap_idx, &old_idx)| {
+            if use_keep && !keep_mask.get(hap_idx).copied().unwrap_or(false) {
+                PatternId::RESERVOIR
+            } else {
+                old_to_new[old_idx as usize]
+            }
+        })
+        .collect();
+
+    let mut reservoir_globals = if use_keep { unkept_globals } else { Vec::new() };
+    for (pattern_idx, globals) in initial_pattern_to_globals.iter().enumerate() {
+        if !kept_patterns_set.contains(&pattern_idx) {
+            reservoir_globals.extend(globals.iter().copied());
+        }
+    }
+
+    let reservoir_count = reservoir_globals.len() as u32;
+
+    let (reservoir_freqs, reservoir_freq_offsets, reservoir_obs_fractions, reservoir_ld) =
+        if reservoir_count > 0 {
+            compute_reservoir_freqs(&storage, &reservoir_globals, n_markers, &marker_n_alleles)
+        } else {
+            (Vec::new(), vec![0; n_markers], vec![0.0; n_markers], Vec::new())
+        };
+
+    let pattern_counts: Vec<f32> =
+        kept_indices.iter().map(|&i| initial_pattern_counts[i]).collect();
+    let pattern_to_globals: Vec<Vec<GlobalId>> = kept_indices
+        .iter()
+        .map(|&i| initial_pattern_to_globals[i].clone())
+        .collect();
 
     let (
         pattern_counts,
@@ -90,80 +155,17 @@ where
         reservoir_obs_fractions,
         reservoir_ld,
         hap_to_state,
-    ) = if n_unique_patterns > limit {
-        let mut pattern_order: Vec<usize> = (0..n_unique_patterns).collect();
-        pattern_order.sort_by(|&a, &b| {
-            initial_pattern_counts[b]
-                .partial_cmp(&initial_pattern_counts[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let kept_indices = &pattern_order[..limit];
-        let kept_patterns_set: std::collections::HashSet<usize> =
-            kept_indices.iter().copied().collect();
-
-        let mut old_to_new = vec![PatternId::RESERVOIR; n_unique_patterns];
-        for (new_idx, &old_idx) in kept_indices.iter().enumerate() {
-            old_to_new[old_idx] = PatternId::new(new_idx as u32);
-        }
-
-        let hap_to_state: Vec<PatternId> = hap_to_pattern
-            .iter()
-            .map(|&old_idx| old_to_new[old_idx as usize])
-            .collect();
-
-        let mut reservoir_globals = Vec::new();
-        for (pattern_idx, globals) in initial_pattern_to_globals.iter().enumerate() {
-            if !kept_patterns_set.contains(&pattern_idx) {
-                reservoir_globals.extend(globals.iter().copied());
-            }
-        }
-
-        let reservoir_count = reservoir_globals.len() as u32;
-
-        let (reservoir_freqs, reservoir_freq_offsets, reservoir_obs_fractions, reservoir_ld) =
-            if reservoir_count > 0 {
-                compute_reservoir_freqs(&storage, &reservoir_globals, n_markers, &marker_n_alleles)
-            } else {
-                (Vec::new(), vec![0; n_markers], vec![0.0; n_markers], Vec::new())
-            };
-
-        let pattern_counts: Vec<f32> =
-            kept_indices.iter().map(|&i| initial_pattern_counts[i]).collect();
-        let pattern_to_globals: Vec<Vec<GlobalId>> = kept_indices
-            .iter()
-            .map(|&i| initial_pattern_to_globals[i].clone())
-            .collect();
-
-        (
-            pattern_counts,
-            pattern_to_globals,
-            reservoir_count,
-            reservoir_globals,
-            reservoir_freqs,
-            reservoir_freq_offsets,
-            reservoir_obs_fractions,
-            reservoir_ld,
-            hap_to_state,
-        )
-    } else {
-        let hap_to_state: Vec<PatternId> = hap_to_pattern
-            .iter()
-            .map(|&idx| PatternId::new(idx as u32))
-            .collect();
-
-        (
-            initial_pattern_counts,
-            initial_pattern_to_globals,
-            0,
-            Vec::new(),
-            Vec::new(),
-            vec![0; n_markers],
-            vec![0.0; n_markers],
-            Vec::new(),
-            hap_to_state,
-        )
-    };
+    ) = (
+        pattern_counts,
+        pattern_to_globals,
+        reservoir_count,
+        reservoir_globals,
+        reservoir_freqs,
+        reservoir_freq_offsets,
+        reservoir_obs_fractions,
+        reservoir_ld,
+        hap_to_state,
+    );
 
     let n_kept_patterns = pattern_counts.len();
     let mut unpacked_alleles = vec![0u8; n_kept_patterns * n_markers];
@@ -235,6 +237,37 @@ pub(crate) fn build_compressed_block_from_columns(
         marker_n_alleles,
         max_states,
         recomb_rates,
+        None,
+        |m, h| columns[m].get(h),
+    )
+}
+
+/// Build a CompressedBlock from columns with an optional keep-mask over haplotypes.
+///
+/// Haplotypes with keep_mask=false are routed into the reservoir.
+pub(crate) fn build_compressed_block_from_columns_with_mask(
+    markers: &[Marker],
+    columns: &[GenotypeColumn],
+    start_marker: usize,
+    max_states: usize,
+    recomb_rates: &[f32],
+    keep_mask: Option<&[bool]>,
+) -> CompressedBlock {
+    let n_markers = markers.len();
+    let n_haplotypes = columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
+    let marker_n_alleles: Vec<u8> = markers
+        .iter()
+        .map(|m| (1 + m.alt_alleles.len()).min(u8::MAX as usize) as u8)
+        .collect();
+
+    build_compressed_block_with_accessor(
+        start_marker,
+        n_markers,
+        n_haplotypes,
+        marker_n_alleles,
+        max_states,
+        recomb_rates,
+        keep_mask,
         |m, h| columns[m].get(h),
     )
 }
