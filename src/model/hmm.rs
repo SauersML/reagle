@@ -152,6 +152,9 @@ impl HmmUpdater {
     ///
     /// beta[i] = (1.0 - r) * emissions[i] * beta[i] + r * C
     /// where C = sum(emissions[j] * beta[j]) over all j
+    ///
+    /// IMPORTANT: The result is normalized by C to prevent underflow:
+    /// beta_new[i] = beta_raw[i] / C
     #[inline]
     pub fn bwd_update_constant(
         bwd: &mut [f32],
@@ -160,11 +163,14 @@ impl HmmUpdater {
         constant_term: f32, // C
         n_states: usize,
     ) {
-        let r_const = (p_switch / n_states as f32) * constant_term; // (r/N) * C
-        let scale = 1.0 - p_switch; // 1 - r
+        // Normalize by constant term C to prevent underflow
+        let inv_c = 1.0 / constant_term.max(1e-30);
+
+        let shift = p_switch / n_states as f32; // p/N
+        let scale = (1.0 - p_switch) * inv_c; // (1-p)/C
 
         let scale_vec = f32x8::splat(scale);
-        let const_vec = f32x8::splat(r_const);
+        let shift_vec = f32x8::splat(shift);
 
         let mut k = 0;
         while k + 8 <= n_states {
@@ -176,16 +182,16 @@ impl HmmUpdater {
             emit_arr.copy_from_slice(&emissions[k..k + 8]);
             let emit_vec = f32x8::from(emit_arr);
 
-            // res = (scale * emit * bwd) + const
-            let res = (scale_vec * emit_vec * bwd_chunk) + const_vec;
-            
+            // res = (scale * emit * bwd) + shift
+            let res = (scale_vec * emit_vec * bwd_chunk) + shift_vec;
+
             let res_arr: [f32; 8] = res.into();
             bwd[k..k + 8].copy_from_slice(&res_arr);
             k += 8;
         }
 
         for i in k..n_states {
-            bwd[i] = scale * emissions[i] * bwd[i] + r_const;
+            bwd[i] = scale * emissions[i] * bwd[i] + shift;
         }
     }
 }
@@ -1356,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_bwd_update_constant_normalization() {
-        // Formula: bwd[i] = (1-r)*e[i]*bwd[i] + (r/N)*C
+        // Formula: bwd[i] = ( (1-r)*e[i]*bwd[i] + (r/N)*C ) / C
         let n_states = 2;
         let mut bwd = vec![1.0, 1.0];
         let p_switch = 0.1;
@@ -1365,10 +1371,14 @@ mod tests {
 
         HmmUpdater::bwd_update_constant(&mut bwd, p_switch, &emissions, constant_term, n_states);
 
+        // Expected result: 0.5 (normalized)
         assert!(
-            (bwd[0] - 1.0).abs() < 1e-6,
-            "Expected 1.0, got {}. The constant term must be normalized by n_states.",
+            (bwd[0] - 0.5).abs() < 1e-6,
+            "Expected 0.5 (normalized), got {}. The backward update must be normalized by C.",
             bwd[0]
         );
+
+        let sum: f32 = bwd.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "Sum should be 1.0");
     }
 }
