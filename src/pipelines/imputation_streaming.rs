@@ -81,11 +81,11 @@ const IMPUTE_RAM_FRACTION: f64 = 0.25;
 fn available_memory_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
-    let avail_kb = sys.available_memory();
-    if avail_kb == 0 {
+    let avail_bytes = sys.available_memory();
+    if avail_bytes == 0 {
         None
     } else {
-        Some(avail_kb.saturating_mul(1024))
+        Some(avail_bytes)
     }
 }
 
