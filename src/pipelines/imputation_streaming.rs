@@ -2148,10 +2148,18 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            // Prioritize HMM-calculated dosages (from result) over input genotypes
+            // This enables error correction for genotyped markers
+            let dosage = if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                if let Some(&d) = result.dosages.get(local_m) {
+                    d
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else {
+                    0.0
+                }
+            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
                 0.0
             };
