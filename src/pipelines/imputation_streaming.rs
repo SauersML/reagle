@@ -1610,8 +1610,7 @@ target_samples={} target_bytes={}",
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
         }
 
-        let overlap_size = 1000.min(n_ref_markers);
-        let prior_marker_idx = output_end.saturating_sub(overlap_size).saturating_sub(1);
+        let prior_marker_idx = output_end.saturating_sub(1);
         let sample_results: Vec<ImputeResult> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
