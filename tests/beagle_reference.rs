@@ -2174,6 +2174,8 @@ fn run_rust_imputation(
         "--seed",
         &seed.to_string(),
         "--gp",
+        "--ne",
+        "1000000",
     ]);
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
