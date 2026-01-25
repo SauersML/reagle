@@ -1029,7 +1029,15 @@ target_samples={} target_bytes={}",
                     normalize_probs(&mut aligned_probs);
                     probs.extend_from_slice(&aligned_probs);
                 } else {
-                    probs.extend_from_slice(&base_probs);
+                    // For imputed markers (missing data), use uniform emission probability (1/N).
+                    // This prevents double-counting the prior (population frequency), which
+                    // would otherwise penalize rare variants (Perfect LD Trap).
+                    // If we used base_probs (freqs) here, we'd say P(Obs=Missing|State=Rare) is small,
+                    // effectively suppressing the rare variant even if the haplotype path strongly supports it.
+                    let uniform = 1.0 / n_alleles as f32;
+                    for _ in 0..n_alleles {
+                        probs.push(uniform);
+                    }
                 }
 
                 offsets.push(probs.len());

@@ -81,9 +81,8 @@ mod tests {
         let recomb_rate = 0.01;
         let n_ref_haps = 1000;
         
-        // Skewed pattern counts: pattern 0 is very common (900 haps), others rare
+        // Skewed pattern counts
         let pattern_counts = vec![900.0, 50.0, 40.0, 10.0];
-        assert_eq!(pattern_counts.iter().sum::<f32>(), n_ref_haps as f32);
 
         // Uniform emissions for simplicity (or slight variation)
         let emissions = vec![1.0, 0.5, 0.1, 0.01];
@@ -103,9 +102,7 @@ mod tests {
         // Transition:
         // P(t | t-1) = (1-r)*P(t-1) + r*count(t)/N
         // Fwd[i] before emit = (1-r)*Fwd_old[i]/Sum + r*count[i]/N
-        // Since Fwd_old sum is 1.0 (normalized), (1-r)/Sum * Fwd_old sum = 1-r
-        // Sum of second term = Sum(r*count[i]/N) = r/N * Sum(count) = r/N * N = r
-        // Total sum should be (1-r) + r = 1.0
+        // Sum = (1-r) + r = 1.0
         
         // Let's compute expected pre-emission values
         let mut expected_pre_emit = vec![0.0; n_patterns];
