@@ -1130,8 +1130,7 @@ target_samples={} target_bytes={}",
                 next_overlap.set_hap_priors(priors);
             }
             let n_ref_markers = ref_markers.len();
-            let overlap_size = 1000.min(n_ref_markers);
-            let prior_marker_idx = ref_output_end.saturating_sub(overlap_size).saturating_sub(1);
+            let prior_marker_idx = ref_output_end.saturating_sub(1);
             let boundary_recomb_rate = if prior_marker_idx + 1 < n_ref_markers {
                 let marker_idx = prior_marker_idx + 1;
                 let block_idx = ref_map.blocks.partition_point(|b| b.end_marker <= marker_idx);
@@ -1610,8 +1609,7 @@ target_samples={} target_bytes={}",
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
         }
 
-        let overlap_size = 1000.min(n_ref_markers);
-        let prior_marker_idx = output_end.saturating_sub(overlap_size).saturating_sub(1);
+        let prior_marker_idx = output_end.saturating_sub(1);
         let sample_results: Vec<ImputeResult> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
@@ -2137,10 +2135,16 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            let dosage = if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                if let Some(d) = result.dosages.get(local_m) {
+                    *d
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else {
+                    0.0
+                }
+            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
                 0.0
             };
@@ -2155,10 +2159,16 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                if let Some(gt) = result.best_gt.get(local_m) {
+                    *gt
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1, a2)
+                } else {
+                    (0, 0)
+                }
+            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 (a1, a2)
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
                 (0, 0)
             }
