@@ -276,22 +276,48 @@ pub fn backward_and_emit_block_probs(
             } else {
                 error_rate
             };
-            let mut res_weight_sum = 0.0f32;
-            let mut expected_match = 0.0f32;
-            if !probs.is_empty() {
+            let obs_fraction = block.get_reservoir_obs_fraction(marker_idx);
+            let mut denom = 0.0f32;
+            if probs.is_empty() {
                 for allele in 0..n_alleles {
                     let freq = block.reservoir_freq(marker_idx, allele as u8);
-                    expected_match += probs.get(allele).copied().unwrap_or(0.0) * freq;
+                    denom += freq;
+                }
+            } else {
+                for allele in 0..n_alleles {
+                    let freq = block.reservoir_freq(marker_idx, allele as u8);
+                    if freq <= 0.0 {
+                        continue;
+                    }
+                    let p_obs = probs.get(allele).copied().unwrap_or(0.0);
+                    let emit_obs = mismatch_prob + (match_prob - mismatch_prob) * p_obs;
+                    denom += freq * (obs_fraction * emit_obs + (1.0 - obs_fraction));
                 }
             }
-            let emit = mismatch_prob + (match_prob - mismatch_prob) * expected_match;
-            for allele in 0..n_alleles {
-                let freq = block.reservoir_freq(marker_idx, allele as u8);
-                if freq > 0.0 {
-                    let w = res_p * freq * emit;
+            let mut res_weight_sum = 0.0f32;
+            if denom > 0.0 {
+                for allele in 0..n_alleles {
+                    let freq = block.reservoir_freq(marker_idx, allele as u8);
+                    if freq <= 0.0 {
+                        continue;
+                    }
+                    let weight = if probs.is_empty() {
+                        freq / denom
+                    } else {
+                        let p_obs = probs.get(allele).copied().unwrap_or(0.0);
+                        let emit_obs = mismatch_prob + (match_prob - mismatch_prob) * p_obs;
+                        freq * (obs_fraction * emit_obs + (1.0 - obs_fraction)) / denom
+                    };
+                    let w = res_p * weight;
                     allele_probs[allele] += w;
                     res_weight_sum += w;
                 }
+            } else if n_alleles > 0 {
+                let uniform = res_p / n_alleles as f32;
+                for allele in 0..n_alleles {
+                    allele_probs[allele] += uniform;
+                }
+                res_weight_sum = res_p;
             }
             total_prob += res_weight_sum;
         }

@@ -2822,6 +2822,17 @@ impl PhasingPipeline {
         let n_haps = geno.n_haps();
         let n_stage1 = hi_freq_markers.len();
         let seed = self.config.seed;
+        let n_haps_f = target_gt.n_haplotypes() as f32;
+        let alt_freqs: Vec<f32> = if n_haps_f > 0.0 {
+            (0..n_markers)
+                .map(|m| {
+                    let alt = target_gt.column(MarkerIdx::new(m as u32)).alt_count() as f32;
+                    (alt / n_haps_f).clamp(0.0, 1.0)
+                })
+                .collect()
+        } else {
+            vec![0.0; n_markers]
+        };
 
         if n_stage1 < 2 {
             return None;
@@ -3054,7 +3065,7 @@ impl PhasingPipeline {
                         }));
                     }
                     let allele_freqs_stage1: Vec<f32> =
-                        hi_freq_markers.iter().map(|&m| maf[m]).collect();
+                        hi_freq_markers.iter().map(|&m| alt_freqs[m]).collect();
                     if let Some(ref lookup) = lookup {
                         hmm.conditioned_forward_backward_with_lookup(
                             &seq1,
