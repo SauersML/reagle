@@ -5450,20 +5450,12 @@ impl Stage2Phaser {
         let scale1 = 1.0 - r1;
         let scale2 = 1.0 - r2;
 
-        // Interpolate posteriors rather than multiplying them (avoid double-counting evidence).
-        let t = if pos_b > pos_a {
-            ((pos_m - pos_a) / (pos_b - pos_a)) as f32
-        } else {
-            0.0
-        }
-        .clamp(0.0, 1.0);
-
         let mut weights = vec![0.0f32; n_states];
         let mut sum = 0.0f32;
         for k in 0..n_states {
             let a = scale1 * probs_a.get(k).copied().unwrap_or(0.0) + shift1;
             let b = scale2 * probs_b.get(k).copied().unwrap_or(0.0) + shift2;
-            let w = (1.0 - t) * a + t * b;
+            let w = a * b;
             weights[k] = w;
             sum += w;
         }

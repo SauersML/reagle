@@ -103,10 +103,8 @@ pub fn forward_within_block_probs(
 
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
-            let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
-
             ws.reservoir_prob_fwd =
-                reservoir_emission * (stay + background * block.reservoir_count as f32);
+                reservoir_emission * (background * block.reservoir_count as f32);
         }
 
         ws.normalize_forward(n_patterns);
@@ -167,10 +165,8 @@ pub fn forward_to_marker_in_block_probs(
 
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
-            let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
-
             ws.reservoir_prob_fwd =
-                reservoir_emission * (stay + background * block.reservoir_count as f32);
+                reservoir_emission * (background * block.reservoir_count as f32);
         }
 
         ws.normalize_forward(n_patterns);
@@ -225,9 +221,8 @@ pub fn backward_and_emit_block_probs(
             );
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
-            let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate);
             ws.reservoir_prob_fwd =
-                reservoir_emission * (stay + background * block.reservoir_count as f32);
+                reservoir_emission * (background * block.reservoir_count as f32);
         }
 
         ws.normalize_forward(n_patterns);
@@ -250,7 +245,7 @@ pub fn backward_and_emit_block_probs(
         let n_alleles = block.n_alleles(marker_idx);
 
         let mut allele_probs = vec![0.0f32; n_alleles];
-        let mut total_prob = 0.0;
+        let mut observed_mass = 0.0f32;
 
         let stride = ws.max_states + 1;
         let start = marker_idx * stride;
@@ -259,11 +254,11 @@ pub fn backward_and_emit_block_probs(
         for pattern_idx in 0..n_patterns {
             let p = current_fwd[pattern_idx] * ws.bwd[pattern_idx];
             if p > 0.0 {
-                total_prob += p;
                 let allele =
                     block.get_pattern_allele(pattern_idx_to_id(pattern_idx), marker_idx) as usize;
                 if allele < n_alleles {
                     allele_probs[allele] += p;
+                    observed_mass += p;
                 }
             }
         }
@@ -319,13 +314,34 @@ pub fn backward_and_emit_block_probs(
                 }
                 res_weight_sum = res_p;
             }
-            total_prob += res_weight_sum;
+            observed_mass += res_weight_sum;
         }
 
-        if total_prob > 0.0 {
-            let scale = 1.0 / total_prob;
+        if observed_mass > 0.0 {
+            let scale = 1.0 / observed_mass;
             for p in &mut allele_probs {
                 *p *= scale;
+            }
+        } else if n_alleles > 0 {
+            if block.reservoir_count > 0 {
+                let mut sum = 0.0f32;
+                for allele in 0..n_alleles {
+                    let freq = block.reservoir_freq(marker_idx, allele as u8);
+                    allele_probs[allele] = freq;
+                    sum += freq;
+                }
+                if sum > 0.0 {
+                    let scale = 1.0 / sum;
+                    for p in &mut allele_probs {
+                        *p *= scale;
+                    }
+                } else {
+                    let uniform = 1.0 / n_alleles as f32;
+                    allele_probs.fill(uniform);
+                }
+            } else {
+                let uniform = 1.0 / n_alleles as f32;
+                allele_probs.fill(uniform);
             }
         }
 
@@ -370,7 +386,7 @@ pub fn backward_and_emit_block_probs(
             for i in 0..n_patterns {
                 ws.bwd[i] = ws.bwd[i] * stay_prob + common_add;
             }
-            ws.reservoir_prob_bwd = ws.reservoir_prob_bwd * stay_prob + common_add;
+            ws.reservoir_prob_bwd = common_add;
         }
 
         ws.normalize_bwd(n_patterns);

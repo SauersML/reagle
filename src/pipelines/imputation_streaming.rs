@@ -1129,10 +1129,8 @@ target_samples={} target_bytes={}",
                         }
                     }
 
-                    if mapped_allele != 255 && (mapped_allele as usize) < n_alleles {
-                        if !use_probs {
-                            aligned_probs.resize(n_alleles, 1.0 / n_alleles as f32);
-                        }
+                    if mapped_allele != 255 && (mapped_allele as usize) < n_alleles && !use_probs {
+                        aligned_probs.resize(n_alleles, 1.0 / n_alleles as f32);
                         for a in 0..n_alleles {
                             let hard = if a == mapped_allele as usize { 1.0 } else { 0.0 };
                             aligned_probs[a] = conf * hard + (1.0 - conf) * aligned_probs[a];
