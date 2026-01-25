@@ -460,9 +460,16 @@ fn test_synthetic_slam_dunk() {
         .allele_generator(|_, h| if h < 50 { 0 } else { 1 })
         .build();
 
-    let target_file = SyntheticVcfBuilder::new(n_markers, 1)
+    let target_file = SyntheticVcfBuilder::new(n_markers, 2)
         .unphased()
-        .allele_generator(|m, _| if m % 2 != 0 { 255 } else { 0 })
+        .allele_generator(|m, h| {
+            let s = h / 2;
+            if m % 2 != 0 {
+                255 // Missing
+            } else {
+                if s == 0 { 0 } else { 1 } // Sample 0 -> 0, Sample 1 -> 1
+            }
+        })
         .build();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -474,7 +481,7 @@ fn test_synthetic_slam_dunk() {
     config.out = out_prefix.clone();
     config.imp_states = 50;
     config.imp_nsteps = 10;
-    config.ne = 10000.0;
+    config.ne = 10.0;
     config.err = Some(0.0001);
     config.window = 0.02;
     config.overlap = 0.005;
@@ -486,11 +493,13 @@ fn test_synthetic_slam_dunk() {
     let out_vcf = temp_dir.path().join("output_slam.vcf.gz");
     assert!(out_vcf.exists());
 
-    let dosages = inspect_dosages(&out_vcf, 1);
+    let dosages = inspect_dosages(&out_vcf, 2);
 
     for m in (1..n_markers).step_by(2) {
-        let ds = dosages[m][0];
-        assert!(ds < 0.1, "Marker {} should be 0, got {}", m, ds);
+        let ds0 = dosages[m][0];
+        let ds1 = dosages[m][1];
+        assert!(ds0 < 0.1, "Sample 0 Marker {} should be 0, got {}", m, ds0);
+        assert!(ds1 > 1.9, "Sample 1 Marker {} should be 2, got {}", m, ds1);
     }
 
     // DR2 validation for slam dunk test
@@ -516,15 +525,16 @@ fn test_synthetic_slam_dunk() {
     // SEN Validation
     // For slam dunk:
     // Markers 1, 3... are target sites.
-    // Ref has 0 for h < 50, 1 for h >= 50.
-    // Target matches hap 0 (all 0s) except odd markers are 255 (missing).
-    // So truth at target odd markers is 0.0.
-    // Dosages should be close to 0.0.
+    // Sample 0: Truth 0.0
+    // Sample 1: Truth 2.0
     let mut truth_vec = Vec::new();
     let mut imp_vec = Vec::new();
     for m in (1..n_markers).step_by(2) {
         truth_vec.push(0.0);
         imp_vec.push(dosages[m][0] as f64);
+
+        truth_vec.push(2.0);
+        imp_vec.push(dosages[m][1] as f64);
     }
     let sen = calculate_sen(&truth_vec, &imp_vec);
     println!("Slam dunk test - SEN: {:.4}", sen);
@@ -685,7 +695,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 200.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -1472,12 +1482,17 @@ fn test_ultra_dense_markers() {
         })
         .build();
 
-    // Target with every 10th marker genotyped - ALL haplotypes match ref group 0
+    // Target with every 10th marker genotyped.
+    // Sample 0 (haplotypes 0,1) matches ref group 0 (all 0s).
+    // Sample 1 (haplotypes 2,3) matches ref group 1 (all 1s).
+    // This diversity ensures DR2 can be calculated (variance > 0).
     let target_file = SyntheticVcfBuilder::new(n_ref_markers, 2)
         .positions(positions)
-        .allele_generator(|m, _| {
+        .allele_generator(|m, h| {
+            let s = h / 2;
             if m % 10 == 0 {
-                0 // All target haplotypes get allele 0, matching ref haps 0-9
+                // Genotyped markers
+                if s == 0 { 0 } else { 1 }
             } else {
                 255
             }
@@ -1492,6 +1507,7 @@ fn test_ultra_dense_markers() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
+    config.ne = 100.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1502,23 +1518,37 @@ fn test_ultra_dense_markers() {
     let out_vcf = temp_dir.path().join("output_dense.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 2);
 
-    // With perfect LD, imputed dosages should be very close to 0 (match target pattern)
-    let mut sum_dosage = 0.0f32;
+    // Check concordance for imputed markers
+    // Sample 0 should be close to 0. Sample 1 should be close to 2.
+    let mut sum_dosage_s0 = 0.0f32;
+    let mut sum_dosage_s1 = 0.0f32;
     let mut count = 0;
-    for marker_dosages in &dosages {
-        for ds in marker_dosages {
-            sum_dosage += ds;
+
+    for m in 0..n_ref_markers {
+        // Skip genotyped markers
+        if m % 10 != 0 {
+            let ds0 = dosages[m][0];
+            let ds1 = dosages[m][1];
+            sum_dosage_s0 += ds0;
+            sum_dosage_s1 += ds1;
             count += 1;
         }
     }
 
-    let avg_dosage = sum_dosage / count as f32;
-    println!("Average dosage: {}", avg_dosage);
-    // Target matches haplotype group 0, so average dosage should be LOW
+    let avg_dosage_s0 = sum_dosage_s0 / count as f32;
+    let avg_dosage_s1 = sum_dosage_s1 / count as f32;
+
+    println!("Average dosage S0: {}, S1: {}", avg_dosage_s0, avg_dosage_s1);
+
     assert!(
-        avg_dosage < 0.5,
-        "Average dosage should be low for matching haplotype group, got {}",
-        avg_dosage
+        avg_dosage_s0 < 0.1,
+        "Average dosage for Sample 0 should be 0 (matched ref group 0), got {}",
+        avg_dosage_s0
+    );
+    assert!(
+        avg_dosage_s1 > 1.9,
+        "Average dosage for Sample 1 should be 2 (matched ref group 1), got {}",
+        avg_dosage_s1
     );
 
     // DR2 validation for ultra-dense markers test
