@@ -932,7 +932,7 @@ impl PhasingPipeline {
         }
 
         // Build final GenotypeMatrix from mutable genotypes
-        let final_gt = self.build_final_matrix(&target_gt, &geno);
+        let final_gt = self.build_final_matrix(&target_gt, &geno, &sample_phases);
 
         // Write output
         let output_path = self.config.out.with_extension("vcf.gz");
@@ -1419,7 +1419,7 @@ impl PhasingPipeline {
         };
 
         Ok((
-            self.build_final_matrix(target_gt, &geno),
+            self.build_final_matrix(target_gt, &geno, &sample_phases),
             next_state_probs,
             pbwt_state_for_next_window,
         ))
@@ -2249,7 +2249,7 @@ impl PhasingPipeline {
                             let p_err = self.params.p_mismatch;
                             let p_no_err = 1.0 - p_err;
 
-                            let (swap_bits, swap_lr, new_paths) = THREAD_WORKSPACE.with(|ws| {
+                            let (swap_bits, swap_lr, swap_probs, new_paths) = THREAD_WORKSPACE.with(|ws| {
                                 let mut workspace = ws.borrow_mut();
                                 if workspace.is_none() {
                                     *workspace =
@@ -2306,6 +2306,7 @@ impl PhasingPipeline {
                                 *paths_out = Some(new_paths);
                             }
                             assert!(swap_lr.len() <= n_markers);
+                            assert!(swap_probs.len() <= het_positions.len());
                             let mut swapped = false;
                             let mut swap_idx = 0usize;
                             for m in 0..n_markers {
@@ -2451,7 +2452,7 @@ impl PhasingPipeline {
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
         // We use a scoped immutable borrow that ends before the apply phase.
-        type PhaseDecision = (Vec<bool>, Vec<(usize, f32)>, Option<MosaicPaths>);
+        type PhaseDecision = (Vec<bool>, Vec<(usize, f32)>, Vec<(usize, f32)>, Option<MosaicPaths>);
         let phase_decisions: Vec<PhaseDecision> = {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
@@ -2531,16 +2532,16 @@ impl PhasingPipeline {
 
                     if het_positions.is_empty() {
                         // No hets to phase: no swaps needed, no LR values
-                        return (vec![false; n_hi_freq], Vec::new(), None);
+                        return (vec![false; n_hi_freq], Vec::new(), Vec::new(), None);
                     }
 
                     let p_err = self.params.p_mismatch;
                     let p_no_err = 1.0 - p_err;
 
-                    let (swap_bits, swap_lr, new_paths) = if use_dynamic_mcmc {
+                    let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
                         // SHAPEIT5-style dynamic MCMC: re-select states each step
                         // Note: Dynamic MCMC doesn't use ThreadWorkspace yet
-                        let (swap_bits, swap_lr, new_paths) = if self.config.profile {
+                        let (swap_bits, swap_lr, swap_probs, new_paths) = if self.config.profile {
                             info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
                                 sample_dynamic_mcmc(
                                     n_hi_freq,
@@ -2579,7 +2580,7 @@ impl PhasingPipeline {
                                 prior_paths.get(s).and_then(|p| p.as_ref()),
                             )
                         };
-                        (swap_bits, swap_lr, Some(new_paths))
+                        (swap_bits, swap_lr, swap_probs, Some(new_paths))
                     } else {
                         // Classic Beagle-style: static state space MCMC with thread-local workspace
                         THREAD_WORKSPACE.with(|ws| {
@@ -2675,7 +2676,7 @@ impl PhasingPipeline {
                                 )
                             };
                             ws.lookup = lookup.into_buffer();
-                            (result.0, result.1, Some(result.2))
+                            (result.0, result.1, result.2, Some(result.3))
                         })
                     };
 
@@ -2695,12 +2696,17 @@ impl PhasingPipeline {
                         .copied()
                         .zip(swap_lr.into_iter())
                         .collect();
+                    let het_phase_values: Vec<(usize, f32)> = het_positions
+                        .iter()
+                        .copied()
+                        .zip(swap_probs.into_iter())
+                        .collect();
 
                     if let Some(bb) = telemetry.as_ref() {
                         bb.add_samples(1);
                     }
 
-                    (swap_mask, het_lr_values, new_paths)
+                    (swap_mask, het_lr_values, het_phase_values, new_paths)
                 })
             };
 
@@ -2720,7 +2726,9 @@ impl PhasingPipeline {
         let is_burnin = iteration < self.config.burnin;
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, (swap_mask, het_lr_values, new_paths)) in phase_decisions.into_iter().enumerate() {
+        for (s, (swap_mask, het_lr_values, het_phase_values, new_paths)) in
+            phase_decisions.into_iter().enumerate()
+        {
             let sp = &mut sample_phases[s];
 
             // Apply swaps using the mask (correctly handles cumulative swap propagation)
@@ -2741,6 +2749,11 @@ impl PhasingPipeline {
                         total_phased += 1;
                     }
                 }
+            }
+
+            for (hi_freq_idx, p_orient) in het_phase_values {
+                let m = hi_freq_to_orig[hi_freq_idx];
+                sp.set_phase_confidence(m, p_orient);
             }
 
             if let Some(paths) = new_paths {
@@ -2765,10 +2778,12 @@ impl PhasingPipeline {
         &self,
         original: &GenotypeMatrix,
         geno: &MutableGenotypes,
+        sample_phases: &[SamplePhase],
     ) -> GenotypeMatrix<crate::data::storage::phase_state::Phased> {
         let markers = original.markers().clone();
         let samples = original.samples_arc();
         let n_markers = geno.n_markers();
+        let n_samples = samples.len();
 
         let columns: Vec<GenotypeColumn> = (0..n_markers)
             .map(|m| {
@@ -2778,11 +2793,20 @@ impl PhasingPipeline {
             })
             .collect();
 
+        let mut phase_confidence = vec![vec![255u8; n_samples]; n_markers];
+        for (s, sp) in sample_phases.iter().enumerate() {
+            for m in 0..n_markers {
+                let p = sp.phase_confidence(m).clamp(0.0, 1.0);
+                phase_confidence[m][s] = (p * 255.0).round() as u8;
+            }
+        }
+
         let confidence = original.confidence_clone();
         let pl = original.likelihoods_pl_arc();
         GenotypeMatrix::new_phased_with_confidence_and_likelihoods(
             markers, columns, samples, confidence, pl,
         )
+        .with_phase_confidence(Some(phase_confidence))
     }
 
     /// Stage 2: Phase rare markers using HMM state probability interpolation
@@ -3465,6 +3489,8 @@ impl PhasingPipeline {
                             sp.swap_haps(m, m + 1);
                             total_switches += 1;
                         }
+
+                        sp.set_phase_confidence(m, lr / (1.0 + lr));
 
                         // Only mark as phased if likelihood ratio exceeds threshold
                         // (Stage 2 runs after iterations, so threshold is typically 1.0)
@@ -4688,11 +4714,12 @@ fn sample_dynamic_mcmc(
     p_no_err: f32,
     p_err: f32,
     initial_paths: Option<&MosaicPaths>,
-) -> (Vec<u8>, Vec<f32>, MosaicPaths) {
+) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
 
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
         return (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             MosaicPaths {
@@ -4734,6 +4761,7 @@ fn sample_dynamic_mcmc(
     let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
     if initial_neighbors.is_empty() {
         return (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             MosaicPaths {
@@ -4979,6 +5007,7 @@ fn sample_dynamic_mcmc(
     // Determine swap decisions from final H1, H2 vs original seq1, seq2
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
+    let mut swap_probs = Vec::with_capacity(het_positions.len());
 
     for &m in het_positions {
         let a1 = seq1[m];
@@ -4987,6 +5016,7 @@ fn sample_dynamic_mcmc(
         if a1 == 255 || a2 == 255 || a1 == a2 {
             swap_bits.push(0);
             swap_lr.push(1.0);
+            swap_probs.push(0.5);
             continue;
         }
 
@@ -5010,11 +5040,13 @@ fn sample_dynamic_mcmc(
             p_err,
         );
         swap_lr.push(lr);
+        swap_probs.push(lr / (1.0 + lr));
     }
 
     (
         swap_bits,
         swap_lr,
+        swap_probs,
         MosaicPaths {
             path1: path1_ref,
             path2: path2_ref,
@@ -5051,9 +5083,10 @@ fn sample_swap_bits_mosaic(
     p_no_err: f32,
     p_err: f32,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
-) -> (Vec<u8>, Vec<f32>, MosaicPaths) {
+) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
         return (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             MosaicPaths {
@@ -5226,12 +5259,14 @@ fn sample_swap_bits_mosaic(
 
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
+    let mut swap_probs = Vec::with_capacity(het_positions.len());
     for (i, &m) in het_positions.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
         if a1 == 255 || a2 == 255 || a1 == a2 || obs_counts[i] == 0 {
             swap_bits.push(0);
             swap_lr.push(1.0);
+            swap_probs.push(0.5);
             continue;
         }
 
@@ -5249,6 +5284,12 @@ fn sample_swap_bits_mosaic(
             (max_p / min_p).min(1e6)
         };
         swap_lr.push(lr);
+        let p_orient = if last_orients[i] == 1 {
+            p_swap
+        } else {
+            p_keep
+        };
+        swap_probs.push(p_orient.clamp(0.0, 1.0));
     }
 
     // Return buffers to workspace for reuse
@@ -5269,7 +5310,7 @@ fn sample_swap_bits_mosaic(
     workspace.fwd_block = returned.fwd_block;
     workspace.combined_checkpoint_data = combined_checkpoints.into_buffer();
 
-    (swap_bits, swap_lr, new_paths)
+    (swap_bits, swap_lr, swap_probs, new_paths)
 }
 
 /// Decision type for Stage 2 marker processing
@@ -5670,13 +5711,16 @@ impl PhasingPipeline {
             })
             .collect();
 
-        Ok(GenotypeMatrix::new_phased_with_confidence_and_likelihoods(
-            markers,
-            columns,
-            samples,
-            current_phased.confidence_clone(),
-            current_phased.likelihoods_pl_arc(),
-        ))
+        Ok(
+            GenotypeMatrix::new_phased_with_confidence_and_likelihoods(
+                markers,
+                columns,
+                samples,
+                current_phased.confidence_clone(),
+                current_phased.likelihoods_pl_arc(),
+            )
+            .with_phase_confidence(current_phased.phase_confidence_clone()),
+        )
     }
 }
 
@@ -5930,7 +5974,7 @@ mod tests {
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
         // Sample 0: haplotypes 0 and 1
-        let (swap_bits, swap_lr, paths) = sample_dynamic_mcmc(
+        let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
             n_markers,
             n_total_haps,
             &p_recomb,
@@ -5964,6 +6008,7 @@ mod tests {
 
         // LR should be high confidence
         assert_eq!(swap_lr.len(), het_positions.len());
+        assert!(swap_probs.len() <= het_positions.len());
     }
 
     #[test]
@@ -6002,7 +6047,7 @@ mod tests {
         let p_recomb = vec![0.01f32; n_markers];
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
-        let (swap_bits, swap_lr, paths) = sample_dynamic_mcmc(
+        let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
             n_markers,
             n_total_haps,
             &p_recomb,
@@ -6036,5 +6081,6 @@ mod tests {
 
         // Verify LR values exist
         assert_eq!(swap_lr.len(), het_positions.len());
+        assert!(swap_probs.len() <= het_positions.len());
     }
 }

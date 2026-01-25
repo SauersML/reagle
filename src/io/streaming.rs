@@ -193,6 +193,9 @@ pub struct PhasedOverlap {
     /// Per-target-haplotype priors indexed by reference haplotype ID
     /// This enables proper soft-information handoff when HMM states differ between windows
     pub hap_priors: Option<Vec<HaplotypePriors>>,
+
+    /// Recombination rate between the prior marker and the first marker of this overlap
+    pub incoming_recomb_rate: Option<f32>,
 }
 
 impl PhasedOverlap {
@@ -210,6 +213,7 @@ impl PhasedOverlap {
             n_haps,
             state_probs: None,
             hap_priors: None,
+            incoming_recomb_rate: None,
         }
     }
 
@@ -226,6 +230,16 @@ impl PhasedOverlap {
     /// Get haplotype priors if available
     pub fn hap_priors(&self) -> Option<&[HaplotypePriors]> {
         self.hap_priors.as_deref()
+    }
+
+    /// Set recombination rate between the prior marker and overlap start.
+    pub fn set_incoming_recomb_rate(&mut self, rate: f32) {
+        self.incoming_recomb_rate = Some(rate);
+    }
+
+    /// Get recombination rate between the prior marker and overlap start.
+    pub fn incoming_recomb_rate(&self) -> Option<f32> {
+        self.incoming_recomb_rate
     }
 
     /// Get the allele for a specific haplotype at a specific marker

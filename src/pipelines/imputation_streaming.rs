@@ -733,6 +733,31 @@ target_samples={} target_bytes={}",
             if let Some(priors) = next_priors {
                 next_overlap.set_hap_priors(priors);
             }
+            let n_ref_markers = ref_markers.len();
+            let overlap_size = 1000.min(n_ref_markers);
+            let prior_marker_idx = ref_output_end.saturating_sub(overlap_size).saturating_sub(1);
+            let boundary_recomb_rate = if prior_marker_idx + 1 < n_ref_markers {
+                let marker_idx = prior_marker_idx + 1;
+                let block_idx = ref_map.blocks.partition_point(|b| b.end_marker <= marker_idx);
+                if block_idx >= ref_map.blocks.len() {
+                    0.0
+                } else {
+                    let block = &ref_map.blocks[block_idx];
+                    let local_idx = marker_idx.saturating_sub(block.start_marker);
+                    if local_idx == 0 {
+                        if block_idx == 0 {
+                            0.0
+                        } else {
+                            ref_map.boundary_rates[block_idx - 1]
+                        }
+                    } else {
+                        block.local_recomb_rates[local_idx - 1]
+                    }
+                }
+            } else {
+                0.0
+            };
+            next_overlap.set_incoming_recomb_rate(boundary_recomb_rate);
             imp_overlap = Some(next_overlap);
         }
 
@@ -972,20 +997,29 @@ target_samples={} target_bytes={}",
                         sample_idx,
                     );
                     let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap_idx);
+                    let partner_allele =
+                        target_win.allele(MarkerIdx::new(target_m as u32), hap_idx.other());
 
-                    let mapped_allele = if let Some(mapping) = alignment
+                    let (mapped_allele, mapped_partner) = if let Some(mapping) = alignment
                         .allele_mappings
                         .get(target_m)
                         .and_then(|m| m.as_ref())
                     {
                         if (allele as usize) < mapping.targ_to_ref.len() {
                             let r = mapping.targ_to_ref[allele as usize];
-                            if r >= 0 { r as u8 } else { 255 }
+                            let mapped_allele = if r >= 0 { r as u8 } else { 255 };
+                            let mapped_partner = if (partner_allele as usize) < mapping.targ_to_ref.len() {
+                                let rp = mapping.targ_to_ref[partner_allele as usize];
+                                if rp >= 0 { rp as u8 } else { 255 }
+                            } else {
+                                255
+                            };
+                            (mapped_allele, mapped_partner)
                         } else {
-                            255
+                            (255, 255)
                         }
                     } else {
-                        allele
+                        (allele, partner_allele)
                     };
 
                     let mut pl_probs: Vec<f32> = Vec::new();
@@ -1131,8 +1165,31 @@ target_samples={} target_bytes={}",
 
                     if mapped_allele != 255 && (mapped_allele as usize) < n_alleles && !use_probs {
                         aligned_probs.resize(n_alleles, 1.0 / n_alleles as f32);
+                        let is_het = mapped_partner != 255
+                            && (mapped_partner as usize) < n_alleles
+                            && mapped_partner != mapped_allele;
+                        let phase_conf = if is_het {
+                            target_win.sample_phase_confidence_f32(
+                                MarkerIdx::new(target_m as u32),
+                                sample_idx,
+                            )
+                        } else {
+                            1.0
+                        };
                         for a in 0..n_alleles {
-                            let hard = if a == mapped_allele as usize { 1.0 } else { 0.0 };
+                            let hard = if is_het {
+                                if a == mapped_allele as usize {
+                                    phase_conf
+                                } else if a == mapped_partner as usize {
+                                    1.0 - phase_conf
+                                } else {
+                                    0.0
+                                }
+                            } else if a == mapped_allele as usize {
+                                1.0
+                            } else {
+                                0.0
+                            };
                             aligned_probs[a] = conf * hard + (1.0 - conf) * aligned_probs[a];
                         }
                         normalize_probs(&mut aligned_probs);
@@ -1157,6 +1214,8 @@ target_samples={} target_bytes={}",
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
         }
 
+        let overlap_size = 1000.min(n_ref_markers);
+        let prior_marker_idx = output_end.saturating_sub(overlap_size).saturating_sub(1);
         let sample_results: Vec<ImputeResult> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
@@ -1225,9 +1284,22 @@ target_samples={} target_bytes={}",
                         
                                                                         // Run HMM
                         
-                                                                        ref_map.forward_pass_probs(&input_probs, self.params.p_mismatch, ws);
-                        
-                                                                        let posteriors = ref_map.backward_and_emit_posteriors_probs(&input_probs, self.params.p_mismatch, ws);
+                                                                        let initial_recomb_rate = imp_overlap
+                                                                            .and_then(|o| o.incoming_recomb_rate())
+                                                                            .unwrap_or(0.0);
+                                                                        ref_map.forward_pass_probs(
+                                                                            &input_probs,
+                                                                            self.params.p_mismatch,
+                                                                            ws,
+                                                                            initial_recomb_rate,
+                                                                        );
+
+                                                                        let posteriors = ref_map.backward_and_emit_posteriors_probs(
+                                                                            &input_probs,
+                                                                            self.params.p_mismatch,
+                                                                            ws,
+                                                                            initial_recomb_rate,
+                                                                        );
                         
                                                                         
                         
@@ -1243,15 +1315,14 @@ target_samples={} target_bytes={}",
                         
                                                                         // We use state at overlap_start - 1 (approximate, misses one transition step but avoids double emission)
                         
-                                                                        let overlap_size = 1000.min(n_ref_markers);
-                        
-                                                                        let prior_marker_idx = output_end.saturating_sub(overlap_size).saturating_sub(1);
-                        
-                                                                        
-                        
                                                                         // Run forward pass up to prior_marker_idx
-                        
-                                                                        ref_map.forward_to_marker_probs(&input_probs, self.params.p_mismatch, ws, prior_marker_idx);
+                                                                        ref_map.forward_to_marker_probs(
+                                                                            &input_probs,
+                                                                            self.params.p_mismatch,
+                                                                            ws,
+                                                                            prior_marker_idx,
+                                                                            initial_recomb_rate,
+                                                                        );
                         
                                                                         
                         

@@ -57,15 +57,17 @@ pub fn forward_within_block_probs(
     target_probs: &TargetAlleleProbsView<'_>,
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
+    initial_recomb_rate: f32,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
 
     // For each marker in the window
+    let mut prev_probs: &[f32] = &[];
     for marker_in_window in 0..window_size {
         let probs = target_probs.probs_for_marker(marker_in_window);
         let recomb_rate = if marker_in_window == 0 {
-            0.0
+            initial_recomb_rate
         } else {
             block.local_recomb_rates[marker_in_window - 1]
         };
@@ -103,11 +105,14 @@ pub fn forward_within_block_probs(
 
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
+            let coherence = reservoir_coherence(block, marker_in_window, prev_probs, probs);
+            let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate) * coherence;
             ws.reservoir_prob_fwd =
-                reservoir_emission * (background * block.reservoir_count as f32);
+                reservoir_emission * (stay + background * block.reservoir_count as f32);
         }
 
         ws.normalize_forward(n_patterns);
+        prev_probs = probs;
     }
 }
 
@@ -118,16 +123,18 @@ pub fn forward_to_marker_in_block_probs(
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
     stop_marker_in_window: usize,
+    initial_recomb_rate: f32,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
 
     assert!(stop_marker_in_window < window_size);
 
+    let mut prev_probs: &[f32] = &[];
     for marker_in_window in 0..=stop_marker_in_window {
         let probs = target_probs.probs_for_marker(marker_in_window);
         let recomb_rate = if marker_in_window == 0 {
-            0.0
+            initial_recomb_rate
         } else {
             block.local_recomb_rates[marker_in_window - 1]
         };
@@ -165,11 +172,14 @@ pub fn forward_to_marker_in_block_probs(
 
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
+            let coherence = reservoir_coherence(block, marker_in_window, prev_probs, probs);
+            let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate) * coherence;
             ws.reservoir_prob_fwd =
-                reservoir_emission * (background * block.reservoir_count as f32);
+                reservoir_emission * (stay + background * block.reservoir_count as f32);
         }
 
         ws.normalize_forward(n_patterns);
+        prev_probs = probs;
     }
 }
 
@@ -180,16 +190,18 @@ pub fn backward_and_emit_block_probs(
     error_rate: f32,
     ws: &mut BlockHmmWorkspace,
     output: &mut [AllelePosteriors],
+    initial_recomb_rate: f32,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
 
     assert_eq!(output.len(), window_size, "Output slice size mismatch");
 
+    let mut prev_probs: &[f32] = &[];
     for marker_idx in 0..window_size {
         let probs = target_probs.probs_for_marker(marker_idx);
         let recomb_rate = if marker_idx == 0 {
-            0.0
+            initial_recomb_rate
         } else {
             block.local_recomb_rates[marker_idx - 1]
         };
@@ -221,8 +233,10 @@ pub fn backward_and_emit_block_probs(
             );
             let total_mass = fwd_sum;
             let background = total_mass * recomb_rate / block.n_ref_haps() as f32;
+            let coherence = reservoir_coherence(block, marker_idx, prev_probs, probs);
+            let stay = ws.reservoir_prob_fwd * (1.0 - recomb_rate) * coherence;
             ws.reservoir_prob_fwd =
-                reservoir_emission * (background * block.reservoir_count as f32);
+                reservoir_emission * (stay + background * block.reservoir_count as f32);
         }
 
         ws.normalize_forward(n_patterns);
@@ -233,12 +247,14 @@ pub fn backward_and_emit_block_probs(
 
         history[..n_patterns].copy_from_slice(&ws.fwd[..n_patterns]);
         history[n_patterns] = ws.reservoir_prob_fwd;
+        prev_probs = probs;
     }
 
+    let mut next_probs: &[f32] = &[];
     for marker_idx in (0..window_size).rev() {
         let probs = target_probs.probs_for_marker(marker_idx);
         let recomb_rate = if marker_idx == 0 {
-            0.0
+            initial_recomb_rate
         } else {
             block.local_recomb_rates[marker_idx - 1]
         };
@@ -386,10 +402,12 @@ pub fn backward_and_emit_block_probs(
             for i in 0..n_patterns {
                 ws.bwd[i] = ws.bwd[i] * stay_prob + common_add;
             }
-            ws.reservoir_prob_bwd = common_add;
+            let coherence = reservoir_coherence_backward(block, marker_idx, probs, next_probs);
+            ws.reservoir_prob_bwd = ws.reservoir_prob_bwd * stay_prob * coherence + common_add;
         }
 
         ws.normalize_bwd(n_patterns);
+        next_probs = probs;
     }
 }
 
@@ -481,6 +499,65 @@ fn emission_prob_soft(
     }
 }
 
+fn reservoir_coherence(
+    block: &CompressedBlock,
+    marker_in_window: usize,
+    prev_probs: &[f32],
+    curr_probs: &[f32],
+) -> f32 {
+    if marker_in_window == 0 || block.reservoir_ld.is_empty() {
+        return 1.0;
+    }
+    if prev_probs.len() < 2 || curr_probs.len() < 2 {
+        return 1.0;
+    }
+    let idx = marker_in_window - 1;
+    let ld = match block.reservoir_ld.get(idx) {
+        Some(v) => v,
+        None => return 1.0,
+    };
+    let p0_prev = prev_probs.get(0).copied().unwrap_or(0.0);
+    let p1_prev = prev_probs.get(1).copied().unwrap_or(0.0);
+    let p0_curr = curr_probs.get(0).copied().unwrap_or(0.0);
+    let p1_curr = curr_probs.get(1).copied().unwrap_or(0.0);
+    let coherence = p0_prev * (p0_curr * ld[0] + p1_curr * ld[1])
+        + p1_prev * (p0_curr * ld[2] + p1_curr * ld[3]);
+    if coherence.is_finite() {
+        coherence.clamp(0.0, 10.0)
+    } else {
+        1.0
+    }
+}
+
+fn reservoir_coherence_backward(
+    block: &CompressedBlock,
+    marker_in_window: usize,
+    curr_probs: &[f32],
+    next_probs: &[f32],
+) -> f32 {
+    if next_probs.is_empty() || block.reservoir_ld.is_empty() {
+        return 1.0;
+    }
+    if curr_probs.len() < 2 || next_probs.len() < 2 {
+        return 1.0;
+    }
+    let ld = match block.reservoir_ld.get(marker_in_window) {
+        Some(v) => v,
+        None => return 1.0,
+    };
+    let p0_curr = curr_probs.get(0).copied().unwrap_or(0.0);
+    let p1_curr = curr_probs.get(1).copied().unwrap_or(0.0);
+    let p0_next = next_probs.get(0).copied().unwrap_or(0.0);
+    let p1_next = next_probs.get(1).copied().unwrap_or(0.0);
+    let coherence = p0_curr * (p0_next * ld[0] + p1_next * ld[1])
+        + p1_curr * (p0_next * ld[2] + p1_next * ld[3]);
+    if coherence.is_finite() {
+        coherence.clamp(0.0, 10.0)
+    } else {
+        1.0
+    }
+}
+
 fn pattern_idx_to_id(idx: usize) -> PatternId {
     PatternId::new(idx as u32)
 }
@@ -548,7 +625,7 @@ mod tests {
         
         // Run forward pass
         let view = TargetAlleleProbsView::new(&target_probs, 0);
-        forward_within_block_probs(&block, &view, error, &mut ws);
+        forward_within_block_probs(&block, &view, error, &mut ws, 0.0);
         
         // Expected probs (ignoring normalization for a moment, or rather checking ratios)
         // P0 (0 mismatches): Init * match * match

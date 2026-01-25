@@ -80,7 +80,7 @@ impl TransitionBridge {
         
         let mut reservoir_to_pattern: Vec<(PatternId, f32)> = Vec::new();
         let mut pattern_to_reservoir: Vec<(PatternId, f32)> = Vec::new();
-        let reservoir_to_reservoir = 0.0f32;
+        let mut reservoir_to_reservoir = 0.0f32;
 
         // Zip the two mappings to track how each haplotype transitions
         for (&pat_a, &pat_b) in map_a.iter().zip(map_b.iter()) {
@@ -101,10 +101,20 @@ impl TransitionBridge {
             let flow = weight * (1.0 - recomb_rate);
 
             // Route the flow based on source and destination
-            if pat_a.is_reservoir() || pat_b.is_reservoir() {
-                continue;
+            match (pat_a.is_reservoir(), pat_b.is_reservoir()) {
+                (false, false) => {
+                    transitions.push((pat_a, pat_b, flow));
+                }
+                (false, true) => {
+                    pattern_to_reservoir.push((pat_a, flow));
+                }
+                (true, false) => {
+                    reservoir_to_pattern.push((pat_b, flow));
+                }
+                (true, true) => {
+                    reservoir_to_reservoir += flow;
+                }
             }
-            transitions.push((pat_a, pat_b, flow));
         }
 
         // Sort and aggregate for Forward (sorted by Source)

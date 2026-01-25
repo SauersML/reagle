@@ -88,6 +88,7 @@ where
         reservoir_allele_freqs,
         reservoir_freq_offsets,
         reservoir_obs_fractions,
+        reservoir_ld,
         hap_to_state,
     ) = if n_unique_patterns > limit {
         let mut pattern_order: Vec<usize> = (0..n_unique_patterns).collect();
@@ -120,11 +121,11 @@ where
 
         let reservoir_count = reservoir_globals.len() as u32;
 
-        let (reservoir_freqs, reservoir_freq_offsets, reservoir_obs_fractions) =
+        let (reservoir_freqs, reservoir_freq_offsets, reservoir_obs_fractions, reservoir_ld) =
             if reservoir_count > 0 {
                 compute_reservoir_freqs(&storage, &reservoir_globals, n_markers, &marker_n_alleles)
             } else {
-                (Vec::new(), vec![0; n_markers], vec![0.0; n_markers])
+                (Vec::new(), vec![0; n_markers], vec![0.0; n_markers], Vec::new())
             };
 
         let pattern_counts: Vec<f32> =
@@ -142,6 +143,7 @@ where
             reservoir_freqs,
             reservoir_freq_offsets,
             reservoir_obs_fractions,
+            reservoir_ld,
             hap_to_state,
         )
     } else {
@@ -158,6 +160,7 @@ where
             Vec::new(),
             vec![0; n_markers],
             vec![0.0; n_markers],
+            Vec::new(),
             hap_to_state,
         )
     };
@@ -189,6 +192,7 @@ where
         reservoir_globals,
         reservoir_freqs: reservoir_allele_freqs,
         reservoir_freq_offsets,
+        reservoir_ld,
         reservoir_obs_fractions,
         unpacked_alleles,
         local_recomb_rates,
@@ -241,10 +245,15 @@ fn compute_reservoir_freqs(
     reservoir_globals: &[GlobalId],
     window_size: usize,
     marker_n_alleles: &[u8],
-) -> (Vec<f32>, Vec<usize>, Vec<f32>) {
+) -> (Vec<f32>, Vec<usize>, Vec<f32>, Vec<[f32; 4]>) {
     let n_reservoir = reservoir_globals.len();
     if n_reservoir == 0 {
-        return (Vec::new(), vec![0; window_size], vec![0.0; window_size]);
+        return (
+            Vec::new(),
+            vec![0; window_size],
+            vec![0.0; window_size],
+            Vec::new(),
+        );
     }
 
     // Calculate total size and offsets
@@ -302,7 +311,70 @@ fn compute_reservoir_freqs(
         .map(|&c| if n_reservoir > 0 { c as f32 / n_reservoir as f32 } else { 0.0 })
         .collect();
 
-    (freqs, offsets, obs_fractions)
+    let reservoir_ld =
+        compute_reservoir_ld(storage, reservoir_globals, window_size, marker_n_alleles);
+    (freqs, offsets, obs_fractions, reservoir_ld)
+}
+
+/// Compute LD coherence factors for reservoir haplotypes (biallelic only).
+fn compute_reservoir_ld(
+    storage: &Arc<DictionaryColumn>,
+    reservoir_globals: &[GlobalId],
+    window_size: usize,
+    marker_n_alleles: &[u8],
+) -> Vec<[f32; 4]> {
+    let mut ld = vec![[1.0f32; 4]; window_size.saturating_sub(1)];
+    if reservoir_globals.is_empty() || window_size < 2 {
+        return ld;
+    }
+
+    for m in 0..window_size.saturating_sub(1) {
+        if marker_n_alleles[m] != 2 || marker_n_alleles[m + 1] != 2 {
+            continue;
+        }
+        let mut counts = [[0u32; 2]; 2];
+        let mut row = [0u32; 2];
+        let mut col = [0u32; 2];
+        let mut total = 0u32;
+
+        for &global_id in reservoir_globals {
+            let hap = HapIdx::new(global_id.as_u32());
+            let a = storage.get(m, hap);
+            let b = storage.get(m + 1, hap);
+            if a == 255 || b == 255 || a > 1 || b > 1 {
+                continue;
+            }
+            let ai = a as usize;
+            let bi = b as usize;
+            counts[ai][bi] += 1;
+            row[ai] += 1;
+            col[bi] += 1;
+            total += 1;
+        }
+
+        if total == 0 {
+            continue;
+        }
+        let total_f = total as f32;
+        for ai in 0..2 {
+            for bi in 0..2 {
+                let p_uv = counts[ai][bi] as f32 / total_f;
+                let p_u = row[ai] as f32 / total_f;
+                let p_v = col[bi] as f32 / total_f;
+                let mut lambda = if p_u > 0.0 && p_v > 0.0 {
+                    p_uv / (p_u * p_v)
+                } else {
+                    1.0
+                };
+                if !lambda.is_finite() {
+                    lambda = 1.0;
+                }
+                ld[m][ai * 2 + bi] = lambda.clamp(0.1, 10.0);
+            }
+        }
+    }
+
+    ld
 }
 
 #[cfg(test)]

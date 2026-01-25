@@ -44,6 +44,10 @@ pub struct CompressedBlock {
     /// Offsets into reservoir_freqs for each marker [marker_in_window]
     pub reservoir_freq_offsets: Vec<usize>,
 
+    /// Reservoir LD coherence factors for adjacent markers (biallelic only).
+    /// Layout per interval: [00, 01, 10, 11] for allele pairs (t, t+1).
+    pub reservoir_ld: Vec<[f32; 4]>,
+
     /// Fraction of reservoir haplotypes that are NOT missing at each marker [marker_in_window]
     /// Needed for proper missingness handling in emission probabilities.
     pub reservoir_obs_fractions: Vec<f32>,

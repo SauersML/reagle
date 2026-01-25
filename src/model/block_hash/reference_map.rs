@@ -31,6 +31,9 @@ pub struct ReferenceMap {
 
     /// Actual maximum states observed in any block
     pub max_observed_states: usize,
+
+    /// Recombination rates between consecutive blocks (len = blocks.len()-1)
+    pub boundary_rates: Vec<f32>,
 }
 
 impl ReferenceMap {
@@ -68,6 +71,7 @@ impl ReferenceMap {
             bridges,
             window_size,
             max_observed_states,
+            boundary_rates: boundary_rates.to_vec(),
         })
     }
 
@@ -91,6 +95,7 @@ impl ReferenceMap {
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
         marker_idx: usize,
+        initial_recomb_rate: f32,
     ) {
         let block_idx = self.blocks.partition_point(|b| b.end_marker <= marker_idx);
 
@@ -100,13 +105,13 @@ impl ReferenceMap {
 
             let local_marker = marker_idx - block.start_marker;
             let view = TargetAlleleProbsView::new(target_probs, block.start_marker);
-
             super::hmm::forward_to_marker_in_block_probs(
                 block,
                 &view,
                 error_rate,
                 ws,
                 local_marker,
+                if block_idx == 0 { initial_recomb_rate } else { 0.0 },
             );
         }
     }
@@ -117,12 +122,19 @@ impl ReferenceMap {
         target_probs: &TargetAlleleProbs,
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
+        initial_recomb_rate: f32,
     ) {
         for (block_idx, block) in self.blocks.iter().enumerate() {
             ws.save_checkpoint(block_idx, block.n_patterns());
 
             let view = TargetAlleleProbsView::new(target_probs, block.start_marker);
-            super::hmm::forward_within_block_probs(block, &view, error_rate, ws);
+            super::hmm::forward_within_block_probs(
+                block,
+                &view,
+                error_rate,
+                ws,
+                if block_idx == 0 { initial_recomb_rate } else { 0.0 },
+            );
 
             if block_idx < self.bridges.len() {
                 self.bridges[block_idx].apply_forward(block, &self.blocks[block_idx + 1], ws);
@@ -136,6 +148,7 @@ impl ReferenceMap {
         target_probs: &TargetAlleleProbs,
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
+        initial_recomb_rate: f32,
     ) -> Vec<AllelePosteriors> {
         let mut posteriors = vec![AllelePosteriors::Biallelic(0.0); target_probs.n_markers()];
 
@@ -159,13 +172,13 @@ impl ReferenceMap {
 
             let view = TargetAlleleProbsView::new(target_probs, block.start_marker);
             let output_slice = &mut posteriors[start..end];
-
             super::hmm::backward_and_emit_block_probs(
                 block,
                 &view,
                 error_rate,
                 ws,
                 output_slice,
+                if block_idx == 0 { initial_recomb_rate } else { 0.0 },
             );
 
             if block_idx > 0 {
