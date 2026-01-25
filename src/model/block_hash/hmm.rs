@@ -8,6 +8,7 @@ use super::workspace::BlockHmmWorkspace;
 use super::types::PatternId;
 use super::weighted_kernel::WeightedHmmUpdater;
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::model::parameters::ParamEstimates;
 
 /// Per-marker allele probability distributions for a single haplotype.
 pub struct TargetAlleleProbs {
@@ -191,6 +192,7 @@ pub fn backward_and_emit_block_probs(
     ws: &mut BlockHmmWorkspace,
     output: &mut [AllelePosteriors],
     initial_recomb_rate: f32,
+    estimates: Option<&mut ParamEstimates>,
 ) {
     let n_patterns = block.n_patterns();
     let window_size = block.window_size();
@@ -331,6 +333,45 @@ pub fn backward_and_emit_block_probs(
                 res_weight_sum = res_p;
             }
             observed_mass += res_weight_sum;
+        }
+
+        // Accumulate estimates for EM
+        if let Some(est) = estimates.as_mut() {
+            // Only use markers where target probabilities are available
+            if observed_mass > 0.0 && !probs.is_empty() {
+                let norm = 1.0 / observed_mass;
+                let mut total_match = 0.0f32;
+
+                // Standard patterns
+                for pattern_idx in 0..n_patterns {
+                    let p = current_fwd[pattern_idx] * ws.bwd[pattern_idx];
+                    if p > 0.0 {
+                        let allele = block.get_pattern_allele(pattern_idx_to_id(pattern_idx), marker_idx) as usize;
+                        if allele < n_alleles {
+                            let p_norm = p * norm;
+                            let p_match = probs.get(allele).copied().unwrap_or(0.0);
+                            total_match += p_norm * p_match;
+                        }
+                    }
+                }
+
+                // Reservoir
+                if res_p > 0.0 {
+                    let obs_fraction = block.get_reservoir_obs_fraction(marker_idx);
+                    if obs_fraction > 0.0 {
+                        let p_norm = res_p * norm; // Approximation using total res prob mass
+                        let mut expected_match = 0.0f32;
+                        for allele in 0..n_alleles {
+                            let p_tgt = probs.get(allele).copied().unwrap_or(0.0);
+                            let freq = block.reservoir_freq(marker_idx, allele as u8);
+                            expected_match += p_tgt * freq;
+                        }
+                        total_match += p_norm * expected_match;
+                    }
+                }
+
+                est.add_emission(total_match as f64, (1.0 - total_match) as f64);
+            }
         }
 
         if observed_mass > 0.0 {
