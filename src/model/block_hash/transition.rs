@@ -77,7 +77,7 @@ impl TransitionBridge {
         // Collect all transitions in COO format (coordinate list)
         // We store (src, dst, weight)
         let mut transitions: Vec<(PatternId, PatternId, f32)> = Vec::new();
-        
+
         let mut reservoir_to_pattern: Vec<(PatternId, f32)> = Vec::new();
         let mut pattern_to_reservoir: Vec<(PatternId, f32)> = Vec::new();
         let mut reservoir_to_reservoir = 0.0f32;
@@ -124,7 +124,7 @@ impl TransitionBridge {
         // Sort and aggregate for Backward (sorted by Dest)
         let mut bwd_transitions = transitions; // Move
         bwd_transitions.sort_by_key(|(from, to, _)| (*to, *from));
-        
+
         let (bwd_i, bwd_j, bwd_w) = aggregate_transitions(bwd_transitions);
         // aggregate returns (from, to, w).
         // Since we sorted by (to, from):
@@ -134,7 +134,7 @@ impl TransitionBridge {
         // bwd_sources (j) -> bwd_dests (i).
         // Renaming to transpose_cols -> transpose_rows.
         let transpose_cols = bwd_j; // j (sorted)
-        let transpose_rows = bwd_i;   // i
+        let transpose_rows = bwd_i; // i
         let bwd_weights = bwd_w;
 
         // Reservoir → Pattern (sort for determinism)
@@ -165,14 +165,19 @@ impl TransitionBridge {
     }
 
     /// Apply this transition to transfer probabilities from window_a to window_b (Forward)
-    pub(crate) fn apply_forward(&self, window_a: &CompressedBlock, window_b: &CompressedBlock, ws: &mut super::workspace::BlockHmmWorkspace) {
+    pub(crate) fn apply_forward(
+        &self,
+        window_a: &CompressedBlock,
+        window_b: &CompressedBlock,
+        ws: &mut super::workspace::BlockHmmWorkspace,
+    ) {
         let n_patterns_b = window_b.n_patterns();
 
         // reuse emissions buffer as scratch space for new_fwd
         // ensure it has enough capacity
         ws.emissions.fill(0.0);
         if ws.emissions.len() < ws.fwd.len() {
-             ws.emissions.resize(ws.fwd.len(), 0.0);
+            ws.emissions.resize(ws.fwd.len(), 0.0);
         }
 
         let mut new_reservoir_prob = 0.0f32;
@@ -206,7 +211,8 @@ impl TransitionBridge {
         new_reservoir_prob += ws.reservoir_prob_fwd * self.reservoir_to_reservoir;
 
         // Add recombination background to all states
-        let total_mass = ws.fwd.iter().take(window_a.n_patterns()).sum::<f32>() + ws.reservoir_prob_fwd;
+        let total_mass =
+            ws.fwd.iter().take(window_a.n_patterns()).sum::<f32>() + ws.reservoir_prob_fwd;
         let background_per_hap = total_mass * self.recomb_rate / (self.n_ref_haps as f32);
 
         // Distribute recombination mass proportionally to pattern counts in B
@@ -229,25 +235,30 @@ impl TransitionBridge {
 
     /// Apply transition Backward (B -> A)
     /// Updates ws.bwd (which currently holds B) to hold A.
-    pub(crate) fn apply_backward(&self, window_a: &CompressedBlock, window_b: &CompressedBlock, ws: &mut super::workspace::BlockHmmWorkspace) {
+    pub(crate) fn apply_backward(
+        &self,
+        window_a: &CompressedBlock,
+        window_b: &CompressedBlock,
+        ws: &mut super::workspace::BlockHmmWorkspace,
+    ) {
         let n_patterns_a = window_a.n_patterns();
         let n_patterns_b = window_b.n_patterns();
 
         // ws.bwd holds values for B. We want to compute values for A into ws.emissions (reused buffer).
         ws.emissions.fill(0.0);
         if ws.emissions.len() < ws.bwd.len() {
-             ws.emissions.resize(ws.bwd.len(), 0.0);
+            ws.emissions.resize(ws.bwd.len(), 0.0);
         }
-        
+
         // Background recombination contribution (Gather from all B)
         let mut recomb_sum = 0.0f32;
         for j in 0..n_patterns_b {
             recomb_sum += ws.bwd[j] * window_b.pattern_counts[j];
         }
         recomb_sum += ws.reservoir_prob_bwd * (window_b.reservoir_count as f32);
-        
+
         let recomb_term = (self.recomb_rate / self.n_ref_haps as f32) * recomb_sum;
-        
+
         // Initialize A with recomb term
         for i in 0..n_patterns_a {
             ws.emissions[i] = recomb_term;
@@ -272,7 +283,7 @@ impl TransitionBridge {
             // Do NOT multiply by count_a - that would incorrectly scale by cluster size
             ws.emissions[pat_a.as_usize()] += ws.bwd[pat_b.as_usize()] * weight;
         }
-        
+
         // Reservoir transitions (only if A has reservoir)
         // Reservoir -> Pattern (A->B)
         // beta[res_A] += beta[pat_B] * weight
@@ -283,7 +294,7 @@ impl TransitionBridge {
                 new_reservoir_prob += ws.bwd[pat_b.as_usize()] * weight;
             }
         }
-        
+
         // Pattern -> Reservoir (A->B)
         // beta[pat_A] += beta[res_B] * weight
         for k in 0..self.pattern_to_reservoir_ids.len() {
@@ -291,7 +302,7 @@ impl TransitionBridge {
             let weight = self.pattern_to_reservoir_weights[k];
             ws.emissions[pat_a.as_usize()] += ws.reservoir_prob_bwd * weight;
         }
-        
+
         // Reservoir -> Reservoir
         if window_a.reservoir_count > 0 {
             new_reservoir_prob += ws.reservoir_prob_bwd * self.reservoir_to_reservoir;
@@ -302,7 +313,6 @@ impl TransitionBridge {
         ws.reservoir_prob_bwd = new_reservoir_prob;
     }
 }
-
 
 /// Aggregate sorted transitions into parallel vectors (CSR-like format)
 fn aggregate_transitions(
@@ -348,9 +358,7 @@ fn aggregate_transitions(
 }
 
 /// Aggregate reservoir transitions
-fn aggregate_reservoir_transitions(
-    sorted: Vec<(PatternId, f32)>,
-) -> (Vec<PatternId>, Vec<f32>) {
+fn aggregate_reservoir_transitions(sorted: Vec<(PatternId, f32)>) -> (Vec<PatternId>, Vec<f32>) {
     if sorted.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -388,8 +396,8 @@ mod tests {
     use crate::model::block_hash::compression::build_compressed_block_from_columns;
 
     fn create_mock_block(alleles: &[u8], n_haps: usize, n_markers: usize) -> CompressedBlock {
-        use crate::data::marker::{Marker, Allele};
-        
+        use crate::data::marker::{Allele, Marker};
+
         let mut cols = Vec::new();
         for m in 0..n_markers {
             let mut col_alleles = Vec::new();
@@ -402,9 +410,15 @@ mod tests {
         let mut markers = Markers::new();
         let chr = markers.add_chrom("1");
         for i in 0..n_markers {
-            markers.push(Marker::new(chr, i as u32, None, Allele::Base(0), vec![Allele::Base(1)]));
+            markers.push(Marker::new(
+                chr,
+                i as u32,
+                None,
+                Allele::Base(0),
+                vec![Allele::Base(1)],
+            ));
         }
-        
+
         let markers: Vec<Marker> = (0..markers.len())
             .map(|i| markers[crate::data::marker::MarkerIdx::new(i as u32)].clone())
             .collect();
@@ -416,20 +430,10 @@ mod tests {
     fn test_build_bridge_deterministic() {
         // Window A: 2 patterns (0,0) and (1,1) duplicated
         // Haps: 0->P0, 1->P0, 2->P1, 3->P1
-        let a_alleles = vec![
-            0,0, 
-            0,0, 
-            1,1, 
-            1,1
-        ];
+        let a_alleles = vec![0, 0, 0, 0, 1, 1, 1, 1];
         // Window B: Swapped? No, let's mix it up.
         // Haps: 0->P0(0,0), 1->P1(1,1), 2->P0(0,0), 3->P1(1,1) (Cross-over)
-        let b_alleles = vec![
-            0,0,
-            1,1,
-            0,0,
-            1,1
-        ];
+        let b_alleles = vec![0, 0, 1, 1, 0, 0, 1, 1];
 
         let block_a = create_mock_block(&a_alleles, 4, 2);
         let block_b = create_mock_block(&b_alleles, 4, 2);
@@ -438,19 +442,19 @@ mod tests {
 
         // block_a has 2 patterns (weights 2/4 each)
         // block_b has 2 patterns (weights 2/4 each)
-        
+
         // Transition logic:
         // Hap 0: P0(A) -> P0(B)
         // Hap 1: P0(A) -> P1(B)
         // Hap 2: P1(A) -> P0(B)
         // Hap 3: P1(A) -> P1(B)
-        
+
         // P0(A) splits equally to P0(B) and P1(B).
         // P1(A) splits equally to P0(B) and P1(B).
-        
+
         assert_eq!(bridge.sources.len(), 4);
         assert_eq!(bridge.destinations.len(), 4);
-        
+
         // Check weights
         // P0(A) count=2. Weight=1/2.
         // Flow = 1/2 * 1 * 1.0 (no recomb) = 0.5.
@@ -468,23 +472,23 @@ mod tests {
         // Random alleles
         let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
         use rand::Rng;
-        
+
         let mut alleles_a = vec![0u8; n_haps * n_markers];
         let mut alleles_b = vec![0u8; n_haps * n_markers];
         for i in 0..alleles_a.len() {
-             alleles_a[i] = if rng.random_bool(0.5) { 1 } else { 0 };
-             alleles_b[i] = if rng.random_bool(0.5) { 1 } else { 0 };
+            alleles_a[i] = if rng.random_bool(0.5) { 1 } else { 0 };
+            alleles_b[i] = if rng.random_bool(0.5) { 1 } else { 0 };
         }
 
         let block_a = create_mock_block(&alleles_a, n_haps, n_markers);
         let block_b = create_mock_block(&alleles_b, n_haps, n_markers);
 
         let bridge = TransitionBridge::build(&block_a, &block_b, 0.01);
-        
+
         // Setup workspace
         use crate::model::block_hash::BlockHmmWorkspace;
         let mut ws = BlockHmmWorkspace::new(1000, 1, n_markers); // Plenty of space
-        
+
         // Initialize random probability distribution summing to 1.0
         let n_patterns_a = block_a.n_patterns();
         let mut sum = 0.0;
@@ -497,14 +501,18 @@ mod tests {
         for i in 0..n_patterns_a {
             ws.fwd[i] /= sum;
         }
-        
+
         // Apply Forward
         bridge.apply_forward(&block_a, &block_b, &mut ws);
-        
+
         // Check sum in B
         let n_patterns_b = block_b.n_patterns();
         let final_sum: f32 = ws.fwd[..n_patterns_b].iter().sum::<f32>() + ws.reservoir_prob_fwd;
-        
-        assert!((final_sum - 1.0).abs() < 1e-5, "Mass not conserved: {}", final_sum);
+
+        assert!(
+            (final_sum - 1.0).abs() < 1e-5,
+            "Mass not conserved: {}",
+            final_sum
+        );
     }
 }

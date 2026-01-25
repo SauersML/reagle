@@ -112,7 +112,6 @@ impl DictionaryColumn {
         &self.hap_to_pattern
     }
 
-
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.hap_to_pattern.len()
@@ -176,12 +175,7 @@ mod tests {
             vec![0u8, 0, 1, 1], // Marker 2
         ];
 
-        let dict = DictionaryColumn::compress(
-            |m, h| data[m][h.as_usize()],
-            3,
-            4,
-            1,
-        );
+        let dict = DictionaryColumn::compress(|m, h| data[m][h.as_usize()], 3, 4, 1);
 
         assert_eq!(dict.n_haplotypes(), 4);
         assert_eq!(dict.n_markers(), 3);

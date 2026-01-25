@@ -88,11 +88,7 @@ fn normalize_allele_freqs(freqs: &[f32], out: &mut Vec<f32>) -> Option<()> {
 fn genotype_prior(i: usize, j: usize, allele_freqs: &[f32]) -> f32 {
     let fi = allele_freqs.get(i).copied().unwrap_or(0.0);
     let fj = allele_freqs.get(j).copied().unwrap_or(0.0);
-    if i == j {
-        fi * fi
-    } else {
-        2.0 * fi * fj
-    }
+    if i == j { fi * fi } else { 2.0 * fi * fj }
 }
 
 pub fn allele_probs_uncond_from_pl(

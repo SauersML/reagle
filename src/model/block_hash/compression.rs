@@ -3,12 +3,12 @@
 //! This module provides functions to build `DictionaryColumn` and `MicroWindow`
 //! from ranges of markers in a `GenotypeMatrix`.
 
-use crate::data::haplotype::HapIdx;
-use crate::data::marker::Marker;
-use crate::data::storage::dictionary::DictionaryColumn;
-use crate::data::storage::GenotypeColumn;
 use super::compressed_block::CompressedBlock;
 use super::types::{GlobalId, PatternId};
+use crate::data::haplotype::HapIdx;
+use crate::data::marker::Marker;
+use crate::data::storage::GenotypeColumn;
+use crate::data::storage::dictionary::DictionaryColumn;
 
 use std::sync::Arc;
 
@@ -64,7 +64,8 @@ where
         8
     };
 
-    let dict_column = DictionaryColumn::compress(get_allele, n_markers, n_haplotypes, bits_per_allele);
+    let dict_column =
+        DictionaryColumn::compress(get_allele, n_markers, n_haplotypes, bits_per_allele);
     let storage = Arc::new(dict_column);
 
     let hap_to_pattern = storage.hap_to_pattern();
@@ -86,7 +87,11 @@ where
         initial_pattern_to_globals[pattern_idx as usize].push(global_id);
     }
 
-    let limit = if max_states == 0 { usize::MAX } else { max_states };
+    let limit = if max_states == 0 {
+        usize::MAX
+    } else {
+        max_states
+    };
 
     let mut pattern_order: Vec<usize> = (0..n_unique_patterns)
         .filter(|&i| initial_pattern_counts[i] > 0.0 || !use_keep)
@@ -135,11 +140,18 @@ where
         if reservoir_count > 0 {
             compute_reservoir_freqs(&storage, &reservoir_globals, n_markers, &marker_n_alleles)
         } else {
-            (Vec::new(), vec![0; n_markers], vec![0.0; n_markers], Vec::new())
+            (
+                Vec::new(),
+                vec![0; n_markers],
+                vec![0.0; n_markers],
+                Vec::new(),
+            )
         };
 
-    let pattern_counts: Vec<f32> =
-        kept_indices.iter().map(|&i| initial_pattern_counts[i]).collect();
+    let pattern_counts: Vec<f32> = kept_indices
+        .iter()
+        .map(|&i| initial_pattern_counts[i])
+        .collect();
     let pattern_to_globals: Vec<Vec<GlobalId>> = kept_indices
         .iter()
         .map(|&i| initial_pattern_to_globals[i].clone())
@@ -297,7 +309,7 @@ fn compute_reservoir_freqs(
         current_offset += n as usize;
     }
     let total_slots = current_offset;
-    
+
     let mut counts = vec![0u32; total_slots];
     let mut obs_counts = vec![0u32; window_size];
 
@@ -305,7 +317,7 @@ fn compute_reservoir_freqs(
         let hap = HapIdx::new(global_id.as_u32());
         for marker_idx in 0..window_size {
             let allele = storage.get(marker_idx, hap);
-            // Skip missing data in frequency calculation? 
+            // Skip missing data in frequency calculation?
             // Or treat as "no info"?
             // Usually we only count observed alleles.
             // If allele is 255, we ignore it.
@@ -324,24 +336,34 @@ fn compute_reservoir_freqs(
     let mut freqs = Vec::with_capacity(counts.len());
     let mut current_marker = 0;
     let mut current_end = offsets.get(1).copied().unwrap_or(counts.len());
-    
+
     for (i, &c) in counts.iter().enumerate() {
-         while i >= current_end {
-             current_marker += 1;
-             current_end = offsets.get(current_marker + 1).copied().unwrap_or(counts.len());
-         }
-         
-         let n_obs = obs_counts[current_marker];
-         if n_obs > 0 {
-             freqs.push(c as f32 / n_obs as f32);
-         } else {
-             freqs.push(0.0);
-         }
+        while i >= current_end {
+            current_marker += 1;
+            current_end = offsets
+                .get(current_marker + 1)
+                .copied()
+                .unwrap_or(counts.len());
+        }
+
+        let n_obs = obs_counts[current_marker];
+        if n_obs > 0 {
+            freqs.push(c as f32 / n_obs as f32);
+        } else {
+            freqs.push(0.0);
+        }
     }
-    
+
     // obs fractions
-    let obs_fractions: Vec<f32> = obs_counts.iter()
-        .map(|&c| if n_reservoir > 0 { c as f32 / n_reservoir as f32 } else { 0.0 })
+    let obs_fractions: Vec<f32> = obs_counts
+        .iter()
+        .map(|&c| {
+            if n_reservoir > 0 {
+                c as f32 / n_reservoir as f32
+            } else {
+                0.0
+            }
+        })
         .collect();
 
     let reservoir_ld =
@@ -431,8 +453,20 @@ mod tests {
         use crate::data::marker::{Allele, Marker};
         let mut m = Markers::new();
         let chr = m.add_chrom("chr1");
-        m.push(Marker::new(chr, 100, None, Allele::Base(0), vec![Allele::Base(1)]));
-        m.push(Marker::new(chr, 200, None, Allele::Base(0), vec![Allele::Base(1)]));
+        m.push(Marker::new(
+            chr,
+            100,
+            None,
+            Allele::Base(0),
+            vec![Allele::Base(1)],
+        ));
+        m.push(Marker::new(
+            chr,
+            200,
+            None,
+            Allele::Base(0),
+            vec![Allele::Base(1)],
+        ));
 
         let markers: Vec<Marker> = (0..m.len())
             .map(|i| m[crate::data::marker::MarkerIdx::new(i as u32)].clone())
@@ -447,7 +481,7 @@ mod tests {
         // Haps 2,3 should be Pattern B
         assert_eq!(block.n_patterns(), 2);
         assert_eq!(block.n_ref_haps(), 4);
-        
+
         let p0 = block.pattern_for_haplotype(GlobalId::new(0));
         let p1 = block.pattern_for_haplotype(GlobalId::new(1));
         let p2 = block.pattern_for_haplotype(GlobalId::new(2));

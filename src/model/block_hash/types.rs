@@ -70,7 +70,10 @@ impl PatternId {
 
     #[inline]
     pub fn new(id: u32) -> Self {
-        assert!(id != u32::MAX, "Use PatternId::RESERVOIR for sentinel value");
+        assert!(
+            id != u32::MAX,
+            "Use PatternId::RESERVOIR for sentinel value"
+        );
         Self(id)
     }
 

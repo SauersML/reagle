@@ -3395,8 +3395,7 @@ fn test_dosage_by_distance_from_genotyped() {
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
     let (_, truth_records) = parse_vcf(&truth_path);
-    let truth_map: HashMap<u64, &ParsedRecord> =
-        truth_records.iter().map(|r| (r.pos, r)).collect();
+    let truth_map: HashMap<u64, &ParsedRecord> = truth_records.iter().map(|r| (r.pos, r)).collect();
 
     // Find genotyped marker positions
     let genotyped_positions: Vec<u64> = java_records
@@ -3540,8 +3539,7 @@ fn test_dosage_by_distance_from_genotyped() {
         );
         println!(
             "  Java mean MAD: {:.4} (max {:.4})",
-            mean_mad_java,
-            max_java
+            mean_mad_java, max_java
         );
     }
 
@@ -3720,7 +3718,10 @@ fn test_posterior_probability_calibration() {
         0.0
     };
 
-    println!("\n  Total imputed genotype calls: Java={} Rust={}", java_total, rust_total);
+    println!(
+        "\n  Total imputed genotype calls: Java={} Rust={}",
+        java_total, rust_total
+    );
     println!(
         "  Correct by max(GP): Java={} ({:.2}%) Rust={} ({:.2}%)",
         java_correct,

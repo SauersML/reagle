@@ -659,7 +659,6 @@ impl StreamingVcfReader {
                 GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
             };
 
-
             // Peek ahead to find next window start position (if available)
             // window_end is the index of the first marker NOT in the current output+overlap set.
             // But wait, window_end was calculated based on `full_window_gen`.

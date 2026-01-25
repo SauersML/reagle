@@ -178,7 +178,7 @@ impl HmmUpdater {
 
             // res = (scale * emit * bwd) + const
             let res = (scale_vec * emit_vec * bwd_chunk) + const_vec;
-            
+
             let res_arr: [f32; 8] = res.into();
             bwd[k..k + 8].copy_from_slice(&res_arr);
             k += 8;
@@ -336,9 +336,8 @@ impl<'a> BeagleHmm<'a> {
                 let partner = partner_alleles.get(m).copied().unwrap_or(255);
                 let pl = plp.pl(m).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
-                    let biallelic_freqs = allele_freqs
-                        .and_then(|f| f.get(m).copied())
-                        .and_then(|f| {
+                    let biallelic_freqs =
+                        allele_freqs.and_then(|f| f.get(m).copied()).and_then(|f| {
                             if (0.0..=1.0).contains(&f) {
                                 Some([1.0 - f, f])
                             } else {
@@ -622,9 +621,8 @@ impl<'a> BeagleHmm<'a> {
                 let partner = partner_alleles.get(m).copied().unwrap_or(255);
                 let pl = plp.pl(m).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
-                    let biallelic_freqs = allele_freqs
-                        .and_then(|f| f.get(m).copied())
-                        .and_then(|f| {
+                    let biallelic_freqs =
+                        allele_freqs.and_then(|f| f.get(m).copied()).and_then(|f| {
                             if (0.0..=1.0).contains(&f) {
                                 Some([1.0 - f, f])
                             } else {

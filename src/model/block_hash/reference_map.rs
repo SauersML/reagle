@@ -7,10 +7,10 @@
 //! Built ONCE for the entire reference panel, then shared across all samples.
 
 use super::compressed_block::CompressedBlock;
+use super::hmm::{TargetAlleleProbs, TargetAlleleProbsView};
 use super::transition::TransitionBridge;
 use super::workspace::BlockHmmWorkspace;
 use crate::pipelines::imputation::AllelePosteriors;
-use super::hmm::{TargetAlleleProbs, TargetAlleleProbsView};
 use std::sync::Arc;
 
 /// Pre-computed reference map for block-hash HMM
@@ -60,11 +60,7 @@ impl ReferenceMap {
             bridges.push(Arc::new(bridge));
         }
 
-        let max_observed_states = blocks
-            .iter()
-            .map(|b| b.n_patterns())
-            .max()
-            .unwrap_or(0);
+        let max_observed_states = blocks.iter().map(|b| b.n_patterns()).max().unwrap_or(0);
 
         Arc::new(Self {
             blocks,
@@ -80,7 +76,11 @@ impl ReferenceMap {
     /// Uses the ACTUAL observed max patterns, not the theoretical config limit.
     /// This prevents over-allocation and ensures safety even if max_states=0 (no limit).
     pub fn create_workspace(&self) -> BlockHmmWorkspace {
-        BlockHmmWorkspace::new(self.max_observed_patterns(), self.blocks.len(), self.window_size)
+        BlockHmmWorkspace::new(
+            self.max_observed_patterns(),
+            self.blocks.len(),
+            self.window_size,
+        )
     }
 
     /// Calculate the actual maximum number of states required by any block
@@ -111,7 +111,11 @@ impl ReferenceMap {
                 error_rate,
                 ws,
                 local_marker,
-                if block_idx == 0 { initial_recomb_rate } else { 0.0 },
+                if block_idx == 0 {
+                    initial_recomb_rate
+                } else {
+                    0.0
+                },
             );
         }
     }
@@ -133,7 +137,11 @@ impl ReferenceMap {
                 &view,
                 error_rate,
                 ws,
-                if block_idx == 0 { initial_recomb_rate } else { 0.0 },
+                if block_idx == 0 {
+                    initial_recomb_rate
+                } else {
+                    0.0
+                },
             );
 
             if block_idx < self.bridges.len() {
@@ -178,21 +186,18 @@ impl ReferenceMap {
                 error_rate,
                 ws,
                 output_slice,
-                if block_idx == 0 { initial_recomb_rate } else { 0.0 },
+                if block_idx == 0 {
+                    initial_recomb_rate
+                } else {
+                    0.0
+                },
             );
 
             if block_idx > 0 {
-                self.bridges[block_idx - 1].apply_backward(
-                    &self.blocks[block_idx - 1],
-                    block,
-                    ws,
-                );
+                self.bridges[block_idx - 1].apply_backward(&self.blocks[block_idx - 1], block, ws);
             }
         }
 
         posteriors
     }
-
-
-
 }

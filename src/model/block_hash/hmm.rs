@@ -4,9 +4,9 @@
 //! SIMD-optimized HMM kernels instead of writing new scalar loops.
 
 use super::compressed_block::CompressedBlock;
-use super::workspace::BlockHmmWorkspace;
 use super::types::PatternId;
 use super::weighted_kernel::WeightedHmmUpdater;
+use super::workspace::BlockHmmWorkspace;
 use crate::pipelines::imputation::AllelePosteriors;
 
 /// Per-marker allele probability distributions for a single haplotype.
@@ -41,7 +41,10 @@ pub struct TargetAlleleProbsView<'a> {
 
 impl<'a> TargetAlleleProbsView<'a> {
     pub fn new(probs: &'a TargetAlleleProbs, start_marker: usize) -> Self {
-        Self { probs, start_marker }
+        Self {
+            probs,
+            start_marker,
+        }
     }
 
     #[inline]
@@ -73,13 +76,7 @@ pub fn forward_within_block_probs(
         };
 
         let emissions = &mut ws.emissions;
-        fill_emissions_for_marker_probs(
-            block,
-            marker_in_window,
-            probs,
-            error_rate,
-            emissions,
-        );
+        fill_emissions_for_marker_probs(block, marker_in_window, probs, error_rate, emissions);
 
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
 
@@ -140,13 +137,7 @@ pub fn forward_to_marker_in_block_probs(
         };
 
         let emissions = &mut ws.emissions;
-        fill_emissions_for_marker_probs(
-            block,
-            marker_in_window,
-            probs,
-            error_rate,
-            emissions,
-        );
+        fill_emissions_for_marker_probs(block, marker_in_window, probs, error_rate, emissions);
 
         let fwd_sum = ws.fwd[..n_patterns].iter().sum::<f32>() + ws.reservoir_prob_fwd;
 
@@ -565,10 +556,10 @@ fn pattern_idx_to_id(idx: usize) -> PatternId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::block_hash::compression::build_compressed_block_from_columns;
-    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
+    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::model::block_hash::compression::build_compressed_block_from_columns;
     use std::sync::Arc;
 
     /// Ported/Adapted from deleted `test_compute_cluster_mismatches_accumulation`
@@ -584,15 +575,27 @@ mod tests {
 
         let col0 = GenotypeColumn::from_alleles(&[0, 0, 1], 2);
         let col1 = GenotypeColumn::from_alleles(&[0, 1, 1], 2);
-        
+
         let mut markers = Markers::new();
         let chr = markers.add_chrom("1");
-        markers.push(Marker::new(chr, 100, None, Allele::Base(0), vec![Allele::Base(1)]));
-        markers.push(Marker::new(chr, 200, None, Allele::Base(0), vec![Allele::Base(1)]));
+        markers.push(Marker::new(
+            chr,
+            100,
+            None,
+            Allele::Base(0),
+            vec![Allele::Base(1)],
+        ));
+        markers.push(Marker::new(
+            chr,
+            200,
+            None,
+            Allele::Base(0),
+            vec![Allele::Base(1)],
+        ));
 
         let samples = Arc::new(Samples::from_ids(vec!["H0".to_string(), "H1".to_string()])); // Dummy
         let gt = GenotypeMatrix::new_phased(markers, vec![col0, col1], samples);
-        
+
         let rates = vec![0.0]; // No recombination to isolate emissions
         let marker_vec: Vec<Marker> = (0..gt.n_markers())
             .map(|i| gt.marker(MarkerIdx::new(i as u32)).clone())
@@ -601,7 +604,7 @@ mod tests {
             .map(|i| gt.column(MarkerIdx::new(i as u32)).clone())
             .collect();
         let block = build_compressed_block_from_columns(&marker_vec, &columns, 0, 0, &rates);
-        
+
         // Haps are distinct, so we expect 3 patterns?
         // 0,0 -> P0 (count 1)
         // 0,1 -> P1 (count 1)
@@ -610,42 +613,52 @@ mod tests {
         let p0 = block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(0)); // 0,0
         let p1 = block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(1)); // 0,1
         let p2 = block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(2)); // 1,1
-        
+
         let mut ws = BlockHmmWorkspace::new(10, 1, 2);
         // Start uniform
         ws.fwd.fill(0.0);
-        ws.fwd[p0.as_usize()] = 1.0/3.0;
-        ws.fwd[p1.as_usize()] = 1.0/3.0;
-        ws.fwd[p2.as_usize()] = 1.0/3.0;
-        
+        ws.fwd[p0.as_usize()] = 1.0 / 3.0;
+        ws.fwd[p1.as_usize()] = 1.0 / 3.0;
+        ws.fwd[p2.as_usize()] = 1.0 / 3.0;
+
         let target_probs = TargetAlleleProbs::new(vec![0, 2, 4], vec![1.0, 0.0, 1.0, 0.0]);
         let error = 0.01;
         let match_prob = 1.0 - error;
         let mismatch_prob = error;
-        
+
         // Run forward pass
         let view = TargetAlleleProbsView::new(&target_probs, 0);
         forward_within_block_probs(&block, &view, error, &mut ws, 0.0);
-        
+
         // Expected probs (ignoring normalization for a moment, or rather checking ratios)
         // P0 (0 mismatches): Init * match * match
         // P1 (1 mismatch):   Init * match * mismatch
         // P2 (2 mismatches): Init * mismatch * mismatch
-        
+
         let prob0 = ws.fwd[p0.as_usize()];
         let prob1 = ws.fwd[p1.as_usize()];
         let prob2 = ws.fwd[p2.as_usize()];
-        
+
         // Ratios should reflect penalty accumulation
         // prob1 / prob0 ~ mismatch/match
         let ratio1 = prob1 / prob0;
         let expected1 = mismatch_prob / match_prob;
-        
-        assert!((ratio1 - expected1).abs() < 1e-4, "Hap 1 should be penalized once. Got ratio {}, expected {}", ratio1, expected1);
-        
+
+        assert!(
+            (ratio1 - expected1).abs() < 1e-4,
+            "Hap 1 should be penalized once. Got ratio {}, expected {}",
+            ratio1,
+            expected1
+        );
+
         // prob2 / prob0 ~ (mismatch/match)^2
         let ratio2 = prob2 / prob0;
         let expected2 = (mismatch_prob / match_prob).powi(2);
-        assert!((ratio2 - expected2).abs() < 1e-5, "Hap 2 should be penalized twice. Got ratio {}, expected {}", ratio2, expected2);
+        assert!(
+            (ratio2 - expected2).abs() < 1e-5,
+            "Hap 2 should be penalized twice. Got ratio {}, expected {}",
+            ratio2,
+            expected2
+        );
     }
 }

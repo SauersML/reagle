@@ -4,8 +4,8 @@ use reagle::pipelines::imputation::ImputationPipeline;
 use noodles::bgzf::io as bgzf_io;
 use noodles::vcf as noodles_vcf;
 use noodles_vcf::variant::record::samples::Sample;
-use noodles_vcf::variant::record::samples::series::value::Array;
 use noodles_vcf::variant::record::samples::series::Value;
+use noodles_vcf::variant::record::samples::series::value::Array;
 
 use serial_test::serial;
 
@@ -37,11 +37,7 @@ fn write_trap_vcfs(
         .unwrap();
         writeln!(f, "##contig=<ID=chr1,length=100000000>").unwrap();
 
-        write!(
-            f,
-            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
-        )
-        .unwrap();
+        write!(f, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").unwrap();
         for s in 0..n_ref_samples {
             write!(f, "\tRef{}", s).unwrap();
         }
@@ -54,8 +50,7 @@ fn write_trap_vcfs(
             write!(
                 f,
                 "chr1\t{}\trs{}\tA\tT\t.\tPASS\t.\tGT",
-                positions_bp[m],
-                m
+                positions_bp[m], m
             )
             .unwrap();
 
@@ -87,7 +82,11 @@ fn write_trap_vcfs(
         )
         .unwrap();
         writeln!(f, "##contig=<ID=chr1,length=100000000>").unwrap();
-        writeln!(f, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget").unwrap();
+        writeln!(
+            f,
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget"
+        )
+        .unwrap();
 
         for m in 0..n_markers {
             let gt = if masked_marker_indices.contains(&m) {
@@ -99,9 +98,7 @@ fn write_trap_vcfs(
             writeln!(
                 f,
                 "chr1\t{}\trs{}\tA\tT\t.\tPASS\t.\tGT\t{}",
-                positions_bp[m],
-                m,
-                gt
+                positions_bp[m], m, gt
             )
             .unwrap();
         }
@@ -122,11 +119,7 @@ fn allele_for_hap(
     // Rotate which hap-group matches.
     // This is deterministic and creates neighbor churn.
     let hap_group = (hap_idx + 7 * marker_idx) % 20;
-    if hap_group == active_group {
-        0
-    } else {
-        1
-    }
+    if hap_group == active_group { 0 } else { 1 }
 }
 
 fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
@@ -135,7 +128,10 @@ fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
     let mut reader = noodles_vcf::io::Reader::new(decoder);
 
     let header = reader.read_header().expect("read VCF header");
-    assert!(header.formats().contains_key("DS"), "DS missing from output");
+    assert!(
+        header.formats().contains_key("DS"),
+        "DS missing from output"
+    );
 
     let mut ds = Vec::new();
 
@@ -180,9 +176,7 @@ fn test_state_index_stability_trap() {
     let n_ref_samples = 100;
 
     // Default genetic map is 1cM/Mb => 100kb = 0.1cM spacing.
-    let positions: Vec<u32> = (0..n_markers)
-        .map(|m| (m as u32) * 100_000 + 1)
-        .collect();
+    let positions: Vec<u32> = (0..n_markers).map(|m| (m as u32) * 100_000 + 1).collect();
 
     let masked = [50usize, 100usize, 150usize];
 

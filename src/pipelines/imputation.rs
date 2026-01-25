@@ -73,7 +73,6 @@ impl AllelePosteriors {
     }
 }
 
-
 impl ImputationPipeline {
     /// Create a new imputation pipeline
     pub fn new(config: Config, telemetry: Option<Arc<TelemetryBlackboard>>) -> Self {
