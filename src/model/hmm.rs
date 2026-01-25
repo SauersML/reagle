@@ -160,8 +160,9 @@ impl HmmUpdater {
         constant_term: f32, // C
         n_states: usize,
     ) {
-        let r_const = (p_switch / n_states as f32) * constant_term; // (r/N) * C
-        let scale = 1.0 - p_switch; // 1 - r
+        let inv_c = 1.0 / constant_term.max(1e-30);
+        let r_const = p_switch / n_states as f32; // (r/N) * C * inv_c = r/N
+        let scale = (1.0 - p_switch) * inv_c; // (1-r) * inv_c
 
         let scale_vec = f32x8::splat(scale);
         let const_vec = f32x8::splat(r_const);
@@ -1363,9 +1364,12 @@ mod tests {
 
         HmmUpdater::bwd_update_constant(&mut bwd, p_switch, &emissions, constant_term, n_states);
 
+        // With C normalization:
+        // bwd[i] = ((1-r)*e[i]*bwd[i] + (r/N)*C) / C
+        // bwd[i] = (0.9*1*1 + 0.05*2) / 2 = 1.0 / 2 = 0.5
         assert!(
-            (bwd[0] - 1.0).abs() < 1e-6,
-            "Expected 1.0, got {}. The constant term must be normalized by n_states.",
+            (bwd[0] - 0.5).abs() < 1e-6,
+            "Expected 0.5 (normalized), got {}. The backward update should normalize by constant term C.",
             bwd[0]
         );
     }
