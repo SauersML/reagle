@@ -31,7 +31,8 @@ use crate::data::storage::{GenotypeColumn, GenotypeMatrix, GenotypeView, Mutable
 use crate::error::Result;
 use crate::io::bref3::Bref3Reader;
 use crate::io::streaming::{
-    PhasedOverlap, StateProbs, StreamWindow, StreamingConfig, StreamingVcfReader,
+    GlobalHapId, HaplotypePriors, PhasedOverlap, StateProbs, StreamWindow, StreamingConfig,
+    StreamingVcfReader,
 };
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
@@ -177,6 +178,17 @@ fn max_block_len_from_starts(block_starts: &[usize], n_markers: usize) -> usize 
         }
     }
     max_len
+}
+
+/// Overlap handoff payload for streaming windows.
+///
+/// `state_probs` is kept for compatibility and intra-window diagnostics, but
+/// cross-window continuity should use `hap_priors`, which is identity-aware.
+#[derive(Clone, Debug)]
+pub struct Stage2OverlapHandoff {
+    state_probs: Option<StateProbs>,
+    hap_priors: Option<Vec<HaplotypePriors>>,
+    prior_stage1_global_marker: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -907,7 +919,7 @@ impl PhasingPipeline {
                 bb.set_markers_processed(0);
                 bb.set_samples_processed(0);
             }
-            self.phase_rare_markers_with_hmm(
+            let _ = self.phase_rare_markers_with_hmm(
                 &target_gt,
                 &mut geno,
                 samples.as_ref(),
@@ -1020,10 +1032,11 @@ impl PhasingPipeline {
 
             // Set the phased overlap from previous window
             window.phased_overlap = phased_overlap.take();
-            // Note: PBWT state handoff is handled via phased_overlap's state probabilities
+            // Note: PBWT state handoff is handled separately via PbwtState
 
             // Phase this window with overlap constraint
-            let (phased, next_state_probs, next_pbwt_state) = self.phase_in_memory_with_overlap(
+            let (phased, next_overlap_handoff, next_pbwt_state) =
+                self.phase_in_memory_with_overlap(
                 &window.genotypes,
                 &gen_maps,
                 window.phased_overlap.as_ref(),
@@ -1034,13 +1047,13 @@ impl PhasingPipeline {
 
             pbwt_state = next_pbwt_state;
 
-            // Extract overlap for next window (contains state probabilities for PBWT handoff)
+            // Extract overlap for next window (contains identity-aware priors for handoff)
             if !window.is_last() {
                 phased_overlap = Some(self.extract_overlap(
                     &phased,
                     window.output_end,
                     n_markers,
-                    next_state_probs,
+                    next_overlap_handoff,
                 ));
             }
 
@@ -1102,7 +1115,7 @@ impl PhasingPipeline {
         phased: &GenotypeMatrix<crate::data::storage::phase_state::Phased>,
         start: usize,
         end: usize,
-        state_probs: Option<StateProbs>,
+        handoff: Option<Stage2OverlapHandoff>,
     ) -> PhasedOverlap {
         let n_overlap = end - start;
         let n_haps = phased.n_haplotypes();
@@ -1120,9 +1133,24 @@ impl PhasingPipeline {
 
         let mut overlap = PhasedOverlap::new(n_overlap, n_haps, alleles);
 
-        // Attach state probabilities if available (Soft-Information Handoff)
-        if let Some(probs) = state_probs {
-            overlap.set_state_probs(probs);
+        // Attach soft-information handoff payloads if available.
+        if let Some(handoff) = handoff {
+            if let Some(probs) = handoff.state_probs {
+                let state_meta = (probs.n_states, probs.marker_indices.len(), probs.data.len());
+                tracing::trace!(
+                    n_states = state_meta.0,
+                    marker_indices = state_meta.1,
+                    hap_entries = state_meta.2,
+                    "Attaching legacy state_probs handoff"
+                );
+                overlap.set_state_probs(probs);
+            }
+            if let Some(priors) = handoff.hap_priors {
+                overlap.set_hap_priors(priors);
+            }
+            if let Some(marker) = handoff.prior_stage1_global_marker {
+                overlap.set_prior_stage1_global_marker(marker);
+            }
         }
 
         overlap
@@ -1163,7 +1191,7 @@ impl PhasingPipeline {
         pbwt_handoff_at: Option<usize>,
     ) -> Result<(
         GenotypeMatrix<crate::data::storage::phase_state::Phased>,
-        Option<StateProbs>,
+        Option<Stage2OverlapHandoff>,
         Option<PbwtState>,
     )> {
         let n_markers = target_gt.n_markers();
@@ -1378,7 +1406,7 @@ impl PhasingPipeline {
             .map(|&m| gen_positions_vec[m])
             .collect();
 
-        let next_state_probs = if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
+        let next_overlap_handoff = if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
             eprintln!(
                 "Stage 2: Phasing {} rare markers using HMM interpolation...",
                 rare_markers.len()
@@ -1391,7 +1419,7 @@ impl PhasingPipeline {
                 bb.set_markers_processed(0);
                 bb.set_samples_processed(0);
             }
-            let probs = self.phase_rare_markers_with_hmm(
+            let handoff = self.phase_rare_markers_with_hmm(
                 target_gt,
                 &mut geno,
                 samples.as_ref(),
@@ -1413,14 +1441,14 @@ impl PhasingPipeline {
 
             // Sync again after Stage 2
             self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
-            probs
+            handoff
         } else {
             None
         };
 
         Ok((
             self.build_final_matrix(target_gt, &geno, &sample_phases),
-            next_state_probs,
+            next_overlap_handoff,
             pbwt_state_for_next_window,
         ))
     }
@@ -2824,8 +2852,8 @@ impl PhasingPipeline {
     /// **Key fix**: Only phases markers that are currently UNPHASED in SamplePhase.
     ///
     /// **Streaming Soft-Handoff**: Accepts optional `previous_overlap` to combine state probabilities
-    /// from the previous window with current ones, ensuring continuity. Also returns state probabilities
-    /// for the *next* overlap region if `next_overlap_start` is provided.
+    /// from the previous window with current ones, ensuring continuity. The returned handoff
+    /// includes identity-aware haplotype priors for the *next* overlap region.
     fn phase_rare_markers_with_hmm(
         &self,
         target_gt: &GenotypeMatrix,
@@ -2841,7 +2869,7 @@ impl PhasingPipeline {
         rare_threshold: f32,
         previous_overlap: Option<&PhasedOverlap>,
         next_overlap_start: Option<usize>,
-    ) -> Option<StateProbs> {
+    ) -> Option<Stage2OverlapHandoff> {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
         let n_stage1 = hi_freq_markers.len();
@@ -2906,7 +2934,12 @@ impl PhasingPipeline {
         // It needs to be ordered by haplotype.
 
         // Return type from parallel map
-        type PhaseResult = (Vec<Stage2Decision>, Option<Vec<Vec<Vec<f32>>>>);
+        type PhaseResult = (
+            Vec<Stage2Decision>,
+            Option<Vec<Vec<Vec<f32>>>>,
+            Option<[HaplotypePriors; 2]>,
+            Option<usize>,
+        );
 
         let n_samples = n_haps / 2;
         let n_candidates = 20.min(n_total_haps).max(1);
@@ -3045,26 +3078,72 @@ impl PhasingPipeline {
 
                     let mut fwd1 = Vec::new();
                     let mut bwd1 = Vec::new();
-                    let mut init_prior1: Option<&[f32]> = None;
-                    let mut init_prior2: Option<&[f32]> = None;
-                    if let Some(overlap) = previous_overlap {
-                        if let Some(ref left_state_probs) = overlap.state_probs {
-                            if left_state_probs.n_states == n_states {
-                                let h1_idx = s * 2;
-                                let h2_idx = s * 2 + 1;
-                                if h1_idx < left_state_probs.data.len() {
-                                    init_prior1 = left_state_probs.data[h1_idx]
-                                        .first()
-                                        .map(|v| v.as_slice());
-                                }
-                                if h2_idx < left_state_probs.data.len() {
-                                    init_prior2 = left_state_probs.data[h2_idx]
-                                        .first()
-                                        .map(|v| v.as_slice());
-                                }
+                    let (init_prior1_storage, init_prior2_storage) = if let Some(overlap) =
+                        previous_overlap
+                    {
+                        let h1_idx = s * 2;
+                        let h2_idx = s * 2 + 1;
+                        let prior_stage1_idx = n_stage1_in_prev_overlap
+                            .saturating_sub(1)
+                            .min(n_stage1.saturating_sub(1));
+                        let current_global_marker =
+                            hi_freq_markers.get(prior_stage1_idx).copied();
+                        let markers_aligned = match (
+                            overlap.prior_stage1_global_marker(),
+                            current_global_marker,
+                        ) {
+                            (Some(expected), Some(current)) if expected != current => {
+                                tracing::warn!(
+                                    expected,
+                                    current,
+                                    sample = s,
+                                    "Stage2 hap prior marker mismatch; skipping priors"
+                                );
+                                false
                             }
+                            (Some(_), Some(_)) => true,
+                            _ => true,
+                        };
+
+                        // Identity-aware handoff: project haplotype priors onto the
+                        // current window's local state set using state->hap mapping.
+                        if markers_aligned {
+                            if let Some(hap_priors) = overlap.hap_priors() {
+                                if prior_stage1_idx < n_stage1
+                                    && h1_idx < hap_priors.len()
+                                    && h2_idx < hap_priors.len()
+                                    && n_states > 0
+                                {
+                                    let mut state_haps = vec![0u32; n_states];
+                                    threaded_haps.materialize_at(
+                                        prior_stage1_idx,
+                                        &mut state_haps,
+                                    );
+
+                                    (
+                                        Some(project_haplotype_priors_to_states(
+                                            &hap_priors[h1_idx],
+                                            &state_haps,
+                                        )),
+                                        Some(project_haplotype_priors_to_states(
+                                            &hap_priors[h2_idx],
+                                            &state_haps,
+                                        )),
+                                    )
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
                         }
-                    }
+                    } else {
+                        (None, None)
+                    };
+                    let init_prior1: Option<&[f32]> = init_prior1_storage.as_deref();
+                    let init_prior2: Option<&[f32]> = init_prior2_storage.as_deref();
                     let use_lookup = self.reference_gt.is_some() && self.alignment.is_some();
                     let mut lookup = None;
                     if use_lookup {
@@ -3156,39 +3235,12 @@ impl PhasingPipeline {
                     }
 
                     // Compute posterior state probabilities at each Stage 1 marker
-                    let mut probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
-                    let mut probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
+                    let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
+                    let probs2 = compute_state_posteriors(&fwd2, &bwd2, n_stage1, n_states);
 
-                    // SOFT-INFORMATION HANDOFF: Merge with previous window's state probs
-                    if let Some(overlap) = previous_overlap {
-                        if let Some(ref left_state_probs) = overlap.state_probs {
-                            let h1_idx = s * 2;
-                            let h2_idx = s * 2 + 1;
-                            // Assuming left_state_probs are ordered by haplotype
-                            if h1_idx < left_state_probs.data.len()
-                                && h2_idx < left_state_probs.data.len()
-                            {
-                                let left_probs1 = &left_state_probs.data[h1_idx];
-                                let left_probs2 = &left_state_probs.data[h2_idx];
-
-                                // Validate state counts match
-                                if left_state_probs.n_states == n_states {
-                                    self.finalize_stage2_with_context(
-                                        &mut probs1,
-                                        left_probs1,
-                                        n_stage1_in_prev_overlap,
-                                        &left_state_probs.marker_indices,
-                                    );
-                                    self.finalize_stage2_with_context(
-                                        &mut probs2,
-                                        left_probs2,
-                                        n_stage1_in_prev_overlap,
-                                        &left_state_probs.marker_indices,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    // Do NOT merge previous window probabilities by state index. State
+                    // identity is not preserved across windows, and blending by index
+                    // corrupts the posterior.
 
                     // Extract state probs for next window (if needed)
                     let next_probs = if !next_overlap_indices.is_empty() {
@@ -3211,6 +3263,32 @@ impl PhasingPipeline {
                     } else {
                         None
                     };
+
+                    // Export identity-aware haplotype priors for the next window.
+                    let (next_hap_priors, next_prior_global_marker) =
+                        if let Some(&stage1_idx) = next_overlap_indices.last() {
+                            if stage1_idx < probs1.len() && n_states > 0 {
+                                let mut state_haps = vec![0u32; n_states];
+                                threaded_haps.materialize_at(stage1_idx, &mut state_haps);
+
+                                let prior1 = build_haplotype_priors_from_state_probs(
+                                    &probs1[stage1_idx],
+                                    &state_haps,
+                                    PRIOR_EXPORT_MIN_PROB,
+                                );
+                                let prior2 = build_haplotype_priors_from_state_probs(
+                                    &probs2[stage1_idx],
+                                    &state_haps,
+                                    PRIOR_EXPORT_MIN_PROB,
+                                );
+                                let marker = hi_freq_markers.get(stage1_idx).copied();
+                                (Some([prior1, prior2]), marker)
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        };
 
                     // Lazy cache for state->hap mapping - O(1) indexing with Option<Vec>
                     // Uses immutable materialize_at() to avoid clone() overhead
@@ -3441,7 +3519,7 @@ impl PhasingPipeline {
                         });
                     }
 
-                    (decisions, next_probs)
+                    (decisions, next_probs, next_hap_priors, next_prior_global_marker)
                 })
                 .collect::<Vec<_>>()
         }; // ref_geno borrow ends here
@@ -3452,6 +3530,12 @@ impl PhasingPipeline {
         } else {
             None
         };
+        let mut all_next_hap_priors = if next_overlap_start.is_some() {
+            Some(Vec::with_capacity(n_haps))
+        } else {
+            None
+        };
+        let mut next_prior_global_marker: Option<usize> = None;
 
         // Apply phase changes and imputations to SamplePhase
         let mut total_switches = 0;
@@ -3462,12 +3546,26 @@ impl PhasingPipeline {
         // (all decisions pass). We still check for consistency with Stage 1.
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, (decisions, next_probs)) in phase_results.into_iter().enumerate() {
+        for (s, (decisions, next_probs, next_hap_priors, prior_marker)) in
+            phase_results.into_iter().enumerate()
+        {
             // Collect probs
             if let (Some(all), Some(probs)) = (all_next_probs.as_mut(), next_probs) {
                 // probs is vec![p1_tail, p2_tail]
                 for p in probs {
                     all.push(p);
+                }
+            }
+            if let Some(all) = all_next_hap_priors.as_mut() {
+                if let Some(priors_pair) = next_hap_priors {
+                    all.push(priors_pair[0].clone());
+                    all.push(priors_pair[1].clone());
+                    if next_prior_global_marker.is_none() {
+                        next_prior_global_marker = prior_marker;
+                    }
+                } else {
+                    all.push(HaplotypePriors::empty());
+                    all.push(HaplotypePriors::empty());
                 }
             }
 
@@ -3513,58 +3611,125 @@ impl PhasingPipeline {
             total_switches, total_phased, total_imputed
         );
 
-        if let Some(data) = all_next_probs {
-            // Reconstruct StateProbs
-            if !data.is_empty() {
-                // Determine marker indices
-                // We know from above they are next_overlap_indices
-                let indices = if let Some(start) = next_overlap_start {
-                    let start_stage1 = hi_freq_markers
-                        .iter()
-                        .position(|&m| m >= start)
-                        .unwrap_or(n_stage1);
-                    (start_stage1..n_stage1).collect()
-                } else {
-                    Vec::new()
-                };
+        let indices = if let Some(start) = next_overlap_start {
+            let start_stage1 = hi_freq_markers
+                .iter()
+                .position(|&m| m >= start)
+                .unwrap_or(n_stage1);
+            (start_stage1..n_stage1).collect()
+        } else {
+            Vec::new()
+        };
 
+        let next_state_probs = all_next_probs.and_then(|data| {
+            if data.is_empty() {
+                None
+            } else {
                 let n_states = self.params.n_states; // Approximate, but StateProbs carries it
-                return Some(StateProbs::new(data, indices, n_states));
+                Some(StateProbs::new(data, indices.clone(), n_states))
             }
+        });
+
+        let next_hap_priors = all_next_hap_priors.and_then(|priors| {
+            if priors.len() == n_haps && priors.iter().any(|p| !p.is_empty()) {
+                Some(priors)
+            } else {
+                None
+            }
+        });
+
+        if next_state_probs.is_some() || next_hap_priors.is_some() {
+            return Some(Stage2OverlapHandoff {
+                state_probs: next_state_probs,
+                hap_priors: next_hap_priors,
+                prior_stage1_global_marker: next_prior_global_marker,
+            });
         }
 
         None
     }
+}
 
-    /// Finalize Stage 2 phasing in overlap region using soft-information handoff
-    fn finalize_stage2_with_context(
-        &self,
-        probs: &mut [Vec<f32>],
-        left_probs: &[Vec<f32>],
-        n_stage1_in_overlap: usize,
-        marker_indices: &[usize],
-    ) {
-        let n_markers = probs.len().min(left_probs.len()).min(n_stage1_in_overlap);
+const PRIOR_EXPORT_MIN_PROB: f32 = 1e-5;
+const PRIOR_MIN_SUM: f32 = 1e-30;
 
-        // Ensure marker indices are at least available for the processed range
-        // This effectively 'uses' the variable to silence warnings and provides a sanity check
-        if marker_indices.len() < n_markers {
-            return;
-        }
+/// Collapse local state probabilities into haplotype-identity priors.
+fn build_haplotype_priors_from_state_probs(
+    state_probs: &[f32],
+    state_haps: &[u32],
+    min_prob: f32,
+) -> HaplotypePriors {
+    if state_probs.is_empty() || state_haps.is_empty() {
+        return HaplotypePriors::empty();
+    }
 
-        for i in 0..n_markers {
-            // Linear interpolation weight (0.0 -> 1.0 across overlap)
-            // Left (prev window) should decay, Right (current window) should grow
-            let w = i as f32 / n_stage1_in_overlap.max(1) as f32;
-            let left = &left_probs[i];
-            let right = &mut probs[i];
+    let mut mass_by_hap: std::collections::HashMap<u32, f32> =
+        std::collections::HashMap::with_capacity(state_haps.len());
 
-            for (k, p) in right.iter_mut().enumerate() {
-                let p_left = left.get(k).copied().unwrap_or(0.0);
-                *p = (1.0 - w) * p_left + w * *p;
-            }
+    for (k, &hap) in state_haps.iter().enumerate() {
+        let p = state_probs.get(k).copied().unwrap_or(0.0);
+        if p.is_finite() && p > 0.0 {
+            *mass_by_hap.entry(hap).or_insert(0.0) += p;
         }
     }
+
+    let mut entries: Vec<(u32, f32)> = mass_by_hap
+        .into_iter()
+        .filter(|&(_, p)| p >= min_prob)
+        .collect();
+
+    if entries.is_empty() {
+        return HaplotypePriors::empty();
+    }
+
+    entries.sort_unstable_by_key(|(hap, _)| *hap);
+    let mut hap_ids: Vec<GlobalHapId> = Vec::with_capacity(entries.len());
+    let mut probs: Vec<f32> = Vec::with_capacity(entries.len());
+    for (hap, p) in entries {
+        hap_ids.push(GlobalHapId(hap));
+        probs.push(p);
+    }
+
+    HaplotypePriors::new(hap_ids, probs)
+}
+
+/// Project haplotype-identity priors onto the current window's local state set.
+fn project_haplotype_priors_to_states(priors: &HaplotypePriors, state_haps: &[u32]) -> Vec<f32> {
+    let n_states = state_haps.len();
+    if n_states == 0 {
+        return Vec::new();
+    }
+
+    let mut out = vec![0.0f32; n_states];
+    let mut covered_mass = 0.0f32;
+
+    for (k, &hap) in state_haps.iter().enumerate() {
+        let p = priors.prob_of(GlobalHapId(hap)).unwrap_or(0.0);
+        out[k] = p;
+        covered_mass += p;
+    }
+
+    // Any prior mass that is not represented in the new state set becomes
+    // background uncertainty rather than being silently dropped.
+    let leftover = (1.0 - covered_mass).max(0.0);
+    if leftover > 0.0 {
+        let background = leftover / n_states as f32;
+        for p in &mut out {
+            *p += background;
+        }
+    }
+
+    let total: f32 = out.iter().sum();
+    if total > PRIOR_MIN_SUM {
+        for p in &mut out {
+            *p /= total;
+        }
+    } else {
+        let uniform = 1.0 / n_states as f32;
+        out.fill(uniform);
+    }
+
+    out
 }
 
 /// Compute normalized posterior state probabilities from forward-backward arrays

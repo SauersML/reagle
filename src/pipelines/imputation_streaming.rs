@@ -22,7 +22,7 @@ use crate::error::ReagleError;
 use crate::error::Result;
 use crate::io::bref3::{RefPanelReader, TargetMarkerIndex};
 use crate::io::streaming::{
-    HaplotypePriors, PhasedOverlap, StreamWindow, StreamingConfig, StreamingVcfReader,
+    GlobalHapId, HaplotypePriors, PhasedOverlap, StreamWindow, StreamingConfig, StreamingVcfReader,
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
 use crate::model::block_hash::ReferenceMap;
@@ -1652,7 +1652,9 @@ target_samples={} target_bytes={}",
                                 let mut total_mass = 0.0;
                                 
                                 for (&global_id, &prob) in p.ids().iter().zip(p.probs().iter()) {
-                                    let pid = first_block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(global_id));
+                                    let pid = first_block.pattern_for_haplotype(
+                                        crate::model::block_hash::types::GlobalId::new(global_id.0),
+                                    );
                                     if pid.is_reservoir() {
                                         ws.reservoir_prob_fwd += prob;
                                     } else {
@@ -1742,7 +1744,7 @@ target_samples={} target_bytes={}",
                         
                                                                             let threshold = 1e-4;
                         
-                                                                            let mut priors_list: Vec<(u32, f32)> = Vec::new();
+                                                                            let mut priors_list: Vec<(GlobalHapId, f32)> = Vec::new();
                         
                                                                             
                         
@@ -1756,7 +1758,7 @@ target_samples={} target_bytes={}",
                         
                                                                                     for &global_id in block.pattern_globals(pat_idx) {
                         
-                                                                                        priors_list.push((global_id.as_u32(), global_prob));
+                                                                                        priors_list.push((GlobalHapId(global_id.as_u32()), global_prob));
                         
                                                                                     }
                         
@@ -1772,7 +1774,7 @@ target_samples={} target_bytes={}",
                         
                                                                                 for &global_id in &block.reservoir_globals {
                         
-                                                                                    priors_list.push((global_id.as_u32(), global_prob));
+                                                                                    priors_list.push((GlobalHapId(global_id.as_u32()), global_prob));
                         
                                                                                 }
                         
@@ -1782,7 +1784,7 @@ target_samples={} target_bytes={}",
 
                                                                             priors_list.sort_unstable_by_key(|(h, _)| *h);
 
-                                                                            let (hap_ids, probs): (Vec<u32>, Vec<f32>) = priors_list.into_iter().unzip();
+                                                                            let (hap_ids, probs): (Vec<GlobalHapId>, Vec<f32>) = priors_list.into_iter().unzip();
                                                                             next_priors = HaplotypePriors::new(hap_ids, probs);
 
                                                                         }
