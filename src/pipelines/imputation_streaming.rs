@@ -294,49 +294,59 @@ fn build_reference_map_with_mask(
     keep_mask: Option<&[bool]>,
 ) -> Arc<ReferenceMap> {
     let n_markers = markers.len();
-    let mut gen_positions = Vec::with_capacity(n_markers);
-    for m in 0..n_markers {
-        let marker = markers.marker(MarkerIdx::new(m as u32));
-        let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
-        gen_positions.push(gen_pos);
-    }
+    let gen_positions: Vec<f64> = (0..n_markers)
+        .map(|m| {
+            let marker = markers.marker(MarkerIdx::new(m as u32));
+            gen_maps.gen_pos(marker.chrom, marker.pos)
+        })
+        .collect();
 
-    let mut blocks: Vec<Arc<crate::model::block_hash::CompressedBlock>> = Vec::new();
+    // Calculate block ranges
+    let mut block_ranges: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
     while start < n_markers {
         let end = (start + block_size).min(n_markers);
-        let mut block_markers: Vec<crate::data::marker::Marker> = Vec::with_capacity(end - start);
-        let mut block_columns: Vec<crate::data::storage::GenotypeColumn> =
-            Vec::with_capacity(end - start);
-        for m in start..end {
-            block_markers.push(markers.marker(MarkerIdx::new(m as u32)).clone());
-            block_columns.push(ref_gt.column(MarkerIdx::new(m as u32)).clone());
-        }
-        let mut recomb_rates = Vec::with_capacity(end.saturating_sub(start + 1));
-        for i in start..end.saturating_sub(1) {
-            let dist_cm = (gen_positions[i + 1] - gen_positions[i]).abs();
-            recomb_rates.push(params.p_recomb(dist_cm));
-        }
-        let block =
-            crate::model::block_hash::compression::build_compressed_block_from_columns_with_mask(
-                &block_markers,
-                &block_columns,
-                start,
-                max_states,
-                &recomb_rates,
-                keep_mask,
-            );
-        blocks.push(Arc::new(block));
+        block_ranges.push((start, end));
         start = end;
     }
 
-    let mut boundary_rates = Vec::with_capacity(blocks.len().saturating_sub(1));
-    for i in 0..blocks.len().saturating_sub(1) {
-        let left_idx = blocks[i].end_marker - 1;
-        let right_idx = blocks[i + 1].start_marker;
-        let dist_cm = (gen_positions[right_idx] - gen_positions[left_idx]).abs();
-        boundary_rates.push(params.p_recomb(dist_cm));
-    }
+    // Build blocks in parallel
+    let blocks: Vec<Arc<crate::model::block_hash::CompressedBlock>> = block_ranges
+        .par_iter()
+        .map(|&(start, end)| {
+            let block_markers: Vec<crate::data::marker::Marker> = (start..end)
+                .map(|m| markers.marker(MarkerIdx::new(m as u32)).clone())
+                .collect();
+            let block_columns: Vec<crate::data::storage::GenotypeColumn> = (start..end)
+                .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
+                .collect();
+            let recomb_rates: Vec<f32> = (start..end.saturating_sub(1))
+                .map(|i| {
+                    let dist_cm = (gen_positions[i + 1] - gen_positions[i]).abs();
+                    params.p_recomb(dist_cm)
+                })
+                .collect();
+            let block =
+                crate::model::block_hash::compression::build_compressed_block_from_columns_with_mask(
+                    &block_markers,
+                    &block_columns,
+                    start,
+                    max_states,
+                    &recomb_rates,
+                    keep_mask,
+                );
+            Arc::new(block)
+        })
+        .collect();
+
+    let boundary_rates: Vec<f32> = (0..blocks.len().saturating_sub(1))
+        .map(|i| {
+            let left_idx = blocks[i].end_marker - 1;
+            let right_idx = blocks[i + 1].start_marker;
+            let dist_cm = (gen_positions[right_idx] - gen_positions[left_idx]).abs();
+            params.p_recomb(dist_cm)
+        })
+        .collect();
 
     ReferenceMap::build_from_blocks(blocks, &boundary_rates, block_size)
 }

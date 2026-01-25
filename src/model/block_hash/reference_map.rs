@@ -11,6 +11,7 @@ use super::hmm::{TargetAlleleProbs, TargetAlleleProbsView};
 use super::transition::TransitionBridge;
 use super::workspace::BlockHmmWorkspace;
 use crate::pipelines::imputation::AllelePosteriors;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 /// Pre-computed reference map for block-hash HMM
@@ -54,11 +55,14 @@ impl ReferenceMap {
             "boundary_rates must have len = blocks.len() - 1"
         );
 
-        let mut bridges = Vec::with_capacity(blocks.len().saturating_sub(1));
-        for i in 0..blocks.len().saturating_sub(1) {
-            let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], boundary_rates[i]);
-            bridges.push(Arc::new(bridge));
-        }
+        // Build bridges in parallel - each bridge only depends on consecutive blocks
+        let bridges: Vec<Arc<TransitionBridge>> = (0..blocks.len().saturating_sub(1))
+            .into_par_iter()
+            .map(|i| {
+                let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], boundary_rates[i]);
+                Arc::new(bridge)
+            })
+            .collect();
 
         let max_observed_states = blocks.iter().map(|b| b.n_patterns()).max().unwrap_or(0);
 

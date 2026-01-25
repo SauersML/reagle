@@ -174,7 +174,7 @@ pub fn compress_block<F>(
     bits_per_allele: u8,
 ) -> Option<DictionaryColumn>
 where
-    F: Fn(usize, HapIdx) -> u8,
+    F: Fn(usize, HapIdx) -> u8 + Sync,
 {
     // Only compress if block has enough markers
     if n_markers < 4 || n_haplotypes == 0 {

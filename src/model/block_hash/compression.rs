@@ -10,6 +10,7 @@ use crate::data::marker::Marker;
 use crate::data::storage::GenotypeColumn;
 use crate::data::storage::dictionary::DictionaryColumn;
 
+use rayon::prelude::*;
 use std::sync::Arc;
 
 fn flatten_pattern_globals(pattern_to_globals: &[Vec<GlobalId>]) -> (Vec<GlobalId>, Vec<usize>) {
@@ -38,7 +39,7 @@ fn build_compressed_block_with_accessor<F>(
     get_allele: F,
 ) -> CompressedBlock
 where
-    F: Fn(usize, HapIdx) -> u8,
+    F: Fn(usize, HapIdx) -> u8 + Sync,
 {
     assert_eq!(
         recomb_rates.len(),
@@ -285,6 +286,7 @@ pub(crate) fn build_compressed_block_from_columns_with_mask(
 }
 
 /// Compute allele frequencies for reservoir haplotypes (Multiallelic)
+/// Parallelized: chunks of haplotypes are processed in parallel, then reduced.
 fn compute_reservoir_freqs(
     storage: &Arc<DictionaryColumn>,
     reservoir_globals: &[GlobalId],
@@ -310,27 +312,41 @@ fn compute_reservoir_freqs(
     }
     let total_slots = current_offset;
 
-    let mut counts = vec![0u32; total_slots];
-    let mut obs_counts = vec![0u32; window_size];
-
-    for &global_id in reservoir_globals {
-        let hap = HapIdx::new(global_id.as_u32());
-        for marker_idx in 0..window_size {
-            let allele = storage.get(marker_idx, hap);
-            // Skip missing data in frequency calculation?
-            // Or treat as "no info"?
-            // Usually we only count observed alleles.
-            // If allele is 255, we ignore it.
-            if allele != 255 {
-                let n_alleles = marker_n_alleles[marker_idx] as usize;
-                if (allele as usize) < n_alleles {
-                    let offset = offsets[marker_idx];
-                    counts[offset + allele as usize] += 1;
-                    obs_counts[marker_idx] += 1;
+    // Parallel map-reduce over chunks of reservoir haplotypes
+    let chunk_size = (n_reservoir / rayon::current_num_threads().max(1)).max(64);
+    let (counts, obs_counts) = reservoir_globals
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut local_counts = vec![0u32; total_slots];
+            let mut local_obs = vec![0u32; window_size];
+            for &global_id in chunk {
+                let hap = HapIdx::new(global_id.as_u32());
+                for marker_idx in 0..window_size {
+                    let allele = storage.get(marker_idx, hap);
+                    if allele != 255 {
+                        let n_alleles = marker_n_alleles[marker_idx] as usize;
+                        if (allele as usize) < n_alleles {
+                            let offset = offsets[marker_idx];
+                            local_counts[offset + allele as usize] += 1;
+                            local_obs[marker_idx] += 1;
+                        }
+                    }
                 }
             }
-        }
-    }
+            (local_counts, local_obs)
+        })
+        .reduce(
+            || (vec![0u32; total_slots], vec![0u32; window_size]),
+            |(mut acc_counts, mut acc_obs), (counts, obs)| {
+                for (a, c) in acc_counts.iter_mut().zip(counts.iter()) {
+                    *a += c;
+                }
+                for (a, o) in acc_obs.iter_mut().zip(obs.iter()) {
+                    *a += o;
+                }
+                (acc_counts, acc_obs)
+            },
+        );
 
     // frequencies
     let mut freqs = Vec::with_capacity(counts.len());
@@ -372,64 +388,70 @@ fn compute_reservoir_freqs(
 }
 
 /// Compute LD coherence factors for reservoir haplotypes (biallelic only).
+/// Parallelized: each marker pair is computed independently.
 fn compute_reservoir_ld(
     storage: &Arc<DictionaryColumn>,
     reservoir_globals: &[GlobalId],
     window_size: usize,
     marker_n_alleles: &[u8],
 ) -> Vec<[f32; 4]> {
-    let mut ld = vec![[1.0f32; 4]; window_size.saturating_sub(1)];
     if reservoir_globals.is_empty() || window_size < 2 {
-        return ld;
+        return vec![[1.0f32; 4]; window_size.saturating_sub(1)];
     }
 
-    for m in 0..window_size.saturating_sub(1) {
-        if marker_n_alleles[m] != 2 || marker_n_alleles[m + 1] != 2 {
-            continue;
-        }
-        let mut counts = [[0u32; 2]; 2];
-        let mut row = [0u32; 2];
-        let mut col = [0u32; 2];
-        let mut total = 0u32;
-
-        for &global_id in reservoir_globals {
-            let hap = HapIdx::new(global_id.as_u32());
-            let a = storage.get(m, hap);
-            let b = storage.get(m + 1, hap);
-            if a == 255 || b == 255 || a > 1 || b > 1 {
-                continue;
+    // Parallel computation per marker pair
+    (0..window_size.saturating_sub(1))
+        .into_par_iter()
+        .map(|m| {
+            if marker_n_alleles[m] != 2 || marker_n_alleles[m + 1] != 2 {
+                return [1.0f32; 4];
             }
-            let ai = a as usize;
-            let bi = b as usize;
-            counts[ai][bi] += 1;
-            row[ai] += 1;
-            col[bi] += 1;
-            total += 1;
-        }
 
-        if total == 0 {
-            continue;
-        }
-        let total_f = total as f32;
-        for ai in 0..2 {
-            for bi in 0..2 {
-                let p_uv = counts[ai][bi] as f32 / total_f;
-                let p_u = row[ai] as f32 / total_f;
-                let p_v = col[bi] as f32 / total_f;
-                let mut lambda = if p_u > 0.0 && p_v > 0.0 {
-                    p_uv / (p_u * p_v)
-                } else {
-                    1.0
-                };
-                if !lambda.is_finite() {
-                    lambda = 1.0;
+            let mut counts = [[0u32; 2]; 2];
+            let mut row = [0u32; 2];
+            let mut col = [0u32; 2];
+            let mut total = 0u32;
+
+            for &global_id in reservoir_globals {
+                let hap = HapIdx::new(global_id.as_u32());
+                let a = storage.get(m, hap);
+                let b = storage.get(m + 1, hap);
+                if a == 255 || b == 255 || a > 1 || b > 1 {
+                    continue;
                 }
-                ld[m][ai * 2 + bi] = lambda.clamp(0.1, 10.0);
+                let ai = a as usize;
+                let bi = b as usize;
+                counts[ai][bi] += 1;
+                row[ai] += 1;
+                col[bi] += 1;
+                total += 1;
             }
-        }
-    }
 
-    ld
+            if total == 0 {
+                return [1.0f32; 4];
+            }
+
+            let total_f = total as f32;
+            let mut ld = [1.0f32; 4];
+            for ai in 0..2 {
+                for bi in 0..2 {
+                    let p_uv = counts[ai][bi] as f32 / total_f;
+                    let p_u = row[ai] as f32 / total_f;
+                    let p_v = col[bi] as f32 / total_f;
+                    let mut lambda = if p_u > 0.0 && p_v > 0.0 {
+                        p_uv / (p_u * p_v)
+                    } else {
+                        1.0
+                    };
+                    if !lambda.is_finite() {
+                        lambda = 1.0;
+                    }
+                    ld[ai * 2 + bi] = lambda.clamp(0.1, 10.0);
+                }
+            }
+            ld
+        })
+        .collect()
 }
 
 #[cfg(test)]
