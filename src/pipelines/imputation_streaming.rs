@@ -1029,7 +1029,18 @@ target_samples={} target_bytes={}",
                     normalize_probs(&mut aligned_probs);
                     probs.extend_from_slice(&aligned_probs);
                 } else {
-                    probs.extend_from_slice(&base_probs);
+                    // Use uniform probability for imputed markers to avoid prior double-counting.
+                    // The HMM transition probabilities already encode allele frequency information via pattern counts.
+                    // Using base_probs (allele frequencies) here would penalize rare variants twice.
+                    let n = base_probs.len();
+                    if n > 0 {
+                        let uniform = 1.0 / n as f32;
+                        for _ in 0..n {
+                            probs.push(uniform);
+                        }
+                    } else {
+                        probs.extend_from_slice(&base_probs);
+                    }
                 }
 
                 offsets.push(probs.len());
