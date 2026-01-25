@@ -1131,7 +1131,7 @@ target_samples={} target_bytes={}",
             }
             let n_ref_markers = ref_markers.len();
             let overlap_size = 1000.min(n_ref_markers);
-            let prior_marker_idx = ref_output_end.saturating_sub(overlap_size).saturating_sub(1);
+            let prior_marker_idx = ref_output_end.saturating_sub(1);
             let boundary_recomb_rate = if prior_marker_idx + 1 < n_ref_markers {
                 let marker_idx = prior_marker_idx + 1;
                 let block_idx = ref_map.blocks.partition_point(|b| b.end_marker <= marker_idx);
