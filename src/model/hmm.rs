@@ -531,6 +531,19 @@ impl<'a> BeagleHmm<'a> {
                 constant_term,
                 n_states,
             );
+
+            // Normalize bwd to prevent underflow
+            let mut sum = 0.0f32;
+            let current_bwd = &mut bwd[curr_row..curr_row + n_states];
+            for val in current_bwd.iter() {
+                sum += *val;
+            }
+            if sum > 0.0 {
+                let scale = 1.0 / sum;
+                for val in current_bwd.iter_mut() {
+                    *val *= scale;
+                }
+            }
         }
 
         log_likelihood
@@ -807,6 +820,19 @@ impl<'a> BeagleHmm<'a> {
                 constant_term,
                 n_states,
             );
+
+            // Normalize bwd to prevent underflow
+            let mut sum = 0.0f32;
+            let current_bwd = &mut bwd[curr_row..curr_row + n_states];
+            for val in current_bwd.iter() {
+                sum += *val;
+            }
+            if sum > 0.0 {
+                let scale = 1.0 / sum;
+                for val in current_bwd.iter_mut() {
+                    *val *= scale;
+                }
+            }
         }
 
         log_likelihood
