@@ -12,6 +12,7 @@ use super::workspace::BlockHmmWorkspace;
 use crate::pipelines::imputation::AllelePosteriors;
 use super::hmm::{TargetAlleleProbs, TargetAlleleProbsView};
 use std::sync::Arc;
+use crate::model::parameters::ParamEstimates;
 
 /// Pre-computed reference map for block-hash HMM
 ///
@@ -149,6 +150,7 @@ impl ReferenceMap {
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
         initial_recomb_rate: f32,
+        mut estimates: Option<&mut ParamEstimates>,
     ) -> Vec<AllelePosteriors> {
         let mut posteriors = vec![AllelePosteriors::Biallelic(0.0); target_probs.n_markers()];
 
@@ -179,6 +181,7 @@ impl ReferenceMap {
                 ws,
                 output_slice,
                 if block_idx == 0 { initial_recomb_rate } else { 0.0 },
+                estimates.as_deref_mut(),
             );
 
             if block_idx > 0 {
@@ -192,7 +195,4 @@ impl ReferenceMap {
 
         posteriors
     }
-
-
-
 }

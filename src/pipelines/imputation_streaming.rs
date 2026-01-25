@@ -35,6 +35,7 @@ use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, infer_n_alleles_from_pl_len,
 };
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::model::parameters::ParamEstimates;
 
 fn push_unique(dst: &mut Vec<String>, value: String) {
     if !dst.iter().any(|v| v == &value) {
@@ -422,7 +423,11 @@ struct SampleImputationResult {
     hap_posteriors: Option<(Vec<AllelePosteriors>, Vec<AllelePosteriors>)>,
 }
 
-
+// Helper struct to hold results from parallel iteration
+struct ImputeResult {
+    result: Option<SampleImputationResult>,
+    priors: Option<(HaplotypePriors, HaplotypePriors)>,
+}
 
 impl crate::pipelines::ImputationPipeline {
 
@@ -1245,7 +1250,7 @@ target_samples={} target_bytes={}",
     }
 
     fn run_imputation_window_streaming(
-        &self,
+        &mut self,
         target_win: &GenotypeMatrix<Phased>,
         ref_markers: &crate::data::marker::Markers,
         ref_map: &Arc<ReferenceMap>,
@@ -1603,353 +1608,268 @@ target_samples={} target_bytes={}",
             TargetAlleleProbs::new(offsets, probs)
         };
 
-        // Container for next priors (populated in parallel)
-        // Since we can't easily merge vectors from par_iter, we'll collect results including priors
-        struct ImputeResult {
-            result: SampleImputationResult,
-            priors: Option<(HaplotypePriors, HaplotypePriors)>,
-        }
-
         let overlap_size = 1000.min(n_ref_markers);
         let prior_marker_idx = output_end.saturating_sub(overlap_size).saturating_sub(1);
-        let sample_results: Vec<ImputeResult> = (0..n_target_samples)
-            .into_par_iter()
-            .map(|s| {
-                let h1_idx = HapIdx::new((s * 2) as u32);
-                let h2_idx = HapIdx::new((s * 2 + 1) as u32);
-                
-                // Get incoming priors if available
-                let priors_h1 = imp_overlap.and_then(|o| o.hap_priors()).and_then(|p| p.get(h1_idx.as_usize()));
-                let priors_h2 = imp_overlap.and_then(|o| o.hap_priors()).and_then(|p| p.get(h2_idx.as_usize()));
 
-                LOCAL_WORKSPACE.with(|cell| {
-                    let mut ws_opt = cell.borrow_mut();
-                    
-                    // Check if workspace needs resizing
-                    // Use max_observed_states instead of configured max_states to prevent thrashing
-                    let needs_resize = if let Some(ws) = ws_opt.as_ref() {
-                        ws.checkpoints.len() < ref_map.blocks.len() ||
-                        ws.max_states < ref_map.max_observed_states ||
-                        ws.fwd_history.len() < (ref_map.max_observed_states + 1) * ref_map.window_size
-                    } else {
-                        true
-                    };
+        let n_iterations = if self.config.em { self.config.imp_nsteps.max(1) } else { 1 };
+        let mut current_p_mismatch = self.params.p_mismatch;
 
-                    if needs_resize {
-                        *ws_opt = Some(ref_map.create_workspace());
-                    }
-                    let ws = ws_opt.as_mut().unwrap();
-                    
-                    let mut process_haplotype = |hap_idx: HapIdx, priors: Option<&HaplotypePriors>| -> (Vec<AllelePosteriors>, HaplotypePriors) {
-                        let input_probs = build_input_probs(hap_idx, s);
-                        
-                        // Initialize workspace
-                        if let Some(first_block) = ref_map.blocks.first() {
-                            if let Some(p) = priors {
-                                // Initialize from priors
-                                ws.fwd.fill(0.0);
-                                ws.reservoir_prob_fwd = 0.0;
-                                let mut total_mass = 0.0;
-                                
-                                for (&global_id, &prob) in p.ids().iter().zip(p.probs().iter()) {
-                                    let pid = first_block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(global_id));
-                                    if pid.is_reservoir() {
-                                        ws.reservoir_prob_fwd += prob;
-                                    } else {
-                                        ws.fwd[pid.as_usize()] += prob;
-                                    }
-                                    total_mass += prob;
-                                }
-                                
-                                // Fill remaining mass with uniform?
-                                if total_mass < 0.999 {
-                                    let remaining = (1.0f32 - total_mass).max(0.0f32);
-                                    let uniform = remaining / first_block.n_ref_haps() as f32;
-                                    
-                                    for i in 0..first_block.n_patterns() {
-                                        ws.fwd[i] += uniform * first_block.pattern_counts[i];
-                                    }
-                                    ws.reservoir_prob_fwd += uniform * first_block.reservoir_count as f32;
-                                }
-                                
-                                ws.normalize_forward(first_block.n_patterns());
-                            } else {
-                                ws.reset_from_block(first_block);
-                            }
-                        }
-                        
-                                                                        // Run HMM
-                        
-                                                                        let initial_recomb_rate = imp_overlap
-                                                                            .and_then(|o| o.incoming_recomb_rate())
-                                                                            .unwrap_or(0.0);
-                                                                        ref_map.forward_pass_probs(
-                                                                            &input_probs,
-                                                                            self.params.p_mismatch,
-                                                                            ws,
-                                                                            initial_recomb_rate,
-                                                                        );
-
-                                                                        let posteriors = ref_map.backward_and_emit_posteriors_probs(
-                                                                            &input_probs,
-                                                                            self.params.p_mismatch,
-                                                                            ws,
-                                                                            initial_recomb_rate,
-                                                                        );
-                        
-                                                                        
-                        
-                                                                        // Extract next priors
-                        
-                                                                        let mut next_priors = HaplotypePriors::empty();
-                        
-                                                                        
-                        
-                                                                        // Determine marker index for priors (start of overlap region - 1)
-                        
-                                                                        // This corresponds to state before observing the first marker of next window's overlap
-                        
-                                                                        // We use state at overlap_start - 1 (approximate, misses one transition step but avoids double emission)
-                        
-                                                                        // Run forward pass up to prior_marker_idx
-                                                                        ref_map.forward_to_marker_probs(
-                                                                            &input_probs,
-                                                                            self.params.p_mismatch,
-                                                                            ws,
-                                                                            prior_marker_idx,
-                                                                            initial_recomb_rate,
-                                                                        );
-                        
-                                                                        
-                        
-                                                                        // Extract state from ws.fwd (which is now at prior_marker_idx)
-                        
-                                                                        // Need to find which block this marker belongs to, to access pattern counts
-                        
-                                                                        let block_idx = ref_map.blocks.partition_point(|b| b.end_marker <= prior_marker_idx);
-                        
-                                                                        if block_idx < ref_map.blocks.len() {
-                        
-                                                                            let block = &ref_map.blocks[block_idx];
-                        
-                                                                            // ws.fwd now contains state after observing prior_marker_idx
-                        
-                                                                            let fwd = &ws.fwd;
-                        
-                                                                            let res_prob = ws.reservoir_prob_fwd;
-                        
-                                                                            
-                        
-                                                                            let threshold = 1e-4;
-                        
-                                                                            let mut priors_list: Vec<(u32, f32)> = Vec::new();
-                        
-                                                                            
-                        
-                                                                            for (pat_idx, &prob) in fwd.iter().enumerate().take(block.n_patterns()) {
-                        
-                                                                                if prob > threshold {
-                        
-                                                                                    let count = block.pattern_counts[pat_idx];
-                        
-                                                                                    let global_prob = prob / count;
-                        
-                                                                                    for &global_id in block.pattern_globals(pat_idx) {
-                        
-                                                                                        priors_list.push((global_id.as_u32(), global_prob));
-                        
-                                                                                    }
-                        
-                                                                                }
-                        
-                                                                            }
-                        
-                                                                            
-                        
-                                                                            if res_prob > threshold && block.reservoir_count > 0 {
-                        
-                                                                                let global_prob = res_prob / block.reservoir_count as f32;
-                        
-                                                                                for &global_id in &block.reservoir_globals {
-                        
-                                                                                    priors_list.push((global_id.as_u32(), global_prob));
-                        
-                                                                                }
-                        
-                                                                            }
-                        
-
-
-                                                                            priors_list.sort_unstable_by_key(|(h, _)| *h);
-
-                                                                            let (hap_ids, probs): (Vec<u32>, Vec<f32>) = priors_list.into_iter().unzip();
-                                                                            next_priors = HaplotypePriors::new(hap_ids, probs);
-
-                                                                        }
-
-
-
-                                                                        (posteriors, next_priors)
-                        
-                                                                    };
-                        
-                                                
-                        
-                                                                    let (post1_full, p1_out) = process_haplotype(h1_idx, priors_h1);
-                        
-                                                                    let (post2_full, p2_out) = process_haplotype(h2_idx, priors_h2);
-                        
-                                                                    
-                        
-                                                                    // Combine results
-                        
-                                                                    let output_len = output_end.saturating_sub(output_start);
-                        
-                                                                    let mut dosages = Vec::with_capacity(output_len);
-                        
-                                                                    let mut best_gt = Vec::with_capacity(output_len);
-                        
-                                                                    
-                        
-                                                                    // Optional outputs
-                        
-                                                                    let include_posteriors = self.config.gp || self.config.ap;
-                        
-                                                                    let mut hap1_alt = if !include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
-                        
-                                                                    let mut hap2_alt = if !include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
-                        
-                                                                    let mut hap1_posts = if include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
-                        
-                                                                    let mut hap2_posts = if include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
-                        
-                                                                    
-                        
-                                                                    for m in output_start..output_end {
-                        
-                                                                        let p1 = &post1_full[m];
-                        
-                                                                        let p2 = &post2_full[m];
-                        
-                                                                        
-                        
-                                                                        let (d1, g1, prob1) = match p1 {
-                        
-                                                                            AllelePosteriors::Biallelic(p) => (*p, if *p > 0.5 { 1 } else { 0 }, *p),
-                        
-                                                                            AllelePosteriors::Multiallelic(probs) => {
-                        
-                                                                                let dosage = probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
-                        
-                                                                                let (best_allele, _) = probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap_or((0, &0.0));
-                        
-                                                                                let p_alt = if probs.len() > 1 { probs[1] } else { 0.0 };
-                        
-                                                                                (dosage, best_allele as u8, p_alt)
-                        
-                                                                            }
-                        
-                                                                        };
-                        
-                                                                        
-                        
-                                                                        let (d2, g2, prob2) = match p2 {
-                        
-                                                                            AllelePosteriors::Biallelic(p) => (*p, if *p > 0.5 { 1 } else { 0 }, *p),
-                        
-                                                                            AllelePosteriors::Multiallelic(probs) => {
-                        
-                                                                                let dosage = probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
-                        
-                                                                                let (best_allele, _) = probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap_or((0, &0.0));
-                        
-                                                                                let p_alt = if probs.len() > 1 { probs[1] } else { 0.0 };
-                        
-                                                                                (dosage, best_allele as u8, p_alt)
-                        
-                                                                            }
-                        
-                                                                        };
-                        
-                                                                        
-                        
-                                                                        best_gt.push((g1, g2));
-                        
-                                                                        dosages.push(d1 + d2);
-                        
-                                                                        
-                        
-                                                                        if let Some(v) = hap1_alt.as_mut() { v.push(prob1); }
-                        
-                                                                        if let Some(v) = hap2_alt.as_mut() { v.push(prob2); }
-                        
-                                                                        if let Some(v) = hap1_posts.as_mut() { v.push(p1.clone()); }
-                        
-                                                                        if let Some(v) = hap2_posts.as_mut() { v.push(p2.clone()); }
-                        
-                                                                    }
-                        
-                                                                    
-                        
-                                                                    let hap_alt_probs = match (hap1_alt, hap2_alt) {
-                        
-                                                                        (Some(h1), Some(h2)) => Some((h1, h2)),
-                        
-                                                                        _ => None,
-                        
-                                                                    };
-                        
-                                                                    
-                        
-                                                                    let hap_posteriors = match (hap1_posts, hap2_posts) {
-                        
-                                                                        (Some(h1), Some(h2)) => Some((h1, h2)),
-                        
-                                                                        _ => None,
-                        
-                                                                    };
-                        
-                                                                    
-                        
-                                                                    ImputeResult {
-                        
-                                                                        result: SampleImputationResult {
-                        
-                                                                            sample_idx: s,
-                        
-                                                                            dosages,
-                        
-                                                                            best_gt,
-                        
-                                                                            hap_alt_probs,
-                        
-                                                                            hap_posteriors,
-                        
-                                                                        },
-                        
-                                                                        priors: Some((p1_out, p2_out)),
-                        
-                                                                    }                })
-            })
-            .collect();
-            
-        let mut all_results = Vec::with_capacity(n_target_samples);
+        let mut all_results = Vec::new();
         let mut next_priors_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
-        
-        for item in sample_results {
-            let sample_idx = item.result.sample_idx;
-            all_results.push(item.result);
-            if let Some((p1, p2)) = item.priors {
-                let base = sample_idx * 2;
-                if base + 1 < next_priors_vec.len() {
-                    next_priors_vec[base] = p1;
-                    next_priors_vec[base + 1] = p2;
+
+        // EM Iterations
+        for iter in 0..n_iterations {
+            let is_last = iter == n_iterations - 1;
+
+            // Run parallel loop, collecting results (last iter) and estimates (intermediate iters)
+            let (iter_results, estimates) = (0..n_target_samples)
+                .into_par_iter()
+                .fold(
+                    || (Vec::new(), ParamEstimates::new()),
+                    |(mut acc_results, mut acc_estimates), s| {
+                        let h1_idx = HapIdx::new((s * 2) as u32);
+                        let h2_idx = HapIdx::new((s * 2 + 1) as u32);
+                        
+                        let priors_h1 = imp_overlap.and_then(|o| o.hap_priors()).and_then(|p| p.get(h1_idx.as_usize()));
+                        let priors_h2 = imp_overlap.and_then(|o| o.hap_priors()).and_then(|p| p.get(h2_idx.as_usize()));
+
+                        LOCAL_WORKSPACE.with(|cell| {
+                            let mut ws_opt = cell.borrow_mut();
+
+                            let needs_resize = if let Some(ws) = ws_opt.as_ref() {
+                                ws.checkpoints.len() < ref_map.blocks.len() ||
+                                ws.max_states < ref_map.max_observed_states ||
+                                ws.fwd_history.len() < (ref_map.max_observed_states + 1) * ref_map.window_size
+                            } else {
+                                true
+                            };
+
+                            if needs_resize {
+                                *ws_opt = Some(ref_map.create_workspace());
+                            }
+                            let ws = ws_opt.as_mut().unwrap();
+
+                            let mut process_haplotype = |hap_idx: HapIdx, priors: Option<&HaplotypePriors>| -> (Vec<AllelePosteriors>, HaplotypePriors) {
+                                let input_probs = build_input_probs(hap_idx, s);
+                                
+                                if let Some(first_block) = ref_map.blocks.first() {
+                                    if let Some(p) = priors {
+                                        ws.fwd.fill(0.0);
+                                        ws.reservoir_prob_fwd = 0.0;
+                                        let mut total_mass = 0.0;
+
+                                        for (&global_id, &prob) in p.ids().iter().zip(p.probs().iter()) {
+                                            let pid = first_block.pattern_for_haplotype(crate::model::block_hash::types::GlobalId::new(global_id));
+                                            if pid.is_reservoir() {
+                                                ws.reservoir_prob_fwd += prob;
+                                            } else {
+                                                ws.fwd[pid.as_usize()] += prob;
+                                            }
+                                            total_mass += prob;
+                                        }
+
+                                        if total_mass < 0.999 {
+                                            let remaining = (1.0f32 - total_mass).max(0.0f32);
+                                            let uniform = remaining / first_block.n_ref_haps() as f32;
+
+                                            for i in 0..first_block.n_patterns() {
+                                                ws.fwd[i] += uniform * first_block.pattern_counts[i];
+                                            }
+                                            ws.reservoir_prob_fwd += uniform * first_block.reservoir_count as f32;
+                                        }
+
+                                        ws.normalize_forward(first_block.n_patterns());
+                                    } else {
+                                        ws.reset_from_block(first_block);
+                                    }
+                                }
+                                
+                                let initial_recomb_rate = imp_overlap
+                                    .and_then(|o| o.incoming_recomb_rate())
+                                    .unwrap_or(0.0);
+                                ref_map.forward_pass_probs(
+                                    &input_probs,
+                                    current_p_mismatch,
+                                    ws,
+                                    initial_recomb_rate,
+                                );
+
+                                // Pass mutable reference to estimates if not last iteration (accumulate mode)
+                                // or if we want to update estimates in the last iteration too (optional)
+                                let estimates_arg = if !is_last { Some(&mut acc_estimates) } else { None };
+
+                                let posteriors = ref_map.backward_and_emit_posteriors_probs(
+                                    &input_probs,
+                                    current_p_mismatch,
+                                    ws,
+                                    initial_recomb_rate,
+                                    estimates_arg,
+                                );
+
+                                let mut next_priors = HaplotypePriors::empty();
+                                if is_last {
+                                    ref_map.forward_to_marker_probs(
+                                        &input_probs,
+                                        current_p_mismatch,
+                                        ws,
+                                        prior_marker_idx,
+                                        initial_recomb_rate,
+                                    );
+                                    
+                                    let block_idx = ref_map.blocks.partition_point(|b| b.end_marker <= prior_marker_idx);
+                                    if block_idx < ref_map.blocks.len() {
+                                        let block = &ref_map.blocks[block_idx];
+                                        let fwd = &ws.fwd;
+                                        let res_prob = ws.reservoir_prob_fwd;
+                                        let threshold = 1e-4;
+                                        let mut priors_list: Vec<(u32, f32)> = Vec::new();
+
+                                        for (pat_idx, &prob) in fwd.iter().enumerate().take(block.n_patterns()) {
+                                            if prob > threshold {
+                                                let count = block.pattern_counts[pat_idx];
+                                                let global_prob = prob / count;
+                                                for &global_id in block.pattern_globals(pat_idx) {
+                                                    priors_list.push((global_id.as_u32(), global_prob));
+                                                }
+                                            }
+                                        }
+
+                                        if res_prob > threshold && block.reservoir_count > 0 {
+                                            let global_prob = res_prob / block.reservoir_count as f32;
+                                            for &global_id in &block.reservoir_globals {
+                                                priors_list.push((global_id.as_u32(), global_prob));
+                                            }
+                                        }
+
+                                        priors_list.sort_unstable_by_key(|(h, _)| *h);
+                                        let (hap_ids, probs): (Vec<u32>, Vec<f32>) = priors_list.into_iter().unzip();
+                                        next_priors = HaplotypePriors::new(hap_ids, probs);
+                                    }
+                                }
+
+                                (posteriors, next_priors)
+                            };
+
+                            if is_last {
+                                let (post1_full, p1_out) = process_haplotype(h1_idx, priors_h1);
+                                let (post2_full, p2_out) = process_haplotype(h2_idx, priors_h2);
+
+                                let output_len = output_end.saturating_sub(output_start);
+                                let mut dosages = Vec::with_capacity(output_len);
+                                let mut best_gt = Vec::with_capacity(output_len);
+
+                                let include_posteriors = self.config.gp || self.config.ap;
+                                let mut hap1_alt = if !include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
+                                let mut hap2_alt = if !include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
+                                let mut hap1_posts = if include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
+                                let mut hap2_posts = if include_posteriors { Some(Vec::with_capacity(output_len)) } else { None };
+
+                                for m in output_start..output_end {
+                                    let p1 = &post1_full[m];
+                                    let p2 = &post2_full[m];
+
+                                    let (d1, g1, prob1) = match p1 {
+                                        AllelePosteriors::Biallelic(p) => (*p, if *p > 0.5 { 1 } else { 0 }, *p),
+                                        AllelePosteriors::Multiallelic(probs) => {
+                                            let dosage = probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
+                                            let (best_allele, _) = probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap_or((0, &0.0));
+                                            let p_alt = if probs.len() > 1 { probs[1] } else { 0.0 };
+                                            (dosage, best_allele as u8, p_alt)
+                                        }
+                                    };
+
+                                    let (d2, g2, prob2) = match p2 {
+                                        AllelePosteriors::Biallelic(p) => (*p, if *p > 0.5 { 1 } else { 0 }, *p),
+                                        AllelePosteriors::Multiallelic(probs) => {
+                                            let dosage = probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
+                                            let (best_allele, _) = probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap_or((0, &0.0));
+                                            let p_alt = if probs.len() > 1 { probs[1] } else { 0.0 };
+                                            (dosage, best_allele as u8, p_alt)
+                                        }
+                                    };
+
+                                    best_gt.push((g1, g2));
+                                    dosages.push(d1 + d2);
+
+                                    if let Some(v) = hap1_alt.as_mut() { v.push(prob1); }
+                                    if let Some(v) = hap2_alt.as_mut() { v.push(prob2); }
+                                    if let Some(v) = hap1_posts.as_mut() { v.push(p1.clone()); }
+                                    if let Some(v) = hap2_posts.as_mut() { v.push(p2.clone()); }
+                                }
+
+                                let hap_alt_probs = match (hap1_alt, hap2_alt) {
+                                    (Some(h1), Some(h2)) => Some((h1, h2)),
+                                    _ => None,
+                                };
+                                
+                                let hap_posteriors = match (hap1_posts, hap2_posts) {
+                                    (Some(h1), Some(h2)) => Some((h1, h2)),
+                                    _ => None,
+                                };
+
+                                acc_results.push(ImputeResult {
+                                    result: Some(SampleImputationResult {
+                                        sample_idx: s,
+                                        dosages,
+                                        best_gt,
+                                        hap_alt_probs,
+                                        hap_posteriors,
+                                    }),
+                                    priors: Some((p1_out, p2_out)),
+                                });
+                            } else {
+                                // Intermediate iteration: just run to accumulate estimates
+                                process_haplotype(h1_idx, priors_h1);
+                                process_haplotype(h2_idx, priors_h2);
+                            }
+                        });
+                        
+                        (acc_results, acc_estimates)
+                    }
+                )
+                .reduce(
+                    || (Vec::new(), ParamEstimates::new()),
+                    |(mut r1, mut e1), (r2, e2)| {
+                        r1.extend(r2);
+                        e1.merge(&e2);
+                        (r1, e1)
+                    }
+                );
+
+            if !is_last {
+                let new_p = estimates.p_mismatch();
+                if new_p != current_p_mismatch {
+                    // eprintln!("  Window {} EM iter {}: p_mismatch {:.6} -> {:.6} (obs={})", window_idx, iter+1, current_p_mismatch, new_p, estimates.n_emit_obs());
+                    current_p_mismatch = new_p;
                 }
+            } else {
+                all_results = iter_results;
             }
         }
 
-        // Sort all results by sample index for writing
-        all_results.sort_by_key(|result| result.sample_idx);
+        // Update model params for future windows (heuristic: keep last window's estimate)
+        if self.config.em {
+            self.params.p_mismatch = current_p_mismatch;
+        }
+
+        // Unpack results
+        let mut final_results = Vec::with_capacity(n_target_samples);
+        let mut sorted_items = all_results;
+        sorted_items.sort_by_key(|item| item.result.as_ref().map(|r| r.sample_idx).unwrap_or(0));
+        
+        for item in sorted_items {
+            if let Some(res) = item.result {
+                let s_idx = res.sample_idx;
+                final_results.push(res);
+                if let Some((p1, p2)) = item.priors {
+                    let base = s_idx * 2;
+                    if base + 1 < next_priors_vec.len() {
+                        next_priors_vec[base] = p1;
+                        next_priors_vec[base + 1] = p2;
+                    }
+                }
+            }
+        }
 
         if let Some(bb) = &self.telemetry {
             let output_markers = output_end.saturating_sub(output_start);
@@ -1974,7 +1894,7 @@ target_samples={} target_bytes={}",
             output_start,
             output_end,
             markers_to_process.start,
-            &all_results,
+            &final_results,
             self.config.gp,
             self.config.ap,
         )?;
