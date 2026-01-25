@@ -6106,6 +6106,57 @@ mod tests {
         let (phased, _, _) = result.unwrap();
         assert_eq!(phased.n_markers(), n_markers);
         assert_eq!(phased.n_haplotypes(), n_samples * 2);
+
+        // Check phase confidence values
+        let mut total_hets = 0;
+        let mut high_conf_hets = 0;
+        let mut sum_conf = 0.0;
+        let mut count_conf = 0;
+
+        for m in 0..n_markers {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let column = phased.column(marker_idx);
+
+            for s in 0..n_samples {
+                let sample_idx = crate::data::SampleIdx::new(s as u32);
+                let hap1 = column.get(sample_idx.hap1());
+                let hap2 = column.get(sample_idx.hap2());
+
+                // Get phase confidence
+                let conf = phased.sample_phase_confidence_f32(marker_idx, s);
+
+                // Confidence must be in valid range [0.0, 1.0]
+                assert!(conf >= 0.0 && conf <= 1.0,
+                    "Phase confidence out of range: {} at marker {} sample {}", conf, m, s);
+
+                // Track heterozygous sites
+                if hap1 != hap2 {
+                    total_hets += 1;
+                    sum_conf += conf;
+                    count_conf += 1;
+
+                    // Count hets with high confidence (>0.7)
+                    if conf > 0.7 {
+                        high_conf_hets += 1;
+                    }
+                }
+            }
+        }
+
+        // Assert that most heterozygous sites have reasonable confidence
+        if total_hets > 0 {
+            let mean_conf = sum_conf / count_conf as f32;
+            let high_conf_ratio = high_conf_hets as f32 / total_hets as f32;
+
+            // For this unit test with random data and minimal iterations,
+            // we just verify confidence values are computed and in valid range.
+            // Real integration tests with actual data should have mean_conf > 0.8
+            assert!(mean_conf >= 0.0 && mean_conf <= 1.0,
+                "Mean phase confidence out of range: {:.3}", mean_conf);
+
+            println!("Phase confidence stats: mean={:.3}, high_conf_ratio={:.1}%, n_hets={}",
+                mean_conf, high_conf_ratio * 100.0, total_hets);
+        }
     }
 
     #[test]

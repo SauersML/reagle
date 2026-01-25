@@ -1937,3 +1937,247 @@ fn test_high_density_array_imputation() {
         mean_dr2
     );
 }
+
+/// Test that phasing produces high confidence values for most heterozygous sites
+#[test]
+#[serial]
+fn test_phasing_confidence() {
+    use reagle::data::{ChromIdx, MarkerIdx, SampleIdx};
+    use reagle::data::genetic_map::GeneticMaps;
+    use reagle::data::haplotype::Samples;
+    use reagle::data::marker::{Allele, Marker, Markers};
+    use reagle::data::storage::GenotypeColumn;
+    use reagle::data::storage::matrix::GenotypeMatrix;
+    use std::sync::Arc;
+
+    let n_markers = 200;
+    let n_target_samples = 10;
+    let n_ref_samples = 100;
+
+    // Build target genotype matrix with unphased heterozygous sites
+    let mut target_markers = Markers::new();
+    target_markers.add_chrom("chr1");
+    for i in 0..n_markers {
+        let m = Marker::new(
+            ChromIdx::new(0),
+            i as u32 * 1000 + 1000,
+            Some(format!("rs{}", i).into()),
+            Allele::Base(b'A'),
+            vec![Allele::Base(b'T')],
+        );
+        target_markers.push(m);
+    }
+
+    let target_samples = Arc::new(Samples::from_ids(
+        (0..n_target_samples).map(|i| format!("sample{}", i)).collect(),
+    ));
+
+    // Create heterozygous genotypes with strong LD blocks
+    // Block structure: markers 0-19 in block 0, 20-39 in block 1, etc.
+    let target_columns: Vec<GenotypeColumn> = (0..n_markers)
+        .map(|m| {
+            let block = m / 20;  // 20-marker blocks
+            let alleles: Vec<u8> = (0..n_target_samples * 2)
+                .map(|h| {
+                    let sample = h / 2;
+                    // Hap1 and Hap2 for each sample have opposite patterns
+                    // Pattern alternates by block to create LD structure
+                    if h % 2 == 0 {
+                        // Hap1: follows pattern A or B depending on sample
+                        if (sample + block) % 2 == 0 { 0 } else { 1 }
+                    } else {
+                        // Hap2: opposite of Hap1
+                        if (sample + block) % 2 == 0 { 1 } else { 0 }
+                    }
+                })
+                .collect();
+            GenotypeColumn::from_alleles(&alleles, 2)
+        })
+        .collect();
+
+    let target_gt = GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
+
+    // Build reference haplotype matrix with clear patterns
+    let mut ref_markers = Markers::new();
+    ref_markers.add_chrom("chr1");
+    for i in 0..n_markers {
+        let m = Marker::new(
+            ChromIdx::new(0),
+            i as u32 * 1000 + 1000,
+            Some(format!("rs{}", i).into()),
+            Allele::Base(b'A'),
+            vec![Allele::Base(b'T')],
+        );
+        ref_markers.push(m);
+    }
+
+    let ref_samples = Arc::new(Samples::from_ids(
+        (0..n_ref_samples).map(|i| format!("ref{}", i)).collect(),
+    ));
+
+    // Reference: create haplotypes with strong LD blocks matching target structure
+    // Half of haplotypes follow pattern A (blocks alternate 0/1)
+    // Half follow pattern B (opposite: blocks alternate 1/0)
+    let ref_columns: Vec<GenotypeColumn> = (0..n_markers)
+        .map(|m| {
+            let block = m / 20;  // Same 20-marker blocks as target
+            let alleles: Vec<u8> = (0..n_ref_samples * 2)
+                .map(|h| {
+                    // Create two distinct haplotype clusters
+                    if h < 100 {
+                        // First 100 haplotypes: pattern A (block value alternates with block number)
+                        if block % 2 == 0 { 0 } else { 1 }
+                    } else {
+                        // Second 100 haplotypes: pattern B (opposite of A)
+                        if block % 2 == 0 { 1 } else { 0 }
+                    }
+                })
+                .collect();
+            GenotypeColumn::from_alleles(&alleles, 2)
+        })
+        .collect();
+
+    let ref_gt = GenotypeMatrix::new_phased(ref_markers, ref_columns, ref_samples);
+
+    // Create genetic map
+    let gen_maps = GeneticMaps::new();
+
+    // Create phasing pipeline with good parameters
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("phased_confidence");
+
+    let config = Config {
+        gt: out_prefix.clone(),
+        r#ref: None,
+        out: out_prefix.clone(),
+        map: None,
+        chrom: None,
+        excludesamples: None,
+        excludemarkers: None,
+        burnin: 5,
+        iterations: 10,
+        mcmc_burnin: 3,
+        dynamic_mcmc: false,
+        mcmc_steps: 10,
+        phase_states: 80,
+        rare: 0.002,
+        impute: false,
+        imp_states: 10,
+        imp_segment: 6.0,
+        imp_step: 0.1,
+        imp_nsteps: 7,
+        cluster: 0.005,
+        pbwt_batch_mb: 256,
+        ap: false,
+        gp: false,
+        ne: 10000.0,
+        err: None,
+        em: false,
+        window: 40.0,
+        window_markers: 100000,
+        overlap: 2.0,
+        seed: 12345,
+        nthreads: Some(1),
+        profile: false,
+    };
+
+    let mut pipeline = PhasingPipeline::new(config, None);
+
+    // Set up reference panel
+    use reagle::data::alignment::MarkerAlignment;
+    let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+    pipeline.set_reference(std::sync::Arc::new(ref_gt), alignment);
+
+    // Run phasing in memory
+    let result = pipeline.phase_in_memory_with_overlap(
+        &target_gt,
+        &gen_maps,
+        None,  // No overlap from previous window
+        None,
+        None,
+        None,
+    );
+
+    assert!(result.is_ok(), "Phasing should succeed");
+    let (phased, _, _) = result.unwrap();
+
+    // Debug: check if any genotypes changed
+    let mut changed_count = 0;
+    for m in 0..std::cmp::min(10, n_markers) {
+        let marker_idx = MarkerIdx::new(m as u32);
+        let target_col = target_gt.column(marker_idx);
+        let phased_col = phased.column(marker_idx);
+        for s in 0..n_target_samples {
+            let sample_idx = SampleIdx::new(s as u32);
+            let t_a1 = target_col.get(sample_idx.hap1());
+            let t_a2 = target_col.get(sample_idx.hap2());
+            let p_a1 = phased_col.get(sample_idx.hap1());
+            let p_a2 = phased_col.get(sample_idx.hap2());
+            if (t_a1, t_a2) != (p_a1, p_a2) {
+                changed_count += 1;
+            }
+        }
+    }
+    println!("Genotypes changed during phasing: {} / {}", changed_count, 10 * n_target_samples);
+
+    // Check phase confidence values
+    let mut total_hets = 0;
+    let mut high_conf_hets = 0;
+    let mut sum_conf = 0.0;
+
+    for m in 0..n_markers {
+        let marker_idx = MarkerIdx::new(m as u32);
+        let column = phased.column(marker_idx);
+
+        for s in 0..n_target_samples {
+            let sample_idx = SampleIdx::new(s as u32);
+            let a1 = column.get(sample_idx.hap1());
+            let a2 = column.get(sample_idx.hap2());
+
+            let conf = phased.sample_phase_confidence_f32(marker_idx, s);
+
+            // Confidence must be in valid range
+            assert!(
+                conf >= 0.0 && conf <= 1.0,
+                "Phase confidence out of range: {} at marker {} sample {}",
+                conf, m, s
+            );
+
+            // Track heterozygous sites
+            if a1 != a2 {
+                total_hets += 1;
+                sum_conf += conf;
+
+                if conf > 0.75 {
+                    high_conf_hets += 1;
+                }
+            }
+        }
+    }
+
+    // Calculate statistics
+    assert!(total_hets > 0, "Should have heterozygous sites");
+    let mean_conf = sum_conf / total_hets as f32;
+    let high_conf_ratio = high_conf_hets as f32 / total_hets as f32;
+
+    println!(
+        "Phasing confidence stats: mean={:.3}, high_conf_ratio={:.1}%, n_hets={}",
+        mean_conf,
+        high_conf_ratio * 100.0,
+        total_hets
+    );
+
+    // ASSERT: With a good reference panel and clear patterns,
+    // phasing should produce high confidence for most hets
+    assert!(
+        mean_conf > 0.8,
+        "Mean phase confidence too low: {:.3} (expected > 0.8)",
+        mean_conf
+    );
+
+    assert!(
+        high_conf_ratio > 0.7,
+        "Only {:.1}% of hets have high confidence (expected > 70%)",
+        high_conf_ratio * 100.0
+    );
+}
