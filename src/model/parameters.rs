@@ -51,7 +51,7 @@ impl ModelParams {
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
-    pub const MIN_RECOMB_PROB: f32 = 1e-9;
+    pub const MIN_RECOMB_PROB: f32 = 1e-5;
 
     /// Create default parameters
     pub fn new() -> Self {
@@ -138,7 +138,7 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        val.max(1e-4)
     }
 
     /// Calculate LR threshold for a given iteration
