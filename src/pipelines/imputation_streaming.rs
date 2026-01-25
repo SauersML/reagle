@@ -503,8 +503,9 @@ impl crate::pipelines::ImputationPipeline {
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
         let available_bytes = available_memory_bytes().unwrap_or(0);
         let window_markers = self.config.window_markers.max(1);
+        let block_size = 64usize;
         let max_states_budget = if available_bytes > 0 {
-            estimate_max_states(available_bytes, n_threads, window_markers, 64)
+            estimate_max_states(available_bytes, n_threads, window_markers, block_size)
         } else {
             self.config.imp_states.max(1)
         };
@@ -527,15 +528,25 @@ impl crate::pipelines::ImputationPipeline {
             "Streaming imputation: {} ref haplotypes, {} target samples (target_bytes={})",
             n_ref_haps, n_target_samples, target_bytes
         );
+        let n_blocks = (window_markers + block_size - 1) / block_size;
+        let per_state_bytes = 4usize.saturating_mul(3 + n_blocks + window_markers);
+        let per_thread_budget = if n_threads > 0 {
+            (available_bytes as usize / n_threads).saturating_div(1024 * 1024)
+        } else {
+            0
+        };
         eprintln!(
-            "Imputation state plan: mode={:?}, max_states={}, threads={}, available_mb={}",
+            "Imputation state plan: mode={:?}, max_states={}, ref_haps={}, threads={}, available_mb={}, per_thread_mb={}, est_bytes_per_state={}",
             auto_plan.mode,
             auto_plan.max_states,
+            n_ref_haps,
             n_threads,
-            (available_bytes / (1024 * 1024))
+            (available_bytes / (1024 * 1024)),
+            per_thread_budget,
+            per_state_bytes
         );
 
-        let ref_block_size = 64;
+        let ref_block_size = block_size;
         let ref_max_states = match auto_plan.mode {
             ImputeRefMode::Lossless => 0,
             ImputeRefMode::PbwtSubset | ImputeRefMode::Truncated => auto_plan.max_states,
@@ -728,6 +739,30 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_end
                     );
                 }
+                if should_log && window_count == 1 {
+                    let mut min_patterns = usize::MAX;
+                    let mut max_patterns = 0usize;
+                    let mut sum_patterns = 0usize;
+                    let n_blocks = ref_window.ref_map.blocks.len();
+                    for block in ref_window.ref_map.blocks.iter() {
+                        let n = block.n_patterns();
+                        min_patterns = min_patterns.min(n);
+                        max_patterns = max_patterns.max(n);
+                        sum_patterns += n;
+                    }
+                    let avg_patterns = if n_blocks > 0 {
+                        sum_patterns as f64 / n_blocks as f64
+                    } else {
+                        0.0
+                    };
+                    if min_patterns == usize::MAX {
+                        min_patterns = 0;
+                    }
+                    eprintln!(
+                        "    Compression: blocks={}, patterns min/avg/max={}/{:.1}/{}",
+                        n_blocks, min_patterns, avg_patterns, max_patterns
+                    );
+                }
                 let alignment = MarkerAlignment::new_with_ref_markers(
                     &target_window.genotypes,
                     &ref_window.markers,
@@ -849,6 +884,12 @@ impl crate::pipelines::ImputationPipeline {
                             &producer_maps,
                             auto_plan_for_producer.max_states,
                         ) {
+                            let kept = keep_mask.iter().filter(|&&k| k).count();
+                            let total = keep_mask.len();
+                            eprintln!(
+                                "  PBWT selection: kept {} / {} ref haplotypes (max_states={})",
+                                kept, total, auto_plan_for_producer.max_states
+                            );
                             ref_map = build_reference_map_with_mask(
                                 ref_gt,
                                 &ref_window.markers,
