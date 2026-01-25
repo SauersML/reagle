@@ -1591,6 +1591,12 @@ target_samples={} target_bytes={}",
                         normalize_probs(&mut aligned_probs);
                         use_probs = true;
                     }
+                } else {
+                    // Force uniform probabilities for missing markers (imputed sites)
+                    // This prevents "prior double-counting" where reference frequency acts as prior
+                    // AND HMM transitions encode frequency, suppressing rare variants.
+                    aligned_probs.resize(n_alleles, 1.0 / n_alleles as f32);
+                    use_probs = true;
                 }
 
                 if use_probs {
