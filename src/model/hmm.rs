@@ -160,8 +160,17 @@ impl HmmUpdater {
         constant_term: f32, // C
         n_states: usize,
     ) {
-        let r_const = (p_switch / n_states as f32) * constant_term; // (r/N) * C
-        let scale = 1.0 - p_switch; // 1 - r
+        // Normalize by dividing by constant_term (C) to prevent underflow
+        // bwd[i] = ((1-r)*e[i]*bwd[i] + r/N * C) / C
+        //        = (1-r)*e[i]*bwd[i]/C + r/N
+        let inv_c = if constant_term > 1e-30 {
+            1.0 / constant_term
+        } else {
+            0.0
+        };
+
+        let r_const = p_switch / n_states as f32; // r/N
+        let scale = (1.0 - p_switch) * inv_c; // (1-r)/C
 
         let scale_vec = f32x8::splat(scale);
         let const_vec = f32x8::splat(r_const);
