@@ -444,15 +444,15 @@ mod tests {
             ChromIdx::new(0),
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
         let m2 = Marker::new(
             ChromIdx::new(0),
             200,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
 
         markers.push(m1);
@@ -473,15 +473,15 @@ mod tests {
             ChromIdx::new(0),
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
         let m2 = Marker::new(
             ChromIdx::new(0),
             200,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
 
         markers.push(m1);
@@ -525,15 +525,15 @@ mod tests {
             ChromIdx::new(0),
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
         let m2 = Marker::new(
             ChromIdx::new(0),
             200,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
 
         markers.push(m1);

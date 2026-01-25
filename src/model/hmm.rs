@@ -1044,8 +1044,8 @@ mod tests {
                 ChromIdx::new(0),
                 (i * 1000 + 100) as u32,
                 None,
-                Allele::Base(0),
-                vec![Allele::Base(1)],
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::C)],
             );
             markers.push(m);
 

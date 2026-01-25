@@ -1,6 +1,7 @@
 use reagle::config::Config;
 use reagle::pipelines::imputation::ImputationPipeline;
 use reagle::pipelines::phasing::PhasingPipeline;
+use reagle::Nucleotide;
 
 // Serialize tests to prevent OOM from parallel execution
 use ::noodles::bgzf::io as bgzf_io;
@@ -1962,8 +1963,8 @@ fn test_phasing_confidence() {
             ChromIdx::new(0),
             i as u32 * 1000 + 1000,
             Some(format!("rs{}", i).into()),
-            Allele::Base(b'A'),
-            vec![Allele::Base(b'T')],
+            Allele::Base(Nucleotide::A),  // A=0, not b'A'=65
+            vec![Allele::Base(Nucleotide::T)],  // T=3, not b'T'=84
         );
         target_markers.push(m);
     }
@@ -1972,23 +1973,35 @@ fn test_phasing_confidence() {
         (0..n_target_samples).map(|i| format!("sample{}", i)).collect(),
     ));
 
-    // Create heterozygous genotypes with strong LD blocks
-    // Block structure: markers 0-19 in block 0, 20-39 in block 1, etc.
+    // Create heterozygous genotypes matching reference LD structure
+    // Use deterministic pattern that matches subset of reference haplotypes
     let target_columns: Vec<GenotypeColumn> = (0..n_markers)
         .map(|m| {
             let block = m / 20;  // 20-marker blocks
+            let position_in_block = m % 20;
             let alleles: Vec<u8> = (0..n_target_samples * 2)
                 .map(|h| {
                     let sample = h / 2;
-                    // Hap1 and Hap2 for each sample have opposite patterns
-                    // Pattern alternates by block to create LD structure
-                    if h % 2 == 0 {
-                        // Hap1: follows pattern A or B depending on sample
-                        if (sample + block) % 2 == 0 { 0 } else { 1 }
+
+                    // Each target haplotype mimics a reference haplotype
+                    // Hap1 uses ref pattern from first half, Hap2 from second half
+                    let ref_hap_id = if h % 2 == 0 {
+                        sample * 3  // Hap1: ref haps 0, 3, 6, 9, ... (first half)
                     } else {
-                        // Hap2: opposite of Hap1
-                        if (sample + block) % 2 == 0 { 1 } else { 0 }
-                    }
+                        100 + sample * 3  // Hap2: ref haps 100, 103, 106, ... (second half)
+                    };
+
+                    // Generate allele matching the chosen reference haplotype
+                    // First half has base_allele = block%2, second half has opposite
+                    let base_allele = if ref_hap_id < 100 {
+                        if block % 2 == 0 { 0 } else { 1 }
+                    } else {
+                        if block % 2 == 0 { 1 } else { 0 }
+                    };
+
+                    let flip = (ref_hap_id * 7 + position_in_block * 11 + block * 13) % 10 < 2;
+
+                    if flip { 1 - base_allele } else { base_allele }
                 })
                 .collect();
             GenotypeColumn::from_alleles(&alleles, 2)
@@ -2005,8 +2018,8 @@ fn test_phasing_confidence() {
             ChromIdx::new(0),
             i as u32 * 1000 + 1000,
             Some(format!("rs{}", i).into()),
-            Allele::Base(b'A'),
-            vec![Allele::Base(b'T')],
+            Allele::Base(Nucleotide::A),  // A=0, not b'A'=65
+            vec![Allele::Base(Nucleotide::T)],  // T=3, not b'T'=84
         );
         ref_markers.push(m);
     }
@@ -2015,22 +2028,26 @@ fn test_phasing_confidence() {
         (0..n_ref_samples).map(|i| format!("ref{}", i)).collect(),
     ));
 
-    // Reference: create haplotypes with strong LD blocks matching target structure
-    // Half of haplotypes follow pattern A (blocks alternate 0/1)
-    // Half follow pattern B (opposite: blocks alternate 1/0)
+    // Reference: create haplotypes with realistic LD structure
+    // First 100 haps have pattern A, second 100 have pattern B (opposite)
     let ref_columns: Vec<GenotypeColumn> = (0..n_markers)
         .map(|m| {
             let block = m / 20;  // Same 20-marker blocks as target
+            let position_in_block = m % 20;
             let alleles: Vec<u8> = (0..n_ref_samples * 2)
                 .map(|h| {
-                    // Create two distinct haplotype clusters
-                    if h < 100 {
-                        // First 100 haplotypes: pattern A (block value alternates with block number)
+                    // Base pattern: first half vs second half have opposite patterns
+                    let base_allele = if h < 100 {
                         if block % 2 == 0 { 0 } else { 1 }
                     } else {
-                        // Second 100 haplotypes: pattern B (opposite of A)
                         if block % 2 == 0 { 1 } else { 0 }
-                    }
+                    };
+
+                    // Add diversity: flip allele based on haplotype and position
+                    // This creates realistic variation while preserving LD
+                    let flip = (h * 7 + position_in_block * 11 + block * 13) % 10 < 2;  // ~20% flip rate
+
+                    if flip { 1 - base_allele } else { base_allele }
                 })
                 .collect();
             GenotypeColumn::from_alleles(&alleles, 2)
@@ -2086,6 +2103,34 @@ fn test_phasing_confidence() {
     // Set up reference panel
     use reagle::data::alignment::MarkerAlignment;
     let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+
+    // Debug: Check alignment and allele mappings
+    let mut aligned_count = 0;
+    let mut has_mapping_count = 0;
+    for t_m in 0..n_markers {
+        let has_mapping = alignment.allele_mappings.get(t_m).and_then(|m| m.as_ref()).is_some();
+        if has_mapping {
+            has_mapping_count += 1;
+        }
+
+        if let Some(ref_m) = alignment.target_to_ref(t_m) {
+            aligned_count += 1;
+            if t_m < 3 {
+                let t_marker = target_gt.marker(MarkerIdx::new(t_m as u32));
+                let r_marker = ref_gt.marker(MarkerIdx::new(ref_m as u32));
+                println!("Target marker {} (pos {}, ref={}, alt={:?}) → Ref marker {} (pos {}, ref={}, alt={:?}), has_mapping={}",
+                    t_m, t_marker.pos, t_marker.ref_allele, t_marker.alt_alleles,
+                    ref_m, r_marker.pos, r_marker.ref_allele, r_marker.alt_alleles,
+                    has_mapping
+                );
+            }
+        } else if t_m < 3 {
+            println!("Target marker {} FAILED to align (has_mapping={})", t_m, has_mapping);
+        }
+    }
+    println!("Aligned markers: {} / {}, with allele_mappings: {} / {}",
+        aligned_count, n_markers, has_mapping_count, n_markers);
+
     pipeline.set_reference(std::sync::Arc::new(ref_gt), alignment);
 
     // Run phasing in memory

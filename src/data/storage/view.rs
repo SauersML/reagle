@@ -157,8 +157,8 @@ mod tests {
             ChromIdx::new(0),
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         ));
         let col = GenotypeColumn::from_alleles(&[0, 1, 0, 1], 2);
         GenotypeMatrix::new_phased(markers, vec![col], samples)
@@ -171,8 +171,8 @@ mod tests {
             ChromIdx::new(0),
             200,
             None,
-            Allele::Base(1),
-            vec![Allele::Base(0)],
+            Allele::Base(Nucleotide::C),
+            vec![Allele::Base(Nucleotide::A)],
         ));
         let geno = MutableGenotypes::from_fn(1, 2, |_, h| h as u8);
         (geno, markers)

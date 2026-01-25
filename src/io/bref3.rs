@@ -1446,9 +1446,9 @@ mod tests {
         let allele_strs = vec!["A".to_string(), "G".to_string()];
         let (ref_allele, alt_alleles, end) = parse_alleles(&allele_strs, None);
 
-        assert_eq!(ref_allele, Allele::Base(0));
+        assert_eq!(ref_allele, Allele::Base(Nucleotide::A));
         assert_eq!(alt_alleles.len(), 1);
-        assert_eq!(alt_alleles[0], Allele::Base(2));
+        assert_eq!(alt_alleles[0], Allele::Base(Nucleotide::G));
         assert!(end.is_none());
     }
 
@@ -1462,7 +1462,7 @@ mod tests {
         ];
         let (ref_allele, alt_alleles, ..) = parse_alleles(&allele_strs, None);
 
-        assert_eq!(ref_allele, Allele::Base(0));
+        assert_eq!(ref_allele, Allele::Base(Nucleotide::A));
         assert_eq!(alt_alleles.len(), 3);
     }
 
@@ -1473,7 +1473,7 @@ mod tests {
 
         assert!(matches!(ref_allele, Allele::Seq(_)));
         assert_eq!(alt_alleles.len(), 1);
-        assert_eq!(alt_alleles[0], Allele::Base(0));
+        assert_eq!(alt_alleles[0], Allele::Base(Nucleotide::A));
     }
 
     #[test]

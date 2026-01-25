@@ -479,15 +479,15 @@ mod tests {
             chr,
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         ));
         m.push(Marker::new(
             chr,
             200,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         ));
 
         let markers: Vec<Marker> = (0..m.len())

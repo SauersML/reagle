@@ -582,15 +582,15 @@ mod tests {
             chr,
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         ));
         markers.push(Marker::new(
             chr,
             200,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         ));
 
         let samples = Arc::new(Samples::from_ids(vec!["H0".to_string(), "H1".to_string()])); // Dummy

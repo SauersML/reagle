@@ -414,8 +414,8 @@ mod tests {
                 chr,
                 i as u32,
                 None,
-                Allele::Base(0),
-                vec![Allele::Base(1)],
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::C)],
             ));
         }
 
