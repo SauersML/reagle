@@ -17,7 +17,7 @@ Requirements:
 Usage:
   python integration_test.py              # Run all stages
   python integration_test.py prepare      # Download data and prepare VCFs
-  python integration_test.py prepare-profile  # Prepare first 5% of chr22 for profiling
+  python integration_test.py prepare-profile  # Prepare middle 5% of chr22 for profiling
   python integration_test.py beagle       # Run Beagle imputation only
   python integration_test.py reagle       # Run Reagle imputation only
   python integration_test.py metrics      # Calculate metrics only
@@ -1960,9 +1960,9 @@ def stage_prepare():
 
 
 def stage_prepare_profile():
-    """Prepare reduced data (first 5% of chr22) for profiling runs."""
+    """Prepare reduced data (middle 5% of chr22 target markers) for profiling runs."""
     print("=" * 60)
-    print("STAGE: PREPARE PROFILE - First 5% of chr22")
+    print("STAGE: PREPARE PROFILE - Middle 5% of chr22 (target markers)")
     print("=" * 60)
 
     paths = get_paths()
@@ -2005,14 +2005,41 @@ def stage_prepare_profile():
         run(f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
     ensure_index(paths['chr22_vcf'], recreate_cmd=f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
 
-    # Compute first 5% region of chr22
-    region_info = compute_profile_region(paths['chr22_vcf'], "22", fraction=0.05)
-    if not region_info:
-        raise RuntimeError("Unable to determine chr22 bounds for profiling subset")
-    region, min_pos, end_pos, chrom_label = region_info
-    print(f"Profiling region: {region} (positions {min_pos}..{end_pos})")
+    # Download GSA sites first
+    print("\n" + "=" * 60)
+    print("Downloading GSA variant list...")
+    print("=" * 60)
 
-    # Create trimmed VCF
+    download_if_missing(
+        "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv",
+        str(paths['gsa_file'])
+    )
+
+    # Load GSA sites for chr22
+    gsa_sites = load_gsa_sites(str(paths['gsa_file']), chrom="22")
+    gsa_positions = sorted([pos for chrom, pos in gsa_sites])
+
+    if not gsa_positions:
+        raise RuntimeError("No GSA sites found for chr22")
+
+    # Compute region based on MIDDLE 5% of TARGET (GSA) markers
+    total_markers = len(gsa_positions)
+    window_size = max(1, int(total_markers * 0.05))
+    start_idx = (total_markers - window_size) // 2
+    end_idx = start_idx + window_size
+
+    min_pos = gsa_positions[start_idx]
+    end_pos = gsa_positions[end_idx - 1]
+
+    # Find chromosome label from VCF
+    chrom_label = find_chrom_label(paths['chr22_vcf'], "22") or "chr22"
+    region = f"{chrom_label}:{min_pos}-{end_pos}"
+
+    print(f"Profiling region based on middle 5% of {total_markers} GSA markers:")
+    print(f"  Region: {region} (positions {min_pos}..{end_pos})")
+    print(f"  Target markers in region: {window_size} (indices {start_idx}-{end_idx-1})")
+
+    # Create trimmed VCF covering this region
     trimmed_vcf = paths['data_dir'] / "hgdp1kg_chr22.profile5.vcf.gz"
     if not validate_vcf(trimmed_vcf) or not has_vcf_records(trimmed_vcf):
         print("Creating trimmed VCF for profiling...")
@@ -2029,18 +2056,7 @@ def stage_prepare_profile():
         Path(str(path) + ".csi").unlink(missing_ok=True)
         Path(str(path) + ".tbi").unlink(missing_ok=True)
 
-    # Download GSA sites
-    print("\n" + "=" * 60)
-    print("Downloading GSA variant list...")
-    print("=" * 60)
-
-    download_if_missing(
-        "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv",
-        str(paths['gsa_file'])
-    )
-
-    # Load GSA sites for chr22 and filter to region
-    gsa_sites = load_gsa_sites(str(paths['gsa_file']), chrom="22")
+    # Filter GSA sites to this region and verify they exist in VCF
     filtered_sites = set()
     for chrom, pos in gsa_sites:
         if min_pos <= pos <= end_pos:
@@ -2062,7 +2078,7 @@ def stage_prepare_profile():
             present_sites.add((fields[0], pos))
 
     filtered_sites = {site for site in filtered_sites if site in present_sites}
-    print(f"Filtered GSA sites in region (present in VCF): {len(filtered_sites)}")
+    print(f"GSA sites in region (present in VCF): {len(filtered_sites)}")
 
     # Download Beagle
     download_if_missing(
@@ -2311,7 +2327,7 @@ def main():
         epilog="""
 Stages:
   prepare      Download data and prepare reference/truth/input VCFs
-  prepare-profile  Prepare first 5% of chr22 for profiling
+  prepare-profile  Prepare middle 5% of chr22 target markers for profiling
   beagle       Run Java Beagle imputation
   reagle       Run Reagle imputation
   impute5      Run IMPUTE5 imputation
