@@ -1696,6 +1696,7 @@ fn test_microarray_vs_wgs_imputation() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 100;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
