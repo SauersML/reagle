@@ -2798,7 +2798,7 @@ impl PhasingPipeline {
             let sp = &mut sample_phases[s];
 
             // Apply swaps using the mask (correctly handles cumulative swap propagation)
-            for (hi_freq_idx, should_swap) in swap_mask.into_iter().enumerate() {
+            for (hi_freq_idx, &should_swap) in swap_mask.iter().enumerate() {
                 if should_swap {
                     let m = hi_freq_to_orig[hi_freq_idx];
                     sp.swap_alleles(m);
@@ -2819,7 +2819,15 @@ impl PhasingPipeline {
 
             for (hi_freq_idx, p_orient) in het_phase_values {
                 let m = hi_freq_to_orig[hi_freq_idx];
-                sp.set_phase_confidence(m, p_orient);
+                // Store confidence in the *selected* phase orientation
+                // If we swapped, confidence is p_orient. If we kept, confidence is 1.0 - p_orient.
+                let swapped = swap_mask[hi_freq_idx];
+                let conf = if swapped {
+                    p_orient
+                } else {
+                    1.0 - p_orient
+                };
+                sp.set_phase_confidence(m, conf);
             }
 
             if let Some(paths) = new_paths {
