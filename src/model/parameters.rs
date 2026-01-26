@@ -109,7 +109,11 @@ impl ModelParams {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+        // Heuristic: clamp effective Ne for small panels to prevent excessive recombination
+        // Target max intensity ~4.0 (switch prob ~0.04 per 0.01 cM)
+        // 0.04 * ne / n <= 4.0 => ne <= 100 * n
+        let effective_ne = ne.min((n_ref_haps as f32) * 100.0);
+        let recomb_intensity = 0.04 * effective_ne / n_ref_haps as f32;
 
         Self {
             p_mismatch,
