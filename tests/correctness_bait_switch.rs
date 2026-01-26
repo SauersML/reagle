@@ -162,7 +162,9 @@ fn test_state_index_stability_bait_and_switch() {
     config.overlap = 0.2;
 
     config.err = Some(0.0001);
-    config.ne = 10_000.0;
+    // Use low Ne to reduce recombination probability and enforce strong LD
+    // for this stability test.
+    config.ne = 20.0;
     config.imp_states = 10;
     config.nthreads = Some(1);
 
