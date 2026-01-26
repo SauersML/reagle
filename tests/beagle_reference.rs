@@ -3528,6 +3528,18 @@ fn test_dosage_by_distance_from_genotyped() {
             any_bucket_failed = true;
         }
 
+        if lo == 0 && mean_mad_rust > 0.01 {
+             println!("  [DEBUG] High error for genotyped markers:");
+             let mut bad_count = 0;
+             for &(pos, _, j_err, r_err) in &bucket {
+                 if *r_err > 0.01 {
+                     println!("    pos={}: Java_err={:.4}, Rust_err={:.4}", pos, j_err, r_err);
+                     bad_count += 1;
+                     if bad_count >= 10 { break; }
+                 }
+             }
+        }
+
         println!(
             "{:>12} {:>8} {:>10.4} {:>10.4} {:>12}{}",
             label,
