@@ -419,6 +419,12 @@ fn fill_emissions_for_marker_probs(
         return;
     }
 
+    let conf = emission_confidence(target_probs);
+    if conf <= 0.0 {
+        emissions[..n_patterns].fill(1.0);
+        return;
+    }
+
     let n_alleles = block.n_alleles(marker_in_window);
     let mismatch_prob = if n_alleles > 1 {
         error_rate / (n_alleles - 1) as f32
@@ -439,7 +445,7 @@ fn fill_emissions_for_marker_probs(
                 .unwrap_or(0.0);
             mismatch_prob + (match_prob - mismatch_prob) * p_match
         };
-        emissions[pattern_idx] = emit;
+        emissions[pattern_idx] = emit * conf + (1.0 - conf);
     }
 }
 
@@ -453,6 +459,11 @@ fn emission_prob_soft(
     n_alleles: usize,
 ) -> f32 {
     if target_probs.is_empty() {
+        return 1.0;
+    }
+
+    let conf = emission_confidence(target_probs);
+    if conf <= 0.0 {
         return 1.0;
     }
 
@@ -473,7 +484,8 @@ fn emission_prob_soft(
                 expected_match += p * freq;
             }
             let p_given_observed = mismatch_prob + (match_prob - mismatch_prob) * expected_match;
-            p_given_observed * obs_fraction + 1.0 * (1.0 - obs_fraction)
+            let emit = p_given_observed * obs_fraction + 1.0 * (1.0 - obs_fraction);
+            emit * conf + (1.0 - conf)
         } else {
             1.0
         }
@@ -486,8 +498,39 @@ fn emission_prob_soft(
             .get(ref_allele as usize)
             .copied()
             .unwrap_or(0.0);
-        mismatch_prob + (match_prob - mismatch_prob) * p_match
+        let emit = mismatch_prob + (match_prob - mismatch_prob) * p_match;
+        emit * conf + (1.0 - conf)
     }
+}
+
+#[inline]
+fn emission_confidence(target_probs: &[f32]) -> f32 {
+    let n = target_probs.len();
+    if n <= 1 {
+        return 1.0;
+    }
+    let mut sum = 0.0f32;
+    for &p in target_probs {
+        if p.is_finite() && p > 0.0 {
+            sum += p;
+        }
+    }
+    if sum <= 0.0 {
+        return 0.0;
+    }
+    let mut entropy = 0.0f32;
+    for &p in target_probs {
+        if p.is_finite() && p > 0.0 {
+            let pn = p / sum;
+            entropy -= pn * pn.ln();
+        }
+    }
+    let max_entropy = (n as f32).ln();
+    if max_entropy <= 0.0 {
+        return 1.0;
+    }
+    let conf = 1.0 - (entropy / max_entropy);
+    conf.clamp(0.0, 1.0)
 }
 
 fn reservoir_coherence(

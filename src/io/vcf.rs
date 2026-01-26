@@ -1138,9 +1138,11 @@ impl VcfWriter {
                 for s in 0..self.samples.len() {
                     let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
                     let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
-                    let a1 = column.get(hap1);
-                    let a2 = column.get(hap2);
-                    write!(self.writer, "\t{}|{}", a1, a2)?;
+                let a1 = column.get(hap1);
+                let a2 = column.get(hap2);
+                let phase_p = matrix.sample_phase_confidence_f32(marker_idx, s);
+                let sep = if phase_p >= 0.9 { '|' } else { '/' };
+                write!(self.writer, "\t{}{}{}", a1, sep, a2)?;
                 }
                 writeln!(self.writer)?;
             }
@@ -1284,7 +1286,58 @@ impl VcfWriter {
                 let ds = get_dosage(m, s);
                 let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
                 let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
-                    (p1.max_allele(), p2.max_allele())
+                    if n_alleles <= 2 {
+                        let p1_alt = p1.prob(1);
+                        let p2_alt = p2.prob(1);
+                        let gp00 = (1.0 - p1_alt) * (1.0 - p2_alt);
+                        let gp01 =
+                            p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
+                        let gp11 = p1_alt * p2_alt;
+                        if gp01 >= gp00 && gp01 >= gp11 {
+                            let p10 = p1_alt * (1.0 - p2_alt);
+                            let p01 = (1.0 - p1_alt) * p2_alt;
+                            if p10 >= p01 {
+                                (1, 0)
+                            } else {
+                                (0, 1)
+                            }
+                        } else if gp11 >= gp00 {
+                            (1, 1)
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        let mut best = (0u8, 0u8);
+                        let mut best_prob = -1.0f32;
+                        for i in 0..n_alleles {
+                            for j in i..n_alleles {
+                                let p_i1 = p1.prob(i);
+                                let p_i2 = p2.prob(i);
+                                let p_j1 = p1.prob(j);
+                                let p_j2 = p2.prob(j);
+                                let prob = if i == j {
+                                    p_i1 * p_i2
+                                } else {
+                                    p_i1 * p_j2 + p_j1 * p_i2
+                                };
+                                if prob > best_prob {
+                                    best_prob = prob;
+                                    if i == j {
+                                        best = (i as u8, i as u8);
+                                    } else {
+                                        let p_ij = p_i1 * p_j2;
+                                        let p_ji = p_j1 * p_i2;
+                                        if p_ij >= p_ji {
+                                            best = (i as u8, j as u8);
+                                        } else {
+                                            best = (j as u8, i as u8);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        best
+                    }
                 } else {
                     get_best_gt(m, s)
                 };

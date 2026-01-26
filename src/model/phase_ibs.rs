@@ -383,6 +383,12 @@ impl BidirectionalPhaseIbs {
         ibs2: &Ibs2,
         n_candidates: usize,
     ) -> Vec<u32> {
+        let span = self.best_match_span(hap_idx, marker_idx);
+        let n_candidates = if span < PBWT_CHECKPOINT_INTERVAL / 2 {
+            n_candidates.saturating_mul(2)
+        } else {
+            n_candidates
+        };
         let mut neighbors = Vec::with_capacity(n_candidates * 2 + 10);
         let sample = SampleIdx::new(hap_idx / 2);
 

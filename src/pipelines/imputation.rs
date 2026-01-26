@@ -52,25 +52,6 @@ impl AllelePosteriors {
         }
     }
 
-    /// Get the most likely allele (argmax)
-    #[inline]
-    pub fn max_allele(&self) -> u8 {
-        match self {
-            AllelePosteriors::Biallelic(p_alt) => {
-                if *p_alt >= 0.5 {
-                    1
-                } else {
-                    0
-                }
-            }
-            AllelePosteriors::Multiallelic(probs) => probs
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u8)
-                .unwrap_or(0),
-        }
-    }
 }
 
 impl ImputationPipeline {

@@ -2983,6 +2983,7 @@ impl PhasingPipeline {
         let n_stage1 = hi_freq_markers.len();
         let seed = self.config.seed;
         let n_haps_f = target_gt.n_haplotypes() as f32;
+        let has_ref = self.reference_gt.is_some() && self.alignment.is_some();
         let alt_freqs: Vec<f32> = if n_haps_f > 0.0 {
             (0..n_markers)
                 .map(|m| {
@@ -3089,6 +3090,11 @@ impl PhasingPipeline {
         let phase_results: Vec<PhaseResult> = {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
+            let phase_ibs = if has_ref {
+                None
+            } else {
+                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_markers, n_haps))
+            };
 
             let rare_markers: Vec<usize> = (0..n_markers)
                 .filter(|&m| maf[m] < rare_threshold && maf[m] > 0.0)
@@ -3142,14 +3148,6 @@ impl PhasingPipeline {
                 carrier_haps[m] = carriers;
             }
 
-            // Build bidirectional PBWT on hi-freq markers for consistent state selection
-            let has_ref = self.reference_gt.is_some() && self.alignment.is_some();
-            let phase_ibs = if has_ref {
-                None
-            } else {
-                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_markers, n_haps))
-            };
-
             // Process samples in parallel - collect results: Stage2Decision
             // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
             sample_phases
@@ -3191,9 +3189,15 @@ impl PhasingPipeline {
                     {
                         let h1_idx = s * 2;
                         let h2_idx = s * 2 + 1;
-                        let prior_stage1_idx = n_stage1_in_prev_overlap
+                        let mut prior_stage1_idx = n_stage1_in_prev_overlap
                             .saturating_sub(1)
                             .min(n_stage1.saturating_sub(1));
+                        if let Some(prior_marker) = overlap.prior_stage1_global_marker() {
+                            if let Some(idx) = hi_freq_markers.iter().position(|&m| m == prior_marker)
+                            {
+                                prior_stage1_idx = idx;
+                            }
+                        }
                         let current_global_marker = hi_freq_markers.get(prior_stage1_idx).copied();
                         let markers_aligned =
                             match (overlap.prior_stage1_global_marker(), current_global_marker) {
@@ -3367,30 +3371,32 @@ impl PhasingPipeline {
                     };
 
                     // Export identity-aware haplotype priors for the next window.
-                    let (next_hap_priors, next_prior_global_marker) =
-                        if let Some(&stage1_idx) = next_overlap_indices.last() {
-                            if stage1_idx < probs1.len() && n_states > 0 {
-                                let mut state_haps = vec![GlobalId::new(0); n_states];
-                                threaded_haps.materialize_at(stage1_idx, &mut state_haps);
+                    let (next_hap_priors, next_prior_global_marker) = if !next_overlap_indices
+                        .is_empty()
+                    {
+                        let stage1_idx = next_overlap_indices[0];
+                        if stage1_idx < probs1.len() && n_states > 0 {
+                            let mut state_haps = vec![GlobalId::new(0); n_states];
+                            threaded_haps.materialize_at(stage1_idx, &mut state_haps);
 
-                                let prior1 = build_haplotype_priors_from_state_probs(
-                                    &probs1[stage1_idx],
-                                    &state_haps,
-                                    PRIOR_EXPORT_MIN_PROB,
-                                );
-                                let prior2 = build_haplotype_priors_from_state_probs(
-                                    &probs2[stage1_idx],
-                                    &state_haps,
-                                    PRIOR_EXPORT_MIN_PROB,
-                                );
-                                let marker = hi_freq_markers.get(stage1_idx).copied();
-                                (Some([prior1, prior2]), marker)
-                            } else {
-                                (None, None)
-                            }
+                            let prior1 = build_haplotype_priors_from_state_probs(
+                                &probs1[stage1_idx],
+                                &state_haps,
+                                PRIOR_EXPORT_MIN_PROB,
+                            );
+                            let prior2 = build_haplotype_priors_from_state_probs(
+                                &probs2[stage1_idx],
+                                &state_haps,
+                                PRIOR_EXPORT_MIN_PROB,
+                            );
+                            let marker = hi_freq_markers.get(stage1_idx).copied();
+                            (Some([prior1, prior2]), marker)
                         } else {
                             (None, None)
-                        };
+                        }
+                    } else {
+                        (None, None)
+                    };
 
                     // Lazy cache for state->hap mapping - O(1) indexing with Option<Vec>
                     // Uses immutable materialize_at() to avoid clone() overhead
@@ -3542,16 +3548,12 @@ impl PhasingPipeline {
                                         .and_then(|v| v.iter().copied().reduce(f32::max))
                                         .unwrap_or(0.0);
                                     max1 < max2
-                                } else {
-                                    let span1 = phase_ibs
-                                        .as_ref()
-                                        .expect("phase_ibs")
-                                        .best_match_span(hap1_idx, stage1_idx);
-                                    let span2 = phase_ibs
-                                        .as_ref()
-                                        .expect("phase_ibs")
-                                        .best_match_span(hap2_idx, stage1_idx);
+                                } else if let Some(phase_ibs) = phase_ibs.as_ref() {
+                                    let span1 = phase_ibs.best_match_span(hap1_idx, stage1_idx);
+                                    let span2 = phase_ibs.best_match_span(hap2_idx, stage1_idx);
                                     span1 < span2
+                                } else {
+                                    rng.random_bool(0.5)
                                 };
                                 let alt_on_hap1 = a1 > 0 && a1 != 255;
                                 let alt_on_hap2 = a2 > 0 && a2 != 255;
@@ -3570,13 +3572,26 @@ impl PhasingPipeline {
                                 }
                             }
 
-                            let should_swap =
-                                score2 > score1 || (score2 == score1 && rng.random_bool(0.5));
-                            let lr = if score2 > score1 {
+                            let mut lr = if score2 > score1 {
                                 (score2 / score1.max(1e-30)) as f32
                             } else {
                                 (score1 / score2.max(1e-30)) as f32
                             };
+                            let eps = 1e-6f64;
+                            let s1 = (score1 as f64 + eps).max(eps);
+                            let s2 = (score2 as f64 + eps).max(eps);
+                            let denom = s1 + s2;
+                            let mut p_swap = if denom > 0.0 {
+                                (s2 / denom).clamp(0.0, 1.0)
+                            } else {
+                                0.5
+                            };
+                            let mut p_conf = (lr / (1.0 + lr)).clamp(0.0, 1.0);
+                            p_conf = 0.5 + (p_conf - 0.5) * 0.5;
+                            lr = (p_conf / (1.0 - p_conf)).max(1e-6);
+                            let alpha = ((lr - 1.0) / (lr + 1.0)).clamp(0.0, 1.0) as f64;
+                            p_swap = 0.5 * (1.0 - alpha) + alpha * p_swap;
+                            let should_swap = rng.random_bool(p_swap as f64);
                             decisions.push(Stage2Decision::Phase {
                                 marker: m,
                                 should_swap,
@@ -3608,12 +3623,26 @@ impl PhasingPipeline {
                         let p1 = al_probs1[0] * al_probs2[1];
                         let p2 = al_probs1[1] * al_probs2[0];
 
-                        let should_swap = p2 > p1 || (p1 == p2 && rng.random_bool(0.5));
-                        let lr = if p2 > p1 {
+                        let mut lr = if p2 > p1 {
                             (p2 / p1.max(1e-30)) as f32
                         } else {
                             (p1 / p2.max(1e-30)) as f32
                         };
+                        let eps = 1e-6f64;
+                        let pp1 = (p1 as f64 + eps).max(eps);
+                        let pp2 = (p2 as f64 + eps).max(eps);
+                        let denom = pp1 + pp2;
+                        let mut p_swap = if denom > 0.0 {
+                            (pp2 / denom).clamp(0.0, 1.0)
+                        } else {
+                            0.5
+                        };
+                        let mut p_conf = (lr / (1.0 + lr)).clamp(0.0, 1.0);
+                        p_conf = 0.5 + (p_conf - 0.5) * 0.5;
+                        lr = (p_conf / (1.0 - p_conf)).max(1e-6);
+                        let alpha = ((lr - 1.0) / (lr + 1.0)).clamp(0.0, 1.0) as f64;
+                        p_swap = 0.5 * (1.0 - alpha) + alpha * p_swap;
+                        let should_swap = rng.random_bool(p_swap as f64);
                         decisions.push(Stage2Decision::Phase {
                             marker: m,
                             should_swap,
@@ -3690,16 +3719,19 @@ impl PhasingPipeline {
                             continue;
                         }
 
+                        let confident = lr >= lr_threshold;
                         if should_swap {
                             sp.swap_haps(m, m + 1);
-                            total_switches += 1;
+                            if confident {
+                                total_switches += 1;
+                            }
                         }
 
                         sp.set_phase_confidence(m, lr / (1.0 + lr));
 
                         // Only mark as phased if likelihood ratio exceeds threshold
                         // (Stage 2 runs after iterations, so threshold is typically 1.0)
-                        if lr >= lr_threshold {
+                        if confident {
                             sp.mark_phased(m);
                             total_phased += 1;
                         }
@@ -5809,12 +5841,16 @@ impl Stage2Phaser {
         let scale1 = 1.0 - r1;
         let scale2 = 1.0 - r2;
 
+        let denom = d1 + d2;
+        let weight_a = if denom > 0.0 { (d2 / denom) as f32 } else { 0.5 };
+        let weight_b = 1.0 - weight_a;
+
         let mut weights = vec![0.0f32; n_states];
         let mut sum = 0.0f32;
         for k in 0..n_states {
             let a = scale1 * probs_a.get(k).copied().unwrap_or(0.0) + shift1;
             let b = scale2 * probs_b.get(k).copied().unwrap_or(0.0) + shift2;
-            let w = a * b;
+            let w = weight_a * a + weight_b * b;
             weights[k] = w;
             sum += w;
         }

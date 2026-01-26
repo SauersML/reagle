@@ -1156,9 +1156,11 @@ target_samples={} target_bytes={}",
             }
             let n_ref_markers = ref_markers.len();
             let overlap_size = 1000.min(n_ref_markers);
-            let prior_marker_idx = ref_output_end
-                .saturating_sub(overlap_size)
-                .saturating_sub(1);
+            let prior_marker_idx = if overlap_size == 0 {
+                0
+            } else {
+                ref_output_end.saturating_sub(1)
+            };
             let boundary_recomb_rate = if prior_marker_idx + 1 < n_ref_markers {
                 let marker_idx = prior_marker_idx + 1;
                 let block_idx = ref_map
@@ -1231,9 +1233,9 @@ target_samples={} target_bytes={}",
     ) -> PhasedOverlap {
         use crate::io::streaming::HaplotypePriors;
 
-        let overlap_size = 1000.min(n_markers);
-        let start = output_end.saturating_sub(overlap_size);
-        let end = output_end;
+        let overlap_size = 1000.min(n_markers.saturating_sub(output_end));
+        let start = output_end;
+        let end = output_end.saturating_add(overlap_size);
         let n_haps = phased.n_haplotypes();
         let mut alleles = vec![255u8; overlap_size * n_haps];
         for h in 0..n_haps {
@@ -1637,7 +1639,11 @@ target_samples={} target_bytes={}",
         }
 
         let overlap_size = 1000.min(n_ref_markers);
-        let prior_marker_idx = output_end.saturating_sub(overlap_size).saturating_sub(1);
+        let prior_marker_idx = if overlap_size == 0 {
+            0
+        } else {
+            output_end.saturating_sub(1)
+        };
         let sample_results: Vec<ImputeResult> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
@@ -1782,24 +1788,82 @@ target_samples={} target_bytes={}",
                                 {
                                     if prob > threshold {
                                         let count = block.pattern_counts[pat_idx];
-
-                                        let global_prob = prob / count;
-
-                                        for &global_id in block.pattern_globals(pat_idx) {
-                                            priors_list.push((
-                                                GlobalHapId(global_id.as_u32()),
-                                                global_prob,
-                                            ));
+                                        let globals = block.pattern_globals(pat_idx);
+                                        if let Some(p) = priors {
+                                            let mut sum_prior = 0.0f32;
+                                            for &global_id in globals {
+                                                if let Some(w) = p.prob_of(GlobalHapId(global_id.as_u32())) {
+                                                    sum_prior += w;
+                                                }
+                                            }
+                                            if sum_prior > 0.0 {
+                                                for &global_id in globals {
+                                                    if let Some(w) = p.prob_of(GlobalHapId(global_id.as_u32())) {
+                                                        let global_prob = prob * (w / sum_prior);
+                                                        priors_list.push((
+                                                            GlobalHapId(global_id.as_u32()),
+                                                            global_prob,
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                let global_prob = prob / count;
+                                                for &global_id in globals {
+                                                    priors_list.push((
+                                                        GlobalHapId(global_id.as_u32()),
+                                                        global_prob,
+                                                    ));
+                                                }
+                                            }
+                                        } else {
+                                            let global_prob = prob / count;
+                                            for &global_id in globals {
+                                                priors_list.push((
+                                                    GlobalHapId(global_id.as_u32()),
+                                                    global_prob,
+                                                ));
+                                            }
                                         }
                                     }
                                 }
 
                                 if res_prob > threshold && block.reservoir_count > 0 {
-                                    let global_prob = res_prob / block.reservoir_count as f32;
-
-                                    for &global_id in &block.reservoir_globals {
-                                        priors_list
-                                            .push((GlobalHapId(global_id.as_u32()), global_prob));
+                                    let globals = &block.reservoir_globals;
+                                    if let Some(p) = priors {
+                                        let mut sum_prior = 0.0f32;
+                                        for &global_id in globals {
+                                            if let Some(w) = p.prob_of(GlobalHapId(global_id.as_u32())) {
+                                                sum_prior += w;
+                                            }
+                                        }
+                                        if sum_prior > 0.0 {
+                                            for &global_id in globals {
+                                                if let Some(w) = p.prob_of(GlobalHapId(global_id.as_u32())) {
+                                                    let global_prob = res_prob * (w / sum_prior);
+                                                    priors_list.push((
+                                                        GlobalHapId(global_id.as_u32()),
+                                                        global_prob,
+                                                    ));
+                                                }
+                                            }
+                                        } else {
+                                            let global_prob =
+                                                res_prob / block.reservoir_count as f32;
+                                            for &global_id in globals {
+                                                priors_list.push((
+                                                    GlobalHapId(global_id.as_u32()),
+                                                    global_prob,
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        let global_prob = res_prob / block.reservoir_count as f32;
+                                        for &global_id in globals {
+                                            priors_list.push((
+                                                GlobalHapId(global_id.as_u32()),
+                                                global_prob,
+                                            ));
+                                        }
                                     }
                                 }
 
@@ -1858,49 +1922,88 @@ target_samples={} target_bytes={}",
 
                         let p2 = &post2_full[m];
 
-                        let (d1, g1, prob1) = match p1 {
-                            AllelePosteriors::Biallelic(p) => {
-                                (*p, if *p > 0.5 { 1 } else { 0 }, *p)
-                            }
+                        let (d1, prob1) = match p1 {
+                            AllelePosteriors::Biallelic(p) => (*p, *p),
 
                             AllelePosteriors::Multiallelic(probs) => {
                                 let dosage =
                                     probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
 
-                                let (best_allele, _) = probs
-                                    .iter()
-                                    .enumerate()
-                                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                                    .unwrap_or((0, &0.0));
-
                                 let p_alt = if probs.len() > 1 { probs[1] } else { 0.0 };
 
-                                (dosage, best_allele as u8, p_alt)
+                                (dosage, p_alt)
                             }
                         };
 
-                        let (d2, g2, prob2) = match p2 {
-                            AllelePosteriors::Biallelic(p) => {
-                                (*p, if *p > 0.5 { 1 } else { 0 }, *p)
-                            }
+                        let (d2, prob2) = match p2 {
+                            AllelePosteriors::Biallelic(p) => (*p, *p),
 
                             AllelePosteriors::Multiallelic(probs) => {
                                 let dosage =
                                     probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
 
-                                let (best_allele, _) = probs
-                                    .iter()
-                                    .enumerate()
-                                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                                    .unwrap_or((0, &0.0));
-
                                 let p_alt = if probs.len() > 1 { probs[1] } else { 0.0 };
 
-                                (dosage, best_allele as u8, p_alt)
+                                (dosage, p_alt)
                             }
                         };
 
-                        best_gt.push((g1, g2));
+                        let n_alleles = ref_markers
+                            .marker(MarkerIdx::new(m as u32))
+                            .n_alleles()
+                            .max(1);
+                        let (gt1, gt2) = if n_alleles <= 2 {
+                            let p1_alt = p1.prob(1);
+                            let p2_alt = p2.prob(1);
+                            let gp00 = (1.0 - p1_alt) * (1.0 - p2_alt);
+                            let gp01 = p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
+                            let gp11 = p1_alt * p2_alt;
+                            if gp01 >= gp00 && gp01 >= gp11 {
+                                let p10 = p1_alt * (1.0 - p2_alt);
+                                let p01 = (1.0 - p1_alt) * p2_alt;
+                                if p10 >= p01 {
+                                    (1u8, 0u8)
+                                } else {
+                                    (0u8, 1u8)
+                                }
+                            } else if gp11 >= gp00 {
+                                (1u8, 1u8)
+                            } else {
+                                (0u8, 0u8)
+                            }
+                        } else {
+                            let mut best = (0u8, 0u8);
+                            let mut best_prob = -1.0f32;
+                            for i in 0..n_alleles {
+                                for j in i..n_alleles {
+                                    let p_i1 = p1.prob(i);
+                                    let p_i2 = p2.prob(i);
+                                    let p_j1 = p1.prob(j);
+                                    let p_j2 = p2.prob(j);
+                                    let prob = if i == j {
+                                        p_i1 * p_i2
+                                    } else {
+                                        p_i1 * p_j2 + p_j1 * p_i2
+                                    };
+                                    if prob > best_prob {
+                                        best_prob = prob;
+                                        if i == j {
+                                            best = (i as u8, i as u8);
+                                        } else {
+                                            let p_ij = p_i1 * p_j2;
+                                            let p_ji = p_j1 * p_i2;
+                                            if p_ij >= p_ji {
+                                                best = (i as u8, j as u8);
+                                            } else {
+                                                best = (j as u8, i as u8);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            best
+                        };
+                        best_gt.push((gt1, gt2));
 
                         dosages.push(d1 + d2);
 
@@ -2014,9 +2117,9 @@ target_samples={} target_bytes={}",
         alignment: &MarkerAlignment,
         output_end: usize,
     ) -> PhasedOverlap {
-        let overlap_size = 1000.min(ref_markers.len());
-        let start = output_end.saturating_sub(overlap_size);
-        let end = output_end;
+        let overlap_size = 1000.min(ref_markers.len().saturating_sub(output_end));
+        let start = output_end;
+        let end = output_end.saturating_add(overlap_size);
         let n_haps = target_win.n_haplotypes();
         let mut alleles = vec![255u8; overlap_size * n_haps];
         for h in 0..n_haps {
