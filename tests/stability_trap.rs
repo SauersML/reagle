@@ -148,8 +148,7 @@ fn test_stability_trap_file_based() {
     let expected_out_path = out_path.with_extension("vcf.gz");
     assert!(expected_out_path.exists(), "Output VCF does not exist");
 
-    // DEBUG: Check what the phased output looks like
-    println!("=== DEBUG: First few phased genotypes ===");
+    // Parse the output VCF to check phasing quality
     use flate2::read::MultiGzDecoder;
     use std::io::BufRead;
     use std::io::BufReader;
@@ -158,13 +157,15 @@ fn test_stability_trap_file_based() {
     let decoder = MultiGzDecoder::new(file);
     let reader = BufReader::new(decoder);
 
-    let mut lines: Vec<String> = Vec::new();
-    for line in reader.lines().take(60) {
-        // Read first 60 lines
-        lines.push(line.unwrap());
+    // Read all output lines to check quality
+    let mut all_lines: Vec<String> = Vec::new();
+    for line in reader.lines() {
+        all_lines.push(line.unwrap());
     }
 
-    for (i, line) in lines.iter().enumerate() {
+    // DEBUG: Check what the phased output looks like
+    println!("=== DEBUG: First few phased genotypes ===");
+    for (i, line) in all_lines.iter().enumerate().take(60) {
         if i < 10 || (i >= 45 && i < 55) {
             // Show header and first few data lines
             println!("Line {}: {}", i, line);
@@ -172,9 +173,7 @@ fn test_stability_trap_file_based() {
     }
 
     let mut phased_haps: Vec<(u8, u8)> = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.unwrap();
+    for line in &all_lines {
         if line.starts_with('#') {
             continue;
         }
