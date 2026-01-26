@@ -445,9 +445,13 @@ mod tests {
             } else if m < 70 {
                 GlobalId::from(15u32)
             } else {
-                 GlobalId::from(20u32)
+                GlobalId::from(20u32)
             };
-            let expected1 = if m < 50 { GlobalId::from(30u32) } else { GlobalId::from(35u32) };
+            let expected1 = if m < 50 {
+                GlobalId::from(30u32)
+            } else {
+                GlobalId::from(35u32)
+            };
 
             let mut buffer = vec![GlobalId::from(0u32); 2];
             th.materialize_at(m, &mut buffer);

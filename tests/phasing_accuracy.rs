@@ -418,12 +418,21 @@ fn test_hypothesis_initial_phasing_causes_beam_exclusion() {
         "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
     )
     .unwrap();
-    writeln!(file, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget").unwrap();
+    writeln!(
+        file,
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget"
+    )
+    .unwrap();
 
     for (m, &pos) in marker_pos.iter().enumerate() {
         let hero_allele = (m % 2) as u8;
         let anti_hero = 1 - hero_allele;
-        write!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}", pos, hero_allele, anti_hero).unwrap();
+        write!(
+            file,
+            "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
+            pos, hero_allele, anti_hero
+        )
+        .unwrap();
         writeln!(file).unwrap();
     }
 
@@ -488,7 +497,11 @@ fn test_hypothesis_initial_phasing_causes_beam_exclusion() {
 
     let ser = switch_errors as f32 / (n_markers - 1) as f32;
 
-    assert!(ser < 0.05, "SER too high with correct initial phasing: {:.4}", ser);
+    assert!(
+        ser < 0.05,
+        "SER too high with correct initial phasing: {:.4}",
+        ser
+    );
 }
 
 #[test]
@@ -643,12 +656,21 @@ fn test_homozygous_anchors_vs_all_heterozygous() {
         "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
     )
     .unwrap();
-    writeln!(file, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget").unwrap();
+    writeln!(
+        file,
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget"
+    )
+    .unwrap();
 
     for (m, &pos) in marker_pos.iter().enumerate() {
         let hero_allele = (m % 2) as u8;
         if m < 10 && m % 2 == 0 {
-            write!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}", pos, hero_allele, hero_allele).unwrap();
+            write!(
+                file,
+                "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
+                pos, hero_allele, hero_allele
+            )
+            .unwrap();
         } else {
             write!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t0/1", pos).unwrap();
         }

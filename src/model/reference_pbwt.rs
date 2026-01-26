@@ -250,12 +250,7 @@ impl ReferencePbwt {
         total
     }
 
-    pub fn update_beams(
-        &self,
-        beams: &mut [RankBeam],
-        query_alleles: &[u8],
-        n_alleles: usize,
-    ) {
+    pub fn update_beams(&self, beams: &mut [RankBeam], query_alleles: &[u8], n_alleles: usize) {
         let n_ref = self.ppa.len();
         let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
 
@@ -365,18 +360,24 @@ impl ReferencePbwt {
             if a1 != a2 && a1 != 255 && a2 != 255 {
                 let len_keep_h1 = self.match_len(&beams[h1], a1, n_alleles);
                 let len_keep_h2 = self.match_len(&beams[h2], a2, n_alleles);
-                let score_keep = (len_keep_h1 as u64) * (len_keep_h2 as u64);
+
+                let b1 = Self::bin_for_allele(a1, n_alleles);
+                let count_a1 = self.counts[b1].max(1) as f32;
+                let b2 = Self::bin_for_allele(a2, n_alleles);
+                let count_a2 = self.counts[b2].max(1) as f32;
+
+                // Smoothed Consistency Scoring: len / (count + 1)
+                // This balances maximizing match length with preferring unique/rare haplotypes (high consistency),
+                // but avoids over-penalizing common haplotypes by adding +1 smoothing.
+                let score_keep =
+                    ((len_keep_h1 as f32) / (count_a1 + 1.0)) * ((len_keep_h2 as f32) / (count_a2 + 1.0));
 
                 let len_swap_h1 = self.match_len(&beams[h1], a2, n_alleles);
                 let len_swap_h2 = self.match_len(&beams[h2], a1, n_alleles);
-                let score_swap = (len_swap_h1 as u64) * (len_swap_h2 as u64);
 
-                if s == 0 && marker < 10 {
-                   eprintln!("M{}: keep=({}*{})={} swap=({}*{})={} -> do_swap={}", 
-                        marker, len_keep_h1, len_keep_h2, score_keep, 
-                        len_swap_h1, len_swap_h2, score_swap, 
-                        score_swap > score_keep);
-                }
+                // For swap: h1 gets a2 (so we use count_a2), h2 gets a1 (so we use count_a1)
+                let score_swap =
+                    ((len_swap_h1 as f32) / (count_a2 + 1.0)) * ((len_swap_h2 as f32) / (count_a1 + 1.0));
 
                 if score_swap > score_keep {
                     query_alleles[h1] = a2;

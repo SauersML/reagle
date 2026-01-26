@@ -446,7 +446,8 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         // Collect target positions first so we can load the correct chromosomes from the map.
-        let (target_positions_map, target_marker_count) = collect_target_positions(&self.config.gt)?;
+        let (target_positions_map, target_marker_count) =
+            collect_target_positions(&self.config.gt)?;
         let target_positions = if target_marker_count == 0 {
             None
         } else {

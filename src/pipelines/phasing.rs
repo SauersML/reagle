@@ -59,12 +59,12 @@ impl std::ops::Deref for StreamWindowWithResult {
 }
 use crate::data::alignment::MarkerAlignment;
 use crate::model::allele_lookup::RefAlleleLookup;
+use crate::model::block_hash::types::GlobalId;
 use crate::model::hmm::BeagleHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
-use crate::model::block_hash::types::GlobalId;
 
 use crate::model::phase_states::PhaseStates;
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
@@ -1138,11 +1138,7 @@ impl PhasingPipeline {
                 if current.window.is_first && !wrote_header {
                     writer.write_header(finalized.markers())?;
                 }
-                writer.write_phased(
-                    &finalized,
-                    current.output_start,
-                    current.output_end,
-                )?;
+                writer.write_phased(&finalized, current.output_start, current.output_end)?;
                 total_markers += current.output_end - current.output_start;
                 Ok(())
             })?;
@@ -1776,7 +1772,7 @@ impl PhasingPipeline {
 
         let mut donors_fwd: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
         let mut swaps_buffer = vec![false; n_samples];
-        
+
         let mut block_idx_fwd = 0usize;
         let mut next_block_start_fwd = if !donor_blocks.is_empty() {
             donor_blocks[0].0
@@ -1784,11 +1780,17 @@ impl PhasingPipeline {
             n_markers
         };
 
-        // Forward pass: reference-only PBWT + query beams for target haplotypes
-        for m in 0..n_markers {
-            let orig_m = marker_to_global
-                .and_then(|map| map.get(m).copied())
-                .unwrap_or(m);
+                // Forward pass: reference-only PBWT + query beams for target haplotypes
+
+                for m in 0..n_markers {
+
+                    let orig_m = marker_to_global
+
+                        .and_then(|map| map.get(m).copied())
+
+                        .unwrap_or(m);
+
+        
 
             // Build query alleles (target haps)
             for h in 0..n_target_haps {
@@ -1876,12 +1878,8 @@ impl PhasingPipeline {
                             let other_s = seg.other_sample;
                             if other_s != sample {
                                 let neighbors: [u32; 2] = [other_s.hap1().0, other_s.hap2().0];
-                                phase_states[s].add_neighbors_at_marker(
-                                    s as u32,
-                                    m,
-                                    &neighbors,
-                                    &neighbors,
-                                );
+                                phase_states[s]
+                                    .add_neighbors_at_marker(s as u32, m, &neighbors, &neighbors);
                             }
                         }
                     }
@@ -1903,10 +1901,15 @@ impl PhasingPipeline {
             next_block_end_bwd = donor_blocks[block_idx_bwd].1;
         }
 
-        for (rev_step, m) in (0..n_markers).rev().enumerate() {
-            let orig_m = marker_to_global
-                .and_then(|map| map.get(m).copied())
-                .unwrap_or(m);
+                for (rev_step, m) in (0..n_markers).rev().enumerate() {
+
+                    let orig_m = marker_to_global
+
+                        .and_then(|map| map.get(m).copied())
+
+                        .unwrap_or(m);
+
+        
 
             for h in 0..n_target_haps {
                 query_alleles[h] = target_geno.get(orig_m, HapIdx::new(h as u32));
@@ -1930,13 +1933,26 @@ impl PhasingPipeline {
             }
             let n_alleles = if is_biallelic { 2 } else { 256 };
 
-            pbwt_bwd.advance_with_beams(
+            pbwt_bwd.advance_with_rephase(
                 &ref_alleles,
                 n_alleles,
                 rev_step,
-                &query_alleles,
+                &mut query_alleles,
                 &mut beams_bwd,
+                &mut swaps_buffer,
             );
+
+            // Apply swaps to MutableGenotypes to maintain consistency
+            for (s, &swapped) in swaps_buffer.iter().enumerate() {
+                if swapped {
+                    let h1 = HapIdx::new((s * 2) as u32);
+                    let h2 = HapIdx::new((s * 2 + 1) as u32);
+                    let a1 = query_alleles[s * 2];
+                    let a2 = query_alleles[s * 2 + 1];
+                    target_geno.set(orig_m, h1, a1);
+                    target_geno.set(orig_m, h2, a2);
+                }
+            }
 
             // Block-static donors for backward traversal: select at block end-1
             if m + 1 == next_block_end_bwd {
@@ -2232,7 +2248,7 @@ impl PhasingPipeline {
         // We use a scoped immutable borrow that ends before the swap phase.
         // Build composite haplotypes for all samples using streaming PBWT
         // This uses O(N) memory instead of O(M*N) for the PBWT index
-        let n_candidates = 20.min(n_total_haps).max(1);
+        let n_candidates = self.params.n_states.min(n_total_haps).max(1);
         let (threaded_haps_vec, pbwt_state_next) =
             tracing::info_span!("streaming_pbwt").in_scope(|| {
                 if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
@@ -2494,7 +2510,7 @@ impl PhasingPipeline {
         let n_samples = sample_phases.len();
         let n_hi_freq = hi_freq_to_orig.len();
 
-        let n_candidates = 20.min(n_total_haps).max(1);
+        let n_candidates = self.params.n_states.min(n_total_haps).max(1);
         let (threaded_haps_vec, _) =
             if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
                 if self.config.profile {
@@ -3034,7 +3050,7 @@ impl PhasingPipeline {
         );
 
         let n_samples = n_haps / 2;
-        let n_candidates = 20.min(n_total_haps).max(1);
+        let n_candidates = self.params.n_states.min(n_total_haps).max(1);
         let (threaded_haps_vec, _) =
             if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
                 self.build_composite_haps_streaming(
@@ -3743,9 +3759,6 @@ impl PhasingPipeline {
 
 const PRIOR_EXPORT_MIN_PROB: f32 = 1e-5;
 
-
-
-
 /// Project haplotype-identity priors onto the current window's local state set.
 fn project_haplotype_priors_to_states(
     priors: &HaplotypePriors,
@@ -3764,7 +3777,7 @@ fn project_haplotype_priors_to_states(
         out[k] = p;
         covered_mass += p;
     }
-    
+
     // Any prior mass that is not represented in the new state set becomes
     // background uncertainty rather than being silently dropped.
     let leftover = (1.0 - covered_mass).max(0.0);
@@ -3821,7 +3834,7 @@ fn build_haplotype_priors_from_state_probs(
         hap_ids.push(GlobalHapId(hap));
         probs.push(p);
     }
-    
+
     HaplotypePriors::new(hap_ids, probs)
 }
 
@@ -5705,9 +5718,9 @@ impl Stage2Phaser {
     fn interpolated_allele_probs<F>(
         &self,
         marker: usize,
-        state_probs: &[Vec<f32>], // [stage1_marker][state]
-        haps_at_mkr_a: &[GlobalId],    // haplotypes at flanking Stage 1 marker
-        get_allele: &F,           // Closure to get allele for any haplotype
+        state_probs: &[Vec<f32>],   // [stage1_marker][state]
+        haps_at_mkr_a: &[GlobalId], // haplotypes at flanking Stage 1 marker
+        get_allele: &F,             // Closure to get allele for any haplotype
         a1: u8,
         a2: u8,
     ) -> [f32; 2]
@@ -6185,8 +6198,13 @@ mod tests {
                 let conf = phased.sample_phase_confidence_f32(marker_idx, s);
 
                 // Confidence must be in valid range [0.0, 1.0]
-                assert!(conf >= 0.0 && conf <= 1.0,
-                    "Phase confidence out of range: {} at marker {} sample {}", conf, m, s);
+                assert!(
+                    conf >= 0.0 && conf <= 1.0,
+                    "Phase confidence out of range: {} at marker {} sample {}",
+                    conf,
+                    m,
+                    s
+                );
 
                 // Track heterozygous sites
                 if hap1 != hap2 {
@@ -6210,11 +6228,18 @@ mod tests {
             // For this unit test with random data and minimal iterations,
             // we just verify confidence values are computed and in valid range.
             // Real integration tests with actual data should have mean_conf > 0.8
-            assert!(mean_conf >= 0.0 && mean_conf <= 1.0,
-                "Mean phase confidence out of range: {:.3}", mean_conf);
+            assert!(
+                mean_conf >= 0.0 && mean_conf <= 1.0,
+                "Mean phase confidence out of range: {:.3}",
+                mean_conf
+            );
 
-            println!("Phase confidence stats: mean={:.3}, high_conf_ratio={:.1}%, n_hets={}",
-                mean_conf, high_conf_ratio * 100.0, total_hets);
+            println!(
+                "Phase confidence stats: mean={:.3}, high_conf_ratio={:.1}%, n_hets={}",
+                mean_conf,
+                high_conf_ratio * 100.0,
+                total_hets
+            );
         }
     }
 

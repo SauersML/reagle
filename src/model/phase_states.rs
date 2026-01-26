@@ -393,8 +393,8 @@ mod tests {
         let mut ps = PhaseStates::new(max_states, n_markers);
 
         // Sets of "perfect match" reference haplotypes
-        let set_a: Vec<u32> = (0..5).collect();         // [0, 1, 2, 3, 4]
-        let set_b: Vec<u32> = (10..15).collect();       // [10, 11, 12, 13, 14]
+        let set_a: Vec<u32> = (0..5).collect(); // [0, 1, 2, 3, 4]
+        let set_b: Vec<u32> = (10..15).collect(); // [10, 11, 12, 13, 14]
 
         // Important: sample=999 is set to avoid excluding any specific neighbors
         // (the code excludes if ibs_hap / 2 == sample)
@@ -407,7 +407,7 @@ mod tests {
 
         // Inspect Result
         let th = ps.finalize_streaming(999, 1000);
-        
+
         let mut count_a = 0;
         let mut count_b = 0;
         let mut buffer = vec![GlobalId::from(0u32); th.n_states()];
@@ -415,10 +415,15 @@ mod tests {
         // Check reference haplotype used at last marker
         th.materialize_at(n_markers - 1, &mut buffer);
 
-        println!("Capacity: {}, H1 Set size: {}, H2 Set size: {}", max_states, set_a.len(), set_b.len());
+        println!(
+            "Capacity: {}, H1 Set size: {}, H2 Set size: {}",
+            max_states,
+            set_a.len(),
+            set_b.len()
+        );
         println!("State | Final Ref Hap ID | Origin");
         println!("---------------------------------");
-        
+
         for (i, &hap_id) in buffer.iter().enumerate() {
             let id = hap_id.as_u32();
             let origin = if set_a.contains(&id) {
@@ -433,12 +438,18 @@ mod tests {
             println!("{:<5} | {:<16} | {}", i, id, origin);
         }
 
-        println!("Final Counts -> H1_Matches: {}, H2_Matches: {}", count_a, count_b);
+        println!(
+            "Final Counts -> H1_Matches: {}, H2_Matches: {}",
+            count_a, count_b
+        );
 
         // The Failure Assertion
         // We expect a mix, or at least fairness. If H1 matches are wiped out, that's bad.
-        assert!(count_a > 2, 
-            "Eviction bias detected! H1 matches (Set A) were evicted. count_a={}, count_b={}", 
-            count_a, count_b);
+        assert!(
+            count_a > 2,
+            "Eviction bias detected! H1 matches (Set A) were evicted. count_a={}, count_b={}",
+            count_a,
+            count_b
+        );
     }
 }

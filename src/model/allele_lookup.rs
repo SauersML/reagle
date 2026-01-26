@@ -47,7 +47,7 @@ impl RefAlleleLookup {
             let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
             let ref_m_opt = alignment.and_then(|a| a.target_to_ref(orig_m));
 
-use crate::model::block_hash::types::GlobalId;
+            use crate::model::block_hash::types::GlobalId;
 
             move |hap: GlobalId| {
                 let hap = hap.as_u32() as usize;

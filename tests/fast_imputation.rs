@@ -1,7 +1,7 @@
+use reagle::Nucleotide;
 use reagle::config::Config;
 use reagle::pipelines::imputation::ImputationPipeline;
 use reagle::pipelines::phasing::PhasingPipeline;
-use reagle::Nucleotide;
 
 // Serialize tests to prevent OOM from parallel execution
 use ::noodles::bgzf::io as bgzf_io;
@@ -1943,12 +1943,12 @@ fn test_high_density_array_imputation() {
 #[test]
 #[serial]
 fn test_phasing_confidence() {
-    use reagle::data::{ChromIdx, MarkerIdx, SampleIdx, HapIdx};
     use reagle::data::genetic_map::GeneticMaps;
     use reagle::data::haplotype::Samples;
     use reagle::data::marker::{Allele, Marker, Markers};
     use reagle::data::storage::GenotypeColumn;
     use reagle::data::storage::matrix::GenotypeMatrix;
+    use reagle::data::{ChromIdx, HapIdx, MarkerIdx, SampleIdx};
     use std::sync::Arc;
 
     let n_markers = 200;
@@ -1963,21 +1963,23 @@ fn test_phasing_confidence() {
             ChromIdx::new(0),
             i as u32 * 1000 + 1000,
             Some(format!("rs{}", i).into()),
-            Allele::Base(Nucleotide::A),  // A=0, not b'A'=65
-            vec![Allele::Base(Nucleotide::T)],  // T=3, not b'T'=84
+            Allele::Base(Nucleotide::A),       // A=0, not b'A'=65
+            vec![Allele::Base(Nucleotide::T)], // T=3, not b'T'=84
         );
         target_markers.push(m);
     }
 
     let target_samples = Arc::new(Samples::from_ids(
-        (0..n_target_samples).map(|i| format!("sample{}", i)).collect(),
+        (0..n_target_samples)
+            .map(|i| format!("sample{}", i))
+            .collect(),
     ));
 
     // Create heterozygous genotypes matching reference LD structure
     // Use deterministic pattern that matches subset of reference haplotypes
     let target_columns: Vec<GenotypeColumn> = (0..n_markers)
         .map(|m| {
-            let block = m / 20;  // 20-marker blocks
+            let block = m / 20; // 20-marker blocks
             let position_in_block = m % 20;
             let alleles: Vec<u8> = (0..n_target_samples * 2)
                 .map(|h| {
@@ -1986,9 +1988,9 @@ fn test_phasing_confidence() {
                     // Each target haplotype mimics a reference haplotype
                     // Hap1 uses ref pattern from first half, Hap2 from second half
                     let ref_hap_id = if h % 2 == 0 {
-                        sample * 3  // Hap1: ref haps 0, 3, 6, 9, ... (first half)
+                        sample * 3 // Hap1: ref haps 0, 3, 6, 9, ... (first half)
                     } else {
-                        100 + sample * 3  // Hap2: ref haps 100, 103, 106, ... (second half)
+                        100 + sample * 3 // Hap2: ref haps 100, 103, 106, ... (second half)
                     };
 
                     // Generate allele matching the chosen reference haplotype
@@ -2018,8 +2020,8 @@ fn test_phasing_confidence() {
             ChromIdx::new(0),
             i as u32 * 1000 + 1000,
             Some(format!("rs{}", i).into()),
-            Allele::Base(Nucleotide::A),  // A=0, not b'A'=65
-            vec![Allele::Base(Nucleotide::T)],  // T=3, not b'T'=84
+            Allele::Base(Nucleotide::A),       // A=0, not b'A'=65
+            vec![Allele::Base(Nucleotide::T)], // T=3, not b'T'=84
         );
         ref_markers.push(m);
     }
@@ -2032,7 +2034,7 @@ fn test_phasing_confidence() {
     // First 100 haps have pattern A, second 100 have pattern B (opposite)
     let ref_columns: Vec<GenotypeColumn> = (0..n_markers)
         .map(|m| {
-            let block = m / 20;  // Same 20-marker blocks as target
+            let block = m / 20; // Same 20-marker blocks as target
             let position_in_block = m % 20;
             let alleles: Vec<u8> = (0..n_ref_samples * 2)
                 .map(|h| {
@@ -2045,7 +2047,7 @@ fn test_phasing_confidence() {
 
                     // Add diversity: flip allele based on haplotype and position
                     // This creates realistic variation while preserving LD
-                    let flip = (h * 7 + position_in_block * 11 + block * 13) % 10 < 2;  // ~20% flip rate
+                    let flip = (h * 7 + position_in_block * 11 + block * 13) % 10 < 2; // ~20% flip rate
 
                     if flip { 1 - base_allele } else { base_allele }
                 })
@@ -2108,7 +2110,11 @@ fn test_phasing_confidence() {
     let mut aligned_count = 0;
     let mut has_mapping_count = 0;
     for t_m in 0..n_markers {
-        let has_mapping = alignment.allele_mappings.get(t_m).and_then(|m| m.as_ref()).is_some();
+        let has_mapping = alignment
+            .allele_mappings
+            .get(t_m)
+            .and_then(|m| m.as_ref())
+            .is_some();
         if has_mapping {
             has_mapping_count += 1;
         }
@@ -2118,18 +2124,30 @@ fn test_phasing_confidence() {
             if t_m < 3 {
                 let t_marker = target_gt.marker(MarkerIdx::new(t_m as u32));
                 let r_marker = ref_gt.marker(MarkerIdx::new(ref_m as u32));
-                println!("Target marker {} (pos {}, ref={}, alt={:?}) → Ref marker {} (pos {}, ref={}, alt={:?}), has_mapping={}",
-                    t_m, t_marker.pos, t_marker.ref_allele, t_marker.alt_alleles,
-                    ref_m, r_marker.pos, r_marker.ref_allele, r_marker.alt_alleles,
+                println!(
+                    "Target marker {} (pos {}, ref={}, alt={:?}) → Ref marker {} (pos {}, ref={}, alt={:?}), has_mapping={}",
+                    t_m,
+                    t_marker.pos,
+                    t_marker.ref_allele,
+                    t_marker.alt_alleles,
+                    ref_m,
+                    r_marker.pos,
+                    r_marker.ref_allele,
+                    r_marker.alt_alleles,
                     has_mapping
                 );
             }
         } else if t_m < 3 {
-            println!("Target marker {} FAILED to align (has_mapping={})", t_m, has_mapping);
+            println!(
+                "Target marker {} FAILED to align (has_mapping={})",
+                t_m, has_mapping
+            );
         }
     }
-    println!("Aligned markers: {} / {}, with allele_mappings: {} / {}",
-        aligned_count, n_markers, has_mapping_count, n_markers);
+    println!(
+        "Aligned markers: {} / {}, with allele_mappings: {} / {}",
+        aligned_count, n_markers, has_mapping_count, n_markers
+    );
 
     // TEST 1: Verify target has heterozygotes
     let mut het_count = 0;
@@ -2153,13 +2171,15 @@ fn test_phasing_confidence() {
     // TEST 2: Verify reference has expected patterns
     let ref_col0 = ref_gt.column(MarkerIdx::new(0));
     let ref_col20 = ref_gt.column(MarkerIdx::new(20));
-    println!("Ref marker 0 (block 0, expect 0/1 split): hap0={}, hap50={}, hap100={}, hap150={}",
+    println!(
+        "Ref marker 0 (block 0, expect 0/1 split): hap0={}, hap50={}, hap100={}, hap150={}",
         ref_col0.get(HapIdx::new(0)),
         ref_col0.get(HapIdx::new(50)),
         ref_col0.get(HapIdx::new(100)),
         ref_col0.get(HapIdx::new(150))
     );
-    println!("Ref marker 20 (block 1, expect 1/0 split): hap0={}, hap50={}, hap100={}, hap150={}",
+    println!(
+        "Ref marker 20 (block 1, expect 1/0 split): hap0={}, hap50={}, hap100={}, hap150={}",
         ref_col20.get(HapIdx::new(0)),
         ref_col20.get(HapIdx::new(50)),
         ref_col20.get(HapIdx::new(100)),
@@ -2188,13 +2208,15 @@ fn test_phasing_confidence() {
     // TEST 2: Verify reference has expected patterns
     let ref_col0 = ref_gt.column(MarkerIdx::new(0));
     let ref_col20 = ref_gt.column(MarkerIdx::new(20));
-    println!("Ref marker 0 (block 0, expect 0/1 split): hap0={}, hap50={}, hap100={}, hap150={}",
+    println!(
+        "Ref marker 0 (block 0, expect 0/1 split): hap0={}, hap50={}, hap100={}, hap150={}",
         ref_col0.get(HapIdx::new(0)),
         ref_col0.get(HapIdx::new(50)),
         ref_col0.get(HapIdx::new(100)),
         ref_col0.get(HapIdx::new(150))
     );
-    println!("Ref marker 20 (block 1, expect 1/0 split): hap0={}, hap50={}, hap100={}, hap150={}",
+    println!(
+        "Ref marker 20 (block 1, expect 1/0 split): hap0={}, hap50={}, hap100={}, hap150={}",
         ref_col20.get(HapIdx::new(0)),
         ref_col20.get(HapIdx::new(50)),
         ref_col20.get(HapIdx::new(100)),
@@ -2205,12 +2227,8 @@ fn test_phasing_confidence() {
 
     // Run phasing in memory
     let result = pipeline.phase_in_memory_with_overlap(
-        &target_gt,
-        &gen_maps,
-        None,  // No overlap from previous window
-        None,
-        None,
-        None,
+        &target_gt, &gen_maps, None, // No overlap from previous window
+        None, None, None,
     );
 
     assert!(result.is_ok(), "Phasing should succeed");
@@ -2233,7 +2251,11 @@ fn test_phasing_confidence() {
             }
         }
     }
-    println!("Genotypes changed during phasing: {} / {}", changed_count, 10 * n_target_samples);
+    println!(
+        "Genotypes changed during phasing: {} / {}",
+        changed_count,
+        10 * n_target_samples
+    );
 
     // Check phase confidence values
     let mut total_hets = 0;
@@ -2255,7 +2277,9 @@ fn test_phasing_confidence() {
             assert!(
                 conf >= 0.0 && conf <= 1.0,
                 "Phase confidence out of range: {} at marker {} sample {}",
-                conf, m, s
+                conf,
+                m,
+                s
             );
 
             // Track heterozygous sites

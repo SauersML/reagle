@@ -1022,11 +1022,11 @@ impl<'a> BeagleHmm<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::block_hash::types::GlobalId;
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::model::block_hash::types::GlobalId;
     use std::sync::Arc;
 
     fn make_test_ref_panel() -> GenotypeMatrix {
