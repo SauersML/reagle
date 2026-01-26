@@ -413,7 +413,7 @@ fn test_dynamic_phasing_continuity_stress() {
 
     config.dynamic_mcmc = true;
     config.phase_states = 20;
-    config.ne = 10_000.0;
+    config.ne = 100_000.0;
     config.burnin = 2;
     config.iterations = 3;
     config.mcmc_burnin = 1;
@@ -475,7 +475,7 @@ fn test_synthetic_slam_dunk() {
     config.out = out_prefix.clone();
     config.imp_states = 50;
     config.imp_nsteps = 10;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.err = Some(0.0001);
     config.window = 0.02;
     config.overlap = 0.005;
@@ -568,7 +568,7 @@ fn test_synthetic_recombination() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 100;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 10.0;
     config.overlap = 2.0;
     config.nthreads = Some(1);
@@ -686,7 +686,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -763,7 +763,7 @@ fn test_population_structure() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 20.0;
     config.nthreads = Some(1);
 
@@ -853,7 +853,7 @@ fn test_hotspot_switching() {
     config.map = Some(map_path);
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 100.0;
     config.nthreads = Some(1);
 
@@ -925,7 +925,7 @@ fn test_phase_switch_torture() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -996,7 +996,7 @@ fn test_error_injection() {
     config.out = out_prefix.clone();
     config.err = Some(0.01);
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -1072,7 +1072,7 @@ fn test_rare_variant() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -1167,7 +1167,7 @@ fn test_dr2_validation() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 

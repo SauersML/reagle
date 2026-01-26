@@ -53,6 +53,11 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
+    /// Scaling factor to convert cM to Morgans for recombination intensity
+    /// 1 cM = 0.01 Morgans. The formula 0.04*Ne/n assumes distances in Morgans.
+    /// Since we use cM, we must scale down by 100.
+    pub const RECOMB_SCALE: f32 = 0.01;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -74,7 +79,9 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        // recombIntensity = 0.04 * ne / nHaps
+        // We apply RECOMB_SCALE because our distances are in cM
+        let recomb_intensity = (0.04 * ne / n_haps as f32) * Self::RECOMB_SCALE;
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -109,7 +116,7 @@ impl ModelParams {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+        let recomb_intensity = (0.04 * ne / n_ref_haps as f32) * Self::RECOMB_SCALE;
 
         Self {
             p_mismatch,
@@ -358,9 +365,9 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
-        assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
+        // Should be 0.04 * 1_000_000 / 1000 * 0.01 = 0.4
+        let expected = (0.04 * 1_000_000.0 / 1000.0) * 0.01;
+        assert!((params.recomb_intensity - expected as f32).abs() < 0.001);
     }
 
     #[test]
@@ -372,8 +379,9 @@ mod tests {
         assert!(p0.abs() < 0.0001);
 
         // Small distance -> small prob
+        // Intensity ~0.4. Dist 0.001. exp(-0.0004) ~ 0.9996. p ~ 0.0004.
         let p1 = params.p_recomb(0.001);
-        assert!(p1 > 0.0 && p1 < 0.5);
+        assert!(p1 > 0.0 && p1 < 0.01);
 
         // Larger distance -> higher prob
         let p2 = params.p_recomb(0.01);
