@@ -2159,12 +2159,32 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
+            let use_hmm_correction = self.config.err.is_some();
+
+            // Helper to get HMM dosage if available
+            let hmm_dosage = || -> Option<f32> {
+                result_by_sample
+                    .get(sample_idx)
+                    .and_then(|r| *r)
+                    .and_then(|result| result.dosages.get(local_m).copied())
+            };
+
+            let dosage = if use_hmm_correction {
+                // If error correction is enabled, prefer HMM dosage, fallback to genotype
+                hmm_dosage().unwrap_or_else(|| {
+                    if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                        (a1 + a2) as f32
+                    } else {
+                        0.0
+                    }
+                })
             } else {
-                0.0
+                // Otherwise prefer genotype, fallback to HMM dosage
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else {
+                    hmm_dosage().unwrap_or(0.0)
+                }
             };
 
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
@@ -2177,12 +2197,25 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+            let use_hmm_correction = self.config.err.is_some();
+
+            let hmm_gt = || -> Option<(u8, u8)> {
+                result_by_sample
+                    .get(sample_idx)
+                    .and_then(|r| *r)
+                    .and_then(|result| result.best_gt.get(local_m).copied())
+            };
+
+            if use_hmm_correction {
+                hmm_gt().unwrap_or_else(|| {
+                    get_genotyped_alleles(marker_idx, sample_idx).unwrap_or((0, 0))
+                })
             } else {
-                (0, 0)
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1, a2)
+                } else {
+                    hmm_gt().unwrap_or((0, 0))
+                }
             }
         };
 
