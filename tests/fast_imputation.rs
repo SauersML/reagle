@@ -475,7 +475,7 @@ fn test_synthetic_slam_dunk() {
     config.out = out_prefix.clone();
     config.imp_states = 50;
     config.imp_nsteps = 10;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.err = Some(0.0001);
     config.window = 0.02;
     config.overlap = 0.005;
@@ -686,7 +686,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -996,7 +996,7 @@ fn test_error_injection() {
     config.out = out_prefix.clone();
     config.err = Some(0.01);
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -1493,6 +1493,7 @@ fn test_ultra_dense_markers() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
+    config.ne = 100.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -2001,7 +2002,8 @@ fn test_phasing_confidence() {
                         if block % 2 == 0 { 1 } else { 0 }
                     };
 
-                    let flip = (ref_hap_id * 7 + position_in_block * 11 + block * 13) % 10 < 2;
+                    // Break symmetry between hap i and hap i+100 by adding term dependent on group
+                    let flip = (ref_hap_id * 7 + (ref_hap_id / 100) * 3 + position_in_block * 11 + block * 13) % 10 < 2;
 
                     if flip { 1 - base_allele } else { base_allele }
                 })
@@ -2047,7 +2049,8 @@ fn test_phasing_confidence() {
 
                     // Add diversity: flip allele based on haplotype and position
                     // This creates realistic variation while preserving LD
-                    let flip = (h * 7 + position_in_block * 11 + block * 13) % 10 < 2; // ~20% flip rate
+                    // Break symmetry between hap i and hap i+100 by adding term dependent on group
+                    let flip = (h * 7 + (h / 100) * 3 + position_in_block * 11 + block * 13) % 10 < 2; // ~20% flip rate
 
                     if flip { 1 - base_allele } else { base_allele }
                 })
@@ -2073,12 +2076,12 @@ fn test_phasing_confidence() {
         chrom: None,
         excludesamples: None,
         excludemarkers: None,
-        burnin: 5,
-        iterations: 10,
-        mcmc_burnin: 3,
+        burnin: 10,
+        iterations: 20,
+        mcmc_burnin: 10,
         dynamic_mcmc: false,
         mcmc_steps: 10,
-        phase_states: 80,
+        phase_states: 200,
         rare: 0.002,
         impute: false,
         imp_states: 10,
@@ -2089,7 +2092,7 @@ fn test_phasing_confidence() {
         pbwt_batch_mb: 256,
         ap: false,
         gp: false,
-        ne: 10000.0,
+        ne: 1.0,
         err: None,
         em: false,
         window: 40.0,
