@@ -1,0 +1,45 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.40s
+     Running unittests src/lib.rs (target/debug/deps/reagle-cd9d25c45298a55c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 129 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/reagle-97a1a14d34511b55)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 130 filtered out; finished in 0.00s
+
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-fb2df580bc99fca9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 27 filtered out; finished in 0.00s
+
+     Running tests/block_hash_integration.rs (target/debug/deps/block_hash_integration-5c73f0e50b83a699)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/correctness_bait_switch.rs (target/debug/deps/correctness_bait_switch-70373ff9c42d127f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/fast_imputation.rs (target/debug/deps/fast_imputation-18d60c99477d8d3c)
+
+running 1 test
+test test_simulated_chip_density ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.55s
+
+     Running tests/phasing_accuracy.rs (target/debug/deps/phasing_accuracy-745814f25cad76ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+

@@ -1,0 +1,5 @@
+error: unexpected argument 'test_simulated_chip_density' found
+
+Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
+
+For more information, try '--help'.
