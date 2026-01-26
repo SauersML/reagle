@@ -117,10 +117,6 @@ pub struct Samples {
     is_diploid: Vec<bool>,
     /// Map from sample ID to index for fast lookup
     id_to_idx: HashMap<Arc<str>, SampleIdx>,
-    /// Cumulative haplotype offsets for each sample (precomputed for O(1) lookup)
-    /// hap_offset[i] = number of haplotypes from samples 0..i
-    #[serde(skip)]
-    hap_offset: Vec<usize>,
 }
 
 impl Samples {
@@ -149,27 +145,11 @@ impl Samples {
             .map(|(i, id)| (id.clone(), SampleIdx::new(i as u32)))
             .collect();
 
-        // Compute cumulative haplotype offsets for O(1) lookup
-        let hap_offset = Self::compute_hap_offsets(&is_diploid);
-
         Self {
             ids,
             is_diploid,
             id_to_idx,
-            hap_offset,
         }
-    }
-
-    /// Compute cumulative haplotype offsets from ploidy vector
-    fn compute_hap_offsets(is_diploid: &[bool]) -> Vec<usize> {
-        let mut offsets = Vec::with_capacity(is_diploid.len() + 1);
-        offsets.push(0);
-        let mut cumulative = 0usize;
-        for &diploid in is_diploid {
-            cumulative += if diploid { 2 } else { 1 };
-            offsets.push(cumulative);
-        }
-        offsets
     }
 
     /// Number of samples
@@ -183,14 +163,6 @@ impl Samples {
     /// (the allele is duplicated). Use `is_diploid()` to check actual ploidy.
     pub fn n_haps(&self) -> usize {
         self.ids.len() * 2
-    }
-
-    /// Number of true haplotypes accounting for ploidy
-    ///
-    /// Returns 2 for diploid samples, 1 for haploid samples.
-    /// Use this for statistical calculations, not for storage indexing.
-    pub fn n_true_haps(&self) -> usize {
-        self.hap_offset.last().copied().unwrap_or(0)
     }
 
     /// Check if a sample is diploid
@@ -248,8 +220,6 @@ mod tests {
         assert_eq!(samples.len(), 3);
         // n_haps() returns storage-based count (always 2 per sample)
         assert_eq!(samples.n_haps(), 6);
-        // n_true_haps() returns actual count accounting for ploidy
-        assert_eq!(samples.n_true_haps(), 5); // 2 + 1 + 2 = 5
 
         // Check ploidy
         assert!(samples.is_diploid(SampleIdx::new(0)));

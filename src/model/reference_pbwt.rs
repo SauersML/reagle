@@ -184,6 +184,12 @@ impl ReferencePbwt {
         query_alleles: &[u8],
         beams: &mut [RankBeam],
     ) {
+        self.prepare_step(ref_alleles, n_alleles);
+        self.update_beams(beams, query_alleles, n_alleles);
+        self.finalize_step(ref_alleles, n_alleles, marker);
+    }
+
+    pub fn prepare_step(&mut self, ref_alleles: &[u8], n_alleles: usize) {
         let n_ref = self.ppa.len();
         let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
         self.ensure_buffers(n_bins);
@@ -219,6 +225,39 @@ impl ReferencePbwt {
                 self.prefix_counts[base + i + 1] = c;
             }
         }
+    }
+
+    pub fn match_len(&self, beam: &RankBeam, allele: u8, n_alleles: usize) -> u32 {
+        if allele == 255 {
+            return 0;
+        }
+        let n_ref = self.ppa.len();
+        let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
+        let b = Self::bin_for_allele(allele, n_alleles);
+
+        if b >= n_bins {
+            return 0;
+        }
+
+        let mut total = 0;
+        for &(l, r) in beam.intervals() {
+            let nl = self.offsets[b] + self.rank(b, l, n_ref);
+            let nr = self.offsets[b] + self.rank(b, r, n_ref);
+            if nr > nl {
+                total += nr - nl;
+            }
+        }
+        total
+    }
+
+    pub fn update_beams(
+        &self,
+        beams: &mut [RankBeam],
+        query_alleles: &[u8],
+        n_alleles: usize,
+    ) {
+        let n_ref = self.ppa.len();
+        let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
 
         for (q_idx, &qa) in query_alleles.iter().enumerate() {
             if q_idx >= beams.len() {
@@ -292,8 +331,66 @@ impl ReferencePbwt {
             next.normalize();
             beams[q_idx] = next;
         }
+    }
 
+    pub fn finalize_step(&mut self, ref_alleles: &[u8], n_alleles: usize, marker: usize) {
         self.updater
             .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
+    }
+
+    pub fn advance_with_rephase(
+        &mut self,
+        ref_alleles: &[u8],
+        n_alleles: usize,
+        marker: usize,
+        query_alleles: &mut [u8],
+        beams: &mut [RankBeam],
+        swaps_out: &mut [bool],
+    ) {
+        self.prepare_step(ref_alleles, n_alleles);
+
+        let n_samples = query_alleles.len() / 2;
+        // Greedy Local Rephasing
+        for s in 0..n_samples {
+            let h1 = s * 2;
+            let h2 = h1 + 1;
+
+            if h2 >= beams.len() {
+                continue;
+            }
+
+            let a1 = query_alleles[h1];
+            let a2 = query_alleles[h2];
+
+            if a1 != a2 && a1 != 255 && a2 != 255 {
+                let len_keep_h1 = self.match_len(&beams[h1], a1, n_alleles);
+                let len_keep_h2 = self.match_len(&beams[h2], a2, n_alleles);
+                let score_keep = (len_keep_h1 as u64) * (len_keep_h2 as u64);
+
+                let len_swap_h1 = self.match_len(&beams[h1], a2, n_alleles);
+                let len_swap_h2 = self.match_len(&beams[h2], a1, n_alleles);
+                let score_swap = (len_swap_h1 as u64) * (len_swap_h2 as u64);
+
+                if s == 0 && marker < 10 {
+                   eprintln!("M{}: keep=({}*{})={} swap=({}*{})={} -> do_swap={}", 
+                        marker, len_keep_h1, len_keep_h2, score_keep, 
+                        len_swap_h1, len_swap_h2, score_swap, 
+                        score_swap > score_keep);
+                }
+
+                if score_swap > score_keep {
+                    query_alleles[h1] = a2;
+                    query_alleles[h2] = a1;
+                    swaps_out[s] = true;
+                } else {
+                    swaps_out[s] = false;
+                }
+            } else {
+                swaps_out[s] = false;
+            }
+        }
+
+        self.update_beams(beams, query_alleles, n_alleles);
+        self.finalize_step(ref_alleles, n_alleles, marker);
     }
 }

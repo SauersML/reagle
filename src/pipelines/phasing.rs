@@ -464,6 +464,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
             let dummy_target = vec![255u8; self.n_markers];
             let dummy_partner = vec![255u8; self.n_markers];
             let dummy_combined = vec![true; self.n_markers];
+
             sample_path_from_checkpoints(
                 &mut self.path1,
                 &self.combined_checkpoints,
@@ -827,12 +828,10 @@ impl PhasingPipeline {
             .filter(|&s| !samples.is_diploid(SampleIdx::new(s as u32)))
             .count();
         if n_haploid > 0 {
-            eprintln!(
-                "Detected {} haploid samples ({} diploid), {} true haplotypes",
-                n_haploid,
-                n_samples - n_haploid,
-                samples.n_true_haps()
-            );
+            return Err(crate::error::ReagleError::vcf(format!(
+                "Detected {} haploid samples. Reagle currently supports diploid samples only.",
+                n_haploid
+            )));
         }
 
         // Run phasing iterations (STAGE 1: high-frequency markers only)
@@ -1024,6 +1023,18 @@ impl PhasingPipeline {
             StreamingVcfReader::open(&self.config.gt, gen_maps.clone(), streaming_config)?;
         let samples = reader.samples_arc();
 
+        // Check for haploid samples
+        let n_samples = samples.len();
+        let n_haploid = (0..n_samples)
+            .filter(|&s| !samples.is_diploid(SampleIdx::new(s as u32)))
+            .count();
+        if n_haploid > 0 {
+            return Err(crate::error::ReagleError::vcf(format!(
+                "Detected {} haploid samples. Reagle currently supports diploid samples only.",
+                n_haploid
+            )));
+        }
+
         // Create output writer
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
@@ -1031,6 +1042,7 @@ impl PhasingPipeline {
 
         let mut window_count = 0;
         let mut total_markers = 0;
+        let mut wrote_header = false;
 
         // Track phased overlap from previous window for phase continuity
         // PhasedOverlap contains state probabilities used for PBWT state handoff
@@ -1100,8 +1112,9 @@ impl PhasingPipeline {
                 })?;
 
                 // Write output region
-                if current.window.is_first {
+                if current.window.is_first && !wrote_header {
                     writer.write_header(finalized.markers())?;
+                    wrote_header = true;
                 }
                 writer.write_phased(
                     &finalized,
@@ -1120,14 +1133,19 @@ impl PhasingPipeline {
 
         // Finalize last window (no next window for Stage 2 context)
         if let Some(ref current) = current_window {
-            info_span!("finalize_last_window").in_scope(|| {
+            info_span!("finalize_last_window").in_scope(|| -> Result<()> {
                 let finalized = current.phased_result.as_ref().unwrap().clone(); // No additional context
-                writer.write_header(finalized.markers()).ok();
-                writer
-                    .write_phased(&finalized, current.output_start, current.output_end)
-                    .ok();
+                if current.window.is_first && !wrote_header {
+                    writer.write_header(finalized.markers())?;
+                }
+                writer.write_phased(
+                    &finalized,
+                    current.output_start,
+                    current.output_end,
+                )?;
                 total_markers += current.output_end - current.output_start;
-            });
+                Ok(())
+            })?;
         }
 
         writer.flush()?;
@@ -1236,6 +1254,17 @@ impl PhasingPipeline {
             .unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
         let samples = target_gt.samples_arc();
+
+        // Check for haploid samples
+        let n_haploid = (0..n_samples)
+            .filter(|&s| !samples.is_diploid(SampleIdx::new(s as u32)))
+            .count();
+        if n_haploid > 0 {
+            return Err(crate::error::ReagleError::vcf(format!(
+                "Detected {} haploid samples. Reagle currently supports diploid samples only.",
+                n_haploid
+            )));
+        }
 
         if n_markers == 0 {
             return Ok((target_gt.clone().into_phased(), None, None));
@@ -1746,8 +1775,14 @@ impl PhasingPipeline {
         let mut query_alleles = vec![0u8; n_target_haps];
 
         let mut donors_fwd: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
+        let mut swaps_buffer = vec![false; n_samples];
+        
         let mut block_idx_fwd = 0usize;
-        let mut next_block_start_fwd = donor_blocks.first().map(|b| b.0).unwrap_or(0);
+        let mut next_block_start_fwd = if !donor_blocks.is_empty() {
+            donor_blocks[0].0
+        } else {
+            n_markers
+        };
 
         // Forward pass: reference-only PBWT + query beams for target haplotypes
         for m in 0..n_markers {
@@ -1780,7 +1815,26 @@ impl PhasingPipeline {
             }
             let n_alleles = if is_biallelic { 2 } else { 256 };
 
-            pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
+            pbwt_fwd.advance_with_rephase(
+                &ref_alleles,
+                n_alleles,
+                m,
+                &mut query_alleles,
+                &mut beams_fwd,
+                &mut swaps_buffer,
+            );
+
+            // Apply swaps to MutableGenotypes to maintain consistency
+            for (s, &swapped) in swaps_buffer.iter().enumerate() {
+                if swapped {
+                    let h1 = HapIdx::new((s * 2) as u32);
+                    let h2 = HapIdx::new((s * 2 + 1) as u32);
+                    let a1 = query_alleles[s * 2];
+                    let a2 = query_alleles[s * 2 + 1];
+                    target_geno.set(orig_m, h1, a1);
+                    target_geno.set(orig_m, h2, a2);
+                }
+            }
 
             // Block-static donors: (re)select donors once per genetic-distance block
             if m == next_block_start_fwd {
@@ -1826,7 +1880,7 @@ impl PhasingPipeline {
                                     s as u32,
                                     m,
                                     &neighbors,
-                                    &[],
+                                    &neighbors,
                                 );
                             }
                         }
@@ -2178,7 +2232,7 @@ impl PhasingPipeline {
         // We use a scoped immutable borrow that ends before the swap phase.
         // Build composite haplotypes for all samples using streaming PBWT
         // This uses O(N) memory instead of O(M*N) for the PBWT index
-        let n_candidates = self.params.n_states.min(n_total_haps).max(20);
+        let n_candidates = 20.min(n_total_haps).max(1);
         let (threaded_haps_vec, pbwt_state_next) =
             tracing::info_span!("streaming_pbwt").in_scope(|| {
                 if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
