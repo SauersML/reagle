@@ -1138,11 +1138,10 @@ impl VcfWriter {
                 for s in 0..self.samples.len() {
                     let hap1 = crate::data::SampleIdx::new(s as u32).hap1();
                     let hap2 = crate::data::SampleIdx::new(s as u32).hap2();
-                let a1 = column.get(hap1);
-                let a2 = column.get(hap2);
-                let phase_p = matrix.sample_phase_confidence_f32(marker_idx, s);
-                let sep = if phase_p >= 0.9 { '|' } else { '/' };
-                write!(self.writer, "\t{}{}{}", a1, sep, a2)?;
+                    let a1 = column.get(hap1);
+                    let a2 = column.get(hap2);
+                    let sep = '|';
+                    write!(self.writer, "\t{}{}{}", a1, sep, a2)?;
                 }
                 writeln!(self.writer)?;
             }
