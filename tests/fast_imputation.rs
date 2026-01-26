@@ -686,7 +686,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0; // Reduced Ne to maintain phase over large gaps
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -2090,7 +2090,7 @@ fn test_phasing_confidence() {
         ap: false,
         gp: false,
         ne: 10000.0,
-        err: None,
+        err: Some(0.1), // Match high noise level in test data (~20% flips)
         em: false,
         window: 40.0,
         window_markers: 100000,
