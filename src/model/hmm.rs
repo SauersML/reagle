@@ -531,6 +531,19 @@ impl<'a> BeagleHmm<'a> {
                 constant_term,
                 n_states,
             );
+
+            // Normalize backward probabilities to prevent underflow
+            let bwd_slice = &mut bwd[curr_row..curr_row + n_states];
+            let sum: f32 = bwd_slice.iter().sum();
+            if sum > 1e-30 {
+                let scale = 1.0 / sum;
+                for x in bwd_slice.iter_mut() {
+                    *x *= scale;
+                }
+            } else {
+                let uniform = 1.0 / n_states as f32;
+                bwd_slice.fill(uniform);
+            }
         }
 
         log_likelihood
@@ -807,6 +820,19 @@ impl<'a> BeagleHmm<'a> {
                 constant_term,
                 n_states,
             );
+
+            // Normalize backward probabilities to prevent underflow
+            let bwd_slice = &mut bwd[curr_row..curr_row + n_states];
+            let sum: f32 = bwd_slice.iter().sum();
+            if sum > 1e-30 {
+                let scale = 1.0 / sum;
+                for x in bwd_slice.iter_mut() {
+                    *x *= scale;
+                }
+            } else {
+                let uniform = 1.0 / n_states as f32;
+                bwd_slice.fill(uniform);
+            }
         }
 
         log_likelihood
