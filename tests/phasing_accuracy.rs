@@ -141,7 +141,7 @@ fn test_stability_trap_file_based() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 1000000.0; // Increased Ne to compensate for scaled-down recomb_intensity (0.0001)
     // Set low error rate to force strong preference for matches
     config.err = Some(0.0001);
 
@@ -309,7 +309,7 @@ fn test_hypothesis_max_states_fixes_stability_trap() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 1000000.0;
     config.err = Some(0.0001);
 
     let mut pipeline = PhasingPipeline::new(config, None);
@@ -447,7 +447,7 @@ fn test_hypothesis_initial_phasing_causes_beam_exclusion() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 1000000.0;
     config.err = Some(0.0001);
 
     let mut pipeline = PhasingPipeline::new(config, None);
@@ -558,7 +558,7 @@ fn test_small_panel_perfect_match() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 1000000.0;
     config.err = Some(0.0001);
 
     let mut pipeline = PhasingPipeline::new(config, None);
@@ -688,7 +688,7 @@ fn test_homozygous_anchors_vs_all_heterozygous() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 1000000.0;
     config.err = Some(0.0001);
 
     let mut pipeline = PhasingPipeline::new(config, None);
@@ -789,7 +789,7 @@ fn test_burnin_zero_forces_combined_initialization() {
     config.burnin = 0;
     config.iterations = 1;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 1000000.0;
     config.err = Some(0.0001);
 
     let mut pipeline = PhasingPipeline::new(config, None);
