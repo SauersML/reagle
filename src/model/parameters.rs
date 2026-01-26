@@ -51,7 +51,7 @@ impl ModelParams {
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
-    pub const MIN_RECOMB_PROB: f32 = 1e-9;
+    pub const MIN_RECOMB_PROB: f32 = 0.0005;
 
     /// Create default parameters
     pub fn new() -> Self {
