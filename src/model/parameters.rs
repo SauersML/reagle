@@ -36,7 +36,7 @@ pub struct ModelParams {
 
 impl ModelParams {
     /// Default phase states
-    pub const DEFAULT_PHASE_STATES: usize = 280;
+    pub const DEFAULT_PHASE_STATES: usize = 600;
 
     /// Default imputation states
     pub const DEFAULT_IMP_STATES: usize = 1600;
@@ -52,6 +52,9 @@ impl ModelParams {
 
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
+
+    /// Recombination rate scaling factor
+    pub const RECOMB_SCALE: f32 = 1e-2;
 
     /// Create default parameters
     pub fn new() -> Self {
@@ -74,7 +77,7 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = Self::RECOMB_SCALE * 0.04 * ne / n_haps as f32;
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -109,7 +112,7 @@ impl ModelParams {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+        let recomb_intensity = Self::RECOMB_SCALE * 0.04 * ne / n_ref_haps as f32;
 
         Self {
             p_mismatch,
