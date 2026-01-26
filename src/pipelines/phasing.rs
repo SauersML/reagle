@@ -5368,6 +5368,96 @@ fn sample_dynamic_mcmc(
     )
 }
 
+/// Find the best constant pair of states that explains the target genotype.
+///
+/// This initialization heuristic performs a pairwise scan of all HMM states (which
+/// correspond to reference haplotypes in ThreadedHaps) to find the pair (i, j)
+/// that maximizes consistency with the target genotype.
+///
+/// This breaks the symmetry of the Combined HMM initialization (which cannot distinguish
+/// between phasing configurations at 0/1 sites) and helps the Gibbs sampler escape
+/// "Mosaic Traps" where H1 and H2 lock each other into high-switching local optima.
+fn find_best_constant_pair(
+    n_markers: usize,
+    n_states: usize,
+    seq1: &[u8],
+    seq2: &[u8],
+    lookup: &RefAlleleLookup,
+) -> Option<MosaicPaths> {
+    if n_states < 2 {
+        return None;
+    }
+
+    // Allocate score matrix (flat vector) on heap to avoid stack overflow
+    // Size is n_states * n_states. For 280 states -> ~300KB.
+    let mut scores = vec![0.0f32; n_states * n_states];
+
+    for m in 0..n_markers {
+        let a1 = seq1[m];
+        let a2 = seq2[m];
+        if a1 == 255 && a2 == 255 {
+            continue;
+        }
+
+        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+
+        for i in 0..n_states {
+            let r1 = lookup.allele(m, i);
+            if r1 == 255 {
+                continue;
+            }
+
+            // Symmetric scan: only check j < i (lower triangle)
+            // We can infer upper triangle or just pick best from lower.
+            for j in 0..i {
+                let r2 = lookup.allele(m, j);
+                if r2 == 255 {
+                    continue;
+                }
+
+                let compatible = if is_het {
+                    // Het: need (r1=a1, r2=a2) OR (r1=a2, r2=a1)
+                    (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                } else {
+                    // Hom (or one missing): need r1=obs and r2=obs
+                    // If a1 or a2 is missing, we match the present one.
+                    let obs = if a1 != 255 { a1 } else { a2 };
+                    r1 == obs && r2 == obs
+                };
+
+                if compatible {
+                    scores[i * n_states + j] += 1.0;
+                } else {
+                    scores[i * n_states + j] -= 1.0;
+                }
+            }
+        }
+    }
+
+    // Find best pair
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_pair = (0, 1);
+
+    for i in 0..n_states {
+        for j in 0..i {
+            let s = scores[i * n_states + j];
+            if s > best_score {
+                best_score = s;
+                best_pair = (i, j);
+            }
+        }
+    }
+
+    // If best score is too low (worse than random), maybe don't use it?
+    // But random initialization is also bad. This is likely the "least bad" start.
+    // So we return it.
+
+    let path1 = vec![best_pair.0 as u32; n_markers];
+    let path2 = vec![best_pair.1 as u32; n_markers];
+
+    Some(MosaicPaths { path1, path2 })
+}
+
 /// Sample phase swap decisions using Stochastic EM (single chain MCMC).
 ///
 /// This implements Forward-Filtering Backward-Sampling (FFBS) with a single
@@ -5376,10 +5466,11 @@ fn sample_dynamic_mcmc(
 /// cancellation, so we use exactly one chain (Stochastic EM).
 ///
 /// The algorithm:
-/// 1. Build forward checkpoints for the combined (both haplotypes uncertain) HMM
-/// 2. Run burn-in steps to let the chain mix
-/// 3. Take exactly ONE sample from the posterior
-/// 4. Return swap decisions directly from that sample
+/// 1. Initialize H1/H2 using pairwise compatibility search (breaks symmetry)
+///    OR fall back to Combined HMM checkpoint sampling
+/// 2. Run burn-in steps to let the chain mix via Gibbs sampling
+/// 3. Take samples from the posterior
+/// 4. Return swap decisions based on average posterior
 fn sample_swap_bits_mosaic(
     n_markers: usize,
     n_states: usize,
@@ -5416,42 +5507,54 @@ fn sample_swap_bits_mosaic(
     workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
 
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
+    // Attempt pairwise initialization if no initial paths provided
+    let heuristic_paths = if initial_paths.is_none() {
+        find_best_constant_pair(n_markers, n_states, seq1, seq2, lookup)
+    } else {
+        None
+    };
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
+    // Only build combined checkpoints if we don't have a start path
+    // This optimization avoids the expensive Combined HMM step when we have a good guess
     let mut combined_checkpoints =
         FwdCheckpoints::from_buffer(block_starts.clone(), n_states, combined_data);
-    let dummy_target = vec![255u8; n_markers];
-    let dummy_partner = vec![255u8; n_markers];
-    let dummy_combined = vec![true; n_markers];
-    let fwd = &mut workspace.fwd[..n_states];
-    let fwd_prior = &mut workspace.fwd_prior[..n_states];
-    let ref_alleles = &mut workspace.ref_alleles[..n_states];
-    build_fwd_checkpoints(
-        &mut combined_checkpoints,
-        n_markers,
-        n_states,
-        p_recomb,
-        seq1,
-        seq2,
-        conf,
-        HapEmissionInputs {
-            target_constraint: &dummy_target,
-            partner_allele: &dummy_partner,
-            use_combined: &dummy_combined,
-        },
-        lookup,
-        pl_provider.as_ref(),
-        &mut workspace.allele_probs,
-        fwd,
-        fwd_prior,
-        ref_alleles,
-        p_no_err,
-        p_err,
-        EmissionMode::Combined,
-    );
+
+    if start_paths.is_none() {
+        let dummy_target = vec![255u8; n_markers];
+        let dummy_partner = vec![255u8; n_markers];
+        let dummy_combined = vec![true; n_markers];
+        let fwd = &mut workspace.fwd[..n_states];
+        let fwd_prior = &mut workspace.fwd_prior[..n_states];
+        let ref_alleles = &mut workspace.ref_alleles[..n_states];
+        build_fwd_checkpoints(
+            &mut combined_checkpoints,
+            n_markers,
+            n_states,
+            p_recomb,
+            seq1,
+            seq2,
+            conf,
+            HapEmissionInputs {
+                target_constraint: &dummy_target,
+                partner_allele: &dummy_partner,
+                use_combined: &dummy_combined,
+            },
+            lookup,
+            pl_provider.as_ref(),
+            &mut workspace.allele_probs,
+            fwd,
+            fwd_prior,
+            ref_alleles,
+            p_no_err,
+            p_err,
+            EmissionMode::Combined,
+        );
+    }
 
     let combined_checkpoints_ref = &combined_checkpoints;
 
-    // Pure Stochastic EM: single chain, take the final sample after burn-in.
-    // No averaging, no counting - just sample once from the posterior.
+    // Pure Stochastic EM: single chain
     let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
     let buffers = MosaicBuffers {
         fwd: std::mem::replace(&mut workspace.fwd, aligned_vec::AVec::new(32)),
@@ -5496,7 +5599,7 @@ fn sample_swap_bits_mosaic(
         pl_provider,
     );
 
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths {
         let has_valid_lengths = paths.path1.len() == n_markers && paths.path2.len() == n_markers;
         let has_valid_states = has_valid_lengths
             && paths.path1.iter().all(|&p| (p as usize) < n_states)
@@ -6520,5 +6623,51 @@ mod tests {
         // Verify LR values exist
         assert_eq!(swap_lr.len(), het_positions.len());
         assert!(swap_probs.len() <= het_positions.len());
+    }
+
+    #[test]
+    fn test_find_best_constant_pair() {
+        use crate::model::allele_lookup::RefAlleleLookup;
+
+        let n_markers = 3;
+        let n_states = 4;
+
+        // Mock lookup
+        // State 0: 0, 0, 0 (Matches Hero)
+        // State 1: 1, 1, 1 (Matches Anti-Hero)
+        // State 2: 0, 1, 0
+        // State 3: 1, 0, 1
+
+        // Target: 0/1 (Het) everywhere.
+        // Seq1: 0, 0, 0
+        // Seq2: 1, 1, 1
+        // (This is one possible phasing of 0/1)
+
+        let mut data = Vec::new();
+        // M0
+        data.extend_from_slice(&[0, 1, 0, 1]);
+        // M1
+        data.extend_from_slice(&[0, 1, 1, 0]);
+        // M2
+        data.extend_from_slice(&[0, 1, 0, 1]);
+
+        let lookup = RefAlleleLookup::new_raw(data, n_states);
+
+        let seq1 = vec![0, 0, 0];
+        let seq2 = vec![1, 1, 1];
+
+        let paths = find_best_constant_pair(n_markers, n_states, &seq1, &seq2, &lookup).unwrap();
+
+        // Best pair should be (0, 1) or (1, 0) - Score 3.
+        // Or (2, 3) / (3, 2).
+
+        println!("Selected pair: ({}, {})", paths.path1[0], paths.path2[0]);
+
+        assert!(
+            (paths.path1[0] == 1 && paths.path2[0] == 0)
+                || (paths.path1[0] == 0 && paths.path2[0] == 1)
+                || (paths.path1[0] == 3 && paths.path2[0] == 2)
+                || (paths.path1[0] == 2 && paths.path2[0] == 3)
+        );
     }
 }

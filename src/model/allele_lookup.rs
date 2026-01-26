@@ -21,6 +21,13 @@ pub struct RefAlleleLookup {
 }
 
 impl RefAlleleLookup {
+    #[cfg(test)]
+    pub fn new_raw(alleles: Vec<u8>, n_states: usize) -> Self {
+        Self {
+            alleles: AVec::from_iter(32, alleles.into_iter()),
+            n_states,
+        }
+    }
     /// Create a new lookup directly from ThreadedHaps without intermediate allocation.
     ///
     /// This avoids the O(n_markers × n_states × 4) temporary from materialize_all().
