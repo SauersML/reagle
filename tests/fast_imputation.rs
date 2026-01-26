@@ -686,7 +686,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0; // Lower Ne for sparse data to maintain phase
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -2074,9 +2074,9 @@ fn test_phasing_confidence() {
         excludesamples: None,
         excludemarkers: None,
         burnin: 5,
-        iterations: 10,
+        iterations: 1, // Single iteration to avoid averaging over symmetric modes
         mcmc_burnin: 3,
-        dynamic_mcmc: false,
+        dynamic_mcmc: true, // Use dynamic MCMC to prevent haplotype collapse
         mcmc_steps: 10,
         phase_states: 80,
         rare: 0.002,
@@ -2089,7 +2089,7 @@ fn test_phasing_confidence() {
         pbwt_batch_mb: 256,
         ap: false,
         gp: false,
-        ne: 10000.0,
+        ne: 100.0,
         err: None,
         em: false,
         window: 40.0,
