@@ -461,9 +461,16 @@ fn test_synthetic_slam_dunk() {
         .allele_generator(|_, h| if h < 50 { 0 } else { 1 })
         .build();
 
-    let target_file = SyntheticVcfBuilder::new(n_markers, 1)
+    let target_file = SyntheticVcfBuilder::new(n_markers, 2)
         .unphased()
-        .allele_generator(|m, _| if m % 2 != 0 { 255 } else { 0 })
+        .allele_generator(|m, h| {
+            let s = h / 2;
+            if m % 2 != 0 {
+                255
+            } else {
+                if s == 0 { 0 } else { 1 }
+            }
+        })
         .build();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -475,7 +482,7 @@ fn test_synthetic_slam_dunk() {
     config.out = out_prefix.clone();
     config.imp_states = 50;
     config.imp_nsteps = 10;
-    config.ne = 10000.0;
+    config.ne = 10.0;
     config.err = Some(0.0001);
     config.window = 0.02;
     config.overlap = 0.005;
@@ -487,11 +494,13 @@ fn test_synthetic_slam_dunk() {
     let out_vcf = temp_dir.path().join("output_slam.vcf.gz");
     assert!(out_vcf.exists());
 
-    let dosages = inspect_dosages(&out_vcf, 1);
+    let dosages = inspect_dosages(&out_vcf, 2);
 
     for m in (1..n_markers).step_by(2) {
-        let ds = dosages[m][0];
-        assert!(ds < 0.1, "Marker {} should be 0, got {}", m, ds);
+        let ds0 = dosages[m][0];
+        let ds1 = dosages[m][1];
+        assert!(ds0 < 0.1, "Marker {} sample 0 should be 0, got {}", m, ds0);
+        assert!(ds1 > 1.9, "Marker {} sample 1 should be 2, got {}", m, ds1);
     }
 
     // DR2 validation for slam dunk test
@@ -526,6 +535,8 @@ fn test_synthetic_slam_dunk() {
     for m in (1..n_markers).step_by(2) {
         truth_vec.push(0.0);
         imp_vec.push(dosages[m][0] as f64);
+        truth_vec.push(2.0);
+        imp_vec.push(dosages[m][1] as f64);
     }
     let sen = calculate_sen(&truth_vec, &imp_vec);
     println!("Slam dunk test - SEN: {:.4}", sen);
@@ -686,7 +697,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -996,7 +1007,7 @@ fn test_error_injection() {
     config.out = out_prefix.clone();
     config.err = Some(0.01);
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -1476,9 +1487,10 @@ fn test_ultra_dense_markers() {
     // Target with every 10th marker genotyped - ALL haplotypes match ref group 0
     let target_file = SyntheticVcfBuilder::new(n_ref_markers, 2)
         .positions(positions)
-        .allele_generator(|m, _| {
+        .allele_generator(|m, h| {
+            let s = h / 2;
             if m % 10 == 0 {
-                0 // All target haplotypes get allele 0, matching ref haps 0-9
+                if s == 0 { 0 } else { 1 } // Sample 0 -> 0, Sample 1 -> 1
             } else {
                 255
             }
@@ -1493,6 +1505,8 @@ fn test_ultra_dense_markers() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
+    config.ne = 100.0;
+    config.err = Some(0.0001);
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1503,24 +1517,23 @@ fn test_ultra_dense_markers() {
     let out_vcf = temp_dir.path().join("output_dense.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 2);
 
-    // With perfect LD, imputed dosages should be very close to 0 (match target pattern)
-    let mut sum_dosage = 0.0f32;
-    let mut count = 0;
+    // With perfect LD, imputed dosages should match sample pattern (0 or 2)
+    // Check concordance for both samples
+    let mut correct = 0;
+    let mut total = 0;
     for marker_dosages in &dosages {
-        for ds in marker_dosages {
-            sum_dosage += ds;
-            count += 1;
-        }
+        // Sample 0 should be ~0
+        if marker_dosages[0] < 0.5 { correct += 1; }
+        total += 1;
+
+        // Sample 1 should be ~2
+        if marker_dosages[1] > 1.5 { correct += 1; }
+        total += 1;
     }
 
-    let avg_dosage = sum_dosage / count as f32;
-    println!("Average dosage: {}", avg_dosage);
-    // Target matches haplotype group 0, so average dosage should be LOW
-    assert!(
-        avg_dosage < 0.5,
-        "Average dosage should be low for matching haplotype group, got {}",
-        avg_dosage
-    );
+    let accuracy = correct as f64 / total as f64;
+    println!("Ultra-dense accuracy: {:.2}%", accuracy * 100.0);
+    assert!(accuracy > 0.99, "Accuracy should be near 100%, got {:.2}%", accuracy * 100.0);
 
     // DR2 validation for ultra-dense markers test
     let dr2_values = inspect_dr2(&out_vcf);
@@ -1696,6 +1709,7 @@ fn test_microarray_vs_wgs_imputation() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 100;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1860,6 +1874,7 @@ fn test_high_density_array_imputation() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 40;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
