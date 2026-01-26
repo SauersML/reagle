@@ -292,6 +292,7 @@ fn build_reference_map_with_mask(
     block_size: usize,
     max_states: usize,
     keep_mask: Option<&[bool]>,
+    cluster_cm: f32,
 ) -> Arc<ReferenceMap> {
     let n_markers = markers.len();
     let gen_positions: Vec<f64> = (0..n_markers)
@@ -323,7 +324,11 @@ fn build_reference_map_with_mask(
             let recomb_rates: Vec<f32> = (start..end.saturating_sub(1))
                 .map(|i| {
                     let dist_cm = (gen_positions[i + 1] - gen_positions[i]).abs();
-                    params.p_recomb(dist_cm)
+                    if (dist_cm as f32) < cluster_cm {
+                        0.0
+                    } else {
+                        params.p_recomb(dist_cm)
+                    }
                 })
                 .collect();
             let block =
@@ -344,7 +349,11 @@ fn build_reference_map_with_mask(
             let left_idx = blocks[i].end_marker - 1;
             let right_idx = blocks[i + 1].start_marker;
             let dist_cm = (gen_positions[right_idx] - gen_positions[left_idx]).abs();
-            params.p_recomb(dist_cm)
+            if (dist_cm as f32) < cluster_cm {
+                0.0
+            } else {
+                params.p_recomb(dist_cm)
+            }
         })
         .collect();
 
@@ -928,6 +937,7 @@ impl crate::pipelines::ImputationPipeline {
                                 ref_block_size,
                                 0,
                                 Some(&keep_mask),
+                                pipeline.config.cluster,
                             );
                         } else {
                             ref_map = build_reference_map_with_mask(
@@ -938,6 +948,7 @@ impl crate::pipelines::ImputationPipeline {
                                 ref_block_size,
                                 ref_max_states,
                                 None,
+                                pipeline.config.cluster,
                             );
                         }
                     } else if window_count == 1 {
