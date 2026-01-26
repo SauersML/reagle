@@ -127,6 +127,12 @@ impl MarkerImputationStats {
             return 1.0;
         }
 
+        // Handle near-monomorphic sites where variance is extremely low due to HMM confidence
+        let mean_p = sum / n;
+        if mean_p <= 1e-4 || mean_p >= 1.0 - 1e-4 {
+            return 1.0;
+        }
+
         let sum_sq = self.sum_p_sq[allele];
 
         // Java: float meanTerm = sum*sum/(nInputTargHaps);
