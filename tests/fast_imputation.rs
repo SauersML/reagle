@@ -1262,6 +1262,7 @@ fn test_phasing_perfect_ld() {
     let mut config = default_test_config();
     config.gt = target_file.path().to_path_buf();
     config.out = out_prefix.clone();
+    config.ne = 100000.0;
     config.burnin = 2;
     config.iterations = 5;
     config.nthreads = Some(1);
@@ -1340,6 +1341,7 @@ fn test_singleton_imputation() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1416,6 +1418,7 @@ fn test_high_recombination_stress() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 30;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1493,6 +1496,7 @@ fn test_ultra_dense_markers() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1584,6 +1588,7 @@ fn test_diverse_reference_with_mismatch() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1696,6 +1701,7 @@ fn test_microarray_vs_wgs_imputation() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 100;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1860,6 +1866,7 @@ fn test_high_density_array_imputation() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 40;
+    config.ne = 100000.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
