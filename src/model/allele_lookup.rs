@@ -47,8 +47,10 @@ impl RefAlleleLookup {
             let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
             let ref_m_opt = alignment.and_then(|a| a.target_to_ref(orig_m));
 
-            move |hap: u32| {
-                let hap = hap as usize;
+use crate::model::block_hash::types::GlobalId;
+
+            move |hap: GlobalId| {
+                let hap = hap.as_u32() as usize;
                 if hap < n_target_haps {
                     ref_geno.get(orig_m, HapIdx::new(hap as u32))
                 } else {

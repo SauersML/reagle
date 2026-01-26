@@ -64,6 +64,8 @@ use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
+use crate::model::block_hash::types::GlobalId;
+
 use crate::model::phase_states::PhaseStates;
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::utils::telemetry::{Stage, TelemetryBlackboard};
@@ -3147,7 +3149,7 @@ impl PhasingPipeline {
                                     && h2_idx < hap_priors.len()
                                     && n_states > 0
                                 {
-                                    let mut state_haps = vec![0u32; n_states];
+                                    let mut state_haps = vec![GlobalId::new(0); n_states];
                                     threaded_haps.materialize_at(prior_stage1_idx, &mut state_haps);
 
                                     (
@@ -3298,7 +3300,7 @@ impl PhasingPipeline {
                     let (next_hap_priors, next_prior_global_marker) =
                         if let Some(&stage1_idx) = next_overlap_indices.last() {
                             if stage1_idx < probs1.len() && n_states > 0 {
-                                let mut state_haps = vec![0u32; n_states];
+                                let mut state_haps = vec![GlobalId::new(0); n_states];
                                 threaded_haps.materialize_at(stage1_idx, &mut state_haps);
 
                                 let prior1 = build_haplotype_priors_from_state_probs(
@@ -3322,13 +3324,13 @@ impl PhasingPipeline {
 
                     // Lazy cache for state->hap mapping - O(1) indexing with Option<Vec>
                     // Uses immutable materialize_at() to avoid clone() overhead
-                    let mut hap_cache: Vec<Option<Vec<u32>>> = vec![None; n_markers];
+                    let mut hap_cache: Vec<Option<Vec<GlobalId>>> = vec![None; n_markers];
 
                     macro_rules! get_haps {
                         ($marker:expr) => {{
                             let m = $marker;
                             if hap_cache[m].is_none() {
-                                let mut haps = vec![0u32; n_states];
+                                let mut haps = vec![GlobalId::new(0); n_states];
                                 threaded_haps.materialize_at(m, &mut haps);
                                 hap_cache[m] = Some(haps);
                             }
@@ -3379,12 +3381,12 @@ impl PhasingPipeline {
                             let bridge_probs = stage2_phaser.bridge_state_probs(m, probs, n_states);
 
                             for (j, &hap) in state_haps.iter().enumerate() {
-                                let prob = bridge_probs.get(j).copied().unwrap_or(0.0);
-                                let b1 = get_allele(m, hap as usize);
+                                let prob_state = bridge_probs.get(j).copied().unwrap_or(0.0);
+                                let hap_allele = get_allele(m, hap.as_u32() as usize);
 
-                                if b1 != 255 {
-                                    if (b1 as usize) < n_alleles {
-                                        al_probs[b1 as usize] += prob;
+                                if hap_allele != 255 {
+                                    if (hap_allele as usize) < n_alleles {
+                                        al_probs[hap_allele as usize] += prob_state;
                                     }
                                 }
                             }
@@ -3412,7 +3414,7 @@ impl PhasingPipeline {
                             let mut score = 0.0f32;
                             for (j, &hap) in state_haps.iter().enumerate() {
                                 let prob = bridge_probs.get(j).copied().unwrap_or(0.0);
-                                if carrier_set.contains(&hap) {
+                                if carrier_set.contains(&hap.as_u32()) {
                                     score += prob;
                                 }
                             }
@@ -3686,25 +3688,66 @@ impl PhasingPipeline {
 }
 
 const PRIOR_EXPORT_MIN_PROB: f32 = 1e-5;
-const PRIOR_MIN_SUM: f32 = 1e-30;
 
-/// Collapse local state probabilities into haplotype-identity priors.
-fn build_haplotype_priors_from_state_probs(
-    state_probs: &[f32],
-    state_haps: &[u32],
-    min_prob: f32,
-) -> HaplotypePriors {
-    if state_probs.is_empty() || state_haps.is_empty() {
-        return HaplotypePriors::empty();
+
+
+
+/// Project haplotype-identity priors onto the current window's local state set.
+fn project_haplotype_priors_to_states(
+    priors: &HaplotypePriors,
+    state_haps: &[GlobalId],
+) -> Vec<f32> {
+    let n_states = state_haps.len();
+    if n_states == 0 {
+        return Vec::new();
     }
 
+    let mut out = vec![0.0f32; n_states];
+    let mut covered_mass = 0.0f32;
+
+    for (k, &hap) in state_haps.iter().enumerate() {
+        let p = priors.prob_of(GlobalHapId(hap.as_u32())).unwrap_or(0.0);
+        out[k] = p;
+        covered_mass += p;
+    }
+    
+    // Any prior mass that is not represented in the new state set becomes
+    // background uncertainty rather than being silently dropped.
+    let leftover = (1.0 - covered_mass).max(0.0);
+    if leftover > 0.0 {
+        let background = leftover / n_states as f32;
+        for p in &mut out {
+            *p += background;
+        }
+    }
+
+    let total: f32 = out.iter().sum();
+    // Use a small epsilon
+    if total > 1e-6 {
+        for p in &mut out {
+            *p /= total;
+        }
+    } else {
+        let uniform = 1.0 / n_states as f32;
+        out.fill(uniform);
+    }
+
+    out
+}
+
+/// Build haplotype priors from state posteriors.
+fn build_haplotype_priors_from_state_probs(
+    state_probs: &[f32],
+    state_haps: &[GlobalId],
+    min_prob: f32,
+) -> HaplotypePriors {
     let mut mass_by_hap: std::collections::HashMap<u32, f32> =
         std::collections::HashMap::with_capacity(state_haps.len());
 
     for (k, &hap) in state_haps.iter().enumerate() {
-        let p = state_probs.get(k).copied().unwrap_or(0.0);
+        let p: f32 = state_probs.get(k).copied().unwrap_or(0.0);
         if p.is_finite() && p > 0.0 {
-            *mass_by_hap.entry(hap).or_insert(0.0) += p;
+            *mass_by_hap.entry(hap.as_u32()).or_insert(0.0) += p;
         }
     }
 
@@ -3724,47 +3767,8 @@ fn build_haplotype_priors_from_state_probs(
         hap_ids.push(GlobalHapId(hap));
         probs.push(p);
     }
-
+    
     HaplotypePriors::new(hap_ids, probs)
-}
-
-/// Project haplotype-identity priors onto the current window's local state set.
-fn project_haplotype_priors_to_states(priors: &HaplotypePriors, state_haps: &[u32]) -> Vec<f32> {
-    let n_states = state_haps.len();
-    if n_states == 0 {
-        return Vec::new();
-    }
-
-    let mut out = vec![0.0f32; n_states];
-    let mut covered_mass = 0.0f32;
-
-    for (k, &hap) in state_haps.iter().enumerate() {
-        let p = priors.prob_of(GlobalHapId(hap)).unwrap_or(0.0);
-        out[k] = p;
-        covered_mass += p;
-    }
-
-    // Any prior mass that is not represented in the new state set becomes
-    // background uncertainty rather than being silently dropped.
-    let leftover = (1.0 - covered_mass).max(0.0);
-    if leftover > 0.0 {
-        let background = leftover / n_states as f32;
-        for p in &mut out {
-            *p += background;
-        }
-    }
-
-    let total: f32 = out.iter().sum();
-    if total > PRIOR_MIN_SUM {
-        for p in &mut out {
-            *p /= total;
-        }
-    } else {
-        let uniform = 1.0 / n_states as f32;
-        out.fill(uniform);
-    }
-
-    out
 }
 
 /// Compute normalized posterior state probabilities from forward-backward arrays
@@ -5648,7 +5652,7 @@ impl Stage2Phaser {
         &self,
         marker: usize,
         state_probs: &[Vec<f32>], // [stage1_marker][state]
-        haps_at_mkr_a: &[u32],    // haplotypes at flanking Stage 1 marker
+        haps_at_mkr_a: &[GlobalId],    // haplotypes at flanking Stage 1 marker
         get_allele: &F,           // Closure to get allele for any haplotype
         a1: u8,
         a2: u8,
@@ -5662,7 +5666,7 @@ impl Stage2Phaser {
         let bridge_probs = self.bridge_state_probs(marker, state_probs, n_states);
 
         for j in 0..n_states {
-            let hap = haps_at_mkr_a[j] as usize;
+            let hap = haps_at_mkr_a[j].as_u32() as usize;
 
             // Get allele from this specific haplotype at the rare marker.
             // Li-Stephens HMM models haploid copying: state k means we're copying

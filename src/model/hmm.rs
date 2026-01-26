@@ -329,7 +329,7 @@ impl<'a> BeagleHmm<'a> {
 
             scratch.materialize(&cursor, m, |marker, hap| {
                 self.ref_gt
-                    .allele(MarkerIdx::new(marker as u32), HapIdx::new(hap))
+                    .allele(MarkerIdx::new(marker as u32), HapIdx::new(hap.as_u32()))
             });
 
             if let Some(plp) = pl_provider {
@@ -448,7 +448,7 @@ impl<'a> BeagleHmm<'a> {
                 let hap = cursor.active_haps()[k];
                 scratch.alleles[k] = self
                     .ref_gt
-                    .allele(MarkerIdx::new(m_next as u32), HapIdx::new(hap));
+                    .allele(MarkerIdx::new(m_next as u32), HapIdx::new(hap.as_u32()));
             }
 
             if let Some(plp) = pl_provider {
@@ -860,7 +860,7 @@ impl<'a> BeagleHmm<'a> {
                 for k in 0..n_states {
                     let ref_al = self
                         .ref_gt
-                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k].as_u32()));
                     let is_mismatch = ref_al != targ_al;
                     let em = if is_mismatch { p_err } else { p_no_err };
                     fwd[k] = em * (scale * fwd[k] + shift);
@@ -874,7 +874,7 @@ impl<'a> BeagleHmm<'a> {
                 for k in 0..n_states {
                     let ref_al = self
                         .ref_gt
-                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k].as_u32()));
                     let is_mismatch = ref_al != targ_al;
                     let em = if is_mismatch { p_err } else { p_no_err };
                     fwd[k] = em * prior;
@@ -941,7 +941,7 @@ impl<'a> BeagleHmm<'a> {
                 for k in 0..n_states {
                     let ref_al = self.ref_gt.allele(
                         recomp_marker_idx,
-                        HapIdx::new(recomp_cursor.active_haps()[k]),
+                        HapIdx::new(recomp_cursor.active_haps()[k].as_u32()),
                     );
                     let is_mismatch = ref_al != recomp_targ_al;
                     let em = if is_mismatch { p_err } else { p_no_err };
@@ -966,7 +966,7 @@ impl<'a> BeagleHmm<'a> {
             for k in 0..n_states {
                 let ref_al = self
                     .ref_gt
-                    .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                    .allele(marker_idx, HapIdx::new(cursor.active_haps()[k].as_u32()));
                 let is_mismatch = ref_al != targ_al;
                 let em = if is_mismatch { p_err } else { p_no_err };
 
@@ -1009,7 +1009,7 @@ impl<'a> BeagleHmm<'a> {
 
                 for k in 0..n_states {
                     let h = cursor.active_haps()[k];
-                    let r = self.ref_gt.allele(marker_idx, HapIdx::new(h));
+                    let r = self.ref_gt.allele(marker_idx, HapIdx::new(h.as_u32()));
                     mismatches[k] = if r == targ_al_next { 0 } else { 1 };
                 }
 
@@ -1022,6 +1022,7 @@ impl<'a> BeagleHmm<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::block_hash::types::GlobalId;
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
@@ -1103,15 +1104,15 @@ mod tests {
         let mut threaded_haps = ThreadedHaps::new(n_states, n_states * 2, n_markers);
 
         // State 0: hap 0 for markers 0-2, then hap 1 for markers 3-4 (segment switch at marker 3)
-        threaded_haps.push_new(0);
-        threaded_haps.add_segment(0, 1, 3);
+        threaded_haps.push_new(GlobalId::new(0));
+        threaded_haps.add_segment(0, GlobalId::new(1), 3);
 
         // State 1: hap 2 for entire chromosome (no switch - tests static case too)
-        threaded_haps.push_new(2);
+        threaded_haps.push_new(GlobalId::new(2));
 
         // State 2: hap 4 for markers 0-1, then hap 5 for markers 2-4 (segment switch at marker 2)
-        threaded_haps.push_new(4);
-        threaded_haps.add_segment(2, 5, 2);
+        threaded_haps.push_new(GlobalId::new(4));
+        threaded_haps.add_segment(2, GlobalId::new(5), 2);
 
         let hmm = BeagleHmm::new(&ref_panel, &params, n_states, p_recomb);
 
