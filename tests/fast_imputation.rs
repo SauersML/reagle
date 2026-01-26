@@ -475,7 +475,7 @@ fn test_synthetic_slam_dunk() {
     config.out = out_prefix.clone();
     config.imp_states = 50;
     config.imp_nsteps = 10;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.err = Some(0.0001);
     config.window = 0.02;
     config.overlap = 0.005;
@@ -686,7 +686,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -996,7 +996,7 @@ fn test_error_injection() {
     config.out = out_prefix.clone();
     config.err = Some(0.01);
     config.imp_states = 50;
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -1493,6 +1493,7 @@ fn test_ultra_dense_markers() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
+    config.ne = 100.0;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -2089,7 +2090,7 @@ fn test_phasing_confidence() {
         pbwt_batch_mb: 256,
         ap: false,
         gp: false,
-        ne: 10000.0,
+        ne: 100.0,
         err: None,
         em: false,
         window: 40.0,
