@@ -34,11 +34,13 @@ struct CompHapEntry {
     start_marker: usize,
     /// Last marker where this hap was seen in IBS matches
     last_ibs_marker: i32,
+    /// Insertion sequence number for stable tie-breaking (LRU)
+    insertion_seq: u64,
 }
 
 impl PartialEq for CompHapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.last_ibs_marker == other.last_ibs_marker
+        self.last_ibs_marker == other.last_ibs_marker && self.insertion_seq == other.insertion_seq
     }
 }
 
@@ -52,8 +54,18 @@ impl PartialOrd for CompHapEntry {
 
 impl Ord for CompHapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Min-heap: smallest last_ibs_marker should be at top (to be replaced first)
-        other.last_ibs_marker.cmp(&self.last_ibs_marker)
+        // Min-heap logic using Max-heap structure:
+        // We want to pop the "smallest" (oldest/worst) item.
+        // So "smallest" must compare as Greater than others.
+
+        // Primary key: last_ibs_marker (smaller is older/worse)
+        other
+            .last_ibs_marker
+            .cmp(&self.last_ibs_marker)
+            .then_with(|| {
+                // Secondary key: insertion_seq (smaller is older/worse)
+                other.insertion_seq.cmp(&self.insertion_seq)
+            })
     }
 }
 
@@ -73,6 +85,8 @@ pub struct PhaseStates {
     queue: BinaryHeap<CompHapEntry>,
     /// Number of markers
     n_markers: usize,
+    /// Sequence counter for insertion ordering
+    insertion_seq_counter: u64,
 }
 
 const NIL: i32 = -103;
@@ -90,6 +104,7 @@ impl PhaseStates {
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
             n_markers,
+            insertion_seq_counter: 0,
         }
     }
 
@@ -98,6 +113,13 @@ impl PhaseStates {
         self.threaded_haps.clear();
         self.hap_to_last_ibs.clear();
         self.queue.clear();
+        self.insertion_seq_counter = 0;
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.insertion_seq_counter;
+        self.insertion_seq_counter = self.insertion_seq_counter.wrapping_add(1);
+        seq
     }
 
     /// Add an IBS haplotype at a marker
@@ -126,12 +148,14 @@ impl PhaseStates {
         if self.queue.len() < self.max_states {
             // Queue has room - add new entry
             let index = self.queue.len();
+            let seq = self.next_seq();
             self.threaded_haps.push_new(ibs_hap);
             self.queue.push(CompHapEntry {
                 comp_hap_idx: index,
                 hap: ibs_hap,
                 start_marker: 0,
                 last_ibs_marker: marker,
+                insertion_seq: seq,
             });
             self.hap_to_last_ibs.insert(ibs_hap, marker);
         } else if !self.queue.is_empty() {
@@ -160,11 +184,13 @@ impl PhaseStates {
             }
 
             // Add new entry for the replacement hap
+            let seq = self.next_seq();
             self.queue.push(CompHapEntry {
                 comp_hap_idx: index,
                 hap: ibs_hap,
                 start_marker: next_start,
                 last_ibs_marker: marker,
+                insertion_seq: seq,
             });
             self.hap_to_last_ibs.insert(ibs_hap, marker);
         }
@@ -180,6 +206,8 @@ impl PhaseStates {
             // Update the entry with its actual last IBS marker
             let mut entry = self.queue.pop().unwrap();
             entry.last_ibs_marker = current_last;
+            // Update insertion_seq to reflect recent usage (promote to most recent)
+            entry.insertion_seq = self.next_seq();
             self.queue.push(entry);
         }
     }
@@ -209,6 +237,7 @@ impl PhaseStates {
             let hap_id = GlobalId::from(h);
             if h / 2 != sample && !self.hap_to_last_ibs.contains_key(&hap_id) {
                 let index = self.threaded_haps.n_states();
+                let seq = self.next_seq();
                 self.threaded_haps.push_new(hap_id);
                 self.hap_to_last_ibs.insert(hap_id, 0);
                 self.queue.push(CompHapEntry {
@@ -216,6 +245,7 @@ impl PhaseStates {
                     hap: hap_id,
                     start_marker: 0,
                     last_ibs_marker: 0,
+                    insertion_seq: seq,
                 });
             }
         }
@@ -257,17 +287,18 @@ impl PhaseStates {
     ) {
         let marker_i32 = marker as i32;
 
-        // Add neighbors from haplotype 1
-        for &ibs_hap in neighbors1 {
-            if ibs_hap / 2 != sample {
-                self.add_ibs_hap(GlobalId::from(ibs_hap), marker_i32);
+        // Interleave processing to ensure fairness when queue capacity is limited
+        let len = neighbors1.len().max(neighbors2.len());
+        for i in 0..len {
+            if let Some(&h1) = neighbors1.get(i) {
+                if h1 / 2 != sample {
+                    self.add_ibs_hap(GlobalId::from(h1), marker_i32);
+                }
             }
-        }
-
-        // Add neighbors from haplotype 2
-        for &ibs_hap in neighbors2 {
-            if ibs_hap / 2 != sample {
-                self.add_ibs_hap(GlobalId::from(ibs_hap), marker_i32);
+            if let Some(&h2) = neighbors2.get(i) {
+                if h2 / 2 != sample {
+                    self.add_ibs_hap(GlobalId::from(h2), marker_i32);
+                }
             }
         }
     }
