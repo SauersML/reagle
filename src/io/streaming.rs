@@ -460,7 +460,7 @@ impl StreamingVcfReader {
                 config,
                 gen_maps,
                 buffer: VecDeque::new(),
-                markers_meta: Markers::new(),
+                markers_meta: Markers::<crate::data::AnyMarkerSpace>::new(),
                 current_chrom: None,
                 window_num: 0,
                 global_marker_idx: 0,
@@ -550,7 +550,7 @@ impl StreamingVcfReader {
             };
 
             // Build GenotypeMatrix for this window
-            let mut markers = Markers::new();
+            let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
             let mut columns = Vec::with_capacity(window_end);
             let mut confidences: Vec<Vec<u8>> = Vec::new();
             let n_samples = self.samples.len();
@@ -752,7 +752,7 @@ impl StreamingVcfReader {
         let last_idx = *indices.last().unwrap();
         let n_markers = indices.len();
 
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         let mut columns = Vec::with_capacity(n_markers);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
         let n_samples = self.samples.len();

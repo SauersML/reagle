@@ -474,7 +474,7 @@ mod tests {
         let col1 = GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2);
 
         use crate::data::marker::{Allele, Marker};
-        let mut m = Markers::new();
+        let mut m = Markers::<crate::data::AnyMarkerSpace>::new();
         let chr = m.add_chrom("chr1");
         m.push(Marker::new(
             chr,

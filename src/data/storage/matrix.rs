@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
-use crate::data::marker::{Marker, MarkerIdx, Markers};
+use crate::data::marker::{AnyMarkerSpace, Marker, MarkerIdx, Markers};
 use crate::data::storage::GenotypeColumn;
 use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
 
@@ -95,10 +95,10 @@ impl PlMatrix {
 ///
 /// Type parameter `State` encodes whether data is phased at compile time,
 /// enabling the compiler to enforce correct pipeline usage.
-#[derive(Clone, Debug)]
-pub struct GenotypeMatrix<State: PhaseState = Unphased> {
+#[derive(Debug)]
+pub struct GenotypeMatrix<State: PhaseState = Unphased, Space = AnyMarkerSpace> {
     /// Marker metadata
-    markers: Markers,
+    markers: Markers<Space>,
 
     /// Genotype data (one column per marker)
     columns: Vec<GenotypeColumn>,
@@ -126,11 +126,26 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased> {
     phantom: PhantomData<State>,
 }
 
+impl<State: PhaseState, Space> Clone for GenotypeMatrix<State, Space> {
+    fn clone(&self) -> Self {
+        Self {
+            markers: self.markers.clone(),
+            columns: self.columns.clone(),
+            samples: Arc::clone(&self.samples),
+            is_reversed: self.is_reversed,
+            confidence: self.confidence.clone(),
+            phase_confidence: self.phase_confidence.clone(),
+            likelihoods_pl: self.likelihoods_pl.clone(),
+            phantom: PhantomData,
+        }
+    }
+}
+
 // ============================================================================
 // Methods available for ALL phase states
 // ============================================================================
 
-impl<S: PhaseState> GenotypeMatrix<S> {
+impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
     /// Number of markers
     pub fn n_markers(&self) -> usize {
         self.markers.len()
@@ -147,12 +162,12 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     }
 
     /// Get marker by index
-    pub fn marker(&self, idx: MarkerIdx) -> &Marker {
+    pub fn marker(&self, idx: MarkerIdx<Space>) -> &Marker {
         self.markers.marker(idx)
     }
 
     /// Get all markers
-    pub fn markers(&self) -> &Markers {
+    pub fn markers(&self) -> &Markers<Space> {
         &self.markers
     }
 
@@ -164,13 +179,13 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     }
 
     /// Get genotype column for a marker
-    pub fn column(&self, idx: MarkerIdx) -> &GenotypeColumn {
+    pub fn column(&self, idx: MarkerIdx<Space>) -> &GenotypeColumn {
         &self.columns[idx.as_usize()]
     }
 
     /// Get allele at (marker, haplotype)
     #[inline]
-    pub fn allele(&self, marker: MarkerIdx, hap: HapIdx) -> u8 {
+    pub fn allele(&self, marker: MarkerIdx<Space>, hap: HapIdx) -> u8 {
         self.columns[marker.as_usize()].get(hap)
     }
 
@@ -195,7 +210,7 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Get confidence score for a sample at a marker (0-255 representing 0.0-1.0).
     /// Returns 255 (full confidence) if confidence data is not available.
     #[inline]
-    pub fn sample_confidence(&self, marker: MarkerIdx, sample_idx: usize) -> u8 {
+    pub fn sample_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
         if marker.as_usize() >= self.columns.len() {
             return 0;
         }
@@ -224,7 +239,7 @@ impl<S: PhaseState> GenotypeMatrix<S> {
 
     /// Get confidence score as f32 (0.0-1.0)
     #[inline]
-    pub fn sample_confidence_f32(&self, marker: MarkerIdx, sample_idx: usize) -> f32 {
+    pub fn sample_confidence_f32(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> f32 {
         self.sample_confidence(marker, sample_idx) as f32 / 255.0
     }
 
@@ -236,7 +251,7 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Get phase confidence score for a sample at a marker (0-255).
     /// Returns 255 (full confidence) if phase confidence is not available.
     #[inline]
-    pub fn sample_phase_confidence(&self, marker: MarkerIdx, sample_idx: usize) -> u8 {
+    pub fn sample_phase_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
         self.phase_confidence
             .as_ref()
             .and_then(|c| c.get(marker.as_usize()))
@@ -247,7 +262,7 @@ impl<S: PhaseState> GenotypeMatrix<S> {
 
     /// Get phase confidence score as f32 (0.0-1.0).
     #[inline]
-    pub fn sample_phase_confidence_f32(&self, marker: MarkerIdx, sample_idx: usize) -> f32 {
+    pub fn sample_phase_confidence_f32(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> f32 {
         self.sample_phase_confidence(marker, sample_idx) as f32 / 255.0
     }
 
@@ -261,7 +276,7 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     }
 
     #[inline]
-    pub fn sample_pl(&self, marker: MarkerIdx, sample_idx: usize) -> Option<&[u16]> {
+    pub fn sample_pl(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> Option<&[u16]> {
         self.likelihoods_pl
             .as_ref()
             .and_then(|pl| pl.sample_pl(marker.as_usize(), sample_idx))
@@ -272,10 +287,10 @@ impl<S: PhaseState> GenotypeMatrix<S> {
 // Methods ONLY for Unphased matrices
 // ============================================================================
 
-impl GenotypeMatrix<Unphased> {
+impl<Space> GenotypeMatrix<Unphased, Space> {
     /// Create a new unphased genotype matrix
     pub fn new_unphased(
-        markers: Markers,
+        markers: Markers<Space>,
         columns: Vec<GenotypeColumn>,
         samples: Arc<Samples>,
     ) -> Self {
@@ -294,7 +309,7 @@ impl GenotypeMatrix<Unphased> {
 
     /// Create new unphased matrix with confidence scores
     pub fn new_unphased_with_confidence(
-        markers: Markers,
+        markers: Markers<Space>,
         columns: Vec<GenotypeColumn>,
         samples: Arc<Samples>,
         confidence: Vec<Vec<u8>>,
@@ -314,7 +329,7 @@ impl GenotypeMatrix<Unphased> {
     }
 
     pub fn new_unphased_with_confidence_and_likelihoods(
-        markers: Markers,
+        markers: Markers<Space>,
         columns: Vec<GenotypeColumn>,
         samples: Arc<Samples>,
         confidence: Option<Vec<Vec<u8>>>,
@@ -340,7 +355,7 @@ impl GenotypeMatrix<Unphased> {
     ///
     /// This is the primary way to create a `GenotypeMatrix<Phased>`.
     /// Consumes self to prevent accidental use of unphased data.
-    pub fn into_phased(self) -> GenotypeMatrix<Phased> {
+    pub fn into_phased(self) -> GenotypeMatrix<Phased, Space> {
         GenotypeMatrix {
             markers: self.markers,
             columns: self.columns,
@@ -358,10 +373,10 @@ impl GenotypeMatrix<Unphased> {
 // Methods ONLY for Phased matrices
 // ============================================================================
 
-impl GenotypeMatrix<Phased> {
+impl<Space> GenotypeMatrix<Phased, Space> {
     /// Create a new phased genotype matrix
     pub fn new_phased(
-        markers: Markers,
+        markers: Markers<Space>,
         columns: Vec<GenotypeColumn>,
         samples: Arc<Samples>,
     ) -> Self {
@@ -380,7 +395,7 @@ impl GenotypeMatrix<Phased> {
 
     /// Create a new phased genotype matrix with confidence scores
     pub fn new_phased_with_confidence(
-        markers: Markers,
+        markers: Markers<Space>,
         columns: Vec<GenotypeColumn>,
         samples: Arc<Samples>,
         confidence: Vec<Vec<u8>>,
@@ -400,7 +415,7 @@ impl GenotypeMatrix<Phased> {
     }
 
     pub fn new_phased_with_confidence_and_likelihoods(
-        markers: Markers,
+        markers: Markers<Space>,
         columns: Vec<GenotypeColumn>,
         samples: Arc<Samples>,
         confidence: Option<Vec<Vec<u8>>>,
@@ -440,10 +455,12 @@ impl GenotypeMatrix<Phased> {
     }
 
     /// Get a reference as unphased (zero-cost, same memory layout)
-    pub fn as_unphased_ref(&self) -> &GenotypeMatrix<Unphased> {
+    pub fn as_unphased_ref(&self) -> &GenotypeMatrix<Unphased, Space> {
         // SAFETY: GenotypeMatrix<Phased> and GenotypeMatrix<Unphased> have identical
         // memory layouts (PhantomData is zero-sized), differing only in the type parameter
-        unsafe { &*(self as *const GenotypeMatrix<Phased> as *const GenotypeMatrix<Unphased>) }
+        unsafe {
+            &*(self as *const GenotypeMatrix<Phased, Space> as *const GenotypeMatrix<Unphased, Space>)
+        }
     }
 }
 
@@ -455,7 +472,7 @@ mod tests {
 
     fn make_test_matrix_phased() -> GenotypeMatrix<Phased> {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         markers.add_chrom("chr1");
 
         let m1 = Marker::new(
@@ -484,7 +501,7 @@ mod tests {
 
     fn make_test_matrix_unphased() -> GenotypeMatrix<Unphased> {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         markers.add_chrom("chr1");
 
         let m1 = Marker::new(
@@ -536,7 +553,7 @@ mod tests {
     #[test]
     fn test_confidence_scores() {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         markers.add_chrom("chr1");
 
         let m1 = Marker::new(

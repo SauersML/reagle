@@ -31,14 +31,14 @@ impl RefAlleleLookup {
     /// Create a new lookup directly from ThreadedHaps without intermediate allocation.
     ///
     /// This avoids the O(n_markers × n_states × 4) temporary from materialize_all().
-    pub fn new_from_threaded_with_buffer(
+    pub fn new_from_threaded_with_buffer<TargetSpace, RefSpace>(
         threaded_haps: &ThreadedHaps,
         n_markers: usize,
         n_states: usize,
         n_target_haps: usize,
         ref_geno: &MutableGenotypes,
-        reference_gt: Option<&GenotypeMatrix<Phased>>,
-        alignment: Option<&MarkerAlignment>,
+        reference_gt: Option<&GenotypeMatrix<Phased, RefSpace>>,
+        alignment: Option<&MarkerAlignment<TargetSpace, RefSpace>>,
         marker_map: Option<&[usize]>,
         mut alleles: AVec<u8, ConstAlign<32>>,
     ) -> Self {
@@ -52,7 +52,9 @@ impl RefAlleleLookup {
         // Use marker-major iteration to hoist per-marker alignment computation
         threaded_haps.fill_alleles_marker_major(&mut alleles, |m| {
             let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
-            let ref_m_opt = alignment.and_then(|a| a.target_to_ref(orig_m));
+            let ref_m_opt = alignment.and_then(|a| {
+                a.target_to_ref(MarkerIdx::new(orig_m as u32))
+            });
 
             use crate::model::block_hash::types::GlobalId;
 
@@ -63,8 +65,7 @@ impl RefAlleleLookup {
                 } else {
                     let ref_h = (hap - n_target_haps) as u32;
                     if let (Some(ref_gt), Some(ref_m)) = (reference_gt, ref_m_opt) {
-                        let ref_allele =
-                            ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h));
+                        let ref_allele = ref_gt.allele(ref_m, HapIdx::new(ref_h));
                         alignment.unwrap().reverse_map_allele(orig_m, ref_allele)
                     } else {
                         255

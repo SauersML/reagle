@@ -196,7 +196,7 @@ impl MarkerMap {
     /// Create a MarkerMap from markers and genetic map
     ///
     /// This matches Java `MarkerMap.create(GeneticMap genMap, Markers markers)`
-    pub fn create(markers: &Markers, gen_map: &GeneticMap) -> Self {
+    pub fn create<Space>(markers: &Markers<Space>, gen_map: &GeneticMap) -> Self {
         let n = markers.len();
         if n == 0 {
             return Self {
@@ -214,8 +214,8 @@ impl MarkerMap {
     /// Create from genetic map with minimum distance between markers
     ///
     /// From Java `GeneticMap.genPos(GeneticMap genMap, double minGenDist, Markers markers)`
-    pub fn from_gen_map_with_min_dist(
-        markers: &Markers,
+    pub fn from_gen_map_with_min_dist<Space>(
+        markers: &Markers<Space>,
         gen_map: &GeneticMap,
         min_gen_dist: f64,
     ) -> Self {
@@ -250,7 +250,7 @@ impl MarkerMap {
     }
 
     /// Create using default position-based map (1 cM per Mb)
-    pub fn from_positions(markers: &Markers) -> Self {
+    pub fn from_positions<Space>(markers: &Markers<Space>) -> Self {
         let n = markers.len();
         if n == 0 {
             return Self {
@@ -272,7 +272,7 @@ impl MarkerMap {
     /// Mean single-base genetic distance
     ///
     /// From Java `MarkerMap.meanSingleBaseGenDist`
-    fn mean_single_base_gen_dist(markers: &Markers, gen_map: &GeneticMap) -> f64 {
+    fn mean_single_base_gen_dist<Space>(markers: &Markers<Space>, gen_map: &GeneticMap) -> f64 {
         // Minimum genetic distance (~0.01 * mean human single base genetic distance)
         const MIN_GEN_DIST: f64 = 1e-8;
 
@@ -370,7 +370,7 @@ mod tests {
     }
 
     fn make_test_markers() -> Markers {
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         markers.add_chrom("chr1");
 
         // 5 markers at 1Mb intervals

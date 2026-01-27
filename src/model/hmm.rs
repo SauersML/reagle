@@ -216,9 +216,9 @@ use crate::model::states::{AlleleScratch, MosaicCursor, StateSwitch, ThreadedHap
 /// - **Phase A**: State maintenance (integer logic, branch-predictable)
 /// - **Phase B**: Allele materialization (memory fetch into contiguous scratch)
 /// - **Phase C**: Math kernel (SIMD-vectorizable on flat data)
-pub struct BeagleHmm<'a> {
+pub struct BeagleHmm<'a, TargetSpace = crate::data::AnyMarkerSpace, RefSpace = crate::data::AnyMarkerSpace> {
     /// Reference panel genotypes
-    ref_gt: GenotypeView<'a>,
+    ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     /// Model parameters
     params: &'a ModelParams,
     /// Number of HMM states
@@ -227,10 +227,10 @@ pub struct BeagleHmm<'a> {
     p_recomb: Vec<f32>,
 }
 
-impl<'a> BeagleHmm<'a> {
+impl<'a, TargetSpace, RefSpace> BeagleHmm<'a, TargetSpace, RefSpace> {
     /// Create a new BeagleHmm
     pub fn new(
-        ref_gt: impl Into<GenotypeView<'a>>,
+        ref_gt: impl Into<GenotypeView<'a, TargetSpace, RefSpace>>,
         params: &'a ModelParams,
         n_states: usize,
         p_recomb: Vec<f32>,
@@ -1041,7 +1041,7 @@ mod tests {
             "R2".to_string(),
             "R3".to_string(),
         ]));
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         markers.add_chrom("chr1");
 
         // Create 5 markers

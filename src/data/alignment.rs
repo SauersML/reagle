@@ -1,31 +1,41 @@
 //! Marker alignment between target and reference panels.
 
-use crate::data::marker::{AlleleMapping, MarkerIdx};
+use crate::data::marker::{AlleleMapping, AnyMarkerSpace, MarkerIdx, Markers};
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
 use std::collections::HashMap;
 
 /// Marker alignment between target and reference panels
-#[derive(Clone, Debug)]
-pub struct MarkerAlignment {
+#[derive(Debug)]
+pub struct MarkerAlignment<TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     /// For each reference marker, the index of the corresponding target marker (-1 if not in target)
-    pub ref_to_target: Vec<i32>,
+    pub ref_to_target: Vec<Option<MarkerIdx<TargetSpace>>>,
     /// For each target marker, the index of the corresponding reference marker
-    pub target_to_ref: Vec<usize>,
+    pub target_to_ref: Vec<Option<MarkerIdx<RefSpace>>>,
 
     /// Allele mapping for each aligned marker (indexed by target marker)
     /// Maps target allele indices to reference allele indices
     pub allele_mappings: Vec<Option<AlleleMapping>>,
 }
 
-impl MarkerAlignment {
+impl<TargetSpace, RefSpace> Clone for MarkerAlignment<TargetSpace, RefSpace> {
+    fn clone(&self) -> Self {
+        Self {
+            ref_to_target: self.ref_to_target.clone(),
+            target_to_ref: self.target_to_ref.clone(),
+            allele_mappings: self.allele_mappings.clone(),
+        }
+    }
+}
+
+impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
     /// Create alignment by matching markers by position with allele mapping
     ///
     /// This handles strand flips (A/T vs T/A) and allele swaps automatically
     /// using `compute_allele_mapping`.
     pub fn new<S1: PhaseState, S2: PhaseState>(
-        target_gt: &GenotypeMatrix<S1>,
-        ref_gt: &GenotypeMatrix<S2>,
+        target_gt: &GenotypeMatrix<S1, TargetSpace>,
+        ref_gt: &GenotypeMatrix<S2, RefSpace>,
     ) -> Self {
         use crate::data::marker::compute_allele_mapping;
 
@@ -42,8 +52,8 @@ impl MarkerAlignment {
         }
 
         // Map reference markers to target markers
-        let mut ref_to_target = vec![-1i32; n_ref_markers];
-        let mut target_to_ref = vec![0usize; n_target_markers];
+        let mut ref_to_target = vec![None; n_ref_markers];
+        let mut target_to_ref = vec![None; n_target_markers];
         let mut allele_mappings: Vec<Option<AlleleMapping>> = vec![None; n_target_markers];
 
         let mut n_strand_flipped = 0usize;
@@ -60,8 +70,8 @@ impl MarkerAlignment {
                 if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
                     // Check if the mapping is valid (at least REF allele maps)
                     if mapping.is_valid() {
-                        ref_to_target[m] = target_idx as i32;
-                        target_to_ref[target_idx] = m;
+                        ref_to_target[m] = Some(MarkerIdx::new(target_idx as u32));
+                        target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
 
                         if mapping.strand_flipped {
                             n_strand_flipped += 1;
@@ -100,8 +110,8 @@ impl MarkerAlignment {
 
     /// Create alignment against reference markers without reference genotypes.
     pub fn new_with_ref_markers<S: PhaseState>(
-        target_gt: &GenotypeMatrix<S>,
-        ref_markers: &crate::data::marker::Markers,
+        target_gt: &GenotypeMatrix<S, TargetSpace>,
+        ref_markers: &Markers<RefSpace>,
     ) -> Self {
         use crate::data::marker::compute_allele_mapping;
 
@@ -116,8 +126,8 @@ impl MarkerAlignment {
             target_pos_map.insert((chrom_norm, marker.pos), m);
         }
 
-        let mut ref_to_target = vec![-1i32; n_ref_markers];
-        let mut target_to_ref = vec![0usize; n_target_markers];
+        let mut ref_to_target = vec![None; n_ref_markers];
+        let mut target_to_ref = vec![None; n_target_markers];
         let mut allele_mappings: Vec<Option<AlleleMapping>> = vec![None; n_target_markers];
 
         let mut n_strand_flipped = 0usize;
@@ -132,8 +142,8 @@ impl MarkerAlignment {
 
                 if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
                     if mapping.is_valid() {
-                        ref_to_target[m] = target_idx as i32;
-                        target_to_ref[target_idx] = m;
+                        ref_to_target[m] = Some(MarkerIdx::new(target_idx as u32));
+                        target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
 
                         if mapping.strand_flipped {
                             n_strand_flipped += 1;
@@ -170,10 +180,10 @@ impl MarkerAlignment {
 
     /// Get target marker index for a reference marker (returns None if not genotyped)
     #[inline]
-    pub fn target_marker(&self, ref_marker: usize) -> Option<usize> {
-        // Use direct vector access for performance if possible, but keep method for compatibility
-        let idx = *self.ref_to_target.get(ref_marker).unwrap_or(&-1);
-        if idx >= 0 { Some(idx as usize) } else { None }
+    pub fn target_marker(&self, ref_marker: MarkerIdx<RefSpace>) -> Option<MarkerIdx<TargetSpace>> {
+        self.ref_to_target
+            .get(ref_marker.as_usize())
+            .and_then(|idx| *idx)
     }
 
     /// Map a reference allele to target allele space (reverse mapping)
@@ -195,16 +205,21 @@ impl MarkerAlignment {
     }
 
     /// Get reference marker index for a target marker (returns None if not aligned)
-    pub fn target_to_ref(&self, target_marker: usize) -> Option<usize> {
+    pub fn target_to_ref(
+        &self,
+        target_marker: MarkerIdx<TargetSpace>,
+    ) -> Option<MarkerIdx<RefSpace>> {
         // Check allele_mappings to ensure the marker actually aligns.
         // The raw target_to_ref vector initializes with 0s, which is ambiguous.
         if self
             .allele_mappings
-            .get(target_marker)
+            .get(target_marker.as_usize())
             .and_then(|m| m.as_ref())
             .is_some()
         {
-            Some(self.target_to_ref[target_marker])
+            self.target_to_ref
+                .get(target_marker.as_usize())
+                .and_then(|idx| *idx)
         } else {
             None
         }
@@ -212,7 +227,7 @@ impl MarkerAlignment {
 
     /// Get the number of markers that were successfully aligned
     pub fn n_aligned(&self) -> usize {
-        self.ref_to_target.iter().filter(|&&x| x >= 0).count()
+        self.ref_to_target.iter().filter(|x| x.is_some()).count()
     }
 }
 

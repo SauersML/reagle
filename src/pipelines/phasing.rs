@@ -96,14 +96,14 @@ fn partition_markers_by_cm(gen_positions: &[f64], block_cm: f64) -> Vec<(usize, 
 }
 
 /// Phasing pipeline
-pub struct PhasingPipeline {
+pub struct PhasingPipeline<RefSpace = crate::data::AnyMarkerSpace> {
     config: Config,
     params: ModelParams,
     /// Reference panel for reference-guided phasing (optional)
     /// Uses Arc for shared ownership to avoid cloning the large reference panel
-    reference_gt: Option<Arc<GenotypeMatrix<Phased>>>,
+    reference_gt: Option<Arc<GenotypeMatrix<Phased, RefSpace>>>,
     /// Marker alignment between target and reference
-    alignment: Option<MarkerAlignment>,
+    alignment: Option<MarkerAlignment<crate::data::AnyMarkerSpace, RefSpace>>,
     telemetry: Option<Arc<TelemetryBlackboard>>,
 }
 
@@ -610,7 +610,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
     }
 }
 
-impl PhasingPipeline {
+impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
     /// Create a new phasing pipeline
     pub fn new(config: Config, telemetry: Option<Arc<TelemetryBlackboard>>) -> Self {
         let params = ModelParams::new();
@@ -632,12 +632,15 @@ impl PhasingPipeline {
     /// Uses Arc for shared ownership to avoid cloning the large reference panel.
     pub fn set_reference(
         &mut self,
-        reference: Arc<GenotypeMatrix<Phased>>,
-        alignment: MarkerAlignment,
+        reference: Arc<GenotypeMatrix<Phased, RefSpace>>,
+        alignment: MarkerAlignment<crate::data::AnyMarkerSpace, RefSpace>,
     ) {
         self.reference_gt = Some(reference);
         self.alignment = Some(alignment);
     }
+}
+
+impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
     /// Run the phasing pipeline
     pub fn run(&mut self) -> Result<()> {
@@ -1221,7 +1224,9 @@ impl PhasingPipeline {
             self.run()
         }
     }
+}
 
+impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
     /// Phase a GenotypeMatrix in-memory with overlap constraint from previous window
     ///
     /// This is like `phase_in_memory` but seeds the phasing with alleles from the
@@ -1670,11 +1675,11 @@ impl PhasingPipeline {
     ///
     /// # Returns
     /// Vector of ThreadedHaps, one per sample
-    fn build_composite_haps_streaming(
+    fn build_composite_haps_streaming<RefPanelSpace>(
         &self,
         target_geno: &mut MutableGenotypes,
-        ref_gt: Option<&GenotypeMatrix<crate::data::storage::phase_state::Phased>>,
-        alignment: Option<&MarkerAlignment>,
+        ref_gt: Option<&GenotypeMatrix<crate::data::storage::phase_state::Phased, RefPanelSpace>>,
+        alignment: Option<&MarkerAlignment<crate::data::AnyMarkerSpace, RefPanelSpace>>,
         n_markers: usize,
         n_total_haps: usize,
         n_samples: usize,
@@ -1815,9 +1820,9 @@ impl PhasingPipeline {
             }
 
             // Build reference alleles aligned into target encoding
-            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
                 for rh in 0..n_ref_haps {
-                    let ref_a = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(rh as u32));
+                    let ref_a = ref_gt.allele(ref_m, HapIdx::new(rh as u32));
                     ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
                 }
             } else {
@@ -1932,9 +1937,9 @@ impl PhasingPipeline {
                 query_alleles[h] = target_geno.get(orig_m, HapIdx::new(h as u32));
             }
 
-            if let Some(ref_m) = alignment.target_to_ref(orig_m) {
+            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
                 for rh in 0..n_ref_haps {
-                    let ref_a = ref_gt.allele(MarkerIdx::new(ref_m as u32), HapIdx::new(rh as u32));
+                    let ref_a = ref_gt.allele(ref_m, HapIdx::new(rh as u32));
                     ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
                 }
             } else {
@@ -2253,7 +2258,6 @@ impl PhasingPipeline {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
-        let markers = target_gt.markers();
         let samples = target_gt.samples_arc();
         let mut gen_positions = Vec::with_capacity(n_markers);
         gen_positions.push(0.0);
@@ -2322,18 +2326,17 @@ impl PhasingPipeline {
                 let ref_geno: &MutableGenotypes = geno;
 
                 // Use Composite view when reference panel is available
-                let ref_view = if let (Some(ref_gt), Some(alignment)) =
-                    (&self.reference_gt, &self.alignment)
-                {
-                    GenotypeView::Composite {
-                        target: ref_geno,
-                        reference: ref_gt,
-                        alignment,
-                        n_target_haps: n_haps,
-                    }
-                } else {
-                    GenotypeView::from((ref_geno, markers))
-                };
+                let ref_view: GenotypeView<'_, crate::data::AnyMarkerSpace, RefSpace> =
+                    if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                        GenotypeView::Composite {
+                            target: ref_geno,
+                            reference: ref_gt,
+                            alignment,
+                            n_target_haps: n_haps,
+                        }
+                    } else {
+                        GenotypeView::Mutable(ref_geno)
+                    };
 
                 let prior_paths = &mcmc_paths[..];
                 let mut swap_results: Vec<(BitVec<u8, Lsb0>, Option<MosaicPaths>)> =
@@ -3107,19 +3110,20 @@ impl PhasingPipeline {
                     .get(m)
                     .and_then(|m| m.as_ref());
                 if let Some(mapping) = mapping {
-                    let ref_idx = alignment.target_to_ref.get(m).copied().unwrap_or(0);
-                    if n_ref_haps > 0.0 {
-                        let ref_col = ref_gt.column(MarkerIdx::new(ref_idx as u32));
-                        let ref_alt = (ref_col.alt_count() as f32 + prior_alpha)
-                            / (n_ref_haps + prior_alpha + prior_beta);
-                        if let Some(&targ_to_ref_alt) = mapping.targ_to_ref.get(1) {
-                            if targ_to_ref_alt == 1 {
-                                freqs[m] = ref_alt.clamp(0.0, 1.0);
-                                continue;
-                            }
-                            if targ_to_ref_alt == 0 {
-                                freqs[m] = (1.0 - ref_alt).clamp(0.0, 1.0);
-                                continue;
+                    if let Some(ref_idx) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                        if n_ref_haps > 0.0 {
+                            let ref_col = ref_gt.column(ref_idx);
+                            let ref_alt = (ref_col.alt_count() as f32 + prior_alpha)
+                                / (n_ref_haps + prior_alpha + prior_beta);
+                            if let Some(&targ_to_ref_alt) = mapping.targ_to_ref.get(1) {
+                                if targ_to_ref_alt == 1 {
+                                    freqs[m] = ref_alt.clamp(0.0, 1.0);
+                                    continue;
+                                }
+                                if targ_to_ref_alt == 0 {
+                                    freqs[m] = (1.0 - ref_alt).clamp(0.0, 1.0);
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -3270,9 +3274,9 @@ impl PhasingPipeline {
                 } else {
                     let ref_h = hap - n_haps;
                     if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                        if let Some(ref_m) = alignment.target_to_ref(marker) {
-                            let ref_allele = ref_gt
-                                .allele(MarkerIdx::new(ref_m as u32), HapIdx::new(ref_h as u32));
+                        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(marker as u32))
+                        {
+                            let ref_allele = ref_gt.allele(ref_m, HapIdx::new(ref_h as u32));
                             alignment.reverse_map_allele(marker, ref_allele)
                         } else {
                             255
@@ -3564,11 +3568,10 @@ impl PhasingPipeline {
                             if let (Some(ref_gt), Some(alignment)) =
                                 (&self.reference_gt, &self.alignment)
                             {
-                                if let Some(ref_m) = alignment.target_to_ref(marker) {
-                                    let ref_allele = ref_gt.allele(
-                                        MarkerIdx::new(ref_m as u32),
-                                        HapIdx::new(ref_h as u32),
-                                    );
+                                if let Some(ref_m) =
+                                    alignment.target_to_ref(MarkerIdx::new(marker as u32))
+                                {
+                                    let ref_allele = ref_gt.allele(ref_m, HapIdx::new(ref_h as u32));
                                     alignment.reverse_map_allele(marker, ref_allele)
                                 } else {
                                     255 // Missing - marker not in reference
@@ -6101,7 +6104,7 @@ impl Stage2Phaser {
     }
 }
 
-impl PhasingPipeline {
+impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
     /// Phase a window with PBWT state handoff from previous window
     ///
     /// This maintains PBWT continuity across windows by passing the
@@ -6353,7 +6356,7 @@ mod tests {
             profile: false,
         };
 
-        let pipeline = PhasingPipeline::new(config, None);
+        let pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
         assert_eq!(pipeline.params.n_states, 280);
     }
 
@@ -6373,7 +6376,7 @@ mod tests {
         use crate::data::marker::Nucleotide;
 
         // Mock Markers
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         markers.add_chrom("chr1");
 
         for i in 0..n_markers {
@@ -6440,7 +6443,7 @@ mod tests {
             profile: false,
         };
 
-        let mut pipeline = PhasingPipeline::new(config, None);
+        let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
 
         // Run phasing (with no overlap from previous window)
         let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None, None, None);
