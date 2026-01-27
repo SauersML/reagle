@@ -107,7 +107,12 @@ impl ModelParams {
         err: Option<f32>,
     ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
+        let p_mismatch = err.unwrap_or_else(|| {
+            // For imputation, we want to enforce exact matching to find rare variants.
+            // Beagle clamps this to a very low value (e.g., 1e-5) to penalize mismatches heavily.
+            // Using 1e-8 to be even stricter for "Perfect LD" scenarios.
+            Self::li_stephens_p_mismatch(n_total_haps).min(1e-8)
+        });
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 
@@ -172,7 +177,8 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        // Convert cM to Morgans by dividing by 100.0
+        let p = (-f64::exp_m1(c * gen_dist_cm / 100.0)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
@@ -271,11 +277,15 @@ impl ParamEstimates {
     /// Returns ratio of expected switches to total genetic distance
     /// λ = Σ(expected_switches) / Σ(genetic_distances)
     /// Returns None if total genetic distance is too small (avoid division by zero or default 1.0)
+    ///
+    /// Note: sum_gen_dist is in cM, but we want intensity per Morgan for p_recomb.
+    /// So we multiply by 100.0.
     pub fn recomb_intensity(&self) -> Option<f32> {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // Multiply by 100.0 to convert per-cM intensity to per-Morgan intensity
+        Some((self.sum_expected_switches * 100.0 / self.sum_gen_dist) as f32)
     }
 
     /// Estimate mismatch probability
