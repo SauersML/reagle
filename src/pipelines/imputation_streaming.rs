@@ -1229,8 +1229,13 @@ target_samples={} target_bytes={}",
         phased_overlap: Option<&PhasedOverlap>,
         pbwt_state: Option<&PbwtState>,
     ) -> Result<GenotypeMatrix<Phased>> {
+        // Create phasing config with p_mismatch from imputation params (which use global counts)
+        // This ensures parameter consistency between imputation and phasing steps
+        let mut phasing_config = self.config.clone();
+        phasing_config.err = Some(self.params.p_mismatch);
+
         let mut phasing =
-            crate::pipelines::PhasingPipeline::new(self.config.clone(), self.telemetry.clone());
+            crate::pipelines::PhasingPipeline::new(phasing_config, self.telemetry.clone());
         if let Some(ref_gt) = ref_gt {
             let ref_gt_arc = Arc::new(ref_gt.clone());
             phasing.set_reference(ref_gt_arc, alignment.clone());
