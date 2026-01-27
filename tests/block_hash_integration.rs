@@ -76,7 +76,10 @@ fn test_default_constants() {
 #[test]
 fn test_readme_documentation_exists() {
     // Verify that documentation files exist
-    let readme_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/model/block_hash/README.md");
+    let readme_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/model/block_hash/README.md"
+    );
     assert!(
         std::path::Path::new(readme_path).exists(),
         "README.md should exist"

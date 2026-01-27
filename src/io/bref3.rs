@@ -724,13 +724,14 @@ impl StreamingBref3WindowReader {
                     recomb_rates.push(params.p_recomb(dist_cm));
                 }
                 let start_marker = window_size - block_markers.len();
-                let block = crate::model::block_hash::compression::build_compressed_block_from_columns(
-                    &block_markers,
-                    &block_columns,
-                    start_marker,
-                    max_states,
-                    &recomb_rates,
-                );
+                let block =
+                    crate::model::block_hash::compression::build_compressed_block_from_columns(
+                        &block_markers,
+                        &block_columns,
+                        start_marker,
+                        max_states,
+                        &recomb_rates,
+                    );
                 blocks.push(Arc::new(block));
                 block_markers.clear();
                 block_columns.clear();
@@ -1111,10 +1112,7 @@ impl StreamingRefVcfReader {
                 break;
             };
 
-            let marker_chrom = self
-                .markers
-                .chrom_name(marker.marker.chrom)
-                .unwrap_or("");
+            let marker_chrom = self.markers.chrom_name(marker.marker.chrom).unwrap_or("");
             if let Some(cur) = self.current_chrom.as_ref() {
                 if marker_chrom != cur.as_ref() {
                     if window_size == 0 {
@@ -1185,13 +1183,14 @@ impl StreamingRefVcfReader {
                     recomb_rates.push(params.p_recomb(dist_cm));
                 }
                 let start_marker = window_size - block_markers.len();
-                let block = crate::model::block_hash::compression::build_compressed_block_from_columns(
-                    &block_markers,
-                    &block_columns,
-                    start_marker,
-                    max_states,
-                    &recomb_rates,
-                );
+                let block =
+                    crate::model::block_hash::compression::build_compressed_block_from_columns(
+                        &block_markers,
+                        &block_columns,
+                        start_marker,
+                        max_states,
+                        &recomb_rates,
+                    );
                 blocks.push(Arc::new(block));
                 block_markers.clear();
                 block_columns.clear();
@@ -1376,6 +1375,7 @@ impl StreamingRefVcfReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::marker::Nucleotide;
     use std::io::Cursor;
 
     #[test]
@@ -1447,9 +1447,9 @@ mod tests {
         let allele_strs = vec!["A".to_string(), "G".to_string()];
         let (ref_allele, alt_alleles, end) = parse_alleles(&allele_strs, None);
 
-        assert_eq!(ref_allele, Allele::Base(0));
+        assert_eq!(ref_allele, Allele::Base(Nucleotide::A));
         assert_eq!(alt_alleles.len(), 1);
-        assert_eq!(alt_alleles[0], Allele::Base(2));
+        assert_eq!(alt_alleles[0], Allele::Base(Nucleotide::G));
         assert!(end.is_none());
     }
 
@@ -1463,7 +1463,7 @@ mod tests {
         ];
         let (ref_allele, alt_alleles, ..) = parse_alleles(&allele_strs, None);
 
-        assert_eq!(ref_allele, Allele::Base(0));
+        assert_eq!(ref_allele, Allele::Base(Nucleotide::A));
         assert_eq!(alt_alleles.len(), 3);
     }
 
@@ -1474,7 +1474,7 @@ mod tests {
 
         assert!(matches!(ref_allele, Allele::Seq(_)));
         assert_eq!(alt_alleles.len(), 1);
-        assert_eq!(alt_alleles[0], Allele::Base(0));
+        assert_eq!(alt_alleles[0], Allele::Base(Nucleotide::A));
     }
 
     #[test]

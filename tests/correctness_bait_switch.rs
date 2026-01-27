@@ -4,8 +4,8 @@ use reagle::pipelines::imputation::ImputationPipeline;
 use noodles::bgzf::io as bgzf_io;
 use noodles::vcf as noodles_vcf;
 use noodles_vcf::variant::record::samples::Sample;
-use noodles_vcf::variant::record::samples::series::value::Array;
 use noodles_vcf::variant::record::samples::series::Value;
+use noodles_vcf::variant::record::samples::series::value::Array;
 
 use serial_test::serial;
 
@@ -28,27 +28,21 @@ fn write_biallelic_vcf(
 
     writeln!(f, "##fileformat=VCFv4.2").unwrap();
     writeln!(f, "##FILTER=<ID=PASS,Description=\"All filters passed\">").unwrap();
-    writeln!(f, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">").unwrap();
-    writeln!(f, "##contig=<ID=chr1,length=1000000>").unwrap();
-
-    write!(
+    writeln!(
         f,
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
     )
     .unwrap();
+    writeln!(f, "##contig=<ID=chr1,length=1000000>").unwrap();
+
+    write!(f, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").unwrap();
     for s in sample_names {
         write!(f, "\t{}", s).unwrap();
     }
     writeln!(f).unwrap();
 
     for (m, pos) in positions_bp.iter().copied().enumerate() {
-        write!(
-            f,
-            "chr1\t{}\trs{}\tA\tT\t.\tPASS\t.\tGT",
-            pos,
-            m
-        )
-        .unwrap();
+        write!(f, "chr1\t{}\trs{}\tA\tT\t.\tPASS\t.\tGT", pos, m).unwrap();
 
         for sample_gts in gt_strings_per_sample {
             write!(f, "\t{}", sample_gts[m]).unwrap();
@@ -64,7 +58,10 @@ fn read_single_sample_ds_by_record_index(path: &Path) -> Vec<f64> {
     let mut reader = noodles_vcf::io::Reader::new(decoder);
 
     let header = reader.read_header().expect("read VCF header");
-    assert!(header.formats().contains_key("DS"), "DS missing from output");
+    assert!(
+        header.formats().contains_key("DS"),
+        "DS missing from output"
+    );
 
     let mut ds = Vec::new();
 

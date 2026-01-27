@@ -37,6 +37,8 @@ pub struct SamplePhase {
     hap2: Vec<u8>,
     /// Genotype confidence per marker (0.0-1.0)
     confidence: Vec<f32>,
+    /// Phase confidence per marker (0.0-1.0) for the current orientation
+    phase_confidence: Vec<f32>,
     /// Status of each marker
     status: Vec<ClusterStatus>,
     /// Count of each status type for quick access
@@ -74,6 +76,7 @@ impl SamplePhase {
         let confidence: Vec<f32> = confidence.to_vec();
 
         let mut status = Vec::with_capacity(n_markers);
+        let mut phase_confidence = Vec::with_capacity(n_markers);
         let mut status_counts = [0usize; ClusterStatus::COUNT];
 
         let mut missing_idx = 0;
@@ -97,12 +100,21 @@ impl SamplePhase {
             let st = Self::determine_status(is_missing, is_unphased, a1, a2);
             status_counts[st as usize] += 1;
             status.push(st);
+            let phase_p = if is_missing || a1 == a2 {
+                1.0
+            } else if is_unphased {
+                0.5
+            } else {
+                1.0
+            };
+            phase_confidence.push(phase_p);
         }
 
         Self {
             hap1,
             hap2,
             confidence,
+            phase_confidence,
             status,
             status_counts,
         }
@@ -140,6 +152,18 @@ impl SamplePhase {
     #[inline]
     pub fn confidence(&self, marker: usize) -> f32 {
         self.confidence[marker]
+    }
+
+    /// Returns the per-marker phase confidence (0.0-1.0) for the current orientation.
+    #[inline]
+    pub fn phase_confidence(&self, marker: usize) -> f32 {
+        self.phase_confidence[marker]
+    }
+
+    /// Set phase confidence for a marker (0.0-1.0) for the current orientation.
+    #[inline]
+    pub fn set_phase_confidence(&mut self, marker: usize, p: f32) {
+        self.phase_confidence[marker] = p.clamp(0.0, 1.0);
     }
 
     /// Returns true if the marker is an unphased heterozygote.
@@ -197,6 +221,7 @@ impl SamplePhase {
             self.status_counts[ClusterStatus::Missing as usize] -= 1;
             self.status_counts[ClusterStatus::Phased as usize] += 1;
             self.status[marker] = ClusterStatus::Phased;
+            self.phase_confidence[marker] = 1.0;
         }
     }
 }

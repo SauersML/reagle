@@ -383,6 +383,12 @@ impl BidirectionalPhaseIbs {
         ibs2: &Ibs2,
         n_candidates: usize,
     ) -> Vec<u32> {
+        let span = self.best_match_span(hap_idx, marker_idx);
+        let n_candidates = if span < PBWT_CHECKPOINT_INTERVAL / 2 {
+            n_candidates.saturating_mul(2)
+        } else {
+            n_candidates
+        };
         let mut neighbors = Vec::with_capacity(n_candidates * 2 + 10);
         let sample = SampleIdx::new(hap_idx / 2);
 
@@ -395,7 +401,9 @@ impl BidirectionalPhaseIbs {
         // Strict handling of subset_to_global mapping to prevent silent fallback errors
         // IBS2 segments use global marker indices.
         let ibs2_marker_idx = match &self.subset_to_global {
-            Some(mapping) => *mapping.get(marker_idx).expect("Marker index out of bounds for subset mapping"),
+            Some(mapping) => *mapping
+                .get(marker_idx)
+                .expect("Marker index out of bounds for subset mapping"),
             None => marker_idx,
         };
 

@@ -21,6 +21,13 @@ pub struct RefAlleleLookup {
 }
 
 impl RefAlleleLookup {
+    #[cfg(test)]
+    pub fn new_raw(alleles: Vec<u8>, n_states: usize) -> Self {
+        Self {
+            alleles: AVec::from_iter(32, alleles.into_iter()),
+            n_states,
+        }
+    }
     /// Create a new lookup directly from ThreadedHaps without intermediate allocation.
     ///
     /// This avoids the O(n_markers × n_states × 4) temporary from materialize_all().
@@ -47,8 +54,10 @@ impl RefAlleleLookup {
             let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
             let ref_m_opt = alignment.and_then(|a| a.target_to_ref(orig_m));
 
-            move |hap: u32| {
-                let hap = hap as usize;
+            use crate::model::block_hash::types::GlobalId;
+
+            move |hap: GlobalId| {
+                let hap = hap.as_u32() as usize;
                 if hap < n_target_haps {
                     ref_geno.get(orig_m, HapIdx::new(hap as u32))
                 } else {

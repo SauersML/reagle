@@ -20,6 +20,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
+use crate::model::block_hash::types::GlobalId;
 use crate::model::states::ThreadedHaps;
 
 /// Entry in the priority queue for managing composite haplotypes
@@ -28,7 +29,7 @@ struct CompHapEntry {
     /// Index into the composite haplotypes array
     comp_hap_idx: usize,
     /// Current reference haplotype
-    hap: u32,
+    hap: GlobalId,
     /// Marker index where this segment starts
     start_marker: usize,
     /// Last marker where this hap was seen in IBS matches
@@ -67,14 +68,19 @@ pub struct PhaseStates {
     /// Composite haplotypes (the HMM states) - Optimized Arena
     threaded_haps: ThreadedHaps,
     /// Map from reference haplotype to last IBS marker
-    hap_to_last_ibs: HashMap<u32, i32>,
+    hap_to_last_ibs: HashMap<GlobalId, i32>,
     /// Priority queue for managing composite haplotypes
     queue: BinaryHeap<CompHapEntry>,
+    /// Track new candidate haplotypes seen but not yet admitted
+    pending_last_seen: HashMap<GlobalId, i32>,
     /// Number of markers
     n_markers: usize,
 }
 
 const NIL: i32 = -103;
+const MIN_EVICT_GAP_DIV: usize = 20;
+const MIN_EVICT_GAP_MIN: i32 = 20;
+const MIN_SEGMENT_LEN_MIN: i32 = 20;
 
 impl PhaseStates {
     /// Create a new phase state selector
@@ -88,6 +94,7 @@ impl PhaseStates {
             threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_markers),
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
+            pending_last_seen: HashMap::with_capacity(max_states),
             n_markers,
         }
     }
@@ -97,6 +104,7 @@ impl PhaseStates {
         self.threaded_haps.clear();
         self.hap_to_last_ibs.clear();
         self.queue.clear();
+        self.pending_last_seen.clear();
     }
 
     /// Add an IBS haplotype at a marker
@@ -105,7 +113,7 @@ impl PhaseStates {
     /// - If the hap is already in the queue, just update its last IBS marker
     /// - If the hap is new and queue isn't full, add it
     /// - If queue is full and the oldest entry is stale enough, replace it
-    fn add_ibs_hap(&mut self, ibs_hap: u32, marker: i32) {
+    fn add_ibs_hap(&mut self, ibs_hap: GlobalId, marker: i32) {
         // Check if hap is already being tracked
         if let Some(&last_marker) = self.hap_to_last_ibs.get(&ibs_hap) {
             if last_marker != NIL {
@@ -133,9 +141,35 @@ impl PhaseStates {
                 last_ibs_marker: marker,
             });
             self.hap_to_last_ibs.insert(ibs_hap, marker);
+            self.pending_last_seen.remove(&ibs_hap);
         } else if !self.queue.is_empty() {
+            let min_gap = (self.n_markers / MIN_EVICT_GAP_DIV).max(1) as i32;
+            let min_gap = min_gap.max(MIN_EVICT_GAP_MIN);
+
+            let admit = match self.pending_last_seen.get(&ibs_hap).copied() {
+                Some(prev) => marker - prev >= min_gap,
+                None => {
+                    self.pending_last_seen.insert(ibs_hap, marker);
+                    false
+                }
+            };
+            if !admit {
+                return;
+            }
+            self.pending_last_seen.remove(&ibs_hap);
+
             // Queue is full - evict oldest (LRU) to make room for new match
             let head = self.queue.pop().unwrap();
+            let min_seg_len = (self.n_markers / MIN_EVICT_GAP_DIV).max(1) as i32;
+            let min_seg_len = min_seg_len.max(MIN_SEGMENT_LEN_MIN);
+
+            let head_start = head.start_marker as i32;
+            if marker - head.last_ibs_marker < min_gap || marker - head_start < min_seg_len
+            {
+                // Preserve active states to avoid churn; defer adding this hap.
+                self.queue.push(head);
+                return;
+            }
             let index = head.comp_hap_idx;
             let prev_hap = head.hap;
             let prev_start = head.start_marker;
@@ -205,13 +239,14 @@ impl PhaseStates {
         for _ in 0..n_states {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             let h = (seed % n_haps as u64) as u32;
-            if h / 2 != sample && !self.hap_to_last_ibs.contains_key(&h) {
+            let hap_id = GlobalId::from(h);
+            if h / 2 != sample && !self.hap_to_last_ibs.contains_key(&hap_id) {
                 let index = self.threaded_haps.n_states();
-                self.threaded_haps.push_new(h);
-                self.hap_to_last_ibs.insert(h, 0);
+                self.threaded_haps.push_new(hap_id);
+                self.hap_to_last_ibs.insert(hap_id, 0);
                 self.queue.push(CompHapEntry {
                     comp_hap_idx: index,
-                    hap: h,
+                    hap: hap_id,
                     start_marker: 0,
                     last_ibs_marker: 0,
                 });
@@ -258,14 +293,14 @@ impl PhaseStates {
         // Add neighbors from haplotype 1
         for &ibs_hap in neighbors1 {
             if ibs_hap / 2 != sample {
-                self.add_ibs_hap(ibs_hap, marker_i32);
+                self.add_ibs_hap(GlobalId::from(ibs_hap), marker_i32);
             }
         }
 
         // Add neighbors from haplotype 2
         for &ibs_hap in neighbors2 {
             if ibs_hap / 2 != sample {
-                self.add_ibs_hap(ibs_hap, marker_i32);
+                self.add_ibs_hap(GlobalId::from(ibs_hap), marker_i32);
             }
         }
     }
@@ -305,9 +340,9 @@ mod tests {
         assert_eq!(ps.n_states(), 0);
 
         // Add some IBS haps
-        ps.add_ibs_hap(0, 0);
-        ps.add_ibs_hap(2, 0);
-        ps.add_ibs_hap(4, 10);
+        ps.add_ibs_hap(GlobalId::from(0u32), 0);
+        ps.add_ibs_hap(GlobalId::from(2u32), 0);
+        ps.add_ibs_hap(GlobalId::from(4u32), 10);
 
         assert!(ps.n_states() > 0);
     }
@@ -317,12 +352,12 @@ mod tests {
         let mut ps = PhaseStates::new(2, 1000); // Only 2 states
 
         // Fill up the queue
-        ps.add_ibs_hap(0, 0);
-        ps.add_ibs_hap(2, 0);
+        ps.add_ibs_hap(GlobalId::from(0u32), 0);
+        ps.add_ibs_hap(GlobalId::from(2u32), 0);
 
         // This should trigger replacement after enough markers
         for m in 1..200 {
-            ps.add_ibs_hap(4, m);
+            ps.add_ibs_hap(GlobalId::from(4u32), m);
         }
 
         // Should have replaced one of the original haps
@@ -334,10 +369,10 @@ mod tests {
         let mut ps = PhaseStates::new(2, 1000);
 
         // Add haplotype 0 at marker 0
-        ps.add_ibs_hap(0, 0);
+        ps.add_ibs_hap(GlobalId::from(0u32), 0);
 
         // Add haplotype 2 at marker 0 (second state)
-        ps.add_ibs_hap(2, 0);
+        ps.add_ibs_hap(GlobalId::from(2u32), 0);
 
         // Now simulate IBS matches later that should cause segment changes
         // With LRU eviction, new IBS matches always replace oldest when queue is full
@@ -345,7 +380,7 @@ mod tests {
         // Add haplotype 10 repeatedly starting at marker 100
         // This should eventually replace one of the original states' segments
         for m in 100..300 {
-            ps.add_ibs_hap(10, m);
+            ps.add_ibs_hap(GlobalId::from(10u32), m);
         }
 
         ps.finalize();
@@ -359,7 +394,7 @@ mod tests {
         // Verify that at least one state has had a segment change by checking
         // if the haplotype changes across markers
         let mut found_segment_change = false;
-        let mut buffer = vec![0u32; th.n_states()];
+        let mut buffer = vec![GlobalId::from(0u32); th.n_states()];
 
         for state in 0..th.n_states() {
             th.materialize_at(0, &mut buffer);
@@ -381,6 +416,73 @@ mod tests {
              dynamic composite haplotypes. All states have the same haplotype \
              from start to end, meaning we're back to static state selection. \
              This defeats the purpose of the PhaseStates implementation."
+        );
+    }
+    #[test]
+    fn test_eviction_bias() {
+        // Setup distinct pools: small capacity
+        let max_states = 10;
+        let n_markers = 100;
+        let mut ps = PhaseStates::new(max_states, n_markers);
+
+        // Sets of "perfect match" reference haplotypes
+        let set_a: Vec<u32> = (0..5).collect(); // [0, 1, 2, 3, 4]
+        let set_b: Vec<u32> = (10..15).collect(); // [10, 11, 12, 13, 14]
+
+        // Important: sample=999 is set to avoid excluding any specific neighbors
+        // (the code excludes if ibs_hap / 2 == sample)
+
+        // Simulate Streaming
+        for m in 0..n_markers {
+            // Force "H2 after H1" insertion repeatedly
+            ps.add_neighbors_at_marker(999, m, &set_a, &set_b);
+        }
+
+        // Inspect Result
+        let th = ps.finalize_streaming(999, 1000);
+
+        let mut count_a = 0;
+        let mut count_b = 0;
+        let mut buffer = vec![GlobalId::from(0u32); th.n_states()];
+
+        // Check reference haplotype used at last marker
+        th.materialize_at(n_markers - 1, &mut buffer);
+
+        println!(
+            "Capacity: {}, H1 Set size: {}, H2 Set size: {}",
+            max_states,
+            set_a.len(),
+            set_b.len()
+        );
+        println!("State | Final Ref Hap ID | Origin");
+        println!("---------------------------------");
+
+        for (i, &hap_id) in buffer.iter().enumerate() {
+            let id = hap_id.as_u32();
+            let origin = if set_a.contains(&id) {
+                count_a += 1;
+                "Set A (H1)"
+            } else if set_b.contains(&id) {
+                count_b += 1;
+                "Set B (H2)"
+            } else {
+                "Unknown"
+            };
+            println!("{:<5} | {:<16} | {}", i, id, origin);
+        }
+
+        println!(
+            "Final Counts -> H1_Matches: {}, H2_Matches: {}",
+            count_a, count_b
+        );
+
+        // The Failure Assertion
+        // We expect a mix, or at least fairness. If H1 matches are wiped out, that's bad.
+        assert!(
+            count_a > 2,
+            "Eviction bias detected! H1 matches (Set A) were evicted. count_a={}, count_b={}",
+            count_a,
+            count_b
         );
     }
 }

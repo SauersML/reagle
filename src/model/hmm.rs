@@ -152,6 +152,9 @@ impl HmmUpdater {
     ///
     /// beta[i] = (1.0 - r) * emissions[i] * beta[i] + r * C
     /// where C = sum(emissions[j] * beta[j]) over all j
+    ///
+    /// IMPORTANT: The result is normalized by C to prevent underflow:
+    /// beta_new[i] = beta_raw[i] / C
     #[inline]
     pub fn bwd_update_constant(
         bwd: &mut [f32],
@@ -160,11 +163,14 @@ impl HmmUpdater {
         constant_term: f32, // C
         n_states: usize,
     ) {
-        let r_const = (p_switch / n_states as f32) * constant_term; // (r/N) * C
-        let scale = 1.0 - p_switch; // 1 - r
+        // Normalize by constant term C to prevent underflow
+        let inv_c = 1.0 / constant_term.max(1e-30);
+
+        let shift = p_switch / n_states as f32; // p/N
+        let scale = (1.0 - p_switch) * inv_c; // (1-p)/C
 
         let scale_vec = f32x8::splat(scale);
-        let const_vec = f32x8::splat(r_const);
+        let shift_vec = f32x8::splat(shift);
 
         let mut k = 0;
         while k + 8 <= n_states {
@@ -176,16 +182,16 @@ impl HmmUpdater {
             emit_arr.copy_from_slice(&emissions[k..k + 8]);
             let emit_vec = f32x8::from(emit_arr);
 
-            // res = (scale * emit * bwd) + const
-            let res = (scale_vec * emit_vec * bwd_chunk) + const_vec;
-            
+            // res = (scale * emit * bwd) + shift
+            let res = (scale_vec * emit_vec * bwd_chunk) + shift_vec;
+
             let res_arr: [f32; 8] = res.into();
             bwd[k..k + 8].copy_from_slice(&res_arr);
             k += 8;
         }
 
         for i in k..n_states {
-            bwd[i] = scale * emissions[i] * bwd[i] + r_const;
+            bwd[i] = scale * emissions[i] * bwd[i] + shift;
         }
     }
 }
@@ -329,16 +335,15 @@ impl<'a> BeagleHmm<'a> {
 
             scratch.materialize(&cursor, m, |marker, hap| {
                 self.ref_gt
-                    .allele(MarkerIdx::new(marker as u32), HapIdx::new(hap))
+                    .allele(MarkerIdx::new(marker as u32), HapIdx::new(hap.as_u32()))
             });
 
             if let Some(plp) = pl_provider {
                 let partner = partner_alleles.get(m).copied().unwrap_or(255);
                 let pl = plp.pl(m).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
-                    let biallelic_freqs = allele_freqs
-                        .and_then(|f| f.get(m).copied())
-                        .and_then(|f| {
+                    let biallelic_freqs =
+                        allele_freqs.and_then(|f| f.get(m).copied()).and_then(|f| {
                             if (0.0..=1.0).contains(&f) {
                                 Some([1.0 - f, f])
                             } else {
@@ -449,7 +454,7 @@ impl<'a> BeagleHmm<'a> {
                 let hap = cursor.active_haps()[k];
                 scratch.alleles[k] = self
                     .ref_gt
-                    .allele(MarkerIdx::new(m_next as u32), HapIdx::new(hap));
+                    .allele(MarkerIdx::new(m_next as u32), HapIdx::new(hap.as_u32()));
             }
 
             if let Some(plp) = pl_provider {
@@ -622,9 +627,8 @@ impl<'a> BeagleHmm<'a> {
                 let partner = partner_alleles.get(m).copied().unwrap_or(255);
                 let pl = plp.pl(m).filter(|v| !v.is_empty());
                 if let Some(pl) = pl {
-                    let biallelic_freqs = allele_freqs
-                        .and_then(|f| f.get(m).copied())
-                        .and_then(|f| {
+                    let biallelic_freqs =
+                        allele_freqs.and_then(|f| f.get(m).copied()).and_then(|f| {
                             if (0.0..=1.0).contains(&f) {
                                 Some([1.0 - f, f])
                             } else {
@@ -862,7 +866,7 @@ impl<'a> BeagleHmm<'a> {
                 for k in 0..n_states {
                     let ref_al = self
                         .ref_gt
-                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k].as_u32()));
                     let is_mismatch = ref_al != targ_al;
                     let em = if is_mismatch { p_err } else { p_no_err };
                     fwd[k] = em * (scale * fwd[k] + shift);
@@ -876,7 +880,7 @@ impl<'a> BeagleHmm<'a> {
                 for k in 0..n_states {
                     let ref_al = self
                         .ref_gt
-                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                        .allele(marker_idx, HapIdx::new(cursor.active_haps()[k].as_u32()));
                     let is_mismatch = ref_al != targ_al;
                     let em = if is_mismatch { p_err } else { p_no_err };
                     fwd[k] = em * prior;
@@ -943,7 +947,7 @@ impl<'a> BeagleHmm<'a> {
                 for k in 0..n_states {
                     let ref_al = self.ref_gt.allele(
                         recomp_marker_idx,
-                        HapIdx::new(recomp_cursor.active_haps()[k]),
+                        HapIdx::new(recomp_cursor.active_haps()[k].as_u32()),
                     );
                     let is_mismatch = ref_al != recomp_targ_al;
                     let em = if is_mismatch { p_err } else { p_no_err };
@@ -968,7 +972,7 @@ impl<'a> BeagleHmm<'a> {
             for k in 0..n_states {
                 let ref_al = self
                     .ref_gt
-                    .allele(marker_idx, HapIdx::new(cursor.active_haps()[k]));
+                    .allele(marker_idx, HapIdx::new(cursor.active_haps()[k].as_u32()));
                 let is_mismatch = ref_al != targ_al;
                 let em = if is_mismatch { p_err } else { p_no_err };
 
@@ -1011,7 +1015,7 @@ impl<'a> BeagleHmm<'a> {
 
                 for k in 0..n_states {
                     let h = cursor.active_haps()[k];
-                    let r = self.ref_gt.allele(marker_idx, HapIdx::new(h));
+                    let r = self.ref_gt.allele(marker_idx, HapIdx::new(h.as_u32()));
                     mismatches[k] = if r == targ_al_next { 0 } else { 1 };
                 }
 
@@ -1026,8 +1030,9 @@ mod tests {
     use super::*;
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
-    use crate::data::marker::{Allele, Marker, Markers};
+    use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::model::block_hash::types::GlobalId;
     use std::sync::Arc;
 
     fn make_test_ref_panel() -> GenotypeMatrix {
@@ -1046,8 +1051,8 @@ mod tests {
                 ChromIdx::new(0),
                 (i * 1000 + 100) as u32,
                 None,
-                Allele::Base(0),
-                vec![Allele::Base(1)],
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::C)],
             );
             markers.push(m);
 
@@ -1105,15 +1110,15 @@ mod tests {
         let mut threaded_haps = ThreadedHaps::new(n_states, n_states * 2, n_markers);
 
         // State 0: hap 0 for markers 0-2, then hap 1 for markers 3-4 (segment switch at marker 3)
-        threaded_haps.push_new(0);
-        threaded_haps.add_segment(0, 1, 3);
+        threaded_haps.push_new(GlobalId::new(0));
+        threaded_haps.add_segment(0, GlobalId::new(1), 3);
 
         // State 1: hap 2 for entire chromosome (no switch - tests static case too)
-        threaded_haps.push_new(2);
+        threaded_haps.push_new(GlobalId::new(2));
 
         // State 2: hap 4 for markers 0-1, then hap 5 for markers 2-4 (segment switch at marker 2)
-        threaded_haps.push_new(4);
-        threaded_haps.add_segment(2, 5, 2);
+        threaded_haps.push_new(GlobalId::new(4));
+        threaded_haps.add_segment(2, GlobalId::new(5), 2);
 
         let hmm = BeagleHmm::new(&ref_panel, &params, n_states, p_recomb);
 
@@ -1356,7 +1361,7 @@ mod tests {
 
     #[test]
     fn test_bwd_update_constant_normalization() {
-        // Formula: bwd[i] = (1-r)*e[i]*bwd[i] + (r/N)*C
+        // Formula: bwd[i] = ( (1-r)*e[i]*bwd[i] + (r/N)*C ) / C
         let n_states = 2;
         let mut bwd = vec![1.0, 1.0];
         let p_switch = 0.1;
@@ -1365,10 +1370,14 @@ mod tests {
 
         HmmUpdater::bwd_update_constant(&mut bwd, p_switch, &emissions, constant_term, n_states);
 
+        // Expected result: 0.5 (normalized)
         assert!(
-            (bwd[0] - 1.0).abs() < 1e-6,
-            "Expected 1.0, got {}. The constant term must be normalized by n_states.",
+            (bwd[0] - 0.5).abs() < 1e-6,
+            "Expected 0.5 (normalized), got {}. The backward update must be normalized by C.",
             bwd[0]
         );
+
+        let sum: f32 = bwd.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "Sum should be 1.0");
     }
 }
