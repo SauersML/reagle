@@ -67,7 +67,7 @@ pub struct Config {
     pub mcmc_steps: usize,
 
     /// Model states for phasing (more states = better accuracy)
-    #[arg(long = "phase-states", default_value = "400")]
+    #[arg(long = "phase-states", default_value = "600")]
     pub phase_states: usize,
 
     /// Rare variant frequency threshold
@@ -96,7 +96,7 @@ pub struct Config {
     pub imp_nsteps: usize,
 
     /// Maximum cM in a marker cluster
-    #[arg(long, default_value = "0.005")]
+    #[arg(long, default_value = "0.00001")]
     pub cluster: f32,
 
     /// PBWT batch memory budget (MB) for imputation state selection
@@ -113,7 +113,7 @@ pub struct Config {
 
     // ============ General Parameters ============
     /// Effective population size
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "1000000")]
     pub ne: f32,
 
     /// Allele mismatch probability (auto-calculated if not specified)
@@ -164,18 +164,18 @@ impl Default for Config {
             mcmc_burnin: 2,
             dynamic_mcmc: false,
             mcmc_steps: 3,
-            phase_states: 400,
+            phase_states: 600,
             rare: 0.002,
             impute: true,
             imp_states: 1600,
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
-            cluster: 0.005,
+            cluster: 0.00001,
             pbwt_batch_mb: 256,
             ap: false,
             gp: false,
-            ne: 100000.0,
+            ne: 1000000.0,
             err: None,
             em: true,
             window: 40.0,

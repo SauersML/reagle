@@ -36,7 +36,7 @@ pub struct ModelParams {
 
 impl ModelParams {
     /// Default phase states
-    pub const DEFAULT_PHASE_STATES: usize = 280;
+    pub const DEFAULT_PHASE_STATES: usize = 600;
 
     /// Default imputation states
     pub const DEFAULT_IMP_STATES: usize = 1600;
