@@ -1,0 +1,87 @@
+============================================================
+IMPUTATION ACCURACY METRICS - DETAILED REPORT
+============================================================
+
+OVERALL STATISTICS
+----------------------------------------
+Sites compared: 13105
+Genotypes compared: 10719890
+Calculation time: 1232.0s
+
+ACCURACY METRICS
+----------------------------------------
+F1 Score (Non-Ref): 0.674317
+Precision: 0.775644
+Recall: 0.596406
+Unphased concordance: 0.805345
+Non-ref concordance: 0.388337
+Overall R²: 0.521070
+Overall IQS: 0.230494
+SEN (mean): 0.952338
+INFO score (approx): 0.546359
+Hellinger Score: 0.314069
+Switch error rate: 0.409134
+N50 Phase Block: 406267 bp
+
+CONFUSION MATRIX
+----------------------------------------
+                 HomRef        Het     HomAlt
+HomRef          7599853     402226      56825
+Het              927261     574418     222513
+HomAlt           146697     331156     458941
+
+BY MAF BIN
+----------------------------------------
+
+common (>20%):
+  F1 Score: 0.742289
+  Recall: 0.737428
+  Concordance: 0.511934
+  Non-ref concordance: 0.460142
+  R²: 0.226297
+  IQS: 0.159478
+  N genotypes: 2840914
+
+low-freq (1-5%):
+  F1 Score: 0.259060
+  Recall: 0.154430
+  Concordance: 0.954510
+  Non-ref concordance: 0.139531
+  R²: 0.299846
+  IQS: 0.453255
+  N genotypes: 2100624
+
+medium (5-20%):
+  F1 Score: 0.514478
+  Recall: 0.351687
+  Concordance: 0.790295
+  Non-ref concordance: 0.267584
+  R²: 0.482106
+  IQS: 0.395414
+  N genotypes: 2717396
+
+rare (0.5-1%):
+  F1 Score: 0.282945
+  Recall: 0.177399
+  Concordance: 0.983870
+  Non-ref concordance: 0.159571
+  R²: 0.303813
+  IQS: 0.429544
+  N genotypes: 1281806
+
+ultra-rare (<0.1%):
+  F1 Score: 0.002772
+  Recall: 0.003200
+  Concordance: 0.997394
+  R²: 0.000002
+  IQS: -0.924358
+  N genotypes: 552968
+
+very-rare (0.1-0.5%):
+  F1 Score: 0.349866
+  Recall: 0.252661
+  Concordance: 0.989725
+  Non-ref concordance: 0.212804
+  R²: 0.386971
+  IQS: -0.039364
+  N genotypes: 1226182

@@ -24,7 +24,7 @@ pub mod utils;
 pub use config::Config;
 pub use data::genetic_map::{GeneticMap, GeneticMaps, MarkerMap};
 pub use data::haplotype::{HapIdx, SampleIdx, Samples};
-pub use data::marker::{Marker, MarkerIdx, Markers};
+pub use data::marker::{Marker, MarkerIdx, Markers, Nucleotide};
 pub use data::storage::GenotypeMatrix;
 pub use error::{ReagleError, Result};
 pub use io::bref3::Bref3Reader;

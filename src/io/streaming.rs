@@ -64,15 +64,11 @@ pub struct StateProbs {
     pub n_states: usize,
 }
 
-impl StateProbs {
-    pub fn new(data: Vec<Vec<Vec<f32>>>, marker_indices: Vec<usize>, n_states: usize) -> Self {
-        Self {
-            data,
-            marker_indices,
-            n_states,
-        }
-    }
-}
+impl StateProbs {}
+
+/// Global haplotype identifier (stable across windows).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct GlobalHapId(pub u32);
 
 /// Haplotype-indexed state probabilities for soft-information handoff between windows.
 ///
@@ -84,14 +80,14 @@ impl StateProbs {
 #[derive(Clone, Debug)]
 pub struct HaplotypePriors {
     /// Sorted haplotype IDs (for binary search)
-    hap_ids: Vec<u32>,
+    hap_ids: Vec<GlobalHapId>,
     /// Corresponding probabilities (same order as hap_ids)
     probs: Vec<f32>,
 }
 
 impl HaplotypePriors {
     /// Create new priors with invariant enforcement (validation, sorting, normalization)
-    pub fn new(hap_ids: Vec<u32>, probs: Vec<f32>) -> Self {
+    pub fn new(hap_ids: Vec<GlobalHapId>, probs: Vec<f32>) -> Self {
         // Length validation
         assert_eq!(
             hap_ids.len(),
@@ -123,7 +119,7 @@ impl HaplotypePriors {
             assert_ne!(
                 pairs[i - 1].0,
                 pairs[i].0,
-                "HaplotypePriors: duplicate haplotype ID {}",
+                "HaplotypePriors: duplicate haplotype ID {:?}",
                 pairs[i].0
             );
         }
@@ -132,15 +128,17 @@ impl HaplotypePriors {
 
         // Normalize to sum to 1.0
         let sum: f32 = ps.iter().sum();
-        assert!(
-            sum > 0.0,
-            "HaplotypePriors: sum of probabilities must be > 0"
-        );
+        if sum <= 0.0 {
+            return Self::empty();
+        }
         for p in &mut ps {
             *p /= sum;
         }
 
-        Self { hap_ids: ids, probs: ps }
+        Self {
+            hap_ids: ids,
+            probs: ps,
+        }
     }
 
     /// Create empty priors (uniform distribution)
@@ -152,13 +150,21 @@ impl HaplotypePriors {
     }
 
     /// Get reference to sorted haplotype IDs
-    pub fn ids(&self) -> &[u32] {
+    pub fn ids(&self) -> &[GlobalHapId] {
         &self.hap_ids
     }
 
     /// Get reference to probabilities aligned with IDs
     pub fn probs(&self) -> &[f32] {
         &self.probs
+    }
+
+    /// Lookup the probability mass for a specific haplotype ID.
+    pub fn prob_of(&self, hap_id: GlobalHapId) -> Option<f32> {
+        match self.hap_ids.binary_search(&hap_id) {
+            Ok(idx) => self.probs.get(idx).copied(),
+            Err(_) => None,
+        }
     }
 
     /// Check if we have any priors
@@ -194,6 +200,10 @@ pub struct PhasedOverlap {
     /// This enables proper soft-information handoff when HMM states differ between windows
     pub hap_priors: Option<Vec<HaplotypePriors>>,
 
+    /// Global marker index used to export haplotype priors.
+    /// This lets the next window verify it is projecting at the same physical marker.
+    pub prior_stage1_global_marker: Option<usize>,
+
     /// Recombination rate between the prior marker and the first marker of this overlap
     pub incoming_recomb_rate: Option<f32>,
 }
@@ -213,6 +223,7 @@ impl PhasedOverlap {
             n_haps,
             state_probs: None,
             hap_priors: None,
+            prior_stage1_global_marker: None,
             incoming_recomb_rate: None,
         }
     }
@@ -230,6 +241,16 @@ impl PhasedOverlap {
     /// Get haplotype priors if available
     pub fn hap_priors(&self) -> Option<&[HaplotypePriors]> {
         self.hap_priors.as_deref()
+    }
+
+    /// Set the global marker index at which haplotype priors were exported.
+    pub fn set_prior_stage1_global_marker(&mut self, marker: usize) {
+        self.prior_stage1_global_marker = Some(marker);
+    }
+
+    /// Get the global marker index used for haplotype prior export.
+    pub fn prior_stage1_global_marker(&self) -> Option<usize> {
+        self.prior_stage1_global_marker
     }
 
     /// Set recombination rate between the prior marker and overlap start.
@@ -629,7 +650,6 @@ impl StreamingVcfReader {
             } else {
                 GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
             };
-
 
             // Peek ahead to find next window start position (if available)
             // window_end is the index of the first marker NOT in the current output+overlap set.

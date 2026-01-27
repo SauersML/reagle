@@ -100,7 +100,6 @@ impl SeqCodedColumn {
         self.block.get(self.marker_offset, hap)
     }
 
-
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.block.n_haplotypes()

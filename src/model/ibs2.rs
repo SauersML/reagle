@@ -236,6 +236,7 @@ impl Ibs2 {
             .collect()
     }
 
+
     /// Check if two samples are IBS2 at a marker position.
     ///
     /// IBS2 means the samples share BOTH haplotypes (identical diploid genotype).
@@ -251,6 +252,11 @@ impl Ibs2 {
         let a2 = gt.allele(m_idx, s1.hap2());
         let b1 = gt.allele(m_idx, s2.hap1());
         let b2 = gt.allele(m_idx, s2.hap2());
+
+        let informative = (a1 != 255 && b1 != 255) || (a2 != 255 && b2 != 255);
+        if !informative {
+            return false;
+        }
 
         // Check both phase orderings: (a1,a2)=(b1,b2) OR (a1,a2)=(b2,b1)
         Self::are_phase_consistent(a1, a2, b1, b2) || Self::are_phase_consistent(a1, a2, b2, b1)
@@ -282,6 +288,7 @@ impl Ibs2 {
             .unwrap_or(&[])
     }
 }
+
 
 /// Identifies informative markers and partitions them into steps for IBS2 detection.
 ///

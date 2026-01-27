@@ -8,6 +8,8 @@
 //! - `ThreadedHaps` stores segments in a linked-list arena for O(1) updates
 //! - `MosaicCursor` provides SIMD-friendly state access for the HMM hot path
 
+use crate::model::block_hash::types::GlobalId;
+
 /// Arena-based storage for composite haplotypes using threaded indices.
 ///
 /// This avoids the O(N) shift cost of standard SoA insertion and the
@@ -19,7 +21,7 @@
 #[derive(Clone, Debug)]
 pub struct ThreadedHaps {
     // --- Arena Storage ---
-    segments_hap: Vec<u32>,
+    segments_hap: Vec<GlobalId>,
     segments_end: Vec<u32>,
     segments_next: Vec<u32>,
 
@@ -68,7 +70,7 @@ impl ThreadedHaps {
     }
 
     /// Initialize a new state starting with given hap. Returns the state index.
-    pub fn push_new(&mut self, start_hap: u32) -> usize {
+    pub fn push_new(&mut self, start_hap: GlobalId) -> usize {
         let state_idx = self.state_heads.len();
 
         let seg_idx = self.segments_hap.len() as u32;
@@ -84,7 +86,7 @@ impl ThreadedHaps {
     }
 
     /// Add a segment to an existing state
-    pub fn add_segment(&mut self, state_idx: usize, hap: u32, start_marker: usize) {
+    pub fn add_segment(&mut self, state_idx: usize, hap: GlobalId, start_marker: usize) {
         let tail_idx = self.state_tails[state_idx] as usize;
 
         self.segments_end[tail_idx] = start_marker as u32;
@@ -98,6 +100,27 @@ impl ThreadedHaps {
         self.state_tails[state_idx] = new_seg_idx;
     }
 
+    /// Build a new ThreadedHaps containing only the selected states.
+    pub fn subset_states(&self, indices: &[usize]) -> ThreadedHaps {
+        let mut out = ThreadedHaps::new(indices.len(), self.segments_hap.len(), self.n_markers);
+        for &state_idx in indices {
+            let mut cur = self.state_heads[state_idx] as usize;
+            let hap = self.segments_hap[cur];
+            let end = self.segments_end[cur] as usize;
+            let new_idx = out.push_new(hap);
+            let mut last_end = end;
+
+            while self.segments_next[cur] != Self::NIL {
+                cur = self.segments_next[cur] as usize;
+                let seg_hap = self.segments_hap[cur];
+                let seg_end = self.segments_end[cur] as usize;
+                out.add_segment(new_idx, seg_hap, last_end);
+                last_end = seg_end;
+            }
+        }
+        out
+    }
+
     /// Materialize haplotypes for a single marker without mutating cursors.
     ///
     /// This method takes `&self` (immutable) since it walks the segment linked lists
@@ -106,7 +129,7 @@ impl ThreadedHaps {
     /// Use this for sparse access patterns (Stage 2). For dense access across all
     /// markers, prefer `materialize_all()` which is O(markers + segments) total.
     #[inline]
-    pub fn materialize_at(&self, marker: usize, out: &mut [u32]) {
+    pub fn materialize_at(&self, marker: usize, out: &mut [GlobalId]) {
         let n_states = self.state_heads.len();
         assert!(out.len() >= n_states);
 
@@ -139,7 +162,7 @@ impl ThreadedHaps {
     pub fn fill_alleles_marker_major<F, G>(&self, out: &mut [u8], mut per_marker: F)
     where
         F: FnMut(usize) -> G,
-        G: Fn(u32) -> u8,
+        G: Fn(GlobalId) -> u8,
     {
         let n_states = self.state_heads.len();
         let n_markers = self.n_markers;
@@ -152,7 +175,7 @@ impl ThreadedHaps {
             .iter()
             .map(|&c| self.segments_end[c] as usize)
             .collect();
-        let mut haps: Vec<u32> = cursors.iter().map(|&c| self.segments_hap[c]).collect();
+        let mut haps: Vec<GlobalId> = cursors.iter().map(|&c| self.segments_hap[c]).collect();
 
         for m in 0..n_markers {
             // Get the hap-to-allele function for this marker (allows hoisting per-marker work)
@@ -194,7 +217,7 @@ pub struct StateSwitch {
     /// State index that switched
     pub state_idx: u32,
     /// Haplotype index *before* the switch (for restoration)
-    pub old_hap: u32,
+    pub old_hap: GlobalId,
 }
 
 // ============================================================================
@@ -210,7 +233,7 @@ pub struct StateSwitch {
 #[derive(Clone, Debug)]
 pub struct MosaicCursor {
     /// Current active haplotype index for each state
-    active_haps: Vec<u32>,
+    active_haps: Vec<GlobalId>,
     /// Marker index where each state switches to next segment
     next_switch: Vec<usize>,
     /// Current segment arena index for each state
@@ -241,7 +264,7 @@ impl MosaicCursor {
 
     /// Get slice of all active haplotypes (for SIMD materialization)
     #[inline]
-    pub fn active_haps(&self) -> &[u32] {
+    pub fn active_haps(&self) -> &[GlobalId] {
         &self.active_haps
     }
 
@@ -340,7 +363,7 @@ impl AlleleScratch {
     #[inline]
     pub fn materialize<F>(&mut self, cursor: &MosaicCursor, marker: usize, get_allele: F)
     where
-        F: Fn(usize, u32) -> u8,
+        F: Fn(usize, GlobalId) -> u8,
     {
         for (state, &hap) in cursor.active_haps.iter().enumerate() {
             self.alleles[state] = get_allele(marker, hap);
@@ -356,72 +379,72 @@ mod tests {
     fn test_threaded_haps_basic() {
         let mut th = ThreadedHaps::new(4, 16, 100);
 
-        th.push_new(10);
-        th.push_new(20);
+        th.push_new(GlobalId::from(10u32));
+        th.push_new(GlobalId::from(20u32));
 
         assert_eq!(th.n_states(), 2);
-        let mut buffer = vec![0u32; 2];
+        let mut buffer = vec![GlobalId::from(0u32); 2];
         th.materialize_at(0, &mut buffer);
-        assert_eq!(buffer[0], 10);
-        assert_eq!(buffer[1], 20);
+        assert_eq!(buffer[0], GlobalId::from(10u32));
+        assert_eq!(buffer[1], GlobalId::from(20u32));
         th.materialize_at(50, &mut buffer);
-        assert_eq!(buffer[0], 10);
-        assert_eq!(buffer[1], 20);
+        assert_eq!(buffer[0], GlobalId::from(10u32));
+        assert_eq!(buffer[1], GlobalId::from(20u32));
     }
 
     #[test]
     fn test_threaded_haps_segments() {
         let mut th = ThreadedHaps::new(2, 8, 100);
 
-        th.push_new(10);
-        th.add_segment(0, 15, 50);
-        th.push_new(20);
+        th.push_new(GlobalId::from(10u32));
+        th.add_segment(0, GlobalId::from(15u32), 50);
+        th.push_new(GlobalId::from(20u32));
 
-        let mut buffer = vec![0u32; 2];
+        let mut buffer = vec![GlobalId::from(0u32); 2];
         th.materialize_at(25, &mut buffer);
-        assert_eq!(buffer[0], 10);
-        assert_eq!(buffer[1], 20);
+        assert_eq!(buffer[0], GlobalId::from(10u32));
+        assert_eq!(buffer[1], GlobalId::from(20u32));
         th.materialize_at(75, &mut buffer);
-        assert_eq!(buffer[0], 15);
-        assert_eq!(buffer[1], 20);
+        assert_eq!(buffer[0], GlobalId::from(15u32));
+        assert_eq!(buffer[1], GlobalId::from(20u32));
     }
 
     #[test]
     fn test_mosaic_cursor_threaded() {
         let mut th = ThreadedHaps::new(2, 8, 100);
 
-        th.push_new(10);
-        th.add_segment(0, 15, 50);
-        th.push_new(20);
+        th.push_new(GlobalId::from(10u32));
+        th.add_segment(0, GlobalId::from(15u32), 50);
+        th.push_new(GlobalId::from(20u32));
 
         let mut cursor = MosaicCursor::from_threaded(&th);
         let mut history = Vec::new();
 
-        assert_eq!(cursor.active_haps()[0], 10);
-        assert_eq!(cursor.active_haps()[1], 20);
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(10u32));
+        assert_eq!(cursor.active_haps()[1], GlobalId::from(20u32));
 
         cursor.advance_with_history(25, &th, &mut history);
-        assert_eq!(cursor.active_haps()[0], 10);
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(10u32));
 
         cursor.advance_with_history(60, &th, &mut history);
-        assert_eq!(cursor.active_haps()[0], 15);
-        assert_eq!(cursor.active_haps()[1], 20);
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(15u32));
+        assert_eq!(cursor.active_haps()[1], GlobalId::from(20u32));
 
         cursor.reset(&th);
-        assert_eq!(cursor.active_haps()[0], 10);
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(10u32));
     }
 
     #[test]
     fn test_allele_scratch() {
         let mut th = ThreadedHaps::new(3, 3, 100);
-        th.push_new(0);
-        th.push_new(1);
-        th.push_new(2);
+        th.push_new(GlobalId::from(0u32));
+        th.push_new(GlobalId::from(1u32));
+        th.push_new(GlobalId::from(2u32));
 
         let cursor = MosaicCursor::from_threaded(&th);
         let mut scratch = AlleleScratch::new(3);
 
-        scratch.materialize(&cursor, 5, |_, h| h as u8);
+        scratch.materialize(&cursor, 5, |_, h| h.as_u32() as u8);
 
         assert_eq!(scratch.alleles[0], 0);
         assert_eq!(scratch.alleles[1], 1);
@@ -431,32 +454,36 @@ mod tests {
     #[test]
     fn test_threaded_haps_cursor_helpers() {
         let mut th = ThreadedHaps::new(2, 8, 100);
-        th.push_new(10);
-        th.add_segment(0, 15, 40);
-        th.add_segment(0, 20, 70);
-        th.push_new(30);
-        th.add_segment(1, 35, 50);
+        th.push_new(GlobalId::from(10u32));
+        th.add_segment(0, GlobalId::from(15u32), 40);
+        th.add_segment(0, GlobalId::from(20u32), 70);
+        th.push_new(GlobalId::from(30u32));
+        th.add_segment(1, GlobalId::from(35u32), 50);
 
         for m in 0..100 {
             let expected0 = if m < 40 {
-                10
+                GlobalId::from(10u32)
             } else if m < 70 {
-                15
+                GlobalId::from(15u32)
             } else {
-                20
+                GlobalId::from(20u32)
             };
-            let expected1 = if m < 50 { 30 } else { 35 };
+            let expected1 = if m < 50 {
+                GlobalId::from(30u32)
+            } else {
+                GlobalId::from(35u32)
+            };
 
-            let mut buffer = vec![0u32; 2];
+            let mut buffer = vec![GlobalId::from(0u32); 2];
             th.materialize_at(m, &mut buffer);
             assert_eq!(buffer[0], expected0);
             assert_eq!(buffer[1], expected1);
         }
 
-        let mut buffer = vec![0u32; 2];
+        let mut buffer = vec![GlobalId::from(0u32); 2];
         th.materialize_at(0, &mut buffer);
-        assert_eq!(buffer[0], 10);
-        assert_eq!(buffer[1], 30);
+        assert_eq!(buffer[0], GlobalId::from(10u32));
+        assert_eq!(buffer[1], GlobalId::from(30u32));
     }
 
     #[test]
@@ -465,13 +492,13 @@ mod tests {
         let mut th = ThreadedHaps::new(2, 8, 100);
 
         // State 0: hap 10 for [0, 40), hap 15 for [40, 70), hap 20 for [70, 100)
-        th.push_new(10);
-        th.add_segment(0, 15, 40);
-        th.add_segment(0, 20, 70);
+        th.push_new(GlobalId::from(10u32));
+        th.add_segment(0, GlobalId::from(15u32), 40);
+        th.add_segment(0, GlobalId::from(20u32), 70);
 
         // State 1: hap 30 for [0, 50), hap 35 for [50, 100)
-        th.push_new(30);
-        th.add_segment(1, 35, 50);
+        th.push_new(GlobalId::from(30u32));
+        th.add_segment(1, GlobalId::from(35u32), 50);
 
         let mut cursor = MosaicCursor::from_threaded(&th);
         let mut history: Vec<StateSwitch> = Vec::new();
@@ -482,8 +509,8 @@ mod tests {
         }
 
         // Verify cursor is at end state
-        assert_eq!(cursor.active_haps()[0], 20); // State 0 at marker 99
-        assert_eq!(cursor.active_haps()[1], 35); // State 1 at marker 99
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(20u32)); // State 0 at marker 99
+        assert_eq!(cursor.active_haps()[1], GlobalId::from(35u32)); // State 1 at marker 99
 
         // History should have recorded 3 switches total:
         // - State 0 switched at marker 40, 70
@@ -493,26 +520,26 @@ mod tests {
         // Now test rewinding
         // Rewind to marker 80 - should stay at hap 20, 35
         cursor.rewind(80, &mut history);
-        assert_eq!(cursor.active_haps()[0], 20);
-        assert_eq!(cursor.active_haps()[1], 35);
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(20u32));
+        assert_eq!(cursor.active_haps()[1], GlobalId::from(35u32));
         assert_eq!(history.len(), 3); // No events popped
 
         // Rewind to marker 60 - state 1 stays at 35, state 0 reverts to 15
         cursor.rewind(60, &mut history);
-        assert_eq!(cursor.active_haps()[0], 15);
-        assert_eq!(cursor.active_haps()[1], 35);
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(15u32));
+        assert_eq!(cursor.active_haps()[1], GlobalId::from(35u32));
         assert_eq!(history.len(), 2); // One event popped (state 0's switch at 70)
 
         // Rewind to marker 45 - state 1 reverts to 30, state 0 stays at 15
         cursor.rewind(45, &mut history);
-        assert_eq!(cursor.active_haps()[0], 15);
-        assert_eq!(cursor.active_haps()[1], 30);
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(15u32));
+        assert_eq!(cursor.active_haps()[1], GlobalId::from(30u32));
         assert_eq!(history.len(), 1); // Two events popped total
 
         // Rewind to marker 30 - state 0 reverts to 10, state 1 stays at 30
         cursor.rewind(30, &mut history);
-        assert_eq!(cursor.active_haps()[0], 10);
-        assert_eq!(cursor.active_haps()[1], 30);
+        assert_eq!(cursor.active_haps()[0], GlobalId::from(10u32));
+        assert_eq!(cursor.active_haps()[1], GlobalId::from(30u32));
         assert_eq!(history.len(), 0); // All events popped
     }
 
@@ -521,40 +548,40 @@ mod tests {
         let mut th = ThreadedHaps::new(3, 8, 100);
 
         // State 0: hap 10 for [0, 50), hap 15 for [50, 100)
-        th.push_new(10);
-        th.add_segment(0, 15, 50);
+        th.push_new(GlobalId::from(10u32));
+        th.add_segment(0, GlobalId::from(15u32), 50);
 
         // State 1: hap 20 for all markers
-        th.push_new(20);
+        th.push_new(GlobalId::from(20u32));
 
         // State 2: hap 30 for [0, 25), hap 35 for [25, 100)
-        th.push_new(30);
-        th.add_segment(2, 35, 25);
+        th.push_new(GlobalId::from(30u32));
+        th.add_segment(2, GlobalId::from(35u32), 25);
 
-        let mut buffer = vec![0u32; 3];
+        let mut buffer = vec![GlobalId::from(0u32); 3];
 
         // Test at marker 10 - before any segment transitions
         th.materialize_at(10, &mut buffer);
-        assert_eq!(buffer[0], 10);
-        assert_eq!(buffer[1], 20);
-        assert_eq!(buffer[2], 30);
+        assert_eq!(buffer[0], GlobalId::from(10u32));
+        assert_eq!(buffer[1], GlobalId::from(20u32));
+        assert_eq!(buffer[2], GlobalId::from(30u32));
 
         // Test at marker 30 - after state 2's transition
         th.materialize_at(30, &mut buffer);
-        assert_eq!(buffer[0], 10);
-        assert_eq!(buffer[1], 20);
-        assert_eq!(buffer[2], 35);
+        assert_eq!(buffer[0], GlobalId::from(10u32));
+        assert_eq!(buffer[1], GlobalId::from(20u32));
+        assert_eq!(buffer[2], GlobalId::from(35u32));
 
         // Test at marker 60 - after state 0's transition
         th.materialize_at(60, &mut buffer);
-        assert_eq!(buffer[0], 15);
-        assert_eq!(buffer[1], 20);
-        assert_eq!(buffer[2], 35);
+        assert_eq!(buffer[0], GlobalId::from(15u32));
+        assert_eq!(buffer[1], GlobalId::from(20u32));
+        assert_eq!(buffer[2], GlobalId::from(35u32));
 
         // Re-check early marker for consistent access
         th.materialize_at(5, &mut buffer);
-        assert_eq!(buffer[0], 10);
-        assert_eq!(buffer[1], 20);
-        assert_eq!(buffer[2], 30);
+        assert_eq!(buffer[0], GlobalId::from(10u32));
+        assert_eq!(buffer[1], GlobalId::from(20u32));
+        assert_eq!(buffer[2], GlobalId::from(30u32));
     }
 }

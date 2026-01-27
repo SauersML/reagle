@@ -206,9 +206,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: metrics-${{ matrix.tool }}-chr${{ matrix.chromosome }}
-          path: |
-            tests/data_chr${{ matrix.chromosome }}/*_metrics.txt
-            tests/data_chr${{ matrix.chromosome }}/*_metrics.json
+          path: tests/data_chr${{ matrix.chromosome }}/
           retention-days: 30
 
   # Job 4: Aggregate all chromosome metrics

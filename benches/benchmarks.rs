@@ -370,8 +370,8 @@ fn bench_imputation_e2e(c: &mut Criterion) {
                 ChromIdx::new(0),
                 (m * 1000 + 100) as u32,
                 None,
-                Allele::Base(0),
-                vec![Allele::Base(1)],
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::C)],
             ));
             // Random-ish alleles based on marker/hap indices
             let alleles: Vec<u8> = (0..n_ref_haps)

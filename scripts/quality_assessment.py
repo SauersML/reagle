@@ -29,9 +29,15 @@ def run_benchmark(person, file_path, format):
 
     # 3. Run Beagle
     print("=== Running Beagle ===")
-    beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
-    run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=chr22", "nthreads=4", "gp=true"])
+    # Reference panels used for Beagle imputation must be fully phased and contain no missing data.
+    # We create a derivative panel that excludes sites with missing calls and forces phased separators.
+    # The original ref.vcf.gz is preserved for Reagle to ensure no loss of data in the primary pipeline.
+    run_cmd("bcftools view -g ^miss ref.vcf.gz -Ou | bcftools +setGT - -- -t a -n p | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
+    run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
 
+    beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
+    run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref_beagle.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=chr22", "nthreads=4", "gp=true"])
+    
     # 4. Run Metrics using the Python integration test
     print("=== Calculating Metrics ===")
     
