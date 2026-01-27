@@ -787,9 +787,7 @@ impl StreamingBref3WindowReader {
                 self.inner.samples_arc(),
             ))
         };
-        let ref_genotypes_full = full_columns.map(|cols| {
-            GenotypeMatrix::new_phased(markers.clone(), cols, self.inner.samples_arc())
-        });
+        let ref_columns_full = full_columns;
 
         if carryover.is_empty() {
             self.buffer = next_overlap;
@@ -805,7 +803,7 @@ impl StreamingBref3WindowReader {
             markers,
             ref_map,
             ref_genotypes,
-            ref_genotypes_full,
+            ref_columns_full,
             global_start: self.global_marker_idx - output_end,
             global_end: (self.global_marker_idx - output_end) + window_size,
             output_start: 0,
@@ -883,9 +881,8 @@ pub struct RefWindow {
     /// Optional phased reference genotypes (used for reference-guided phasing)
     pub ref_genotypes:
         Option<GenotypeMatrix<crate::data::storage::phase_state::Phased, RefPhasingSpace>>,
-    /// Optional full-window reference genotypes (used for PBWT keep-mask rebuild)
-    pub ref_genotypes_full:
-        Option<GenotypeMatrix<crate::data::storage::phase_state::Phased, RefWindowSpace>>,
+    /// Optional full-window reference columns (used for PBWT keep-mask rebuild)
+    pub ref_columns_full: Option<Vec<GenotypeColumn>>,
     /// Global start marker index
     pub global_start: usize,
     /// Global end marker index (exclusive)
@@ -1259,8 +1256,7 @@ impl StreamingRefVcfReader {
                 Arc::clone(&self.samples),
             ))
         };
-        let ref_genotypes_full =
-            full_columns.map(|cols| GenotypeMatrix::new_phased(markers.clone(), cols, Arc::clone(&self.samples)));
+        let ref_columns_full = full_columns;
 
         if carryover.is_empty() {
             self.buffer = next_overlap;
@@ -1276,7 +1272,7 @@ impl StreamingRefVcfReader {
             markers,
             ref_map,
             ref_genotypes,
-            ref_genotypes_full,
+            ref_columns_full,
             global_start: self.global_marker_idx - output_end,
             global_end: (self.global_marker_idx - output_end) + window_size,
             output_start: 0,

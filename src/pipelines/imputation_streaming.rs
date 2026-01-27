@@ -298,8 +298,8 @@ fn pbwt_select_keep_mask<TargetSpace, RefSpace>(
 }
 
 fn build_reference_map_with_mask<RefSpace: Sync>(
-    ref_gt: &GenotypeMatrix<Phased, RefSpace>,
     markers: &crate::data::marker::Markers<RefSpace>,
+    columns: &[crate::data::storage::GenotypeColumn],
     gen_maps: &GeneticMaps,
     params: &ModelParams,
     block_size: usize,
@@ -307,6 +307,7 @@ fn build_reference_map_with_mask<RefSpace: Sync>(
     keep_mask: Option<&[bool]>,
 ) -> Arc<ReferenceMap> {
     let n_markers = markers.len();
+    debug_assert_eq!(n_markers, columns.len());
     let gen_positions: Vec<f64> = (0..n_markers)
         .map(|m| {
             let marker = markers.marker(MarkerIdx::new(m as u32));
@@ -330,9 +331,8 @@ fn build_reference_map_with_mask<RefSpace: Sync>(
             let block_markers: Vec<crate::data::marker::Marker> = (start..end)
                 .map(|m| markers.marker(MarkerIdx::new(m as u32)).clone())
                 .collect();
-            let block_columns: Vec<crate::data::storage::GenotypeColumn> = (start..end)
-                .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
-                .collect();
+            let block_columns: Vec<crate::data::storage::GenotypeColumn> =
+                columns[start..end].to_vec();
             let recomb_rates: Vec<f32> = (start..end.saturating_sub(1))
                 .map(|i| {
                     let dist_cm = (gen_positions[i + 1] - gen_positions[i]).abs();
@@ -942,10 +942,10 @@ impl crate::pipelines::ImputationPipeline {
                                 "  PBWT selection: kept {} / {} ref haplotypes (max_states={})",
                                 kept, total, auto_plan_for_producer.max_states
                             );
-                            if let Some(ref_full) = ref_window.ref_genotypes_full.as_ref() {
+                            if let Some(ref_columns_full) = ref_window.ref_columns_full.as_ref() {
                                 ref_map = build_reference_map_with_mask(
-                                    ref_full,
                                     &ref_window.markers,
+                                    ref_columns_full,
                                     &producer_maps,
                                     &pipeline.params,
                                     ref_block_size,
