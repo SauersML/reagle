@@ -2435,6 +2435,11 @@ target_samples={} target_bytes={}",
             None
         };
 
+        // If err is specified in config (config.err is Some), we allow the HMM output
+        // to override the input genotype (error correction).
+        // If err is None (default), we strictly adhere to the input genotype (hard truth).
+        let use_hard_truth = self.config.err.is_none();
+
         let samples = target_win.samples_arc();
 
         let get_genotyped_alleles = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
@@ -2584,12 +2589,24 @@ target_samples={} target_bytes={}",
             let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
+            } else if use_hard_truth {
+                // Hard truth mode: prioritize input genotype
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.dosages.get(local_m).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                }
             } else {
-                0.0
+                // Error correction mode: prioritize HMM result
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.dosages.get(local_m).copied().unwrap_or(0.0)
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else {
+                    0.0
+                }
             };
 
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
@@ -2605,12 +2622,22 @@ target_samples={} target_bytes={}",
             if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 best_gt_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+            } else if use_hard_truth {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1, a2)
+                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                }
             } else {
-                (0, 0)
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1, a2)
+                } else {
+                    (0, 0)
+                }
             }
         };
 
