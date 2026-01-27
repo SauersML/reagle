@@ -44,16 +44,38 @@ def _update_panel_if_present(output_dir, panel_path):
     subprocess.check_call(["bcftools", "index", "-f", panel_path])
     return True
 
+def _clear_convert_genome_cache():
+    """Removes any existing convert_genome binary and caches to force a fresh install."""
+    # Remove known binary locations if present.
+    binary_candidates = [
+        shutil.which("convert_genome"),
+        os.path.join(os.path.expanduser("~"), ".local", "bin", "convert_genome"),
+        os.path.join(os.path.expanduser("~"), "bin", "convert_genome"),
+        os.path.join(os.path.expanduser("~"), "bin", "convert_genome.exe"),
+    ]
+    for path in {p for p in binary_candidates if p}:
+        if os.path.exists(path):
+            print(f"Removing existing convert_genome binary: {path}")
+            os.remove(path)
+
+    # Remove common cache locations (best-effort).
+    cache_dirs = [
+        os.path.join(os.path.expanduser("~"), ".cache", "convert_genome"),
+        os.path.join(os.path.expanduser("~"), "Library", "Caches", "convert_genome"),
+        os.path.join(os.path.expanduser("~"), "Library", "Application Support", "convert_genome"),
+    ]
+    for path in cache_dirs:
+        if os.path.isdir(path):
+            print(f"Removing convert_genome cache: {path}")
+            shutil.rmtree(path)
+
 def install_convert_genome():
     """Installs convert_genome using the official install script (pre-compiled binary)."""
-    print("Installing convert_genome...")
-    # Only install if not present
-    if shutil.which("convert_genome"):
-        print("convert_genome already installed.")
-        return
+    print("Installing convert_genome (fresh install)...")
+    _clear_convert_genome_cache()
 
     # Download and run the install script
-    install_script_url = "https://raw.githubusercontent.com/SauersML/convert_genome/refs/heads/main/install.sh"
+    install_script_url = "https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh"
     subprocess.check_call(["bash", "-c", f"curl -fsSL {install_script_url} | bash"])
 
     # Add install location to PATH for this session

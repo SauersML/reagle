@@ -17,7 +17,7 @@ Requirements:
 Usage:
   python integration_test.py              # Run all stages
   python integration_test.py prepare      # Download data and prepare VCFs
-  python integration_test.py prepare-profile  # Prepare first 5% of chr22 for profiling
+  python integration_test.py prepare-profile  # Prepare middle 5% of chr22 for profiling
   python integration_test.py beagle       # Run Beagle imputation only
   python integration_test.py reagle       # Run Reagle imputation only
   python integration_test.py metrics      # Calculate metrics only
@@ -1960,9 +1960,9 @@ def stage_prepare():
 
 
 def stage_prepare_profile():
-    """Prepare reduced data (first 5% of chr22) for profiling runs."""
+    """Prepare reduced data (middle 5% of chr22 target markers) for profiling runs."""
     print("=" * 60)
-    print("STAGE: PREPARE PROFILE - First 5% of chr22")
+    print("STAGE: PREPARE PROFILE - Middle 5% of chr22 (target markers)")
     print("=" * 60)
 
     paths = get_paths()
@@ -2005,14 +2005,41 @@ def stage_prepare_profile():
         run(f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
     ensure_index(paths['chr22_vcf'], recreate_cmd=f"bcftools view {paths['chr22_bcf']} -O z -o {paths['chr22_vcf']}")
 
-    # Compute first 5% region of chr22
-    region_info = compute_profile_region(paths['chr22_vcf'], "22", fraction=0.05)
-    if not region_info:
-        raise RuntimeError("Unable to determine chr22 bounds for profiling subset")
-    region, min_pos, end_pos, chrom_label = region_info
-    print(f"Profiling region: {region} (positions {min_pos}..{end_pos})")
+    # Download GSA sites first
+    print("\n" + "=" * 60)
+    print("Downloading GSA variant list...")
+    print("=" * 60)
 
-    # Create trimmed VCF
+    download_if_missing(
+        "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv",
+        str(paths['gsa_file'])
+    )
+
+    # Load GSA sites for chr22
+    gsa_sites = load_gsa_sites(str(paths['gsa_file']), chrom="22")
+    gsa_positions = sorted([pos for chrom, pos in gsa_sites])
+
+    if not gsa_positions:
+        raise RuntimeError("No GSA sites found for chr22")
+
+    # Compute region based on MIDDLE 5% of TARGET (GSA) markers
+    total_markers = len(gsa_positions)
+    window_size = max(1, int(total_markers * 0.05))
+    start_idx = (total_markers - window_size) // 2
+    end_idx = start_idx + window_size
+
+    min_pos = gsa_positions[start_idx]
+    end_pos = gsa_positions[end_idx - 1]
+
+    # Find chromosome label from VCF
+    chrom_label = find_chrom_label(paths['chr22_vcf'], "22") or "chr22"
+    region = f"{chrom_label}:{min_pos}-{end_pos}"
+
+    print(f"Profiling region based on middle 5% of {total_markers} GSA markers:")
+    print(f"  Region: {region} (positions {min_pos}..{end_pos})")
+    print(f"  Target markers in region: {window_size} (indices {start_idx}-{end_idx-1})")
+
+    # Create trimmed VCF covering this region
     trimmed_vcf = paths['data_dir'] / "hgdp1kg_chr22.profile5.vcf.gz"
     if not validate_vcf(trimmed_vcf) or not has_vcf_records(trimmed_vcf):
         print("Creating trimmed VCF for profiling...")
@@ -2029,18 +2056,7 @@ def stage_prepare_profile():
         Path(str(path) + ".csi").unlink(missing_ok=True)
         Path(str(path) + ".tbi").unlink(missing_ok=True)
 
-    # Download GSA sites
-    print("\n" + "=" * 60)
-    print("Downloading GSA variant list...")
-    print("=" * 60)
-
-    download_if_missing(
-        "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv",
-        str(paths['gsa_file'])
-    )
-
-    # Load GSA sites for chr22 and filter to region
-    gsa_sites = load_gsa_sites(str(paths['gsa_file']), chrom="22")
+    # Filter GSA sites to this region and verify they exist in VCF
     filtered_sites = set()
     for chrom, pos in gsa_sites:
         if min_pos <= pos <= end_pos:
@@ -2062,7 +2078,7 @@ def stage_prepare_profile():
             present_sites.add((fields[0], pos))
 
     filtered_sites = {site for site in filtered_sites if site in present_sites}
-    print(f"Filtered GSA sites in region (present in VCF): {len(filtered_sites)}")
+    print(f"GSA sites in region (present in VCF): {len(filtered_sites)}")
 
     # Download Beagle
     download_if_missing(
@@ -2311,7 +2327,7 @@ def main():
         epilog="""
 Stages:
   prepare      Download data and prepare reference/truth/input VCFs
-  prepare-profile  Prepare first 5% of chr22 for profiling
+  prepare-profile  Prepare middle 5% of chr22 target markers for profiling
   beagle       Run Java Beagle imputation
   reagle       Run Reagle imputation
   impute5      Run IMPUTE5 imputation
@@ -2616,17 +2632,9 @@ def stage_prepare_chr(chrom):
         regions_file = data_dir / f"gsa_chr{chrom}.regions"
         create_regions_file(gsa_sites, str(regions_file))
         
-        # Downsample and unphase
-        tmp_phased = data_dir / "input_phased_tmp.vcf.gz"
-        run(f"bcftools view -R {regions_file} {paths['truth_vcf']} -O z -o {tmp_phased}")
-        # Keep phased version for IMPUTE5 (which requires phased input)
-        phased_input = data_dir / "input_phased.vcf.gz"
-        run(f"cp {tmp_phased} {phased_input}")
-        run(f"bcftools index -f {phased_input}")
-        # Create unphased version for Beagle/Reagle
-        run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
+        # Downsample to array sites (keep phased for fair comparison)
+        run(f"bcftools view -R {regions_file} {paths['truth_vcf']} -O z -o {paths['input_vcf']}")
         run(f"bcftools index -f {paths['input_vcf']}")
-        os.remove(tmp_phased)
     
     print(f"Chromosome {chrom} preparation complete.")
 
@@ -2719,16 +2727,13 @@ def run_impute5_chr(chrom, paths):
         try:
             # IMPUTE5 requires an indexed reference and map file usually, but minimal example:
             # --h reference --g input --r region --o output
-            # IMPUTE5 requires PHASED input - use input_phased.vcf.gz
-            phased_input = data_dir / "input_phased.vcf.gz"
-            if not phased_input.exists():
-                raise RuntimeError(f"Phased input not found: {phased_input}. Run stage_prepare_chr first.")
+            # All tools now use phased input for fair comparison
             region_arg = resolve_region_arg(paths, chrom)
             print_tool_help("IMPUTE5", str(impute5_bin))
             print(f"IMPUTE5 region: {region_arg}")
             print(f"IMPUTE5 ref: {paths['ref_vcf']}")
-            print(f"IMPUTE5 input (phased): {phased_input}")
-            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {phased_input} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
+            print(f"IMPUTE5 input (phased): {paths['input_vcf']}")
+            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
             run(f"bcftools index -f {out}")
         except Exception as e:
             print(f"IMPUTE5 failed on chr{chrom}: {e}")
@@ -2886,7 +2891,7 @@ def stage_summary():
     script_dir = Path(__file__).parent
     tools = ["beagle", "reagle", "impute5", "minimac", "glimpse"]
     display_names = {
-        "beagle": "Beagle 5.4",
+        "beagle": "Beagle 5.5",
         "reagle": "Reagle (Rust)",
         "impute5": "IMPUTE5",
         "minimac": "Minimac4",
@@ -3107,19 +3112,124 @@ def stage_summary():
 
                     maf_metrics[maf_bin] = {"r2": r2, "conc": conc, "f1": f1, "ser": ser, "n": n}
 
+        # Collect additional metrics from first chromosome with data
+        confusion_matrix = None
+        homref_acc = het_acc = homalt_acc = 0.0
+        homref_total = het_total = homalt_total = 0
+        iqs = info_score = sen_mean = 0.0
+        sample_conc_mean = sample_conc_min = sample_conc_max = 0.0
+        sample_r2_mean = sample_r2_min = 0.0
+        sample_sen_mean = sample_sen_min = sample_sen_max = 0.0
+        sample_ser_mean = sample_ser_min = sample_ser_max = 0.0
+        masked_total = masked_conc = masked_nonref_conc = masked_r2 = 0
+
+        # Get these from aggregate or first available chromosome
+        for chrom in range(1, 23):
+            json_file = script_dir / f"data_chr{chrom}" / f"{tool}_metrics.json"
+            if json_file.exists():
+                try:
+                    with open(json_file) as f:
+                        data = json.load(f)
+
+                    # Aggregate confusion matrix
+                    if confusion_matrix is None and "confusion_matrix" in data:
+                        confusion_matrix = [[0]*3 for _ in range(3)]
+                    if "confusion_matrix" in data:
+                        for i in range(3):
+                            for j in range(3):
+                                confusion_matrix[i][j] += data["confusion_matrix"][i][j]
+
+                    # Aggregate class accuracies
+                    homref_total += data.get("homref_total", 0)
+                    het_total += data.get("het_total", 0)
+                    homalt_total += data.get("homalt_total", 0)
+
+                    # Masked metrics
+                    masked_total += data.get("masked_total", 0)
+
+                except:
+                    pass
+
+        # Calculate accuracies from confusion matrix
+        if confusion_matrix:
+            homref_acc = confusion_matrix[0][0] / homref_total if homref_total > 0 else 0.0
+            het_acc = confusion_matrix[1][1] / het_total if het_total > 0 else 0.0
+            homalt_acc = confusion_matrix[2][2] / homalt_total if homalt_total > 0 else 0.0
+
+        # Get sample stats and other metrics from first chromosome (these don't aggregate well)
+        for chrom in range(1, 23):
+            json_file = script_dir / f"data_chr{chrom}" / f"{tool}_metrics.json"
+            if json_file.exists():
+                try:
+                    with open(json_file) as f:
+                        data = json.load(f)
+                    iqs = data.get("iqs", 0.0)
+                    info_score = data.get("info_score_approx", 0.0)
+                    sen_mean = data.get("sen_mean", 0.0)
+                    sample_conc_mean = data.get("sample_concordance_mean", 0.0)
+                    sample_conc_min = data.get("sample_concordance_min", 0.0)
+                    sample_conc_max = data.get("sample_concordance_max", 0.0)
+                    sample_r2_mean = data.get("sample_r2_mean", 0.0)
+                    sample_r2_min = data.get("sample_r2_min", 0.0)
+                    sample_sen_mean = data.get("sample_sen_mean", 0.0)
+                    sample_sen_min = data.get("sample_sen_min", 0.0)
+                    sample_sen_max = data.get("sample_sen_max", 0.0)
+                    sample_ser_mean = data.get("sample_switch_error_mean", 0.0)
+                    sample_ser_min = data.get("sample_switch_error_min", 0.0)
+                    sample_ser_max = data.get("sample_switch_error_max", 0.0)
+                    masked_conc = data.get("masked_concordance", 0.0)
+                    masked_nonref_conc = data.get("masked_nonref_concordance", 0.0)
+                    masked_r2 = data.get("masked_r_squared", 0.0)
+                    break
+                except:
+                    pass
+
         final_metrics.append({
             'id': tool,
             'name': display_names[tool],
             'time': total_time_sec,
+            'sites': total_sites_compared,
+            'genotypes': agg_genotypes,
             'conc': global_conc,
             'nonref': global_nonref,
+            'nonref_total': agg_nonref_total,
             'r2': global_r2,
             'rare_r2': global_rare_r2,
+            'iqs': iqs,
+            'info_score': info_score,
+            'sen_mean': sen_mean,
             'ser': global_ser,
+            'switch_errors': agg_switch_errors,
+            'switch_opps': agg_switch_opps,
             'f1': global_f1,
             'prec': global_prec,
             'rec': global_rec,
+            'tp': agg_tp,
+            'fp': agg_fp,
+            'fn': agg_fn,
             'n50': global_n50,
+            'confusion_matrix': confusion_matrix,
+            'homref_acc': homref_acc,
+            'het_acc': het_acc,
+            'homalt_acc': homalt_acc,
+            'homref_total': homref_total,
+            'het_total': het_total,
+            'homalt_total': homalt_total,
+            'sample_conc_mean': sample_conc_mean,
+            'sample_conc_min': sample_conc_min,
+            'sample_conc_max': sample_conc_max,
+            'sample_r2_mean': sample_r2_mean,
+            'sample_r2_min': sample_r2_min,
+            'sample_sen_mean': sample_sen_mean,
+            'sample_sen_min': sample_sen_min,
+            'sample_sen_max': sample_sen_max,
+            'sample_ser_mean': sample_ser_mean,
+            'sample_ser_min': sample_ser_min,
+            'sample_ser_max': sample_ser_max,
+            'masked_total': masked_total,
+            'masked_conc': masked_conc,
+            'masked_nonref_conc': masked_nonref_conc,
+            'masked_r2': masked_r2,
             'chromosomes': chromosomes_found,
             'maf_metrics': maf_metrics
         })
@@ -3130,12 +3240,30 @@ def stage_summary():
 
     # -- Sort by R2 (descending) --
     final_metrics.sort(key=lambda x: x['r2'], reverse=True)
-    
+
+    # Determine which chromosomes were tested
+    chromosomes_tested = set()
+    for chrom in range(1, 23):
+        json_file = script_dir / f"data_chr{chrom}" / f"{tools[0]}_metrics.json"
+        if json_file.exists():
+            chromosomes_tested.add(chrom)
+
+    # Format chromosome range description
+    if len(chromosomes_tested) == 22:
+        chr_desc = "All 22 autosomes"
+    elif len(chromosomes_tested) == 1:
+        chr_desc = f"Chromosome {list(chromosomes_tested)[0]}"
+    else:
+        chr_list = sorted(chromosomes_tested)
+        chr_desc = f"Chromosomes {', '.join(map(str, chr_list))}"
+
     # -- Generate Markdown Report --
     md_lines = []
     md_lines.append("# 🧬 Imputation Benchmark Results")
-    md_lines.append(f"**Genome-wide comparison (All 22 autosomes)**")
+    md_lines.append(f"**{chr_desc}**")
     md_lines.append(f"*Metrics aggregated exactly across all sites (Dosage R²).*")
+    md_lines.append(f"")
+    md_lines.append(f"**Test Setup:** All tools receive pre-phased genotype array data (GSA v2 sites) as input for fair comparison. Reference panel: HGDP+1kG phased haplotypes.")
     
     # Winner badges
     best_r2 = max(final_metrics, key=lambda x: x['r2'])
@@ -3169,9 +3297,10 @@ def stage_summary():
     if best_n50:
         md_lines.append(f"- **Longest Phase Blocks (N50):** {best_n50['name']} ({best_n50['n50']:.0f} bp)")
     
-    md_lines.append(f"\n### 📊 Comprehensive Comparison")
-    md_lines.append("| Tool | R² | Rare R² (<1%) | F1 Score | Non-Ref Conc. | Switch Error | N50 (bp) | Time (s) | Speedup |")
-    md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    md_lines.append(f"\n### 📊 Accuracy Metrics")
+    md_lines.append("*Primary imputation quality metrics*\n")
+    md_lines.append("| Tool | Dosage R² | Rare R² (<1%) | IQS | INFO Score | Concordance | Non-Ref Conc. | Precision | Recall | F1 Score | SEN (mean) |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
 
     for m in final_metrics:
         # Comparison vs Reagle (if present)
@@ -3182,7 +3311,38 @@ def stage_summary():
             icon = "🔻" if diff < 0 else "🔺"
             r2_diff = f" ({icon}{abs(diff):.4f})"
 
-        # Speedup vs Beagle
+        md_lines.append(f"| **{m['name']}** | {m['r2']:.4f}{r2_diff} | {m['rare_r2']:.4f} | {m['iqs']:.4f} | {m['info_score']:.4f} | {m['conc']:.4f} | {m['nonref']:.4f} | {m['prec']:.4f} | {m['rec']:.4f} | {m['f1']:.4f} | {m['sen_mean']:.4f} |")
+
+    md_lines.append(f"\n### 🔀 Phasing Quality")
+    md_lines.append("*Haplotype phasing accuracy metrics*\n")
+    md_lines.append("| Tool | Switch Error Rate | Switch Errors | Switch Opportunities | N50 Phase Block (bp) |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: |")
+
+    for m in final_metrics:
+        md_lines.append(f"| **{m['name']}** | {m['ser']:.4f} | {m['switch_errors']:,} | {m['switch_opps']:,} | {m['n50']:.0f} |")
+
+    md_lines.append(f"\n### 📈 Per-Class Accuracy")
+    md_lines.append("*Genotype calling accuracy by zygosity class*\n")
+    md_lines.append("| Tool | HomRef Acc. | Het Acc. | HomAlt Acc. | HomRef N | Het N | HomAlt N |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+    for m in final_metrics:
+        md_lines.append(f"| **{m['name']}** | {m['homref_acc']:.4f} | {m['het_acc']:.4f} | {m['homalt_acc']:.4f} | {m['homref_total']:,} | {m['het_total']:,} | {m['homalt_total']:,} |")
+
+    md_lines.append(f"\n### 👥 Per-Sample Statistics")
+    md_lines.append("*Distribution of metrics across samples*\n")
+    md_lines.append("| Tool | Conc. Mean | Conc. Min | Conc. Max | R² Mean | R² Min | SEN Mean | SEN Min | SEN Max | SER Mean | SER Min | SER Max |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+    for m in final_metrics:
+        md_lines.append(f"| **{m['name']}** | {m['sample_conc_mean']:.4f} | {m['sample_conc_min']:.4f} | {m['sample_conc_max']:.4f} | {m['sample_r2_mean']:.4f} | {m['sample_r2_min']:.4f} | {m['sample_sen_mean']:.4f} | {m['sample_sen_min']:.4f} | {m['sample_sen_max']:.4f} | {m['sample_ser_mean']:.4f} | {m['sample_ser_min']:.4f} | {m['sample_ser_max']:.4f} |")
+
+    md_lines.append(f"\n### 📊 Overall Statistics")
+    md_lines.append("*Dataset size and runtime*\n")
+    md_lines.append("| Tool | Sites Compared | Genotypes | Time (s) | Speedup vs Beagle |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: |")
+
+    for m in final_metrics:
         speedup_str = "-"
         if beagle_stats and beagle_stats['time'] > 0:
             if m['id'] == 'beagle':
@@ -3190,8 +3350,42 @@ def stage_summary():
             else:
                 speedup = beagle_stats['time'] / m['time'] if m['time'] > 0 else 0
                 speedup_str = f"{speedup:.1f}x"
+        md_lines.append(f"| **{m['name']}** | {m['sites']:,} | {m['genotypes']:,} | {m['time']:.1f} | {speedup_str} |")
 
-        md_lines.append(f"| **{m['name']}** | {m['r2']:.4f}{r2_diff} | {m['rare_r2']:.4f} | {m['f1']:.4f} | {m['nonref']:.4f} | {m['ser']:.4f} | {m['n50']:.0f} | {m['time']:.1f} | {speedup_str} |")
+    # Confusion matrices
+    md_lines.append(f"\n### 📋 Confusion Matrices")
+    md_lines.append("*Truth (rows) vs Imputed (columns): HomRef, Het, HomAlt*\n")
+
+    for m in final_metrics:
+        md_lines.append(f"\n**{m['name']}:**")
+        if m['confusion_matrix']:
+            cm = m['confusion_matrix']
+            md_lines.append("```")
+            md_lines.append("              HomRef        Het     HomAlt")
+            md_lines.append(f"  HomRef  {cm[0][0]:>12,} {cm[0][1]:>10,} {cm[0][2]:>10,}")
+            md_lines.append(f"  Het     {cm[1][0]:>12,} {cm[1][1]:>10,} {cm[1][2]:>10,}")
+            md_lines.append(f"  HomAlt  {cm[2][0]:>12,} {cm[2][1]:>10,} {cm[2][2]:>10,}")
+            md_lines.append("```")
+        else:
+            md_lines.append("*No confusion matrix data available*")
+
+    # Masked SNP metrics
+    md_lines.append(f"\n### 🧪 Masked-SNP Metrics")
+    md_lines.append("*Quality assessment on held-out proxy variants*\n")
+    md_lines.append("| Tool | Masked Total | Masked Concordance | Masked Non-Ref Conc. | Masked R² |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: |")
+
+    for m in final_metrics:
+        md_lines.append(f"| **{m['name']}** | {m['masked_total']} | {m['masked_conc']:.4f} | {m['masked_nonref_conc']:.4f} | {m['masked_r2']:.4f} |")
+
+    # Raw counts table
+    md_lines.append(f"\n### 🔢 Raw Counts")
+    md_lines.append("*Underlying counts used to calculate metrics above*\n")
+    md_lines.append("| Tool | True Positives | False Positives | False Negatives | Non-Ref Total | Switch Errors | Switch Opportunities |")
+    md_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+    for m in final_metrics:
+        md_lines.append(f"| **{m['name']}** | {m['tp']:,} | {m['fp']:,} | {m['fn']:,} | {m['nonref_total']:,} | {m['switch_errors']:,} | {m['switch_opps']:,} |")
 
     # MAF-stratified performance comparison table
     bin_order = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)",

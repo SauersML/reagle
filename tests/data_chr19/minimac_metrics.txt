@@ -1,0 +1,87 @@
+============================================================
+IMPUTATION ACCURACY METRICS - DETAILED REPORT
+============================================================
+
+OVERALL STATISTICS
+----------------------------------------
+Sites compared: 1749078
+Genotypes compared: 1430745804
+Calculation time: 6636.4s
+
+ACCURACY METRICS
+----------------------------------------
+F1 Score (Non-Ref): 0.868046
+Precision: 0.913204
+Recall: 0.827144
+Unphased concordance: 0.983134
+Non-ref concordance: 0.742864
+Overall R²: 0.821525
+Overall IQS: 0.348698
+SEN (mean): 0.995526
+INFO score (approx): 0.946505
+Switch error rate: 0.016631
+N50 Phase Block: 270732 bp
+
+CONFUSION MATRIX
+----------------------------------------
+                 HomRef        Het     HomAlt
+HomRef       1353225398    5481757     168448
+Het            12100426   32123696    2829515
+HomAlt           322735    3227713   21266116
+
+BY MAF BIN
+----------------------------------------
+
+common (>20%):
+  F1 Score: 0.920457
+  Recall: 0.892160
+  Concordance: 0.859048
+  Non-ref concordance: 0.787526
+  R²: 0.762950
+  IQS: 0.757257
+  N genotypes: 73962742
+
+low-freq (1-5%):
+  F1 Score: 0.752531
+  Recall: 0.697067
+  Concordance: 0.967798
+  Non-ref concordance: 0.652422
+  R²: 0.733412
+  IQS: 0.602940
+  N genotypes: 119854996
+
+medium (5-20%):
+  F1 Score: 0.856940
+  Recall: 0.811860
+  Concordance: 0.920826
+  Non-ref concordance: 0.743123
+  R²: 0.781284
+  IQS: 0.752352
+  N genotypes: 79008166
+
+rare (0.5-1%):
+  F1 Score: 0.684950
+  Recall: 0.618427
+  Concordance: 0.985756
+  Non-ref concordance: 0.577690
+  R²: 0.663532
+  IQS: 0.485002
+  N genotypes: 77237196
+
+ultra-rare (<0.1%):
+  F1 Score: 0.486646
+  Recall: 0.397131
+  Concordance: 0.999019
+  Non-ref concordance: 0.384718
+  R²: 0.501931
+  IQS: 0.244190
+  N genotypes: 810839228
+
+very-rare (0.1-0.5%):
+  F1 Score: 0.691549
+  Recall: 0.624923
+  Concordance: 0.993719
+  Non-ref concordance: 0.570890
+  R²: 0.666661
+  IQS: 0.273961
+  N genotypes: 269843476
