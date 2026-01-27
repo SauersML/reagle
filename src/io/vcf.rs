@@ -1154,12 +1154,13 @@ impl VcfWriter {
     ///
     /// Eliminates O(n_markers * n_samples) flat_dosages allocation by using
     /// closures to access sample-major data directly during write.
-    pub fn write_imputed_streaming<S, F, B, G>(
+    pub fn write_imputed_streaming<S, F, B, G, H>(
         &mut self,
         matrix: &GenotypeMatrix<S>,
         get_dosage: F,
         get_best_gt: B,
         get_posteriors: Option<G>,
+        get_genotype_posteriors: Option<H>,
         quality: &ImputationQuality,
         start: usize,
         end: usize,
@@ -1178,6 +1179,7 @@ impl VcfWriter {
             crate::pipelines::imputation::AllelePosteriors,
             crate::pipelines::imputation::AllelePosteriors,
         ),
+        H: Fn(usize, usize) -> Option<Vec<f32>>,
     {
         let n_samples = self.samples.len();
 
@@ -1216,6 +1218,28 @@ impl VcfWriter {
             } else {
                 std::borrow::Cow::Borrowed(s)
             }
+        }
+
+        #[inline(always)]
+        fn best_gt_from_gp(n_alleles: usize, gp: &[f32]) -> (u8, u8) {
+            let mut best = (0u8, 0u8);
+            let mut best_prob = -1.0f32;
+            let mut idx = 0usize;
+            for j in 0..n_alleles {
+                for i in 0..=j {
+                    let p = gp.get(idx).copied().unwrap_or(0.0);
+                    if p > best_prob {
+                        best_prob = p;
+                        if i == j {
+                            best = (i as u8, i as u8);
+                        } else {
+                            best = (i as u8, j as u8);
+                        }
+                    }
+                    idx += 1;
+                }
+            }
+            best
         }
 
         for m in start..end {
@@ -1284,7 +1308,20 @@ impl VcfWriter {
             for s in 0..n_samples {
                 let ds = get_dosage(m, s);
                 let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
-                let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
+                let gp_override = get_genotype_posteriors
+                    .as_ref()
+                    .and_then(|f| f(m, s))
+                    .and_then(|gp| {
+                        let expected = n_alleles * (n_alleles + 1) / 2;
+                        if gp.len() == expected {
+                            Some(gp)
+                        } else {
+                            None
+                        }
+                    });
+                let (a1, a2) = if let Some(ref gp) = gp_override {
+                    best_gt_from_gp(n_alleles, gp)
+                } else if let Some((ref p1, ref p2)) = posteriors {
                     if n_alleles <= 2 {
                         let p1_alt = p1.prob(1);
                         let p2_alt = p2.prob(1);
@@ -1372,7 +1409,17 @@ impl VcfWriter {
 
                 if include_gp {
                     line_buf.push(':');
-                    if let Some((ref p1, ref p2)) = posteriors {
+                    if let Some(ref gp) = gp_override {
+                        let mut first = true;
+                        for p in gp.iter() {
+                            if !first {
+                                line_buf.push(',');
+                            }
+                            first = false;
+                            let v = format_f32_4dp(*p, &mut ryu_buf);
+                            line_buf.push_str(&v);
+                        }
+                    } else if let Some((ref p1, ref p2)) = posteriors {
                         let mut first = true;
                         for i2 in 0..n_alleles {
                             for i1 in 0..=i2 {

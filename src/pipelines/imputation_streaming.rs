@@ -31,7 +31,8 @@ use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::pl_emission::{
-    allele_probs_cond_from_pl, allele_probs_uncond_from_pl, infer_n_alleles_from_pl_len,
+    allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
+    infer_n_alleles_from_pl_len,
 };
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::pipelines::imputation::AllelePosteriors;
@@ -2267,11 +2268,132 @@ target_samples={} target_bytes={}",
             }
         };
 
+        let genotype_index = |a: usize, b: usize| -> usize {
+            let (i, j) = if a <= b { (a, b) } else { (b, a) };
+            j * (j + 1) / 2 + i
+        };
+
+        let best_gt_from_gp = |n_alleles: usize, gp: &[f32]| -> (u8, u8) {
+            let mut best = (0u8, 0u8);
+            let mut best_prob = -1.0f32;
+            let mut idx = 0usize;
+            for j in 0..n_alleles {
+                for i in 0..=j {
+                    let p = gp.get(idx).copied().unwrap_or(0.0);
+                    if p > best_prob {
+                        best_prob = p;
+                        if i == j {
+                            best = (i as u8, i as u8);
+                        } else {
+                            best = (i as u8, j as u8);
+                        }
+                    }
+                    idx += 1;
+                }
+            }
+            best
+        };
+
+        let dosage_from_gp = |n_alleles: usize, gp: &[f32]| -> f32 {
+            let mut dosage = 0.0f32;
+            let mut idx = 0usize;
+            for j in 0..n_alleles {
+                for i in 0..=j {
+                    let p = gp.get(idx).copied().unwrap_or(0.0);
+                    let alt_count = (i > 0) as u8 + (j > 0) as u8;
+                    dosage += p * (alt_count as f32);
+                    idx += 1;
+                }
+            }
+            dosage
+        };
+
+        let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
+            let target_m = alignment.target_marker(marker_idx)?;
+            let pl = target_win.sample_pl(MarkerIdx::new(target_m as u32), sample_idx)?;
+            if pl.is_empty() {
+                return None;
+            }
+            let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len())?;
+            if n_pl_alleles == 0 {
+                return None;
+            }
+            let n_ref_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+            let mapping = alignment
+                .allele_mappings
+                .get(target_m)
+                .and_then(|m| m.as_ref());
+
+            let base_probs = &ref_allele_freqs[marker_idx];
+            let mut target_priors = vec![0.0f32; n_pl_alleles];
+            if let Some(mapping) = mapping {
+                for t in 0..n_pl_alleles {
+                    if t < mapping.targ_to_ref.len() {
+                        let r = mapping.targ_to_ref[t];
+                        if r >= 0 && (r as usize) < base_probs.len() {
+                            target_priors[t] = base_probs[r as usize];
+                        }
+                    }
+                }
+            } else if n_pl_alleles == base_probs.len() {
+                target_priors.copy_from_slice(base_probs);
+            } else {
+                return None;
+            }
+            if !normalize_probs(&mut target_priors) {
+                let uniform = 1.0 / n_pl_alleles as f32;
+                target_priors.fill(uniform);
+            }
+
+            let mut target_gp: Vec<f32> = Vec::new();
+            let n = genotype_probs_from_pl(pl, Some(&target_priors), &mut target_gp)?;
+            if n != n_pl_alleles {
+                return None;
+            }
+
+            let mut ref_gp = vec![0.0f32; n_ref_alleles * (n_ref_alleles + 1) / 2];
+            let mut idx = 0usize;
+            for j in 0..n_pl_alleles {
+                for i in 0..=j {
+                    let p = target_gp.get(idx).copied().unwrap_or(0.0);
+                    idx += 1;
+                    let ri = if let Some(mapping) = mapping {
+                        mapping.targ_to_ref.get(i).copied().unwrap_or(-1)
+                    } else {
+                        i as i32
+                    };
+                    let rj = if let Some(mapping) = mapping {
+                        mapping.targ_to_ref.get(j).copied().unwrap_or(-1)
+                    } else {
+                        j as i32
+                    };
+                    if ri < 0 || rj < 0 {
+                        continue;
+                    }
+                    let (ri, rj) = (ri as usize, rj as usize);
+                    if ri >= n_ref_alleles || rj >= n_ref_alleles {
+                        continue;
+                    }
+                    let ref_idx = genotype_index(ri, rj);
+                    if ref_idx < ref_gp.len() {
+                        ref_gp[ref_idx] += p;
+                    }
+                }
+            }
+            if !normalize_probs(&mut ref_gp) {
+                return None;
+            }
+            Some(ref_gp)
+        };
+
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                dosage_from_gp(n_alleles, &gp)
+            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
@@ -2289,7 +2411,10 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                best_gt_from_gp(n_alleles, &gp)
+            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 (a1, a2)
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
@@ -2324,7 +2449,15 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                let n_alleles = ref_markers
+                                    .marker(MarkerIdx::new(marker_idx as u32))
+                                    .n_alleles();
+                                let dosage = dosage_from_gp(n_alleles, &gp);
+                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                                v1 = p_alt;
+                                v2 = p_alt;
+                            } else if let Some(target_m) = alignment.target_marker(marker_idx) {
                                 let h1 = HapIdx::new((s * 2) as u32);
                                 let h2 = HapIdx::new((s * 2 + 1) as u32);
                                 let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
@@ -2370,7 +2503,15 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(target_m) = alignment.target_marker(marker_idx) {
+                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                let n_alleles = ref_markers
+                                    .marker(MarkerIdx::new(marker_idx as u32))
+                                    .n_alleles();
+                                let dosage = dosage_from_gp(n_alleles, &gp);
+                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                                v1 = p_alt;
+                                v2 = p_alt;
+                            } else if let Some(target_m) = alignment.target_marker(marker_idx) {
                                 let h1 = HapIdx::new((s * 2) as u32);
                                 let h2 = HapIdx::new((s * 2 + 1) as u32);
                                 let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
@@ -2435,11 +2576,15 @@ target_samples={} target_bytes={}",
             &marker_matrix
         };
 
+        let get_genotype_posteriors_for_writer =
+            if include_gp { Some(|m, s| get_genotype_posteriors(m, s)) } else { None };
+
         writer.write_imputed_streaming(
             marker_matrix_ref,
             get_dosage,
             get_best_gt,
             get_posteriors_for_writer,
+            get_genotype_posteriors_for_writer,
             quality,
             output_start,
             output_end,
