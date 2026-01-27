@@ -6234,7 +6234,7 @@ mod tests {
         };
 
         let pipeline = PhasingPipeline::new(config, None);
-        assert_eq!(pipeline.params.n_states, 280);
+        assert_eq!(pipeline.params.n_states, 600);
     }
 
     #[test]
