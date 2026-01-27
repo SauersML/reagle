@@ -1417,6 +1417,20 @@ target_samples={} target_bytes={}",
                 false
             }
         };
+        let pl_is_uniform = |pl: &[u16]| -> bool {
+            if pl.is_empty() {
+                return true;
+            }
+            let first = pl[0];
+            pl.iter().all(|&v| v == first)
+        };
+        let pl_is_uniform = |pl: &[u16]| -> bool {
+            if pl.is_empty() {
+                return true;
+            }
+            let first = pl[0];
+            pl.iter().all(|&v| v == first)
+        };
 
         let build_input_probs = |hap_idx: HapIdx, sample_idx: usize| -> TargetAlleleProbs {
             let mut offsets = Vec::with_capacity(n_ref_markers + 1);
@@ -1462,34 +1476,15 @@ target_samples={} target_bytes={}",
                     let mut pl_probs: Vec<f32> = Vec::new();
                     let pl = target_win.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
                     if let Some(pl) = pl {
-                        if !pl.is_empty() {
-                            let mut base_probs = ref_allele_freqs[ref_m].clone();
-                            if base_probs.len() != n_alleles {
-                                base_probs.resize(n_alleles, 1.0 / n_alleles as f32);
-                            }
+                        if !pl.is_empty() && !pl_is_uniform(pl) {
                             let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len()).unwrap_or(0);
                             if n_pl_alleles > 0 {
                                 let mapping = alignment
                                     .allele_mappings
                                     .get(target_m)
                                     .and_then(|m| m.as_ref());
-                                let mut target_priors = vec![0.0f32; n_pl_alleles];
-                                if let Some(mapping) = mapping {
-                                    for t in 0..n_pl_alleles {
-                                        if t < mapping.targ_to_ref.len() {
-                                            let r = mapping.targ_to_ref[t];
-                                            if r >= 0 && (r as usize) < base_probs.len() {
-                                                target_priors[t] = base_probs[r as usize];
-                                            }
-                                        }
-                                    }
-                                } else if n_pl_alleles == base_probs.len() {
-                                    target_priors.copy_from_slice(&base_probs);
-                                }
-                                if !normalize_probs(&mut target_priors) {
-                                    let uniform = 1.0 / n_pl_alleles as f32;
-                                    target_priors.fill(uniform);
-                                }
+                                let uniform = 1.0 / n_pl_alleles as f32;
+                                let mut target_priors = vec![uniform; n_pl_alleles];
 
                                 let partner = target_win
                                     .allele(MarkerIdx::new(target_m as u32), hap_idx.other());
@@ -1531,13 +1526,8 @@ target_samples={} target_bytes={}",
                                     if w <= 0.0 {
                                         continue;
                                     }
-                                    if allele_probs_cond_from_pl(
-                                        pl,
-                                        b as u8,
-                                        Some(&base_probs),
-                                        &mut cond_probs,
-                                    )
-                                    .is_some()
+                                    if allele_probs_cond_from_pl(pl, b as u8, None, &mut cond_probs)
+                                        .is_some()
                                     {
                                         for (a, &p) in cond_probs.iter().enumerate() {
                                             if a < pl_probs.len() {
@@ -1567,12 +1557,8 @@ target_samples={} target_bytes={}",
                                         aligned_probs = pl_probs.clone();
                                         use_probs = true;
                                     }
-                                } else if allele_probs_uncond_from_pl(
-                                    pl,
-                                    Some(&base_probs),
-                                    &mut pl_probs,
-                                )
-                                .is_some()
+                                } else if allele_probs_uncond_from_pl(pl, None, &mut pl_probs)
+                                    .is_some()
                                 {
                                     if let Some(mapping) = mapping {
                                         let mut mapped = vec![0.0f32; n_alleles];
@@ -2149,7 +2135,7 @@ target_samples={} target_bytes={}",
         &self,
         ref_markers: &crate::data::marker::Markers,
         ref_genotypes: Option<&GenotypeMatrix<Phased>>,
-        ref_allele_freqs: &[Vec<f32>],
+        _ref_allele_freqs: &[Vec<f32>],
         target_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
         writer: &mut VcfWriter,
@@ -2334,6 +2320,9 @@ target_samples={} target_bytes={}",
             if pl.is_empty() {
                 return None;
             }
+            if pl_is_uniform(pl) {
+                return None;
+            }
             let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len())?;
             if n_pl_alleles == 0 {
                 return None;
@@ -2343,30 +2332,8 @@ target_samples={} target_bytes={}",
                 .allele_mappings
                 .get(target_m)
                 .and_then(|m| m.as_ref());
-
-            let base_probs = &ref_allele_freqs[marker_idx];
-            let mut target_priors = vec![0.0f32; n_pl_alleles];
-            if let Some(mapping) = mapping {
-                for t in 0..n_pl_alleles {
-                    if t < mapping.targ_to_ref.len() {
-                        let r = mapping.targ_to_ref[t];
-                        if r >= 0 && (r as usize) < base_probs.len() {
-                            target_priors[t] = base_probs[r as usize];
-                        }
-                    }
-                }
-            } else if n_pl_alleles == base_probs.len() {
-                target_priors.copy_from_slice(base_probs);
-            } else {
-                return None;
-            }
-            if !normalize_probs(&mut target_priors) {
-                let uniform = 1.0 / n_pl_alleles as f32;
-                target_priors.fill(uniform);
-            }
-
             let mut target_gp: Vec<f32> = Vec::new();
-            let n = genotype_probs_from_pl(pl, Some(&target_priors), &mut target_gp)?;
+            let n = genotype_probs_from_pl(pl, None, &mut target_gp)?;
             if n != n_pl_alleles {
                 return None;
             }
