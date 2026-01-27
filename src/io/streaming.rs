@@ -64,15 +64,7 @@ pub struct StateProbs {
     pub n_states: usize,
 }
 
-impl StateProbs {
-    pub fn new(data: Vec<Vec<Vec<f32>>>, marker_indices: Vec<usize>, n_states: usize) -> Self {
-        Self {
-            data,
-            marker_indices,
-            n_states,
-        }
-    }
-}
+impl StateProbs {}
 
 /// Global haplotype identifier (stable across windows).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

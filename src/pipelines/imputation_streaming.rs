@@ -2098,6 +2098,7 @@ target_samples={} target_bytes={}",
         self.write_imputed_window_streaming(
             ref_markers,
             ref_genotypes,
+            &ref_allele_freqs,
             target_win,
             alignment,
             final_writer,
@@ -2148,6 +2149,7 @@ target_samples={} target_bytes={}",
         &self,
         ref_markers: &crate::data::marker::Markers,
         ref_genotypes: Option<&GenotypeMatrix<Phased>>,
+        ref_allele_freqs: &[Vec<f32>],
         target_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
         writer: &mut VcfWriter,
@@ -2204,6 +2206,24 @@ target_samples={} target_bytes={}",
                     AllelePosteriors::Multiallelic(zeros.clone()),
                     AllelePosteriors::Multiallelic(zeros),
                 )
+            }
+        };
+
+        let normalize_probs = |probs: &mut [f32]| -> bool {
+            let mut sum = 0.0f32;
+            for p in probs.iter_mut() {
+                if *p < 0.0 {
+                    *p = 0.0;
+                }
+                sum += *p;
+            }
+            if sum > 0.0 {
+                for p in probs.iter_mut() {
+                    *p /= sum;
+                }
+                true
+            } else {
+                false
             }
         };
 
@@ -2357,15 +2377,19 @@ target_samples={} target_bytes={}",
                 for i in 0..=j {
                     let p = target_gp.get(idx).copied().unwrap_or(0.0);
                     idx += 1;
-                    let ri = if let Some(mapping) = mapping {
+                    let ri: i8 = if let Some(mapping) = mapping {
                         mapping.targ_to_ref.get(i).copied().unwrap_or(-1)
+                    } else if i <= i8::MAX as usize {
+                        i as i8
                     } else {
-                        i as i32
+                        -1
                     };
-                    let rj = if let Some(mapping) = mapping {
+                    let rj: i8 = if let Some(mapping) = mapping {
                         mapping.targ_to_ref.get(j).copied().unwrap_or(-1)
+                    } else if j <= i8::MAX as usize {
+                        j as i8
                     } else {
-                        j as i32
+                        -1
                     };
                     if ri < 0 || rj < 0 {
                         continue;
@@ -2717,10 +2741,12 @@ mod tests {
 
         let pipeline = ImputationPipeline::new(Config::default(), None);
         let ref_is_biallelic = vec![true; ref_markers.len()];
+        let ref_allele_freqs = vec![vec![0.5, 0.5]; ref_markers.len()];
 
         let result = pipeline.write_imputed_window_streaming(
             &ref_markers,
             Some(&ref_genotypes),
+            &ref_allele_freqs,
             &target_win,
             &alignment,
             &mut writer,

@@ -2386,16 +2386,17 @@ impl PhasingPipeline {
                                     aligned_vec::AVec::new(32),
                                 );
 
+                                let plp = PlProvider {
+                                    gt: target_gt,
+                                    sample: s,
+                                    subset_to_orig: None,
+                                };
                                 hmm_full.conditioned_forward_backward_with_lookup(
                                     &seq1,
                                     &seq2,
                                     &seq2,
                                     Some(sample_conf),
-                                    Some(PlProvider {
-                                        gt: target_gt,
-                                        sample: s,
-                                        subset_to_orig: None,
-                                    }),
+                                    Some(&plp),
                                     None,
                                     None,
                                     &lookup_full,
@@ -2407,11 +2408,7 @@ impl PhasingPipeline {
                                     &seq1,
                                     &seq1,
                                     Some(sample_conf),
-                                    Some(PlProvider {
-                                        gt: target_gt,
-                                        sample: s,
-                                        subset_to_orig: None,
-                                    }),
+                                    Some(&plp),
                                     None,
                                     None,
                                     &lookup_full,
@@ -3801,7 +3798,7 @@ impl PhasingPipeline {
         // (all decisions pass). We still check for consistency with Stage 1.
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, (decisions, _next_probs, next_hap_priors, prior_marker)) in
+        for (s, (decisions, _, next_hap_priors, prior_marker)) in
             phase_results.into_iter().enumerate()
         {
             if let Some(all) = all_next_hap_priors.as_mut() {
@@ -3861,16 +3858,6 @@ impl PhasingPipeline {
             "Stage 2: Applied {} phase switches, {} markers phased, {} markers imputed (HMM interpolation)",
             total_switches, total_phased, total_imputed
         );
-
-        let _indices = if let Some(start) = next_overlap_start {
-            let start_stage1 = hi_freq_markers
-                .iter()
-                .position(|&m| m >= start)
-                .unwrap_or(n_stage1);
-            (start_stage1..n_stage1).collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
 
         let next_state_probs = None;
 
