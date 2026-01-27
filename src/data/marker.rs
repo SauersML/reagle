@@ -3,6 +3,7 @@
 //! Genomic marker (variant site) representation. Replaces `vcf/Marker.java`.
 
 use std::sync::Arc;
+use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,36 +24,55 @@ pub fn bits_per_allele(n_alleles: usize) -> u8 {
     }
 }
 
-/// Zero-cost newtype for marker indices
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
-)]
-pub struct MarkerIdx(pub u32);
+/// Marker space tags (used to prevent index-space mixups at compile time)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AnyMarkerSpace;
 
-impl MarkerIdx {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RefGlobalSpace;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RefWindowSpace;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RefPhasingSpace;
+
+/// Zero-cost newtype for marker indices
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
+pub struct MarkerIdx<Space = AnyMarkerSpace>(pub u32, #[serde(skip)] PhantomData<Space>);
+
+impl<Space> Copy for MarkerIdx<Space> {}
+
+impl<Space> Clone for MarkerIdx<Space> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Space> MarkerIdx<Space> {
     pub fn new(idx: u32) -> Self {
-        Self(idx)
+        Self(idx, PhantomData)
     }
 
-    pub fn as_usize(self) -> usize {
+    pub fn as_usize(&self) -> usize {
         self.0 as usize
     }
 }
 
-impl From<u32> for MarkerIdx {
+impl<Space> From<u32> for MarkerIdx<Space> {
     fn from(idx: u32) -> Self {
-        Self(idx)
+        Self(idx, PhantomData)
     }
 }
 
-impl From<usize> for MarkerIdx {
+impl<Space> From<usize> for MarkerIdx<Space> {
     fn from(idx: usize) -> Self {
-        Self(idx as u32)
+        Self(idx as u32, PhantomData)
     }
 }
 
-impl From<MarkerIdx> for usize {
-    fn from(idx: MarkerIdx) -> usize {
+impl<Space> From<MarkerIdx<Space>> for usize {
+    fn from(idx: MarkerIdx<Space>) -> usize {
         idx.0 as usize
     }
 }
@@ -470,18 +490,24 @@ impl Ord for Marker {
 }
 
 /// A collection of markers
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Markers {
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Markers<Space = AnyMarkerSpace> {
     /// The markers in order
     markers: Vec<Marker>,
     /// Chromosome names (indexed by ChromIdx)
     chrom_names: Vec<Arc<str>>,
+    #[serde(skip)]
+    space: PhantomData<Space>,
 }
 
-impl Markers {
+impl<Space> Markers<Space> {
     /// Create an empty marker collection
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            markers: Vec::new(),
+            chrom_names: Vec::new(),
+            space: PhantomData,
+        }
     }
 
     /// Number of markers
@@ -491,12 +517,12 @@ impl Markers {
 
     /// Check if empty
     /// Get marker by index
-    pub fn get(&self, idx: MarkerIdx) -> Option<&Marker> {
+    pub fn get(&self, idx: MarkerIdx<Space>) -> Option<&Marker> {
         self.markers.get(idx.as_usize())
     }
 
     /// Get marker by index (unchecked)
-    pub fn marker(&self, idx: MarkerIdx) -> &Marker {
+    pub fn marker(&self, idx: MarkerIdx<Space>) -> &Marker {
         &self.markers[idx.as_usize()]
     }
 
@@ -529,10 +555,20 @@ impl Markers {
     }
 }
 
-impl std::ops::Index<MarkerIdx> for Markers {
+impl<Space> Clone for Markers<Space> {
+    fn clone(&self) -> Self {
+        Self {
+            markers: self.markers.clone(),
+            chrom_names: self.chrom_names.clone(),
+            space: PhantomData,
+        }
+    }
+}
+
+impl<Space> std::ops::Index<MarkerIdx<Space>> for Markers<Space> {
     type Output = Marker;
 
-    fn index(&self, idx: MarkerIdx) -> &Self::Output {
+    fn index(&self, idx: MarkerIdx<Space>) -> &Self::Output {
         &self.markers[idx.as_usize()]
     }
 }

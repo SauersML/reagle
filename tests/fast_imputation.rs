@@ -1956,7 +1956,7 @@ fn test_phasing_confidence() {
     let n_ref_samples = 100;
 
     // Build target genotype matrix with unphased heterozygous sites
-    let mut target_markers = Markers::new();
+    let mut target_markers = Markers::<reagle::data::AnyMarkerSpace>::new();
     target_markers.add_chrom("chr1");
     for i in 0..n_markers {
         let m = Marker::new(
@@ -2013,7 +2013,7 @@ fn test_phasing_confidence() {
     let target_gt = GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
 
     // Build reference haplotype matrix with clear patterns
-    let mut ref_markers = Markers::new();
+    let mut ref_markers = Markers::<reagle::data::AnyMarkerSpace>::new();
     ref_markers.add_chrom("chr1");
     for i in 0..n_markers {
         let m = Marker::new(
@@ -2119,18 +2119,18 @@ fn test_phasing_confidence() {
             has_mapping_count += 1;
         }
 
-        if let Some(ref_m) = alignment.target_to_ref(t_m) {
+        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(t_m as u32)) {
             aligned_count += 1;
             if t_m < 3 {
                 let t_marker = target_gt.marker(MarkerIdx::new(t_m as u32));
-                let r_marker = ref_gt.marker(MarkerIdx::new(ref_m as u32));
+                let r_marker = ref_gt.marker(ref_m);
                 println!(
                     "Target marker {} (pos {}, ref={}, alt={:?}) → Ref marker {} (pos {}, ref={}, alt={:?}), has_mapping={}",
                     t_m,
                     t_marker.pos,
                     t_marker.ref_allele,
                     t_marker.alt_alleles,
-                    ref_m,
+                    ref_m.as_usize(),
                     r_marker.pos,
                     r_marker.ref_allele,
                     r_marker.alt_alleles,

@@ -380,7 +380,7 @@ impl VcfReader {
     /// Read all records into a GenotypeMatrix
     pub fn read_all(&mut self, mut reader: Box<dyn BufRead + Send>) -> Result<GenotypeMatrix> {
         info_span!("vcf_read_all").in_scope(|| {
-            let mut markers = Markers::new();
+            let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
             let mut columns = Vec::new();
             let n_samples = self.samples.len();
             // Accumulate per-marker confidence scores (one Vec<u8> per marker, indexed by sample)
@@ -1021,7 +1021,7 @@ impl VcfWriter {
     }
 
     /// Write VCF header for phased output
-    pub fn write_header(&mut self, markers: &Markers) -> Result<()> {
+    pub fn write_header<Space>(&mut self, markers: &Markers<Space>) -> Result<()> {
         info_span!("vcf_write_header")
             .in_scope(|| self.write_header_extended(markers, false, false, false))
     }
@@ -1033,9 +1033,9 @@ impl VcfWriter {
     /// * `imputed` - Include imputation INFO fields (DR2, AF, IMP)
     /// * `include_gp` - Include GP (genotype probabilities) FORMAT field
     /// * `include_ap` - Include AP (allele probabilities) FORMAT field
-    pub fn write_header_extended(
+    pub fn write_header_extended<Space>(
         &mut self,
-        markers: &Markers,
+        markers: &Markers<Space>,
         imputed: bool,
         include_gp: bool,
         include_ap: bool,
@@ -1106,9 +1106,9 @@ impl VcfWriter {
     }
 
     /// Write a genotype matrix (works with any phase state)
-    pub fn write_phased<S: PhaseState>(
+    pub fn write_phased<S: PhaseState, Space>(
         &mut self,
-        matrix: &GenotypeMatrix<S>,
+        matrix: &GenotypeMatrix<S, Space>,
         start_marker: usize,
         end_marker: usize,
     ) -> Result<()> {
@@ -1154,9 +1154,9 @@ impl VcfWriter {
     ///
     /// Eliminates O(n_markers * n_samples) flat_dosages allocation by using
     /// closures to access sample-major data directly during write.
-    pub fn write_imputed_streaming<S, F, B, G, H>(
+    pub fn write_imputed_streaming<S, Space, F, B, G, H>(
         &mut self,
-        matrix: &GenotypeMatrix<S>,
+        matrix: &GenotypeMatrix<S, Space>,
         get_dosage: F,
         get_best_gt: B,
         get_posteriors: Option<G>,

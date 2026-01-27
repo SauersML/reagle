@@ -235,7 +235,7 @@ fn run_rust_imputation_with_ap(
 fn test_missing_confidence_is_not_full_by_default() {
     // Hypothesis: missing GL/PL causes confidence to default to 1.0 (hard evidence).
     // This test should FAIL if that hypothesis is true.
-    let markers = reagle::data::marker::Markers::new();
+    let markers = reagle::data::marker::Markers::<reagle::data::AnyMarkerSpace>::new();
     let samples = std::sync::Arc::new(reagle::data::haplotype::Samples::from_ids(vec![
         "s0".into(),
     ]));

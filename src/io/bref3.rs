@@ -34,7 +34,9 @@ use anyhow::{Context, Result, bail};
 use crate::data::ChromIdx;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::haplotype::Samples;
-use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
+use crate::data::marker::{
+    Allele, Marker, MarkerIdx, Markers, RefGlobalSpace, RefPhasingSpace, RefWindowSpace,
+};
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, SeqCodedBlock, SeqCodedColumn};
 use crate::model::block_hash::{CompressedBlock, ReferenceMap};
@@ -115,7 +117,7 @@ impl Bref3Reader {
             reader,
             samples,
             n_haps,
-            markers: Markers::new(),
+            markers: Markers::<crate::data::AnyMarkerSpace>::new(),
             chrom_map: std::collections::HashMap::new(),
         })
     }
@@ -456,7 +458,7 @@ impl StreamingBref3Reader {
 
         // Create SeqCodedBlock for sequence-coded records
         let mut seq_block = SeqCodedBlock::new(hap_to_seq);
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         markers.add_chrom(&chrom_name);
         let mut columns: Vec<GenotypeColumn> = Vec::with_capacity(n_recs);
         let block_start_idx = 0;
@@ -635,9 +637,11 @@ impl StreamingBref3WindowReader {
         }
 
         let mut carryover = std::mem::take(&mut self.buffer);
-        let mut markers = Markers::new();
-        let mut phasing_markers = Markers::new();
+        let mut markers = Markers::<RefWindowSpace>::new();
+        let mut phasing_markers = Markers::<RefPhasingSpace>::new();
         let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
+        let mut full_columns: Option<Vec<GenotypeColumn>> =
+            if max_states > 0 { Some(Vec::new()) } else { None };
         let mut window_gen_pos: Vec<f64> = Vec::new();
         let mut blocks: Vec<Arc<CompressedBlock>> = Vec::new();
         let mut block_markers: Vec<Marker> = Vec::with_capacity(block_size);
@@ -693,6 +697,9 @@ impl StreamingBref3WindowReader {
             }
             markers.push(window_marker.clone());
             window_gen_pos.push(marker.gen_pos);
+            if let Some(cols) = full_columns.as_mut() {
+                cols.push(marker.column.clone());
+            }
 
             if let Some(ref_chrom) = self.current_chrom.as_deref() {
                 if marker_in_target(ref_chrom, marker.marker.pos, target_positions) {
@@ -780,6 +787,9 @@ impl StreamingBref3WindowReader {
                 self.inner.samples_arc(),
             ))
         };
+        let ref_genotypes_full = full_columns.map(|cols| {
+            GenotypeMatrix::new_phased(markers.clone(), cols, self.inner.samples_arc())
+        });
 
         if carryover.is_empty() {
             self.buffer = next_overlap;
@@ -795,6 +805,7 @@ impl StreamingBref3WindowReader {
             markers,
             ref_map,
             ref_genotypes,
+            ref_genotypes_full,
             global_start: self.global_marker_idx - output_end,
             global_end: (self.global_marker_idx - output_end) + window_size,
             output_start: 0,
@@ -866,11 +877,15 @@ impl StreamingBref3WindowReader {
 /// A window of reference data accumulated from multiple blocks
 pub struct RefWindow {
     /// Marker metadata for this window
-    pub markers: Markers,
+    pub markers: Markers<RefWindowSpace>,
     /// Compressed reference map for this window
     pub ref_map: Arc<ReferenceMap>,
     /// Optional phased reference genotypes (used for reference-guided phasing)
-    pub ref_genotypes: Option<GenotypeMatrix<crate::data::storage::phase_state::Phased>>,
+    pub ref_genotypes:
+        Option<GenotypeMatrix<crate::data::storage::phase_state::Phased, RefPhasingSpace>>,
+    /// Optional full-window reference genotypes (used for PBWT keep-mask rebuild)
+    pub ref_genotypes_full:
+        Option<GenotypeMatrix<crate::data::storage::phase_state::Phased, RefWindowSpace>>,
     /// Global start marker index
     pub global_start: usize,
     /// Global end marker index (exclusive)
@@ -936,7 +951,7 @@ struct RefPanelMarker {
 pub struct StreamingRefVcfReader {
     reader: Box<dyn BufRead + Send>,
     samples: Arc<Samples>,
-    markers: Markers,
+    markers: Markers<RefGlobalSpace>,
     buffer: VecDeque<RefPanelMarker>,
     pending_marker: Option<RefPanelMarker>,
     current_chrom: Option<Arc<str>>,
@@ -1049,7 +1064,7 @@ impl StreamingRefVcfReader {
         Ok(Self {
             reader,
             samples,
-            markers: Markers::new(),
+            markers: Markers::<RefGlobalSpace>::new(),
             buffer: VecDeque::new(),
             pending_marker: None,
             current_chrom: None,
@@ -1075,9 +1090,11 @@ impl StreamingRefVcfReader {
         }
 
         let mut carryover = std::mem::take(&mut self.buffer);
-        let mut markers = Markers::new();
-        let mut phasing_markers = Markers::new();
+        let mut markers = Markers::<RefWindowSpace>::new();
+        let mut phasing_markers = Markers::<RefPhasingSpace>::new();
         let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
+        let mut full_columns: Option<Vec<GenotypeColumn>> =
+            if max_states > 0 { Some(Vec::new()) } else { None };
         let mut window_gen_pos: Vec<f64> = Vec::new();
         let mut blocks: Vec<Arc<CompressedBlock>> = Vec::new();
         let mut block_markers: Vec<Marker> = Vec::with_capacity(block_size);
@@ -1152,6 +1169,9 @@ impl StreamingRefVcfReader {
             }
             markers.push(window_marker.clone());
             window_gen_pos.push(marker.gen_pos);
+            if let Some(cols) = full_columns.as_mut() {
+                cols.push(marker.column.clone());
+            }
 
             if let Some(chrom_name) = self.current_chrom.as_deref() {
                 if marker_in_target(chrom_name, marker.marker.pos, target_positions) {
@@ -1239,6 +1259,8 @@ impl StreamingRefVcfReader {
                 Arc::clone(&self.samples),
             ))
         };
+        let ref_genotypes_full =
+            full_columns.map(|cols| GenotypeMatrix::new_phased(markers.clone(), cols, Arc::clone(&self.samples)));
 
         if carryover.is_empty() {
             self.buffer = next_overlap;
@@ -1254,6 +1276,7 @@ impl StreamingRefVcfReader {
             markers,
             ref_map,
             ref_genotypes,
+            ref_genotypes_full,
             global_start: self.global_marker_idx - output_end,
             global_end: (self.global_marker_idx - output_end) + window_size,
             output_start: 0,

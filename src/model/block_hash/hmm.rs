@@ -619,7 +619,7 @@ mod tests {
         let col0 = GenotypeColumn::from_alleles(&[0, 0, 1], 2);
         let col1 = GenotypeColumn::from_alleles(&[0, 1, 1], 2);
 
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         let chr = markers.add_chrom("1");
         markers.push(Marker::new(
             chr,

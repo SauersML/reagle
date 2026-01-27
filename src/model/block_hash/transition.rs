@@ -408,7 +408,7 @@ mod tests {
             cols.push(GenotypeColumn::from_alleles(&col_alleles, 2));
         }
 
-        let mut markers = Markers::new();
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         let chr = markers.add_chrom("1");
         for i in 0..n_markers {
             markers.push(Marker::new(
