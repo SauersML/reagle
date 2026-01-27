@@ -129,7 +129,7 @@ pub struct Config {
     pub window: f32,
 
     /// Maximum markers per window
-    #[arg(long = "window-markers", default_value = "100000")]
+    #[arg(long = "window-markers", default_value = "4000000")]
     pub window_markers: usize,
 
     /// Window overlap in cM
@@ -179,7 +179,7 @@ impl Default for Config {
             err: None,
             em: true,
             window: 40.0,
-            window_markers: 100000,
+            window_markers: 4000000,
             overlap: 2.0,
             seed: -99999,
             nthreads: None,
