@@ -1795,19 +1795,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let mut ref_alleles = vec![0u8; n_ref_haps];
         let mut query_alleles = vec![0u8; n_target_haps];
 
-        let mut donors_fwd: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
         let mut swaps_buffer = vec![false; n_samples];
 
-        let mut block_idx_fwd = 0usize;
-        let mut next_block_start_fwd = if !donor_blocks.is_empty() {
-            donor_blocks[0].0
-        } else {
-            n_markers
-        };
+        // Forward pass: reference-only PBWT + query beams for target haplotypes
 
-                // Forward pass: reference-only PBWT + query beams for target haplotypes
-
-                for m in 0..n_markers {
+        for m in 0..n_markers {
 
                     let orig_m = marker_to_global
 
@@ -1863,33 +1855,25 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
 
-            // Block-static donors: (re)select donors once per genetic-distance block
-            if m == next_block_start_fwd {
-                for h in 0..n_target_haps {
-                    let mut ds = pbwt_fwd.select_donors(&beams_fwd[h], n_candidates);
-                    let offset = n_target_haps as u32;
-                    for x in &mut ds {
-                        *x += offset;
-                    }
-                    donors_fwd[h] = ds;
-                }
-
-                block_idx_fwd += 1;
-                if block_idx_fwd < donor_blocks.len() {
-                    next_block_start_fwd = donor_blocks[block_idx_fwd].0;
-                } else {
-                    next_block_start_fwd = n_markers;
-                }
-            }
-
             // At sampling points, collect forward donors for all samples
             if sampling_points.get(m).copied().unwrap_or(false) {
                 for s in 0..n_samples {
                     let h1 = s * 2;
                     let h2 = h1 + 1;
-                    let n1 = donors_fwd.get(h1).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let n2 = donors_fwd.get(h2).map(|v| v.as_slice()).unwrap_or(&[]);
-                    phase_states[s].add_neighbors_at_marker(s as u32, m, n1, n2);
+
+                    // Compute donors on demand based on current beam
+                    let mut ds1 = pbwt_fwd.select_donors(&beams_fwd[h1], n_candidates);
+                    let offset = n_target_haps as u32;
+                    for x in &mut ds1 {
+                        *x += offset;
+                    }
+
+                    let mut ds2 = pbwt_fwd.select_donors(&beams_fwd[h2], n_candidates);
+                    for x in &mut ds2 {
+                        *x += offset;
+                    }
+
+                    phase_states[s].add_neighbors_at_marker(s as u32, m, &ds1, &ds2);
                 }
 
                 // Also add IBS2 neighbors
@@ -1918,15 +1902,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             .map(|_| RankBeam::full(n_ref_haps as u32))
             .collect();
 
-        let mut donors_bwd: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
-        let mut block_idx_bwd = donor_blocks.len();
-        let mut next_block_end_bwd = 0usize;
-        if block_idx_bwd > 0 {
-            block_idx_bwd -= 1;
-            next_block_end_bwd = donor_blocks[block_idx_bwd].1;
-        }
-
-                for (rev_step, m) in (0..n_markers).rev().enumerate() {
+        for (rev_step, m) in (0..n_markers).rev().enumerate() {
 
                     let orig_m = marker_to_global
 
@@ -1979,32 +1955,24 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
 
-            // Block-static donors for backward traversal: select at block end-1
-            if m + 1 == next_block_end_bwd {
-                for h in 0..n_target_haps {
-                    let mut ds = pbwt_bwd.select_donors(&beams_bwd[h], n_candidates);
-                    let offset = n_target_haps as u32;
-                    for x in &mut ds {
-                        *x += offset;
-                    }
-                    donors_bwd[h] = ds;
-                }
-
-                if block_idx_bwd > 0 {
-                    block_idx_bwd -= 1;
-                    next_block_end_bwd = donor_blocks[block_idx_bwd].1;
-                } else {
-                    next_block_end_bwd = 0;
-                }
-            }
-
             if sampling_points.get(m).copied().unwrap_or(false) {
                 for s in 0..n_samples {
                     let h1 = s * 2;
                     let h2 = h1 + 1;
-                    let n1 = donors_bwd.get(h1).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let n2 = donors_bwd.get(h2).map(|v| v.as_slice()).unwrap_or(&[]);
-                    phase_states[s].add_neighbors_at_marker(s as u32, m, n1, n2);
+
+                    // Compute donors on demand based on current beam
+                    let mut ds1 = pbwt_bwd.select_donors(&beams_bwd[h1], n_candidates);
+                    let offset = n_target_haps as u32;
+                    for x in &mut ds1 {
+                        *x += offset;
+                    }
+
+                    let mut ds2 = pbwt_bwd.select_donors(&beams_bwd[h2], n_candidates);
+                    for x in &mut ds2 {
+                        *x += offset;
+                    }
+
+                    phase_states[s].add_neighbors_at_marker(s as u32, m, &ds1, &ds2);
                 }
             }
         }
