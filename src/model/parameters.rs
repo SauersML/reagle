@@ -109,7 +109,8 @@ impl ModelParams {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+        // Java Beagle uses 0.0001 scalar for imputation (vs 0.04 for phasing) to preserve long-range haplotypes
+        let recomb_intensity = 0.0001 * ne / n_ref_haps as f32;
 
         Self {
             p_mismatch,

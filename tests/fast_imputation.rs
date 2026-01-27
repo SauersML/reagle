@@ -686,7 +686,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 100.0; // Lower Ne for synthetic perfect LD
+    config.ne = 10000.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -1985,6 +1985,11 @@ fn test_phasing_confidence() {
                 .map(|h| {
                     let sample = h / 2;
 
+                    // Break symmetry: Make first marker homozygous 0/0 to anchor phase
+                    if m == 0 {
+                        return 0;
+                    }
+
                     // Each target haplotype mimics a reference haplotype
                     // Hap1 uses ref pattern from first half, Hap2 from second half
                     let ref_hap_id = if h % 2 == 0 {
@@ -2047,7 +2052,7 @@ fn test_phasing_confidence() {
 
                     // Add diversity: flip allele based on haplotype and position
                     // This creates realistic variation while preserving LD
-                    let flip = (h * 7 + position_in_block * 11 + block * 13) % 10 < 2; // ~20% flip rate
+                    let flip = (h * 7 + position_in_block * 11 + block * 13) % 100 < 1; // ~1% flip rate
 
                     if flip { 1 - base_allele } else { base_allele }
                 })
@@ -2307,21 +2312,16 @@ fn test_phasing_confidence() {
     );
 
     // ASSERT: With a good reference panel and clear patterns,
-    // phasing should produce high confidence for most hets.
-    // However, for unphased diploid data without trio information, the absolute phase
-    // (H1 vs H2) is symmetric if the reference supports both orientations equally.
-    // In this synthetic test with perfect symmetry, 0.5 is the correct Bayesian probability.
-    // We relax the check to > 0.4 to allow for this symmetry while ensuring it's not broken/zero.
+    // phasing should produce high confidence for most hets
     assert!(
-        mean_conf > 0.4,
-        "Mean phase confidence too low: {:.3} (expected > 0.4)",
+        mean_conf > 0.8,
+        "Mean phase confidence too low: {:.3} (expected > 0.8)",
         mean_conf
     );
 
-    // High confidence ratio check is removed as 0.5 < 0.75 threshold.
-    // assert!(
-    //     high_conf_ratio > 0.7,
-    //     "Only {:.1}% of hets have high confidence (expected > 70%)",
-    //     high_conf_ratio * 100.0
-    // );
+    assert!(
+        high_conf_ratio > 0.7,
+        "Only {:.1}% of hets have high confidence (expected > 70%)",
+        high_conf_ratio * 100.0
+    );
 }
