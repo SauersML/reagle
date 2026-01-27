@@ -289,18 +289,21 @@ impl PhaseStates {
         neighbors2: &[u32],
     ) {
         let marker_i32 = marker as i32;
+        let max_len = neighbors1.len().max(neighbors2.len());
 
-        // Add neighbors from haplotype 1
-        for &ibs_hap in neighbors1 {
-            if ibs_hap / 2 != sample {
-                self.add_ibs_hap(GlobalId::from(ibs_hap), marker_i32);
+        // Interleave neighbors to ensure fair representation when queue is full
+        for i in 0..max_len {
+            if i < neighbors1.len() {
+                let ibs_hap = neighbors1[i];
+                if ibs_hap / 2 != sample {
+                    self.add_ibs_hap(GlobalId::from(ibs_hap), marker_i32);
+                }
             }
-        }
-
-        // Add neighbors from haplotype 2
-        for &ibs_hap in neighbors2 {
-            if ibs_hap / 2 != sample {
-                self.add_ibs_hap(GlobalId::from(ibs_hap), marker_i32);
+            if i < neighbors2.len() {
+                let ibs_hap = neighbors2[i];
+                if ibs_hap / 2 != sample {
+                    self.add_ibs_hap(GlobalId::from(ibs_hap), marker_i32);
+                }
             }
         }
     }
@@ -421,7 +424,7 @@ mod tests {
     #[test]
     fn test_eviction_bias() {
         // Setup distinct pools: small capacity
-        let max_states = 10;
+        let max_states = 5; // Capacity < Total inputs (10)
         let n_markers = 100;
         let mut ps = PhaseStates::new(max_states, n_markers);
 
@@ -478,9 +481,10 @@ mod tests {
 
         // The Failure Assertion
         // We expect a mix, or at least fairness. If H1 matches are wiped out, that's bad.
+        // We also want to ensure H2 matches aren't wiped out (bias towards H1).
         assert!(
-            count_a > 2,
-            "Eviction bias detected! H1 matches (Set A) were evicted. count_a={}, count_b={}",
+            count_a > 1 && count_b > 1,
+            "Eviction bias detected! One set dominates. count_a={}, count_b={}",
             count_a,
             count_b
         );
