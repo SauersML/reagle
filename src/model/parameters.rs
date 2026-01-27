@@ -37,7 +37,7 @@ pub struct ModelParams {
 impl ModelParams {
     /// Scaling factor for recombination intensity
     /// Calibrated to align Ne=1,000,000 with ~1% recombination per cM
-    const RECOMB_SCALE: f32 = 1e-2;
+    const RECOMB_SCALE: f32 = 1e-4;
 
     /// Default phase states
     pub const DEFAULT_PHASE_STATES: usize = 280;
@@ -362,7 +362,7 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // Should be 0.04 * 1_000_000 * 1e-2 / 1000 = 0.4
+        // Should be 0.04 * 1_000_000 * 1e-4 / 1000 = 0.004
         let expected = 0.04 * 1_000_000.0 * ModelParams::RECOMB_SCALE / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 1e-6);
     }
