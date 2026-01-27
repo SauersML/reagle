@@ -1831,7 +1831,32 @@ def get_paths():
     }
 
 
-def stage_prepare():
+def has_phased_genotypes(vcf_path, max_records=200):
+    """Return True if any GT fields appear phased (contain '|')."""
+    if not Path(vcf_path).exists():
+        return False
+    try:
+        seen = 0
+        with _open_maybe_gzip(vcf_path) as handle:
+            for line in handle:
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.rstrip().split("\t")
+                if len(fields) < 10:
+                    continue
+                for sample_field in fields[9:]:
+                    gt = sample_field.split(":", 1)[0]
+                    if "|" in gt:
+                        return True
+                seen += 1
+                if seen >= max_records:
+                    break
+    except OSError:
+        return False
+    return False
+
+
+def stage_prepare(keep_phased=False):
     """Download data and prepare reference/truth/input VCFs."""
     print("=" * 60)
     print("STAGE: PREPARE - Download and prepare data")
@@ -1925,26 +1950,40 @@ def stage_prepare():
     if not has_index(paths['truth_vcf']):
         ensure_index(paths['truth_vcf'], recreate_cmd=f"bcftools view -S {test_file} {paths['chr22_vcf']} -O z -o {paths['truth_vcf']}")
 
-    # Create input (test samples, downsampled to GSA sites, UNPHASED)
-    # We unphase the input so switch error rate measures TRUE phasing accuracy
+    # Create input (test samples, downsampled to GSA sites)
+    # Default: unphase input so switch error rate measures true phasing accuracy.
+    # Optional: keep phased input for manual runs.
     tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
-    if not validate_vcf(paths['input_vcf']) or not has_vcf_records(paths['input_vcf']):
-        print("Downsampling to GSA sites and unphasing...")
+    input_valid = validate_vcf(paths['input_vcf']) and has_vcf_records(paths['input_vcf'])
+    input_is_phased = has_phased_genotypes(paths['input_vcf']) if input_valid else False
+    needs_rebuild = not input_valid or (keep_phased and not input_is_phased) or (not keep_phased and input_is_phased)
+    if needs_rebuild:
         create_regions_file(gsa_sites, str(paths['gsa_regions']))
-        # Two-step process: downsample, then unphase
-        tmp_phased = str(tmp_phased_path)
-        run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
-        # Unphase: convert 0|1 to 0/1 using bcftools +setGT
-        # The plugin sets genotypes to unphased while preserving allele values
-        run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
-        # Clean up temp file
-        os.remove(tmp_phased)
+        if keep_phased:
+            print("Downsampling to GSA sites (keeping phasing)...")
+            run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {paths['input_vcf']}")
+        else:
+            print("Downsampling to GSA sites and unphasing...")
+            # Two-step process: downsample, then unphase
+            tmp_phased = str(tmp_phased_path)
+            run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
+            # Unphase: convert 0|1 to 0/1 using bcftools +setGT
+            # The plugin sets genotypes to unphased while preserving allele values
+            run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
+            # Clean up temp file
+            os.remove(tmp_phased)
         run(f"bcftools index -f {paths['input_vcf']}")
     if not has_index(paths['input_vcf']):
-        ensure_index(
-            paths['input_vcf'],
-            recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased_path} && bcftools +setGT {tmp_phased_path} -O z -o {paths['input_vcf']} -- -t a -n u",
-        )
+        if keep_phased:
+            ensure_index(
+                paths['input_vcf'],
+                recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {paths['input_vcf']}",
+            )
+        else:
+            ensure_index(
+                paths['input_vcf'],
+                recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased_path} && bcftools +setGT {tmp_phased_path} -O z -o {paths['input_vcf']} -- -t a -n u",
+            )
     if tmp_phased_path.exists():
         os.remove(tmp_phased_path)
 
@@ -1959,7 +1998,7 @@ def stage_prepare():
     print("\nPrepare stage completed successfully.")
 
 
-def stage_prepare_profile():
+def stage_prepare_profile(keep_phased=False):
     """Prepare reduced data (middle 5% of chr22 target markers) for profiling runs."""
     print("=" * 60)
     print("STAGE: PREPARE PROFILE - Middle 5% of chr22 (target markers)")
@@ -2115,25 +2154,38 @@ def stage_prepare_profile():
     if not has_index(paths['truth_vcf']):
         ensure_index(paths['truth_vcf'], recreate_cmd=f"bcftools view -S {test_file} {trimmed_vcf} -O z -o {paths['truth_vcf']}")
 
-    # Create input (test samples, downsampled to GSA sites, UNPHASED)
+    # Create input (test samples, downsampled to GSA sites)
     tmp_phased_path = paths['data_dir'] / "input_phased_tmp.vcf.gz"
     if not filtered_sites:
         raise RuntimeError("Profiling region contains no GSA sites present in VCF; increase subset size.")
-    if not validate_vcf(paths['input_vcf']) or not has_vcf_records(paths['input_vcf']):
-        print("Downsampling to GSA sites and unphasing...")
+    input_valid = validate_vcf(paths['input_vcf']) and has_vcf_records(paths['input_vcf'])
+    input_is_phased = has_phased_genotypes(paths['input_vcf']) if input_valid else False
+    needs_rebuild = not input_valid or (keep_phased and not input_is_phased) or (not keep_phased and input_is_phased)
+    if needs_rebuild:
         create_regions_file(filtered_sites, str(paths['gsa_regions']))
-        tmp_phased = str(tmp_phased_path)
-        run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
-        run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
-        os.remove(tmp_phased)
+        if keep_phased:
+            print("Downsampling to GSA sites (keeping phasing)...")
+            run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {paths['input_vcf']}")
+        else:
+            print("Downsampling to GSA sites and unphasing...")
+            tmp_phased = str(tmp_phased_path)
+            run(f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased}")
+            run(f"bcftools +setGT {tmp_phased} -O z -o {paths['input_vcf']} -- -t a -n u")
+            os.remove(tmp_phased)
         run(f"bcftools index -f {paths['input_vcf']}")
         if not has_vcf_records(paths['input_vcf']):
             raise RuntimeError("Profiling input VCF is empty after downsampling; adjust subset size.")
     if not has_index(paths['input_vcf']):
-        ensure_index(
-            paths['input_vcf'],
-            recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased_path} && bcftools +setGT {tmp_phased_path} -O z -o {paths['input_vcf']} -- -t a -n u",
-        )
+        if keep_phased:
+            ensure_index(
+                paths['input_vcf'],
+                recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {paths['input_vcf']}",
+            )
+        else:
+            ensure_index(
+                paths['input_vcf'],
+                recreate_cmd=f"bcftools view -R {paths['gsa_regions']} {paths['truth_vcf']} -O z -o {tmp_phased_path} && bcftools +setGT {tmp_phased_path} -O z -o {paths['input_vcf']} -- -t a -n u",
+            )
     if tmp_phased_path.exists():
         os.remove(tmp_phased_path)
 
@@ -2346,6 +2398,7 @@ Examples:
   python integration_test.py                  # Run all stages (chr22 only)
   python integration_test.py prepare          # Just prepare data
   python integration_test.py prepare-profile  # Prepare profiling subset
+  python integration_test.py prepare --keep-phased  # Prepare input without de-phasing
   python integration_test.py impute5          # Run IMPUTE5
   python integration_test.py prepare-chr 1    # Prepare chr1 for full genome
   python integration_test.py summary          # Aggregate all chromosome metrics
@@ -2371,6 +2424,11 @@ Examples:
         default='beagle,reagle',
         help='Comma-separated list of tools to run (default: beagle,reagle)'
     )
+    parser.add_argument(
+        '--keep-phased',
+        action='store_true',
+        help='Keep phased input VCFs (skip de-phasing; default is to unphase input)'
+    )
 
     args = parser.parse_args()
 
@@ -2379,9 +2437,9 @@ Examples:
     print("=" * 60)
 
     if args.stage == 'prepare':
-        stage_prepare()
+        stage_prepare(args.keep_phased)
     elif args.stage == 'prepare-profile':
-        stage_prepare_profile()
+        stage_prepare_profile(args.keep_phased)
     elif args.stage == 'beagle':
         stage_beagle()
     elif args.stage == 'reagle':
@@ -2404,7 +2462,7 @@ Examples:
         stage_summary()
     elif args.stage == 'all':
         # Run all stages sequentially
-        stage_prepare()
+        stage_prepare(args.keep_phased)
 
         paths = get_paths()
 

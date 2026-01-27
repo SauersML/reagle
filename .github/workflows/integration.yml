@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '0 */2 * * *'  # Every 2 hours
   workflow_dispatch:
+    inputs:
+      keep_phased:
+        description: 'Keep input phased (skip de-phasing)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
 
@@ -11,6 +17,8 @@ jobs:
   # Job 2: Prepare test data (runs in parallel with build)
   prepare-data:
     runs-on: ubuntu-latest
+    env:
+      KEEP_PHASED: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_phased == true }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,12 +33,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: tests/data/
-          key: test-data-hgdp1kg-chr22-v2
+          key: test-data-hgdp1kg-chr22-v2${{ env.KEEP_PHASED == 'true' && '-phased' || '' }}
 
       - name: Prepare test data
         if: steps.cache-data.outputs.cache-hit != 'true'
         working-directory: .
-        run: python3 tests/integration_test.py prepare
+        run: |
+          args=""
+          if [[ "${KEEP_PHASED}" == "true" ]]; then
+            args="--keep-phased"
+          fi
+          python3 tests/integration_test.py prepare ${args}
 
       - name: Upload prepared data
         uses: actions/upload-artifact@v4
@@ -51,6 +64,8 @@ jobs:
   # Job 2b: Prepare 5% chr22 data
   prepare-profile-data:
     runs-on: ubuntu-latest
+    env:
+      KEEP_PHASED: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_phased == true }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,12 +80,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: tests/data/
-          key: test-data-hgdp1kg-chr22-profile5-v2
+          key: test-data-hgdp1kg-chr22-profile5-v2${{ env.KEEP_PHASED == 'true' && '-phased' || '' }}
 
       - name: Prepare 5% chr22 data
         if: steps.cache-profile-data.outputs.cache-hit != 'true'
         working-directory: .
-        run: python3 tests/integration_test.py prepare-profile
+        run: |
+          args=""
+          if [[ "${KEEP_PHASED}" == "true" ]]; then
+            args="--keep-phased"
+          fi
+          python3 tests/integration_test.py prepare-profile ${args}
 
       - name: Upload prepared 5% chr22 data
         uses: actions/upload-artifact@v4
