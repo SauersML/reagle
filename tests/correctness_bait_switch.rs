@@ -165,6 +165,8 @@ fn test_state_index_stability_bait_and_switch() {
     config.overlap = 0.2;
 
     config.err = Some(0.0001);
+    // With small N (4), default Ne (10000) causes p_recomb ~ 1.0 over 0.1 cM,
+    // destroying LD and causing random state selection. Reduce Ne to preserve LD.
     config.ne = 20.0;
     config.imp_states = 10;
     config.nthreads = Some(1);

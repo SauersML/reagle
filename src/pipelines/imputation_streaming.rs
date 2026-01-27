@@ -2159,16 +2159,10 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                if let Some(gt) = result.best_gt.get(local_m) {
-                    *gt
-                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                    (a1, a2)
-                } else {
-                    (0, 0)
-                }
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 (a1, a2)
+            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
                 (0, 0)
             }
