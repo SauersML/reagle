@@ -3710,12 +3710,6 @@ impl PhasingPipeline {
                 .collect::<Vec<_>>()
         }; // ref_geno borrow ends here
 
-        // Collect next state probabilities
-        let mut all_next_probs = if next_overlap_start.is_some() {
-            Some(Vec::with_capacity(n_haps))
-        } else {
-            None
-        };
         let mut all_next_hap_priors = if next_overlap_start.is_some() {
             Some(Vec::with_capacity(n_haps))
         } else {
@@ -3732,16 +3726,9 @@ impl PhasingPipeline {
         // (all decisions pass). We still check for consistency with Stage 1.
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, (decisions, next_probs, next_hap_priors, prior_marker)) in
+        for (s, (decisions, _next_probs, next_hap_priors, prior_marker)) in
             phase_results.into_iter().enumerate()
         {
-            // Collect probs
-            if let (Some(all), Some(probs)) = (all_next_probs.as_mut(), next_probs) {
-                // probs is vec![p1_tail, p2_tail]
-                for p in probs {
-                    all.push(p);
-                }
-            }
             if let Some(all) = all_next_hap_priors.as_mut() {
                 if let Some(priors_pair) = next_hap_priors {
                     all.push(priors_pair[0].clone());
@@ -3800,24 +3787,17 @@ impl PhasingPipeline {
             total_switches, total_phased, total_imputed
         );
 
-        let indices = if let Some(start) = next_overlap_start {
+        let _indices = if let Some(start) = next_overlap_start {
             let start_stage1 = hi_freq_markers
                 .iter()
                 .position(|&m| m >= start)
                 .unwrap_or(n_stage1);
-            (start_stage1..n_stage1).collect()
+            (start_stage1..n_stage1).collect::<Vec<_>>()
         } else {
             Vec::new()
         };
 
-        let next_state_probs = all_next_probs.and_then(|data| {
-            if data.is_empty() {
-                None
-            } else {
-                let n_states = self.params.n_states; // Approximate, but StateProbs carries it
-                Some(StateProbs::new(data, indices.clone(), n_states))
-            }
-        });
+        let next_state_probs = None;
 
         let next_hap_priors = all_next_hap_priors.and_then(|priors| {
             if priors.len() == n_haps && priors.iter().any(|p| !p.is_empty()) {
