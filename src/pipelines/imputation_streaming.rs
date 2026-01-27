@@ -2581,15 +2581,33 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
+            let hmm_dosage = result_by_sample
+                .get(sample_idx)
+                .and_then(|r| *r)
+                .and_then(|r| r.dosages.get(local_m).copied());
+
+            let dosage = if self.config.err.is_some() {
+                // If error correction is enabled, prefer HMM dosage
+                if let Some(d) = hmm_dosage {
+                    d
+                } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    dosage_from_gp(n_alleles, &gp)
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else {
+                    0.0
+                }
             } else {
-                0.0
+                // If no error correction (Hard Truth), prefer Input
+                if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    dosage_from_gp(n_alleles, &gp)
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else {
+                    hmm_dosage.unwrap_or(0.0)
+                }
             };
 
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
@@ -2602,15 +2620,29 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                best_gt_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+            let hmm_gt = result_by_sample
+                .get(sample_idx)
+                .and_then(|r| *r)
+                .and_then(|r| r.best_gt.get(local_m).copied());
+
+            if self.config.err.is_some() {
+                if let Some(gt) = hmm_gt {
+                    gt
+                } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    best_gt_from_gp(n_alleles, &gp)
+                } else {
+                    get_genotyped_alleles(marker_idx, sample_idx).unwrap_or((0, 0))
+                }
             } else {
-                (0, 0)
+                if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    best_gt_from_gp(n_alleles, &gp)
+                } else if let Some(gt) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    gt
+                } else {
+                    hmm_gt.unwrap_or((0, 0))
+                }
             }
         };
 
