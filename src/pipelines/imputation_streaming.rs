@@ -2581,6 +2581,15 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
+
+            // Prioritize Hard GT if error correction is NOT enabled
+            // This ensures we respect the input truth for genotyped markers
+            if self.config.err.is_none() {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    return (a1 + a2) as f32;
+                }
+            }
+
             let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
@@ -2602,6 +2611,14 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
+
+            // Prioritize Hard GT if error correction is NOT enabled
+            if self.config.err.is_none() {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    return (a1, a2);
+                }
+            }
+
             if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 best_gt_from_gp(n_alleles, &gp)
@@ -2640,44 +2657,39 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
-                                let n_alleles = ref_markers
-                                    .marker(MarkerIdx::new(marker_idx as u32))
-                                    .n_alleles();
-                                let dosage = dosage_from_gp(n_alleles, &gp);
-                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
-                            } else if let Some(target_m) = alignment.target_marker(marker_idx) {
-                                let h1 = HapIdx::new((s * 2) as u32);
-                                let h2 = HapIdx::new((s * 2 + 1) as u32);
-                                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-
-                                let mapping = alignment
-                                    .allele_mappings
-                                    .get(target_m)
-                                    .and_then(|m| m.as_ref());
-                                let map_allele = |a: u8| -> u8 {
-                                    if a == 255 {
-                                        return 255;
-                                    }
-                                    if let Some(m) = mapping {
-                                        if (a as usize) < m.targ_to_ref.len() {
-                                            let r = m.targ_to_ref[a as usize];
-                                            if r >= 0 { r as u8 } else { 255 }
-                                        } else {
-                                            255
-                                        }
+                            // If error correction is disabled, try to use hard genotypes first
+                            let used_gt = if self.config.err.is_none() {
+                                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
+                                    if a1 < 2 && a2 < 2 {
+                                        v1 = a1 as f32;
+                                        v2 = a2 as f32;
+                                        true
                                     } else {
-                                        a
+                                        false
                                     }
-                                };
-                                let a1 = map_allele(raw_a1);
-                                let a2 = map_allele(raw_a2);
-                                if a1 < 2 && a2 < 2 {
-                                    v1 = a1 as f32;
-                                    v2 = a2 as f32;
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if !used_gt {
+                                if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                    let n_alleles = ref_markers
+                                        .marker(MarkerIdx::new(marker_idx as u32))
+                                        .n_alleles();
+                                    let dosage = dosage_from_gp(n_alleles, &gp);
+                                    let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                                    v1 = p_alt;
+                                    v2 = p_alt;
+                                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
+                                    // Fallback to GT if GP is missing (or if err correction is enabled but GP missing)
+                                    // Note: if err is None, we already checked GT above.
+                                    if a1 < 2 && a2 < 2 {
+                                        v1 = a1 as f32;
+                                        v2 = a2 as f32;
+                                    }
                                 }
                             }
                         }
@@ -2694,44 +2706,38 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
-                                let n_alleles = ref_markers
-                                    .marker(MarkerIdx::new(marker_idx as u32))
-                                    .n_alleles();
-                                let dosage = dosage_from_gp(n_alleles, &gp);
-                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
-                            } else if let Some(target_m) = alignment.target_marker(marker_idx) {
-                                let h1 = HapIdx::new((s * 2) as u32);
-                                let h2 = HapIdx::new((s * 2 + 1) as u32);
-                                let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
-                                let raw_a2 = target_win.allele(MarkerIdx::new(target_m as u32), h2);
-
-                                let mapping = alignment
-                                    .allele_mappings
-                                    .get(target_m)
-                                    .and_then(|m| m.as_ref());
-                                let map_allele = |a: u8| -> u8 {
-                                    if a == 255 {
-                                        return 255;
-                                    }
-                                    if let Some(m) = mapping {
-                                        if (a as usize) < m.targ_to_ref.len() {
-                                            let r = m.targ_to_ref[a as usize];
-                                            if r >= 0 { r as u8 } else { 255 }
-                                        } else {
-                                            255
-                                        }
+                            // If error correction is disabled, try to use hard genotypes first
+                            let used_gt = if self.config.err.is_none() {
+                                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
+                                    if a1 < 2 && a2 < 2 {
+                                        v1 = a1 as f32;
+                                        v2 = a2 as f32;
+                                        true
                                     } else {
-                                        a
+                                        false
                                     }
-                                };
-                                let a1 = map_allele(raw_a1);
-                                let a2 = map_allele(raw_a2);
-                                if a1 < 2 && a2 < 2 {
-                                    v1 = a1 as f32;
-                                    v2 = a2 as f32;
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if !used_gt {
+                                if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                    let n_alleles = ref_markers
+                                        .marker(MarkerIdx::new(marker_idx as u32))
+                                        .n_alleles();
+                                    let dosage = dosage_from_gp(n_alleles, &gp);
+                                    let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                                    v1 = p_alt;
+                                    v2 = p_alt;
+                                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
+                                    // Fallback to GT if GP is missing
+                                    if a1 < 2 && a2 < 2 {
+                                        v1 = a1 as f32;
+                                        v2 = a2 as f32;
+                                    }
                                 }
                             }
                         }
