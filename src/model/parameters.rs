@@ -73,13 +73,10 @@ impl ModelParams {
     /// * `ne` - Effective population size (from CLI or default)
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
-        // Formula from Java PhaseData constructor uses 0.04 (assuming cM).
-        // However, with default Ne=1,000,000, this leads to p_recomb ~ 1.0 for small distances.
-        // We scale by 0.0001 to align with project's map units and effective population size.
-        let recomb_intensity = 0.0001 * ne / n_haps as f32;
+        // Formula from Java PhaseData constructor
+        let recomb_intensity = 0.04 * ne / n_haps as f32;
 
-        // Heuristic adjustment: scale mismatch probability to encourage haplotype latching
-        let p_mismatch = err.unwrap_or_else(|| 0.001 * Self::li_stephens_p_mismatch(n_haps));
+        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
         Self {
             p_mismatch,
@@ -110,11 +107,9 @@ impl ModelParams {
         err: Option<f32>,
     ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        // Heuristic adjustment: scale mismatch probability
-        let p_mismatch = err.unwrap_or_else(|| 0.001 * Self::li_stephens_p_mismatch(n_total_haps));
+        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        // Scaled to 0.0001 to prevent saturation of recombination probability
-        let recomb_intensity = 0.0001 * ne / n_ref_haps as f32;
+        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 
         Self {
             p_mismatch,
@@ -363,9 +358,9 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // Should be 0.0001 * 1_000_000 / 1000 = 0.1
-        let expected = 0.0001 * 1_000_000.0 / 1000.0;
-        assert!((params.recomb_intensity - expected as f32).abs() < 0.001);
+        // Should be 0.04 * 1_000_000 / 1000 = 40.0
+        let expected = 0.04 * 1_000_000.0 / 1000.0;
+        assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
     }
 
     #[test]
