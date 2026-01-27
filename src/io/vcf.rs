@@ -123,8 +123,7 @@ impl MarkerImputationStats {
         let n = self.n_haps as f32;
         // Monomorphic sites (sum ≈ 0 or sum ≈ n) have no variance to measure.
         // Return 1.0 because they trivially impute correctly.
-        // Use a relaxed threshold to handle floating point noise from HMM emissions
-        if sum <= 1e-4 || (sum - n).abs() <= 1e-4 {
+        if sum == 0.0 || (sum - n).abs() <= 1e-8 {
             return 1.0;
         }
 
