@@ -475,7 +475,7 @@ fn test_synthetic_slam_dunk() {
     config.out = out_prefix.clone();
     config.imp_states = 50;
     config.imp_nsteps = 10;
-    config.ne = 10.0; // Lower Ne for synthetic test with perfect LD
+    config.ne = 10000.0;
     config.err = Some(0.0001);
     config.window = 0.02;
     config.overlap = 0.005;
@@ -686,7 +686,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 100.0; // Lower Ne for sparse chip-like data
+    config.ne = 10000.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -1493,7 +1493,6 @@ fn test_ultra_dense_markers() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
-    config.ne = 100.0; // Lower Ne for ultra dense markers
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -2079,7 +2078,7 @@ fn test_phasing_confidence() {
         mcmc_burnin: 3,
         dynamic_mcmc: false,
         mcmc_steps: 10,
-        phase_states: 200, // Increase states to cover full reference panel (200 haps)
+        phase_states: 80,
         rare: 0.002,
         impute: false,
         imp_states: 10,
@@ -2090,8 +2089,8 @@ fn test_phasing_confidence() {
         pbwt_batch_mb: 256,
         ap: false,
         gp: false,
-        ne: 100.0, // Use lower Ne to enforce longer haplotype sharing despite noise
-        err: None, // Use default Li-Stephens error rate
+        ne: 10000.0,
+        err: None,
         em: false,
         window: 40.0,
         window_markers: 100000,
