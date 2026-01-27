@@ -1368,6 +1368,8 @@ target_samples={} target_bytes={}",
             }
         }
 
+        let prior_alpha = 1.0f32;
+        let prior_beta = 1.0f32;
         for (m, freqs) in ref_allele_freqs.iter_mut().enumerate() {
             let n_alleles = ref_markers.marker(MarkerIdx::new(m as u32)).n_alleles();
             if freqs.is_empty() {
@@ -1382,8 +1384,15 @@ target_samples={} target_bytes={}",
                 sum += *f;
             }
             if sum > 0.0 {
-                for f in freqs.iter_mut() {
-                    *f /= sum;
+                let alpha = prior_alpha;
+                let beta = prior_beta;
+                let total = sum + alpha * (n_alleles as f32) + beta;
+                if total > 0.0 {
+                    for f in freqs.iter_mut() {
+                        *f = (*f + alpha) / total;
+                    }
+                } else {
+                    freqs.fill(1.0 / n_alleles as f32);
                 }
             } else {
                 freqs.fill(1.0 / n_alleles as f32);

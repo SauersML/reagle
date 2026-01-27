@@ -8,8 +8,12 @@ use std::io::Write;
 use std::path::Path;
 
 use clap::Parser;
+use reagle::data::ChromIdx;
+use reagle::model::ibs2::Ibs2;
+use reagle::model::phase_ibs::BidirectionalPhaseIbs;
+use reagle::model::pl_emission::allele_probs_uncond_from_pl;
 use reagle::pipelines::phasing::PhasingPipeline;
-use reagle::{Config, ImputationPipeline};
+use reagle::{Config, GeneticMaps, ImputationPipeline, MarkerIdx, SampleIdx, VcfReader};
 
 /// Simple VCF writer for tiny fixtures.
 fn write_vcf(path: &Path, content: &str) {
@@ -2028,5 +2032,295 @@ fn test_low_confidence_penalty_accumulates_in_region() {
     assert_eq!(
         diffs_in, 0,
         "Uniform PL region should match missing; differences in-region support penalty-bias hypothesis"
+    );
+}
+
+#[test]
+fn test_hardcall_emissions_block_ref_override_when_no_pl() {
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_vcf = work_dir.path().join("ref.vcf");
+    let target_hard = work_dir.path().join("target_hard.vcf");
+    let target_missing = work_dir.path().join("target_missing.vcf");
+
+    let n_markers = 5;
+    let ref_samples: Vec<String> = (0..20).map(|i| format!("R{}", i + 1)).collect();
+    let ref_names: Vec<&str> = ref_samples.iter().map(|s| s.as_str()).collect();
+
+    write_synthetic_vcf(&ref_vcf, n_markers, &ref_names, |_, _| "1|1".to_string());
+
+    // Target has hard 0/0 calls (no PL/GL) at all markers.
+    write_synthetic_vcf(&target_hard, n_markers, &["T1"], |_, _| "0/0".to_string());
+    // Target missing at all markers.
+    write_synthetic_vcf(&target_missing, n_markers, &["T1"], |_, _| "./.".to_string());
+
+    let out_prefix_hard = work_dir.path().join("out_hard");
+    run_rust_imputation_with_args(
+        &target_hard,
+        &ref_vcf,
+        &out_prefix_hard,
+        42,
+        &["--window", "5.0", "--overlap", "0.1", "--window-markers", "50000", "--nthreads", "1"],
+    )
+    .expect("Rust imputation failed (hard)");
+
+    let out_prefix_missing = work_dir.path().join("out_missing");
+    run_rust_imputation_with_args(
+        &target_missing,
+        &ref_vcf,
+        &out_prefix_missing,
+        42,
+        &["--window", "5.0", "--overlap", "0.1", "--window-markers", "50000", "--nthreads", "1"],
+    )
+    .expect("Rust imputation failed (missing)");
+
+    let records_hard = parse_vcf(&work_dir.path().join("out_hard.vcf.gz"));
+    let records_missing = parse_vcf(&work_dir.path().join("out_missing.vcf.gz"));
+
+    let mut hard_homref = 0usize;
+    let mut miss_homalt = 0usize;
+    for (i, (rh, rm)) in records_hard.iter().zip(records_missing.iter()).enumerate() {
+        let gt_h = &rh.genotypes[0].gt;
+        let gt_m = &rm.genotypes[0].gt;
+        if gt_h == "0|0" || gt_h == "0/0" {
+            hard_homref += 1;
+        }
+        if gt_m == "1|1" || gt_m == "1/1" {
+            miss_homalt += 1;
+        }
+        if i < 3 {
+            println!(
+                "[hardcall emissions] idx={} hard_gt={} missing_gt={}",
+                i, gt_h, gt_m
+            );
+        }
+    }
+
+    println!(
+        "[hardcall emissions] hard_homref={} missing_homalt={}",
+        hard_homref, miss_homalt
+    );
+
+    assert_eq!(
+        hard_homref, 0,
+        "Expected hardcalled 0/0 to be overridden by all-ALT reference"
+    );
+    assert_eq!(
+        miss_homalt, n_markers,
+        "Expected missing genotypes to impute to 1/1 against all-ALT reference"
+    );
+}
+
+#[test]
+fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let target_vcf = work_dir.path().join("target.vcf");
+
+    let n_markers = 200;
+    let target_samples: Vec<String> = (0..30).map(|i| format!("T{}", i + 1)).collect();
+    let target_names: Vec<&str> = target_samples.iter().map(|s| s.as_str()).collect();
+
+    // Two strong haplotype groups with clear LD.
+    write_synthetic_vcf(&target_vcf, n_markers, &target_names, |i, s| {
+        if s < 15 {
+            if i % 2 == 0 { "0/1".to_string() } else { "0/0".to_string() }
+        } else {
+            if i % 2 == 0 { "1/1".to_string() } else { "0/1".to_string() }
+        }
+    });
+
+    let out_low = work_dir.path().join("out_low");
+    run_rust_phasing_with_args(
+        &target_vcf,
+        &out_low,
+        12345,
+        &[
+            "--phase-states",
+            "20",
+            "--burnin",
+            "1",
+            "--iterations",
+            "2",
+            "--mcmc-burnin",
+            "1",
+            "--nthreads",
+            "1",
+        ],
+    )
+    .expect("Rust phasing failed (low states)");
+
+    let out_high = work_dir.path().join("out_high");
+    run_rust_phasing_with_args(
+        &target_vcf,
+        &out_high,
+        12345,
+        &[
+            "--phase-states",
+            "200",
+            "--burnin",
+            "1",
+            "--iterations",
+            "2",
+            "--mcmc-burnin",
+            "1",
+            "--nthreads",
+            "1",
+        ],
+    )
+    .expect("Rust phasing failed (high states)");
+
+    let records_low = parse_vcf(&work_dir.path().join("out_low.vcf.gz"));
+    let records_high = parse_vcf(&work_dir.path().join("out_high.vcf.gz"));
+
+    let mut mismatches = 0usize;
+    for (i, (rl, rh)) in records_low.iter().zip(records_high.iter()).enumerate() {
+        let gt_l = &rl.genotypes[0].gt;
+        let gt_h = &rh.genotypes[0].gt;
+        if gt_l != gt_h {
+            mismatches += 1;
+            if mismatches <= 5 {
+                println!(
+                    "[phase-states churn] idx={} low_gt={} high_gt={}",
+                    i, gt_l, gt_h
+                );
+            }
+        }
+    }
+    println!(
+        "[phase-states churn] mismatches={} of {}",
+        mismatches, n_markers
+    );
+
+    assert!(
+        mismatches > 0,
+        "Expected phase output to change with capacity under this setup"
+    );
+}
+
+#[test]
+fn test_uniform_recomb_shift_should_not_overweight_rare_pattern() {
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_vcf = work_dir.path().join("ref.vcf");
+    let target_vcf = work_dir.path().join("target.vcf");
+
+    let n_markers = 3;
+    let n_samples = 50;
+    let ref_samples: Vec<String> = (0..n_samples).map(|i| format!("R{}", i + 1)).collect();
+    let ref_names: Vec<&str> = ref_samples.iter().map(|s| s.as_str()).collect();
+
+    // One haplotype carries ALT at all markers; others are REF.
+    write_synthetic_vcf(&ref_vcf, n_markers, &ref_names, |_, s| {
+        if s == 0 { "1|1".to_string() } else { "0|0".to_string() }
+    });
+    write_synthetic_vcf(&target_vcf, n_markers, &["T1"], |_, _| "./.".to_string());
+
+    let out_prefix = work_dir.path().join("out");
+    run_rust_imputation_with_args(
+        &target_vcf,
+        &ref_vcf,
+        &out_prefix,
+        42,
+        &["--window", "5.0", "--overlap", "0.1", "--window-markers", "50000", "--nthreads", "1"],
+    )
+    .expect("Rust imputation failed");
+
+    let records = parse_vcf(&work_dir.path().join("out.vcf.gz"));
+    let mut max_ds = 0.0f64;
+    for (i, rec) in records.iter().enumerate() {
+        let gp = rec.genotypes[0].gp.expect("Expected GP");
+        let ds = gp[1] + 2.0 * gp[2];
+        max_ds = max_ds.max(ds);
+        if i < 3 {
+            println!("[uniform shift] idx={} ds={:.4} gp={:?}", i, ds, gp);
+        }
+    }
+    println!("[uniform shift] max_ds={:.4}", max_ds);
+
+    assert!(
+        max_ds < 0.2,
+        "Expected dosage to reflect ~1/50 ALT frequency; got max_ds={}",
+        max_ds
+    );
+}
+
+#[test]
+fn test_pl_het_signal_not_erased_by_zero_maf_prior() {
+    let pl = vec![50u16, 0u16, 50u16];
+    let allele_freqs = [1.0f32, 0.0f32];
+    let mut allele_probs = Vec::new();
+    let n = allele_probs_uncond_from_pl(&pl, Some(&allele_freqs), &mut allele_probs)
+        .expect("Expected PL decoding to succeed");
+    assert_eq!(n, 2, "Expected biallelic PL decoding");
+    let p_alt = allele_probs.get(1).copied().unwrap_or(0.0);
+    println!(
+        "[pl zero-maf] allele_probs={:?} p_alt={:.6}",
+        allele_probs, p_alt
+    );
+
+    assert!(
+        p_alt >= 0.4,
+        "Strong het PL should keep alt allele probability near 0.5 even with zero MAF prior; got {:.6}",
+        p_alt
+    );
+}
+
+#[test]
+fn test_pbwt_backward_span_contributes() {
+    let alleles = vec![
+        vec![0u8, 1u8],
+        vec![0u8, 1u8],
+        vec![1u8, 1u8],
+        vec![1u8, 1u8],
+        vec![1u8, 1u8],
+        vec![1u8, 1u8],
+    ];
+    let pbwt = BidirectionalPhaseIbs::build(alleles, 2, 6);
+    let marker_idx = 2usize;
+    let span = pbwt.best_match_span(0u32, marker_idx);
+    println!("[pbwt span] marker={} span={}", marker_idx, span);
+
+    assert!(
+        span >= 4,
+        "Expected backward PBWT to extend match span at marker {}; got {}",
+        marker_idx,
+        span
+    );
+}
+
+#[test]
+fn test_ibs2_missing_not_universally_matching() {
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let target_vcf = work_dir.path().join("target.vcf");
+
+    let n_markers = 200;
+    let n_samples = 10;
+    let sample_names: Vec<String> = (0..n_samples)
+        .map(|i| format!("T{}", i + 1))
+        .collect();
+    let sample_refs: Vec<&str> = sample_names.iter().map(|s| s.as_str()).collect();
+
+    write_synthetic_vcf(&target_vcf, n_markers, &sample_refs, |_, s| {
+        if s == 0 {
+            "./.".to_string()
+        } else {
+            "0/1".to_string()
+        }
+    });
+
+    let (mut reader, file_reader) = VcfReader::open(&target_vcf).expect("Open VCF");
+    let gt = reader.read_all(file_reader).expect("Read VCF");
+    let maf: Vec<f32> = (0..n_markers)
+        .map(|m| gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+        .collect();
+    let gen_maps = GeneticMaps::new();
+    let chrom = gt.marker(MarkerIdx::new(0)).chrom;
+
+    let ibs2 = Ibs2::new(&gt, &gen_maps, ChromIdx::new(chrom.0), &maf);
+    let segs = ibs2.n_segments(SampleIdx::new(0));
+    println!("[ibs2 missing] segments_for_sample0={}", segs);
+
+    assert_eq!(
+        segs, 0,
+        "Expected no IBS2 segments when a sample is fully missing; got {}",
+        segs
     );
 }

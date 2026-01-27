@@ -1700,6 +1700,22 @@ impl PhasingPipeline {
         if n_markers > 0 {
             sampling_points[n_markers - 1] = true;
         }
+        let donor_blocks = partition_markers_by_cm(gen_positions, STAGE1_BLOCK_CM);
+        if !donor_blocks.is_empty() {
+            sampling_points.fill(false);
+            for &(s, e) in &donor_blocks {
+                if s < n_markers {
+                    sampling_points[s] = true;
+                }
+                if e > 0 {
+                    let last = e.saturating_sub(1).min(n_markers.saturating_sub(1));
+                    sampling_points[last] = true;
+                }
+            }
+            if n_markers > 0 {
+                sampling_points[n_markers - 1] = true;
+            }
+        }
 
         // Create PhaseStates for all samples
         let mut phase_states: Vec<PhaseStates> = (0..n_samples)
@@ -2984,15 +3000,57 @@ impl PhasingPipeline {
         let seed = self.config.seed;
         let n_haps_f = target_gt.n_haplotypes() as f32;
         let has_ref = self.reference_gt.is_some() && self.alignment.is_some();
-        let alt_freqs: Vec<f32> = if n_haps_f > 0.0 {
+        let alt_freqs: Vec<f32> = if let (Some(ref_gt), Some(alignment)) =
+            (&self.reference_gt, &self.alignment)
+        {
+            let n_ref_haps = ref_gt.n_haplotypes() as f32;
+            let prior_alpha = 1.0f32;
+            let prior_beta = 1.0f32;
+            let mut freqs = vec![0.0f32; n_markers];
+            for m in 0..n_markers {
+                let fallback = if n_haps_f > 0.0 {
+                    let alt = target_gt.column(MarkerIdx::new(m as u32)).alt_count() as f32;
+                    ((alt + prior_alpha) / (n_haps_f + prior_alpha + prior_beta)).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                let mapping = alignment
+                    .allele_mappings
+                    .get(m)
+                    .and_then(|m| m.as_ref());
+                if let Some(mapping) = mapping {
+                    let ref_idx = alignment.target_to_ref.get(m).copied().unwrap_or(0);
+                    if n_ref_haps > 0.0 {
+                        let ref_col = ref_gt.column(MarkerIdx::new(ref_idx as u32));
+                        let ref_alt = (ref_col.alt_count() as f32 + prior_alpha)
+                            / (n_ref_haps + prior_alpha + prior_beta);
+                        if let Some(&targ_to_ref_alt) = mapping.targ_to_ref.get(1) {
+                            if targ_to_ref_alt == 1 {
+                                freqs[m] = ref_alt.clamp(0.0, 1.0);
+                                continue;
+                            }
+                            if targ_to_ref_alt == 0 {
+                                freqs[m] = (1.0 - ref_alt).clamp(0.0, 1.0);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                freqs[m] = fallback;
+            }
+            freqs
+        } else if n_haps_f > 0.0 {
+            let prior_alpha = 1.0f32;
+            let prior_beta = 1.0f32;
             (0..n_markers)
                 .map(|m| {
                     let alt = target_gt.column(MarkerIdx::new(m as u32)).alt_count() as f32;
-                    (alt / n_haps_f).clamp(0.0, 1.0)
+                    ((alt + prior_alpha) / (n_haps_f + prior_alpha + prior_beta))
+                        .clamp(0.0, 1.0)
                 })
                 .collect()
         } else {
-            vec![0.0; n_markers]
+            vec![0.5f32; n_markers]
         };
 
         if n_stage1 < 2 {
@@ -3199,46 +3257,38 @@ impl PhasingPipeline {
                             }
                         }
                         let current_global_marker = hi_freq_markers.get(prior_stage1_idx).copied();
-                        let markers_aligned =
-                            match (overlap.prior_stage1_global_marker(), current_global_marker) {
-                                (Some(expected), Some(current)) if expected != current => {
-                                    tracing::warn!(
-                                        expected,
-                                        current,
-                                        sample = s,
-                                        "Stage2 hap prior marker mismatch; skipping priors"
-                                    );
-                                    false
-                                }
-                                (Some(_), Some(_)) => true,
-                                _ => true,
-                            };
+                        if let (Some(expected), Some(current)) =
+                            (overlap.prior_stage1_global_marker(), current_global_marker)
+                        {
+                            if expected != current {
+                                panic!(
+                                    "Stage2 hap prior marker mismatch: expected={}, current={}, sample={}",
+                                    expected, current, s
+                                );
+                            }
+                        }
 
                         // Identity-aware handoff: project haplotype priors onto the
                         // current window's local state set using state->hap mapping.
-                        if markers_aligned {
-                            if let Some(hap_priors) = overlap.hap_priors() {
-                                if prior_stage1_idx < n_stage1
-                                    && h1_idx < hap_priors.len()
-                                    && h2_idx < hap_priors.len()
-                                    && n_states > 0
-                                {
-                                    let mut state_haps = vec![GlobalId::new(0); n_states];
-                                    threaded_haps.materialize_at(prior_stage1_idx, &mut state_haps);
+                        if let Some(hap_priors) = overlap.hap_priors() {
+                            if prior_stage1_idx < n_stage1
+                                && h1_idx < hap_priors.len()
+                                && h2_idx < hap_priors.len()
+                                && n_states > 0
+                            {
+                                let mut state_haps = vec![GlobalId::new(0); n_states];
+                                threaded_haps.materialize_at(prior_stage1_idx, &mut state_haps);
 
-                                    (
-                                        Some(project_haplotype_priors_to_states(
-                                            &hap_priors[h1_idx],
-                                            &state_haps,
-                                        )),
-                                        Some(project_haplotype_priors_to_states(
-                                            &hap_priors[h2_idx],
-                                            &state_haps,
-                                        )),
-                                    )
-                                } else {
-                                    (None, None)
-                                }
+                                (
+                                    Some(project_haplotype_priors_to_states(
+                                        &hap_priors[h1_idx],
+                                        &state_haps,
+                                    )),
+                                    Some(project_haplotype_priors_to_states(
+                                        &hap_priors[h2_idx],
+                                        &state_haps,
+                                    )),
+                                )
                             } else {
                                 (None, None)
                             }
