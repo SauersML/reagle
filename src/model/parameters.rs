@@ -169,10 +169,13 @@ impl ModelParams {
     /// pRecomb[m] = -Math.expm1(c * genDist.get(m))
     /// ```
     ///
-    /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
+    /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable.
+    /// Input `gen_dist_cm` is in cM, but `recomb_intensity` is per Morgan.
+    /// We must divide gen_dist_cm by 100.0 to convert to Morgans.
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        let dist_morgans = gen_dist_cm / 100.0;
+        let p = (-f64::exp_m1(c * dist_morgans)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
@@ -271,11 +274,14 @@ impl ParamEstimates {
     /// Returns ratio of expected switches to total genetic distance
     /// λ = Σ(expected_switches) / Σ(genetic_distances)
     /// Returns None if total genetic distance is too small (avoid division by zero or default 1.0)
+    ///
+    /// Note: sum_gen_dist is in cM (accumulated from map). We return intensity per Morgan,
+    /// so we multiply by 100.0.
     pub fn recomb_intensity(&self) -> Option<f32> {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability

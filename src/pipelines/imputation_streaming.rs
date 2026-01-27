@@ -2579,8 +2579,22 @@ target_samples={} target_bytes={}",
 
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
+        let use_error_correction = self.config.err.is_some();
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
+
+            // If error correction is enabled, prioritize HMM posteriors (corrected genotype)
+            if use_error_correction {
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    let dosage = result.dosages.get(local_m).copied().unwrap_or(0.0);
+                    if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                        return dosage;
+                    } else {
+                        return dosage * 0.5;
+                    }
+                }
+            }
+
             let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
