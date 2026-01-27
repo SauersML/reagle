@@ -79,6 +79,25 @@ fn normalize_allele_freqs(freqs: &[f32], out: &mut Vec<f32>) -> Option<()> {
         for f in out.iter_mut() {
             *f /= sum;
         }
+        let n = out.len() as f32;
+        let eps = 2e-5f32;
+        if eps * n >= 1.0 {
+            let uniform = 1.0 / n;
+            out.fill(uniform);
+            return Some(());
+        }
+        let mut sum2 = 0.0f32;
+        for f in out.iter_mut() {
+            if *f < eps {
+                *f = eps;
+            }
+            sum2 += *f;
+        }
+        if sum2 > 0.0 {
+            for f in out.iter_mut() {
+                *f /= sum2;
+            }
+        }
         Some(())
     } else {
         None

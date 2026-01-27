@@ -12,7 +12,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::data::haplotype::{HapIdx, Samples};
+use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
 use crate::data::marker::{Marker, MarkerIdx, Markers};
 use crate::data::storage::GenotypeColumn;
 use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
@@ -196,12 +196,30 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Returns 255 (full confidence) if confidence data is not available.
     #[inline]
     pub fn sample_confidence(&self, marker: MarkerIdx, sample_idx: usize) -> u8 {
-        self.confidence
+        if marker.as_usize() >= self.columns.len() {
+            return 0;
+        }
+        if let Some(conf) = self
+            .confidence
             .as_ref()
             .and_then(|c| c.get(marker.as_usize()))
             .and_then(|row| row.get(sample_idx))
             .copied()
-            .unwrap_or(255)
+        {
+            return conf;
+        }
+        let sample = SampleIdx::new(sample_idx as u32);
+        let a1 = self.allele(marker, sample.hap1());
+        if a1 == 255 {
+            return 0;
+        }
+        if self.samples.is_diploid(sample) {
+            let a2 = self.allele(marker, sample.hap2());
+            if a2 == 255 {
+                return 0;
+            }
+        }
+        255
     }
 
     /// Get confidence score as f32 (0.0-1.0)

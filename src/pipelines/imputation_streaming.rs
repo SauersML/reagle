@@ -37,6 +37,15 @@ use crate::model::pl_emission::{
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::pipelines::imputation::AllelePosteriors;
 
+#[inline]
+fn pl_is_uniform(pl: &[u16]) -> bool {
+    if pl.is_empty() {
+        return true;
+    }
+    let first = pl[0];
+    pl.iter().all(|&v| v == first)
+}
+
 fn push_unique(dst: &mut Vec<String>, value: String) {
     if !dst.iter().any(|v| v == &value) {
         dst.push(value);
@@ -1417,20 +1426,6 @@ target_samples={} target_bytes={}",
                 false
             }
         };
-        let pl_is_uniform = |pl: &[u16]| -> bool {
-            if pl.is_empty() {
-                return true;
-            }
-            let first = pl[0];
-            pl.iter().all(|&v| v == first)
-        };
-        let pl_is_uniform = |pl: &[u16]| -> bool {
-            if pl.is_empty() {
-                return true;
-            }
-            let first = pl[0];
-            pl.iter().all(|&v| v == first)
-        };
 
         let build_input_probs = |hap_idx: HapIdx, sample_idx: usize| -> TargetAlleleProbs {
             let mut offsets = Vec::with_capacity(n_ref_markers + 1);
@@ -1484,7 +1479,7 @@ target_samples={} target_bytes={}",
                                     .get(target_m)
                                     .and_then(|m| m.as_ref());
                                 let uniform = 1.0 / n_pl_alleles as f32;
-                                let mut target_priors = vec![uniform; n_pl_alleles];
+                                let target_priors = vec![uniform; n_pl_alleles];
 
                                 let partner = target_win
                                     .allele(MarkerIdx::new(target_m as u32), hap_idx.other());
@@ -2135,7 +2130,7 @@ target_samples={} target_bytes={}",
         &self,
         ref_markers: &crate::data::marker::Markers,
         ref_genotypes: Option<&GenotypeMatrix<Phased>>,
-        _ref_allele_freqs: &[Vec<f32>],
+        ref_allele_freqs: &[Vec<f32>],
         target_win: &GenotypeMatrix<Phased>,
         alignment: &MarkerAlignment,
         writer: &mut VcfWriter,
@@ -2170,6 +2165,7 @@ target_samples={} target_bytes={}",
         let _ = &write_span;
 
         let include_posteriors = include_gp || include_ap;
+        let _ = ref_allele_freqs.len();
         let n_samples = target_win.n_samples();
         let mut result_by_sample: Vec<Option<&SampleImputationResult>> = vec![None; n_samples];
         for result in all_results {
