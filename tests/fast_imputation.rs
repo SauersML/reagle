@@ -686,7 +686,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 200.0; // Reduced Ne to preserve LD over large gaps (1cM)
+    config.ne = 10000.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
