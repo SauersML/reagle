@@ -36,7 +36,7 @@ pub struct ModelParams {
 
 impl ModelParams {
     /// Default phase states
-    pub const DEFAULT_PHASE_STATES: usize = 280;
+    pub const DEFAULT_PHASE_STATES: usize = 600;
 
     /// Default imputation states
     pub const DEFAULT_IMP_STATES: usize = 1600;
@@ -107,7 +107,8 @@ impl ModelParams {
         err: Option<f32>,
     ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
+        // Clamp to 1e-5 to enforce Exact Matching behavior (high penalty for mismatches)
+        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps).min(1e-5));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
 

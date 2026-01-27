@@ -305,6 +305,7 @@ fn build_reference_map_with_mask(
     block_size: usize,
     max_states: usize,
     keep_mask: Option<&[bool]>,
+    cluster_cm: f32,
 ) -> Arc<ReferenceMap> {
     let n_markers = markers.len();
     let gen_positions: Vec<f64> = (0..n_markers)
@@ -336,7 +337,11 @@ fn build_reference_map_with_mask(
             let recomb_rates: Vec<f32> = (start..end.saturating_sub(1))
                 .map(|i| {
                     let dist_cm = (gen_positions[i + 1] - gen_positions[i]).abs();
-                    params.p_recomb(dist_cm)
+                    if dist_cm < cluster_cm as f64 {
+                        0.0
+                    } else {
+                        params.p_recomb(dist_cm)
+                    }
                 })
                 .collect();
             let block =
@@ -357,7 +362,11 @@ fn build_reference_map_with_mask(
             let left_idx = blocks[i].end_marker - 1;
             let right_idx = blocks[i + 1].start_marker;
             let dist_cm = (gen_positions[right_idx] - gen_positions[left_idx]).abs();
-            params.p_recomb(dist_cm)
+            if dist_cm < cluster_cm as f64 {
+                0.0
+            } else {
+                params.p_recomb(dist_cm)
+            }
         })
         .collect();
 
@@ -941,6 +950,7 @@ impl crate::pipelines::ImputationPipeline {
                                 ref_block_size,
                                 0,
                                 Some(&keep_mask),
+                                pipeline.config.cluster,
                             );
                         } else {
                             ref_map = build_reference_map_with_mask(
@@ -951,6 +961,7 @@ impl crate::pipelines::ImputationPipeline {
                                 ref_block_size,
                                 ref_max_states,
                                 None,
+                                pipeline.config.cluster,
                             );
                         }
                     } else if window_count == 1 {
@@ -2295,6 +2306,7 @@ target_samples={} target_bytes={}",
             &all_results,
             self.config.gp,
             self.config.ap,
+            self.config.err.is_none(),
         )?;
         if let Some(bb) = &self.telemetry {
             let output_markers = output_end.saturating_sub(output_start);
@@ -2346,6 +2358,7 @@ target_samples={} target_bytes={}",
         all_results: &[SampleImputationResult],
         include_gp: bool,
         include_ap: bool,
+        prioritize_gt: bool,
     ) -> Result<()> {
         let markers_range = output_start..output_end;
         let n_markers = markers_range.len();
@@ -2581,15 +2594,31 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
+
+            let dosage = if prioritize_gt {
+                // Priority: GT -> PL -> HMM (Exact Match mode)
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    dosage_from_gp(n_alleles, &gp)
+                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.dosages.get(local_m).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                }
             } else {
-                0.0
+                // Priority: HMM -> PL -> GT (Error Correction mode)
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.dosages.get(local_m).copied().unwrap_or(0.0)
+                } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    dosage_from_gp(n_alleles, &gp)
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else {
+                    0.0
+                }
             };
 
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
@@ -2602,15 +2631,29 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                best_gt_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+
+            if prioritize_gt {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1, a2)
+                } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    best_gt_from_gp(n_alleles, &gp)
+                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                }
             } else {
-                (0, 0)
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+                } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    best_gt_from_gp(n_alleles, &gp)
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1, a2)
+                } else {
+                    (0, 0)
+                }
             }
         };
 
@@ -2925,6 +2968,7 @@ mod tests {
             &all_results,
             false,
             false,
+            true,
         );
         assert!(result.is_ok());
     }
