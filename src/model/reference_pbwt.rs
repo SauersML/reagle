@@ -1,4 +1,4 @@
-use crate::model::pbwt::PbwtDivUpdater;
+use crate::model::pbwt::{PbwtDivUpdater, PbwtState};
 
 const MAX_RANK_INTERVALS: usize = 8;
 
@@ -86,6 +86,21 @@ impl ReferencePbwt {
             counts: Vec::new(),
             offsets: Vec::new(),
         }
+    }
+
+    pub fn with_state(n_ref_haps: usize, state: Option<&PbwtState>) -> Self {
+        let mut pbwt = Self::new(n_ref_haps);
+        if let Some(state) = state {
+            if state.ppa.len() == n_ref_haps && state.div.len() == n_ref_haps {
+                pbwt.ppa = state.ppa.clone();
+                pbwt.div = state.div.clone();
+            }
+        }
+        pbwt
+    }
+
+    pub fn get_state(&self, marker_pos: usize) -> PbwtState {
+        PbwtState::new(self.ppa.clone(), self.div.clone(), marker_pos)
     }
 
     pub fn select_donors(&self, beam: &RankBeam, k: usize) -> Vec<u32> {

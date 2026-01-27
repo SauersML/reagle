@@ -1681,6 +1681,7 @@ impl PhasingPipeline {
         ibs2: &Ibs2,
         n_candidates: usize,
         max_states: usize,
+        pbwt_state: Option<&PbwtState>,
         marker_to_global: Option<&[usize]>,
         gen_positions: &[f64],
         step_cm: f32,
@@ -1778,7 +1779,7 @@ impl PhasingPipeline {
                 sampling_points[n_markers - 1] = true;
             }
         }
-        let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
+        let mut pbwt_fwd = ReferencePbwt::with_state(n_ref_haps, pbwt_state);
         let mut beams_fwd: Vec<RankBeam> = (0..n_target_haps)
             .map(|_| RankBeam::full(n_ref_haps as u32))
             .collect();
@@ -2024,7 +2025,19 @@ impl PhasingPipeline {
                 n_samples
             );
         }
-        (finalized, None)
+        let last_marker = if n_markers == 0 {
+            0usize
+        } else {
+            marker_to_global
+                .and_then(|map| map.get(n_markers - 1).copied())
+                .unwrap_or(n_markers - 1)
+        };
+        let pbwt_state_next = if n_ref_haps > 0 && n_markers > 0 {
+            Some(pbwt_fwd.get_state(last_marker))
+        } else {
+            None
+        };
+        (finalized, pbwt_state_next)
     }
 
     /// Build composite haplotypes using direct MutableGenotypes access (no reference panel).
@@ -2280,6 +2293,7 @@ impl PhasingPipeline {
                         ibs2,
                         n_candidates,
                         state_pool,
+                        pbwt_state,
                         None,
                         &gen_positions,
                         self.config.imp_step,
@@ -2614,6 +2628,7 @@ impl PhasingPipeline {
                                 ibs2,
                                 n_candidates,
                                 self.params.n_states,
+                                None,
                                 Some(hi_freq_to_orig),
                                 hi_freq_gen_positions,
                                 self.config.imp_step,
@@ -2630,6 +2645,7 @@ impl PhasingPipeline {
                         ibs2,
                         n_candidates,
                         self.params.n_states,
+                        None,
                         Some(hi_freq_to_orig),
                         hi_freq_gen_positions,
                         self.config.imp_step,
@@ -3194,6 +3210,7 @@ impl PhasingPipeline {
                     ibs2,
                     n_candidates,
                     self.params.n_states,
+                    None,
                     Some(hi_freq_markers),
                     hi_freq_gen_positions,
                     self.config.imp_step,
