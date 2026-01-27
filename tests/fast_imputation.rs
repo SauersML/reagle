@@ -685,7 +685,7 @@ fn test_simulated_chip_density() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 200.0;
+    config.ne = 10000.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
 
@@ -995,7 +995,7 @@ fn test_error_injection() {
     config.out = out_prefix.clone();
     config.err = Some(0.01);
     config.imp_states = 50;
-    config.ne = 10.0;
+    config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
