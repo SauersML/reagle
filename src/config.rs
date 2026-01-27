@@ -67,7 +67,7 @@ pub struct Config {
     pub mcmc_steps: usize,
 
     /// Model states for phasing (more states = better accuracy)
-    #[arg(long = "phase-states", default_value = "400")]
+    #[arg(long = "phase-states", default_value = "600")]
     pub phase_states: usize,
 
     /// Rare variant frequency threshold
@@ -113,7 +113,7 @@ pub struct Config {
 
     // ============ General Parameters ============
     /// Effective population size
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "1000000")]
     pub ne: f32,
 
     /// Allele mismatch probability (auto-calculated if not specified)
@@ -164,7 +164,7 @@ impl Default for Config {
             mcmc_burnin: 2,
             dynamic_mcmc: false,
             mcmc_steps: 3,
-            phase_states: 400,
+            phase_states: 600,
             rare: 0.002,
             impute: true,
             imp_states: 1600,
@@ -175,7 +175,7 @@ impl Default for Config {
             pbwt_batch_mb: 256,
             ap: false,
             gp: false,
-            ne: 100000.0,
+            ne: 1000000.0,
             err: None,
             em: true,
             window: 40.0,
