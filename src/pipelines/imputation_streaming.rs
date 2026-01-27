@@ -2295,6 +2295,7 @@ target_samples={} target_bytes={}",
             &all_results,
             self.config.gp,
             self.config.ap,
+            self.config.err.is_some(),
         )?;
         if let Some(bb) = &self.telemetry {
             let output_markers = output_end.saturating_sub(output_start);
@@ -2346,6 +2347,7 @@ target_samples={} target_bytes={}",
         all_results: &[SampleImputationResult],
         include_gp: bool,
         include_ap: bool,
+        allow_error_correction: bool,
     ) -> Result<()> {
         let markers_range = output_start..output_end;
         let n_markers = markers_range.len();
@@ -2584,12 +2586,23 @@ target_samples={} target_bytes={}",
             let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
+            } else if !allow_error_correction {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.dosages.get(local_m).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                }
             } else {
-                0.0
+                // Error correction allowed: prioritize imputed dosage over hard genotype
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.dosages.get(local_m).copied().unwrap_or(0.0)
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1 + a2) as f32
+                } else {
+                    0.0
+                }
             };
 
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
@@ -2605,12 +2618,22 @@ target_samples={} target_bytes={}",
             if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 best_gt_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+            } else if !allow_error_correction {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1, a2)
+                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                }
             } else {
-                (0, 0)
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+                } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    (a1, a2)
+                } else {
+                    (0, 0)
+                }
             }
         };
 
@@ -2923,6 +2946,7 @@ mod tests {
             output_end,
             output_start,
             &all_results,
+            false,
             false,
             false,
         );
