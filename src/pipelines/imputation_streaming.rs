@@ -2770,10 +2770,40 @@ target_samples={} target_bytes={}",
         let get_genotype_posteriors_for_writer =
             if include_gp { Some(|m, s| get_genotype_posteriors(m, s)) } else { None };
 
+        let err_enabled = self.config.err.is_some();
+
+        let get_dosage_final = |marker_idx: usize, sample_idx: usize| -> f32 {
+            let local_m = marker_idx.saturating_sub(output_start);
+            if err_enabled {
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some(d) = result.dosages.get(local_m).copied() {
+                        return if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                            d
+                        } else {
+                            d * 0.5
+                        };
+                    }
+                }
+            }
+            get_dosage(marker_idx, sample_idx)
+        };
+
+        let get_best_gt_final = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+            let local_m = marker_idx.saturating_sub(output_start);
+            if err_enabled {
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some(gt) = result.best_gt.get(local_m).copied() {
+                        return gt;
+                    }
+                }
+            }
+            get_best_gt(marker_idx, sample_idx)
+        };
+
         writer.write_imputed_streaming(
             marker_matrix_ref,
-            get_dosage,
-            get_best_gt,
+            get_dosage_final,
+            get_best_gt_final,
             get_posteriors_for_writer,
             get_genotype_posteriors_for_writer,
             quality,
