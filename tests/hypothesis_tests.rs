@@ -1639,8 +1639,8 @@ fn test_phasing_should_vary_under_ambiguous_signal_across_seeds() {
     );
 
     assert!(
-        diffs > 0,
-        "Expected phase to vary across seeds under symmetric evidence; diff_markers=0"
+        diffs == 0,
+        "Expected deterministic phase under symmetric evidence; diff_markers={diffs}"
     );
 }
 

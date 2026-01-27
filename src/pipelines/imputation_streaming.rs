@@ -34,6 +34,7 @@ use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
 };
+use crate::model::block_hash::types::{GlobalId, PatternId};
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::pipelines::imputation::AllelePosteriors;
 
@@ -51,6 +52,8 @@ fn push_unique(dst: &mut Vec<String>, value: String) {
         dst.push(value);
     }
 }
+
+const SHADOW_MAX_HAPS: usize = 256;
 
 fn chrom_variants(chrom: &str) -> Vec<String> {
     let mut candidates = Vec::new();
@@ -1772,7 +1775,156 @@ target_samples={} target_bytes={}",
 
                                 let threshold = 1e-4;
 
+                                let emission_prob_for_pattern =
+                                    |block: &crate::model::block_hash::compressed_block::CompressedBlock,
+                                     pattern_id: PatternId,
+                                     marker_in_window: usize,
+                                     target_probs: &[f32],
+                                     error_rate: f32|
+                                     -> f32 {
+                                        if target_probs.is_empty() {
+                                            return 1.0;
+                                        }
+                                        let conf = {
+                                            let n = target_probs.len();
+                                            if n <= 1 {
+                                                1.0
+                                            } else {
+                                                let mut sum = 0.0f32;
+                                                for &p in target_probs {
+                                                    if p.is_finite() && p > 0.0 {
+                                                        sum += p;
+                                                    }
+                                                }
+                                                if sum <= 0.0 {
+                                                    0.0
+                                                } else {
+                                                    let mut entropy = 0.0f32;
+                                                    for &p in target_probs {
+                                                        if p.is_finite() && p > 0.0 {
+                                                            let pn = p / sum;
+                                                            entropy -= pn * pn.ln();
+                                                        }
+                                                    }
+                                                    let max_entropy = (n as f32).ln();
+                                                    if max_entropy <= 0.0 {
+                                                        1.0
+                                                    } else {
+                                                        (1.0 - (entropy / max_entropy)).clamp(0.0, 1.0)
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        if conf <= 0.0 {
+                                            return 1.0;
+                                        }
+                                        let n_alleles = block.n_alleles(marker_in_window);
+                                        let mismatch_prob = if n_alleles > 1 {
+                                            error_rate / (n_alleles - 1) as f32
+                                        } else {
+                                            error_rate
+                                        };
+                                        let match_prob = 1.0 - error_rate;
+
+                                        if pattern_id.is_reservoir() {
+                                            let obs_fraction =
+                                                block.get_reservoir_obs_fraction(marker_in_window);
+                                            if obs_fraction > 0.0 {
+                                                let mut expected_match = 0.0f32;
+                                                for allele in 0..n_alleles {
+                                                    let p = target_probs
+                                                        .get(allele)
+                                                        .copied()
+                                                        .unwrap_or(0.0);
+                                                    let freq =
+                                                        block.reservoir_freq(marker_in_window, allele as u8);
+                                                    expected_match += p * freq;
+                                                }
+                                                let p_given_observed = mismatch_prob
+                                                    + (match_prob - mismatch_prob) * expected_match;
+                                                let emit =
+                                                    p_given_observed * obs_fraction + 1.0 * (1.0 - obs_fraction);
+                                                emit * conf + (1.0 - conf)
+                                            } else {
+                                                1.0
+                                            }
+                                        } else {
+                                            let ref_allele = block.get_pattern_allele(
+                                                pattern_id,
+                                                marker_in_window,
+                                            );
+                                            if ref_allele == 255 {
+                                                return 1.0;
+                                            }
+                                            let p_match = target_probs
+                                                .get(ref_allele as usize)
+                                                .copied()
+                                                .unwrap_or(0.0);
+                                            let emit =
+                                                mismatch_prob + (match_prob - mismatch_prob) * p_match;
+                                            emit * conf + (1.0 - conf)
+                                        }
+                                    };
+
+                                let mut shadow_weights: Option<Vec<(GlobalHapId, f32)>> = None;
+                                if let Some(p) = priors {
+                                    if !p.ids().is_empty() {
+                                        let mut shadow: Vec<(GlobalHapId, f32)> = p
+                                            .ids()
+                                            .iter()
+                                            .copied()
+                                            .zip(p.probs().iter().copied())
+                                            .collect();
+                                        shadow.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                                        if shadow.len() > SHADOW_MAX_HAPS {
+                                            shadow.truncate(SHADOW_MAX_HAPS);
+                                        }
+                                        let mut weights: Vec<f32> = shadow.iter().map(|(_, w)| *w).collect();
+                                        for block_shadow in ref_map.blocks.iter() {
+                                            let block_start = block_shadow.start_marker;
+                                            if block_start > prior_marker_idx {
+                                                break;
+                                            }
+                                            let block_end = block_shadow.end_marker.min(prior_marker_idx + 1);
+                                            for marker in block_start..block_end {
+                                                let probs = input_probs.probs_for_marker(marker);
+                                                let marker_in_window = marker.saturating_sub(block_shadow.start_marker);
+                                                for (i, (hap_id, _)) in shadow.iter().enumerate() {
+                                                    let pat = block_shadow.pattern_for_haplotype(GlobalId::new(hap_id.0));
+                                                    let emit = emission_prob_for_pattern(
+                                                        block_shadow,
+                                                        pat,
+                                                        marker_in_window,
+                                                        probs,
+                                                        self.params.p_mismatch,
+                                                    );
+                                                    weights[i] *= emit;
+                                                }
+                                            }
+                                        }
+                                        let mut sum_w = 0.0f32;
+                                        for w in &weights {
+                                            sum_w += *w;
+                                        }
+                                        if sum_w > 0.0 {
+                                            for w in &mut weights {
+                                                *w /= sum_w;
+                                            }
+                                            let shadow_norm: Vec<(GlobalHapId, f32)> = shadow
+                                                .iter()
+                                                .zip(weights.iter())
+                                                .map(|((h, _), w)| (*h, *w))
+                                                .collect();
+                                            shadow_weights = Some(shadow_norm);
+                                        }
+                                    }
+                                }
+
                                 let mut priors_list: Vec<(GlobalHapId, f32)> = Vec::new();
+                                let shadow_map: Option<std::collections::HashMap<u32, f32>> =
+                                    shadow_weights.as_ref().map(|shadow| {
+                                        shadow.iter().map(|(h, w)| (h.0, *w)).collect()
+                                    });
 
                                 for (pat_idx, &prob) in
                                     fwd.iter().enumerate().take(block.n_patterns())
@@ -1780,7 +1932,24 @@ target_samples={} target_bytes={}",
                                     if prob > threshold {
                                         let count = block.pattern_counts[pat_idx];
                                         let globals = block.pattern_globals(pat_idx);
-                                        if let Some(p) = priors {
+                                        let mut sum_shadow = 0.0f32;
+                                        if let Some(ref shadow) = shadow_map {
+                                            for &global_id in globals {
+                                                if let Some(w) = shadow.get(&global_id.as_u32()) {
+                                                    sum_shadow += *w;
+                                                }
+                                            }
+                                        }
+                                        if sum_shadow > 0.0 {
+                                            if let Some(ref shadow) = shadow_map {
+                                                for &global_id in globals {
+                                                    if let Some(w) = shadow.get(&global_id.as_u32()) {
+                                                        let global_prob = prob * (*w / sum_shadow);
+                                                        priors_list.push((GlobalHapId(global_id.as_u32()), global_prob));
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(p) = priors {
                                             let mut sum_prior = 0.0f32;
                                             for &global_id in globals {
                                                 if let Some(w) = p.prob_of(GlobalHapId(global_id.as_u32())) {
@@ -1820,7 +1989,27 @@ target_samples={} target_bytes={}",
 
                                 if res_prob > threshold && block.reservoir_count > 0 {
                                     let globals = &block.reservoir_globals;
-                                    if let Some(p) = priors {
+                                    let mut sum_shadow = 0.0f32;
+                                    if let Some(ref shadow) = shadow_map {
+                                        for &global_id in globals {
+                                            if let Some(w) = shadow.get(&global_id.as_u32()) {
+                                                sum_shadow += *w;
+                                            }
+                                        }
+                                    }
+                                    if sum_shadow > 0.0 {
+                                        if let Some(ref shadow) = shadow_map {
+                                            for &global_id in globals {
+                                                if let Some(w) = shadow.get(&global_id.as_u32()) {
+                                                    let global_prob = res_prob * (*w / sum_shadow);
+                                                    priors_list.push((
+                                                        GlobalHapId(global_id.as_u32()),
+                                                        global_prob,
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(p) = priors {
                                         let mut sum_prior = 0.0f32;
                                         for &global_id in globals {
                                             if let Some(w) = p.prob_of(GlobalHapId(global_id.as_u32())) {
