@@ -367,9 +367,9 @@ mod tests {
     fn test_p_recomb() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // No distance -> no recomb
+        // No distance -> min recomb
         let p0 = params.p_recomb(0.0);
-        assert!(p0.abs() < 0.0001);
+        assert!((p0 - ModelParams::MIN_RECOMB_PROB).abs() < 1e-10);
 
         // Small distance -> small prob
         let p1 = params.p_recomb(0.001);
