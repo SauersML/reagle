@@ -2479,27 +2479,6 @@ target_samples={} target_bytes={}",
             j * (j + 1) / 2 + i
         };
 
-        let best_gt_from_gp = |n_alleles: usize, gp: &[f32]| -> (u8, u8) {
-            let mut best = (0u8, 0u8);
-            let mut best_prob = -1.0f32;
-            let mut idx = 0usize;
-            for j in 0..n_alleles {
-                for i in 0..=j {
-                    let p = gp.get(idx).copied().unwrap_or(0.0);
-                    if p > best_prob {
-                        best_prob = p;
-                        if i == j {
-                            best = (i as u8, i as u8);
-                        } else {
-                            best = (i as u8, j as u8);
-                        }
-                    }
-                    idx += 1;
-                }
-            }
-            best
-        };
-
         let dosage_from_gp = |n_alleles: usize, gp: &[f32]| -> f32 {
             let mut dosage = 0.0f32;
             let mut idx = 0usize;
@@ -2581,10 +2560,7 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
@@ -2602,10 +2578,7 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                best_gt_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 (a1, a2)
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
