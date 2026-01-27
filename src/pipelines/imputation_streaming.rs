@@ -2640,15 +2640,8 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
-                                let n_alleles = ref_markers
-                                    .marker(MarkerIdx::new(marker_idx as u32))
-                                    .n_alleles();
-                                let dosage = dosage_from_gp(n_alleles, &gp);
-                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
-                            } else if let Some(target_m) = alignment.target_marker(marker_idx) {
+                            let mut gt_found = false;
+                            if let Some(target_m) = alignment.target_marker(marker_idx) {
                                 let h1 = HapIdx::new((s * 2) as u32);
                                 let h2 = HapIdx::new((s * 2 + 1) as u32);
                                 let raw_a1 = target_win.allele(MarkerIdx::new(target_m as u32), h1);
@@ -2678,6 +2671,19 @@ target_samples={} target_bytes={}",
                                 if a1 < 2 && a2 < 2 {
                                     v1 = a1 as f32;
                                     v2 = a2 as f32;
+                                    gt_found = true;
+                                }
+                            }
+
+                            if !gt_found {
+                                if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                    let n_alleles = ref_markers
+                                        .marker(MarkerIdx::new(marker_idx as u32))
+                                        .n_alleles();
+                                    let dosage = dosage_from_gp(n_alleles, &gp);
+                                    let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                                    v1 = p_alt;
+                                    v2 = p_alt;
                                 }
                             }
                         }
