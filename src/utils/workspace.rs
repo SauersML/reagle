@@ -6,7 +6,6 @@
 
 use aligned_vec::{AVec, ConstAlign};
 
-
 /// Workspace for phasing HMM computations
 #[derive(Debug)]
 pub struct ThreadWorkspace {
@@ -30,6 +29,8 @@ pub struct ThreadWorkspace {
     /// Per-marker haplotype alleles and flags
     pub hap1_allele: Vec<u8>,
     pub hap2_allele: Vec<u8>,
+    pub hap1_partner_allele: Vec<u8>,
+    pub hap2_partner_allele: Vec<u8>,
     pub hap1_use_combined: Vec<bool>,
     pub hap2_use_combined: Vec<bool>,
     /// Forward block buffer for checkpoint recompute
@@ -66,6 +67,8 @@ impl ThreadWorkspace {
             path2: Vec::new(),
             hap1_allele: Vec::new(),
             hap2_allele: Vec::new(),
+            hap1_partner_allele: Vec::new(),
+            hap2_partner_allele: Vec::new(),
             hap1_use_combined: Vec::new(),
             hap2_use_combined: Vec::new(),
             fwd_block: Vec::new(),
@@ -120,10 +123,26 @@ impl ThreadWorkspace {
 
         if self.path1.len() < n_markers {
             self.path1.resize(n_markers, 0);
+        }
+        if self.path2.len() < n_markers {
             self.path2.resize(n_markers, 0);
+        }
+        if self.hap1_allele.len() < n_markers {
             self.hap1_allele.resize(n_markers, 255);
+        }
+        if self.hap2_allele.len() < n_markers {
             self.hap2_allele.resize(n_markers, 255);
+        }
+        if self.hap1_partner_allele.len() < n_markers {
+            self.hap1_partner_allele.resize(n_markers, 255);
+        }
+        if self.hap2_partner_allele.len() < n_markers {
+            self.hap2_partner_allele.resize(n_markers, 255);
+        }
+        if self.hap1_use_combined.len() < n_markers {
             self.hap1_use_combined.resize(n_markers, true);
+        }
+        if self.hap2_use_combined.len() < n_markers {
             self.hap2_use_combined.resize(n_markers, true);
         }
 
@@ -149,4 +168,3 @@ impl ThreadWorkspace {
         // No need to zero out, as we'll overwrite during fill
     }
 }
-

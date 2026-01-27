@@ -12,7 +12,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::data::haplotype::{HapIdx, Samples};
+use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
 use crate::data::marker::{Marker, MarkerIdx, Markers};
 use crate::data::storage::GenotypeColumn;
 use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
@@ -115,6 +115,11 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased> {
     /// None if no confidence information available (assume full confidence).
     confidence: Option<Vec<Vec<u8>>>,
 
+    /// Optional per-sample phase confidence scores (0-255 => 0.0-1.0).
+    /// Represents confidence in the current phased orientation at heterozygotes.
+    /// Layout: `phase_confidence[marker][sample]`
+    phase_confidence: Option<Vec<Vec<u8>>>,
+
     likelihoods_pl: Option<Arc<PlMatrix>>,
 
     /// Phantom data to hold the State type parameter (zero-sized)
@@ -177,7 +182,12 @@ impl<S: PhaseState> GenotypeMatrix<S> {
             .as_ref()
             .map(|c| c.iter().map(|v| v.len()).sum())
             .unwrap_or(0);
-        column_bytes + confidence_bytes + std::mem::size_of::<Self>()
+        let phase_confidence_bytes: usize = self
+            .phase_confidence
+            .as_ref()
+            .map(|c| c.iter().map(|v| v.len()).sum())
+            .unwrap_or(0);
+        column_bytes + confidence_bytes + phase_confidence_bytes + std::mem::size_of::<Self>()
     }
 
     /// Check if confidence scores are available
@@ -186,12 +196,30 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Returns 255 (full confidence) if confidence data is not available.
     #[inline]
     pub fn sample_confidence(&self, marker: MarkerIdx, sample_idx: usize) -> u8 {
-        self.confidence
+        if marker.as_usize() >= self.columns.len() {
+            return 0;
+        }
+        if let Some(conf) = self
+            .confidence
             .as_ref()
             .and_then(|c| c.get(marker.as_usize()))
             .and_then(|row| row.get(sample_idx))
             .copied()
-            .unwrap_or(255)
+        {
+            return conf;
+        }
+        let sample = SampleIdx::new(sample_idx as u32);
+        let a1 = self.allele(marker, sample.hap1());
+        if a1 == 255 {
+            return 0;
+        }
+        if self.samples.is_diploid(sample) {
+            let a2 = self.allele(marker, sample.hap2());
+            if a2 == 255 {
+                return 0;
+            }
+        }
+        255
     }
 
     /// Get confidence score as f32 (0.0-1.0)
@@ -203,6 +231,29 @@ impl<S: PhaseState> GenotypeMatrix<S> {
     /// Clone the confidence data (for transferring to a new matrix)
     pub fn confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
         self.confidence.clone()
+    }
+
+    /// Get phase confidence score for a sample at a marker (0-255).
+    /// Returns 255 (full confidence) if phase confidence is not available.
+    #[inline]
+    pub fn sample_phase_confidence(&self, marker: MarkerIdx, sample_idx: usize) -> u8 {
+        self.phase_confidence
+            .as_ref()
+            .and_then(|c| c.get(marker.as_usize()))
+            .and_then(|row| row.get(sample_idx))
+            .copied()
+            .unwrap_or(255)
+    }
+
+    /// Get phase confidence score as f32 (0.0-1.0).
+    #[inline]
+    pub fn sample_phase_confidence_f32(&self, marker: MarkerIdx, sample_idx: usize) -> f32 {
+        self.sample_phase_confidence(marker, sample_idx) as f32 / 255.0
+    }
+
+    /// Clone the phase confidence data (for transferring to a new matrix)
+    pub fn phase_confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
+        self.phase_confidence.clone()
     }
 
     pub fn likelihoods_pl_arc(&self) -> Option<Arc<PlMatrix>> {
@@ -235,6 +286,7 @@ impl GenotypeMatrix<Unphased> {
             samples,
             is_reversed: false,
             confidence: None,
+            phase_confidence: None,
             likelihoods_pl: None,
             phantom: PhantomData,
         }
@@ -255,6 +307,7 @@ impl GenotypeMatrix<Unphased> {
             samples,
             is_reversed: false,
             confidence: Some(confidence),
+            phase_confidence: None,
             likelihoods_pl: None,
             phantom: PhantomData,
         }
@@ -277,6 +330,7 @@ impl GenotypeMatrix<Unphased> {
             samples,
             is_reversed: false,
             confidence,
+            phase_confidence: None,
             likelihoods_pl: Some(likelihoods_pl),
             phantom: PhantomData,
         }
@@ -293,6 +347,7 @@ impl GenotypeMatrix<Unphased> {
             samples: self.samples,
             is_reversed: self.is_reversed,
             confidence: self.confidence,
+            phase_confidence: self.phase_confidence,
             likelihoods_pl: self.likelihoods_pl,
             phantom: PhantomData,
         }
@@ -317,6 +372,7 @@ impl GenotypeMatrix<Phased> {
             samples,
             is_reversed: false,
             confidence: None,
+            phase_confidence: None,
             likelihoods_pl: None,
             phantom: PhantomData,
         }
@@ -337,6 +393,7 @@ impl GenotypeMatrix<Phased> {
             samples,
             is_reversed: false,
             confidence: Some(confidence),
+            phase_confidence: None,
             likelihoods_pl: None,
             phantom: PhantomData,
         }
@@ -367,9 +424,19 @@ impl GenotypeMatrix<Phased> {
             samples,
             is_reversed: false,
             confidence,
+            phase_confidence: None,
             likelihoods_pl,
             phantom: PhantomData,
         }
+    }
+
+    /// Attach phase confidence data to a phased matrix.
+    pub fn with_phase_confidence(mut self, phase_confidence: Option<Vec<Vec<u8>>>) -> Self {
+        if let Some(ref conf) = phase_confidence {
+            debug_assert_eq!(self.markers.len(), conf.len());
+        }
+        self.phase_confidence = phase_confidence;
+        self
     }
 
     /// Get a reference as unphased (zero-cost, same memory layout)
@@ -384,7 +451,7 @@ impl GenotypeMatrix<Phased> {
 mod tests {
     use super::*;
     use crate::data::ChromIdx;
-    use crate::data::marker::Allele;
+    use crate::data::marker::{Allele, Nucleotide};
 
     fn make_test_matrix_phased() -> GenotypeMatrix<Phased> {
         let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
@@ -395,15 +462,15 @@ mod tests {
             ChromIdx::new(0),
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
         let m2 = Marker::new(
             ChromIdx::new(0),
             200,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
 
         markers.push(m1);
@@ -424,15 +491,15 @@ mod tests {
             ChromIdx::new(0),
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
         let m2 = Marker::new(
             ChromIdx::new(0),
             200,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
 
         markers.push(m1);
@@ -476,15 +543,15 @@ mod tests {
             ChromIdx::new(0),
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
         let m2 = Marker::new(
             ChromIdx::new(0),
             200,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
 
         markers.push(m1);

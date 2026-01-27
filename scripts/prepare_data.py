@@ -16,25 +16,73 @@ def _resolve_local_panel_path():
             return p
     return None
 
-def install_convert_genome():
-    """Installs convert_genome using cargo install (avoids GitHub API rate limits)."""
-    print("Installing convert_genome...")
-    # Only install if not present
-    if shutil.which("convert_genome"):
-        print("convert_genome already installed.")
-        return
+def _clean_output_dir(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    for name in ("panel.vcf", "panel.vcf.gz", "genotypes.vcf", "genotypes.vcf.gz"):
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
 
-    # Use cargo install instead of the bash script to avoid GitHub API rate limits
-    try:
-        subprocess.check_call(["cargo", "install", "convert_genome"])
-    except subprocess.CalledProcessError:
-        # Fallback to git-based install if crates.io version is outdated
-        subprocess.check_call(["cargo", "install", "--git", "https://github.com/SauersML/convert_genome.git"])
-    
-    # Add cargo bin to path for this session
+def _find_genotypes_vcf(output_dir):
+    for name in ("genotypes.vcf", "genotypes.vcf.gz"):
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+def _update_panel_if_present(output_dir, panel_path):
+    panel_candidates = [
+        os.path.join(output_dir, "panel.vcf"),
+        os.path.join(output_dir, "panel.vcf.gz"),
+    ]
+    panel_source = next((p for p in panel_candidates if os.path.exists(p)), None)
+    if not panel_source:
+        return False
+
+    print(f"Updated panel detected at {panel_source}, updating {panel_path}...")
+    subprocess.check_call(["bcftools", "view", panel_source, "-Oz", "-o", panel_path])
+    subprocess.check_call(["bcftools", "index", "-f", panel_path])
+    return True
+
+def _clear_convert_genome_cache():
+    """Removes any existing convert_genome binary and caches to force a fresh install."""
+    # Remove known binary locations if present.
+    binary_candidates = [
+        shutil.which("convert_genome"),
+        os.path.join(os.path.expanduser("~"), ".local", "bin", "convert_genome"),
+        os.path.join(os.path.expanduser("~"), "bin", "convert_genome"),
+        os.path.join(os.path.expanduser("~"), "bin", "convert_genome.exe"),
+    ]
+    for path in {p for p in binary_candidates if p}:
+        if os.path.exists(path):
+            print(f"Removing existing convert_genome binary: {path}")
+            os.remove(path)
+
+    # Remove common cache locations (best-effort).
+    cache_dirs = [
+        os.path.join(os.path.expanduser("~"), ".cache", "convert_genome"),
+        os.path.join(os.path.expanduser("~"), "Library", "Caches", "convert_genome"),
+        os.path.join(os.path.expanduser("~"), "Library", "Application Support", "convert_genome"),
+    ]
+    for path in cache_dirs:
+        if os.path.isdir(path):
+            print(f"Removing convert_genome cache: {path}")
+            shutil.rmtree(path)
+
+def install_convert_genome():
+    """Installs convert_genome using the official install script (pre-compiled binary)."""
+    print("Installing convert_genome (fresh install)...")
+    _clear_convert_genome_cache()
+
+    # Download and run the install script
+    install_script_url = "https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh"
+    subprocess.check_call(["bash", "-c", f"curl -fsSL {install_script_url} | bash"])
+
+    # Add install location to PATH for this session
     home = os.path.expanduser("~")
-    bin_path = os.path.join(home, ".cargo", "bin")
-    os.environ["PATH"] += os.pathsep + bin_path
+    local_bin = os.path.join(home, ".local", "bin")
+    if local_bin not in os.environ["PATH"]:
+        os.environ["PATH"] = local_bin + os.pathsep + os.environ["PATH"]
 
 def prepare_input_file(input_path):
     """
@@ -178,13 +226,15 @@ def prepare_truth(source, output_vcf):
     install_convert_genome()
 
     ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    truth_output_dir = "convert_genome_truth_out"
+    _clean_output_dir(truth_output_dir)
     truth_hg38_vcf = "truth_hg38.vcf.gz"
 
     cmd = [
         "convert_genome",
         source_vcf,
         ref_hg38_url,
-        truth_hg38_vcf,
+        "--output-dir", truth_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
@@ -193,7 +243,14 @@ def prepare_truth(source, output_vcf):
 
     print(f"Running: {' '.join(cmd)}")
     subprocess.check_call(cmd)
+
+    truth_raw_vcf = _find_genotypes_vcf(truth_output_dir)
+    if not truth_raw_vcf:
+        raise RuntimeError("convert_genome failed to produce genotypes.vcf")
+
+    subprocess.check_call(["bcftools", "view", truth_raw_vcf, "-Oz", "-o", truth_hg38_vcf])
     subprocess.check_call(["bcftools", "index", "-f", truth_hg38_vcf])
+    _update_panel_if_present(truth_output_dir, panel_path)
 
     # Rename chroms (22 -> chr22) to match reference panel which uses chr22 notation
     with open("chr_map.txt", "w") as f:
@@ -227,7 +284,8 @@ def run_conversion(input_path, output_vcf):
     print(f"Converting {raw_file} to GRCh38 VCF...")
 
     ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
-    temp_hg38_vcf = "temp_hg38.vcf"
+    temp_output_dir = "convert_genome_array_out"
+    _clean_output_dir(temp_output_dir)
 
     panel_path = _resolve_local_panel_path()
     if not panel_path:
@@ -239,7 +297,7 @@ def run_conversion(input_path, output_vcf):
         "convert_genome",
         raw_file,
         ref_hg38_url,
-        temp_hg38_vcf,
+        "--output-dir", temp_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
@@ -249,8 +307,9 @@ def run_conversion(input_path, output_vcf):
     print(f"Running: {' '.join(cmd)}")
     subprocess.check_call(cmd)
 
-    if not os.path.exists(temp_hg38_vcf):
-        raise RuntimeError("convert_genome failed to produce temp_hg38.vcf")
+    temp_hg38_vcf = _find_genotypes_vcf(temp_output_dir)
+    if not temp_hg38_vcf:
+        raise RuntimeError("convert_genome failed to produce genotypes.vcf")
 
     print("Finalizing GRCh38 output...")
     print("Filtering invalid records (missing ALT but non-ref GT)...")
@@ -258,11 +317,8 @@ def run_conversion(input_path, output_vcf):
     subprocess.check_call(filter_cmd, shell=True)
     subprocess.check_call(["bcftools", "index", "-f", output_vcf])
     print("Conversion complete.")
+    _update_panel_if_present(temp_output_dir, panel_path)
 
-    # Cleanup
-    if os.path.exists("temp_hg38.vcf"):
-        os.remove("temp_hg38.vcf")
-        
     # Cleanup extracted if it was temp
     if "extracted" in raw_file:
         shutil.rmtree(os.path.dirname(raw_file))

@@ -103,6 +103,33 @@ def get_beagle_stats(run_id):
     
     return 0, 0
 
+def get_seed_mean_diff(run_id):
+    """
+    Parses the log for seed accuracy lines like:
+    'Seed 1: Java 98.57%, Rust 98.57%'
+    Returns formatted mean diff string or 'N/A'.
+    """
+    cmd = f"gh run view {run_id} --log | grep -E \"Seed[[:space:]]+[0-9]+: Java\""
+    output = run_command(cmd, use_shell=True)
+    if not output:
+        return "N/A"
+
+    diffs = []
+    pattern = re.compile(r"Seed\s+\d+:\s+Java\s+([0-9.]+)%\s*,\s*Rust\s+([0-9.]+)%")
+    for line in output.splitlines():
+        match = pattern.search(line)
+        if match:
+            java = float(match.group(1))
+            rust = float(match.group(2))
+            diffs.append(rust - java)
+
+    if not diffs:
+        return "N/A"
+
+    mean_diff = sum(diffs) / len(diffs)
+    sign = "+" if mean_diff >= 0 else "-"
+    return f"{sign}{abs(mean_diff):.2f}%"
+
 def fetch_pr_info(pr):
     """Fetches workflow status for a single PR and returns the processed data."""
     number = pr['number']
@@ -133,6 +160,7 @@ def fetch_pr_info(pr):
     ci_run = get_run_for_workflow(branch, "CI")
     ci_disp = "N/A"
     beagle_disp = "N/A"
+    seed_disp = "N/A"
     
     if ci_run:
         status = ci_run.get('status', 'unknown')
@@ -168,13 +196,17 @@ def fetch_pr_info(pr):
                      beagle_disp = "❌ Unit Fail"
                  else:
                      beagle_disp = "❓ Not Found"
+
+             seed_disp = get_seed_mean_diff(run_id)
                  
         else:
             ci_disp = f"⏳ {status.upper()}"
             beagle_disp = "⏳"
+            seed_disp = "⏳"
     else:
         ci_disp = "❓ NO RUN"
         beagle_disp = "-"
+        seed_disp = "-"
 
 
     # Truncate branch name for display
@@ -185,6 +217,7 @@ def fetch_pr_info(pr):
         'imp_disp': imp_disp,
         'ci_disp': ci_disp,
         'beagle_disp': beagle_disp,
+        'seed_disp': seed_disp,
         'display_branch': display_branch,
         'title': title
     }
@@ -200,8 +233,8 @@ def main():
     print(f"Found {len(prs)} open PRs. Fetching statuses concurrently...\n")
     
     # Header
-    print(f"{'PR #':<6} | {'Imp. Qual.':<15} | {'CI Tests':<20} | {'Beagle Ref':<20} | {'Branch':<33} | {'Title'}")
-    print("-" * 155)
+    print(f"{'PR #':<6} | {'Imp. Qual.':<15} | {'CI Tests':<20} | {'Beagle Ref':<20} | {'Seed Δ':<8} | {'Branch':<33} | {'Title'}")
+    print("-" * 165)
 
     # Use ThreadPoolExecutor to fetch statuses in parallel
     results = []
@@ -210,7 +243,7 @@ def main():
         results = list(executor.map(fetch_pr_info, prs))
 
     for res in results:
-        print(f"#{res['number']:<5} | {res['imp_disp']:<15} | {res['ci_disp']:<20} | {res['beagle_disp']:<20} | {res['display_branch']:<33} | {res['title']}")
+        print(f"#{res['number']:<5} | {res['imp_disp']:<15} | {res['ci_disp']:<20} | {res['beagle_disp']:<20} | {res['seed_disp']:<8} | {res['display_branch']:<33} | {res['title']}")
 
 if __name__ == "__main__":
     main()

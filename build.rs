@@ -471,14 +471,15 @@ impl DeadCodeCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str(
-            "\n⚠️ The following attributes are STRICTLY FORBIDDEN in this project:\n",
-        );
+        error_msg
+            .push_str("\n⚠️ The following attributes are STRICTLY FORBIDDEN in this project:\n");
         error_msg.push_str("   - #[allow(dead_code)]\n");
         error_msg.push_str("   - #[allow(unused)] / #![allow(unused)]\n");
         error_msg.push_str("   - #[allow(unused_imports)]\n");
         error_msg.push_str("   - #[allow(unused_variables)]\n");
-        error_msg.push_str("\n   Do not suppress these warnings. Delete or use the unused code/imports instead.\n");
+        error_msg.push_str(
+            "\n   Do not suppress these warnings. Delete or use the unused code/imports instead.\n",
+        );
 
         Some(error_msg)
     }

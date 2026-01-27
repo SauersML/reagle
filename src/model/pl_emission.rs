@@ -62,15 +62,75 @@ fn phred_weight(pl: u16) -> f32 {
     (10.0f32).powf(-(pl as f32) * 0.1)
 }
 
-pub fn allele_probs_uncond_from_pl(pl: &[u16], probs: &mut Vec<f32>) -> Option<usize> {
+fn normalize_allele_freqs(freqs: &[f32], out: &mut Vec<f32>) -> Option<()> {
+    if freqs.is_empty() {
+        return None;
+    }
+    out.clear();
+    out.extend_from_slice(freqs);
+    let mut sum = 0.0f32;
+    for f in out.iter_mut() {
+        if *f < 0.0 {
+            *f = 0.0;
+        }
+        sum += *f;
+    }
+    if sum > 0.0 {
+        for f in out.iter_mut() {
+            *f /= sum;
+        }
+        let n = out.len() as f32;
+        let eps = 2e-5f32;
+        if eps * n >= 1.0 {
+            let uniform = 1.0 / n;
+            out.fill(uniform);
+            return Some(());
+        }
+        let mut sum2 = 0.0f32;
+        for f in out.iter_mut() {
+            if *f < eps {
+                *f = eps;
+            }
+            sum2 += *f;
+        }
+        if sum2 > 0.0 {
+            for f in out.iter_mut() {
+                *f /= sum2;
+            }
+        }
+        Some(())
+    } else {
+        None
+    }
+}
+
+fn genotype_prior(i: usize, j: usize, allele_freqs: &[f32]) -> f32 {
+    let fi = allele_freqs.get(i).copied().unwrap_or(0.0);
+    let fj = allele_freqs.get(j).copied().unwrap_or(0.0);
+    if i == j { fi * fi } else { 2.0 * fi * fj }
+}
+
+pub fn allele_probs_uncond_from_pl(
+    pl: &[u16],
+    allele_freqs: Option<&[f32]>,
+    probs: &mut Vec<f32>,
+) -> Option<usize> {
     let n_alleles = infer_n_alleles_from_pl_len(pl.len())?;
     probs.clear();
     probs.resize(n_alleles, 0.0);
+    let mut norm_freqs: Vec<f32> = Vec::new();
+    let use_priors = allele_freqs
+        .and_then(|f| normalize_allele_freqs(f, &mut norm_freqs))
+        .is_some()
+        && norm_freqs.len() == n_alleles;
     let mut sum_w = 0.0f32;
     let mut idx = 0usize;
     for j in 0..n_alleles {
         for i in 0..=j {
-            let w = phred_weight(*pl.get(idx).unwrap_or(&0));
+            let mut w = phred_weight(*pl.get(idx).unwrap_or(&0));
+            if use_priors {
+                w *= genotype_prior(i, j, &norm_freqs);
+            }
             sum_w += w;
             if i == j {
                 probs[i] += w;
@@ -91,7 +151,50 @@ pub fn allele_probs_uncond_from_pl(pl: &[u16], probs: &mut Vec<f32>) -> Option<u
     Some(n_alleles)
 }
 
-pub fn allele_probs_cond_from_pl(pl: &[u16], partner: u8, probs: &mut Vec<f32>) -> Option<usize> {
+pub fn genotype_probs_from_pl(
+    pl: &[u16],
+    allele_freqs: Option<&[f32]>,
+    probs: &mut Vec<f32>,
+) -> Option<usize> {
+    let n_alleles = infer_n_alleles_from_pl_len(pl.len())?;
+    let n_genotypes = n_alleles * (n_alleles + 1) / 2;
+    probs.clear();
+    probs.resize(n_genotypes, 0.0);
+
+    let mut norm_freqs: Vec<f32> = Vec::new();
+    let use_priors = allele_freqs
+        .and_then(|f| normalize_allele_freqs(f, &mut norm_freqs))
+        .is_some()
+        && norm_freqs.len() == n_alleles;
+
+    let mut sum_w = 0.0f32;
+    let mut idx = 0usize;
+    for j in 0..n_alleles {
+        for i in 0..=j {
+            let mut w = phred_weight(*pl.get(idx).unwrap_or(&0));
+            if use_priors {
+                w *= genotype_prior(i, j, &norm_freqs);
+            }
+            probs[idx] = w;
+            sum_w += w;
+            idx += 1;
+        }
+    }
+    if sum_w <= 0.0 {
+        return None;
+    }
+    for p in probs.iter_mut() {
+        *p /= sum_w;
+    }
+    Some(n_alleles)
+}
+
+pub fn allele_probs_cond_from_pl(
+    pl: &[u16],
+    partner: u8,
+    allele_freqs: Option<&[f32]>,
+    probs: &mut Vec<f32>,
+) -> Option<usize> {
     let n_alleles = infer_n_alleles_from_pl_len(pl.len())?;
     let partner = partner as usize;
     if partner >= n_alleles {
@@ -99,11 +202,19 @@ pub fn allele_probs_cond_from_pl(pl: &[u16], partner: u8, probs: &mut Vec<f32>) 
     }
     probs.clear();
     probs.resize(n_alleles, 0.0);
+    let mut norm_freqs: Vec<f32> = Vec::new();
+    let use_priors = allele_freqs
+        .and_then(|f| normalize_allele_freqs(f, &mut norm_freqs))
+        .is_some()
+        && norm_freqs.len() == n_alleles;
     let mut sum_w = 0.0f32;
     let mut idx = 0usize;
     for j in 0..n_alleles {
         for i in 0..=j {
-            let w = phred_weight(*pl.get(idx).unwrap_or(&0));
+            let mut w = phred_weight(*pl.get(idx).unwrap_or(&0));
+            if use_priors {
+                w *= genotype_prior(i, j, &norm_freqs);
+            }
             let other = if i == partner && j == partner {
                 Some(partner)
             } else if i == partner && j != partner {

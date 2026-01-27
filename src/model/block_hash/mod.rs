@@ -55,17 +55,16 @@
 //! - Parallelization: Zero-cost reference sharing via Arc
 //! - SIMD: Leverages AVX-512 kernels from existing HmmUpdater
 
-
-pub mod types;
 pub mod compressed_block;
-pub mod workspace;
-pub mod reference_map;
-pub mod transition;
 pub mod compression;
 pub mod hmm;
+pub mod reference_map;
+pub mod transition;
+pub mod types;
 pub mod weighted_kernel;
+pub mod workspace;
 
 // Crate-internal API exports (will become public when integrated)
 pub use compressed_block::CompressedBlock;
-pub use workspace::BlockHmmWorkspace;
 pub use reference_map::ReferenceMap;
+pub use workspace::BlockHmmWorkspace;

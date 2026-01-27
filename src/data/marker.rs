@@ -57,11 +57,66 @@ impl From<MarkerIdx> for usize {
     }
 }
 
+/// Type-safe nucleotide representation (A=0, C=1, G=2, T=3)
+///
+/// Zero-cost wrapper that prevents accidentally using ASCII codes like b'A' (65)
+/// instead of the internal encoding (0).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct Nucleotide(u8);
+
+impl Nucleotide {
+    /// Adenine (A)
+    pub const A: Self = Self(0);
+    /// Cytosine (C)
+    pub const C: Self = Self(1);
+    /// Guanine (G)
+    pub const G: Self = Self(2);
+    /// Thymine (T)
+    pub const T: Self = Self(3);
+
+    /// Create from ASCII character (A/C/G/T)
+    #[inline]
+    pub fn from_ascii(c: u8) -> Option<Self> {
+        match c {
+            b'A' | b'a' => Some(Self::A),
+            b'C' | b'c' => Some(Self::C),
+            b'G' | b'g' => Some(Self::G),
+            b'T' | b't' => Some(Self::T),
+            _ => None,
+        }
+    }
+
+    /// Get complement nucleotide (A↔T, C↔G)
+    #[inline]
+    pub const fn complement(self) -> Self {
+        match self.0 {
+            0 => Self::T, // A -> T
+            1 => Self::G, // C -> G
+            2 => Self::C, // G -> C
+            3 => Self::A, // T -> A
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl std::fmt::Display for Nucleotide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => write!(f, "A"),
+            1 => write!(f, "C"),
+            2 => write!(f, "G"),
+            3 => write!(f, "T"),
+            _ => write!(f, "N"),
+        }
+    }
+}
+
 /// Allele representation
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Allele {
-    /// Single nucleotide (A=0, C=1, G=2, T=3)
-    Base(u8),
+    /// Single nucleotide
+    Base(Nucleotide),
     /// Insertion/deletion or complex variant
     Seq(Arc<str>),
     /// Missing data marker
@@ -71,13 +126,13 @@ pub enum Allele {
 impl Allele {
     /// Create allele from a single character
     pub fn from_char(c: char) -> Self {
-        match c {
-            'A' | 'a' => Self::Base(0),
-            'C' | 'c' => Self::Base(1),
-            'G' | 'g' => Self::Base(2),
-            'T' | 't' => Self::Base(3),
-            'N' | 'n' | '.' | '*' => Self::Missing,
-            _ => Self::Seq(c.to_string().into()),
+        if let Some(nuc) = Nucleotide::from_ascii(c as u8) {
+            Self::Base(nuc)
+        } else {
+            match c {
+                'N' | 'n' | '.' | '*' => Self::Missing,
+                _ => Self::Seq(c.to_string().into()),
+            }
         }
     }
 
@@ -100,10 +155,7 @@ impl Allele {
     /// Get complement (for strand flipping)
     pub fn complement(&self) -> Self {
         match self {
-            Self::Base(0) => Self::Base(3), // A -> T
-            Self::Base(1) => Self::Base(2), // C -> G
-            Self::Base(2) => Self::Base(1), // G -> C
-            Self::Base(3) => Self::Base(0), // T -> A
+            Self::Base(nuc) => Self::Base(nuc.complement()),
             other => other.clone(),
         }
     }
@@ -112,11 +164,7 @@ impl Allele {
 impl std::fmt::Display for Allele {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Base(0) => write!(f, "A"),
-            Self::Base(1) => write!(f, "C"),
-            Self::Base(2) => write!(f, "G"),
-            Self::Base(3) => write!(f, "T"),
-            Self::Base(_) => write!(f, "N"),
+            Self::Base(nuc) => write!(f, "{}", nuc),
             Self::Seq(s) => write!(f, "{}", s),
             Self::Missing => write!(f, "."),
         }
@@ -390,10 +438,10 @@ pub fn is_strand_ambiguous(marker: &Marker) -> bool {
     let alt_allele = marker.alt_alleles.first();
 
     match (ref_allele, alt_allele) {
-        (Allele::Base(0), Some(Allele::Base(3))) => true, // A/T
-        (Allele::Base(3), Some(Allele::Base(0))) => true, // T/A
-        (Allele::Base(1), Some(Allele::Base(2))) => true, // C/G
-        (Allele::Base(2), Some(Allele::Base(1))) => true, // G/C
+        (Allele::Base(Nucleotide::A), Some(Allele::Base(Nucleotide::T))) => true, // A/T
+        (Allele::Base(Nucleotide::T), Some(Allele::Base(Nucleotide::A))) => true, // T/A
+        (Allele::Base(Nucleotide::C), Some(Allele::Base(Nucleotide::G))) => true, // C/G
+        (Allele::Base(Nucleotide::G), Some(Allele::Base(Nucleotide::C))) => true, // G/C
         _ => false,
     }
 }
@@ -495,10 +543,10 @@ mod tests {
 
     #[test]
     fn test_allele_from_char() {
-        assert_eq!(Allele::from_char('A'), Allele::Base(0));
-        assert_eq!(Allele::from_char('C'), Allele::Base(1));
-        assert_eq!(Allele::from_char('G'), Allele::Base(2));
-        assert_eq!(Allele::from_char('T'), Allele::Base(3));
+        assert_eq!(Allele::from_char('A'), Allele::Base(Nucleotide::A));
+        assert_eq!(Allele::from_char('C'), Allele::Base(Nucleotide::C));
+        assert_eq!(Allele::from_char('G'), Allele::Base(Nucleotide::G));
+        assert_eq!(Allele::from_char('T'), Allele::Base(Nucleotide::T));
     }
 
     #[test]
@@ -507,8 +555,8 @@ mod tests {
             ChromIdx(0),
             100,
             None,
-            Allele::Base(0),
-            vec![Allele::Base(1)],
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
         );
         assert!(marker.is_snv());
         assert!(marker.is_biallelic());

@@ -44,6 +44,10 @@ pub struct CompressedBlock {
     /// Offsets into reservoir_freqs for each marker [marker_in_window]
     pub reservoir_freq_offsets: Vec<usize>,
 
+    /// Reservoir LD coherence factors for adjacent markers (biallelic only).
+    /// Layout per interval: [00, 01, 10, 11] for allele pairs (t, t+1).
+    pub reservoir_ld: Vec<[f32; 4]>,
+
     /// Fraction of reservoir haplotypes that are NOT missing at each marker [marker_in_window]
     /// Needed for proper missingness handling in emission probabilities.
     pub reservoir_obs_fractions: Vec<f32>,
@@ -119,7 +123,10 @@ impl CompressedBlock {
     /// Panics if called on a reservoir pattern ID.
     #[inline]
     pub fn get_pattern_allele(&self, pattern_id: PatternId, marker_in_window: usize) -> u8 {
-        assert!(!pattern_id.is_reservoir(), "get_pattern_allele called on reservoir");
+        assert!(
+            !pattern_id.is_reservoir(),
+            "get_pattern_allele called on reservoir"
+        );
         // Fast lookup from unpacked buffer
         let idx = pattern_id.as_usize() * self.window_size() + marker_in_window;
         self.unpacked_alleles[idx]
@@ -129,9 +136,9 @@ impl CompressedBlock {
     #[inline]
     pub fn get_reservoir_obs_fraction(&self, marker_in_window: usize) -> f32 {
         if marker_in_window < self.reservoir_obs_fractions.len() {
-             self.reservoir_obs_fractions[marker_in_window]
+            self.reservoir_obs_fractions[marker_in_window]
         } else {
-             0.0
+            0.0
         }
     }
 }

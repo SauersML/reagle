@@ -4,6 +4,7 @@
 //! Replaces `bref/SeqCoder3.java` logic.
 
 use bitvec::prelude::*;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::data::HapIdx;
@@ -34,36 +35,44 @@ impl DictionaryColumn {
         bits_per_allele: u8,
     ) -> Self
     where
-        F: Fn(usize, HapIdx) -> u8,
+        F: Fn(usize, HapIdx) -> u8 + Sync,
     {
         // Build pattern for each haplotype
         // We use (bits_per_allele + 1) bits per marker. The last bit is the missing flag.
         let bits_per_marker = bits_per_allele as usize + 1;
         let pattern_bits = n_markers * bits_per_marker;
 
+        // Phase 1: Build all patterns in parallel
+        let all_patterns: Vec<BitVec<u64, Lsb0>> = (0..n_haplotypes)
+            .into_par_iter()
+            .map(|h| {
+                let hap = HapIdx::new(h as u32);
+                let mut pattern = bitvec![u64, Lsb0; 0; pattern_bits];
+
+                for m in 0..n_markers {
+                    let allele = get_allele(m, hap);
+                    let start = m * bits_per_marker;
+                    if allele == 255 {
+                        // Set the missing bit (the last bit of this marker's segment)
+                        pattern.set(start + bits_per_marker - 1, true);
+                    } else {
+                        for b in 0..bits_per_allele as usize {
+                            if (allele >> b) & 1 == 1 {
+                                pattern.set(start + b, true);
+                            }
+                        }
+                    }
+                }
+                pattern
+            })
+            .collect();
+
+        // Phase 2: Deduplicate sequentially (HashMap not thread-safe, but this is fast)
         let mut pattern_map: HashMap<BitVec<u64, Lsb0>, u32> = HashMap::new();
         let mut patterns: Vec<BitVec<u64, Lsb0>> = Vec::new();
         let mut hap_to_pattern: Vec<u32> = Vec::with_capacity(n_haplotypes);
 
-        for h in 0..n_haplotypes {
-            let hap = HapIdx::new(h as u32);
-            let mut pattern = bitvec![u64, Lsb0; 0; pattern_bits];
-
-            for m in 0..n_markers {
-                let allele = get_allele(m, hap);
-                let start = m * bits_per_marker;
-                if allele == 255 {
-                    // Set the missing bit (the last bit of this marker's segment)
-                    pattern.set(start + bits_per_marker - 1, true);
-                } else {
-                    for b in 0..bits_per_allele as usize {
-                        if (allele >> b) & 1 == 1 {
-                            pattern.set(start + b, true);
-                        }
-                    }
-                }
-            }
-
+        for pattern in all_patterns {
             let pattern_idx = if let Some(&idx) = pattern_map.get(&pattern) {
                 idx
             } else {
@@ -72,7 +81,6 @@ impl DictionaryColumn {
                 patterns.push(pattern);
                 idx
             };
-
             hap_to_pattern.push(pattern_idx);
         }
 
@@ -111,7 +119,6 @@ impl DictionaryColumn {
     pub fn hap_to_pattern(&self) -> &[u32] {
         &self.hap_to_pattern
     }
-
 
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
@@ -176,12 +183,7 @@ mod tests {
             vec![0u8, 0, 1, 1], // Marker 2
         ];
 
-        let dict = DictionaryColumn::compress(
-            |m, h| data[m][h.as_usize()],
-            3,
-            4,
-            1,
-        );
+        let dict = DictionaryColumn::compress(|m, h| data[m][h.as_usize()], 3, 4, 1);
 
         assert_eq!(dict.n_haplotypes(), 4);
         assert_eq!(dict.n_markers(), 3);

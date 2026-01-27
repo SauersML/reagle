@@ -58,8 +58,6 @@ impl BlockHmmWorkspace {
         }
     }
 
-
-
     /// Reset workspace for a new sample using the first block's pattern counts
     ///
     /// This initializes the forward probabilities to the "Uniform Haplotype Prior".
@@ -67,7 +65,7 @@ impl BlockHmmWorkspace {
     pub fn reset_from_block(&mut self, block: &super::compressed_block::CompressedBlock) {
         let n_patterns = block.n_patterns();
         let n_ref_haps = block.n_ref_haps() as f32;
-        
+
         // Safety check to avoid division by zero (should not happen in valid blocks)
         if n_ref_haps <= 0.0 {
             self.fwd[..n_patterns].fill(0.0);
@@ -79,7 +77,7 @@ impl BlockHmmWorkspace {
             }
             // Clear remaining slots
             if n_patterns < self.fwd.len() {
-               self.fwd[n_patterns..].fill(0.0);
+                self.fwd[n_patterns..].fill(0.0);
             }
 
             if block.reservoir_count > 0 {
@@ -89,7 +87,7 @@ impl BlockHmmWorkspace {
             }
         }
 
-        // Initialize Backward to 0.0 (clearing garbage). 
+        // Initialize Backward to 0.0 (clearing garbage).
         // Backward pass usually starts from end of chromosome or bridge from next block.
         self.bwd.fill(0.0);
         self.reservoir_prob_bwd = 0.0;

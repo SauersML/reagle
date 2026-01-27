@@ -7,9 +7,11 @@
 //! Built ONCE for the entire reference panel, then shared across all samples.
 
 use super::compressed_block::CompressedBlock;
+use super::hmm::{TargetAlleleProbs, TargetAlleleProbsView};
 use super::transition::TransitionBridge;
 use super::workspace::BlockHmmWorkspace;
 use crate::pipelines::imputation::AllelePosteriors;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 /// Pre-computed reference map for block-hash HMM
@@ -30,6 +32,9 @@ pub struct ReferenceMap {
 
     /// Actual maximum states observed in any block
     pub max_observed_states: usize,
+
+    /// Recombination rates between consecutive blocks (len = blocks.len()-1)
+    pub boundary_rates: Vec<f32>,
 }
 
 impl ReferenceMap {
@@ -50,23 +55,23 @@ impl ReferenceMap {
             "boundary_rates must have len = blocks.len() - 1"
         );
 
-        let mut bridges = Vec::with_capacity(blocks.len().saturating_sub(1));
-        for i in 0..blocks.len().saturating_sub(1) {
-            let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], boundary_rates[i]);
-            bridges.push(Arc::new(bridge));
-        }
+        // Build bridges in parallel - each bridge only depends on consecutive blocks
+        let bridges: Vec<Arc<TransitionBridge>> = (0..blocks.len().saturating_sub(1))
+            .into_par_iter()
+            .map(|i| {
+                let bridge = TransitionBridge::build(&blocks[i], &blocks[i + 1], boundary_rates[i]);
+                Arc::new(bridge)
+            })
+            .collect();
 
-        let max_observed_states = blocks
-            .iter()
-            .map(|b| b.n_patterns())
-            .max()
-            .unwrap_or(0);
+        let max_observed_states = blocks.iter().map(|b| b.n_patterns()).max().unwrap_or(0);
 
         Arc::new(Self {
             blocks,
             bridges,
             window_size,
             max_observed_states,
+            boundary_rates: boundary_rates.to_vec(),
         })
     }
 
@@ -75,7 +80,11 @@ impl ReferenceMap {
     /// Uses the ACTUAL observed max patterns, not the theoretical config limit.
     /// This prevents over-allocation and ensures safety even if max_states=0 (no limit).
     pub fn create_workspace(&self) -> BlockHmmWorkspace {
-        BlockHmmWorkspace::new(self.max_observed_patterns(), self.blocks.len(), self.window_size)
+        BlockHmmWorkspace::new(
+            self.max_observed_patterns(),
+            self.blocks.len(),
+            self.window_size,
+        )
     }
 
     /// Calculate the actual maximum number of states required by any block
@@ -83,135 +92,116 @@ impl ReferenceMap {
         self.max_observed_states
     }
 
-    /// Run forward pass up to a specific marker index
-    ///
-    /// Restores the checkpoint of the containing block and advances to the target marker.
-    /// Used for extracting HMM state for priors handoff.
-    pub fn forward_to_marker(
+    /// Run forward pass up to a specific marker using soft allele probabilities
+    pub fn forward_to_marker_probs(
         &self,
-        target_genotypes: &[u8],
+        target_probs: &TargetAlleleProbs,
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
         marker_idx: usize,
+        initial_recomb_rate: f32,
     ) {
-        // Find block containing marker_idx
         let block_idx = self.blocks.partition_point(|b| b.end_marker <= marker_idx);
-        
+
         if block_idx < self.blocks.len() {
             let block = &self.blocks[block_idx];
-            
-            // Restore checkpoint
             ws.restore_checkpoint(block_idx, block.n_patterns());
-            
-            // Extract genotypes for this block
-            let block_genotypes =
-                &target_genotypes[block.start_marker..block.end_marker.min(target_genotypes.len())];
-            
+
             let local_marker = marker_idx - block.start_marker;
-            
-            // Run forward partial
-            super::hmm::forward_to_marker_in_block(
+            let view = TargetAlleleProbsView::new(target_probs, block.start_marker);
+            super::hmm::forward_to_marker_in_block_probs(
                 block,
-                block_genotypes,
+                &view,
                 error_rate,
                 ws,
-                local_marker
+                local_marker,
+                if block_idx == 0 {
+                    initial_recomb_rate
+                } else {
+                    0.0
+                },
             );
         }
     }
 
-    /// Run forward pass with checkpointing
-    ///
-    /// Saves forward state at the start of each block for later combination.
-    pub fn forward_pass(
+    /// Run forward pass with checkpointing using soft allele probabilities
+    pub fn forward_pass_probs(
         &self,
-        target_genotypes: &[u8],
+        target_probs: &TargetAlleleProbs,
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
+        initial_recomb_rate: f32,
     ) {
         for (block_idx, block) in self.blocks.iter().enumerate() {
-            // Save checkpoint at start of this block
             ws.save_checkpoint(block_idx, block.n_patterns());
 
-            // Extract target genotypes for this block
-            let block_genotypes =
-                &target_genotypes[block.start_marker..block.end_marker.min(target_genotypes.len())];
+            let view = TargetAlleleProbsView::new(target_probs, block.start_marker);
+            super::hmm::forward_within_block_probs(
+                block,
+                &view,
+                error_rate,
+                ws,
+                if block_idx == 0 {
+                    initial_recomb_rate
+                } else {
+                    0.0
+                },
+            );
 
-            // Run forward within block
-            super::hmm::forward_within_block(block, block_genotypes, error_rate, ws);
-
-            // Apply transition to next block
             if block_idx < self.bridges.len() {
                 self.bridges[block_idx].apply_forward(block, &self.blocks[block_idx + 1], ws);
             }
         }
     }
 
-
-    ///
-    /// Combines saved forward state with backward probabilities to compute posteriors.
-    pub fn backward_and_emit_posteriors(
+    /// Combine forward state and backward probabilities to compute posteriors (soft inputs).
+    pub fn backward_and_emit_posteriors_probs(
         &self,
-        target_genotypes: &[u8],
+        target_probs: &TargetAlleleProbs,
         error_rate: f32,
         ws: &mut BlockHmmWorkspace,
+        initial_recomb_rate: f32,
     ) -> Vec<AllelePosteriors> {
-        // Pre-allocate posteriors with default values to enable direct slicing
-        let mut posteriors = vec![AllelePosteriors::Biallelic(0.0); target_genotypes.len()];
+        let mut posteriors = vec![AllelePosteriors::Biallelic(0.0); target_probs.n_markers()];
 
-        // Initialize backward to neutral likelihood (1.0)
-        // Standard HMM backward pass: beta_T(i) = 1.0 for all states
         if let Some(last_block) = self.blocks.last() {
-             let n_patterns = last_block.n_patterns();
-             ws.bwd[..n_patterns].fill(1.0);
-
-             // Initialize reservoir to 1.0 (neutral likelihood)
-             // Do NOT weight by reservoir_count - backward variables are likelihoods, not mass
-             if last_block.reservoir_count > 0 {
-                 ws.reservoir_prob_bwd = 1.0;
-             } else {
-                 ws.reservoir_prob_bwd = 0.0;
-             }
+            let n_patterns = last_block.n_patterns();
+            ws.bwd[..n_patterns].fill(1.0);
+            if last_block.reservoir_count > 0 {
+                ws.reservoir_prob_bwd = 1.0;
+            } else {
+                ws.reservoir_prob_bwd = 0.0;
+            }
         }
 
-        // Backward pass in reverse order
         for block_idx in (0..self.blocks.len()).rev() {
             let block = &self.blocks[block_idx];
 
             let start = block.start_marker;
-            let end = block.end_marker.min(target_genotypes.len());
-            
-            // Extract target genotypes for this block
-            let block_genotypes = &target_genotypes[start..end];
+            let end = block.end_marker.min(target_probs.n_markers());
 
-            // Restore forward checkpoint for this block
             ws.restore_checkpoint(block_idx, block.n_patterns());
 
-            // Run backward and emit posteriors directly into the pre-allocated slice
-            // Slice range in `posteriors` is `start..end`
+            let view = TargetAlleleProbsView::new(target_probs, block.start_marker);
             let output_slice = &mut posteriors[start..end];
-            
-            super::hmm::backward_and_emit_block(
+            super::hmm::backward_and_emit_block_probs(
                 block,
-                block_genotypes,
+                &view,
                 error_rate,
                 ws,
                 output_slice,
+                if block_idx == 0 {
+                    initial_recomb_rate
+                } else {
+                    0.0
+                },
             );
 
-            // Apply inverse transition to previous block
             if block_idx > 0 {
-                self.bridges[block_idx - 1].apply_backward(
-                    &self.blocks[block_idx - 1],
-                    block,
-                    ws,
-                );
+                self.bridges[block_idx - 1].apply_backward(&self.blocks[block_idx - 1], block, ws);
             }
         }
 
         posteriors
     }
-
-
-
 }
