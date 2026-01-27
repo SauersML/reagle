@@ -1214,8 +1214,13 @@ target_samples={} target_bytes={}",
         phased_overlap: Option<&PhasedOverlap>,
         pbwt_state: Option<&PbwtState>,
     ) -> Result<GenotypeMatrix<Phased>> {
+        // Clamp Ne for phasing step to ensure stability (avoid excessive recombination in MCMC)
+        // while allowing higher Ne for the final imputation step (for rare variants)
+        let mut phasing_config = self.config.clone();
+        phasing_config.ne = phasing_config.ne.min(100_000.0);
+
         let mut phasing =
-            crate::pipelines::PhasingPipeline::new(self.config.clone(), self.telemetry.clone());
+            crate::pipelines::PhasingPipeline::new(phasing_config, self.telemetry.clone());
         if let Some(ref_gt) = ref_gt {
             let ref_gt_arc = Arc::new(ref_gt.clone());
             phasing.set_reference(ref_gt_arc, alignment.clone());
