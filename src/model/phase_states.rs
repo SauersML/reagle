@@ -71,16 +71,11 @@ pub struct PhaseStates {
     hap_to_last_ibs: HashMap<GlobalId, i32>,
     /// Priority queue for managing composite haplotypes
     queue: BinaryHeap<CompHapEntry>,
-    /// Track new candidate haplotypes seen but not yet admitted
-    pending_last_seen: HashMap<GlobalId, i32>,
     /// Number of markers
     n_markers: usize,
 }
 
 const NIL: i32 = -103;
-const MIN_EVICT_GAP_DIV: usize = 20;
-const MIN_EVICT_GAP_MIN: i32 = 20;
-const MIN_SEGMENT_LEN_MIN: i32 = 20;
 
 impl PhaseStates {
     /// Create a new phase state selector
@@ -94,7 +89,6 @@ impl PhaseStates {
             threaded_haps: ThreadedHaps::new(max_states, max_states * 4, n_markers),
             hap_to_last_ibs: HashMap::with_capacity(max_states),
             queue: BinaryHeap::with_capacity(max_states),
-            pending_last_seen: HashMap::with_capacity(max_states),
             n_markers,
         }
     }
@@ -104,7 +98,6 @@ impl PhaseStates {
         self.threaded_haps.clear();
         self.hap_to_last_ibs.clear();
         self.queue.clear();
-        self.pending_last_seen.clear();
     }
 
     /// Add an IBS haplotype at a marker
@@ -141,35 +134,10 @@ impl PhaseStates {
                 last_ibs_marker: marker,
             });
             self.hap_to_last_ibs.insert(ibs_hap, marker);
-            self.pending_last_seen.remove(&ibs_hap);
-        } else if !self.queue.is_empty() {
-            let min_gap = (self.n_markers / MIN_EVICT_GAP_DIV).max(1) as i32;
-            let min_gap = min_gap.max(MIN_EVICT_GAP_MIN);
-
-            let admit = match self.pending_last_seen.get(&ibs_hap).copied() {
-                Some(prev) => marker - prev >= min_gap,
-                None => {
-                    self.pending_last_seen.insert(ibs_hap, marker);
-                    false
-                }
-            };
-            if !admit {
-                return;
-            }
-            self.pending_last_seen.remove(&ibs_hap);
-
-            // Queue is full - evict oldest (LRU) to make room for new match
-            let head = self.queue.pop().unwrap();
-            let min_seg_len = (self.n_markers / MIN_EVICT_GAP_DIV).max(1) as i32;
-            let min_seg_len = min_seg_len.max(MIN_SEGMENT_LEN_MIN);
-
-            let head_start = head.start_marker as i32;
-            if marker - head.last_ibs_marker < min_gap || marker - head_start < min_seg_len
-            {
-                // Preserve active states to avoid churn; defer adding this hap.
-                self.queue.push(head);
-                return;
-            }
+        } else {
+            // Queue is full - do not evict (fixed state set for HMM validity).
+            return;
+        }
             let index = head.comp_hap_idx;
             let prev_hap = head.hap;
             let prev_start = head.start_marker;
