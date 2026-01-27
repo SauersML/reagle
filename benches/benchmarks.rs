@@ -1,5 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use reagle::data::alignment::MarkerAlignment;
+use reagle::data::marker::{AnyMarkerSpace, Nucleotide};
+use reagle::model::block_hash::types::GlobalId;
 use reagle::model::hmm::HmmUpdater;
 use std::hint::black_box;
 
@@ -145,25 +147,25 @@ fn bench_threaded_haps_traversal(c: &mut Criterion) {
     // Build threaded haps with realistic segment structure
     let mut th = ThreadedHaps::new(n_states, n_states * (segments_per_state + 1), n_markers);
     for state in 0..n_states {
-        th.push_new(state as u32);
+        th.push_new(GlobalId::new(state as u32));
         // Add segment transitions at regular intervals
         for seg in 1..segments_per_state {
             let boundary = (n_markers / segments_per_state) * seg;
-            th.add_segment(state, (state + seg) as u32, boundary);
+            th.add_segment(state, GlobalId::new((state + seg) as u32), boundary);
         }
     }
 
     group.throughput(Throughput::Elements((n_markers * n_states) as u64));
 
     // Direct materialize_at (baseline, per-marker scan)
-    let mut hap_buffer = vec![0u32; n_states];
+    let mut hap_buffer = vec![GlobalId::new(0); n_states];
     group.bench_function("materialize_at", |b| {
         b.iter(|| {
             let mut sum = 0u32;
             for m in 0..n_markers {
                 th.materialize_at(m, &mut hap_buffer);
                 for &hap in &hap_buffer {
-                    sum = sum.wrapping_add(hap);
+                    sum = sum.wrapping_add(hap.as_u32());
                 }
             }
             black_box(sum)
@@ -179,7 +181,7 @@ fn bench_threaded_haps_traversal(c: &mut Criterion) {
             for m in 0..n_markers {
                 cursor.advance_with_history(m, &th, &mut history);
                 for &hap in cursor.active_haps() {
-                    sum = sum.wrapping_add(hap);
+                    sum = sum.wrapping_add(hap.as_u32());
                 }
             }
             black_box(sum)
@@ -361,7 +363,7 @@ fn bench_imputation_e2e(c: &mut Criterion) {
         let ref_samples = Arc::new(Samples::from_ids(
             (0..n_ref_samples).map(|i| format!("REF{}", i)).collect(),
         ));
-        let mut ref_markers = Markers::new();
+        let mut ref_markers = Markers::<AnyMarkerSpace>::new();
         ref_markers.add_chrom("chr1");
 
         let mut ref_columns = Vec::with_capacity(n_markers);
@@ -389,7 +391,7 @@ fn bench_imputation_e2e(c: &mut Criterion) {
         let genotyped_fraction = 0.1; // 10% genotyped
         let n_genotyped = (n_markers as f64 * genotyped_fraction) as usize;
 
-        let mut target_markers = Markers::new();
+        let mut target_markers = Markers::<AnyMarkerSpace>::new();
         target_markers.add_chrom("chr1");
         let mut target_columns = Vec::with_capacity(n_genotyped);
 
