@@ -123,8 +123,7 @@ impl MarkerImputationStats {
         let n = self.n_haps as f32;
         // Monomorphic sites (sum ≈ 0 or sum ≈ n) have no variance to measure.
         // Return 1.0 because they trivially impute correctly.
-        // Relaxed threshold to 1e-3 to handle effectively monomorphic sites
-        if sum <= 1e-3 || (sum - n).abs() <= 1e-3 {
+        if sum == 0.0 || (sum - n).abs() <= 1e-8 {
             return 1.0;
         }
 
