@@ -96,7 +96,7 @@ pub struct Config {
     pub imp_nsteps: usize,
 
     /// Maximum cM in a marker cluster
-    #[arg(long, default_value = "0.005")]
+    #[arg(long, default_value = "0.0")]
     pub cluster: f32,
 
     /// PBWT batch memory budget (MB) for imputation state selection
@@ -171,7 +171,7 @@ impl Default for Config {
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
-            cluster: 0.005,
+            cluster: 0.0,
             pbwt_batch_mb: 256,
             ap: false,
             gp: false,
