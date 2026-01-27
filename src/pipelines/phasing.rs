@@ -770,9 +770,51 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
 
         // Compute MAF for each marker (used by IBS2 and two-stage phasing)
-        let maf: Vec<f32> = (0..n_markers)
-            .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
-            .collect();
+        // Includes reference panel allele counts if available, ensuring homozygous
+        // markers in small target panels are correctly classified as high-frequency.
+        let maf: Vec<f32> =
+            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                (0..n_markers)
+                    .map(|m| {
+                        let m_idx = MarkerIdx::new(m as u32);
+                        let mut target_alt =
+                            target_gt.column(m_idx).alt_count() as usize;
+                        let target_total = target_gt.n_haplotypes();
+
+                        // Accumulate from reference if mapped
+                        if let Some(ref_m) = alignment.target_to_ref(m_idx) {
+                            let ref_col = ref_gt.column(ref_m);
+                            let ref_total = ref_gt.n_haplotypes();
+                            let ref_alt = ref_col.alt_count() as usize;
+
+                            if let Some(Some(mapping)) = alignment.allele_mappings.get(m) {
+                                let ref_equiv_of_alt =
+                                    mapping.targ_to_ref.get(1).copied().unwrap_or(-1);
+                                if ref_equiv_of_alt == 1 {
+                                    target_alt += ref_alt;
+                                } else if ref_equiv_of_alt == 0 {
+                                    target_alt += ref_total - ref_alt;
+                                }
+                            }
+
+                            let total = target_total + ref_total;
+                            if total == 0 {
+                                0.0
+                            } else {
+                                let freq = target_alt as f32 / total as f32;
+                                freq.min(1.0 - freq)
+                            }
+                        } else {
+                            let freq = target_alt as f32 / target_total as f32;
+                            freq.min(1.0 - freq)
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..n_markers)
+                    .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+                    .collect()
+            };
 
         // TWO-STAGE PHASING: Classify markers by frequency
         // Stage 1 (high-frequency): Run full HMM - these markers provide phasing signal
@@ -1312,9 +1354,52 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             })
             .collect();
 
-        let maf: Vec<f32> = (0..n_markers)
-            .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
-            .collect();
+        // Compute MAF for each marker (used by IBS2 and two-stage phasing)
+        // Includes reference panel allele counts if available, ensuring homozygous
+        // markers in small target panels are correctly classified as high-frequency.
+        let maf: Vec<f32> =
+            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                (0..n_markers)
+                    .map(|m| {
+                        let m_idx = MarkerIdx::new(m as u32);
+                        let mut target_alt =
+                            target_gt.column(m_idx).alt_count() as usize;
+                        let target_total = target_gt.n_haplotypes();
+
+                        // Accumulate from reference if mapped
+                        if let Some(ref_m) = alignment.target_to_ref(m_idx) {
+                            let ref_col = ref_gt.column(ref_m);
+                            let ref_total = ref_gt.n_haplotypes();
+                            let ref_alt = ref_col.alt_count() as usize;
+
+                            if let Some(Some(mapping)) = alignment.allele_mappings.get(m) {
+                                let ref_equiv_of_alt =
+                                    mapping.targ_to_ref.get(1).copied().unwrap_or(-1);
+                                if ref_equiv_of_alt == 1 {
+                                    target_alt += ref_alt;
+                                } else if ref_equiv_of_alt == 0 {
+                                    target_alt += ref_total - ref_alt;
+                                }
+                            }
+
+                            let total = target_total + ref_total;
+                            if total == 0 {
+                                0.0
+                            } else {
+                                let freq = target_alt as f32 / total as f32;
+                                freq.min(1.0 - freq)
+                            }
+                        } else {
+                            let freq = target_alt as f32 / target_total as f32;
+                            freq.min(1.0 - freq)
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..n_markers)
+                    .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+                    .collect()
+            };
 
         let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
 
