@@ -84,6 +84,10 @@ pub struct TelemetryBlackboard {
 
     // --- Context ---
     current_op: RwLock<String>,
+    producer_op: RwLock<String>,
+    consumer_op: RwLock<String>,
+    producer_stage: AtomicU64,
+    consumer_stage: AtomicU64,
 
     // --- Channel Telemetry ---
     channel_depth: AtomicU64,
@@ -107,6 +111,10 @@ impl TelemetryBlackboard {
             last_progress_nanos: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             current_op: RwLock::new(String::new()),
+            producer_op: RwLock::new(String::new()),
+            consumer_op: RwLock::new(String::new()),
+            producer_stage: AtomicU64::new(Stage::Initializing as u64),
+            consumer_stage: AtomicU64::new(Stage::Initializing as u64),
             channel_depth: AtomicU64::new(0),
             channel_capacity: AtomicU64::new(0),
         })
@@ -117,6 +125,16 @@ impl TelemetryBlackboard {
     #[inline]
     pub fn set_stage(&self, stage: Stage) {
         self.stage.store(stage as u64, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_producer_stage(&self, stage: Stage) {
+        self.producer_stage.store(stage as u64, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_consumer_stage(&self, stage: Stage) {
+        self.consumer_stage.store(stage as u64, Ordering::Relaxed);
         self.touch_progress();
     }
 
@@ -178,6 +196,22 @@ impl TelemetryBlackboard {
         self.touch_progress();
     }
 
+    pub fn set_producer_op(&self, op: &str) {
+        if let Ok(mut guard) = self.producer_op.write() {
+            guard.clear();
+            guard.push_str(op);
+        }
+        self.touch_progress();
+    }
+
+    pub fn set_consumer_op(&self, op: &str) {
+        if let Ok(mut guard) = self.consumer_op.write() {
+            guard.clear();
+            guard.push_str(op);
+        }
+        self.touch_progress();
+    }
+
     pub fn set_channel_capacity(&self, capacity: u64) {
         self.channel_capacity.store(capacity, Ordering::Relaxed);
     }
@@ -218,6 +252,8 @@ impl TelemetryBlackboard {
     fn snapshot(&self) -> TelemetrySnapshot {
         TelemetrySnapshot {
             stage: self.stage(),
+            producer_stage: Stage::from_u64(self.producer_stage.load(Ordering::Relaxed)),
+            consumer_stage: Stage::from_u64(self.consumer_stage.load(Ordering::Relaxed)),
             current_window: self.current_window.load(Ordering::Relaxed),
             total_windows: self.total_windows.load(Ordering::Relaxed),
             current_iteration: self.current_iteration.load(Ordering::Relaxed),
@@ -231,6 +267,16 @@ impl TelemetryBlackboard {
             current_nanos: self.start_time.elapsed().as_nanos() as u64,
             current_op: self
                 .current_op
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or_default(),
+            producer_op: self
+                .producer_op
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or_default(),
+            consumer_op: self
+                .consumer_op
                 .read()
                 .map(|s| s.clone())
                 .unwrap_or_default(),
@@ -265,6 +311,10 @@ impl Default for TelemetryBlackboard {
             last_progress_nanos: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             current_op: RwLock::new(String::new()),
+            producer_op: RwLock::new(String::new()),
+            consumer_op: RwLock::new(String::new()),
+            producer_stage: AtomicU64::new(Stage::Initializing as u64),
+            consumer_stage: AtomicU64::new(Stage::Initializing as u64),
             channel_depth: AtomicU64::new(0),
             channel_capacity: AtomicU64::new(0),
         }
@@ -274,6 +324,8 @@ impl Default for TelemetryBlackboard {
 /// Snapshot of telemetry state at a point in time
 struct TelemetrySnapshot {
     stage: Stage,
+    producer_stage: Stage,
+    consumer_stage: Stage,
     current_window: u64,
     total_windows: u64,
     current_iteration: u64,
@@ -286,6 +338,8 @@ struct TelemetrySnapshot {
     last_progress_nanos: u64,
     current_nanos: u64,
     current_op: String,
+    producer_op: String,
+    consumer_op: String,
     channel_depth: u64,
     channel_capacity: u64,
 }
@@ -739,10 +793,23 @@ fn print_log_progress(
         String::new()
     };
     if show_extra {
+        let producer_stage = snap.producer_stage.as_str();
+        let consumer_stage = snap.consumer_stage.as_str();
+        let producer_op = if snap.producer_op.is_empty() {
+            "?"
+        } else {
+            snap.producer_op.as_str()
+        };
+        let consumer_op = if snap.consumer_op.is_empty() {
+            "?"
+        } else {
+            snap.consumer_op.as_str()
+        };
         eprintln!(
             "[HEARTBEAT] stage=\"{}\" window={}/{}{} samples={}/{} markers={}/{} \
              velocity={:.0}/s velocity_unit={} elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} \
-             cpu_pct={} op=\"{}\" channel={}/{} stalled={}",
+             cpu_pct={} op=\"{}\" producer_stage=\"{}\" consumer_stage=\"{}\" producer_op=\"{}\" \
+             consumer_op=\"{}\" channel={}/{} stalled={}",
             snap.stage.as_str(),
             snap.current_window,
             snap.total_windows,
@@ -768,14 +835,32 @@ fn print_log_progress(
                 .map(|c| format!("{:.0}", c))
                 .unwrap_or_else(|| "?".to_string()),
             snap.current_op,
+            producer_stage,
+            consumer_stage,
+            producer_op,
+            consumer_op,
             snap.channel_depth,
             snap.channel_capacity,
             is_stalled
         );
     } else {
+        let producer_stage = snap.producer_stage.as_str();
+        let consumer_stage = snap.consumer_stage.as_str();
+        let producer_op = if snap.producer_op.is_empty() {
+            "?"
+        } else {
+            snap.producer_op.as_str()
+        };
+        let consumer_op = if snap.consumer_op.is_empty() {
+            "?"
+        } else {
+            snap.consumer_op.as_str()
+        };
         eprintln!(
             "[HEARTBEAT] stage=\"{}\" window={}/{}{} samples={}/{} markers={}/{} \
-             velocity={:.0}/s velocity_unit={} elapsed={:.0}s eta={} rss_mb={} stalled={}",
+             velocity={:.0}/s velocity_unit={} elapsed={:.0}s eta={} rss_mb={} \
+             producer_stage=\"{}\" consumer_stage=\"{}\" producer_op=\"{}\" consumer_op=\"{}\" \
+             stalled={}",
             snap.stage.as_str(),
             snap.current_window,
             snap.total_windows,
@@ -791,6 +876,10 @@ fn print_log_progress(
             rss_mb
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| "?".to_string()),
+            producer_stage,
+            consumer_stage,
+            producer_op,
+            consumer_op,
             is_stalled
         );
     }

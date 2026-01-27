@@ -872,6 +872,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     Stage::PhasingMain
                 };
                 bb.set_stage(stage);
+                bb.set_producer_stage(stage);
                 bb.set_current_iteration((it + 1) as u64);
                 bb.set_samples_processed(0);
                 bb.set_markers_processed(0);
@@ -947,6 +948,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             );
             if let Some(bb) = &self.telemetry {
                 bb.set_stage(Stage::PhasingStage2);
+                bb.set_producer_stage(Stage::PhasingStage2);
                 bb.set_total_iterations(0);
                 bb.set_current_iteration(0);
                 bb.set_total_markers(rare_markers.len() as u64);
@@ -1358,6 +1360,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     Stage::PhasingMain
                 };
                 bb.set_stage(stage);
+                bb.set_producer_stage(stage);
                 bb.set_current_iteration((it + 1) as u64);
                 bb.set_samples_processed(0);
                 bb.set_markers_processed(0);

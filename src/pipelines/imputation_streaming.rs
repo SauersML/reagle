@@ -864,10 +864,25 @@ impl crate::pipelines::ImputationPipeline {
                     eprintln!("  Partial/Mismatching:  {}", counts[4]);
                 }
 
-                if let Some(bb) = &pipeline.telemetry {
-                    bb.set_op(&format!("Phasing window {}", window_count));
-                }
                 let n_target_markers = target_window.genotypes.n_markers();
+                let should_phase = n_target_markers > 0 && !target_reader.was_all_phased();
+                if let Some(bb) = &pipeline.telemetry {
+                    if should_phase {
+                        bb.set_producer_stage(crate::utils::telemetry::Stage::PhasingMain);
+                        bb.set_op(&format!("Phasing window {}", window_count));
+                        bb.set_producer_op(&format!("Phasing window {}", window_count));
+                    } else {
+                        bb.set_producer_stage(crate::utils::telemetry::Stage::LoadingData);
+                        bb.set_op(&format!(
+                            "Passing through window {} (already phased)",
+                            window_count
+                        ));
+                        bb.set_producer_op(&format!(
+                            "Passing through window {} (already phased)",
+                            window_count
+                        ));
+                    }
+                }
                 let phased = if n_target_markers == 0 {
                     target_window.genotypes.clone().into_phased()
                 } else if target_reader.was_all_phased() {
@@ -968,6 +983,7 @@ impl crate::pipelines::ImputationPipeline {
                 // Send to consumer
                 if let Some(bb) = &pipeline.telemetry {
                     bb.set_op("Producer waiting on channel");
+                    bb.set_producer_op("Producer waiting on channel");
                 }
                 let send_result = if pipeline.config.profile {
                     let span_guard = info_span!("channel_send_wait").entered();
@@ -1004,6 +1020,7 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(bb) = &pipeline.telemetry {
                         bb.inc_channel_depth();
                         bb.set_op("Producer processing");
+                        bb.set_producer_op("Producer processing");
                     }
                 } else {
                     break; // Consumer hung up
@@ -1035,6 +1052,7 @@ target_samples={} target_bytes={}",
             if let Some(bb) = &self.telemetry {
                 bb.dec_channel_depth();
                 bb.set_stage(crate::utils::telemetry::Stage::Imputation);
+                bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
                 bb.set_current_window(payload.window_idx as u64);
                 bb.set_total_samples(payload.phased_target.n_samples() as u64);
                 bb.set_samples_processed(0);
@@ -1043,6 +1061,7 @@ target_samples={} target_bytes={}",
                 bb.set_total_iterations(0);
                 bb.set_current_iteration(0);
                 bb.set_op(&format!("Imputing window {}", payload.window_idx));
+                bb.set_consumer_op(&format!("Imputing window {}", payload.window_idx));
             }
             let StreamingPayload {
                 phased_target,
@@ -2272,11 +2291,16 @@ target_samples={} target_bytes={}",
         if let Some(bb) = &self.telemetry {
             let output_markers = output_end.saturating_sub(output_start);
             bb.set_stage(crate::utils::telemetry::Stage::WritingOutput);
+            bb.set_consumer_stage(crate::utils::telemetry::Stage::WritingOutput);
             bb.set_total_markers(output_markers as u64);
             bb.set_markers_processed(0);
             bb.set_total_samples(target_win.n_samples() as u64);
             bb.set_samples_processed(0);
             bb.set_op(&format!(
+                "Writing window {} ({} markers)",
+                window_idx, output_markers
+            ));
+            bb.set_consumer_op(&format!(
                 "Writing window {} ({} markers)",
                 window_idx, output_markers
             ));
@@ -2302,6 +2326,7 @@ target_samples={} target_bytes={}",
             bb.set_markers_processed(output_markers as u64);
             bb.set_samples_processed(target_win.n_samples() as u64);
             bb.set_stage(crate::utils::telemetry::Stage::Imputation);
+            bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
         }
 
         Ok(Some(next_priors_vec))
