@@ -107,14 +107,14 @@ impl ModelParams {
         err: Option<f32>,
     ) -> Self {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        // Scale down significantly to compensate for lack of EM (simulates converged low error rate)
+        // Scale down by 100x to compensate for lack of EM (simulates converged low error rate)
         // This forces the HMM to switch to matching haplotypes even if recombination is low.
         let p_mismatch =
-            err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps) * 0.00001);
+            err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps) * 0.01);
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        // Scale down constant to 0.0001 (400x reduction) to preserve linkage signal over longer distances
+        // Scale down constant to 0.001 (40x reduction) to preserve linkage signal over longer distances
         // This counteracts the default high Ne=1,000,000 which causes "wash out" of rare variants.
-        let recomb_intensity = 0.0001 * ne / n_ref_haps as f32;
+        let recomb_intensity = 0.001 * ne / n_ref_haps as f32;
 
         Self {
             p_mismatch,
