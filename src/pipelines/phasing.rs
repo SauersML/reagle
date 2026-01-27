@@ -2264,7 +2264,9 @@ impl PhasingPipeline {
         // We use a scoped immutable borrow that ends before the swap phase.
         // Build composite haplotypes for all samples using streaming PBWT
         // This uses O(N) memory instead of O(M*N) for the PBWT index
-        let n_candidates = self.params.n_states.min(n_total_haps).max(1);
+        let final_states = self.params.n_states.min(n_total_haps).max(1);
+        let n_candidates = final_states;
+        let state_pool = n_total_haps.max(1);
         let (threaded_haps_vec, pbwt_state_next) =
             tracing::info_span!("streaming_pbwt").in_scope(|| {
                 if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
@@ -2277,7 +2279,7 @@ impl PhasingPipeline {
                         n_samples,
                         ibs2,
                         n_candidates,
-                        self.params.n_states,
+                        state_pool,
                         None,
                         &gen_positions,
                         self.config.imp_step,
@@ -2291,7 +2293,7 @@ impl PhasingPipeline {
                         n_samples,
                         ibs2,
                         n_candidates,
-                        self.params.n_states,
+                        n_haps.max(1),
                         pbwt_state,
                         pbwt_handoff_at,
                         &gen_positions,
@@ -2336,8 +2338,11 @@ impl PhasingPipeline {
                                 .wrapping_add(0xA5A5_5A5A_D00Du64);
 
                             // Use pre-built composite haplotypes from streaming PBWT
-                            let threaded_haps = threaded_haps_vec[s].clone();
-                            let n_states = threaded_haps.n_states();
+                            let threaded_haps_full = threaded_haps_vec[s].clone();
+                            let n_states_full = threaded_haps_full.n_states();
+                            let mut threaded_haps = threaded_haps_full.clone();
+                            let mut n_states = n_states_full;
+                            let mut selection_applied = false;
 
                             // 2. Extract current alleles for H1 and H2
                             let seq1 = ref_geno.haplotype(hap1);
@@ -2357,6 +2362,72 @@ impl PhasingPipeline {
                             //
                             // Collect EM statistics if requested (using original sequences)
                             // Only create HMM when needed to avoid unnecessary p_recomb.clone()
+                            if n_states_full > final_states {
+                                let hmm_full = BeagleHmm::new(
+                                    ref_view,
+                                    &self.params,
+                                    n_states_full,
+                                    p_recomb.to_vec(),
+                                );
+                                let mut fwd1 = Vec::new();
+                                let mut bwd1 = Vec::new();
+                                let mut fwd2 = Vec::new();
+                                let mut bwd2 = Vec::new();
+
+                                let lookup_full = RefAlleleLookup::new_from_threaded_with_buffer(
+                                    &threaded_haps_full,
+                                    n_markers,
+                                    n_states_full,
+                                    n_haps,
+                                    ref_geno,
+                                    self.reference_gt.as_deref(),
+                                    self.alignment.as_ref(),
+                                    None,
+                                    aligned_vec::AVec::new(32),
+                                );
+
+                                hmm_full.conditioned_forward_backward_with_lookup(
+                                    &seq1,
+                                    &seq2,
+                                    &seq2,
+                                    Some(sample_conf),
+                                    Some(PlProvider {
+                                        gt: target_gt,
+                                        sample: s,
+                                        subset_to_orig: None,
+                                    }),
+                                    None,
+                                    None,
+                                    &lookup_full,
+                                    &mut fwd1,
+                                    &mut bwd1,
+                                );
+                                hmm_full.conditioned_forward_backward_with_lookup(
+                                    &seq2,
+                                    &seq1,
+                                    &seq1,
+                                    Some(sample_conf),
+                                    Some(PlProvider {
+                                        gt: target_gt,
+                                        sample: s,
+                                        subset_to_orig: None,
+                                    }),
+                                    None,
+                                    None,
+                                    &lookup_full,
+                                    &mut fwd2,
+                                    &mut bwd2,
+                                );
+
+                                let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_markers, n_states_full);
+                                let probs2 = compute_state_posteriors(&fwd2, &bwd2, n_markers, n_states_full);
+                                let selected = select_top_k_by_mass_two(&probs1, &probs2, n_states_full, final_states);
+
+                                threaded_haps = threaded_haps_full.subset_states(&selected);
+                                n_states = threaded_haps.n_states();
+                                selection_applied = true;
+                            }
+
                             if let Some(atomic) = atomic_estimates {
                                 let hmm = BeagleHmm::new(
                                     ref_view,
@@ -2437,7 +2508,11 @@ impl PhasingPipeline {
                                         }),
                                         block_starts,
                                         &het_positions,
-                                        prior_paths.get(s).and_then(|p| p.as_ref()),
+                                        if selection_applied {
+                                            None
+                                        } else {
+                                            prior_paths.get(s).and_then(|p| p.as_ref())
+                                        },
                                         sample_seed,
                                         self.config.mcmc_burnin,
                                         p_no_err,
@@ -3927,6 +4002,29 @@ fn compute_state_posteriors(
     }
 
     probs
+}
+
+fn select_top_k_by_mass_two(
+    probs1: &[Vec<f32>],
+    probs2: &[Vec<f32>],
+    n_states: usize,
+    k: usize,
+) -> Vec<usize> {
+    let mut mass = vec![0.0f32; n_states];
+    for row in probs1.iter() {
+        for (i, &p) in row.iter().enumerate().take(n_states) {
+            mass[i] += p;
+        }
+    }
+    for row in probs2.iter() {
+        for (i, &p) in row.iter().enumerate().take(n_states) {
+            mass[i] += p;
+        }
+    }
+    let mut idx: Vec<usize> = (0..n_states).collect();
+    idx.sort_by(|&a, &b| mass[b].partial_cmp(&mass[a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.truncate(k.min(n_states));
+    idx
 }
 
 fn build_sample_confidence(target_gt: &GenotypeMatrix) -> Vec<Vec<f32>> {

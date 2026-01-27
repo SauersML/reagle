@@ -100,6 +100,29 @@ impl ThreadedHaps {
         self.state_tails[state_idx] = new_seg_idx;
     }
 
+    /// Build a new ThreadedHaps containing only the selected states.
+    pub fn subset_states(&self, indices: &[usize]) -> ThreadedHaps {
+        let mut out = ThreadedHaps::new(indices.len(), self.segments_hap.len(), self.n_markers);
+        for &state_idx in indices {
+            let mut cur = self.state_heads[state_idx] as usize;
+            let mut start = 0usize;
+            let hap = self.segments_hap[cur];
+            let end = self.segments_end[cur] as usize;
+            let new_idx = out.push_new(hap);
+            let mut last_end = end;
+
+            while self.segments_next[cur] != Self::NIL {
+                cur = self.segments_next[cur] as usize;
+                start = last_end;
+                let seg_hap = self.segments_hap[cur];
+                let seg_end = self.segments_end[cur] as usize;
+                out.add_segment(new_idx, seg_hap, start);
+                last_end = seg_end;
+            }
+        }
+        out
+    }
+
     /// Materialize haplotypes for a single marker without mutating cursors.
     ///
     /// This method takes `&self` (immutable) since it walks the segment linked lists
