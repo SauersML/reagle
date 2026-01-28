@@ -549,7 +549,9 @@ impl crate::pipelines::ImputationPipeline {
         let window_markers = self.config.window_markers.max(1);
         let block_size = 64usize;
         let max_states_budget = if available_bytes > 0 {
+            // Respect config.imp_states as the algorithmic target, but cap at available memory.
             estimate_max_states(available_bytes, n_threads, window_markers, block_size)
+                .min(self.config.imp_states)
         } else {
             self.config.imp_states.max(1)
         };
@@ -944,6 +946,7 @@ impl crate::pipelines::ImputationPipeline {
                         let phase_alignment = phasing_alignment
                             .as_ref()
                             .expect("phasing alignment missing for reference genotypes");
+
                         if let Some(keep_mask) = pbwt_select_keep_mask(
                             &phased,
                             ref_gt,
@@ -1499,7 +1502,7 @@ target_samples={} target_bytes={}",
                     let mut pl_probs: Vec<f32> = Vec::new();
                     let pl = target_win.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
                     if let Some(pl) = pl {
-                        if !pl.is_empty() && !pl_is_uniform(pl) {
+                        if !pl.is_empty() {
                             let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len()).unwrap_or(0);
                             if n_pl_alleles > 0 {
                                 let mapping = alignment
@@ -2609,11 +2612,11 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                (a1 + a2) as f32
+            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
@@ -2668,15 +2671,7 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
-                                let n_alleles = ref_markers
-                                    .marker(MarkerIdx::new(marker_idx as u32))
-                                    .n_alleles();
-                                let dosage = dosage_from_gp(n_alleles, &gp);
-                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
-                            } else if let Some(target_m) =
+                            if let Some(target_m) =
                                 alignment.target_marker(MarkerIdx::new(marker_idx as u32))
                             {
                                 let h1 = HapIdx::new((s * 2) as u32);

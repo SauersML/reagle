@@ -1009,6 +1009,21 @@ impl StreamingVcfReader {
                 } else {
                     Vec::new()
                 };
+
+                // Check for uniform PL (uninformative)
+                // If found, treat genotype as missing (255) regardless of GT field
+                if !pl_vec.is_empty() {
+                    let first = pl_vec[0];
+                    if pl_vec.iter().all(|&v| v == first) {
+                        // Overwrite last two alleles with missing
+                        let len = alleles.len();
+                        if len >= 2 {
+                            alleles[len - 1] = 255;
+                            alleles[len - 2] = 255;
+                        }
+                    }
+                }
+
                 pl_out.push(pl_vec);
             }
 

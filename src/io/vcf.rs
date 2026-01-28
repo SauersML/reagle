@@ -767,6 +767,7 @@ impl VcfReader {
                 } else {
                     Vec::new()
                 };
+
                 pl_out.push(pl_vec);
             }
 
