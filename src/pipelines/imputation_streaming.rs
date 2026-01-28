@@ -1007,24 +1007,26 @@ fn build_imputation_plan(
 
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let mut abyss = vec![false; n_ref_haps];
-            for h in 0..n_ref_haps {
-                let score = best_window_scores[i][h];
-                if window_rank_hits[i][h] == 0 || !score.is_finite() || score <= 0.0 {
-                    abyss[h] = true;
-                }
-            }
-            if abyss.iter().all(|v| *v) {
-                let keep = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
-                    .min(n_ref_haps)
-                    .max(1);
-                let top = select_top_k_allow_zero(&global_scores[i], keep);
-                if top.is_empty() {
-                    for h in 0..keep {
-                        abyss[h] = false;
+            if !full_fit {
+                for h in 0..n_ref_haps {
+                    let score = best_window_scores[i][h];
+                    if window_rank_hits[i][h] == 0 || !score.is_finite() || score <= 0.0 {
+                        abyss[h] = true;
                     }
-                } else {
-                    for (h, _) in top {
-                        abyss[h] = false;
+                }
+                if abyss.iter().all(|v| *v) {
+                    let keep = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
+                        .min(n_ref_haps)
+                        .max(1);
+                    let top = select_top_k_allow_zero(&global_scores[i], keep);
+                    if top.is_empty() {
+                        for h in 0..keep {
+                            abyss[h] = false;
+                        }
+                    } else {
+                        for (h, _) in top {
+                            abyss[h] = false;
+                        }
                     }
                 }
             }
@@ -1215,6 +1217,7 @@ impl crate::pipelines::ImputationPipeline {
             n_threads = (n_threads / 2).max(1);
         }
         let total_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers)
+            .min(self.config.imp_states)
             .max(1);
         let mut core_budget = if total_budget <= 1 {
             total_budget
@@ -1246,6 +1249,16 @@ impl crate::pipelines::ImputationPipeline {
             dynamic_budget,
             self.config.imp_step as f64,
         )?;
+
+        if plan.n_ref_haps > 0 {
+            let intensity = (0.04 * self.config.ne / plan.n_ref_haps as f32).min(5.0);
+            self.params.recomb_intensity = intensity;
+            eprintln!(
+                "Updated recomb_intensity to {:.4} (Ne={}, N={})",
+                intensity, self.config.ne, plan.n_ref_haps
+            );
+        }
+
         if plan.total_budget >= plan.n_ref_haps {
             plan.dynamic_budget = 0;
         }
