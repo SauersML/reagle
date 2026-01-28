@@ -48,8 +48,11 @@ impl StateMapper {
     }
 
     /// Map previous state probabilities into next-state space.
-    /// If `redistribute` is true, any dropped mass is spread uniformly across next states.
-    pub fn map(&self, prev_probs: &[f32], redistribute: bool) -> Vec<f32> {
+    ///
+    /// If `fallback` is provided, any dropped mass is redistributed proportionally to
+    /// that vector (after normalization). Otherwise, dropped mass is spread uniformly
+    /// across next states.
+    pub fn map(&self, prev_probs: &[f32], fallback: Option<&[f32]>) -> Vec<f32> {
         let mut next = vec![0.0f32; self.n_next];
         let mut kept_mass = 0.0f32;
         let mut total_mass = 0.0f32;
@@ -72,9 +75,29 @@ impl StateMapper {
             }
         }
 
-        if redistribute {
-            let dropped = (total_mass - kept_mass).max(0.0);
-            if dropped > 0.0 && self.n_next > 0 {
+        let dropped = (total_mass - kept_mass).max(0.0);
+        if dropped > 0.0 && self.n_next > 0 {
+            if let Some(fallback) = fallback.filter(|f| f.len() == self.n_next) {
+                let mut fallback_sum = 0.0f32;
+                for v in fallback.iter() {
+                    if v.is_finite() && *v > 0.0 {
+                        fallback_sum += *v;
+                    }
+                }
+                if fallback_sum > 0.0 {
+                    let scale = dropped / fallback_sum;
+                    for (v, f) in next.iter_mut().zip(fallback.iter()) {
+                        if f.is_finite() && *f > 0.0 {
+                            *v += *f * scale;
+                        }
+                    }
+                } else {
+                    let add = dropped / self.n_next as f32;
+                    for v in next.iter_mut() {
+                        *v += add;
+                    }
+                }
+            } else {
                 let add = dropped / self.n_next as f32;
                 for v in next.iter_mut() {
                     *v += add;
@@ -97,4 +120,3 @@ impl StateMapper {
         next
     }
 }
-

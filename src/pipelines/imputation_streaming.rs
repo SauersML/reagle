@@ -108,9 +108,12 @@ fn estimate_state_budget(
 #[derive(Clone, Debug)]
 struct ImputationPlan {
     n_ref_haps: usize,
-    core_states: Vec<Vec<GlobalId>>, // per target hap
-    abyss_mask: Vec<Vec<bool>>,      // per target hap
-    dynamic_states: Vec<Vec<Vec<GlobalId>>>, // [window][target_hap]
+    /// Tier-1: chromosome-stable core haplotypes per target haplotype.
+    core_states: Vec<Vec<GlobalId>>,
+    /// Tier-4: abyss exclusion mask per target haplotype.
+    abyss_mask: Vec<Vec<bool>>,
+    /// Tier-2: window-dynamic haplotypes per window/target haplotype.
+    dynamic_states: Vec<Vec<Vec<GlobalId>>>,
     window_meta: Vec<(usize, usize, usize, usize)>, // global_start, global_end, output_start, output_end
     total_budget: usize,
 }
@@ -649,7 +652,8 @@ fn build_imputation_plan(
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let mut abyss = vec![false; n_ref_haps];
             for h in 0..n_ref_haps {
-                if window_hits[i][h] == 0 && global_scores[i][h] <= 0.0 {
+                let score = global_scores[i][h];
+                if !score.is_finite() || score <= 0.0 {
                     abyss[h] = true;
                 }
             }
@@ -670,8 +674,24 @@ fn build_imputation_plan(
                 core = ranked.iter().map(|(h, _, _)| GlobalId::new(*h as u32)).collect();
             } else {
                 let keep = core_budget.min(ranked.len());
-                for j in 0..keep {
-                    core.push(GlobalId::new(ranked[j].0 as u32));
+                let mut remaining = keep;
+
+                for (h, hits, _) in ranked.iter().filter(|(_, hits, _)| *hits >= 2) {
+                    if remaining == 0 {
+                        break;
+                    }
+                    core.push(GlobalId::new(*h as u32));
+                    remaining -= 1;
+                }
+
+                if remaining > 0 {
+                    for (h, hits, _) in ranked.iter().filter(|(_, hits, _)| *hits < 2) {
+                        if remaining == 0 {
+                            break;
+                        }
+                        core.push(GlobalId::new(*h as u32));
+                        remaining -= 1;
+                    }
                 }
             }
             plan.core_states[hap_idx] = core.clone();
@@ -1330,7 +1350,7 @@ impl crate::pipelines::ImputationPipeline {
                         let prev_states: Vec<GlobalId> =
                             p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
                         let mapper = StateMapper::build(&prev_states, &state_haps);
-                        Some(mapper.map(p.probs(), true))
+                        Some(mapper.map(p.probs(), None))
                     });
 
                     let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
