@@ -73,6 +73,7 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_MAX_PER_HAP: usize = 256;
+const ABYSS_RANK_CUTOFF: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 
@@ -517,12 +518,14 @@ fn build_imputation_plan(
         let mut global_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
+        let mut window_rank_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
 
         let mut n_ref_haps: usize = 0;
         for _ in 0..batch_len {
             global_scores.push(Vec::new());
             window_scores.push(Vec::new());
             window_hits.push(Vec::new());
+            window_rank_hits.push(Vec::new());
         }
 
         loop {
@@ -582,6 +585,7 @@ fn build_imputation_plan(
                     global_scores[i] = vec![0.0f32; n_ref_haps];
                     window_scores[i] = vec![0.0f32; n_ref_haps];
                     window_hits[i] = vec![0u32; n_ref_haps];
+                    window_rank_hits[i] = vec![0u32; n_ref_haps];
                 }
             }
 
@@ -597,6 +601,9 @@ fn build_imputation_plan(
             for w in window_scores.iter_mut() {
                 w.fill(0.0);
             }
+
+            let full_fit = total_budget >= n_ref_haps;
+            let effective_dynamic_budget = if full_fit { 0 } else { dynamic_budget };
 
             let k_per_hap = (total_budget / n_target_haps.max(1))
                 .clamp(1, PBWT_MAX_PER_HAP)
@@ -616,25 +623,42 @@ fn build_imputation_plan(
                 &mut window_scores,
             );
 
-            let window_candidate_k = total_budget.min(n_ref_haps);
+            let window_candidate_k = if full_fit {
+                0
+            } else {
+                total_budget.min(n_ref_haps)
+            };
+            let abyss_rank_cutoff = ABYSS_RANK_CUTOFF.min(n_ref_haps).max(1);
             if plan.dynamic_states.len() <= window_idx {
                 plan.dynamic_states
                     .push(vec![Vec::new(); n_target_haps]);
             }
 
             for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                let top = select_top_k(&window_scores[i], window_candidate_k);
-                let mut candidates: Vec<(GlobalId, f32)> = Vec::with_capacity(top.len());
-                for (ref_idx, score) in top {
-                    let gid = GlobalId::new(ref_idx as u32);
-                    candidates.push((gid, score));
-                    if ref_idx < window_hits[i].len() {
-                        window_hits[i][ref_idx] = window_hits[i][ref_idx].saturating_add(1);
+                if window_candidate_k > 0 {
+                    let top = select_top_k(&window_scores[i], window_candidate_k);
+                    let mut candidates: Vec<(GlobalId, f32)> = Vec::with_capacity(top.len());
+                    for (ref_idx, score) in top {
+                        let gid = GlobalId::new(ref_idx as u32);
+                        candidates.push((gid, score));
+                        if ref_idx < window_hits[i].len() {
+                            window_hits[i][ref_idx] = window_hits[i][ref_idx].saturating_add(1);
+                        }
+                    }
+                    if effective_dynamic_budget > 0 {
+                        // Temporarily store scored candidates in dynamic_states; we'll filter after core selection.
+                        plan.dynamic_states[window_idx][hap_idx] =
+                            candidates.into_iter().map(|(g, _)| g).collect();
                     }
                 }
-                // Temporarily store scored candidates in dynamic_states; we'll filter after core selection.
-                plan.dynamic_states[window_idx][hap_idx] =
-                    candidates.into_iter().map(|(g, _)| g).collect();
+
+                let abyss_top = select_top_k(&window_scores[i], abyss_rank_cutoff);
+                for (ref_idx, _) in abyss_top {
+                    if ref_idx < window_rank_hits[i].len() {
+                        window_rank_hits[i][ref_idx] =
+                            window_rank_hits[i][ref_idx].saturating_add(1);
+                    }
+                }
             }
 
             window_idx += 1;
@@ -646,10 +670,14 @@ fn build_imputation_plan(
             ));
         }
 
+        let full_fit = total_budget >= n_ref_haps;
+        let effective_dynamic_budget = if full_fit { 0 } else { dynamic_budget };
+        let effective_core_budget = if full_fit { n_ref_haps } else { core_budget };
+
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let mut abyss = vec![false; n_ref_haps];
             for h in 0..n_ref_haps {
-                if window_hits[i][h] == 0 && global_scores[i][h] <= 0.0 {
+                if window_rank_hits[i][h] == 0 || global_scores[i][h] <= 0.0 {
                     abyss[h] = true;
                 }
             }
@@ -666,25 +694,25 @@ fn build_imputation_plan(
             });
 
             let mut core: Vec<GlobalId> = Vec::new();
-            if total_budget >= n_ref_haps {
+            if full_fit {
                 core = ranked.iter().map(|(h, _, _)| GlobalId::new(*h as u32)).collect();
             } else {
-                let keep = core_budget.min(ranked.len());
+                let keep = effective_core_budget.min(ranked.len());
                 for j in 0..keep {
                     core.push(GlobalId::new(ranked[j].0 as u32));
                 }
             }
             plan.core_states[hap_idx] = core.clone();
 
-            if dynamic_budget == 0 {
+            if effective_dynamic_budget == 0 {
                 continue;
             }
 
             for window_dyn in plan.dynamic_states.iter_mut() {
                 let dyn_vec = &mut window_dyn[hap_idx];
                 dyn_vec.retain(|g| !core.contains(g) && !abyss[g.as_usize()]);
-                if dyn_vec.len() > dynamic_budget {
-                    dyn_vec.truncate(dynamic_budget);
+                if dyn_vec.len() > effective_dynamic_budget {
+                    dyn_vec.truncate(effective_dynamic_budget);
                 }
             }
         }
