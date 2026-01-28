@@ -123,7 +123,9 @@ impl MarkerImputationStats {
         let n = self.n_haps as f32;
         // Monomorphic sites (sum ≈ 0 or sum ≈ n) have no variance to measure.
         // Return 1.0 because they trivially impute correctly.
-        if sum == 0.0 || (sum - n).abs() <= 1e-8 {
+        // Use relaxed tolerance (1e-3) to handle floating-point accumulation errors
+        // where sum might be slightly > 0 or < n despite being effectively monomorphic.
+        if sum <= 1e-3 || (sum - n).abs() <= 1e-3 {
             return 1.0;
         }
 
@@ -1744,5 +1746,25 @@ mod tests {
         // Conf = 0 (Random guess floor)
         let conf = compute_gl_confidence("0,0,-10", 0, 0).unwrap();
         assert_eq!(conf, 0);
+    }
+
+    #[test]
+    fn test_dr2_near_monomorphic_tolerance() {
+        let mut stats = MarkerImputationStats::new(2);
+        stats.is_imputed = true;
+        stats.n_haps = 100;
+
+        // Simulate near-monomorphic: sum is very small but not zero due to float noise
+        // e.g. 1e-4
+        stats.sum_p[1] = 0.0001;
+        stats.sum_p_sq[1] = 0.0001; // doesn't matter much if sum check catches it
+
+        // After fix: should return 1.0 because it's within 1e-3
+        assert_eq!(stats.dr2(1), 1.0);
+
+        // Also check near N
+        stats.sum_p[1] = 100.0 - 0.0001;
+        stats.sum_p_sq[1] = 100.0 - 0.0001;
+        assert_eq!(stats.dr2(1), 1.0);
     }
 }
