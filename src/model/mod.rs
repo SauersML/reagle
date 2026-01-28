@@ -52,7 +52,7 @@ pub mod phase_ibs;
 pub mod phase_states;
 pub mod pl_emission;
 pub mod reference_pbwt;
-pub mod state_mapper;
+pub mod transition_matrix;
 pub mod states;
 pub mod types;
 pub mod weighted_kernel;

@@ -2,11 +2,20 @@
 //!
 //! This maps posterior probabilities from window A to priors for window B when
 //! the active state set changes (core + dynamic). Uses a CSR-style structure to
-//! avoid dense O(N^2) remapping.
+//! avoid dense O(N^2) remapping while conserving probability mass.
 
 use crate::model::types::GlobalId;
 
-pub struct StateMapper {
+#[derive(Debug, Clone, Copy)]
+pub enum Redistribution {
+    /// Do not spread dropped mass; keep only the overlapping state mass.
+    None,
+    /// Spread dropped mass uniformly across all next states.
+    Uniform,
+}
+
+/// Sparse CSR transition matrix from previous to next window state sets.
+pub struct TransitionMatrix {
     /// Row offsets into col_indices/weights (len = n_prev + 1)
     row_offsets: Vec<usize>,
     /// Column indices in next-state space
@@ -17,7 +26,7 @@ pub struct StateMapper {
     n_next: usize,
 }
 
-impl StateMapper {
+impl TransitionMatrix {
     pub fn build(prev_states: &[GlobalId], next_states: &[GlobalId]) -> Self {
         let n_prev = prev_states.len();
         let n_next = next_states.len();
@@ -48,8 +57,7 @@ impl StateMapper {
     }
 
     /// Map previous state probabilities into next-state space.
-    /// If `redistribute` is true, any dropped mass is spread uniformly across next states.
-    pub fn map(&self, prev_probs: &[f32], redistribute: bool) -> Vec<f32> {
+    pub fn map(&self, prev_probs: &[f32], redistribution: Redistribution) -> Vec<f32> {
         let mut next = vec![0.0f32; self.n_next];
         let mut kept_mass = 0.0f32;
         let mut total_mass = 0.0f32;
@@ -72,7 +80,7 @@ impl StateMapper {
             }
         }
 
-        if redistribute {
+        if let Redistribution::Uniform = redistribution {
             let dropped = (total_mass - kept_mass).max(0.0);
             if dropped > 0.0 && self.n_next > 0 {
                 let add = dropped / self.n_next as f32;
@@ -97,4 +105,3 @@ impl StateMapper {
         next
     }
 }
-

@@ -33,7 +33,7 @@ use crate::model::types::GlobalId;
 use crate::model::impute_hmm::{
     ImputeWorkspace, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
 };
-use crate::model::state_mapper::StateMapper;
+use crate::model::transition_matrix::{Redistribution, TransitionMatrix};
 use crate::pipelines::imputation::AllelePosteriors;
 
 
@@ -517,12 +517,14 @@ fn build_imputation_plan(
         let mut global_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
+        let mut best_window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
 
         let mut n_ref_haps: usize = 0;
         for _ in 0..batch_len {
             global_scores.push(Vec::new());
             window_scores.push(Vec::new());
             window_hits.push(Vec::new());
+            best_window_scores.push(Vec::new());
         }
 
         loop {
@@ -582,6 +584,7 @@ fn build_imputation_plan(
                     global_scores[i] = vec![0.0f32; n_ref_haps];
                     window_scores[i] = vec![0.0f32; n_ref_haps];
                     window_hits[i] = vec![0u32; n_ref_haps];
+                    best_window_scores[i] = vec![0.0f32; n_ref_haps];
                 }
             }
 
@@ -623,6 +626,11 @@ fn build_imputation_plan(
             }
 
             for (i, &hap_idx) in batch_haps.iter().enumerate() {
+                for (h, score) in window_scores[i].iter().copied().enumerate() {
+                    if score > best_window_scores[i][h] {
+                        best_window_scores[i][h] = score;
+                    }
+                }
                 let top = select_top_k(&window_scores[i], window_candidate_k);
                 let mut candidates: Vec<(GlobalId, f32)> = Vec::with_capacity(top.len());
                 for (ref_idx, score) in top {
@@ -649,25 +657,36 @@ fn build_imputation_plan(
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let mut abyss = vec![false; n_ref_haps];
             for h in 0..n_ref_haps {
-                if window_hits[i][h] == 0 && global_scores[i][h] <= 0.0 {
+                if window_hits[i][h] == 0 && best_window_scores[i][h] <= 0.0 {
                     abyss[h] = true;
                 }
             }
             plan.abyss_mask[hap_idx] = abyss.clone();
 
-            let mut ranked: Vec<(usize, u32, f32)> = (0..n_ref_haps)
+            let mut ranked: Vec<(usize, u32, f32, f32)> = (0..n_ref_haps)
                 .filter(|&h| !abyss[h])
-                .map(|h| (h, window_hits[i][h], global_scores[i][h]))
+                .map(|h| {
+                    (
+                        h,
+                        window_hits[i][h],
+                        best_window_scores[i][h],
+                        global_scores[i][h],
+                    )
+                })
                 .collect();
             ranked.sort_by(|a, b| {
                 b.1.cmp(&a.1)
                     .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
                     .then_with(|| a.0.cmp(&b.0))
             });
 
             let mut core: Vec<GlobalId> = Vec::new();
             if total_budget >= n_ref_haps {
-                core = ranked.iter().map(|(h, _, _)| GlobalId::new(*h as u32)).collect();
+                core = ranked
+                    .iter()
+                    .map(|(h, _, _, _)| GlobalId::new(*h as u32))
+                    .collect();
             } else {
                 let keep = core_budget.min(ranked.len());
                 for j in 0..keep {
@@ -1329,8 +1348,8 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         let prev_states: Vec<GlobalId> =
                             p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
-                        let mapper = StateMapper::build(&prev_states, &state_haps);
-                        Some(mapper.map(p.probs(), true))
+                        let mapper = TransitionMatrix::build(&prev_states, &state_haps);
+                        Some(mapper.map(p.probs(), Redistribution::Uniform))
                     });
 
                     let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
