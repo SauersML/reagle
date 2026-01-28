@@ -268,22 +268,6 @@ pub fn run_impute_hmm(
             ws.emissions[i] = emission_prob_soft(ref_allele, probs, error_rate);
         }
 
-        let mut constant_term = 0.0f32;
-        for i in 0..active_states {
-            constant_term += ws.bwd[i] * ws.emissions[i];
-        }
-        let constant_full = constant_term;
-        let inv_c = 1.0 / constant_full.max(1e-30);
-        let scale = (1.0 - recomb_rate) * inv_c;
-        let shift = if active_states > 0 {
-            recomb_rate / active_states as f32
-        } else {
-            0.0
-        };
-        for i in 0..active_states {
-            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
-        }
-
         let start = m_rev * active_states;
         let fwd_slice = &ws.fwd_history[start..start + active_states];
 
@@ -357,6 +341,22 @@ pub fn run_impute_hmm(
                 }
             }
             prior_state_post = Some(state_post);
+        }
+
+        let mut constant_term = 0.0f32;
+        for i in 0..active_states {
+            constant_term += ws.bwd[i] * ws.emissions[i];
+        }
+        let constant_full = constant_term;
+        let inv_c = 1.0 / constant_full.max(1e-30);
+        let scale = (1.0 - recomb_rate) * inv_c;
+        let shift = if active_states > 0 {
+            recomb_rate / active_states as f32
+        } else {
+            0.0
+        };
+        for i in 0..active_states {
+            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
         }
     }
 

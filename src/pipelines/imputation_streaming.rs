@@ -24,6 +24,7 @@ use crate::io::streaming::{
     GlobalHapId, HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader,
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
+use crate::model::parameters::ModelParams;
 use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
@@ -1246,6 +1247,10 @@ impl crate::pipelines::ImputationPipeline {
             dynamic_budget,
             self.config.imp_step as f64,
         )?;
+
+        self.params.recomb_intensity = (0.04 * self.config.ne / plan.n_ref_haps as f32)
+            .min(ModelParams::MAX_RECOMB_INTENSITY);
+
         if plan.total_budget >= plan.n_ref_haps {
             plan.dynamic_budget = 0;
         }
