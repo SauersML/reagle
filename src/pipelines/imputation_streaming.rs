@@ -76,6 +76,7 @@ const PBWT_MAX_PER_HAP: usize = 256;
 const ABYSS_RANK_CUTOFF: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const SCAN_RAM_FRACTION: f64 = 0.10;
+const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 
 fn available_memory_bytes() -> Option<u64> {
     let mut sys = System::new();
@@ -215,7 +216,98 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     ranked
 }
 
-fn score_window_batch<TargetSpace, RefSpace>(
+fn should_use_exact_prescan(n_ref_haps: usize, batch_len: usize, n_markers: usize) -> bool {
+    let ops = n_ref_haps as u128 * batch_len as u128 * n_markers as u128;
+    ops <= EXACT_PRESCAN_MAX_OPS
+}
+
+fn score_window_batch_exact<TargetSpace, RefSpace>(
+    batch_haps: &[usize],
+    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+    ref_columns: &[GenotypeColumn],
+    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+    gen_maps: &GeneticMaps,
+    global_scores: &mut [Vec<f32>],
+    window_scores: &mut [Vec<f32>],
+) {
+    let n_markers = target_gt.n_markers();
+    let n_ref_haps = ref_columns
+        .first()
+        .map(|c| c.n_haplotypes())
+        .unwrap_or(0);
+    if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
+        return;
+    }
+
+    let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
+    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+
+    let mut query_alleles = vec![255u8; batch_haps.len()];
+    let mut ref_bins: Vec<Vec<u32>> = Vec::new();
+
+    for m in 0..n_markers {
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            query_alleles[i] =
+                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+        }
+
+        let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) else {
+            continue;
+        };
+
+        let n_alleles = target_gt
+            .markers()
+            .marker(MarkerIdx::new(m as u32))
+            .n_alleles()
+            .max(1);
+        if ref_bins.len() < n_alleles {
+            ref_bins.resize_with(n_alleles, Vec::new);
+        }
+        for bins in ref_bins.iter_mut().take(n_alleles) {
+            bins.clear();
+        }
+
+        for rh in 0..n_ref_haps {
+            let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+            if ref_a == 255 {
+                continue;
+            }
+            let mapped = alignment.reverse_map_allele(m, ref_a);
+            if mapped == 255 {
+                continue;
+            }
+            let idx = mapped as usize;
+            if idx < n_alleles {
+                ref_bins[idx].push(rh as u32);
+            }
+        }
+
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            let targ = query_alleles[i];
+            if targ == 255 {
+                continue;
+            }
+            let freq = freqs
+                .get(m)
+                .and_then(|f| f.get(targ as usize))
+                .copied()
+                .unwrap_or(0.0);
+            if freq <= 0.0 {
+                continue;
+            }
+            let weight = -(freq.max(min_freq)).ln();
+            let bins = ref_bins.get(targ as usize);
+            let Some(bins) = bins else { continue };
+            for &rh in bins {
+                let idx = rh as usize;
+                global_scores[i][idx] += weight;
+                window_scores[i][idx] += weight;
+            }
+        }
+    }
+}
+
+fn score_window_batch_pbwt<TargetSpace, RefSpace>(
     batch_haps: &[usize],
     target_gt: &GenotypeMatrix<Phased, TargetSpace>,
     ref_columns: &[GenotypeColumn],
@@ -615,17 +707,34 @@ fn build_imputation_plan(
 
             let phased_target = target_window.genotypes.clone().into_phased();
             let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
-            score_window_batch(
-                &batch_haps,
-                &phased_target,
-                &ref_window.ref_columns,
-                &alignment,
-                gen_maps,
-                k_per_hap,
-                step_cm,
-                &mut global_scores,
-                &mut window_scores,
+            let use_exact = should_use_exact_prescan(
+                n_ref_haps,
+                batch_haps.len(),
+                phased_target.n_markers(),
             );
+            if use_exact {
+                score_window_batch_exact(
+                    &batch_haps,
+                    &phased_target,
+                    &ref_window.ref_columns,
+                    &alignment,
+                    gen_maps,
+                    &mut global_scores,
+                    &mut window_scores,
+                );
+            } else {
+                score_window_batch_pbwt(
+                    &batch_haps,
+                    &phased_target,
+                    &ref_window.ref_columns,
+                    &alignment,
+                    gen_maps,
+                    k_per_hap,
+                    step_cm,
+                    &mut global_scores,
+                    &mut window_scores,
+                );
+            }
 
             let window_candidate_k = if full_fit {
                 0
