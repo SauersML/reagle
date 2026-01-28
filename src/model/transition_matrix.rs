@@ -8,10 +8,17 @@ use crate::model::types::GlobalId;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Redistribution {
-    /// Do not spread dropped mass; keep only overlapping state mass.
-    None,
     /// Spread dropped mass uniformly across all next states.
     Uniform,
+}
+
+#[derive(Clone, Debug)]
+pub struct NormalizedProbs(Vec<f32>);
+
+impl NormalizedProbs {
+    pub fn into_vec(self) -> Vec<f32> {
+        self.0
+    }
 }
 
 /// Sparse CSR transition matrix from previous to next window state sets.
@@ -63,16 +70,33 @@ impl TransitionMatrix {
         &self,
         prev_probs: &[f32],
         redistribution: Redistribution,
-    ) -> Vec<f32> {
+    ) -> NormalizedProbs {
         let mut next = vec![0.0f32; self.n_next];
-        let mut kept_mass = 0.0f32;
-        let mut total_mass = 0.0f32;
+        if self.n_next == 0 || prev_probs.is_empty() {
+            return NormalizedProbs(next);
+        }
 
+        let mut total_mass = 0.0f32;
+        for p in prev_probs.iter() {
+            if p.is_finite() && *p > 0.0 {
+                total_mass += *p;
+            }
+        }
+        if total_mass <= 0.0 {
+            let uniform = 1.0 / self.n_next as f32;
+            for v in next.iter_mut() {
+                *v = uniform;
+            }
+            return NormalizedProbs(next);
+        }
+        let inv_total = 1.0 / total_mass;
+
+        let mut kept_mass = 0.0f32;
         for (i, p) in prev_probs.iter().enumerate() {
             if !p.is_finite() || *p <= 0.0 {
                 continue;
             }
-            total_mass += *p;
+            let p_norm = *p * inv_total;
             let start = self.row_offsets[i];
             let end = self.row_offsets[i + 1];
             if start == end {
@@ -81,13 +105,14 @@ impl TransitionMatrix {
             for k in start..end {
                 let j = self.col_indices[k];
                 let w = self.weights[k];
-                next[j] += *p * w;
-                kept_mass += *p * w;
+                let add = p_norm * w;
+                next[j] += add;
+                kept_mass += add;
             }
         }
 
-        let dropped = (total_mass - kept_mass).max(0.0);
-        if dropped > 0.0 && self.n_next > 0 {
+        let dropped = (1.0 - kept_mass).max(0.0);
+        if dropped > 0.0 {
             match redistribution {
                 Redistribution::Uniform => {
                     let add = dropped / self.n_next as f32;
@@ -95,22 +120,9 @@ impl TransitionMatrix {
                         *v += add;
                     }
                 }
-                Redistribution::None => {}
             }
         }
 
-        let mut sum = 0.0f32;
-        for v in next.iter() {
-            if v.is_finite() && *v > 0.0 {
-                sum += *v;
-            }
-        }
-        if sum > 0.0 {
-            let inv = 1.0 / sum;
-            for v in next.iter_mut() {
-                *v *= inv;
-            }
-        }
-        next
+        NormalizedProbs(next)
     }
 }

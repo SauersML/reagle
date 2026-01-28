@@ -1,8 +1,8 @@
 //! # Weighted HMM Kernel
 //!
-//! SIMD-optimized HMM kernel for block-hash compressed states.
+//! SIMD-optimized HMM kernel for weighted transitions.
 //! Unlike the standard Li-Stephens kernel where transition probability is uniform,
-//! this kernel weights transitions by the cardinality (frequency) of each pattern.
+//! this kernel weights transitions by per-state weights.
 
 use wide::f32x8;
 

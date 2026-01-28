@@ -1645,7 +1645,7 @@ fn test_phasing_should_vary_under_ambiguous_signal_across_seeds() {
 }
 
 #[test]
-fn test_reservoir_should_preserve_rare_haplotype_linkage() {
+fn test_state_selection_preserves_rare_haplotype_linkage() {
     let work_dir = tempfile::tempdir().expect("Create temp dir");
     let ref_vcf = work_dir.path().join("ref.vcf");
     let target_vcf = work_dir.path().join("target.vcf");
@@ -1705,10 +1705,7 @@ chr1\t1100\t.\tA\tG\t.\tPASS\t.\tGT\t./.
     assert_eq!(records.len(), 2, "Expected two output records");
 
     let gp = records[1].genotypes[0].gp.expect("Expected GP in output");
-    println!(
-        "[reservoir linkage] GP at marker2 = {:?}",
-        gp
-    );
+    println!("[state selection linkage] GP at marker2 = {:?}", gp);
 
     assert!(
         gp[2] > 0.6,

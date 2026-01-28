@@ -4,7 +4,7 @@
 //! 1. Load target and reference VCFs
 //! 2. Align markers between target and reference
 //! 3. Process data in overlapping sliding windows (for memory efficiency)
-//! 4. Run Li-Stephens HMM for each target haplotype with dynamic PBWT state selection
+//! 4. Run Li-Stephens HMM for each target haplotype with core + dynamic state sets
 //! 5. Interpolate state probabilities for ungenotyped markers
 //! 6. Splice window results at overlap midpoints
 //! 7. Compute dosages and write output with quality metrics (DR2, AF)

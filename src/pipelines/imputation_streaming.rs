@@ -97,8 +97,8 @@ fn estimate_state_budget(
     if available_bytes == 0 || n_threads == 0 || window_markers == 0 {
         return 0;
     }
-    // Per-state memory: fwd + bwd + emissions + fwd_history per marker.
-    let per_state_bytes = 4usize.saturating_mul(3 + window_markers);
+    // Per-state memory: fwd + bwd + emissions + weights + fwd_history per marker.
+    let per_state_bytes = 4usize.saturating_mul(4 + window_markers);
     if per_state_bytes == 0 {
         return 0;
     }
@@ -124,7 +124,8 @@ fn estimate_scan_batch_size(
     if available_bytes == 0 || n_ref_haps == 0 || n_target_haps == 0 {
         return 1;
     }
-    let per_hap_bytes = (n_ref_haps as u64).saturating_mul(12); // global + window scores + hits
+    // global_scores + window_scores + best_window_scores + window_hits + window_rank_hits
+    let per_hap_bytes = (n_ref_haps as u64).saturating_mul(20);
     if per_hap_bytes == 0 {
         return 1;
     }
@@ -216,6 +217,23 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     ranked
 }
 
+fn select_top_k_allow_zero(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+    if k == 0 || scores.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(usize, f32)> = scores
+        .iter()
+        .enumerate()
+        .filter(|&(_, &s)| s.is_finite())
+        .map(|(i, &s)| (i, s))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if ranked.len() > k {
+        ranked.truncate(k);
+    }
+    ranked
+}
+
 fn should_use_exact_prescan(n_ref_haps: usize, batch_len: usize, n_markers: usize) -> bool {
     let ops = n_ref_haps as u128 * batch_len as u128 * n_markers as u128;
     ops <= EXACT_PRESCAN_MAX_OPS
@@ -226,7 +244,6 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
     target_gt: &GenotypeMatrix<Phased, TargetSpace>,
     ref_columns: &[GenotypeColumn],
     alignment: &MarkerAlignment<TargetSpace, RefSpace>,
-    gen_maps: &GeneticMaps,
     global_scores: &mut [Vec<f32>],
     window_scores: &mut [Vec<f32>],
 ) {
@@ -282,7 +299,7 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
             }
         }
 
-        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+        for (i, _) in batch_haps.iter().enumerate() {
             let targ = query_alleles[i];
             if targ == 255 {
                 continue;
@@ -718,7 +735,6 @@ fn build_imputation_plan(
                     &phased_target,
                     &ref_window.ref_columns,
                     &alignment,
-                    gen_maps,
                     &mut global_scores,
                     &mut window_scores,
                 );
@@ -794,6 +810,19 @@ fn build_imputation_plan(
                     abyss[h] = true;
                 }
             }
+            if abyss.iter().all(|v| *v) {
+                let keep = ABYSS_RANK_CUTOFF.min(n_ref_haps).max(1);
+                let top = select_top_k_allow_zero(&global_scores[i], keep);
+                if top.is_empty() {
+                    for h in 0..keep {
+                        abyss[h] = false;
+                    }
+                } else {
+                    for (h, _) in top {
+                        abyss[h] = false;
+                    }
+                }
+            }
             plan.abyss_mask[hap_idx] = abyss.clone();
 
             let mut ranked: Vec<(usize, u32, f32, f32)> = (0..n_ref_haps)
@@ -808,7 +837,19 @@ fn build_imputation_plan(
             });
 
             let mut core: Vec<GlobalId> = Vec::new();
-            if full_fit {
+            if ranked.is_empty() {
+                let keep = effective_core_budget.max(1).min(n_ref_haps);
+                let top = select_top_k_allow_zero(&global_scores[i], keep);
+                if top.is_empty() {
+                    for h in 0..keep {
+                        core.push(GlobalId::new(h as u32));
+                    }
+                } else {
+                    for (h, _) in top {
+                        core.push(GlobalId::new(h as u32));
+                    }
+                }
+            } else if full_fit {
                 core = ranked
                     .iter()
                     .map(|(h, _, _, _)| GlobalId::new(*h as u32))
@@ -817,7 +858,7 @@ fn build_imputation_plan(
                 let keep = effective_core_budget.min(ranked.len());
                 let mut remaining = keep;
 
-                for (h, hits, _, _) in ranked.iter().filter(|(_, hits, _, _)| *hits >= 2) {
+                for (h, _, _, _) in ranked.iter().filter(|(_, hits, _, _)| *hits >= 2) {
                     if remaining == 0 {
                         break;
                     }
@@ -826,7 +867,7 @@ fn build_imputation_plan(
                 }
 
                 if remaining > 0 {
-                    for (h, hits, _, _) in ranked.iter().filter(|(_, hits, _, _)| *hits < 2) {
+                    for (h, _, _, _) in ranked.iter().filter(|(_, hits, _, _)| *hits < 2) {
                         if remaining == 0 {
                             break;
                         }
@@ -951,12 +992,15 @@ impl crate::pipelines::ImputationPipeline {
         let avail_bytes = available_memory_bytes().unwrap_or(0);
         let total_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers)
             .max(1);
-        let mut core_budget = total_budget / 2;
-        let mut dynamic_budget = total_budget.saturating_sub(core_budget);
-        if total_budget == 0 {
-            core_budget = 0;
-            dynamic_budget = 0;
+        let mut core_budget = if total_budget <= 1 {
+            total_budget
+        } else {
+            total_budget / 2
+        };
+        if core_budget == 0 && total_budget > 0 {
+            core_budget = 1;
         }
+        let dynamic_budget = total_budget.saturating_sub(core_budget);
 
         eprintln!(
             "Imputation plan: total_states={}, core={}, dynamic={}, threads={}, available_mb={}",
@@ -967,7 +1011,7 @@ impl crate::pipelines::ImputationPipeline {
             avail_bytes / (1024 * 1024)
         );
 
-        let plan = build_imputation_plan(
+        let mut plan = build_imputation_plan(
             &phased_target_path,
             ref_path,
             &streaming_config,
@@ -978,6 +1022,9 @@ impl crate::pipelines::ImputationPipeline {
             dynamic_budget,
             self.config.imp_step as f64,
         )?;
+        if plan.total_budget >= plan.n_ref_haps {
+            plan.dynamic_states.clear();
+        }
 
         let mut ref_reader = open_ref_reader(ref_path)?;
         let mut target_reader =
@@ -1502,29 +1549,10 @@ impl crate::pipelines::ImputationPipeline {
                         let abyss = &plan.abyss_mask[plan_idx];
                         state_haps.retain(|g| !abyss[g.as_usize()]);
                     }
-                    if state_haps.is_empty() {
-                        let keep = plan.total_budget.max(1).min(plan.n_ref_haps);
-                        let abyss = plan.abyss_mask.get(plan_idx);
-                        let mut added = 0usize;
-                        for h in 0..plan.n_ref_haps {
-                            if added >= keep {
-                                break;
-                            }
-                            let gid = GlobalId::new(h as u32);
-                            if let Some(abyss) = abyss {
-                                if abyss[gid.as_usize()] {
-                                    continue;
-                                }
-                            }
-                            state_haps.push(gid);
-                            added += 1;
-                        }
-                        if added == 0 {
-                            for h in 0..keep {
-                                state_haps.push(GlobalId::new(h as u32));
-                            }
-                        }
-                    }
+                    assert!(
+                        !state_haps.is_empty(),
+                        "State selection produced empty haplotype set"
+                    );
 
                     let state_priors = priors.and_then(|p| {
                         if p.is_empty() {
@@ -1533,7 +1561,7 @@ impl crate::pipelines::ImputationPipeline {
                         let prev_states: Vec<GlobalId> =
                             p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
                         let mapper = TransitionMatrix::build(&prev_states, &state_haps);
-                        Some(mapper.map(p.probs(), Redistribution::Uniform))
+                        Some(mapper.map(p.probs(), Redistribution::Uniform).into_vec())
                     });
 
                     let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
