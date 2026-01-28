@@ -114,30 +114,80 @@ impl ReferencePbwt {
 
         let mut out = Vec::with_capacity(k);
 
-        for &(l, r) in beam.intervals() {
-            if out.len() >= k {
-                break;
-            }
-            let l = l.min(n_ref as u32) as usize;
-            let r = r.min(n_ref as u32) as usize;
-            if l >= r {
-                continue;
-            }
-            let center = (l + r) / 2;
+        // Round-robin selection from all intervals to avoid excluding rare matches
+        // when a large common interval comes first.
+        struct IntervalState {
+            l: usize,
+            r: usize,
+            left: usize,
+            right: usize,
+            exhausted: bool,
+            pick_left: bool,
+        }
 
-            let mut left = center;
-            let mut right = center;
-            while out.len() < k && (left > l || right < r) {
-                if left > l {
-                    left -= 1;
-                    out.push(self.ppa[left]);
-                    if out.len() >= k {
-                        break;
-                    }
+        let mut states: Vec<IntervalState> = beam
+            .intervals()
+            .iter()
+            .map(|&(l, r)| {
+                let l = l.min(n_ref as u32) as usize;
+                let r = r.min(n_ref as u32) as usize;
+                let center = (l + r) / 2;
+                IntervalState {
+                    l,
+                    r,
+                    left: center,
+                    right: center,
+                    exhausted: l >= r,
+                    pick_left: true,
                 }
-                if right < r {
-                    out.push(self.ppa[right]);
-                    right += 1;
+            })
+            .collect();
+
+        let mut active = true;
+        while out.len() < k && active {
+            active = false;
+            for state in &mut states {
+                if out.len() >= k {
+                    break;
+                }
+                if state.exhausted {
+                    continue;
+                }
+
+                let can_left = state.left > state.l;
+                let can_right = state.right < state.r;
+
+                if !can_left && !can_right {
+                    state.exhausted = true;
+                    continue;
+                }
+
+                if state.pick_left {
+                    if can_left {
+                        state.left -= 1;
+                        out.push(self.ppa[state.left]);
+                        active = true;
+                        state.pick_left = false;
+                    } else {
+                        // Must pick right
+                        out.push(self.ppa[state.right]);
+                        state.right += 1;
+                        active = true;
+                        // Keep pick_left=true since we failed to pick left
+                    }
+                } else {
+                    if can_right {
+                        out.push(self.ppa[state.right]);
+                        state.right += 1;
+                        active = true;
+                        state.pick_left = true;
+                    } else {
+                        // Must pick left
+                        state.left -= 1;
+                        out.push(self.ppa[state.left]);
+                        active = true;
+                        // Keep pick_left=false since we failed to pick right
+                    }
                 }
             }
         }
