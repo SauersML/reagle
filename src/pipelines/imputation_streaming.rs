@@ -28,7 +28,6 @@ use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
 };
-use crate::model::pbwt::PbwtState;
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::model::types::GlobalId;
 use crate::model::impute_hmm::{
@@ -113,10 +112,11 @@ fn estimate_state_budget(
 #[derive(Clone, Debug)]
 struct ImputationPlan {
     n_ref_haps: usize,
-    core_states: Vec<Vec<GlobalId>>, // per target hap
-    abyss_mask: Vec<Vec<bool>>,      // per target hap
+    core_states: Vec<Vec<GlobalId>>,          // per target hap (derived)
+    window_states: Vec<Vec<Vec<GlobalId>>>,   // per target hap -> per window
+    abyss_mask: Vec<Vec<bool>>,               // per target hap
     total_budget: usize,
-    dynamic_budget: usize,
+    per_window_cap: usize,
 }
 
 fn estimate_scan_batch_size(
@@ -127,7 +127,7 @@ fn estimate_scan_batch_size(
     if available_bytes == 0 || n_ref_haps == 0 || n_target_haps == 0 {
         return 1;
     }
-    // global_scores + window_scores + best_window_scores + window_hits + window_rank_hits
+    // global_scores + window_scores + best_window_scores + window_rank_hits
     let per_hap_bytes = (n_ref_haps as u64).saturating_mul(20);
     if per_hap_bytes == 0 {
         return 1;
@@ -157,6 +157,20 @@ fn build_sampling_points(gen_positions: &[f64], step_cm: f64) -> Vec<bool> {
     }
     sampling[n - 1] = true;
     sampling
+}
+
+fn window_boundaries_from_bounds(bounds: &[(f64, f64)]) -> Vec<f64> {
+    if bounds.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(bounds.len() - 1);
+    for i in 0..bounds.len() - 1 {
+        let (_, end) = bounds[i];
+        let (start_next, _) = bounds[i + 1];
+        let dist = (start_next - end).abs();
+        out.push(dist);
+    }
+    out
 }
 
 fn compute_target_freqs<TargetSpace, RefSpace>(
@@ -266,6 +280,13 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
         let mut ref_bins: Vec<Vec<u32>> = Vec::new();
 
     for m in 0..n_markers {
+        let boundary_cm = window_boundaries_from_bounds(&window_gen_bounds);
+        if window_gen_bounds.is_empty() {
+            return Err(ReagleError::vcf(
+                "Pre-scan produced no windows for LMS allocation".to_string(),
+            ));
+        }
+
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             query_alleles[i] =
                 target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
@@ -489,231 +510,6 @@ fn score_window_batch_pbwt<TargetSpace, RefSpace>(
     }
 }
 
-fn compress_score_list(list: &mut Vec<(usize, f32)>, limit: usize) {
-    if list.is_empty() || limit == 0 {
-        list.clear();
-        return;
-    }
-    list.sort_unstable_by_key(|(idx, _)| *idx);
-    let mut merged: Vec<(usize, f32)> = Vec::with_capacity(list.len());
-    for &(idx, score) in list.iter() {
-        if !score.is_finite() || score <= 0.0 {
-            continue;
-        }
-        if let Some((last_idx, last_score)) = merged.last_mut() {
-            if *last_idx == idx {
-                *last_score += score;
-                continue;
-            }
-        }
-        merged.push((idx, score));
-    }
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    if merged.len() > limit {
-        merged.truncate(limit);
-    }
-    *list = merged;
-}
-
-fn select_top_k_pairs(scores: &mut Vec<(usize, f32)>, k: usize) -> Vec<GlobalId> {
-    if k == 0 || scores.is_empty() {
-        return Vec::new();
-    }
-    compress_score_list(scores, k);
-    scores
-        .iter()
-        .take(k)
-        .map(|(idx, _)| GlobalId::new(*idx as u32))
-        .collect()
-}
-
-fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
-    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
-    ref_columns: &[GenotypeColumn],
-    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
-    gen_maps: &GeneticMaps,
-    dynamic_budget: usize,
-    step_cm: f64,
-    pbwt_state_fwd: &mut Option<PbwtState>,
-) -> Vec<Vec<GlobalId>> {
-    let n_target_haps = target_gt.n_samples() * 2;
-    let n_ref_haps = ref_columns
-        .first()
-        .map(|c| c.n_haplotypes())
-        .unwrap_or(0);
-    if n_target_haps == 0 || n_ref_haps == 0 || dynamic_budget == 0 {
-        return vec![Vec::new(); n_target_haps];
-    }
-
-    let n_markers = target_gt.n_markers();
-    let mut gen_positions = Vec::with_capacity(n_markers);
-    for m in 0..n_markers {
-        let marker = target_gt.markers().marker(MarkerIdx::new(m as u32));
-        let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
-        gen_positions.push(gen_pos);
-    }
-    let sampling = build_sampling_points(&gen_positions, step_cm);
-    let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
-
-    let mut score_lists: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_target_haps];
-    let prune_limit = dynamic_budget.saturating_mul(8).max(dynamic_budget);
-
-    let mut pbwt_fwd = ReferencePbwt::with_state(n_ref_haps, pbwt_state_fwd.as_ref());
-    let mut beams_fwd: Vec<RankBeam> = (0..n_target_haps)
-        .map(|_| RankBeam::full(n_ref_haps as u32))
-        .collect();
-    let mut ref_alleles = vec![0u8; n_ref_haps];
-    let mut query_alleles = vec![0u8; n_target_haps];
-    let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
-    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
-    let k_per_hap = PBWT_MAX_PER_HAP.min(n_ref_haps).max(1);
-
-    for m in 0..n_markers {
-        for hap_idx in 0..n_target_haps {
-            query_alleles[hap_idx] =
-                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-        }
-        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-            for rh in 0..n_ref_haps {
-                let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
-            }
-        } else {
-            ref_alleles.fill(255);
-        }
-
-        let mut is_biallelic = true;
-        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
-            if a >= 2 && a != 255 {
-                is_biallelic = false;
-                break;
-            }
-        }
-        let n_alleles = if is_biallelic { 2 } else { 256 };
-        pbwt_fwd.advance_with_beams_scratch(
-            &ref_alleles,
-            n_alleles,
-            m,
-            &query_alleles,
-            &mut beams_fwd,
-            &mut scratch,
-        );
-
-        if sampling[m] {
-            for i in 0..n_target_haps {
-                let targ = query_alleles[i];
-                if targ == 255 {
-                    continue;
-                }
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
-                if freq <= 0.0 {
-                    continue;
-                }
-                let weight = -(freq.max(min_freq)).ln();
-                let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
-                let list = &mut score_lists[i];
-                for d in donors {
-                    let idx = d as usize;
-                    if idx < n_ref_haps {
-                        let ref_a = ref_alleles[idx];
-                        if ref_a == 255 || ref_a != targ {
-                            continue;
-                        }
-                        list.push((idx, weight));
-                    }
-                }
-                if list.len() > prune_limit {
-                    compress_score_list(list, prune_limit);
-                }
-            }
-        }
-    }
-
-    if n_markers > 0 {
-        *pbwt_state_fwd = Some(pbwt_fwd.get_state(n_markers - 1));
-    }
-
-    let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
-    let mut beams_bwd: Vec<RankBeam> = (0..n_target_haps)
-        .map(|_| RankBeam::full(n_ref_haps as u32))
-        .collect();
-    for (rev_step, m) in (0..n_markers).rev().enumerate() {
-        for hap_idx in 0..n_target_haps {
-            query_alleles[hap_idx] =
-                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-        }
-        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-            for rh in 0..n_ref_haps {
-                let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
-            }
-        } else {
-            ref_alleles.fill(255);
-        }
-
-        let mut is_biallelic = true;
-        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
-            if a >= 2 && a != 255 {
-                is_biallelic = false;
-                break;
-            }
-        }
-        let n_alleles = if is_biallelic { 2 } else { 256 };
-        pbwt_bwd.advance_with_beams_scratch(
-            &ref_alleles,
-            n_alleles,
-            rev_step,
-            &query_alleles,
-            &mut beams_bwd,
-            &mut scratch,
-        );
-
-        if sampling[m] {
-            for i in 0..n_target_haps {
-                let targ = query_alleles[i];
-                if targ == 255 {
-                    continue;
-                }
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
-                if freq <= 0.0 {
-                    continue;
-                }
-                let weight = -(freq.max(min_freq)).ln();
-                let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
-                let list = &mut score_lists[i];
-                for d in donors {
-                    let idx = d as usize;
-                    if idx < n_ref_haps {
-                        let ref_a = ref_alleles[idx];
-                        if ref_a == 255 || ref_a != targ {
-                            continue;
-                        }
-                        list.push((idx, weight));
-                    }
-                }
-                if list.len() > prune_limit {
-                    compress_score_list(list, prune_limit);
-                }
-            }
-        }
-    }
-
-    let mut out = vec![Vec::new(); n_target_haps];
-    for hap_idx in 0..n_target_haps {
-        out[hap_idx] = select_top_k_pairs(&mut score_lists[hap_idx], dynamic_budget);
-    }
-
-    out
-}
-
 fn normalize_chrom_local(name: &str) -> &str {
     if name.len() >= 3 && name[..3].eq_ignore_ascii_case("chr") {
         &name[3..]
@@ -818,9 +614,9 @@ fn build_imputation_plan(
     gen_maps: &GeneticMaps,
     target_positions: &TargetMarkerIndex,
     total_budget: usize,
-    core_budget: usize,
-    dynamic_budget: usize,
+    per_window_cap: usize,
     imp_step_cm: f64,
+    params: &crate::model::parameters::ModelParams,
 ) -> Result<ImputationPlan> {
     let target_reader =
         StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
@@ -832,9 +628,10 @@ fn build_imputation_plan(
     let mut plan = ImputationPlan {
         n_ref_haps: 0,
         core_states: vec![Vec::new(); n_target_haps],
+        window_states: vec![Vec::new(); n_target_haps],
         abyss_mask: vec![Vec::new(); n_target_haps],
         total_budget,
-        dynamic_budget,
+        per_window_cap,
     };
 
     let avail = available_memory_bytes().unwrap_or(0);
@@ -865,6 +662,9 @@ fn build_imputation_plan(
     let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
 
+    // Window boundary positions (genetic) are consistent across batches.
+    let mut window_gen_bounds: Vec<(f64, f64)> = Vec::new();
+
     while batch_start < n_target_haps {
         let batch_end = (batch_start + batch_size).min(n_target_haps);
         let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
@@ -876,18 +676,19 @@ fn build_imputation_plan(
 
         let mut global_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
-        let mut window_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
         let mut best_window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_rank_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
+        let mut scores_by_window: Vec<Vec<Vec<f32>>> = Vec::with_capacity(batch_len);
 
         for _ in 0..batch_len {
             global_scores.push(Vec::new());
             window_scores.push(Vec::new());
-            window_hits.push(Vec::new());
             best_window_scores.push(Vec::new());
             window_rank_hits.push(Vec::new());
+            scores_by_window.push(Vec::new());
         }
 
+        let mut window_idx = 0usize;
         loop {
             let ref_window = ref_reader.next_window(
                 streaming_config,
@@ -931,7 +732,6 @@ fn build_imputation_plan(
                 if global_scores[i].len() != n_ref_haps {
                     global_scores[i] = vec![0.0f32; n_ref_haps];
                     window_scores[i] = vec![0.0f32; n_ref_haps];
-                    window_hits[i] = vec![0u32; n_ref_haps];
                     best_window_scores[i] = vec![0.0f32; n_ref_haps];
                     window_rank_hits[i] = vec![0u32; n_ref_haps];
                 }
@@ -941,10 +741,7 @@ fn build_imputation_plan(
                 w.fill(0.0);
             }
 
-            let full_fit = total_budget >= n_ref_haps;
-            let k_per_hap = total_budget
-                .max(1)
-                .min(PBWT_MAX_PER_HAP);
+            let k_per_hap = total_budget.max(1).min(PBWT_MAX_PER_HAP);
 
             let phased_target = target_window.genotypes.clone().into_phased();
             let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
@@ -976,11 +773,6 @@ fn build_imputation_plan(
                 );
             }
 
-            let window_candidate_k = if full_fit {
-                0
-            } else {
-                total_budget.min(n_ref_haps)
-            };
             let abyss_rank_cutoff = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
                 .min(n_ref_haps)
                 .max(1);
@@ -988,15 +780,6 @@ fn build_imputation_plan(
                 for (h, score) in window_scores[i].iter().copied().enumerate() {
                     if score > best_window_scores[i][h] {
                         best_window_scores[i][h] = score;
-                    }
-                }
-
-                if window_candidate_k > 0 {
-                    let top = select_top_k(&window_scores[i], window_candidate_k);
-                    for (ref_idx, _) in top {
-                        if ref_idx < window_hits[i].len() {
-                            window_hits[i][ref_idx] = window_hits[i][ref_idx].saturating_add(1);
-                        }
                     }
                 }
 
@@ -1009,10 +792,34 @@ fn build_imputation_plan(
                 }
             }
 
-        }
+            // Persist per-window scores for LMS allocator.
+            for i in 0..batch_len {
+                scores_by_window[i].push(window_scores[i].clone());
+            }
 
-        let full_fit = total_budget >= n_ref_haps;
-        let effective_core_budget = if full_fit { n_ref_haps } else { core_budget };
+            // Record window genetic bounds once (batch 0), reuse for all batches.
+            if batch_start == 0 {
+                let gen_start = gen_maps.gen_pos(
+                    ref_window.markers.marker(MarkerIdx::new(0)).chrom,
+                    ref_window.markers.marker(MarkerIdx::new(0)).pos,
+                );
+                let gen_end = gen_maps.gen_pos(
+                    ref_window
+                        .markers
+                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                        .chrom,
+                    ref_window
+                        .markers
+                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                        .pos,
+                );
+                if window_gen_bounds.len() == window_idx {
+                    window_gen_bounds.push((gen_start, gen_end));
+                }
+            }
+            window_idx += 1;
+
+        }
 
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let mut abyss = vec![false; n_ref_haps];
@@ -1039,58 +846,70 @@ fn build_imputation_plan(
             }
             plan.abyss_mask[hap_idx] = abyss.clone();
 
-            let mut ranked: Vec<(usize, u32, f32, f32)> = (0..n_ref_haps)
-                .filter(|&h| !abyss[h])
-                .map(|h| (h, window_hits[i][h], best_window_scores[i][h], global_scores[i][h]))
-                .collect();
-            ranked.sort_by(|a, b| {
-                b.1.cmp(&a.1)
-                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-                    .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-
-            let mut core: Vec<GlobalId> = Vec::new();
-            if ranked.is_empty() {
-                let keep = effective_core_budget.max(1).min(n_ref_haps);
-                let top = select_top_k_allow_zero(&global_scores[i], keep);
-                if top.is_empty() {
-                    for h in 0..keep {
-                        core.push(GlobalId::new(h as u32));
-                    }
-                } else {
-                    for (h, _) in top {
-                        core.push(GlobalId::new(h as u32));
+            // Run LMS allocator for this target haplotype.
+            let window_scores_matrix = &scores_by_window[i];
+            if window_scores_matrix.len() != window_gen_bounds.len() {
+                return Err(ReagleError::vcf(format!(
+                    "Pre-scan window count mismatch for hap {} (scores={}, bounds={})",
+                    hap_idx,
+                    window_scores_matrix.len(),
+                    window_gen_bounds.len()
+                )));
+            }
+            // LMS allocation: select a per-window active set that maximizes a
+            // Li–Stephens-aligned surrogate objective under a slot budget.
+            // This is a prescan-only selection layer; the actual HMM still uses
+            // explicit GlobalId states and identity-preserving transitions.
+            let by_window: Vec<Vec<GlobalId>> = if per_window_cap >= n_ref_haps {
+                // Full panel per window (minus abyss).
+                let mut all: Vec<GlobalId> = Vec::new();
+                for h in 0..n_ref_haps {
+                    if !abyss[h] {
+                        all.push(GlobalId::new(h as u32));
                     }
                 }
-            } else if full_fit {
-                core = ranked
-                    .iter()
-                    .map(|(h, _, _, _)| GlobalId::new(*h as u32))
-                    .collect();
+                let mut out = Vec::with_capacity(window_scores_matrix.len());
+                for _ in 0..window_scores_matrix.len() {
+                    out.push(all.clone());
+                }
+                out
             } else {
-                let keep = effective_core_budget.min(ranked.len());
-                let mut remaining = keep;
-
-                for (h, _, _, _) in ranked.iter().filter(|(_, hits, _, _)| *hits >= 2) {
-                    if remaining == 0 {
-                        break;
-                    }
-                    core.push(GlobalId::new(*h as u32));
-                    remaining -= 1;
+                let allocation = crate::model::state_allocator::allocate_lms(
+                    window_scores_matrix,
+                    &boundary_cm,
+                    params,
+                    total_budget.saturating_mul(window_scores_matrix.len().max(1)),
+                    per_window_cap.max(1),
+                    Some(&abyss),
+                );
+                let mut out: Vec<Vec<GlobalId>> =
+                    Vec::with_capacity(allocation.active_by_window.len());
+                for win in allocation.active_by_window.iter() {
+                    let mut ids: Vec<GlobalId> =
+                        win.iter().map(|h| GlobalId::new(*h as u32)).collect();
+                    ids.sort_unstable_by_key(|g| g.as_u32());
+                    ids.dedup();
+                    out.push(ids);
                 }
+                out
+            };
+            plan.window_states[hap_idx] = by_window.clone();
 
-                if remaining > 0 {
-                    for (h, _, _, _) in ranked.iter().filter(|(_, hits, _, _)| *hits < 2) {
-                        if remaining == 0 {
-                            break;
-                        }
-                        core.push(GlobalId::new(*h as u32));
-                        remaining -= 1;
-                    }
+            // Derive core set as haplotypes active in all windows.
+            let mut counts = vec![0usize; n_ref_haps];
+            for win in by_window.iter() {
+                for id in win.iter() {
+                    counts[id.as_usize()] += 1;
                 }
             }
-            plan.core_states[hap_idx] = core.clone();
+            let mut core: Vec<GlobalId> = Vec::new();
+            let need = window_scores_matrix.len().max(1);
+            for h in 0..n_ref_haps {
+                if counts[h] == need {
+                    core.push(GlobalId::new(h as u32));
+                }
+            }
+            plan.core_states[hap_idx] = core;
         }
 
         batch_start = batch_end;
@@ -1225,21 +1044,11 @@ impl crate::pipelines::ImputationPipeline {
         }
         let total_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers)
             .max(1);
-        let mut core_budget = if total_budget <= 1 {
-            total_budget
-        } else {
-            total_budget / 2
-        };
-        if core_budget == 0 && total_budget > 0 {
-            core_budget = 1;
-        }
-        let dynamic_budget = total_budget.saturating_sub(core_budget);
+        let per_window_cap = total_budget;
 
         eprintln!(
-            "Imputation plan: total_states={}, core={}, dynamic={}, threads={}, available_mb={}",
-            total_budget,
-            core_budget,
-            dynamic_budget,
+            "Imputation plan: per_window_cap={}, threads={}, available_mb={}",
+            per_window_cap,
             n_threads,
             avail_bytes / (1024 * 1024)
         );
@@ -1251,19 +1060,16 @@ impl crate::pipelines::ImputationPipeline {
             &gen_maps,
             &target_positions_map,
             total_budget,
-            core_budget,
-            dynamic_budget,
+            per_window_cap,
             self.config.imp_step as f64,
+            &self.params,
         )?;
-        if plan.total_budget >= plan.n_ref_haps {
-            plan.dynamic_budget = 0;
-        }
-        if plan.total_budget >= plan.n_ref_haps && plan.dynamic_budget == 0 {
-            eprintln!("Imputation mode: full global core (tier 1 only; abyss still active)");
-        } else if plan.dynamic_budget > 0 {
+        if plan.per_window_cap >= plan.n_ref_haps {
+            eprintln!("Imputation mode: full panel per window (abyss still active)");
+        } else {
             eprintln!(
-                "Imputation mode: core + dynamic (tier 1 + tier 2), dynamic_budget={}",
-                plan.dynamic_budget
+                "Imputation mode: LMS allocation (per_window_cap={})",
+                plan.per_window_cap
             );
         }
 
@@ -1288,7 +1094,6 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut imp_overlap: Option<PhasedOverlap> = None;
         let mut warned_no_overlap = false;
-        let mut pbwt_state_fwd: Option<PbwtState> = None;
         let mut header_written = false;
         let mut total_markers = 0usize;
         let mut window_idx = 0usize;
@@ -1380,7 +1185,6 @@ impl crate::pipelines::ImputationPipeline {
                 ref_window.global_start,
                 ref_window.output_start,
                 ref_window.output_end,
-                &mut pbwt_state_fwd,
             )?;
 
             total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
@@ -1439,7 +1243,6 @@ impl crate::pipelines::ImputationPipeline {
         global_start: usize,
         output_start: usize,
         output_end: usize,
-        pbwt_state_fwd: &mut Option<PbwtState>,
     ) -> Result<Option<ImputationHandoff>> {
         let window_span = if self.config.profile {
             Some(
@@ -1770,20 +1573,6 @@ impl crate::pipelines::ImputationPipeline {
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
         }
 
-        let dynamic_states = if plan.dynamic_budget > 0 {
-            compute_dynamic_states_for_window(
-                target_win,
-                ref_columns,
-                alignment,
-                gen_maps,
-                plan.dynamic_budget,
-                PBWT_SELECT_BLOCK_CM.max(self.config.imp_step as f64),
-                pbwt_state_fwd,
-            )
-        } else {
-            vec![Vec::new(); n_target_samples * 2]
-        };
-
         let sample_results: Vec<ImputeResult> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
@@ -1806,11 +1595,10 @@ impl crate::pipelines::ImputationPipeline {
 
                     let plan_idx = hap_idx.as_usize();
                     let mut state_haps: Vec<GlobalId> = Vec::new();
-                    if plan_idx < plan.core_states.len() {
+                    if plan_idx < plan.window_states.len() && window_idx < plan.window_states[plan_idx].len() {
+                        state_haps.extend(plan.window_states[plan_idx][window_idx].iter().copied());
+                    } else if plan_idx < plan.core_states.len() {
                         state_haps.extend(plan.core_states[plan_idx].iter().copied());
-                    }
-                    if plan_idx < dynamic_states.len() {
-                        state_haps.extend(dynamic_states[plan_idx].iter().copied());
                     }
                     state_haps.sort_unstable_by_key(|g| g.as_u32());
                     state_haps.dedup();

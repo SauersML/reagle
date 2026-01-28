@@ -57,3 +57,4 @@ pub mod states;
 pub mod types;
 pub mod weighted_kernel;
 pub mod impute_hmm;
+pub mod state_allocator;
