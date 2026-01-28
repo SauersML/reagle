@@ -259,7 +259,7 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
         return;
     }
 
-    let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
+        let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
 
     let mut query_alleles = vec![255u8; batch_haps.len()];
@@ -489,22 +489,41 @@ fn score_window_batch_pbwt<TargetSpace, RefSpace>(
     }
 }
 
-fn select_top_k_pairs(scores: &[(usize, f32)], k: usize) -> Vec<GlobalId> {
+fn compress_score_list(list: &mut Vec<(usize, f32)>, limit: usize) {
+    if list.is_empty() || limit == 0 {
+        list.clear();
+        return;
+    }
+    list.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut merged: Vec<(usize, f32)> = Vec::with_capacity(list.len());
+    for &(idx, score) in list.iter() {
+        if !score.is_finite() || score <= 0.0 {
+            continue;
+        }
+        if let Some((last_idx, last_score)) = merged.last_mut() {
+            if *last_idx == idx {
+                *last_score += score;
+                continue;
+            }
+        }
+        merged.push((idx, score));
+    }
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if merged.len() > limit {
+        merged.truncate(limit);
+    }
+    *list = merged;
+}
+
+fn select_top_k_pairs(scores: &mut Vec<(usize, f32)>, k: usize) -> Vec<GlobalId> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<(usize, f32)> = scores
+    compress_score_list(scores, k);
+    scores
         .iter()
-        .filter(|(_, s)| s.is_finite() && *s > 0.0)
-        .map(|(idx, s)| (*idx, *s))
-        .collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    if ranked.len() > k {
-        ranked.truncate(k);
-    }
-    ranked
-        .into_iter()
-        .map(|(idx, _)| GlobalId::new(idx as u32))
+        .take(k)
+        .map(|(idx, _)| GlobalId::new(*idx as u32))
         .collect()
 }
 
@@ -596,16 +615,11 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
                         if ref_a == 255 || ref_a != targ {
                             continue;
                         }
-                        if let Some((_, v)) = list.iter_mut().find(|(k, _)| *k == idx) {
-                            *v += weight;
-                        } else {
-                            list.push((idx, weight));
-                        }
+                        list.push((idx, weight));
                     }
                 }
                 if list.len() > prune_limit {
-                    list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    list.truncate(prune_limit);
+                    compress_score_list(list, prune_limit);
                 }
             }
         }
@@ -673,16 +687,11 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
                         if ref_a == 255 || ref_a != targ {
                             continue;
                         }
-                        if let Some((_, v)) = list.iter_mut().find(|(k, _)| *k == idx) {
-                            *v += weight;
-                        } else {
-                            list.push((idx, weight));
-                        }
+                        list.push((idx, weight));
                     }
                 }
                 if list.len() > prune_limit {
-                    list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    list.truncate(prune_limit);
+                    compress_score_list(list, prune_limit);
                 }
             }
         }
@@ -690,7 +699,7 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
 
     let mut out = vec![Vec::new(); n_target_haps];
     for hap_idx in 0..n_target_haps {
-        out[hap_idx] = select_top_k_pairs(&score_lists[hap_idx], dynamic_budget);
+        out[hap_idx] = select_top_k_pairs(&mut score_lists[hap_idx], dynamic_budget);
     }
 
     out
@@ -1186,12 +1195,25 @@ impl crate::pipelines::ImputationPipeline {
             phased_tmp = Some(tmpdir);
         }
 
-        let n_threads = self
+        let mut n_threads = self
             .config
             .nthreads
             .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
             .unwrap_or(1);
         let avail_bytes = available_memory_bytes().unwrap_or(0);
+        let min_states = 64usize;
+        loop {
+            let total_budget = estimate_state_budget(
+                avail_bytes,
+                n_threads,
+                self.config.window_markers,
+            )
+            .max(1);
+            if total_budget >= min_states || n_threads <= 1 {
+                break;
+            }
+            n_threads = (n_threads / 2).max(1);
+        }
         let total_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers)
             .max(1);
         let mut core_budget = if total_budget <= 1 {

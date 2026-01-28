@@ -266,30 +266,14 @@ pub fn run_impute_hmm(
         for i in 0..active_states {
             constant_term += ws.bwd[i] * ws.emissions[i];
         }
-        let mut background_emit = 0.0f32;
-        if m_rev < ref_allele_freqs.len() {
-            let freqs = &ref_allele_freqs[m_rev];
-            for (allele_idx, &f) in freqs.iter().enumerate() {
-                if f <= 0.0 {
-                    continue;
-                }
-                if allele_idx > 254 {
-                    continue;
-                }
-                let e = emission_prob_soft(allele_idx as u8, probs, error_rate);
-                background_emit += f * e;
-            }
-        }
-        let avg_bwd = if active_states > 0 {
-            ws.bwd[..active_states].iter().sum::<f32>() / active_states as f32
-        } else {
-            1.0
-        };
-        let missing = total_ref_haps.saturating_sub(active_states) as f32;
-        let constant_full = constant_term + missing * avg_bwd * background_emit;
+        let constant_full = constant_term;
         let inv_c = 1.0 / constant_full.max(1e-30);
         let scale = (1.0 - recomb_rate) * inv_c;
-        let shift = recomb_rate / total_ref_haps.max(1) as f32;
+        let shift = if active_states > 0 {
+            recomb_rate / active_states as f32
+        } else {
+            0.0
+        };
         for i in 0..active_states {
             ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
         }
