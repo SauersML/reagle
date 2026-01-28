@@ -113,32 +113,62 @@ impl ReferencePbwt {
         }
 
         let mut out = Vec::with_capacity(k);
+        let n_ref_u32 = n_ref as u32;
 
+        // Calculate total length of all intervals
+        let mut total_len = 0usize;
         for &(l, r) in beam.intervals() {
-            if out.len() >= k {
-                break;
+            let l = l.min(n_ref_u32);
+            let r = r.min(n_ref_u32);
+            if r > l {
+                total_len += (r - l) as usize;
             }
-            let l = l.min(n_ref as u32) as usize;
-            let r = r.min(n_ref as u32) as usize;
-            if l >= r {
-                continue;
-            }
-            let center = (l + r) / 2;
+        }
 
-            let mut left = center;
-            let mut right = center;
-            while out.len() < k && (left > l || right < r) {
-                if left > l {
-                    left -= 1;
-                    out.push(self.ppa[left]);
+        if total_len == 0 {
+            return out;
+        }
+
+        // If we can take everyone, take everyone
+        if total_len <= k {
+            for &(l, r) in beam.intervals() {
+                let l = l.min(n_ref_u32) as usize;
+                let r = r.min(n_ref_u32) as usize;
+                for i in l..r {
+                    out.push(self.ppa[i]);
+                }
+            }
+        } else {
+            // Strided sampling to ensure uniform coverage across all intervals
+            let step = total_len as f64 / k as f64;
+            let mut next_sample = 0.5 * step;
+            let mut current_offset = 0;
+
+            for &(l, r) in beam.intervals() {
+                let l = l.min(n_ref_u32) as usize;
+                let r = r.min(n_ref_u32) as usize;
+                if l >= r {
+                    continue;
+                }
+                let len = r - l;
+
+                // While the next sample point falls within this interval
+                while next_sample < (current_offset + len) as f64 {
+                    // Map global sample index to local interval index
+                    let local_idx = (next_sample - current_offset as f64) as usize;
+                    if local_idx < len {
+                        out.push(self.ppa[l + local_idx]);
+                    }
+                    next_sample += step;
+
                     if out.len() >= k {
                         break;
                     }
                 }
-                if right < r {
-                    out.push(self.ppa[right]);
-                    right += 1;
+                if out.len() >= k {
+                    break;
                 }
+                current_offset += len;
             }
         }
 
