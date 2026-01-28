@@ -2605,10 +2605,26 @@ target_samples={} target_bytes={}",
             Some(ref_gp)
         };
 
+        let correct_errors = self.config.err.is_some();
+
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
+
+            // If error correction is enabled, check HMM result first (bypass GT/GP)
+            if correct_errors {
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some(d) = result.dosages.get(local_m).copied() {
+                        if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                            return d;
+                        } else {
+                            return d * 0.5;
+                        }
+                    }
+                }
+            }
+
             let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
@@ -2630,6 +2646,15 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
+
+            if correct_errors {
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some(gt) = result.best_gt.get(local_m).copied() {
+                        return gt;
+                    }
+                }
+            }
+
             if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 best_gt_from_gp(n_alleles, &gp)
@@ -2667,7 +2692,7 @@ target_samples={} target_bytes={}",
                 if let Some(stats) = quality.get_mut(marker_idx) {
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
-                        if !stats.is_imputed {
+                        if !stats.is_imputed && self.config.err.is_none() {
                             if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
                                 let n_alleles = ref_markers
                                     .marker(MarkerIdx::new(marker_idx as u32))
@@ -2723,7 +2748,7 @@ target_samples={} target_bytes={}",
                 if let Some(stats) = quality.get_mut(marker_idx) {
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
-                        if !stats.is_imputed {
+                        if !stats.is_imputed && self.config.err.is_none() {
                             if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
                                 let n_alleles = ref_markers
                                     .marker(MarkerIdx::new(marker_idx as u32))
