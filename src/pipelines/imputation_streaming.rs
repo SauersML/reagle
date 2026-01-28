@@ -35,6 +35,7 @@ use crate::model::impute_hmm::{
     ImputeWorkspace, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
 };
 use crate::model::transition_matrix::TransitionMatrix;
+use crate::model::parameters::ModelParams;
 use crate::pipelines::imputation::AllelePosteriors;
 
 
@@ -1249,6 +1250,10 @@ impl crate::pipelines::ImputationPipeline {
         if plan.total_budget >= plan.n_ref_haps {
             plan.dynamic_budget = 0;
         }
+
+        self.params.recomb_intensity = (0.04 * self.config.ne / plan.n_ref_haps as f32)
+            .min(ModelParams::MAX_RECOMB_INTENSITY);
+
         if plan.total_budget >= plan.n_ref_haps && plan.dynamic_budget == 0 {
             eprintln!("Imputation mode: full global core (tier 1 only; abyss still active)");
         } else if plan.dynamic_budget > 0 {
@@ -2368,15 +2373,29 @@ impl crate::pipelines::ImputationPipeline {
 
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
+        let error_correction = self.config.err.is_some();
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
+
+            // Priority: GT (if !err) > GP > HMM
+            if !error_correction {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    let dosage = (a1 + a2) as f32;
+                    if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                        return dosage;
+                    } else {
+                        return dosage * 0.5;
+                    }
+                }
+            }
+
             let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
+            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                (a1 + a2) as f32
             } else {
                 0.0
             };
