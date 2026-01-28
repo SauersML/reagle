@@ -80,7 +80,7 @@ pub struct Config {
     pub impute: bool,
 
     /// Model states for imputation
-    #[arg(long = "imp-states", default_value = "600")]
+    #[arg(long = "imp-states", default_value = "1600")]
     pub imp_states: usize,
 
     /// Imputation segment length in cM
@@ -167,7 +167,7 @@ impl Default for Config {
             phase_states: 600,
             rare: 0.002,
             impute: true,
-            imp_states: 600,
+            imp_states: 1600,
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
