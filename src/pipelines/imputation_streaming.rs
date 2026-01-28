@@ -1700,10 +1700,17 @@ impl crate::pipelines::ImputationPipeline {
                             && (mapped_partner as usize) < n_alleles
                             && mapped_partner != mapped_allele;
                         let phase_conf = if is_het {
-                            target_win.sample_phase_confidence_f32(
-                                MarkerIdx::new(target_m as u32),
-                                sample_idx,
-                            )
+                            // Boost phase confidence to enforce heterozygosity constraints.
+                            //
+                            // Treating H1 and H2 as independent with 0.5/0.5 probabilities
+                            // allows the HMM to pick the major allele for both haplotypes
+                            // (the "Double Major" error), violating the heterozygote constraint.
+                            //
+                            // By forcing hard phasing (phase_conf=1.0) on the input, we decompose
+                            // the unphased heterozygote into two complementary haplotypes,
+                            // preserving diversity. Since we are using an independent haploid HMM,
+                            // we must commit to a single valid decomposition.
+                            1.0
                         } else {
                             1.0
                         };
