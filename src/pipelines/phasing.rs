@@ -2239,6 +2239,209 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         (finalized, pbwt_state_for_next_window)
     }
 
+    /// Initialize phase using reference panel heuristic.
+    ///
+    /// This finds the best pair of reference haplotypes that explain the target genotype
+    /// (assuming a constant match) and initializes the target phase to match them.
+    /// This helps escape "Mosaic Traps" or "Stability Traps" where the initial random
+    /// phase prevents the PBWT from finding the perfect match.
+    fn initialize_phase_heuristic(
+        &self,
+        geno: &mut MutableGenotypes,
+        hi_freq_to_orig: &[usize],
+    ) {
+        if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            let n_samples = geno.n_haps() / 2;
+            let n_ref_haps = ref_gt.n_haplotypes();
+
+            // Process samples in parallel
+            let updates: Vec<BitVec<u8, Lsb0>> = (0..n_samples)
+                .into_par_iter()
+                .map(|s| {
+                    let hap1 = HapIdx::new((s * 2) as u32);
+                    let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+                    // Collect sample alleles for high-freq markers
+                    let s1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| geno.get(m, hap1)).collect();
+                    let s2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| geno.get(m, hap2)).collect();
+
+                    // Compute scores for each reference haplotype
+                    // Score = Matches at homozygous sites - Mismatches at homozygous sites
+                    let mut ref_scores = vec![0i32; n_ref_haps];
+
+                    for r in 0..n_ref_haps {
+                        let r_idx = HapIdx::new(r as u32);
+                        let mut score = 0;
+
+                        for (i, &m) in hi_freq_to_orig.iter().enumerate() {
+                            let a1 = s1[i];
+                            let a2 = s2[i];
+
+                            // Skip if missing
+                            if a1 == 255 || a2 == 255 {
+                                continue;
+                            }
+
+                            // Homozygous site
+                            if a1 == a2 {
+                                if let Some(ref_m) =
+                                    alignment.target_to_ref(MarkerIdx::new(m as u32))
+                                {
+                                    let ref_allele = ref_gt.allele(ref_m, r_idx);
+                                    let mapped_ref = alignment.reverse_map_allele(m, ref_allele);
+                                    if mapped_ref == 255 {
+                                        continue;
+                                    }
+
+                                    if mapped_ref == a1 {
+                                        score += 1;
+                                    } else {
+                                        score -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        ref_scores[r] = score;
+                    }
+
+                    // Find best R1
+                    let mut best_r1 = 0;
+                    let mut max_score = i32::MIN;
+                    for (r, &score) in ref_scores.iter().enumerate() {
+                        if score > max_score {
+                            max_score = score;
+                            best_r1 = r;
+                        }
+                    }
+
+                    // Find best R2 given R1, considering heterozygous sites
+                    // Score(R2) = HomScore(R2) + HetMatch(R1, R2)
+                    let mut best_r2 = 0;
+                    let mut max_pair_score = i32::MIN;
+
+                    let r1_idx = HapIdx::new(best_r1 as u32);
+
+                    // Optimization: pre-calculate R1 alleles
+                    let r1_alleles: Vec<u8> = hi_freq_to_orig
+                        .iter()
+                        .map(|&m| {
+                            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                                let ref_allele = ref_gt.allele(ref_m, r1_idx);
+                                alignment.reverse_map_allele(m, ref_allele)
+                            } else {
+                                255
+                            }
+                        })
+                        .collect();
+
+                    for r in 0..n_ref_haps {
+                        let r2_idx = HapIdx::new(r as u32);
+                        let mut score = ref_scores[r]; // Start with hom score
+
+                        for (i, &m) in hi_freq_to_orig.iter().enumerate() {
+                            let a1 = s1[i];
+                            let a2 = s2[i];
+
+                            if a1 == 255 || a2 == 255 || a1 == a2 {
+                                continue;
+                            }
+
+                            // Heterozygous site: a1 != a2
+                            let r1_a = r1_alleles[i];
+                            if r1_a == 255 {
+                                continue;
+                            }
+
+                            let ref_allele =
+                                if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                                    ref_gt.allele(ref_m, r2_idx)
+                                } else {
+                                    continue;
+                                };
+                            let r2_a = alignment.reverse_map_allele(m, ref_allele);
+                            if r2_a == 255 {
+                                continue;
+                            }
+
+                            // Check if pair (r1, r2) explains (a1, a2)
+                            // Case 1: r1=a1, r2=a2
+                            // Case 2: r1=a2, r2=a1
+                            if (r1_a == a1 && r2_a == a2) || (r1_a == a2 && r2_a == a1) {
+                                score += 1;
+                            } else {
+                                score -= 1;
+                            }
+                        }
+
+                        if score > max_pair_score {
+                            max_pair_score = score;
+                            best_r2 = r;
+                        }
+                    }
+
+                    // Construct swap mask to match (R1, R2)
+                    let n_total_markers = geno.n_markers();
+                    let mut mask = BitVec::repeat(false, n_total_markers);
+
+                    let r2_idx = HapIdx::new(best_r2 as u32);
+
+                    for (i, &m) in hi_freq_to_orig.iter().enumerate() {
+                        let a1 = s1[i];
+                        let a2 = s2[i];
+
+                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                            continue;
+                        }
+
+                        let r1_a = r1_alleles[i];
+
+                        let ref_allele =
+                            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                                ref_gt.allele(ref_m, r2_idx)
+                            } else {
+                                255
+                            };
+                        let r2_a = alignment.reverse_map_allele(m, ref_allele);
+
+                        if r1_a == 255 || r2_a == 255 {
+                            continue;
+                        }
+
+                        // Target H1 currently has a1, H2 has a2.
+                        // We want H1/H2 to match R1/R2 (or R2/R1).
+                        // Since we don't know if R1 corresponds to H1 or H2, we pick the orientation
+                        // that matches current H1/H2 if possible, or force one.
+                        //
+                        // But wait, finding (R1, R2) just tells us the alleles.
+                        // If R1 has allele X and R2 has allele Y.
+                        // And Target has X and Y.
+                        // We want to assign X to one hap and Y to the other.
+                        // If current H1 has Y and H2 has X, we swap.
+                        // If current H1 has X and H2 has Y, we keep.
+
+                        // Assume we want to align to (R1, R2).
+                        // If R1 has allele matching H2 (a2) and R2 has allele matching H1 (a1), swap.
+                        if r1_a == a2 && r2_a == a1 {
+                            mask.set(m, true);
+                        } else if r1_a == a1 && r2_a == a2 {
+                            mask.set(m, false);
+                        }
+                    }
+                    mask
+                })
+                .collect();
+
+            // Apply updates sequentially
+            for (s, mask) in updates.into_iter().enumerate() {
+                let hap1 = HapIdx::new((s * 2) as u32);
+                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+                geno.swap_haplotypes(hap1, hap2, &mask);
+            }
+
+            eprintln!("Initialized phase using reference panel heuristic");
+        }
+    }
+
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
     ///
     /// This uses the full Forward-Backward algorithm to compute posterior probabilities
