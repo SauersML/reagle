@@ -1611,14 +1611,11 @@ target_samples={} target_bytes={}",
                         let is_het = mapped_partner != 255
                             && (mapped_partner as usize) < n_alleles
                             && mapped_partner != mapped_allele;
-                        let phase_conf = if is_het {
-                            target_win.sample_phase_confidence_f32(
-                                MarkerIdx::new(target_m as u32),
-                                sample_idx,
-                            )
-                        } else {
-                            1.0
-                        };
+                        // Always treat pre-phased genotypes as hard constraints (confidence = 1.0).
+                        // This forces the HMM to respect the phasing decision, which is critical
+                        // for breaking "Perfect LD Traps" where rare variants would otherwise be
+                        // averaged out if we allowed the HMM to treat phase as ambiguous.
+                        let phase_conf = 1.0;
                         for a in 0..n_alleles {
                             let hard = if is_het {
                                 if a == mapped_allele as usize {
