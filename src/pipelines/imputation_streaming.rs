@@ -550,6 +550,7 @@ impl crate::pipelines::ImputationPipeline {
         let block_size = 64usize;
         let max_states_budget = if available_bytes > 0 {
             estimate_max_states(available_bytes, n_threads, window_markers, block_size)
+                .min(self.config.imp_states)
         } else {
             self.config.imp_states.max(1)
         };
@@ -2609,11 +2610,11 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                (a1 + a2) as f32
+            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
@@ -2630,11 +2631,11 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                (a1, a2)
+            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 best_gt_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
@@ -2668,15 +2669,8 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
-                                let n_alleles = ref_markers
-                                    .marker(MarkerIdx::new(marker_idx as u32))
-                                    .n_alleles();
-                                let dosage = dosage_from_gp(n_alleles, &gp);
-                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
-                            } else if let Some(target_m) =
+                            let mut has_gt = false;
+                            if let Some(target_m) =
                                 alignment.target_marker(MarkerIdx::new(marker_idx as u32))
                             {
                                 let h1 = HapIdx::new((s * 2) as u32);
@@ -2708,6 +2702,19 @@ target_samples={} target_bytes={}",
                                 if a1 < 2 && a2 < 2 {
                                     v1 = a1 as f32;
                                     v2 = a2 as f32;
+                                    has_gt = true;
+                                }
+                            }
+
+                            if !has_gt {
+                                if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                    let n_alleles = ref_markers
+                                        .marker(MarkerIdx::new(marker_idx as u32))
+                                        .n_alleles();
+                                    let dosage = dosage_from_gp(n_alleles, &gp);
+                                    let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                                    v1 = p_alt;
+                                    v2 = p_alt;
                                 }
                             }
                         }
@@ -2724,15 +2731,8 @@ target_samples={} target_bytes={}",
                     for s in 0..n_samples {
                         let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
                         if !stats.is_imputed {
-                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
-                                let n_alleles = ref_markers
-                                    .marker(MarkerIdx::new(marker_idx as u32))
-                                    .n_alleles();
-                                let dosage = dosage_from_gp(n_alleles, &gp);
-                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
-                            } else if let Some(target_m) =
+                            let mut has_gt = false;
+                            if let Some(target_m) =
                                 alignment.target_marker(MarkerIdx::new(marker_idx as u32))
                             {
                                 let h1 = HapIdx::new((s * 2) as u32);
@@ -2764,6 +2764,19 @@ target_samples={} target_bytes={}",
                                 if a1 < 2 && a2 < 2 {
                                     v1 = a1 as f32;
                                     v2 = a2 as f32;
+                                    has_gt = true;
+                                }
+                            }
+
+                            if !has_gt {
+                                if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                    let n_alleles = ref_markers
+                                        .marker(MarkerIdx::new(marker_idx as u32))
+                                        .n_alleles();
+                                    let dosage = dosage_from_gp(n_alleles, &gp);
+                                    let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                                    v1 = p_alt;
+                                    v2 = p_alt;
                                 }
                             }
                         }
