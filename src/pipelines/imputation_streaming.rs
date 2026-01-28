@@ -1385,6 +1385,11 @@ impl crate::pipelines::ImputationPipeline {
                             state_haps.push(gid);
                             added += 1;
                         }
+                        if added == 0 {
+                            for h in 0..keep {
+                                state_haps.push(GlobalId::new(h as u32));
+                            }
+                        }
                     }
 
                     let state_priors = priors.and_then(|p| {
