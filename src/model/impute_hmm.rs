@@ -129,6 +129,7 @@ pub fn run_impute_hmm(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     total_ref_haps: usize,
+    ref_allele_freqs: &[Vec<f32>],
     ws: &mut ImputeWorkspace,
 ) -> (Vec<AllelePosteriors>, Option<Vec<f32>>) {
     let n_states = state_haps.len();
@@ -218,7 +219,28 @@ pub fn run_impute_hmm(
         for i in 0..n_states {
             constant_term += ws.bwd[i] * ws.emissions[i];
         }
-        let inv_c = 1.0 / constant_term.max(1e-30);
+        let mut background_emit = 0.0f32;
+        if m_rev < ref_allele_freqs.len() {
+            let freqs = &ref_allele_freqs[m_rev];
+            for (allele_idx, &f) in freqs.iter().enumerate() {
+                if f <= 0.0 {
+                    continue;
+                }
+                if allele_idx > 254 {
+                    continue;
+                }
+                let e = emission_prob_soft(allele_idx as u8, probs, error_rate);
+                background_emit += f * e;
+            }
+        }
+        let avg_bwd = if n_states > 0 {
+            ws.bwd.iter().sum::<f32>() / n_states as f32
+        } else {
+            1.0
+        };
+        let missing = total_ref_haps.saturating_sub(n_states) as f32;
+        let constant_full = constant_term + missing * avg_bwd * background_emit;
+        let inv_c = 1.0 / constant_full.max(1e-30);
         let scale = (1.0 - recomb_rate) * inv_c;
         let shift = recomb_rate / total_ref_haps.max(1) as f32;
         for i in 0..n_states {

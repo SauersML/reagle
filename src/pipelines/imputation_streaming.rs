@@ -261,7 +261,7 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
 
     let mut query_alleles = vec![255u8; batch_haps.len()];
-    let mut ref_bins: Vec<Vec<u32>> = Vec::new();
+        let mut ref_bins: Vec<Vec<u32>> = Vec::new();
 
     for m in 0..n_markers {
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
@@ -295,9 +295,10 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
                 continue;
             }
             let idx = mapped as usize;
-            if idx < n_alleles {
-                ref_bins[idx].push(rh as u32);
+            if idx >= ref_bins.len() {
+                ref_bins.resize_with(idx + 1, Vec::new);
             }
+            ref_bins[idx].push(rh as u32);
         }
 
         for (i, _) in batch_haps.iter().enumerate() {
@@ -532,160 +533,145 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
     let sampling = build_sampling_points(&gen_positions, step_cm);
     let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
 
-    let batch_size = estimate_scan_batch_size(
-        available_memory_bytes().unwrap_or(0),
-        n_ref_haps,
-        n_target_haps,
-    );
+    let mut score_maps: Vec<HashMap<usize, f32>> = Vec::with_capacity(n_target_haps);
+    for _ in 0..n_target_haps {
+        score_maps.push(HashMap::with_capacity(dynamic_budget.saturating_mul(2)));
+    }
+
+    let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
+    let mut beams_fwd: Vec<RankBeam> = (0..n_target_haps)
+        .map(|_| RankBeam::full(n_ref_haps as u32))
+        .collect();
+    let mut ref_alleles = vec![0u8; n_ref_haps];
+    let mut query_alleles = vec![0u8; n_target_haps];
+    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+    let k_per_hap = PBWT_MAX_PER_HAP.min(n_ref_haps).max(1);
+
+    for m in 0..n_markers {
+        for hap_idx in 0..n_target_haps {
+            query_alleles[hap_idx] =
+                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+        }
+        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+            for rh in 0..n_ref_haps {
+                let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
+            }
+        } else {
+            ref_alleles.fill(255);
+        }
+
+        let mut is_biallelic = true;
+        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+            if a >= 2 && a != 255 {
+                is_biallelic = false;
+                break;
+            }
+        }
+        let n_alleles = if is_biallelic { 2 } else { 256 };
+        pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
+
+        if sampling[m] {
+            for i in 0..n_target_haps {
+                let targ = query_alleles[i];
+                if targ == 255 {
+                    continue;
+                }
+                let freq = freqs
+                    .get(m)
+                    .and_then(|f| f.get(targ as usize))
+                    .copied()
+                    .unwrap_or(0.0);
+                if freq <= 0.0 {
+                    continue;
+                }
+                let weight = -(freq.max(min_freq)).ln();
+                let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
+                let map = &mut score_maps[i];
+                for d in donors {
+                    let idx = d as usize;
+                    if idx < n_ref_haps {
+                        let ref_a = ref_alleles[idx];
+                        if ref_a == 255 || ref_a != targ {
+                            continue;
+                        }
+                        let entry = map.entry(idx).or_insert(0.0);
+                        *entry += weight;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
+    let mut beams_bwd: Vec<RankBeam> = (0..n_target_haps)
+        .map(|_| RankBeam::full(n_ref_haps as u32))
+        .collect();
+    for (rev_step, m) in (0..n_markers).rev().enumerate() {
+        for hap_idx in 0..n_target_haps {
+            query_alleles[hap_idx] =
+                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+        }
+        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+            for rh in 0..n_ref_haps {
+                let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
+            }
+        } else {
+            ref_alleles.fill(255);
+        }
+
+        let mut is_biallelic = true;
+        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+            if a >= 2 && a != 255 {
+                is_biallelic = false;
+                break;
+            }
+        }
+        let n_alleles = if is_biallelic { 2 } else { 256 };
+        pbwt_bwd.advance_with_beams(
+            &ref_alleles,
+            n_alleles,
+            rev_step,
+            &query_alleles,
+            &mut beams_bwd,
+        );
+
+        if sampling[m] {
+            for i in 0..n_target_haps {
+                let targ = query_alleles[i];
+                if targ == 255 {
+                    continue;
+                }
+                let freq = freqs
+                    .get(m)
+                    .and_then(|f| f.get(targ as usize))
+                    .copied()
+                    .unwrap_or(0.0);
+                if freq <= 0.0 {
+                    continue;
+                }
+                let weight = -(freq.max(min_freq)).ln();
+                let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
+                let map = &mut score_maps[i];
+                for d in donors {
+                    let idx = d as usize;
+                    if idx < n_ref_haps {
+                        let ref_a = ref_alleles[idx];
+                        if ref_a == 255 || ref_a != targ {
+                            continue;
+                        }
+                        let entry = map.entry(idx).or_insert(0.0);
+                        *entry += weight;
+                    }
+                }
+            }
+        }
+    }
+
     let mut out = vec![Vec::new(); n_target_haps];
-
-    let mut batch_start = 0usize;
-    while batch_start < n_target_haps {
-        let batch_end = (batch_start + batch_size).min(n_target_haps);
-        let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
-        let batch_len = batch_haps.len();
-
-        let mut score_maps: Vec<HashMap<usize, f32>> = Vec::with_capacity(batch_len);
-        for _ in 0..batch_len {
-            score_maps.push(HashMap::new());
-        }
-
-        let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
-        let mut beams_fwd: Vec<RankBeam> = (0..batch_len)
-            .map(|_| RankBeam::full(n_ref_haps as u32))
-            .collect();
-        let mut ref_alleles = vec![0u8; n_ref_haps];
-        let mut query_alleles = vec![0u8; batch_len];
-        let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
-        let k_per_hap = PBWT_MAX_PER_HAP.min(n_ref_haps).max(1);
-
-        for m in 0..n_markers {
-            for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                query_alleles[i] =
-                    target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-            }
-            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-                for rh in 0..n_ref_haps {
-                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-                    ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
-                }
-            } else {
-                ref_alleles.fill(255);
-            }
-
-            let mut is_biallelic = true;
-            for &a in ref_alleles.iter().chain(query_alleles.iter()) {
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
-                }
-            }
-            let n_alleles = if is_biallelic { 2 } else { 256 };
-            pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
-
-            if sampling[m] {
-                for i in 0..batch_len {
-                    let targ = query_alleles[i];
-                    if targ == 255 {
-                        continue;
-                    }
-                    let freq = freqs
-                        .get(m)
-                        .and_then(|f| f.get(targ as usize))
-                        .copied()
-                        .unwrap_or(0.0);
-                    if freq <= 0.0 {
-                        continue;
-                    }
-                    let weight = -(freq.max(min_freq)).ln();
-                    let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
-                    let map = &mut score_maps[i];
-                    for d in donors {
-                        let idx = d as usize;
-                        if idx < n_ref_haps {
-                            let ref_a = ref_alleles[idx];
-                            if ref_a == 255 || ref_a != targ {
-                                continue;
-                            }
-                            let entry = map.entry(idx).or_insert(0.0);
-                            *entry += weight;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
-        let mut beams_bwd: Vec<RankBeam> = (0..batch_len)
-            .map(|_| RankBeam::full(n_ref_haps as u32))
-            .collect();
-        for (rev_step, m) in (0..n_markers).rev().enumerate() {
-            for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                query_alleles[i] =
-                    target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-            }
-            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-                for rh in 0..n_ref_haps {
-                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-                    ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
-                }
-            } else {
-                ref_alleles.fill(255);
-            }
-
-            let mut is_biallelic = true;
-            for &a in ref_alleles.iter().chain(query_alleles.iter()) {
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
-                }
-            }
-            let n_alleles = if is_biallelic { 2 } else { 256 };
-            pbwt_bwd.advance_with_beams(
-                &ref_alleles,
-                n_alleles,
-                rev_step,
-                &query_alleles,
-                &mut beams_bwd,
-            );
-
-            if sampling[m] {
-                for i in 0..batch_len {
-                    let targ = query_alleles[i];
-                    if targ == 255 {
-                        continue;
-                    }
-                    let freq = freqs
-                        .get(m)
-                        .and_then(|f| f.get(targ as usize))
-                        .copied()
-                        .unwrap_or(0.0);
-                    if freq <= 0.0 {
-                        continue;
-                    }
-                    let weight = -(freq.max(min_freq)).ln();
-                    let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
-                    let map = &mut score_maps[i];
-                    for d in donors {
-                        let idx = d as usize;
-                        if idx < n_ref_haps {
-                            let ref_a = ref_alleles[idx];
-                            if ref_a == 255 || ref_a != targ {
-                                continue;
-                            }
-                            let entry = map.entry(idx).or_insert(0.0);
-                            *entry += weight;
-                        }
-                    }
-                }
-            }
-        }
-
-        for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            out[hap_idx] = select_top_k_map(&score_maps[i], dynamic_budget);
-        }
-
-        batch_start = batch_end;
+    for hap_idx in 0..n_target_haps {
+        out[hap_idx] = select_top_k_map(&score_maps[hap_idx], dynamic_budget);
     }
 
     out
@@ -1787,6 +1773,7 @@ impl crate::pipelines::ImputationPipeline {
                             prior_marker_idx,
                             state_priors.as_deref(),
                             plan.n_ref_haps,
+                            &ref_allele_freqs,
                             ws,
                         )
                     });
