@@ -268,22 +268,7 @@ pub fn run_impute_hmm(
             ws.emissions[i] = emission_prob_soft(ref_allele, probs, error_rate);
         }
 
-        let mut constant_term = 0.0f32;
-        for i in 0..active_states {
-            constant_term += ws.bwd[i] * ws.emissions[i];
-        }
-        let constant_full = constant_term;
-        let inv_c = 1.0 / constant_full.max(1e-30);
-        let scale = (1.0 - recomb_rate) * inv_c;
-        let shift = if active_states > 0 {
-            recomb_rate / active_states as f32
-        } else {
-            0.0
-        };
-        for i in 0..active_states {
-            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
-        }
-
+        // Calculate posterior using current backward values (before update)
         let start = m_rev * active_states;
         let fwd_slice = &ws.fwd_history[start..start + active_states];
 
@@ -297,6 +282,7 @@ pub fn run_impute_hmm(
                 if ref_allele == 255 {
                     continue;
                 }
+                // Use current bwd (B_m) with current fwd (F_m)
                 let state_prob = fwd_slice[i] * ws.bwd[i];
                 total += state_prob;
                 let idx = ref_allele as usize;
@@ -346,6 +332,7 @@ pub fn run_impute_hmm(
             let mut state_post = vec![0.0f32; active_states];
             let mut total = 0.0f32;
             for i in 0..active_states {
+                // Use current bwd
                 let v = fwd_slice[i] * ws.bwd[i];
                 state_post[i] = v;
                 total += v;
@@ -357,6 +344,24 @@ pub fn run_impute_hmm(
                 }
             }
             prior_state_post = Some(state_post);
+        }
+
+        // Update backward values for next iteration (B_m -> B_{m-1})
+        // B_{m-1}(i) = (1-r) * E_m(i) * B_m(i) + (r/N) * sum_j(E_m(j) * B_m(j))
+        let mut constant_term = 0.0f32;
+        for i in 0..active_states {
+            constant_term += ws.bwd[i] * ws.emissions[i];
+        }
+        let constant_full = constant_term;
+        let inv_c = 1.0 / constant_full.max(1e-30);
+        let scale = (1.0 - recomb_rate) * inv_c;
+        let shift = if active_states > 0 {
+            recomb_rate / active_states as f32
+        } else {
+            0.0
+        };
+        for i in 0..active_states {
+            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
         }
     }
 
