@@ -770,9 +770,28 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
 
         // Compute MAF for each marker (used by IBS2 and two-stage phasing)
-        let maf: Vec<f32> = (0..n_markers)
-            .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
-            .collect();
+        // If reference is available, include it in MAF calculation to correctly
+        // classify markers that are monomorphic in target but polymorphic in reference.
+        let maf: Vec<f32> = if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            (0..n_markers)
+                .map(|m| {
+                    let m_idx = MarkerIdx::new(m as u32);
+                    let target_maf = target_gt.column(m_idx).maf() as f32;
+                    if let Some(ref_idx) = alignment.target_to_ref(m_idx) {
+                        let ref_maf = ref_gt.column(ref_idx).maf() as f32;
+                        // Use the maximum of target and reference MAF to avoid skipping
+                        // variants that are rare/missing in target but present in reference.
+                        target_maf.max(ref_maf)
+                    } else {
+                        target_maf
+                    }
+                })
+                .collect()
+        } else {
+            (0..n_markers)
+                .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+                .collect()
+        };
 
         // TWO-STAGE PHASING: Classify markers by frequency
         // Stage 1 (high-frequency): Run full HMM - these markers provide phasing signal
@@ -941,7 +960,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // STAGE 2: Phase rare markers using HMM state probability interpolation
         // This implements the proper algorithm from Java Beagle's Stage2Baum.java
-        if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
+        if self.config.impute && !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
             eprintln!(
                 "Stage 2: Phasing {} rare markers using HMM interpolation...",
                 rare_markers.len()
@@ -1471,7 +1490,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             .map(|&m| gen_positions_vec[m])
             .collect();
 
-        let next_overlap_handoff = if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
+        let next_overlap_handoff = if self.config.impute && !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
             eprintln!(
                 "Stage 2: Phasing {} rare markers using HMM interpolation...",
                 rare_markers.len()

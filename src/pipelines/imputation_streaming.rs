@@ -1253,6 +1253,9 @@ target_samples={} target_bytes={}",
         // This ensures parameter consistency between imputation and phasing steps
         let mut phasing_config = self.config.clone();
         phasing_config.err = Some(self.params.p_mismatch);
+        // Disable internal imputation in PhasingPipeline so it doesn't "fill in" missing data
+        // with simplified Stage 2 imputation. We want the full ImputationPipeline HMM to handle it.
+        phasing_config.impute = false;
 
         let mut phasing =
             crate::pipelines::PhasingPipeline::new(phasing_config, self.telemetry.clone());
@@ -1612,10 +1615,19 @@ target_samples={} target_bytes={}",
                             && (mapped_partner as usize) < n_alleles
                             && mapped_partner != mapped_allele;
                         let phase_conf = if is_het {
-                            target_win.sample_phase_confidence_f32(
+                            let raw_conf = target_win.sample_phase_confidence_f32(
                                 MarkerIdx::new(target_m as u32),
                                 sample_idx,
-                            )
+                            );
+                            // Boost confidence if it's already reasonably confident (>=0.5)
+                            // This ensures we don't let priors dominate when we have phasing info.
+                            // Even for ambiguous sites (0.5), we prefer to lock in a phase to avoid
+                            // "Perfect LD Trap" where the HMM collapses heterozygotes to homozygotes.
+                            if raw_conf >= 0.5 {
+                                raw_conf.max(ModelParams::MIN_IMP_PHASE_CONFIDENCE)
+                            } else {
+                                raw_conf
+                            }
                         } else {
                             1.0
                         };
