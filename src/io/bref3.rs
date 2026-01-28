@@ -39,8 +39,6 @@ use crate::data::marker::{
 };
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, SeqCodedBlock, SeqCodedColumn};
-use crate::model::block_hash::{CompressedBlock, ReferenceMap};
-use crate::model::parameters::ModelParams;
 
 pub type TargetMarkerIndex = HashMap<String, HashSet<u32>>;
 
@@ -426,11 +424,6 @@ impl StreamingBref3Reader {
         Arc::clone(&self.samples)
     }
 
-    /// Get number of haplotypes
-    pub fn n_haps(&self) -> usize {
-        self.n_haps
-    }
-
     /// Read the next block from the file
     ///
     /// Returns None when all data has been read
@@ -627,9 +620,6 @@ impl StreamingBref3WindowReader {
         &mut self,
         config: &crate::io::streaming::StreamingConfig,
         gen_maps: &GeneticMaps,
-        params: &ModelParams,
-        block_size: usize,
-        max_states: usize,
         target_positions: Option<&TargetMarkerIndex>,
     ) -> Result<Option<RefWindow>> {
         if self.eof && self.buffer.is_empty() && self.pending_block.is_none() {
@@ -640,13 +630,7 @@ impl StreamingBref3WindowReader {
         let mut markers = Markers::<RefWindowSpace>::new();
         let mut phasing_markers = Markers::<RefPhasingSpace>::new();
         let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
-        let mut full_columns: Option<Vec<GenotypeColumn>> =
-            if max_states > 0 { Some(Vec::new()) } else { None };
-        let mut window_gen_pos: Vec<f64> = Vec::new();
-        let mut blocks: Vec<Arc<CompressedBlock>> = Vec::new();
-        let mut block_markers: Vec<Marker> = Vec::with_capacity(block_size);
-        let mut block_columns: Vec<GenotypeColumn> = Vec::with_capacity(block_size);
-        let mut block_gen_pos: Vec<f64> = Vec::with_capacity(block_size);
+        let mut ref_columns: Vec<GenotypeColumn> = Vec::new();
         let mut next_overlap: VecDeque<Bref3BufferedMarker> = VecDeque::new();
 
         let mut window_start_gen: Option<f64> = None;
@@ -656,7 +640,6 @@ impl StreamingBref3WindowReader {
         let mut window_size = 0usize;
         let mut window_chrom_idx: Option<ChromIdx> = None;
         let mut phasing_chrom_idx: Option<ChromIdx> = None;
-        let mut end_of_chrom = false;
 
         loop {
             if window_size >= config.max_markers {
@@ -670,7 +653,6 @@ impl StreamingBref3WindowReader {
             };
 
             let Some(marker) = next_marker else {
-                end_of_chrom = true;
                 break;
             };
 
@@ -696,10 +678,7 @@ impl StreamingBref3WindowReader {
                 window_marker.chrom = idx;
             }
             markers.push(window_marker.clone());
-            window_gen_pos.push(marker.gen_pos);
-            if let Some(cols) = full_columns.as_mut() {
-                cols.push(marker.column.clone());
-            }
+            ref_columns.push(marker.column.clone());
 
             if let Some(ref_chrom) = self.current_chrom.as_deref() {
                 if marker_in_target(ref_chrom, marker.marker.pos, target_positions) {
@@ -719,64 +698,14 @@ impl StreamingBref3WindowReader {
                 next_overlap.push_back(marker.clone());
             }
 
-            block_markers.push(window_marker);
-            block_columns.push(marker.column.clone());
-            block_gen_pos.push(marker.gen_pos);
             window_size += 1;
-
-            if block_markers.len() == block_size {
-                let mut recomb_rates = Vec::with_capacity(block_markers.len().saturating_sub(1));
-                for i in 0..block_gen_pos.len().saturating_sub(1) {
-                    let dist_cm = (block_gen_pos[i + 1] - block_gen_pos[i]).abs();
-                    recomb_rates.push(params.p_recomb(dist_cm));
-                }
-                let start_marker = window_size - block_markers.len();
-                let block =
-                    crate::model::block_hash::compression::build_compressed_block_from_columns(
-                        &block_markers,
-                        &block_columns,
-                        start_marker,
-                        max_states,
-                        &recomb_rates,
-                    );
-                blocks.push(Arc::new(block));
-                block_markers.clear();
-                block_columns.clear();
-                block_gen_pos.clear();
-            }
         }
 
-        if block_markers.is_empty() && window_size == 0 {
+        if markers.len() == 0 && window_size == 0 {
             self.buffer = carryover;
             return Ok(None);
         }
 
-        if !block_markers.is_empty() {
-            let mut recomb_rates = Vec::with_capacity(block_markers.len().saturating_sub(1));
-            for i in 0..block_gen_pos.len().saturating_sub(1) {
-                let dist_cm = (block_gen_pos[i + 1] - block_gen_pos[i]).abs();
-                recomb_rates.push(params.p_recomb(dist_cm));
-            }
-            let start_marker = window_size - block_markers.len();
-            let block = crate::model::block_hash::compression::build_compressed_block_from_columns(
-                &block_markers,
-                &block_columns,
-                start_marker,
-                max_states,
-                &recomb_rates,
-            );
-            blocks.push(Arc::new(block));
-        }
-
-        let mut boundary_rates = Vec::with_capacity(blocks.len().saturating_sub(1));
-        for i in 0..blocks.len().saturating_sub(1) {
-            let left_idx = blocks[i].end_marker - 1;
-            let right_idx = blocks[i + 1].start_marker;
-            let dist_cm = (window_gen_pos[right_idx] - window_gen_pos[left_idx]).abs();
-            boundary_rates.push(params.p_recomb(dist_cm));
-        }
-
-        let ref_map = ReferenceMap::build_from_blocks(blocks, &boundary_rates, block_size);
         let output_end = output_end.unwrap_or(window_size);
         let ref_genotypes = if phasing_columns.is_empty() {
             None
@@ -787,7 +716,7 @@ impl StreamingBref3WindowReader {
                 self.inner.samples_arc(),
             ))
         };
-        let ref_columns_full = full_columns;
+        let ref_columns = ref_columns;
 
         if carryover.is_empty() {
             self.buffer = next_overlap;
@@ -796,20 +725,16 @@ impl StreamingBref3WindowReader {
             self.buffer = carryover;
         }
         self.global_marker_idx += output_end;
-        let is_first = self.window_num == 0;
         self.window_num += 1;
 
         Ok(Some(RefWindow {
             markers,
-            ref_map,
+            ref_columns,
             ref_genotypes,
-            ref_columns_full,
             global_start: self.global_marker_idx - output_end,
             global_end: (self.global_marker_idx - output_end) + window_size,
             output_start: 0,
             output_end,
-            is_first,
-            is_last: end_of_chrom,
         }))
     }
 
@@ -876,13 +801,11 @@ impl StreamingBref3WindowReader {
 pub struct RefWindow {
     /// Marker metadata for this window
     pub markers: Markers<RefWindowSpace>,
-    /// Compressed reference map for this window
-    pub ref_map: Arc<ReferenceMap>,
+    /// Reference genotype columns for this window
+    pub ref_columns: Vec<GenotypeColumn>,
     /// Optional phased reference genotypes (used for reference-guided phasing)
     pub ref_genotypes:
         Option<GenotypeMatrix<crate::data::storage::phase_state::Phased, RefPhasingSpace>>,
-    /// Optional full-window reference columns (used for PBWT keep-mask rebuild)
-    pub ref_columns_full: Option<Vec<GenotypeColumn>>,
     /// Global start marker index
     pub global_start: usize,
     /// Global end marker index (exclusive)
@@ -891,10 +814,6 @@ pub struct RefWindow {
     pub output_start: usize,
     /// Output end index within window (before overlap for next)
     pub output_end: usize,
-    /// Whether this is the first window
-    pub is_first: bool,
-    /// Whether this is the last window
-    pub is_last: bool,
 }
 
 /// Unified reference panel reader that supports both BREF3 (streaming) and VCF (in-memory)
@@ -910,28 +829,11 @@ impl RefPanelReader {
         &mut self,
         config: &crate::io::streaming::StreamingConfig,
         gen_maps: &GeneticMaps,
-        params: &ModelParams,
-        block_size: usize,
-        max_states: usize,
         target_positions: Option<&TargetMarkerIndex>,
     ) -> Result<Option<RefWindow>> {
         match self {
-            RefPanelReader::Bref3(r) => r.next_window(
-                config,
-                gen_maps,
-                params,
-                block_size,
-                max_states,
-                target_positions,
-            ),
-            RefPanelReader::StreamingVcf(r) => r.next_window(
-                config,
-                gen_maps,
-                params,
-                block_size,
-                max_states,
-                target_positions,
-            ),
+            RefPanelReader::Bref3(r) => r.next_window(config, gen_maps, target_positions),
+            RefPanelReader::StreamingVcf(r) => r.next_window(config, gen_maps, target_positions),
         }
     }
 }
@@ -1077,9 +979,6 @@ impl StreamingRefVcfReader {
         &mut self,
         config: &crate::io::streaming::StreamingConfig,
         gen_maps: &GeneticMaps,
-        params: &ModelParams,
-        block_size: usize,
-        max_states: usize,
         target_positions: Option<&TargetMarkerIndex>,
     ) -> Result<Option<RefWindow>> {
         if self.eof && self.buffer.is_empty() && self.pending_marker.is_none() {
@@ -1090,13 +989,7 @@ impl StreamingRefVcfReader {
         let mut markers = Markers::<RefWindowSpace>::new();
         let mut phasing_markers = Markers::<RefPhasingSpace>::new();
         let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
-        let mut full_columns: Option<Vec<GenotypeColumn>> =
-            if max_states > 0 { Some(Vec::new()) } else { None };
-        let mut window_gen_pos: Vec<f64> = Vec::new();
-        let mut blocks: Vec<Arc<CompressedBlock>> = Vec::new();
-        let mut block_markers: Vec<Marker> = Vec::with_capacity(block_size);
-        let mut block_columns: Vec<GenotypeColumn> = Vec::with_capacity(block_size);
-        let mut block_gen_pos: Vec<f64> = Vec::with_capacity(block_size);
+        let mut ref_columns: Vec<GenotypeColumn> = Vec::new();
         let mut next_overlap: VecDeque<RefPanelMarker> = VecDeque::new();
 
         let mut window_start_gen: Option<f64> = None;
@@ -1106,7 +999,6 @@ impl StreamingRefVcfReader {
         let mut window_size = 0usize;
         let mut window_chrom_idx: Option<ChromIdx> = None;
         let mut phasing_chrom_idx: Option<ChromIdx> = None;
-        let mut end_of_chrom = false;
 
         loop {
             if window_size >= config.max_markers {
@@ -1122,7 +1014,6 @@ impl StreamingRefVcfReader {
             };
 
             let Some(marker) = next_marker else {
-                end_of_chrom = true;
                 break;
             };
 
@@ -1135,7 +1026,6 @@ impl StreamingRefVcfReader {
                         self.global_marker_idx = 0;
                     } else {
                         self.pending_marker = Some(marker);
-                        end_of_chrom = true;
                         break;
                     }
                 }
@@ -1165,10 +1055,7 @@ impl StreamingRefVcfReader {
                 window_marker.chrom = idx;
             }
             markers.push(window_marker.clone());
-            window_gen_pos.push(marker.gen_pos);
-            if let Some(cols) = full_columns.as_mut() {
-                cols.push(marker.column.clone());
-            }
+            ref_columns.push(marker.column.clone());
 
             if let Some(chrom_name) = self.current_chrom.as_deref() {
                 if marker_in_target(chrom_name, marker.marker.pos, target_positions) {
@@ -1188,64 +1075,14 @@ impl StreamingRefVcfReader {
                 next_overlap.push_back(marker.clone());
             }
 
-            block_markers.push(window_marker);
-            block_columns.push(marker.column.clone());
-            block_gen_pos.push(marker.gen_pos);
             window_size += 1;
-
-            if block_markers.len() == block_size {
-                let mut recomb_rates = Vec::with_capacity(block_markers.len().saturating_sub(1));
-                for i in 0..block_gen_pos.len().saturating_sub(1) {
-                    let dist_cm = (block_gen_pos[i + 1] - block_gen_pos[i]).abs();
-                    recomb_rates.push(params.p_recomb(dist_cm));
-                }
-                let start_marker = window_size - block_markers.len();
-                let block =
-                    crate::model::block_hash::compression::build_compressed_block_from_columns(
-                        &block_markers,
-                        &block_columns,
-                        start_marker,
-                        max_states,
-                        &recomb_rates,
-                    );
-                blocks.push(Arc::new(block));
-                block_markers.clear();
-                block_columns.clear();
-                block_gen_pos.clear();
-            }
         }
 
-        if block_markers.is_empty() && window_size == 0 {
+        if markers.len() == 0 && window_size == 0 {
             self.buffer = carryover;
             return Ok(None);
         }
 
-        if !block_markers.is_empty() {
-            let mut recomb_rates = Vec::with_capacity(block_markers.len().saturating_sub(1));
-            for i in 0..block_gen_pos.len().saturating_sub(1) {
-                let dist_cm = (block_gen_pos[i + 1] - block_gen_pos[i]).abs();
-                recomb_rates.push(params.p_recomb(dist_cm));
-            }
-            let start_marker = window_size - block_markers.len();
-            let block = crate::model::block_hash::compression::build_compressed_block_from_columns(
-                &block_markers,
-                &block_columns,
-                start_marker,
-                max_states,
-                &recomb_rates,
-            );
-            blocks.push(Arc::new(block));
-        }
-
-        let mut boundary_rates = Vec::with_capacity(blocks.len().saturating_sub(1));
-        for i in 0..blocks.len().saturating_sub(1) {
-            let left_idx = blocks[i].end_marker - 1;
-            let right_idx = blocks[i + 1].start_marker;
-            let dist_cm = (window_gen_pos[right_idx] - window_gen_pos[left_idx]).abs();
-            boundary_rates.push(params.p_recomb(dist_cm));
-        }
-
-        let ref_map = ReferenceMap::build_from_blocks(blocks, &boundary_rates, block_size);
         let output_end = output_end.unwrap_or(window_size);
         let ref_genotypes = if phasing_columns.is_empty() {
             None
@@ -1256,7 +1093,7 @@ impl StreamingRefVcfReader {
                 Arc::clone(&self.samples),
             ))
         };
-        let ref_columns_full = full_columns;
+        let ref_columns = ref_columns;
 
         if carryover.is_empty() {
             self.buffer = next_overlap;
@@ -1265,20 +1102,16 @@ impl StreamingRefVcfReader {
             self.buffer = carryover;
         }
         self.global_marker_idx += output_end;
-        let is_first = self.window_num == 0;
         self.window_num += 1;
 
         Ok(Some(RefWindow {
             markers,
-            ref_map,
+            ref_columns,
             ref_genotypes,
-            ref_columns_full,
             global_start: self.global_marker_idx - output_end,
             global_end: (self.global_marker_idx - output_end) + window_size,
             output_start: 0,
             output_end,
-            is_first,
-            is_last: end_of_chrom,
         }))
     }
 

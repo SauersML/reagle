@@ -173,6 +173,69 @@ impl<T> std::ops::IndexMut<PatternId> for Vec<T> {
     }
 }
 
+/// HMM state index (0..n_states)
+///
+/// Distinct from GlobalId to avoid mixing reference hap IDs with local state indices.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StateId(pub u32);
+
+impl StateId {
+    #[inline]
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    #[inline]
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Debug for StateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StateId({})", self.0)
+    }
+}
+
+impl fmt::Display for StateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "S{}", self.0)
+    }
+}
+
+impl From<u32> for StateId {
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<usize> for StateId {
+    fn from(id: usize) -> Self {
+        Self(id as u32)
+    }
+}
+
+impl<T> std::ops::Index<StateId> for Vec<T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, id: StateId) -> &Self::Output {
+        &self[id.as_usize()]
+    }
+}
+
+impl<T> std::ops::IndexMut<StateId> for Vec<T> {
+    #[inline]
+    fn index_mut(&mut self, id: StateId) -> &mut Self::Output {
+        &mut self[id.as_usize()]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

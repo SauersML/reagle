@@ -8,7 +8,7 @@
 //! - `ThreadedHaps` stores segments in a linked-list arena for O(1) updates
 //! - `MosaicCursor` provides SIMD-friendly state access for the HMM hot path
 
-use crate::model::block_hash::types::GlobalId;
+use crate::model::types::GlobalId;
 
 /// Arena-based storage for composite haplotypes using threaded indices.
 ///

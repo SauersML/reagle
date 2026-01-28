@@ -138,15 +138,6 @@ impl TelemetryBlackboard {
         self.touch_progress();
     }
 
-    pub fn set_current_window(&self, window: u64) {
-        self.current_window.store(window, Ordering::Relaxed);
-        self.touch_progress();
-    }
-
-    pub fn set_total_windows(&self, total: u64) {
-        self.total_windows.store(total, Ordering::Relaxed);
-        self.touch_progress();
-    }
 
     pub fn set_current_iteration(&self, iter: u64) {
         self.current_iteration.store(iter, Ordering::Relaxed);
@@ -196,13 +187,6 @@ impl TelemetryBlackboard {
         self.touch_progress();
     }
 
-    pub fn set_producer_op(&self, op: &str) {
-        if let Ok(mut guard) = self.producer_op.write() {
-            guard.clear();
-            guard.push_str(op);
-        }
-        self.touch_progress();
-    }
 
     pub fn set_consumer_op(&self, op: &str) {
         if let Ok(mut guard) = self.consumer_op.write() {
@@ -212,23 +196,6 @@ impl TelemetryBlackboard {
         self.touch_progress();
     }
 
-    pub fn set_channel_capacity(&self, capacity: u64) {
-        self.channel_capacity.store(capacity, Ordering::Relaxed);
-    }
-
-    pub fn inc_channel_depth(&self) {
-        self.channel_depth.fetch_add(1, Ordering::Relaxed);
-        self.touch_progress();
-    }
-
-    pub fn dec_channel_depth(&self) {
-        self.channel_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                Some(val.saturating_sub(1))
-            })
-            .ok();
-        self.touch_progress();
-    }
 
     #[inline]
     pub fn stage(&self) -> Stage {

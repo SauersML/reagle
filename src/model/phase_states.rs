@@ -20,7 +20,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
-use crate::model::block_hash::types::GlobalId;
+use crate::model::types::GlobalId;
 use crate::model::states::ThreadedHaps;
 
 /// Entry in the priority queue for managing composite haplotypes

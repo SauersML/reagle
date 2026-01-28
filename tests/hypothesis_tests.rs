@@ -13,7 +13,7 @@ use reagle::model::ibs2::Ibs2;
 use reagle::model::phase_states::PhaseStates;
 use reagle::model::phase_ibs::BidirectionalPhaseIbs;
 use reagle::model::pl_emission::allele_probs_uncond_from_pl;
-use reagle::model::block_hash::types::GlobalId;
+use reagle::model::types::GlobalId;
 use reagle::pipelines::phasing::PhasingPipeline;
 use reagle::{Config, GeneticMaps, ImputationPipeline, MarkerIdx, SampleIdx, VcfReader};
 

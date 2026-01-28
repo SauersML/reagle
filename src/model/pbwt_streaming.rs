@@ -224,11 +224,6 @@ impl PbwtWavefront {
         }
         (start, end)
     }
-    /// Create a new streaming PBWT wavefront
-    pub fn new(n_haps: usize, n_markers: usize) -> Self {
-        Self::with_state(n_haps, n_markers, None)
-    }
-
     /// Create a new streaming PBWT wavefront with optional initial state
     pub fn with_state(
         n_haps: usize,
@@ -439,7 +434,7 @@ mod tests {
     fn test_wavefront_basic() {
         let n_haps = 100;
         let n_markers = 1000;
-        let mut wavefront = PbwtWavefront::new(n_haps, n_markers);
+        let mut wavefront = PbwtWavefront::with_state(n_haps, n_markers, None);
 
         // Forward pass with simple biallelic data
         wavefront.reset_forward();
@@ -459,7 +454,7 @@ mod tests {
     fn test_bidirectional() {
         let n_haps = 50;
         let n_markers = 500;
-        let mut wavefront = PbwtWavefront::new(n_haps, n_markers);
+        let mut wavefront = PbwtWavefront::with_state(n_haps, n_markers, None);
 
         // Generate consistent allele data
         let alleles: Vec<Vec<u8>> = (0..n_markers)

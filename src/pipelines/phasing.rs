@@ -59,7 +59,7 @@ impl std::ops::Deref for StreamWindowWithResult {
 }
 use crate::data::alignment::MarkerAlignment;
 use crate::model::allele_lookup::RefAlleleLookup;
-use crate::model::block_hash::types::GlobalId;
+use crate::model::types::GlobalId;
 use crate::model::hmm::BeagleHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
@@ -714,8 +714,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             );
 
             // Store in pipeline struct for use during phasing iterations
-            self.alignment = Some(alignment);
-            self.reference_gt = Some(Arc::new(ref_gt));
+            self.set_reference(Arc::new(ref_gt), alignment);
         }
 
         // Compute combined haplotype count
@@ -6108,37 +6107,6 @@ impl Stage2Phaser {
 }
 
 impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
-    /// Phase a window with PBWT state handoff from previous window
-    ///
-    /// This maintains PBWT continuity across windows by passing the
-    /// prefix array (PPA) and divergence array from the end of the
-    /// previous window to initialize the current window's PBWT.
-    pub fn phase_window_with_pbwt_handoff(
-        &mut self,
-        target_gt: &GenotypeMatrix,
-        gen_maps: &GeneticMaps,
-        phased_overlap: Option<&PhasedOverlap>,
-        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
-    ) -> Result<GenotypeMatrix<Phased>> {
-        // Log PBWT continuity state for debugging window transitions
-        if let Some(state) = pbwt_state {
-            tracing::trace!(
-                marker_pos = state.marker_pos,
-                n_haps = state.ppa.len(),
-                "PBWT state handoff from previous window"
-            );
-        }
-        self.phase_in_memory_with_overlap(
-            target_gt,
-            gen_maps,
-            phased_overlap,
-            None,
-            pbwt_state,
-            None,
-        )
-        .map(|(result, ..)| result)
-    }
-
     /// Finalize Stage 2 phasing using context from next window
     ///
     /// Finalize Stage 2 phasing with forward context from the next window.

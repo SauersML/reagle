@@ -38,9 +38,6 @@ impl ModelParams {
     /// Default phase states
     pub const DEFAULT_PHASE_STATES: usize = 280;
 
-    /// Default imputation states
-    pub const DEFAULT_IMP_STATES: usize = 1600;
-
     /// Default burnin iterations
     pub const DEFAULT_BURNIN: usize = 3;
 
@@ -89,38 +86,6 @@ impl ModelParams {
         }
     }
 
-    /// Create parameters for imputation
-    ///
-    /// # Arguments
-    /// * `n_ref_haps` - Number of reference haplotypes (used for recomb intensity)
-    /// * `n_total_haps` - Total haplotypes (ref + target, used for error rate)
-    /// * `ne` - Effective population size (from CLI or default)
-    /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
-    ///
-    /// Java ImpData uses different counts for different parameters:
-    /// - errProb: uses nHaps = nRefHaps + nTargHaps
-    /// - pRecomb: uses refGT.nHaps() (ref only)
-    pub fn for_imputation(
-        n_ref_haps: usize,
-        n_total_haps: usize,
-        ne: f32,
-        err: Option<f32>,
-    ) -> Self {
-        // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
-        // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
-
-        Self {
-            p_mismatch,
-            recomb_intensity,
-            n_states: Self::DEFAULT_IMP_STATES.min(n_total_haps),
-            burnin: 0,
-            iterations: 1,
-            lr_threshold: 1.0,
-            initial_lr: Self::DEFAULT_INITIAL_LR,
-        }
-    }
 
     /// Li-Stephens approximation for allele mismatch probability
     ///
