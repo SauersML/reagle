@@ -564,6 +564,7 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
         .collect();
     let mut ref_alleles = vec![0u8; n_ref_haps];
     let mut query_alleles = vec![0u8; n_target_haps];
+    let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
     let k_per_hap = PBWT_MAX_PER_HAP.min(n_ref_haps).max(1);
 
@@ -589,7 +590,14 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
             }
         }
         let n_alleles = if is_biallelic { 2 } else { 256 };
-        pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
+        pbwt_fwd.advance_with_beams_scratch(
+            &ref_alleles,
+            n_alleles,
+            m,
+            &query_alleles,
+            &mut beams_fwd,
+            &mut scratch,
+        );
 
         if sampling[m] {
             for i in 0..n_target_haps {
@@ -655,12 +663,13 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
             }
         }
         let n_alleles = if is_biallelic { 2 } else { 256 };
-        pbwt_bwd.advance_with_beams(
+        pbwt_bwd.advance_with_beams_scratch(
             &ref_alleles,
             n_alleles,
             rev_step,
             &query_alleles,
             &mut beams_bwd,
+            &mut scratch,
         );
 
         if sampling[m] {

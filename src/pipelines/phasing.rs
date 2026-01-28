@@ -2798,9 +2798,35 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                     let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
                         // SHAPEIT5-style dynamic MCMC: re-select states each step
-                        // Note: Dynamic MCMC doesn't use ThreadWorkspace yet
-                        let (swap_bits, swap_lr, swap_probs, new_paths) = if self.config.profile {
-                            info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
+                        let (swap_bits, swap_lr, swap_probs, new_paths) = THREAD_WORKSPACE.with(|ws| {
+                            let mut workspace = ws.borrow_mut();
+                            if workspace.is_none() {
+                                *workspace =
+                                    Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
+                            }
+                            let ws = workspace.as_mut().unwrap();
+                            if self.config.profile {
+                                info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
+                                    sample_dynamic_mcmc(
+                                        n_hi_freq,
+                                        n_states,
+                                        stage1_p_recomb,
+                                        &seq1,
+                                        &seq2,
+                                        &sample_conf,
+                                        phase_ibs.as_ref().expect("phase_ibs"),
+                                        ibs2,
+                                        s as u32,
+                                        &het_positions,
+                                        sample_seed,
+                                        self.config.mcmc_steps,
+                                        p_no_err,
+                                        p_err,
+                                        prior_paths.get(s).and_then(|p| p.as_ref()),
+                                        ws,
+                                    )
+                                })
+                            } else {
                                 sample_dynamic_mcmc(
                                     n_hi_freq,
                                     n_states,
@@ -2817,27 +2843,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     p_no_err,
                                     p_err,
                                     prior_paths.get(s).and_then(|p| p.as_ref()),
+                                    ws,
                                 )
-                            })
-                        } else {
-                            sample_dynamic_mcmc(
-                                n_hi_freq,
-                                n_states,
-                                stage1_p_recomb,
-                                &seq1,
-                                &seq2,
-                                &sample_conf,
-                                phase_ibs.as_ref().expect("phase_ibs"),
-                                ibs2,
-                                s as u32,
-                                &het_positions,
-                                sample_seed,
-                                self.config.mcmc_steps,
-                                p_no_err,
-                                p_err,
-                                prior_paths.get(s).and_then(|p| p.as_ref()),
-                            )
-                        };
+                            }
+                        });
                         (swap_bits, swap_lr, swap_probs, Some(new_paths))
                     } else {
                         // Classic Beagle-style: static state space MCMC with thread-local workspace
@@ -4976,6 +4985,7 @@ fn ffbs_haploid_constrained(
     p_no_err: f32,
     p_err: f32,
     rng: &mut rand::rngs::SmallRng,
+    workspace: &mut crate::utils::workspace::ThreadWorkspace,
 ) {
     use wide::f32x8;
 
@@ -4985,12 +4995,13 @@ fn ffbs_haploid_constrained(
 
     let actual_n_states = neighbors.len().min(n_states);
 
-    // Rolling forward probabilities (2 rows)
-    let mut fwd_curr = vec![0.0f32; actual_n_states];
-    let mut fwd_prev = vec![0.0f32; actual_n_states];
-
-    // Store forward probs at each marker for backward sampling (flat buffer)
-    let mut fwd_at_marker: Vec<f32> = vec![0.0f32; n_markers * actual_n_states];
+    workspace.ensure_ffbs(n_markers, actual_n_states);
+    let fwd_curr = &mut workspace.ffbs_fwd_curr;
+    let fwd_prev = &mut workspace.ffbs_fwd_prev;
+    let fwd_at_marker = &mut workspace.ffbs_fwd_at_marker;
+    let weights = &mut workspace.ffbs_weights;
+    fwd_curr[..actual_n_states].fill(0.0);
+    fwd_prev[..actual_n_states].fill(0.0);
 
     // Initialize at marker 0
     let init = 1.0f32 / actual_n_states as f32;
@@ -5009,11 +5020,11 @@ fn ffbs_haploid_constrained(
     }
     let mut fwd_sum: f32 = fwd_curr.iter().sum();
     fwd_sum = fwd_sum.max(1e-30);
-    fwd_at_marker[0..actual_n_states].copy_from_slice(&fwd_curr);
+    fwd_at_marker[0..actual_n_states].copy_from_slice(&fwd_curr[..actual_n_states]);
 
     // Forward pass
     for m in 1..n_markers {
-        std::mem::swap(&mut fwd_prev, &mut fwd_curr);
+        std::mem::swap(fwd_prev, fwd_curr);
 
         let r = p_recomb.get(m).copied().unwrap_or(0.0);
         let shift = r / actual_n_states as f32;
@@ -5133,15 +5144,15 @@ fn ffbs_haploid_constrained(
         fwd_sum = fwd_sum.max(1e-30);
 
         let start = m * actual_n_states;
-        fwd_at_marker[start..start + actual_n_states].copy_from_slice(&fwd_curr);
+        fwd_at_marker[start..start + actual_n_states]
+            .copy_from_slice(&fwd_curr[..actual_n_states]);
     }
 
     // Backward sampling
     let last_start = (n_markers - 1) * actual_n_states;
     let last_fwd = &fwd_at_marker[last_start..last_start + actual_n_states];
     path[n_markers - 1] = sample_from_weights(last_fwd, rng) as u32;
-
-    let mut weights = vec![0.0f32; actual_n_states];
+    weights[..actual_n_states].fill(0.0);
     for m in (1..n_markers).rev() {
         let next_state = path[m] as usize;
         let r = p_recomb.get(m).copied().unwrap_or(0.0);
@@ -5158,7 +5169,7 @@ fn ffbs_haploid_constrained(
             weights[next_state] = prev_fwd[next_state] * stay;
         }
 
-        path[m - 1] = sample_from_weights(&weights, rng) as u32;
+        path[m - 1] = sample_from_weights(&weights[..actual_n_states], rng) as u32;
     }
 }
 
@@ -5190,6 +5201,7 @@ fn sample_dynamic_mcmc(
     p_no_err: f32,
     p_err: f32,
     initial_paths: Option<&MosaicPaths>,
+    workspace: &mut crate::utils::workspace::ThreadWorkspace,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
 
@@ -5408,6 +5420,7 @@ fn sample_dynamic_mcmc(
             p_no_err,
             p_err,
             &mut rng,
+            workspace,
         );
 
         // Refresh the latent reference path at all markers for the next iteration.
@@ -5477,6 +5490,7 @@ fn sample_dynamic_mcmc(
             p_no_err,
             p_err,
             &mut rng,
+            workspace,
         );
 
         // Refresh the latent reference path at all markers for the next iteration.
@@ -6675,6 +6689,7 @@ mod tests {
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
         // Sample 0: haplotypes 0 and 1
+        let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
         let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
             n_markers,
             n_total_haps,
@@ -6691,6 +6706,7 @@ mod tests {
             0.999,
             0.001,
             None,
+            &mut workspace,
         );
         assert_eq!(paths.path1.len(), n_markers);
         assert_eq!(paths.path2.len(), n_markers);
@@ -6748,6 +6764,7 @@ mod tests {
         let p_recomb = vec![0.01f32; n_markers];
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
+        let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
         let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
             n_markers,
             n_total_haps,
@@ -6764,6 +6781,7 @@ mod tests {
             0.999,
             0.001,
             None,
+            &mut workspace,
         );
         assert_eq!(paths.path1.len(), n_markers);
         assert_eq!(paths.path2.len(), n_markers);

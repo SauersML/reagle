@@ -35,6 +35,11 @@ pub struct ThreadWorkspace {
     pub hap2_use_combined: Vec<bool>,
     /// Forward block buffer for checkpoint recompute
     pub fwd_block: Vec<f32>,
+    /// FFBS forward buffers for dynamic MCMC (haploid constrained)
+    pub ffbs_fwd_curr: Vec<f32>,
+    pub ffbs_fwd_prev: Vec<f32>,
+    pub ffbs_fwd_at_marker: Vec<f32>,
+    pub ffbs_weights: Vec<f32>,
     /// Checkpoint storage buffers (reused between samples)
     pub combined_checkpoint_data: Vec<f32>,
     pub hap1_checkpoint_data: Vec<f32>,
@@ -72,6 +77,10 @@ impl ThreadWorkspace {
             hap1_use_combined: Vec::new(),
             hap2_use_combined: Vec::new(),
             fwd_block: Vec::new(),
+            ffbs_fwd_curr: Vec::new(),
+            ffbs_fwd_prev: Vec::new(),
+            ffbs_fwd_at_marker: Vec::new(),
+            ffbs_weights: Vec::new(),
             combined_checkpoint_data: Vec::new(),
             hap1_checkpoint_data: Vec::new(),
             hap2_checkpoint_data: Vec::new(),
@@ -160,6 +169,23 @@ impl ThreadWorkspace {
         }
         if self.hap2_checkpoint_data.len() < checkpoints_len {
             self.hap2_checkpoint_data.resize(checkpoints_len, 0.0);
+        }
+    }
+
+    /// Ensure FFBS buffers are sized for haploid constrained sampling.
+    pub fn ensure_ffbs(&mut self, n_markers: usize, n_states: usize) {
+        if self.ffbs_fwd_curr.len() < n_states {
+            self.ffbs_fwd_curr.resize(n_states, 0.0);
+        }
+        if self.ffbs_fwd_prev.len() < n_states {
+            self.ffbs_fwd_prev.resize(n_states, 0.0);
+        }
+        if self.ffbs_weights.len() < n_states {
+            self.ffbs_weights.resize(n_states, 0.0);
+        }
+        let needed = n_markers.saturating_mul(n_states);
+        if self.ffbs_fwd_at_marker.len() < needed {
+            self.ffbs_fwd_at_marker.resize(needed, 0.0);
         }
     }
 
