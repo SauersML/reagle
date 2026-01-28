@@ -199,8 +199,28 @@ impl ReferencePbwt {
         query_alleles: &[u8],
         beams: &mut [RankBeam],
     ) {
+        let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
+        self.advance_with_beams_scratch(
+            ref_alleles,
+            n_alleles,
+            marker,
+            query_alleles,
+            beams,
+            &mut scratch,
+        );
+    }
+
+    pub fn advance_with_beams_scratch(
+        &mut self,
+        ref_alleles: &[u8],
+        n_alleles: usize,
+        marker: usize,
+        query_alleles: &[u8],
+        beams: &mut [RankBeam],
+        scratch: &mut Vec<(u32, u32, u32)>,
+    ) {
         self.prepare_step(ref_alleles, n_alleles);
-        self.update_beams(beams, query_alleles, n_alleles);
+        self.update_beams_with_scratch(beams, query_alleles, n_alleles, scratch);
         self.finalize_step(ref_alleles, n_alleles, marker);
     }
 
@@ -266,6 +286,17 @@ impl ReferencePbwt {
     }
 
     pub fn update_beams(&self, beams: &mut [RankBeam], query_alleles: &[u8], n_alleles: usize) {
+        let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
+        self.update_beams_with_scratch(beams, query_alleles, n_alleles, &mut scratch);
+    }
+
+    pub fn update_beams_with_scratch(
+        &self,
+        beams: &mut [RankBeam],
+        query_alleles: &[u8],
+        n_alleles: usize,
+        scratch: &mut Vec<(u32, u32, u32)>,
+    ) {
         let n_ref = self.ppa.len();
         let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
 
@@ -284,7 +315,7 @@ impl ReferencePbwt {
                 // interval explosion and (with overflow merging) degenerate to the full
                 // reference range on sparse targets. Instead, keep only the most informative
                 // mapped intervals.
-                let mut candidates: Vec<(u32, u32, u32)> = Vec::new();
+                scratch.clear();
                 for &(l, r) in old.intervals() {
                     for b in 0..n_bins {
                         let nl = self.offsets[b] + self.rank(b, l, n_ref);
@@ -292,15 +323,15 @@ impl ReferencePbwt {
                         if nl < nr {
                             let len = nr - nl;
                             let score = len.saturating_mul(self.counts[b]);
-                            candidates.push((nl, nr, score));
+                            scratch.push((nl, nr, score));
                         }
                     }
                 }
 
-                candidates.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-                let keep = candidates.len().min(MAX_RANK_INTERVALS);
+                scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                let keep = scratch.len().min(MAX_RANK_INTERVALS);
                 for i in 0..keep {
-                    next.intervals[i] = (candidates[i].0, candidates[i].1);
+                    next.intervals[i] = (scratch[i].0, scratch[i].1);
                 }
                 next.len = keep;
             } else {
@@ -316,7 +347,7 @@ impl ReferencePbwt {
                 }
 
                 if next.len == 0 {
-                    let mut candidates: Vec<(u32, u32, u32)> = Vec::new();
+                    scratch.clear();
                     for &(l, r) in old.intervals() {
                         for b in 0..n_bins {
                             let nl = self.offsets[b] + self.rank(b, l, n_ref);
@@ -324,15 +355,15 @@ impl ReferencePbwt {
                             if nl < nr {
                                 let len = nr - nl;
                                 let score = len.saturating_mul(self.counts[b]);
-                                candidates.push((nl, nr, score));
+                                scratch.push((nl, nr, score));
                             }
                         }
                     }
 
-                    candidates.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-                    let keep = candidates.len().min(MAX_RANK_INTERVALS);
+                    scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                    let keep = scratch.len().min(MAX_RANK_INTERVALS);
                     for i in 0..keep {
-                        next.intervals[i] = (candidates[i].0, candidates[i].1);
+                        next.intervals[i] = (scratch[i].0, scratch[i].1);
                     }
                     next.len = keep;
                 }
