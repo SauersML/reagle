@@ -2271,7 +2271,10 @@ fn test_phasing_confidence() {
             let a1 = column.get(sample_idx.hap1());
             let a2 = column.get(sample_idx.hap2());
 
-            let conf = phased.sample_phase_confidence_f32(marker_idx, s);
+            let conf = phased.phase_confidence_clone()
+                .and_then(|c| c.get(marker_idx.as_usize()).and_then(|row| row.get(s)).copied())
+                .map(|v| v as f32 / 255.0)
+                .unwrap_or(1.0);
 
             // Confidence must be in valid range
             assert!(

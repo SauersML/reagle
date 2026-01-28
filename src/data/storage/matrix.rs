@@ -248,23 +248,6 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.confidence.clone()
     }
 
-    /// Get phase confidence score for a sample at a marker (0-255).
-    /// Returns 255 (full confidence) if phase confidence is not available.
-    #[inline]
-    pub fn sample_phase_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
-        self.phase_confidence
-            .as_ref()
-            .and_then(|c| c.get(marker.as_usize()))
-            .and_then(|row| row.get(sample_idx))
-            .copied()
-            .unwrap_or(255)
-    }
-
-    /// Get phase confidence score as f32 (0.0-1.0).
-    #[inline]
-    pub fn sample_phase_confidence_f32(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> f32 {
-        self.sample_phase_confidence(marker, sample_idx) as f32 / 255.0
-    }
 
     /// Clone the phase confidence data (for transferring to a new matrix)
     pub fn phase_confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
