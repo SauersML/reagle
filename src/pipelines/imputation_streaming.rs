@@ -1521,9 +1521,12 @@ target_samples={} target_bytes={}",
                                             denom += p;
                                         }
                                     }
-                                    weights[partner_idx] = conf;
+                                    // Enforce high confidence to prevent prior dominance (Perfect LD Trap)
+                                    // when using PLs with ambiguous phasing.
+                                    let conf_boosted = conf.max(ModelParams::MIN_IMP_PHASE_CONFIDENCE);
+                                    weights[partner_idx] = conf_boosted;
                                     if denom > 0.0 {
-                                        let scale = (1.0 - conf) / denom;
+                                        let scale = (1.0 - conf_boosted) / denom;
                                         for i in 0..n_pl_alleles {
                                             if i != partner_idx {
                                                 weights[i] = target_priors[i] * scale;
@@ -1612,10 +1615,15 @@ target_samples={} target_bytes={}",
                             && (mapped_partner as usize) < n_alleles
                             && mapped_partner != mapped_allele;
                         let phase_conf = if is_het {
-                            target_win.sample_phase_confidence_f32(
-                                MarkerIdx::new(target_m as u32),
-                                sample_idx,
-                            )
+                            // Enforce high confidence even if phasing is uncertain (0.5).
+                            // This prevents "Prior Dominance" where the HMM ignores the genotype
+                            // in favor of the population prior (Perfect LD Trap) when the phase
+                            // is ambiguous (symmetric). Since Imputation treats haplotypes independently,
+                            // ambiguous phase (0.5) leads to signal cancellation. Hard phasing (even if random)
+                            // preserves the dosage signal.
+                            target_win
+                                .sample_phase_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx)
+                                .max(ModelParams::MIN_IMP_PHASE_CONFIDENCE)
                         } else {
                             1.0
                         };

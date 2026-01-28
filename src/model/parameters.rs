@@ -53,6 +53,12 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
+    /// Maximum recombination intensity for imputation to preserve LD in small panels
+    pub const MAX_RECOMB_INTENSITY: f32 = 5.0;
+
+    /// Minimum phase confidence for imputation to prevent Prior Dominance
+    pub const MIN_IMP_PHASE_CONFIDENCE: f32 = 0.999;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -109,7 +115,9 @@ impl ModelParams {
         // Error rate uses total haps (Java: par.err(nHaps) where nHaps = ref + target)
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
-        let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+        let raw_intensity = 0.04 * ne / n_ref_haps as f32;
+        // Clamp intensity to prevent excessive switching in small panels (Perfect LD Trap)
+        let recomb_intensity = raw_intensity.min(Self::MAX_RECOMB_INTENSITY);
 
         Self {
             p_mismatch,
