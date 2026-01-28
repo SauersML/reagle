@@ -5864,7 +5864,10 @@ fn sample_swap_bits_mosaic(
         }
 
         swap_bits.push(last_orients[i]);
-        let p_swap = (swap_counts[i] as f32 + 0.5) / (obs_counts[i] as f32 + 1.0);
+        // Use a weak prior (0.001) instead of Jeffreys prior (0.5) to allow high confidence
+        // when counts are consistent. This prevents quantization artifacts (u8 storage)
+        // from degrading imputation accuracy for rare variants in Perfect LD.
+        let p_swap = (swap_counts[i] as f32 + 0.001) / (obs_counts[i] as f32 + 0.002);
         let p_keep = 1.0 - p_swap;
         let (max_p, min_p) = if p_swap >= p_keep {
             (p_swap, p_keep)
