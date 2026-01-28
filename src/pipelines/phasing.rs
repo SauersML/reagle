@@ -1880,6 +1880,29 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 } else {
                     next_block_start_fwd = n_markers;
                 }
+            } else {
+                // Dynamic donor update: re-select donors if a sample's phase was swapped.
+                // A swap changes the haplotype sequence, so the PBWT beam now tracks a
+                // different path. We must update the donors to match this new path.
+                for s in 0..n_samples {
+                    if swaps_buffer[s] {
+                        let h1 = s * 2;
+                        let h2 = h1 + 1;
+                        let offset = n_target_haps as u32;
+
+                        let mut ds1 = pbwt_fwd.select_donors(&beams_fwd[h1], n_candidates);
+                        for x in &mut ds1 {
+                            *x += offset;
+                        }
+                        donors_fwd[h1] = ds1;
+
+                        let mut ds2 = pbwt_fwd.select_donors(&beams_fwd[h2], n_candidates);
+                        for x in &mut ds2 {
+                            *x += offset;
+                        }
+                        donors_fwd[h2] = ds2;
+                    }
+                }
             }
 
             // At sampling points, collect forward donors for all samples
@@ -1995,6 +2018,26 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     next_block_end_bwd = donor_blocks[block_idx_bwd].1;
                 } else {
                     next_block_end_bwd = 0;
+                }
+            } else {
+                for s in 0..n_samples {
+                    if swaps_buffer[s] {
+                        let h1 = s * 2;
+                        let h2 = h1 + 1;
+                        let offset = n_target_haps as u32;
+
+                        let mut ds1 = pbwt_bwd.select_donors(&beams_bwd[h1], n_candidates);
+                        for x in &mut ds1 {
+                            *x += offset;
+                        }
+                        donors_bwd[h1] = ds1;
+
+                        let mut ds2 = pbwt_bwd.select_donors(&beams_bwd[h2], n_candidates);
+                        for x in &mut ds2 {
+                            *x += offset;
+                        }
+                        donors_bwd[h2] = ds2;
+                    }
                 }
             }
 

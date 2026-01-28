@@ -114,30 +114,53 @@ impl ReferencePbwt {
 
         let mut out = Vec::with_capacity(k);
 
-        for &(l, r) in beam.intervals() {
-            if out.len() >= k {
-                break;
-            }
-            let l = l.min(n_ref as u32) as usize;
-            let r = r.min(n_ref as u32) as usize;
-            if l >= r {
-                continue;
-            }
-            let center = (l + r) / 2;
+        // Uniform spaced sampling from all intervals to ensure coverage of the
+        // entire PBWT space, avoiding bias towards the center or beginning.
+        // We treat the intervals as a single contiguous range and sample uniformly.
 
-            let mut left = center;
-            let mut right = center;
-            while out.len() < k && (left > l || right < r) {
-                if left > l {
-                    left -= 1;
-                    out.push(self.ppa[left]);
-                    if out.len() >= k {
+        let intervals: Vec<(usize, usize)> = beam
+            .intervals()
+            .iter()
+            .map(|&(l, r)| {
+                let l = l.min(n_ref as u32) as usize;
+                let r = r.min(n_ref as u32) as usize;
+                (l, r)
+            })
+            .filter(|&(l, r)| l < r)
+            .collect();
+
+        if intervals.is_empty() {
+            return Vec::new();
+        }
+
+        let total_len: usize = intervals.iter().map(|&(l, r)| r - l).sum();
+
+        if total_len <= k {
+            for &(l, r) in &intervals {
+                for i in l..r {
+                    out.push(self.ppa[i]);
+                }
+            }
+        } else {
+            // Centered uniform spaced sampling
+            // i-th sample at: (2*i + 1) * total_len / (2*k)
+            let mut current_interval_idx = 0;
+            let mut current_interval_start_offset = 0;
+
+            for i in 0..k {
+                let target = (2 * i + 1) * total_len / (2 * k);
+
+                // Advance to interval containing target
+                while current_interval_idx < intervals.len() {
+                    let (l, r) = intervals[current_interval_idx];
+                    let len = r - l;
+                    if target < current_interval_start_offset + len {
+                        let offset_in_interval = target - current_interval_start_offset;
+                        out.push(self.ppa[l + offset_in_interval]);
                         break;
                     }
-                }
-                if right < r {
-                    out.push(self.ppa[right]);
-                    right += 1;
+                    current_interval_start_offset += len;
+                    current_interval_idx += 1;
                 }
             }
         }
