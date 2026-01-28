@@ -1611,14 +1611,11 @@ target_samples={} target_bytes={}",
                         let is_het = mapped_partner != 255
                             && (mapped_partner as usize) < n_alleles
                             && mapped_partner != mapped_allele;
-                        let phase_conf = if is_het {
-                            target_win.sample_phase_confidence_f32(
-                                MarkerIdx::new(target_m as u32),
-                                sample_idx,
-                            )
-                        } else {
-                            1.0
-                        };
+                        // Force hard phase constraint for heterozygotes to prevent "double-common" collapse.
+                        // Since we run independent haploid HMMs in a single pass, blurring the phase (phase_conf < 1.0)
+                        // allows both HMMs to pick the common allele if the prior is strong, erasing the heterozygote.
+                        // The phasing step has already ordered alleles by most likely phase, so we trust it 100%.
+                        let phase_conf = 1.0;
                         for a in 0..n_alleles {
                             let hard = if is_het {
                                 if a == mapped_allele as usize {
