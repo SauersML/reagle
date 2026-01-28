@@ -638,6 +638,157 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         self.reference_gt = Some(reference);
         self.alignment = Some(alignment);
     }
+
+    /// Heuristic phase initialization for small reference panels
+    ///
+    /// Performs an exact O(N^2) scan of reference haplotype pairs to find the best
+    /// match for each sample. This breaks symmetry in unphased genotypes and
+    /// provides a high-quality starting point for the MCMC, preventing it from
+    /// getting stuck in local optima (Stability/Mosaic Traps).
+    fn initialize_phase_heuristic(
+        &mut self,
+        target_gt: &GenotypeMatrix,
+        geno: &mut MutableGenotypes,
+    ) {
+        let (ref_gt, alignment) = match (&self.reference_gt, &self.alignment) {
+            (Some(r), Some(a)) => (r, a),
+            _ => return,
+        };
+
+        let n_ref_haps = ref_gt.n_haplotypes();
+        // Only run for small reference panels where O(N^2) is feasible
+        if n_ref_haps >= 2000 {
+            return;
+        }
+
+        let n_markers = target_gt.n_markers();
+        let n_samples = target_gt.n_samples();
+
+        eprintln!(
+            "Running heuristic initialization on {} reference haplotypes...",
+            n_ref_haps
+        );
+
+        // Pre-compute reference alleles mapped to target encoding
+        // Layout: ref_alleles[hap][marker]
+        let mut ref_alleles_mapped = vec![vec![255u8; n_markers]; n_ref_haps];
+        for h in 0..n_ref_haps {
+            let hap_idx = HapIdx::new(h as u32);
+            for m in 0..n_markers {
+                if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                    let ref_a = ref_gt.allele(ref_m, hap_idx);
+                    ref_alleles_mapped[h][m] = alignment.reverse_map_allele(m, ref_a);
+                }
+            }
+        }
+
+        // Process each sample in parallel
+        // We need to collect updates and apply them sequentially because geno is mutable
+        let updates: Vec<Vec<(usize, u8, u8)>> = (0..n_samples)
+            .into_par_iter()
+            .map(|s| {
+                let s_idx = SampleIdx::new(s as u32);
+                let hap1 = s_idx.hap1();
+                let hap2 = s_idx.hap2();
+
+                // Get target alleles
+                let mut target_a1 = vec![0u8; n_markers];
+                let mut target_a2 = vec![0u8; n_markers];
+                for m in 0..n_markers {
+                    target_a1[m] = target_gt.allele(MarkerIdx::new(m as u32), hap1);
+                    target_a2[m] = target_gt.allele(MarkerIdx::new(m as u32), hap2);
+                }
+
+                // Identify heterozygous sites
+                let hets: Vec<usize> = (0..n_markers)
+                    .filter(|&m| {
+                        let a1 = target_a1[m];
+                        let a2 = target_a2[m];
+                        a1 != 255 && a2 != 255 && a1 != a2
+                    })
+                    .collect();
+
+                if hets.is_empty() {
+                    return Vec::new();
+                }
+
+                // Find best reference pair
+                let mut best_score = -1.0f32;
+                let mut best_pair = (0, 0);
+
+                // O(N^2) scan
+                for i in 0..n_ref_haps {
+                    let ref_i = &ref_alleles_mapped[i];
+                    for j in 0..=i {
+                        let ref_j = &ref_alleles_mapped[j];
+                        let mut score = 0.0f32;
+
+                        for &m in &hets {
+                            let r1 = ref_i[m];
+                            let r2 = ref_j[m];
+                            if r1 == 255 || r2 == 255 {
+                                continue;
+                            }
+
+                            let a1 = target_a1[m];
+                            let a2 = target_a2[m];
+
+                            // Check compatibility: (r1,r2) == (a1,a2) OR (r1,r2) == (a2,a1)
+                            let compatible = (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1);
+                            if compatible {
+                                score += 1.0;
+                            } else {
+                                score -= 1.0;
+                            }
+                        }
+
+                        if score > best_score {
+                            best_score = score;
+                            best_pair = (i, j);
+                        }
+                    }
+                }
+
+                // Construct updates for this sample based on best pair
+                let mut sample_updates = Vec::new();
+                let ref_best1 = &ref_alleles_mapped[best_pair.0];
+
+                for &m in &hets {
+                    let r1 = ref_best1[m];
+                    if r1 == 255 {
+                        continue;
+                    }
+
+                    let a1 = target_a1[m];
+                    let a2 = target_a2[m];
+
+                    // If r1 matches a1, set H1=a1. If r1 matches a2, set H1=a2.
+                    // This aligns H1 to ref_best1.
+                    if r1 == a1 {
+                        // H1=a1, H2=a2. Matches current.
+                        sample_updates.push((m, a1, a2));
+                    } else if r1 == a2 {
+                        // H1=a2, H2=a1. Swap.
+                        sample_updates.push((m, a2, a1));
+                    }
+                }
+                sample_updates
+            })
+            .collect();
+
+        // Apply updates
+        for (s, sample_updates) in updates.into_iter().enumerate() {
+            let s_idx = SampleIdx::new(s as u32);
+            let hap1 = s_idx.hap1();
+            let hap2 = s_idx.hap2();
+            for (m, a1, a2) in sample_updates {
+                geno.set(m, hap1, a1);
+                geno.set(m, hap2, a2);
+            }
+        }
+
+        eprintln!("Heuristic initialization complete.");
+    }
 }
 
 impl PhasingPipeline<crate::data::AnyMarkerSpace> {
@@ -757,6 +908,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
             target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
         });
+
+        // Run heuristic initialization for small panels
+        self.initialize_phase_heuristic(&target_gt, &mut geno);
 
         // Compute genetic distances and recombination probabilities using MarkerMap
         // This handles map interpolation and minimum distance enforcement
