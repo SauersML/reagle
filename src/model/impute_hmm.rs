@@ -77,6 +77,32 @@ impl ImputeWorkspace {
 }
 
 #[inline]
+fn fill_ref_alleles(col: &GenotypeColumn, state_haps: &[GlobalId], out: &mut [u8]) {
+    match col {
+        GenotypeColumn::Dense(c) => {
+            for (i, hap) in state_haps.iter().enumerate() {
+                out[i] = c.get(HapIdx::new(hap.as_u32()));
+            }
+        }
+        GenotypeColumn::Sparse(c) => {
+            for (i, hap) in state_haps.iter().enumerate() {
+                out[i] = c.get(HapIdx::new(hap.as_u32()));
+            }
+        }
+        GenotypeColumn::Dictionary(c, offset) => {
+            for (i, hap) in state_haps.iter().enumerate() {
+                out[i] = c.get(*offset, HapIdx::new(hap.as_u32()));
+            }
+        }
+        GenotypeColumn::SeqCoded(c) => {
+            for (i, hap) in state_haps.iter().enumerate() {
+                out[i] = c.get(HapIdx::new(hap.as_u32()));
+            }
+        }
+    }
+}
+
+#[inline]
 fn emission_prob_soft(ref_allele: u8, target_probs: &[f32], error_rate: f32) -> f32 {
     if target_probs.is_empty() {
         return 1.0;
@@ -136,7 +162,8 @@ pub fn run_impute_hmm(
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
     if n_states > 0 {
-        ws.weights.fill(1.0);
+        let scale = total_ref_haps.max(1) as f32 / n_states.max(1) as f32;
+        ws.weights.fill(scale);
     }
 
     let mut fwd_sum: f32;
@@ -158,9 +185,11 @@ pub fn run_impute_hmm(
         let probs = target_probs.probs_for_marker(m);
         let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
 
-        for (i, hap) in state_haps.iter().enumerate() {
-            let ref_allele = ref_columns[m].get(HapIdx::new(hap.as_u32()));
-            ws.ref_alleles[m * n_states + i] = ref_allele;
+        let start = m * n_states;
+        let ref_slice = &mut ws.ref_alleles[start..start + n_states];
+        fill_ref_alleles(&ref_columns[m], state_haps, ref_slice);
+        for i in 0..n_states {
+            let ref_allele = ref_slice[i];
             ws.emissions[i] = emission_prob_soft(ref_allele, probs, error_rate);
         }
 
@@ -196,7 +225,6 @@ pub fn run_impute_hmm(
         if fwd_sum <= 0.0 {
             fwd_sum = 1e-30;
         }
-        let start = m * n_states;
         ws.fwd_history[start..start + n_states].copy_from_slice(&ws.fwd);
     }
 
