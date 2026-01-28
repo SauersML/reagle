@@ -855,6 +855,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
             .collect();
 
+        // Initialize phase with heuristic to avoid stability traps
+        self.initialize_phase_heuristic(&mut geno);
+
         // Create SamplePhase instances to track phase state (with confidence)
         let confidence_by_sample = build_sample_confidence(&target_gt);
         let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample);
@@ -1282,6 +1285,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
         });
 
+        // Initialize phase with heuristic to avoid stability traps
+        // This sets a good global phase, which is then overwritten in the
+        // overlap region by apply_overlap_constraint to ensure continuity.
+        self.initialize_phase_heuristic(&mut geno);
+
         // Build missing mask for overlap constraint handling
         let missing_mask: Vec<BitBox<u8, Lsb0>> = (0..n_haps)
             .map(|h| {
@@ -1516,6 +1524,161 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             next_overlap_handoff,
             pbwt_state_for_next_window,
         ))
+    }
+
+    /// Initialize phase using a heuristic pairwise scan of reference haplotypes.
+    ///
+    /// This helps escape "Stability Traps" where random initialization leads to
+    /// local optima that reinforce the random phase. By finding the best pair of
+    /// reference haplotypes that explain the unphased genotype, we seed the
+    /// HMM with a high-quality starting state.
+    fn initialize_phase_heuristic(
+        &self,
+        geno: &mut MutableGenotypes,
+    ) {
+        if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            let n_samples = geno.n_haps() / 2;
+            let n_markers = geno.n_markers();
+            let n_ref = ref_gt.n_haplotypes();
+
+            // Threshold for full scan vs heuristic
+            const FULL_SCAN_LIMIT: usize = 2000;
+            const HEURISTIC_CANDIDATES: usize = 50;
+
+            if n_ref == 0 {
+                return;
+            }
+
+            // Parallel over samples
+            (0..n_samples).into_par_iter().for_each(|s| {
+                let hap1 = HapIdx::new((s * 2) as u32);
+                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+                // Extract sample genotype alleles
+                let alleles1 = geno.haplotype(hap1);
+                let alleles2 = geno.haplotype(hap2);
+
+                // Identify homozygous sites (anchors)
+                let mut hom_sites = Vec::with_capacity(n_markers / 2);
+                for m in 0..n_markers {
+                    let a1 = alleles1[m];
+                    let a2 = alleles2[m];
+                    if a1 != 255 && a2 != 255 && a1 == a2 {
+                        hom_sites.push(m);
+                    }
+                }
+
+                // Helper to get ref allele mapped to target
+                let get_ref_allele = |m: usize, h: usize| -> u8 {
+                    let m_idx = MarkerIdx::new(m as u32);
+                    if let Some(ref_m) = alignment.target_to_ref(m_idx) {
+                        let ref_h = HapIdx::new(h as u32);
+                        let ref_a = ref_gt.allele(ref_m, ref_h);
+                        alignment.reverse_map_allele(m, ref_a)
+                    } else {
+                        255
+                    }
+                };
+
+                // Candidate selection
+                let candidates: Vec<usize> = if n_ref <= FULL_SCAN_LIMIT {
+                    (0..n_ref).collect()
+                } else {
+                    // Score refs by Hom matches
+                    let mut scores: Vec<(usize, i32)> = (0..n_ref).map(|h| (h, 0)).collect();
+                    for (h, score) in scores.iter_mut() {
+                        for &m in &hom_sites {
+                            let ref_a = get_ref_allele(m, *h);
+                            if ref_a != 255 {
+                                if ref_a == alleles1[m] {
+                                    // Hom so a1==a2, match
+                                    *score += 1;
+                                } else {
+                                    *score -= 5; // Strong penalty for mismatch
+                                }
+                            }
+                        }
+                    }
+                    scores.sort_unstable_by_key(|&(_, s)| -s); // Descending
+                    scores
+                        .iter()
+                        .take(HEURISTIC_CANDIDATES)
+                        .map(|&(h, _)| h)
+                        .collect()
+                };
+
+                let mut best_pair = None;
+                let mut best_score = i32::MIN;
+
+                // For heuristic, we pick Best H1 from candidates, then scan candidates for Best H2.
+                // Restricting H2 to candidates is safe because if H2 matches the target
+                // well, it should also match homozygous sites well, so it should be in candidates.
+                let h1_candidates = &candidates;
+
+                for &h1 in h1_candidates {
+                    // Search for best H2 compatible with H1
+                    for &h2 in h1_candidates {
+                        if h2 < h1 {
+                            continue;
+                        }
+
+                        let mut score = 0;
+                        for m in 0..n_markers {
+                            let a1 = alleles1[m];
+                            let a2 = alleles2[m];
+                            if a1 == 255 || a2 == 255 {
+                                continue;
+                            }
+
+                            let r1 = get_ref_allele(m, h1);
+                            let r2 = get_ref_allele(m, h2);
+
+                            if r1 == 255 || r2 == 255 {
+                                continue;
+                            }
+
+                            let compatible = if a1 == a2 {
+                                r1 == a1 && r2 == a2
+                            } else {
+                                (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                            };
+
+                            if compatible {
+                                score += 1;
+                            } else {
+                                score -= 5;
+                            }
+                        }
+
+                        if score > best_score {
+                            best_score = score;
+                            best_pair = Some((h1, h2));
+                        }
+                    }
+                }
+
+                // Apply best pair
+                if let Some((h1_idx, h2_idx)) = best_pair {
+                    for m in 0..n_markers {
+                        let a1 = alleles1[m];
+                        let a2 = alleles2[m];
+                        if a1 != 255 && a2 != 255 && a1 != a2 {
+                            let r1 = get_ref_allele(m, h1_idx);
+                            // If r1 matches a1, we set hap1=a1.
+                            // If r1 matches a2, we set hap1=a2.
+                            if r1 == a1 {
+                                geno.set(m, hap1, a1);
+                                geno.set(m, hap2, a2);
+                            } else if r1 == a2 {
+                                geno.set(m, hap1, a2);
+                                geno.set(m, hap2, a1);
+                            }
+                        }
+                    }
+                }
+            });
+            eprintln!("Initialized phase using heuristic scan of reference panel.");
+        }
     }
 
     /// Apply overlap constraint from previous window's phased output
