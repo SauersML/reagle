@@ -1227,6 +1227,14 @@ impl crate::pipelines::ImputationPipeline {
         if plan.total_budget >= plan.n_ref_haps {
             plan.dynamic_budget = 0;
         }
+        if plan.total_budget >= plan.n_ref_haps && plan.dynamic_budget == 0 {
+            eprintln!("Imputation mode: full global core (tier 1 only; abyss still active)");
+        } else if plan.dynamic_budget > 0 {
+            eprintln!(
+                "Imputation mode: core + dynamic (tier 1 + tier 2), dynamic_budget={}",
+                plan.dynamic_budget
+            );
+        }
 
         let mut ref_reader = open_ref_reader(ref_path)?;
         let mut target_reader = StreamingVcfReader::open(
@@ -1248,6 +1256,7 @@ impl crate::pipelines::ImputationPipeline {
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
 
         let mut imp_overlap: Option<PhasedOverlap> = None;
+        let mut warned_no_overlap = false;
         let mut pbwt_state_fwd: Option<PbwtState> = None;
         let mut header_written = false;
         let mut total_markers = 0usize;
@@ -1325,23 +1334,23 @@ impl crate::pipelines::ImputationPipeline {
                 window_quality.set_imputed(ref_m, target_idx.is_none());
             }
 
-        let next_handoff = self.run_imputation_window_streaming(
-            &phased_target,
-            &ref_window.markers,
-            &ref_window.ref_columns,
-            ref_window.ref_genotypes.as_ref(),
-            &alignment,
-            &gen_maps,
-            imp_overlap.as_ref(),
-            &plan,
-            window_idx,
-            &mut window_quality,
-            &mut writer,
-            ref_window.global_start,
-            ref_window.output_start,
-            ref_window.output_end,
-            &mut pbwt_state_fwd,
-        )?;
+            let next_handoff = self.run_imputation_window_streaming(
+                &phased_target,
+                &ref_window.markers,
+                &ref_window.ref_columns,
+                ref_window.ref_genotypes.as_ref(),
+                &alignment,
+                &gen_maps,
+                imp_overlap.as_ref(),
+                &plan,
+                window_idx,
+                &mut window_quality,
+                &mut writer,
+                ref_window.global_start,
+                ref_window.output_start,
+                ref_window.output_end,
+                &mut pbwt_state_fwd,
+            )?;
 
             total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
 
@@ -1359,6 +1368,12 @@ impl crate::pipelines::ImputationPipeline {
                 if let Some(gen_pos) = handoff.prior_gen_pos {
                     next_overlap.set_prior_stage1_gen_pos(gen_pos);
                 }
+            } else if !warned_no_overlap {
+                warn!(
+                    "No overlap handoff for window {} (empty/short window or region boundary)",
+                    window_idx
+                );
+                warned_no_overlap = true;
             }
             imp_overlap = Some(next_overlap);
 
@@ -1751,7 +1766,9 @@ impl crate::pipelines::ImputationPipeline {
                     .and_then(|o| o.hap_priors())
                     .and_then(|p| p.get(h2_idx.as_usize()));
 
-                let process_haplotype = |hap_idx: HapIdx,
+                let mut warned_no_priors = false;
+                let mut warned_empty_map = false;
+                let mut process_haplotype = |hap_idx: HapIdx,
                                          priors: Option<&HaplotypePriors>|
                  -> (Vec<AllelePosteriors>, HaplotypePriors) {
                     let input_probs = build_input_probs(hap_idx, s);
@@ -1777,12 +1794,27 @@ impl crate::pipelines::ImputationPipeline {
 
                     let state_priors = priors.and_then(|p| {
                         if p.is_empty() {
+                            if !warned_no_priors {
+                                warn!(
+                                    "Handoff priors missing for window {} (no markers or no posterior)",
+                                    window_idx
+                                );
+                                warned_no_priors = true;
+                            }
                             return None;
                         }
                         let prev_states: Vec<GlobalId> =
                             p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
                         let mapper = TransitionMatrix::build(&prev_states, &state_haps);
-                        Some(mapper.map(p.probs()).into_vec())
+                        let mapped = mapper.map(p.probs()).into_vec();
+                        if mapped.iter().all(|v| !v.is_finite() || *v <= 0.0) && !warned_empty_map {
+                            warn!(
+                                "State handoff mapped to empty priors for window {} (state set mismatch)",
+                                window_idx
+                            );
+                            warned_empty_map = true;
+                        }
+                        Some(mapped)
                     });
 
                     let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
