@@ -2609,11 +2609,12 @@ target_samples={} target_bytes={}",
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+            // Prioritize GT > GP > HMM
+            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                (a1 + a2) as f32
+            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
@@ -2630,11 +2631,12 @@ target_samples={} target_bytes={}",
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+            // Prioritize GT > GP > HMM
+            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                (a1, a2)
+            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 best_gt_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
@@ -2659,117 +2661,82 @@ target_samples={} target_bytes={}",
             (0.0, 0.0)
         };
 
+        // Calculate statistics for a marker
+        let calculate_stats = |stats: &mut ImputationQuality, marker_idx: usize, n_samples: usize| {
+            for s in 0..n_samples {
+                let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
+                if !stats.get(marker_idx).map(|s| s.is_imputed).unwrap_or(true) {
+                    // Genotyped marker: prioritize GT > GP
+                    let mut found_gt = false;
+                    if let Some(target_m) =
+                        alignment.target_marker(MarkerIdx::new(marker_idx as u32))
+                    {
+                        let h1 = HapIdx::new((s * 2) as u32);
+                        let h2 = HapIdx::new((s * 2 + 1) as u32);
+                        let raw_a1 = target_win.allele(target_m, h1);
+                        let raw_a2 = target_win.allele(target_m, h2);
+
+                        if raw_a1 != 255 && raw_a2 != 255 {
+                            let mapping = alignment
+                                .allele_mappings
+                                .get(target_m.as_usize())
+                                .and_then(|m| m.as_ref());
+                            let map_allele = |a: u8| -> u8 {
+                                if a == 255 {
+                                    return 255;
+                                }
+                                if let Some(m) = mapping {
+                                    if (a as usize) < m.targ_to_ref.len() {
+                                        let r = m.targ_to_ref[a as usize];
+                                        if r >= 0 { r as u8 } else { 255 }
+                                    } else {
+                                        255
+                                    }
+                                } else {
+                                    a
+                                }
+                            };
+                            let a1 = map_allele(raw_a1);
+                            let a2 = map_allele(raw_a2);
+                            if a1 < 2 && a2 < 2 {
+                                v1 = a1 as f32;
+                                v2 = a2 as f32;
+                                found_gt = true;
+                            }
+                        }
+                    }
+
+                    if !found_gt {
+                        if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                            let n_alleles = ref_markers
+                                .marker(MarkerIdx::new(marker_idx as u32))
+                                .n_alleles();
+                            let dosage = dosage_from_gp(n_alleles, &gp);
+                            let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                            v1 = p_alt;
+                            v2 = p_alt;
+                        }
+                    }
+                }
+                if let Some(stat) = stats.get_mut(marker_idx) {
+                    stat.add_sample_biallelic(v1, v2);
+                }
+            }
+        };
+
         if include_posteriors {
             for marker_idx in markers_to_process_start..output_end {
                 if marker_idx >= ref_is_biallelic.len() || !ref_is_biallelic[marker_idx] {
                     continue;
                 }
-                if let Some(stats) = quality.get_mut(marker_idx) {
-                    for s in 0..n_samples {
-                        let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
-                        if !stats.is_imputed {
-                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
-                                let n_alleles = ref_markers
-                                    .marker(MarkerIdx::new(marker_idx as u32))
-                                    .n_alleles();
-                                let dosage = dosage_from_gp(n_alleles, &gp);
-                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
-                            } else if let Some(target_m) =
-                                alignment.target_marker(MarkerIdx::new(marker_idx as u32))
-                            {
-                                let h1 = HapIdx::new((s * 2) as u32);
-                                let h2 = HapIdx::new((s * 2 + 1) as u32);
-                                let raw_a1 = target_win.allele(target_m, h1);
-                                let raw_a2 = target_win.allele(target_m, h2);
-
-                                let mapping = alignment
-                                    .allele_mappings
-                                    .get(target_m.as_usize())
-                                    .and_then(|m| m.as_ref());
-                                let map_allele = |a: u8| -> u8 {
-                                    if a == 255 {
-                                        return 255;
-                                    }
-                                    if let Some(m) = mapping {
-                                        if (a as usize) < m.targ_to_ref.len() {
-                                            let r = m.targ_to_ref[a as usize];
-                                            if r >= 0 { r as u8 } else { 255 }
-                                        } else {
-                                            255
-                                        }
-                                    } else {
-                                        a
-                                    }
-                                };
-                                let a1 = map_allele(raw_a1);
-                                let a2 = map_allele(raw_a2);
-                                if a1 < 2 && a2 < 2 {
-                                    v1 = a1 as f32;
-                                    v2 = a2 as f32;
-                                }
-                            }
-                        }
-                        stats.add_sample_biallelic(v1, v2);
-                    }
-                }
+                calculate_stats(quality, marker_idx, n_samples);
             }
         } else {
             for marker_idx in markers_to_process_start..output_end {
                 if marker_idx >= ref_is_biallelic.len() || !ref_is_biallelic[marker_idx] {
                     continue;
                 }
-                if let Some(stats) = quality.get_mut(marker_idx) {
-                    for s in 0..n_samples {
-                        let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
-                        if !stats.is_imputed {
-                            if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
-                                let n_alleles = ref_markers
-                                    .marker(MarkerIdx::new(marker_idx as u32))
-                                    .n_alleles();
-                                let dosage = dosage_from_gp(n_alleles, &gp);
-                                let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
-                            } else if let Some(target_m) =
-                                alignment.target_marker(MarkerIdx::new(marker_idx as u32))
-                            {
-                                let h1 = HapIdx::new((s * 2) as u32);
-                                let h2 = HapIdx::new((s * 2 + 1) as u32);
-                                let raw_a1 = target_win.allele(target_m, h1);
-                                let raw_a2 = target_win.allele(target_m, h2);
-
-                                let mapping = alignment
-                                    .allele_mappings
-                                    .get(target_m.as_usize())
-                                    .and_then(|m| m.as_ref());
-                                let map_allele = |a: u8| -> u8 {
-                                    if a == 255 {
-                                        return 255;
-                                    }
-                                    if let Some(m) = mapping {
-                                        if (a as usize) < m.targ_to_ref.len() {
-                                            let r = m.targ_to_ref[a as usize];
-                                            if r >= 0 { r as u8 } else { 255 }
-                                        } else {
-                                            255
-                                        }
-                                    } else {
-                                        a
-                                    }
-                                };
-                                let a1 = map_allele(raw_a1);
-                                let a2 = map_allele(raw_a2);
-                                if a1 < 2 && a2 < 2 {
-                                    v1 = a1 as f32;
-                                    v2 = a2 as f32;
-                                }
-                            }
-                        }
-                        stats.add_sample_biallelic(v1, v2);
-                    }
-                }
+                calculate_stats(quality, marker_idx, n_samples);
             }
         }
 

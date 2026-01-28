@@ -1220,27 +1220,6 @@ impl VcfWriter {
             }
         }
 
-        #[inline(always)]
-        fn best_gt_from_gp(n_alleles: usize, gp: &[f32]) -> (u8, u8) {
-            let mut best = (0u8, 0u8);
-            let mut best_prob = -1.0f32;
-            let mut idx = 0usize;
-            for j in 0..n_alleles {
-                for i in 0..=j {
-                    let p = gp.get(idx).copied().unwrap_or(0.0);
-                    if p > best_prob {
-                        best_prob = p;
-                        if i == j {
-                            best = (i as u8, i as u8);
-                        } else {
-                            best = (i as u8, j as u8);
-                        }
-                    }
-                    idx += 1;
-                }
-            }
-            best
-        }
 
         for m in start..end {
             line_buf.clear();
@@ -1319,64 +1298,7 @@ impl VcfWriter {
                             None
                         }
                     });
-                let (a1, a2) = if let Some(ref gp) = gp_override {
-                    best_gt_from_gp(n_alleles, gp)
-                } else if let Some((ref p1, ref p2)) = posteriors {
-                    if n_alleles <= 2 {
-                        let p1_alt = p1.prob(1);
-                        let p2_alt = p2.prob(1);
-                        let gp00 = (1.0 - p1_alt) * (1.0 - p2_alt);
-                        let gp01 =
-                            p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
-                        let gp11 = p1_alt * p2_alt;
-                        if gp01 >= gp00 && gp01 >= gp11 {
-                            let p10 = p1_alt * (1.0 - p2_alt);
-                            let p01 = (1.0 - p1_alt) * p2_alt;
-                            if p10 >= p01 {
-                                (1, 0)
-                            } else {
-                                (0, 1)
-                            }
-                        } else if gp11 >= gp00 {
-                            (1, 1)
-                        } else {
-                            (0, 0)
-                        }
-                    } else {
-                        let mut best = (0u8, 0u8);
-                        let mut best_prob = -1.0f32;
-                        for i in 0..n_alleles {
-                            for j in i..n_alleles {
-                                let p_i1 = p1.prob(i);
-                                let p_i2 = p2.prob(i);
-                                let p_j1 = p1.prob(j);
-                                let p_j2 = p2.prob(j);
-                                let prob = if i == j {
-                                    p_i1 * p_i2
-                                } else {
-                                    p_i1 * p_j2 + p_j1 * p_i2
-                                };
-                                if prob > best_prob {
-                                    best_prob = prob;
-                                    if i == j {
-                                        best = (i as u8, i as u8);
-                                    } else {
-                                        let p_ij = p_i1 * p_j2;
-                                        let p_ji = p_j1 * p_i2;
-                                        if p_ij >= p_ji {
-                                            best = (i as u8, j as u8);
-                                        } else {
-                                            best = (j as u8, i as u8);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        best
-                    }
-                } else {
-                    get_best_gt(m, s)
-                };
+                let (a1, a2) = get_best_gt(m, s);
 
                 // Format: \t{a1}|{a2}:{ds}
                 line_buf.push('\t');
