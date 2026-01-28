@@ -59,22 +59,19 @@ pub struct PbwtWavefront {
 
 impl PbwtWavefront {
     #[inline]
-    fn finalize_candidates(mut out: Vec<u32>, target: u32, n_candidates: usize) -> Vec<u32> {
+    fn finalize_candidates(mut out: Vec<u32>, n_candidates: usize) -> Vec<u32> {
         if out.is_empty() {
             return out;
         }
         out.sort_unstable();
         out.dedup();
-        if let Ok(pos) = out.binary_search(&target) {
-            out.remove(pos);
-        }
         if out.len() > n_candidates {
             out.truncate(n_candidates);
         }
         out
     }
 
-    // Geometric spiral selection: dense core with exponentially expanding offsets.
+    // Linear expansion: check nearest neighbors first.
     fn select_spiral_window(
         ppa: &[u32],
         start: usize,
@@ -101,52 +98,31 @@ impl PbwtWavefront {
                 return;
             }
             if offset <= max_left {
-                out.push(ppa[sorted_pos - offset]);
+                let hap = ppa[sorted_pos - offset];
+                if hap != target {
+                    out.push(hap);
+                }
             }
             if out.len() >= n_candidates {
                 return;
             }
             if offset <= max_right {
-                out.push(ppa[sorted_pos + offset]);
+                let hap = ppa[sorted_pos + offset];
+                if hap != target {
+                    out.push(hap);
+                }
             }
         };
 
-        // Fibonacci offsets: 1, 2, 3, 5, 8, ...
-        let mut prev = 1usize;
-        let mut curr = 2usize;
-        if max_offset >= 1 {
-            push_offset(prev, &mut out);
-        }
-        if out.len() < n_candidates && max_offset >= 2 {
-            push_offset(curr, &mut out);
-        }
-        while out.len() < n_candidates {
-            let next = prev.saturating_add(curr);
-            if next > max_offset {
+        // Linear offsets: 1, 2, 3, ...
+        for offset in 1..=max_offset {
+            push_offset(offset, &mut out);
+            if out.len() >= n_candidates {
                 break;
             }
-            push_offset(next, &mut out);
-            prev = curr;
-            curr = next;
         }
 
-        // If still short, fill by scanning outward within the bounded window.
-        if out.len() < n_candidates {
-            let mut u = sorted_pos;
-            let mut v = sorted_pos + 1;
-            while out.len() < n_candidates && (u > start || v < end) {
-                if u > start {
-                    u -= 1;
-                    out.push(ppa[u]);
-                }
-                if out.len() < n_candidates && v < end {
-                    out.push(ppa[v]);
-                    v += 1;
-                }
-            }
-        }
-
-        Self::finalize_candidates(out, target, n_candidates)
+        Self::finalize_candidates(out, n_candidates)
     }
 
     fn fwd_window_bounded(

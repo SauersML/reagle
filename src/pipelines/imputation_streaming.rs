@@ -4,7 +4,6 @@
 //! Uses a producer-consumer model with MPSC channel to pipe phased matrices
 //! directly to imputation in-memory.
 
-use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
@@ -75,8 +74,9 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_MAX_PER_HAP: usize = 256;
-const ABYSS_RANK_CUTOFF: usize = 60;
+const ABYSS_RANK_BASE: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.25;
+const STATE_BUDGET_SAFETY: f64 = 0.6;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 
@@ -106,7 +106,8 @@ fn estimate_state_budget(
     }
     let budget = (available_bytes as f64 * IMPUTE_RAM_FRACTION) as u64;
     let per_thread = budget / n_threads.max(1) as u64;
-    (per_thread as usize) / per_state_bytes
+    let safe_bytes = (per_thread as f64 * STATE_BUDGET_SAFETY) as u64;
+    (safe_bytes as usize) / per_state_bytes
 }
 
 #[derive(Clone, Debug)]
@@ -488,14 +489,14 @@ fn score_window_batch_pbwt<TargetSpace, RefSpace>(
     }
 }
 
-fn select_top_k_map(scores: &HashMap<usize, f32>, k: usize) -> Vec<GlobalId> {
+fn select_top_k_pairs(scores: &[(usize, f32)], k: usize) -> Vec<GlobalId> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
     }
     let mut ranked: Vec<(usize, f32)> = scores
         .iter()
-        .filter(|&(_, &s)| s.is_finite() && s > 0.0)
-        .map(|(&idx, &s)| (idx, s))
+        .filter(|(_, s)| s.is_finite() && *s > 0.0)
+        .map(|(idx, s)| (*idx, *s))
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     if ranked.len() > k {
@@ -535,10 +536,8 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
     let sampling = build_sampling_points(&gen_positions, step_cm);
     let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
 
-    let mut score_maps: Vec<HashMap<usize, f32>> = Vec::with_capacity(n_target_haps);
-    for _ in 0..n_target_haps {
-        score_maps.push(HashMap::with_capacity(dynamic_budget.saturating_mul(2)));
-    }
+    let mut score_lists: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_target_haps];
+    let prune_limit = dynamic_budget.saturating_mul(8).max(dynamic_budget);
 
     let mut pbwt_fwd = ReferencePbwt::with_state(n_ref_haps, pbwt_state_fwd.as_ref());
     let mut beams_fwd: Vec<RankBeam> = (0..n_target_haps)
@@ -589,7 +588,7 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
                 }
                 let weight = -(freq.max(min_freq)).ln();
                 let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
-                let map = &mut score_maps[i];
+                let list = &mut score_lists[i];
                 for d in donors {
                     let idx = d as usize;
                     if idx < n_ref_haps {
@@ -597,9 +596,16 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
                         if ref_a == 255 || ref_a != targ {
                             continue;
                         }
-                        let entry = map.entry(idx).or_insert(0.0);
-                        *entry += weight;
+                        if let Some((_, v)) = list.iter_mut().find(|(k, _)| *k == idx) {
+                            *v += weight;
+                        } else {
+                            list.push((idx, weight));
+                        }
                     }
+                }
+                if list.len() > prune_limit {
+                    list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    list.truncate(prune_limit);
                 }
             }
         }
@@ -659,7 +665,7 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
                 }
                 let weight = -(freq.max(min_freq)).ln();
                 let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
-                let map = &mut score_maps[i];
+                let list = &mut score_lists[i];
                 for d in donors {
                     let idx = d as usize;
                     if idx < n_ref_haps {
@@ -667,9 +673,16 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
                         if ref_a == 255 || ref_a != targ {
                             continue;
                         }
-                        let entry = map.entry(idx).or_insert(0.0);
-                        *entry += weight;
+                        if let Some((_, v)) = list.iter_mut().find(|(k, _)| *k == idx) {
+                            *v += weight;
+                        } else {
+                            list.push((idx, weight));
+                        }
                     }
+                }
+                if list.len() > prune_limit {
+                    list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    list.truncate(prune_limit);
                 }
             }
         }
@@ -677,7 +690,7 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
 
     let mut out = vec![Vec::new(); n_target_haps];
     for hap_idx in 0..n_target_haps {
-        out[hap_idx] = select_top_k_map(&score_maps[hap_idx], dynamic_budget);
+        out[hap_idx] = select_top_k_pairs(&score_lists[hap_idx], dynamic_budget);
     }
 
     out
@@ -950,7 +963,9 @@ fn build_imputation_plan(
             } else {
                 total_budget.min(n_ref_haps)
             };
-            let abyss_rank_cutoff = ABYSS_RANK_CUTOFF.min(n_ref_haps).max(1);
+            let abyss_rank_cutoff = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
+                .min(n_ref_haps)
+                .max(1);
             for (i, _) in batch_haps.iter().enumerate() {
                 for (h, score) in window_scores[i].iter().copied().enumerate() {
                     if score > best_window_scores[i][h] {
@@ -990,7 +1005,9 @@ fn build_imputation_plan(
                 }
             }
             if abyss.iter().all(|v| *v) {
-                let keep = ABYSS_RANK_CUTOFF.min(n_ref_haps).max(1);
+                let keep = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
+                    .min(n_ref_haps)
+                    .max(1);
                 let top = select_top_k_allow_zero(&global_scores[i], keep);
                 if top.is_empty() {
                     for h in 0..keep {

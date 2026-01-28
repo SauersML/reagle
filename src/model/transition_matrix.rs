@@ -82,6 +82,7 @@ impl TransitionMatrix {
         let inv_total = 1.0 / total_mass;
 
         let mut kept_mass = 0.0f32;
+        let mut sum_next = 0.0f32;
         for (i, p) in prev_probs.iter().enumerate() {
             if !p.is_finite() || *p <= 0.0 {
                 continue;
@@ -98,15 +99,12 @@ impl TransitionMatrix {
                 let add = p_norm * w;
                 next[j] += add;
                 kept_mass += add;
+                sum_next += add;
             }
         }
 
         let dropped = (1.0 - kept_mass).max(0.0);
         if dropped > 0.0 {
-            let mut sum_next = 0.0f32;
-            for v in next.iter() {
-                sum_next += *v;
-            }
             if sum_next > 0.0 {
                 let scale = dropped / sum_next;
                 for v in next.iter_mut() {
