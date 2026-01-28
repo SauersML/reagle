@@ -1201,12 +1201,32 @@ impl crate::pipelines::ImputationPipeline {
             .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
             .unwrap_or(1);
         let avail_bytes = available_memory_bytes().unwrap_or(0);
+
+        // Peek at first window to estimate actual marker count for budget
+        let mut effective_window_markers = self.config.window_markers;
+        if let Ok(mut ref_reader_peek) = open_ref_reader(ref_path) {
+            // Use same config as main loop
+            if let Ok(Some(win)) = ref_reader_peek.next_window(
+                &streaming_config,
+                &gen_maps,
+                Some(&target_positions_map),
+            ) {
+                if !win.markers.is_empty() {
+                    let peek_markers = win.markers.len();
+                    // If the first window is smaller than the hard limit, use it for budgeting.
+                    // This is critical for small test datasets where allocating for 100k markers
+                    // would artificially restrict the state count (causing Abyss filtering).
+                    effective_window_markers = self.config.window_markers.min(peek_markers);
+                }
+            }
+        }
+
         let min_states = 64usize;
         loop {
             let total_budget = estimate_state_budget(
                 avail_bytes,
                 n_threads,
-                self.config.window_markers,
+                effective_window_markers,
             )
             .max(1);
             if total_budget >= min_states || n_threads <= 1 {
@@ -1214,8 +1234,12 @@ impl crate::pipelines::ImputationPipeline {
             }
             n_threads = (n_threads / 2).max(1);
         }
-        let total_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers)
-            .max(1);
+        let total_budget = estimate_state_budget(
+            avail_bytes,
+            n_threads,
+            effective_window_markers,
+        )
+        .max(1);
         let mut core_budget = if total_budget <= 1 {
             total_budget
         } else {
