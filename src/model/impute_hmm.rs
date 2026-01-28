@@ -271,6 +271,30 @@ pub fn run_impute_hmm(
                 for p in allele_probs.iter_mut() {
                     *p /= total;
                 }
+            } else if m_rev < ref_allele_freqs.len() && !ref_allele_freqs[m_rev].is_empty() {
+                let freqs = &ref_allele_freqs[m_rev];
+                let mut sum = 0.0f32;
+                for (i, p) in allele_probs.iter_mut().enumerate() {
+                    let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
+                    *p = f;
+                    sum += f;
+                }
+                if sum > 0.0 {
+                    let inv = 1.0 / sum;
+                    for p in allele_probs.iter_mut() {
+                        *p *= inv;
+                    }
+                } else {
+                    let uniform = 1.0 / allele_probs.len().max(1) as f32;
+                    for p in allele_probs.iter_mut() {
+                        *p = uniform;
+                    }
+                }
+            } else {
+                let uniform = 1.0 / allele_probs.len().max(1) as f32;
+                for p in allele_probs.iter_mut() {
+                    *p = uniform;
+                }
             }
             if allele_probs.len() == 2 {
                 posteriors[m_rev] = AllelePosteriors::Biallelic(allele_probs[1]);

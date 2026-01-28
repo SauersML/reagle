@@ -6,12 +6,6 @@
 
 use crate::model::types::GlobalId;
 
-#[derive(Debug, Clone, Copy)]
-pub enum Redistribution {
-    /// Spread dropped mass uniformly across all next states.
-    Uniform,
-}
-
 #[derive(Clone, Debug)]
 pub struct NormalizedProbs(Vec<f32>);
 
@@ -65,12 +59,8 @@ impl TransitionMatrix {
 
     /// Map previous state probabilities into next-state space.
     ///
-    /// Dropped mass is spread uniformly when `Redistribution::Uniform` is selected.
-    pub fn map(
-        &self,
-        prev_probs: &[f32],
-        redistribution: Redistribution,
-    ) -> NormalizedProbs {
+    /// Dropped mass is redistributed proportionally to retained mass when possible.
+    pub fn map(&self, prev_probs: &[f32]) -> NormalizedProbs {
         let mut next = vec![0.0f32; self.n_next];
         if self.n_next == 0 || prev_probs.is_empty() {
             return NormalizedProbs(next);
@@ -113,12 +103,19 @@ impl TransitionMatrix {
 
         let dropped = (1.0 - kept_mass).max(0.0);
         if dropped > 0.0 {
-            match redistribution {
-                Redistribution::Uniform => {
-                    let add = dropped / self.n_next as f32;
-                    for v in next.iter_mut() {
-                        *v += add;
-                    }
+            let mut sum_next = 0.0f32;
+            for v in next.iter() {
+                sum_next += *v;
+            }
+            if sum_next > 0.0 {
+                let scale = dropped / sum_next;
+                for v in next.iter_mut() {
+                    *v += *v * scale;
+                }
+            } else {
+                let add = dropped / self.n_next as f32;
+                for v in next.iter_mut() {
+                    *v += add;
                 }
             }
         }

@@ -29,12 +29,13 @@ use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
 };
+use crate::model::pbwt::PbwtState;
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::model::types::GlobalId;
 use crate::model::impute_hmm::{
     ImputeWorkspace, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
 };
-use crate::model::transition_matrix::{Redistribution, TransitionMatrix};
+use crate::model::transition_matrix::TransitionMatrix;
 use crate::pipelines::imputation::AllelePosteriors;
 
 
@@ -513,6 +514,7 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
     gen_maps: &GeneticMaps,
     dynamic_budget: usize,
     step_cm: f64,
+    pbwt_state_fwd: &mut Option<PbwtState>,
 ) -> Vec<Vec<GlobalId>> {
     let n_target_haps = target_gt.n_samples() * 2;
     let n_ref_haps = ref_columns
@@ -538,7 +540,7 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
         score_maps.push(HashMap::with_capacity(dynamic_budget.saturating_mul(2)));
     }
 
-    let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
+    let mut pbwt_fwd = ReferencePbwt::with_state(n_ref_haps, pbwt_state_fwd.as_ref());
     let mut beams_fwd: Vec<RankBeam> = (0..n_target_haps)
         .map(|_| RankBeam::full(n_ref_haps as u32))
         .collect();
@@ -601,6 +603,10 @@ fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
                 }
             }
         }
+    }
+
+    if n_markers > 0 {
+        *pbwt_state_fwd = Some(pbwt_fwd.get_state(n_markers - 1));
     }
 
     let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
@@ -1225,6 +1231,7 @@ impl crate::pipelines::ImputationPipeline {
         let mut writer = VcfWriter::create(&output_path, target_samples.clone())?;
 
         let mut imp_overlap: Option<PhasedOverlap> = None;
+        let mut pbwt_state_fwd: Option<PbwtState> = None;
         let mut header_written = false;
         let mut total_markers = 0usize;
         let mut window_idx = 0usize;
@@ -1316,6 +1323,7 @@ impl crate::pipelines::ImputationPipeline {
             ref_window.global_start,
             ref_window.output_start,
             ref_window.output_end,
+            &mut pbwt_state_fwd,
         )?;
 
             total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
@@ -1368,6 +1376,7 @@ impl crate::pipelines::ImputationPipeline {
         global_start: usize,
         output_start: usize,
         output_end: usize,
+        pbwt_state_fwd: &mut Option<PbwtState>,
     ) -> Result<Option<ImputationHandoff>> {
         let window_span = if self.config.profile {
             Some(
@@ -1706,6 +1715,7 @@ impl crate::pipelines::ImputationPipeline {
                 gen_maps,
                 plan.dynamic_budget,
                 PBWT_SELECT_BLOCK_CM.max(self.config.imp_step as f64),
+                pbwt_state_fwd,
             )
         } else {
             vec![Vec::new(); n_target_samples * 2]
@@ -1755,7 +1765,7 @@ impl crate::pipelines::ImputationPipeline {
                         let prev_states: Vec<GlobalId> =
                             p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
                         let mapper = TransitionMatrix::build(&prev_states, &state_haps);
-                        Some(mapper.map(p.probs(), Redistribution::Uniform).into_vec())
+                        Some(mapper.map(p.probs()).into_vec())
                     });
 
                     let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {

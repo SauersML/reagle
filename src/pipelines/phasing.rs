@@ -3592,8 +3592,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         ($m:expr, $probs:expr) => {{
                             let m = $m;
                             let probs = $probs;
-                            let n_alleles = 4usize;
-                            let mut al_probs = [0.0f32; 4];
+                            let n_alleles = target_gt
+                                .markers()
+                                .marker(MarkerIdx::new(m as u32))
+                                .n_alleles()
+                                .max(1);
+                            let mut al_probs = vec![0.0f32; n_alleles];
 
                             let mkr_a = stage2_phaser.prev_stage1_marker[m];
                             let state_haps = get_haps!(mkr_a);
@@ -3605,8 +3609,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let hap_allele = get_allele(m, hap.as_u32() as usize);
 
                                 if hap_allele != 255 {
-                                    if (hap_allele as usize) < n_alleles {
-                                        al_probs[hap_allele as usize] += prob_state;
+                                    let idx = hap_allele as usize;
+                                    if idx < al_probs.len() {
+                                        al_probs[idx] += prob_state;
                                     }
                                 }
                             }
