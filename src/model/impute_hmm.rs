@@ -6,7 +6,6 @@
 
 use crate::data::storage::GenotypeColumn;
 use crate::data::HapIdx;
-use crate::model::hmm::HmmUpdater;
 use crate::model::weighted_kernel::WeightedHmmUpdater;
 use crate::model::types::GlobalId;
 use crate::pipelines::imputation::AllelePosteriors;
@@ -42,6 +41,7 @@ pub struct ImputeWorkspace {
     pub emissions: Vec<f32>,
     pub fwd_history: Vec<f32>,
     pub weights: Vec<f32>,
+    pub ref_alleles: Vec<u8>,
 }
 
 impl ImputeWorkspace {
@@ -52,6 +52,7 @@ impl ImputeWorkspace {
             emissions: vec![1.0; n_states],
             fwd_history: vec![0.0; n_states * n_markers],
             weights: vec![1.0; n_states],
+            ref_alleles: vec![255u8; n_states * n_markers],
         }
     }
 
@@ -68,6 +69,9 @@ impl ImputeWorkspace {
         let want = n_states.saturating_mul(n_markers);
         if self.fwd_history.len() != want {
             self.fwd_history.resize(want, 0.0);
+        }
+        if self.ref_alleles.len() != want {
+            self.ref_alleles.resize(want, 255);
         }
     }
 }
@@ -124,6 +128,7 @@ pub fn run_impute_hmm(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
+    total_ref_haps: usize,
     ws: &mut ImputeWorkspace,
 ) -> (Vec<AllelePosteriors>, Option<Vec<f32>>) {
     let n_states = state_haps.len();
@@ -154,6 +159,7 @@ pub fn run_impute_hmm(
 
         for (i, hap) in state_haps.iter().enumerate() {
             let ref_allele = ref_columns[m].get(HapIdx::new(hap.as_u32()));
+            ws.ref_alleles[m * n_states + i] = ref_allele;
             ws.emissions[i] = emission_prob_soft(ref_allele, probs, error_rate);
         }
 
@@ -163,7 +169,7 @@ pub fn run_impute_hmm(
                     &mut ws.fwd,
                     fwd_sum,
                     recomb_rate,
-                    n_states.max(1),
+                    total_ref_haps.max(1),
                     &ws.weights,
                     &ws.emissions,
                     n_states,
@@ -179,7 +185,7 @@ pub fn run_impute_hmm(
                 &mut ws.fwd,
                 fwd_sum,
                 recomb_rate,
-                n_states.max(1),
+                total_ref_haps.max(1),
                 &ws.weights,
                 &ws.emissions,
                 n_states,
@@ -203,8 +209,8 @@ pub fn run_impute_hmm(
         let probs = target_probs.probs_for_marker(m_rev);
         let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
 
-        for (i, hap) in state_haps.iter().enumerate() {
-            let ref_allele = ref_columns[m_rev].get(HapIdx::new(hap.as_u32()));
+        for i in 0..n_states {
+            let ref_allele = ws.ref_alleles[m_rev * n_states + i];
             ws.emissions[i] = emission_prob_soft(ref_allele, probs, error_rate);
         }
 
@@ -212,13 +218,12 @@ pub fn run_impute_hmm(
         for i in 0..n_states {
             constant_term += ws.bwd[i] * ws.emissions[i];
         }
-        HmmUpdater::bwd_update_constant(
-            &mut ws.bwd,
-            recomb_rate,
-            &ws.emissions,
-            constant_term.max(1e-30),
-            n_states,
-        );
+        let inv_c = 1.0 / constant_term.max(1e-30);
+        let scale = (1.0 - recomb_rate) * inv_c;
+        let shift = recomb_rate / total_ref_haps.max(1) as f32;
+        for i in 0..n_states {
+            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
+        }
 
         let start = m_rev * n_states;
         let fwd_slice = &ws.fwd_history[start..start + n_states];
@@ -228,8 +233,8 @@ pub fn run_impute_hmm(
         if n_alleles > 0 {
             allele_probs.resize(n_alleles, 0.0f32);
             let mut total = 0.0f32;
-            for (i, hap) in state_haps.iter().enumerate() {
-                let ref_allele = ref_columns[m_rev].get(HapIdx::new(hap.as_u32()));
+            for i in 0..n_states {
+                let ref_allele = ws.ref_alleles[m_rev * n_states + i];
                 if ref_allele == 255 {
                     continue;
                 }

@@ -4,6 +4,7 @@
 //! Uses a producer-consumer model with MPSC channel to pipe phased matrices
 //! directly to imputation in-memory.
 
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
@@ -112,8 +113,8 @@ struct ImputationPlan {
     n_ref_haps: usize,
     core_states: Vec<Vec<GlobalId>>, // per target hap
     abyss_mask: Vec<Vec<bool>>,      // per target hap
-    dynamic_states: Vec<Vec<Vec<GlobalId>>>, // [window][target_hap]
     total_budget: usize,
+    dynamic_budget: usize,
 }
 
 fn estimate_scan_batch_size(
@@ -485,6 +486,211 @@ fn score_window_batch_pbwt<TargetSpace, RefSpace>(
     }
 }
 
+fn select_top_k_map(scores: &HashMap<usize, f32>, k: usize) -> Vec<GlobalId> {
+    if k == 0 || scores.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(usize, f32)> = scores
+        .iter()
+        .filter(|&(_, &s)| s.is_finite() && s > 0.0)
+        .map(|(&idx, &s)| (idx, s))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if ranked.len() > k {
+        ranked.truncate(k);
+    }
+    ranked
+        .into_iter()
+        .map(|(idx, _)| GlobalId::new(idx as u32))
+        .collect()
+}
+
+fn compute_dynamic_states_for_window<TargetSpace, RefSpace>(
+    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+    ref_columns: &[GenotypeColumn],
+    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+    gen_maps: &GeneticMaps,
+    dynamic_budget: usize,
+    step_cm: f64,
+) -> Vec<Vec<GlobalId>> {
+    let n_target_haps = target_gt.n_samples() * 2;
+    let n_ref_haps = ref_columns
+        .first()
+        .map(|c| c.n_haplotypes())
+        .unwrap_or(0);
+    if n_target_haps == 0 || n_ref_haps == 0 || dynamic_budget == 0 {
+        return vec![Vec::new(); n_target_haps];
+    }
+
+    let n_markers = target_gt.n_markers();
+    let mut gen_positions = Vec::with_capacity(n_markers);
+    for m in 0..n_markers {
+        let marker = target_gt.markers().marker(MarkerIdx::new(m as u32));
+        let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
+        gen_positions.push(gen_pos);
+    }
+    let sampling = build_sampling_points(&gen_positions, step_cm);
+    let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
+
+    let batch_size = estimate_scan_batch_size(
+        available_memory_bytes().unwrap_or(0),
+        n_ref_haps,
+        n_target_haps,
+    );
+    let mut out = vec![Vec::new(); n_target_haps];
+
+    let mut batch_start = 0usize;
+    while batch_start < n_target_haps {
+        let batch_end = (batch_start + batch_size).min(n_target_haps);
+        let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
+        let batch_len = batch_haps.len();
+
+        let mut score_maps: Vec<HashMap<usize, f32>> = Vec::with_capacity(batch_len);
+        for _ in 0..batch_len {
+            score_maps.push(HashMap::new());
+        }
+
+        let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
+        let mut beams_fwd: Vec<RankBeam> = (0..batch_len)
+            .map(|_| RankBeam::full(n_ref_haps as u32))
+            .collect();
+        let mut ref_alleles = vec![0u8; n_ref_haps];
+        let mut query_alleles = vec![0u8; batch_len];
+        let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+        let k_per_hap = PBWT_MAX_PER_HAP.min(n_ref_haps).max(1);
+
+        for m in 0..n_markers {
+            for (i, &hap_idx) in batch_haps.iter().enumerate() {
+                query_alleles[i] =
+                    target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+            }
+            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                for rh in 0..n_ref_haps {
+                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                    ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
+                }
+            } else {
+                ref_alleles.fill(255);
+            }
+
+            let mut is_biallelic = true;
+            for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+            let n_alleles = if is_biallelic { 2 } else { 256 };
+            pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
+
+            if sampling[m] {
+                for i in 0..batch_len {
+                    let targ = query_alleles[i];
+                    if targ == 255 {
+                        continue;
+                    }
+                    let freq = freqs
+                        .get(m)
+                        .and_then(|f| f.get(targ as usize))
+                        .copied()
+                        .unwrap_or(0.0);
+                    if freq <= 0.0 {
+                        continue;
+                    }
+                    let weight = -(freq.max(min_freq)).ln();
+                    let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
+                    let map = &mut score_maps[i];
+                    for d in donors {
+                        let idx = d as usize;
+                        if idx < n_ref_haps {
+                            let ref_a = ref_alleles[idx];
+                            if ref_a == 255 || ref_a != targ {
+                                continue;
+                            }
+                            let entry = map.entry(idx).or_insert(0.0);
+                            *entry += weight;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
+        let mut beams_bwd: Vec<RankBeam> = (0..batch_len)
+            .map(|_| RankBeam::full(n_ref_haps as u32))
+            .collect();
+        for (rev_step, m) in (0..n_markers).rev().enumerate() {
+            for (i, &hap_idx) in batch_haps.iter().enumerate() {
+                query_alleles[i] =
+                    target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+            }
+            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                for rh in 0..n_ref_haps {
+                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                    ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
+                }
+            } else {
+                ref_alleles.fill(255);
+            }
+
+            let mut is_biallelic = true;
+            for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+            let n_alleles = if is_biallelic { 2 } else { 256 };
+            pbwt_bwd.advance_with_beams(
+                &ref_alleles,
+                n_alleles,
+                rev_step,
+                &query_alleles,
+                &mut beams_bwd,
+            );
+
+            if sampling[m] {
+                for i in 0..batch_len {
+                    let targ = query_alleles[i];
+                    if targ == 255 {
+                        continue;
+                    }
+                    let freq = freqs
+                        .get(m)
+                        .and_then(|f| f.get(targ as usize))
+                        .copied()
+                        .unwrap_or(0.0);
+                    if freq <= 0.0 {
+                        continue;
+                    }
+                    let weight = -(freq.max(min_freq)).ln();
+                    let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
+                    let map = &mut score_maps[i];
+                    for d in donors {
+                        let idx = d as usize;
+                        if idx < n_ref_haps {
+                            let ref_a = ref_alleles[idx];
+                            if ref_a == 255 || ref_a != targ {
+                                continue;
+                            }
+                            let entry = map.entry(idx).or_insert(0.0);
+                            *entry += weight;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            out[hap_idx] = select_top_k_map(&score_maps[i], dynamic_budget);
+        }
+
+        batch_start = batch_end;
+    }
+
+    out
+}
+
 fn normalize_chrom_local(name: &str) -> &str {
     if name.len() >= 3 && name[..3].eq_ignore_ascii_case("chr") {
         &name[3..]
@@ -604,8 +810,8 @@ fn build_imputation_plan(
         n_ref_haps: 0,
         core_states: vec![Vec::new(); n_target_haps],
         abyss_mask: vec![Vec::new(); n_target_haps],
-        dynamic_states: Vec::new(),
         total_budget,
+        dynamic_budget,
     };
 
     let avail = available_memory_bytes().unwrap_or(0);
@@ -645,7 +851,6 @@ fn build_imputation_plan(
         let mut target_reader =
             StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
 
-        let mut window_idx = 0usize;
         let mut global_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
@@ -670,7 +875,6 @@ fn build_imputation_plan(
 
             let n_ref_markers = ref_window.markers.len();
             if n_ref_markers == 0 {
-                window_idx += 1;
                 continue;
             }
 
@@ -692,7 +896,6 @@ fn build_imputation_plan(
                 end_pos,
             )?;
             let Some(target_window) = target_window else {
-                window_idx += 1;
                 continue;
             };
 
@@ -716,8 +919,6 @@ fn build_imputation_plan(
             }
 
             let full_fit = total_budget >= n_ref_haps;
-            let effective_dynamic_budget = if full_fit { 0 } else { dynamic_budget };
-
             let k_per_hap = total_budget
                 .max(1)
                 .min(PBWT_MAX_PER_HAP);
@@ -758,12 +959,7 @@ fn build_imputation_plan(
                 total_budget.min(n_ref_haps)
             };
             let abyss_rank_cutoff = ABYSS_RANK_CUTOFF.min(n_ref_haps).max(1);
-            if effective_dynamic_budget > 0 && plan.dynamic_states.len() <= window_idx {
-                plan.dynamic_states
-                    .push(vec![Vec::new(); n_target_haps]);
-            }
-
-            for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            for (i, _) in batch_haps.iter().enumerate() {
                 for (h, score) in window_scores[i].iter().copied().enumerate() {
                     if score > best_window_scores[i][h] {
                         best_window_scores[i][h] = score;
@@ -772,17 +968,10 @@ fn build_imputation_plan(
 
                 if window_candidate_k > 0 {
                     let top = select_top_k(&window_scores[i], window_candidate_k);
-                    let mut candidates: Vec<(GlobalId, f32)> = Vec::with_capacity(top.len());
-                    for (ref_idx, score) in top {
-                        let gid = GlobalId::new(ref_idx as u32);
-                        candidates.push((gid, score));
+                    for (ref_idx, _) in top {
                         if ref_idx < window_hits[i].len() {
                             window_hits[i][ref_idx] = window_hits[i][ref_idx].saturating_add(1);
                         }
-                    }
-                    if effective_dynamic_budget > 0 && window_idx < plan.dynamic_states.len() {
-                        plan.dynamic_states[window_idx][hap_idx] =
-                            candidates.into_iter().map(|(g, _)| g).collect();
                     }
                 }
 
@@ -795,11 +984,9 @@ fn build_imputation_plan(
                 }
             }
 
-            window_idx += 1;
         }
 
         let full_fit = total_budget >= n_ref_haps;
-        let effective_dynamic_budget = if full_fit { 0 } else { dynamic_budget };
         let effective_core_budget = if full_fit { n_ref_haps } else { core_budget };
 
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
@@ -877,18 +1064,6 @@ fn build_imputation_plan(
                 }
             }
             plan.core_states[hap_idx] = core.clone();
-
-            if effective_dynamic_budget == 0 {
-                continue;
-            }
-
-            for window_dyn in plan.dynamic_states.iter_mut() {
-                let dyn_vec = &mut window_dyn[hap_idx];
-                dyn_vec.retain(|g| !core.contains(g) && !abyss[g.as_usize()]);
-                if dyn_vec.len() > effective_dynamic_budget {
-                    dyn_vec.truncate(effective_dynamic_budget);
-                }
-            }
         }
 
         batch_start = batch_end;
@@ -966,14 +1141,32 @@ impl crate::pipelines::ImputationPipeline {
             .as_ref()
             .ok_or_else(|| ReagleError::config("Reference panel required for imputation"))?;
 
-        let mut phased_target_path = self.config.gt.clone();
+        let mut input_target_path = self.config.gt.clone();
+        let mut input_tmp: Option<tempfile::TempDir> = None;
+        if input_target_path.as_os_str() == "-" {
+            let tmpdir = tempfile::tempdir()?;
+            let tmp_path = tmpdir.path().join("stdin_target.vcf");
+            let stdin = std::io::stdin();
+            let mut reader = stdin.lock();
+            let mut out = std::fs::File::create(&tmp_path)?;
+            std::io::copy(&mut reader, &mut out)?;
+            input_target_path = tmp_path;
+            input_tmp = Some(tmpdir);
+        } else if !input_target_path.exists() {
+            return Err(ReagleError::config(format!(
+                "Target VCF not found: {:?}",
+                input_target_path
+            )));
+        }
+
+        let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
         if !is_vcf_fully_phased(&phased_target_path)? {
             eprintln!("Target is unphased; running phasing before pre-scan...");
             let tmpdir = tempfile::tempdir()?;
             let phased_prefix = tmpdir.path().join("phased_target");
             let mut phase_config = self.config.clone();
-            phase_config.gt = self.config.gt.clone();
+            phase_config.gt = input_target_path.clone();
             phase_config.out = phased_prefix.clone();
             let mut phasing = crate::pipelines::phasing::PhasingPipeline::new(
                 phase_config,
@@ -1023,12 +1216,15 @@ impl crate::pipelines::ImputationPipeline {
             self.config.imp_step as f64,
         )?;
         if plan.total_budget >= plan.n_ref_haps {
-            plan.dynamic_states.clear();
+            plan.dynamic_budget = 0;
         }
 
         let mut ref_reader = open_ref_reader(ref_path)?;
-        let mut target_reader =
-            StreamingVcfReader::open(&phased_target_path, gen_maps.clone(), streaming_config.clone())?;
+        let mut target_reader = StreamingVcfReader::open(
+            &phased_target_path,
+            gen_maps.clone(),
+            streaming_config.clone(),
+        )?;
 
         let target_samples = target_reader.samples_arc();
         let n_target_samples = target_samples.len();
@@ -1159,6 +1355,7 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let _ = phased_tmp.as_ref();
+        let _ = input_tmp.as_ref();
 
         if total_markers == 0 {
             return Err(ReagleError::vcf(
@@ -1515,6 +1712,19 @@ impl crate::pipelines::ImputationPipeline {
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
         }
 
+        let dynamic_states = if plan.dynamic_budget > 0 {
+            compute_dynamic_states_for_window(
+                target_win,
+                ref_columns,
+                alignment,
+                gen_maps,
+                plan.dynamic_budget,
+                PBWT_SELECT_BLOCK_CM.max(self.config.imp_step as f64),
+            )
+        } else {
+            vec![Vec::new(); n_target_samples * 2]
+        };
+
         let sample_results: Vec<ImputeResult> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
@@ -1538,10 +1748,8 @@ impl crate::pipelines::ImputationPipeline {
                     if plan_idx < plan.core_states.len() {
                         state_haps.extend(plan.core_states[plan_idx].iter().copied());
                     }
-                    if window_idx < plan.dynamic_states.len()
-                        && plan_idx < plan.dynamic_states[window_idx].len()
-                    {
-                        state_haps.extend(plan.dynamic_states[window_idx][plan_idx].iter().copied());
+                    if plan_idx < dynamic_states.len() {
+                        state_haps.extend(dynamic_states[plan_idx].iter().copied());
                     }
                     state_haps.sort_unstable_by_key(|g| g.as_u32());
                     state_haps.dedup();
@@ -1578,6 +1786,7 @@ impl crate::pipelines::ImputationPipeline {
                             self.params.p_mismatch,
                             prior_marker_idx,
                             state_priors.as_deref(),
+                            plan.n_ref_haps,
                             ws,
                         )
                     });
