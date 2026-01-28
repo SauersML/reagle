@@ -1615,7 +1615,7 @@ target_samples={} target_bytes={}",
                             target_win.sample_phase_confidence_f32(
                                 MarkerIdx::new(target_m as u32),
                                 sample_idx,
-                            )
+                            ).max(ModelParams::MIN_IMP_PHASE_CONFIDENCE)
                         } else {
                             1.0
                         };
