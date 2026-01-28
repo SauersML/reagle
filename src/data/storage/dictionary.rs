@@ -115,11 +115,6 @@ impl DictionaryColumn {
         allele
     }
 
-    #[inline]
-    pub fn hap_to_pattern(&self) -> &[u32] {
-        &self.hap_to_pattern
-    }
-
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.hap_to_pattern.len()

@@ -1032,7 +1032,7 @@ mod tests {
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
-    use crate::model::block_hash::types::GlobalId;
+    use crate::model::types::GlobalId;
     use std::sync::Arc;
 
     fn make_test_ref_panel() -> GenotypeMatrix {

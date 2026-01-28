@@ -20,7 +20,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
-use crate::model::block_hash::types::GlobalId;
+use crate::model::types::GlobalId;
 use crate::model::states::ThreadedHaps;
 
 /// Entry in the priority queue for managing composite haplotypes
@@ -236,6 +236,7 @@ impl PhaseStates {
 
         let n_states = self.max_states.min(n_haps.saturating_sub(2));
 
+        let recent_marker = self.n_markers.saturating_sub(1) as i32;
         for _ in 0..n_states {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             let h = (seed % n_haps as u64) as u32;
@@ -243,12 +244,12 @@ impl PhaseStates {
             if h / 2 != sample && !self.hap_to_last_ibs.contains_key(&hap_id) {
                 let index = self.threaded_haps.n_states();
                 self.threaded_haps.push_new(hap_id);
-                self.hap_to_last_ibs.insert(hap_id, 0);
+                self.hap_to_last_ibs.insert(hap_id, recent_marker);
                 self.queue.push(CompHapEntry {
                     comp_hap_idx: index,
                     hap: hap_id,
                     start_marker: 0,
-                    last_ibs_marker: 0,
+                    last_ibs_marker: recent_marker,
                 });
             }
         }

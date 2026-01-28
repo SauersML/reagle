@@ -43,10 +43,8 @@
 //! phasing and imputation.
 
 pub mod allele_lookup;
-pub mod block_hash;
 pub mod hmm;
 pub mod ibs2;
-
 pub mod parameters;
 pub mod pbwt;
 pub mod pbwt_streaming;
@@ -54,4 +52,8 @@ pub mod phase_ibs;
 pub mod phase_states;
 pub mod pl_emission;
 pub mod reference_pbwt;
+pub mod transition_matrix;
 pub mod states;
+pub mod types;
+pub mod weighted_kernel;
+pub mod impute_hmm;

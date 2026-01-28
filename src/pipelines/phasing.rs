@@ -59,7 +59,7 @@ impl std::ops::Deref for StreamWindowWithResult {
 }
 use crate::data::alignment::MarkerAlignment;
 use crate::model::allele_lookup::RefAlleleLookup;
-use crate::model::block_hash::types::GlobalId;
+use crate::model::types::GlobalId;
 use crate::model::hmm::BeagleHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
@@ -71,7 +71,9 @@ use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::utils::telemetry::{Stage, TelemetryBlackboard};
 use mini_mcmc::core::{MarkovChain, Trace};
 
-const STAGE1_BLOCK_CM: f64 = 0.05;
+const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
+const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 
 fn partition_markers_by_cm(gen_positions: &[f64], block_cm: f64) -> Vec<(usize, usize)> {
     if gen_positions.is_empty() {
@@ -93,6 +95,16 @@ fn partition_markers_by_cm(gen_positions: &[f64], block_cm: f64) -> Vec<(usize, 
         start = end;
     }
     blocks
+}
+
+fn stage1_block_cm(gen_positions: &[f64]) -> f64 {
+    if gen_positions.len() < 2 {
+        return STAGE1_BLOCK_MIN_CM;
+    }
+    let span = (gen_positions[gen_positions.len() - 1] - gen_positions[0]).abs();
+    let avg = span / (gen_positions.len().saturating_sub(1).max(1) as f64);
+    let block = avg * STAGE1_BLOCK_TARGET_MARKERS as f64;
+    block.clamp(STAGE1_BLOCK_MIN_CM, STAGE1_BLOCK_MAX_CM)
 }
 
 /// Phasing pipeline
@@ -714,8 +726,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             );
 
             // Store in pipeline struct for use during phasing iterations
-            self.alignment = Some(alignment);
-            self.reference_gt = Some(Arc::new(ref_gt));
+            self.set_reference(Arc::new(ref_gt), alignment);
         }
 
         // Compute combined haplotype count
@@ -798,7 +809,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let hi_freq_gen_positions: Vec<f64> =
             hi_freq_to_orig.iter().map(|&m| gen_positions[m]).collect();
 
-        let stage1_blocks = partition_markers_by_cm(&hi_freq_gen_positions, STAGE1_BLOCK_CM);
+        let stage1_blocks =
+            partition_markers_by_cm(&hi_freq_gen_positions, stage1_block_cm(&hi_freq_gen_positions));
         eprintln!("Stage 1 blocks: {}", stage1_blocks.len());
 
         // Compute genetic distances only for HIGH-FREQUENCY markers
@@ -1709,7 +1721,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         if n_markers > 0 {
             sampling_points[n_markers - 1] = true;
         }
-        let donor_blocks = partition_markers_by_cm(gen_positions, STAGE1_BLOCK_CM);
+        let donor_blocks = partition_markers_by_cm(gen_positions, stage1_block_cm(gen_positions));
         if !donor_blocks.is_empty() {
             sampling_points.fill(false);
             for &(s, e) in &donor_blocks {
@@ -1771,7 +1783,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let ref_gt = ref_gt.expect("reference");
         let alignment = alignment.expect("alignment");
 
-        let donor_blocks = partition_markers_by_cm(gen_positions, STAGE1_BLOCK_CM);
+        let donor_blocks = partition_markers_by_cm(gen_positions, stage1_block_cm(gen_positions));
         if !donor_blocks.is_empty() {
             sampling_points.fill(false);
             for &(s, e) in &donor_blocks {
@@ -2505,7 +2517,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     );
 
                                     let donor_blocks =
-                                        partition_markers_by_cm(&gen_positions, STAGE1_BLOCK_CM);
+                                        partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
                                     let block_starts: Arc<[usize]> =
                                         blocks_to_starts(&donor_blocks, n_markers)
                                             .into_boxed_slice()
@@ -3593,8 +3605,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         ($m:expr, $probs:expr) => {{
                             let m = $m;
                             let probs = $probs;
-                            let n_alleles = 4usize;
-                            let mut al_probs = [0.0f32; 4];
+                            let n_alleles = target_gt
+                                .markers()
+                                .marker(MarkerIdx::new(m as u32))
+                                .n_alleles()
+                                .max(1);
+                            let mut al_probs = vec![0.0f32; n_alleles];
 
                             let mkr_a = stage2_phaser.prev_stage1_marker[m];
                             let state_haps = get_haps!(mkr_a);
@@ -3606,8 +3622,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let hap_allele = get_allele(m, hap.as_u32() as usize);
 
                                 if hap_allele != 255 {
-                                    if (hap_allele as usize) < n_alleles {
-                                        al_probs[hap_allele as usize] += prob_state;
+                                    let idx = hap_allele as usize;
+                                    if idx < al_probs.len() {
+                                        al_probs[idx] += prob_state;
                                     }
                                 }
                             }
@@ -6108,37 +6125,6 @@ impl Stage2Phaser {
 }
 
 impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
-    /// Phase a window with PBWT state handoff from previous window
-    ///
-    /// This maintains PBWT continuity across windows by passing the
-    /// prefix array (PPA) and divergence array from the end of the
-    /// previous window to initialize the current window's PBWT.
-    pub fn phase_window_with_pbwt_handoff(
-        &mut self,
-        target_gt: &GenotypeMatrix,
-        gen_maps: &GeneticMaps,
-        phased_overlap: Option<&PhasedOverlap>,
-        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
-    ) -> Result<GenotypeMatrix<Phased>> {
-        // Log PBWT continuity state for debugging window transitions
-        if let Some(state) = pbwt_state {
-            tracing::trace!(
-                marker_pos = state.marker_pos,
-                n_haps = state.ppa.len(),
-                "PBWT state handoff from previous window"
-            );
-        }
-        self.phase_in_memory_with_overlap(
-            target_gt,
-            gen_maps,
-            phased_overlap,
-            None,
-            pbwt_state,
-            None,
-        )
-        .map(|(result, ..)| result)
-    }
-
     /// Finalize Stage 2 phasing using context from next window
     ///
     /// Finalize Stage 2 phasing with forward context from the next window.

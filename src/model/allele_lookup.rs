@@ -56,7 +56,7 @@ impl RefAlleleLookup {
                 a.target_to_ref(MarkerIdx::new(orig_m as u32))
             });
 
-            use crate::model::block_hash::types::GlobalId;
+            use crate::model::types::GlobalId;
 
             move |hap: GlobalId| {
                 let hap = hap.as_u32() as usize;

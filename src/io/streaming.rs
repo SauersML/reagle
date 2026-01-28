@@ -204,8 +204,8 @@ pub struct PhasedOverlap {
     /// This lets the next window verify it is projecting at the same physical marker.
     pub prior_stage1_global_marker: Option<usize>,
 
-    /// Recombination rate between the prior marker and the first marker of this overlap
-    pub incoming_recomb_rate: Option<f32>,
+    /// Genetic position (cM) for the prior marker used to export haplotype priors.
+    pub prior_stage1_gen_pos: Option<f64>,
 }
 
 impl PhasedOverlap {
@@ -224,7 +224,7 @@ impl PhasedOverlap {
             state_probs: None,
             hap_priors: None,
             prior_stage1_global_marker: None,
-            incoming_recomb_rate: None,
+            prior_stage1_gen_pos: None,
         }
     }
 
@@ -253,14 +253,14 @@ impl PhasedOverlap {
         self.prior_stage1_global_marker
     }
 
-    /// Set recombination rate between the prior marker and overlap start.
-    pub fn set_incoming_recomb_rate(&mut self, rate: f32) {
-        self.incoming_recomb_rate = Some(rate);
+    /// Set genetic position (cM) for the prior marker used to export haplotype priors.
+    pub fn set_prior_stage1_gen_pos(&mut self, gen_pos: f64) {
+        self.prior_stage1_gen_pos = Some(gen_pos);
     }
 
-    /// Get recombination rate between the prior marker and overlap start.
-    pub fn incoming_recomb_rate(&self) -> Option<f32> {
-        self.incoming_recomb_rate
+    /// Get genetic position (cM) for the prior marker used to export haplotype priors.
+    pub fn prior_stage1_gen_pos(&self) -> Option<f64> {
+        self.prior_stage1_gen_pos
     }
 
     /// Get the allele for a specific haplotype at a specific marker
@@ -498,11 +498,6 @@ impl StreamingVcfReader {
     /// Get samples Arc
     pub fn samples_arc(&self) -> Arc<Samples> {
         Arc::clone(&self.samples)
-    }
-
-    /// Returns true if all genotypes seen so far were phased (used '|' separator).
-    pub fn was_all_phased(&self) -> bool {
-        self.all_phased
     }
 
     /// Read the next window of data
