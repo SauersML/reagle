@@ -33,7 +33,7 @@ use crate::model::types::GlobalId;
 use crate::model::impute_hmm::{
     ImputeWorkspace, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
 };
-use crate::model::state_mapper::StateMapper;
+use crate::model::transition_matrix::{Redistribution, TransitionMatrix};
 use crate::pipelines::imputation::AllelePosteriors;
 
 
@@ -73,6 +73,7 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_MAX_PER_HAP: usize = 256;
+const ABYSS_RANK_CUTOFF: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 
@@ -111,7 +112,6 @@ struct ImputationPlan {
     core_states: Vec<Vec<GlobalId>>, // per target hap
     abyss_mask: Vec<Vec<bool>>,      // per target hap
     dynamic_states: Vec<Vec<Vec<GlobalId>>>, // [window][target_hap]
-    window_meta: Vec<(usize, usize, usize, usize)>, // global_start, global_end, output_start, output_end
     total_budget: usize,
 }
 
@@ -496,12 +496,35 @@ fn build_imputation_plan(
         core_states: vec![Vec::new(); n_target_haps],
         abyss_mask: vec![Vec::new(); n_target_haps],
         dynamic_states: Vec::new(),
-        window_meta: Vec::new(),
         total_budget,
     };
 
     let avail = available_memory_bytes().unwrap_or(0);
-    let batch_size = estimate_scan_batch_size(avail, 1, n_target_haps);
+    let mut ref_reader = open_ref_reader(ref_path)?;
+    let mut n_ref_haps = 0usize;
+    loop {
+        let ref_window = ref_reader.next_window(
+            streaming_config,
+            gen_maps,
+            Some(target_positions),
+        )?;
+        let Some(ref_window) = ref_window else { break };
+        n_ref_haps = ref_window
+            .ref_columns
+            .first()
+            .map(|c| c.n_haplotypes())
+            .unwrap_or(0);
+        if n_ref_haps > 0 {
+            break;
+        }
+    }
+    if n_ref_haps == 0 {
+        return Err(ReagleError::vcf(
+            "Reference window scanning found no haplotypes".to_string(),
+        ));
+    }
+    plan.n_ref_haps = n_ref_haps;
+    let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
 
     while batch_start < n_target_haps {
@@ -517,12 +540,15 @@ fn build_imputation_plan(
         let mut global_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
+        let mut best_window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
+        let mut window_rank_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
 
-        let mut n_ref_haps: usize = 0;
         for _ in 0..batch_len {
             global_scores.push(Vec::new());
             window_scores.push(Vec::new());
             window_hits.push(Vec::new());
+            best_window_scores.push(Vec::new());
+            window_rank_hits.push(Vec::new());
         }
 
         loop {
@@ -566,37 +592,22 @@ fn build_imputation_plan(
                 &ref_window.markers,
             );
 
-            if n_ref_haps == 0 {
-                n_ref_haps = ref_window
-                    .ref_columns
-                    .first()
-                    .map(|c| c.n_haplotypes())
-                    .unwrap_or(0);
-                if n_ref_haps == 0 {
-                    return Err(ReagleError::vcf(
-                        "Reference panel has no haplotypes".to_string(),
-                    ));
-                }
-                plan.n_ref_haps = n_ref_haps;
-                for i in 0..batch_len {
+            for i in 0..batch_len {
+                if global_scores[i].len() != n_ref_haps {
                     global_scores[i] = vec![0.0f32; n_ref_haps];
                     window_scores[i] = vec![0.0f32; n_ref_haps];
                     window_hits[i] = vec![0u32; n_ref_haps];
+                    best_window_scores[i] = vec![0.0f32; n_ref_haps];
+                    window_rank_hits[i] = vec![0u32; n_ref_haps];
                 }
-            }
-
-            if plan.window_meta.len() <= window_idx {
-                plan.window_meta.push((
-                    ref_window.global_start,
-                    ref_window.global_end,
-                    ref_window.output_start,
-                    ref_window.output_end,
-                ));
             }
 
             for w in window_scores.iter_mut() {
                 w.fill(0.0);
             }
+
+            let full_fit = total_budget >= n_ref_haps;
+            let effective_dynamic_budget = if full_fit { 0 } else { dynamic_budget };
 
             let k_per_hap = (total_budget / n_target_haps.max(1))
                 .clamp(1, PBWT_MAX_PER_HAP)
@@ -616,75 +627,116 @@ fn build_imputation_plan(
                 &mut window_scores,
             );
 
-            let window_candidate_k = total_budget.min(n_ref_haps);
+            let window_candidate_k = if full_fit {
+                0
+            } else {
+                total_budget.min(n_ref_haps)
+            };
+            let abyss_rank_cutoff = ABYSS_RANK_CUTOFF.min(n_ref_haps).max(1);
             if plan.dynamic_states.len() <= window_idx {
                 plan.dynamic_states
                     .push(vec![Vec::new(); n_target_haps]);
             }
 
             for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                let top = select_top_k(&window_scores[i], window_candidate_k);
-                let mut candidates: Vec<(GlobalId, f32)> = Vec::with_capacity(top.len());
-                for (ref_idx, score) in top {
-                    let gid = GlobalId::new(ref_idx as u32);
-                    candidates.push((gid, score));
-                    if ref_idx < window_hits[i].len() {
-                        window_hits[i][ref_idx] = window_hits[i][ref_idx].saturating_add(1);
+                for (h, score) in window_scores[i].iter().copied().enumerate() {
+                    if score > best_window_scores[i][h] {
+                        best_window_scores[i][h] = score;
                     }
                 }
-                // Temporarily store scored candidates in dynamic_states; we'll filter after core selection.
-                plan.dynamic_states[window_idx][hap_idx] =
-                    candidates.into_iter().map(|(g, _)| g).collect();
+
+                if window_candidate_k > 0 {
+                    let top = select_top_k(&window_scores[i], window_candidate_k);
+                    let mut candidates: Vec<(GlobalId, f32)> = Vec::with_capacity(top.len());
+                    for (ref_idx, score) in top {
+                        let gid = GlobalId::new(ref_idx as u32);
+                        candidates.push((gid, score));
+                        if ref_idx < window_hits[i].len() {
+                            window_hits[i][ref_idx] = window_hits[i][ref_idx].saturating_add(1);
+                        }
+                    }
+                    if effective_dynamic_budget > 0 {
+                        plan.dynamic_states[window_idx][hap_idx] =
+                            candidates.into_iter().map(|(g, _)| g).collect();
+                    }
+                }
+
+                let abyss_top = select_top_k(&window_scores[i], abyss_rank_cutoff);
+                for (ref_idx, _) in abyss_top {
+                    if ref_idx < window_rank_hits[i].len() {
+                        window_rank_hits[i][ref_idx] =
+                            window_rank_hits[i][ref_idx].saturating_add(1);
+                    }
+                }
             }
 
             window_idx += 1;
         }
 
-        if n_ref_haps == 0 {
-            return Err(ReagleError::vcf(
-                "Reference window scanning found no haplotypes".to_string(),
-            ));
-        }
+        let full_fit = total_budget >= n_ref_haps;
+        let effective_dynamic_budget = if full_fit { 0 } else { dynamic_budget };
+        let effective_core_budget = if full_fit { n_ref_haps } else { core_budget };
 
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let mut abyss = vec![false; n_ref_haps];
             for h in 0..n_ref_haps {
-                if window_hits[i][h] == 0 && global_scores[i][h] <= 0.0 {
+                let score = best_window_scores[i][h];
+                if window_rank_hits[i][h] == 0 || !score.is_finite() || score <= 0.0 {
                     abyss[h] = true;
                 }
             }
             plan.abyss_mask[hap_idx] = abyss.clone();
 
-            let mut ranked: Vec<(usize, u32, f32)> = (0..n_ref_haps)
+            let mut ranked: Vec<(usize, u32, f32, f32)> = (0..n_ref_haps)
                 .filter(|&h| !abyss[h])
-                .map(|h| (h, window_hits[i][h], global_scores[i][h]))
+                .map(|h| (h, window_hits[i][h], best_window_scores[i][h], global_scores[i][h]))
                 .collect();
             ranked.sort_by(|a, b| {
                 b.1.cmp(&a.1)
                     .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
                     .then_with(|| a.0.cmp(&b.0))
             });
 
             let mut core: Vec<GlobalId> = Vec::new();
-            if total_budget >= n_ref_haps {
-                core = ranked.iter().map(|(h, _, _)| GlobalId::new(*h as u32)).collect();
+            if full_fit {
+                core = ranked
+                    .iter()
+                    .map(|(h, _, _, _)| GlobalId::new(*h as u32))
+                    .collect();
             } else {
-                let keep = core_budget.min(ranked.len());
-                for j in 0..keep {
-                    core.push(GlobalId::new(ranked[j].0 as u32));
+                let keep = effective_core_budget.min(ranked.len());
+                let mut remaining = keep;
+
+                for (h, hits, _, _) in ranked.iter().filter(|(_, hits, _, _)| *hits >= 2) {
+                    if remaining == 0 {
+                        break;
+                    }
+                    core.push(GlobalId::new(*h as u32));
+                    remaining -= 1;
+                }
+
+                if remaining > 0 {
+                    for (h, hits, _, _) in ranked.iter().filter(|(_, hits, _, _)| *hits < 2) {
+                        if remaining == 0 {
+                            break;
+                        }
+                        core.push(GlobalId::new(*h as u32));
+                        remaining -= 1;
+                    }
                 }
             }
             plan.core_states[hap_idx] = core.clone();
 
-            if dynamic_budget == 0 {
+            if effective_dynamic_budget == 0 {
                 continue;
             }
 
             for window_dyn in plan.dynamic_states.iter_mut() {
                 let dyn_vec = &mut window_dyn[hap_idx];
                 dyn_vec.retain(|g| !core.contains(g) && !abyss[g.as_usize()]);
-                if dyn_vec.len() > dynamic_budget {
-                    dyn_vec.truncate(dynamic_budget);
+                if dyn_vec.len() > effective_dynamic_budget {
+                    dyn_vec.truncate(effective_dynamic_budget);
                 }
             }
         }
@@ -1318,8 +1370,20 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     if state_haps.is_empty() {
                         let keep = plan.total_budget.max(1).min(plan.n_ref_haps);
-                        for h in 0..keep {
-                            state_haps.push(GlobalId::new(h as u32));
+                        let abyss = plan.abyss_mask.get(plan_idx);
+                        let mut added = 0usize;
+                        for h in 0..plan.n_ref_haps {
+                            if added >= keep {
+                                break;
+                            }
+                            let gid = GlobalId::new(h as u32);
+                            if let Some(abyss) = abyss {
+                                if abyss[gid.as_usize()] {
+                                    continue;
+                                }
+                            }
+                            state_haps.push(gid);
+                            added += 1;
                         }
                     }
 
@@ -1329,8 +1393,8 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         let prev_states: Vec<GlobalId> =
                             p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
-                        let mapper = StateMapper::build(&prev_states, &state_haps);
-                        Some(mapper.map(p.probs(), true))
+                        let mapper = TransitionMatrix::build(&prev_states, &state_haps);
+                        Some(mapper.map(p.probs(), Redistribution::Uniform))
                     });
 
                     let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
