@@ -1449,7 +1449,7 @@ impl crate::pipelines::ImputationPipeline {
 
                     let mut next_priors = HaplotypePriors::empty();
                     if let Some(state_post) = state_post {
-                        let pairs = state_posteriors_to_priors(&state_haps, &state_post, 1e-4);
+                        let pairs = state_posteriors_to_priors(&state_haps, &state_post, 0.0);
                         if !pairs.is_empty() {
                             let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = pairs
                                 .into_iter()
