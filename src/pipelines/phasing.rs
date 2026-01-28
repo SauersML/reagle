@@ -770,8 +770,44 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
 
         // Compute MAF for each marker (used by IBS2 and two-stage phasing)
+        // Must include reference panel counts to correctly classify anchors
         let maf: Vec<f32> = (0..n_markers)
-            .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+            .map(|m| {
+                let m_idx = MarkerIdx::new(m as u32);
+                let col = target_gt.column(m_idx);
+                let mut n_total = col.n_haplotypes();
+                let mut n_alt = col.alt_count();
+
+                if let (Some(ref_gt), Some(align)) = (&self.reference_gt, &self.alignment) {
+                    if let Some(ref_idx) = align.target_to_ref(m_idx) {
+                        let ref_col = ref_gt.column(ref_idx);
+                        let n_ref = ref_col.n_haplotypes();
+                        let n_ref_alt = ref_col.alt_count();
+                        // Assume biallelic for counting (Ref=0, Alt>0)
+                        let n_ref_ref = n_ref.saturating_sub(n_ref_alt);
+
+                        // Map Ref alleles to Target alleles
+                        let ta0 = align.reverse_map_allele(m, 0);
+                        let ta1 = align.reverse_map_allele(m, 1);
+
+                        n_total += n_ref;
+
+                        if ta0 > 0 && ta0 != 255 {
+                            n_alt += n_ref_ref;
+                        }
+                        if ta1 > 0 && ta1 != 255 {
+                            n_alt += n_ref_alt;
+                        }
+                    }
+                }
+
+                if n_total > 0 {
+                    let freq = n_alt as f32 / n_total as f32;
+                    freq.min(1.0 - freq)
+                } else {
+                    0.0
+                }
+            })
             .collect();
 
         // TWO-STAGE PHASING: Classify markers by frequency
@@ -5617,6 +5653,7 @@ fn find_best_constant_pair(
             }
         }
     }
+
 
     // If best score is too low (worse than random), maybe don't use it?
     // But random initialization is also bad. This is likely the "least bad" start.
