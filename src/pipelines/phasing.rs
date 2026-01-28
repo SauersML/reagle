@@ -1318,8 +1318,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
 
-        let n_burnin = self.config.burnin.min(3);
-        let n_iterations = self.config.iterations.min(6);
+        let n_burnin = self.config.burnin;
+        let n_iterations = self.config.iterations;
         let total_iterations = n_burnin + n_iterations;
         if let Some(bb) = &self.telemetry {
             bb.set_total_samples(n_samples as u64);
