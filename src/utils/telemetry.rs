@@ -648,6 +648,43 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
                 show_extra,
             );
         } else {
+            if is_stalled {
+                eprintln!(
+                    "[HEARTBEAT-STALL] stage=\"{}\" producer_stage=\"{}\" consumer_stage=\"{}\" \
+                     producer_op=\"{}\" consumer_op=\"{}\" window={}/{} iter={}/{} \
+                     samples={}/{} markers={}/{} elapsed={:.0}s last_progress={}s \
+                     rss_mb={} vsz_mb={} swap_mb={} cpu_pct={} channel={}/{}",
+                    snap.stage.as_str(),
+                    snap.producer_stage.as_str(),
+                    snap.consumer_stage.as_str(),
+                    if snap.producer_op.is_empty() { "?" } else { snap.producer_op.as_str() },
+                    if snap.consumer_op.is_empty() { "?" } else { snap.consumer_op.as_str() },
+                    snap.current_window,
+                    snap.total_windows,
+                    snap.current_iteration,
+                    snap.total_iterations,
+                    snap.samples_processed,
+                    snap.total_samples,
+                    snap.markers_processed,
+                    snap.total_markers,
+                    snap.elapsed_secs,
+                    stall_secs,
+                    rss_mb
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    vsz_mb
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    swap_mb
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    cpu_pct
+                        .map(|c| format!("{:.0}", c))
+                        .unwrap_or_else(|| "?".to_string()),
+                    snap.channel_depth,
+                    snap.channel_capacity
+                );
+            }
             print_log_progress(
                 &snap,
                 progress.unit,

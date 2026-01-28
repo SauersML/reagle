@@ -547,7 +547,7 @@ impl crate::pipelines::ImputationPipeline {
         });
         let available_bytes = available_memory_bytes().unwrap_or(0);
         let window_markers = self.config.window_markers.max(1);
-        let block_size = 64usize;
+        let block_size = 1920usize;
         let max_states_budget = if available_bytes > 0 {
             estimate_max_states(available_bytes, n_threads, window_markers, block_size)
         } else {
