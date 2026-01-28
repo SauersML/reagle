@@ -158,10 +158,22 @@ pub fn run_impute_hmm(
         }
 
         if m == 0 && state_priors.is_some() {
-            for i in 0..n_states {
-                ws.fwd[i] *= ws.emissions[i];
+            if recomb_rate > 0.0 {
+                fwd_sum = WeightedHmmUpdater::fwd_update_weighted(
+                    &mut ws.fwd,
+                    fwd_sum,
+                    recomb_rate,
+                    n_states.max(1),
+                    &ws.weights,
+                    &ws.emissions,
+                    n_states,
+                );
+            } else {
+                for i in 0..n_states {
+                    ws.fwd[i] *= ws.emissions[i];
+                }
+                fwd_sum = ws.fwd.iter().sum::<f32>().max(1e-30);
             }
-            fwd_sum = ws.fwd.iter().sum::<f32>().max(1e-30);
         } else {
             fwd_sum = WeightedHmmUpdater::fwd_update_weighted(
                 &mut ws.fwd,

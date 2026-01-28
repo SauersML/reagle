@@ -203,6 +203,9 @@ pub struct PhasedOverlap {
     /// Global marker index used to export haplotype priors.
     /// This lets the next window verify it is projecting at the same physical marker.
     pub prior_stage1_global_marker: Option<usize>,
+
+    /// Genetic position (cM) for the prior marker used to export haplotype priors.
+    pub prior_stage1_gen_pos: Option<f64>,
 }
 
 impl PhasedOverlap {
@@ -221,6 +224,7 @@ impl PhasedOverlap {
             state_probs: None,
             hap_priors: None,
             prior_stage1_global_marker: None,
+            prior_stage1_gen_pos: None,
         }
     }
 
@@ -247,6 +251,16 @@ impl PhasedOverlap {
     /// Get the global marker index used for haplotype prior export.
     pub fn prior_stage1_global_marker(&self) -> Option<usize> {
         self.prior_stage1_global_marker
+    }
+
+    /// Set genetic position (cM) for the prior marker used to export haplotype priors.
+    pub fn set_prior_stage1_gen_pos(&mut self, gen_pos: f64) {
+        self.prior_stage1_gen_pos = Some(gen_pos);
+    }
+
+    /// Get genetic position (cM) for the prior marker used to export haplotype priors.
+    pub fn prior_stage1_gen_pos(&self) -> Option<f64> {
+        self.prior_stage1_gen_pos
     }
 
     /// Get the allele for a specific haplotype at a specific marker

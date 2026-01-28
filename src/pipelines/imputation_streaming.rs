@@ -609,9 +609,9 @@ fn build_imputation_plan(
             let full_fit = total_budget >= n_ref_haps;
             let effective_dynamic_budget = if full_fit { 0 } else { dynamic_budget };
 
-            let k_per_hap = (total_budget / n_target_haps.max(1))
-                .clamp(1, PBWT_MAX_PER_HAP)
-                .max(1);
+            let k_per_hap = total_budget
+                .max(1)
+                .min(PBWT_MAX_PER_HAP);
 
             let phased_target = target_window.genotypes.clone().into_phased();
             let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
@@ -753,6 +753,12 @@ struct SampleImputationResult {
     best_gt: Vec<(u8, u8)>,
     hap_alt_probs: Option<(Vec<f32>, Vec<f32>)>,
     hap_posteriors: Option<(Vec<AllelePosteriors>, Vec<AllelePosteriors>)>,
+}
+
+struct ImputationHandoff {
+    priors: Vec<HaplotypePriors>,
+    prior_global_idx: Option<usize>,
+    prior_gen_pos: Option<f64>,
 }
 
 impl crate::pipelines::ImputationPipeline {
@@ -957,21 +963,22 @@ impl crate::pipelines::ImputationPipeline {
                 window_quality.set_imputed(ref_m, target_idx.is_none());
             }
 
-            let next_priors = self.run_imputation_window_streaming(
-                &phased_target,
-                &ref_window.markers,
-                &ref_window.ref_columns,
-                ref_window.ref_genotypes.as_ref(),
-                &alignment,
-                &gen_maps,
-                imp_overlap.as_ref(),
-                &plan,
-                window_idx,
-                &mut window_quality,
-                &mut writer,
-                ref_window.output_start,
-                ref_window.output_end,
-            )?;
+        let next_handoff = self.run_imputation_window_streaming(
+            &phased_target,
+            &ref_window.markers,
+            &ref_window.ref_columns,
+            ref_window.ref_genotypes.as_ref(),
+            &alignment,
+            &gen_maps,
+            imp_overlap.as_ref(),
+            &plan,
+            window_idx,
+            &mut window_quality,
+            &mut writer,
+            ref_window.global_start,
+            ref_window.output_start,
+            ref_window.output_end,
+        )?;
 
             total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
 
@@ -981,8 +988,14 @@ impl crate::pipelines::ImputationPipeline {
                 &alignment,
                 ref_window.output_end,
             );
-            if let Some(priors) = next_priors {
-                next_overlap.set_hap_priors(priors);
+            if let Some(handoff) = next_handoff {
+                next_overlap.set_hap_priors(handoff.priors);
+                if let Some(idx) = handoff.prior_global_idx {
+                    next_overlap.set_prior_stage1_global_marker(idx);
+                }
+                if let Some(gen_pos) = handoff.prior_gen_pos {
+                    next_overlap.set_prior_stage1_gen_pos(gen_pos);
+                }
             }
             imp_overlap = Some(next_overlap);
 
@@ -1013,9 +1026,10 @@ impl crate::pipelines::ImputationPipeline {
         window_idx: usize,
         window_quality: &mut ImputationQuality,
         final_writer: &mut VcfWriter,
+        global_start: usize,
         output_start: usize,
         output_end: usize,
-    ) -> Result<Option<Vec<HaplotypePriors>>> {
+    ) -> Result<Option<ImputationHandoff>> {
         let window_span = if self.config.profile {
             Some(
                 info_span!(
@@ -1096,6 +1110,17 @@ impl crate::pipelines::ImputationPipeline {
         for m in 1..n_ref_markers {
             let dist_cm = (gen_positions[m] - gen_positions[m - 1]).abs();
             p_recomb.push(self.params.p_recomb(dist_cm));
+        }
+
+        if let Some(overlap) = imp_overlap {
+            if let Some(prev_gen_pos) = overlap.prior_stage1_gen_pos() {
+                if let Some(current_gen_pos) = gen_positions.first().copied() {
+                    let dist_cm = (current_gen_pos - prev_gen_pos).abs();
+                    if dist_cm > 0.0 && !dist_cm.is_nan() {
+                        p_recomb[0] = self.params.p_recomb(dist_cm);
+                    }
+                }
+            }
         }
 
         let normalize_probs = |probs: &mut [f32]| -> bool {
@@ -1326,6 +1351,8 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             None
         };
+        let prior_global_idx = prior_marker_idx.map(|idx| idx + global_start);
+        let prior_gen_pos = prior_marker_idx.and_then(|idx| gen_positions.get(idx).copied());
 
         struct ImputeResult {
             result: SampleImputationResult,
@@ -1648,7 +1675,11 @@ impl crate::pipelines::ImputationPipeline {
             bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
         }
 
-        Ok(Some(next_priors_vec))
+        Ok(Some(ImputationHandoff {
+            priors: next_priors_vec,
+            prior_global_idx,
+            prior_gen_pos,
+        }))
     }
     fn extract_imputed_overlap_streaming<TargetSpace, RefSpace>(
         &self,
