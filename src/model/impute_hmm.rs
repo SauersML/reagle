@@ -180,8 +180,13 @@ pub fn run_impute_hmm(
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
     if active_states > 0 {
-        // Open-universe subset: each tracked state gets r/N transition mass.
-        // The remaining (N-K) mass represents recombination to unmodeled haplotypes (abyss).
+        // Li-Stephens transition for full panel:
+        //   P(switch to h_j) = r / N
+        // For subset K (with abyss), modeled switch mass is:
+        //   sum_{j in K} r/N = r * K/N
+        // Remaining mass r * (N-K)/N represents recombination to unmodeled haplotypes (abyss).
+        // Therefore we keep weights=1.0 (no scaling). Scaling by N/K would force a
+        // closed-universe model that consumes all recombination mass inside K.
         ws.weights.fill(1.0);
     }
 
