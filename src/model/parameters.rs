@@ -53,6 +53,10 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
+    /// Maximum recombination intensity for phasing
+    /// Prevents excessive switching in small reference panels
+    pub const MAX_PHASING_RECOMB_INTENSITY: f32 = 5.0;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -74,7 +78,8 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let raw_recomb = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = raw_recomb.min(Self::MAX_PHASING_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -110,6 +115,7 @@ impl ModelParams {
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_total_haps));
         // Recomb intensity uses ref haps only (Java: pRecomb(par.ne(), refGT.nHaps(), pos))
         let recomb_intensity = 0.04 * ne / n_ref_haps as f32;
+        // No clamping for imputation to allow higher switching with large Ne
 
         Self {
             p_mismatch,
@@ -358,9 +364,10 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
-        assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
+        // Raw formula: 0.04 * 1_000_000 / 1000 = 40.0
+        // Should be clamped to MAX_PHASING_RECOMB_INTENSITY (5.0)
+        let expected = ModelParams::MAX_PHASING_RECOMB_INTENSITY;
+        assert!((params.recomb_intensity - expected).abs() < 0.01);
     }
 
     #[test]
