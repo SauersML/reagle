@@ -231,6 +231,77 @@ struct MosaicPaths {
     path2: Vec<u32>,
 }
 
+#[derive(Clone, Debug)]
+pub struct GlobalMosaicPaths {
+    pub path1: Vec<GlobalId>,
+    pub path2: Vec<GlobalId>,
+}
+
+fn local_to_global_paths(
+    local: &MosaicPaths,
+    threaded: &crate::model::states::ThreadedHaps,
+    n_markers: usize,
+) -> GlobalMosaicPaths {
+    let n_states = threaded.n_states();
+    let mut buffer = vec![GlobalId::from(0u32); n_states];
+    let mut path1 = Vec::with_capacity(n_markers);
+    let mut path2 = Vec::with_capacity(n_markers);
+
+    for m in 0..n_markers {
+        threaded.materialize_at(m, &mut buffer);
+        let s1 = local.path1[m] as usize;
+        let s2 = local.path2[m] as usize;
+
+        path1.push(if s1 < n_states { buffer[s1] } else { GlobalId::from(0u32) });
+        path2.push(if s2 < n_states { buffer[s2] } else { GlobalId::from(0u32) });
+    }
+
+    GlobalMosaicPaths { path1, path2 }
+}
+
+fn global_to_local_paths(
+    global: &GlobalMosaicPaths,
+    threaded: &crate::model::states::ThreadedHaps,
+    n_markers: usize,
+) -> Option<MosaicPaths> {
+    let n_states = threaded.n_states();
+    let mut buffer = vec![GlobalId::from(0u32); n_states];
+    let mut path1 = Vec::with_capacity(n_markers);
+    let mut path2 = Vec::with_capacity(n_markers);
+
+    for m in 0..n_markers {
+        threaded.materialize_at(m, &mut buffer);
+
+        let g1 = global.path1[m];
+        let mut s1 = None;
+        for (i, &gid) in buffer.iter().enumerate() {
+            if gid == g1 {
+                s1 = Some(i as u32);
+                break;
+            }
+        }
+
+        let g2 = global.path2[m];
+        let mut s2 = None;
+        for (i, &gid) in buffer.iter().enumerate() {
+            if gid == g2 {
+                s2 = Some(i as u32);
+                break;
+            }
+        }
+
+        if let (Some(idx1), Some(idx2)) = (s1, s2) {
+            path1.push(idx1);
+            path2.push(idx2);
+        } else {
+            // Mapping failed (state dropped)
+            return None;
+        }
+    }
+
+    Some(MosaicPaths { path1, path2 })
+}
+
 struct MosaicChain<'a> {
     rng: rand::rngs::SmallRng,
     n_markers: usize,
@@ -859,7 +930,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let confidence_by_sample = build_sample_confidence(&target_gt);
         let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample);
 
-        let mut mcmc_paths: Vec<Option<MosaicPaths>> = vec![None; n_samples];
+        let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
 
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
@@ -1346,7 +1417,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             &confidence_by_sample,
         );
 
-        let mut mcmc_paths: Vec<Option<MosaicPaths>> = vec![None; n_samples];
+        let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
 
         let mut pbwt_state_for_next_window: Option<PbwtState> = None;
 
@@ -2252,7 +2323,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         p_recomb: &[f32],
         gen_dists: &[f64],
         ibs2: &Ibs2,
-        mcmc_paths: &mut [Option<MosaicPaths>],
+        mcmc_paths: &mut [Option<GlobalMosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
         pbwt_state: Option<&crate::model::pbwt::PbwtState>,
@@ -2323,7 +2394,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             });
 
-        let swap_results: Vec<(BitVec<u8, Lsb0>, Option<MosaicPaths>)> =
+        let swap_results: Vec<(BitVec<u8, Lsb0>, Option<GlobalMosaicPaths>)> =
             info_span!("build_composite_view").in_scope(|| {
                 // Immutable borrow of geno for the entire read phase
                 let ref_geno: &MutableGenotypes = geno;
@@ -2342,7 +2413,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     };
 
                 let prior_paths = &mcmc_paths[..];
-                let mut swap_results: Vec<(BitVec<u8, Lsb0>, Option<MosaicPaths>)> =
+                let mut swap_results: Vec<(BitVec<u8, Lsb0>, Option<GlobalMosaicPaths>)> =
                     vec![(BitVec::repeat(false, n_markers), None); n_samples];
 
                 tracing::info_span!("hmm_samples").in_scope(|| {
@@ -2363,6 +2434,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let mut threaded_haps = threaded_haps_full.clone();
                             let mut n_states = n_states_full;
                             let mut selection_applied = false;
+
+                            // Convert global prior paths to local paths for this iteration
+                            let local_prior = prior_paths[s].as_ref().and_then(|gp| {
+                                global_to_local_paths(gp, &threaded_haps_full, n_markers)
+                            });
 
                             // 2. Extract current alleles for H1 and H2
                             let seq1 = ref_geno.haplotype(hap1);
@@ -2528,7 +2604,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         if selection_applied {
                                             None
                                         } else {
-                                            prior_paths.get(s).and_then(|p| p.as_ref())
+                                            local_prior.as_ref()
                                         },
                                         sample_seed,
                                         self.config.mcmc_burnin,
@@ -2542,7 +2618,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             if new_paths.path1.is_empty() {
                                 *paths_out = None;
                             } else {
-                                *paths_out = Some(new_paths);
+                                *paths_out = Some(local_to_global_paths(&new_paths, &threaded_haps, n_markers));
                             }
                             assert!(swap_lr.len() <= n_markers);
                             assert!(swap_probs.len() <= het_positions.len());
@@ -2598,7 +2674,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         stage1_blocks: &[(usize, usize)],
         ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
-        mcmc_paths: &mut [Option<MosaicPaths>],
+        mcmc_paths: &mut [Option<GlobalMosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
     ) -> Result<()> {
@@ -2697,7 +2773,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             Vec<bool>,
             Vec<(usize, f32)>,
             Vec<(usize, f32)>,
-            Option<MosaicPaths>,
+            Option<GlobalMosaicPaths>,
         );
         let phase_decisions: Vec<PhaseDecision> = {
             // Immutable borrow of geno for the entire read phase
@@ -2787,6 +2863,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
                         // SHAPEIT5-style dynamic MCMC: re-select states each step
                         // Note: Dynamic MCMC doesn't use ThreadWorkspace yet
+
+                        // Dynamic MCMC works on Global IDs directly (indices 0..n_haps)
+                        // So we just unwrap Global -> u32
+                        let prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
+                            path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
+                            path2: gp.path2.iter().map(|id| id.as_u32()).collect(),
+                        });
+
                         let (swap_bits, swap_lr, swap_probs, new_paths) = if self.config.profile {
                             info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
                                 sample_dynamic_mcmc(
@@ -2804,7 +2888,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     self.config.mcmc_steps,
                                     p_no_err,
                                     p_err,
-                                    prior_paths.get(s).and_then(|p| p.as_ref()),
+                                    prior_local.as_ref(),
                                 )
                             })
                         } else {
@@ -2823,12 +2907,24 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 self.config.mcmc_steps,
                                 p_no_err,
                                 p_err,
-                                prior_paths.get(s).and_then(|p| p.as_ref()),
+                                prior_local.as_ref(),
                             )
                         };
-                        (swap_bits, swap_lr, swap_probs, Some(new_paths))
+
+                        let global_paths = GlobalMosaicPaths {
+                            path1: new_paths.path1.into_iter().map(GlobalId::from).collect(),
+                            path2: new_paths.path2.into_iter().map(GlobalId::from).collect(),
+                        };
+
+                        (swap_bits, swap_lr, swap_probs, Some(global_paths))
                     } else {
                         // Classic Beagle-style: static state space MCMC with thread-local workspace
+
+                        // Convert global prior paths to local paths for this iteration
+                        let local_prior = prior_paths[s].as_ref().and_then(|gp| {
+                            global_to_local_paths(gp, &threaded_haps, n_hi_freq)
+                        });
+
                         THREAD_WORKSPACE.with(|ws| {
                             let mut workspace = ws.borrow_mut();
                             if workspace.is_none() {
@@ -2889,7 +2985,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         }),
                                         block_starts.clone(),
                                         &het_positions,
-                                        prior_paths.get(s).and_then(|p| p.as_ref()),
+                                        local_prior.as_ref(),
                                         sample_seed,
                                         self.config.mcmc_burnin,
                                         p_no_err,
@@ -2913,7 +3009,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     }),
                                     block_starts,
                                     &het_positions,
-                                    prior_paths.get(s).and_then(|p| p.as_ref()),
+                                    local_prior.as_ref(),
                                     sample_seed,
                                     self.config.mcmc_burnin,
                                     p_no_err,
@@ -2922,7 +3018,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 )
                             };
                             ws.lookup = lookup.into_buffer();
-                            (result.0, result.1, result.2, Some(result.3))
+
+                            // Convert result local paths to global
+                            let global_paths = local_to_global_paths(&result.3, &threaded_haps, n_hi_freq);
+
+                            (result.0, result.1, result.2, Some(global_paths))
                         })
                     };
 
