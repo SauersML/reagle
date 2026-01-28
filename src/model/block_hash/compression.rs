@@ -74,7 +74,7 @@ where
 
     let use_keep = keep_haps.is_some();
     let keep_mask = keep_haps.unwrap_or(&[]);
-    let mut initial_pattern_counts: Vec<f32> = vec![0.0; n_unique_patterns];
+    let mut initial_pattern_counts: Vec<u32> = vec![0; n_unique_patterns];
     let mut initial_pattern_to_globals: Vec<Vec<GlobalId>> = vec![Vec::new(); n_unique_patterns];
     let mut unkept_globals: Vec<GlobalId> = Vec::new();
 
@@ -84,7 +84,7 @@ where
             unkept_globals.push(global_id);
             continue;
         }
-        initial_pattern_counts[pattern_idx as usize] += 1.0;
+        initial_pattern_counts[pattern_idx as usize] += 1;
         initial_pattern_to_globals[pattern_idx as usize].push(global_id);
     }
 
@@ -95,12 +95,10 @@ where
     };
 
     let mut pattern_order: Vec<usize> = (0..n_unique_patterns)
-        .filter(|&i| initial_pattern_counts[i] > 0.0 || !use_keep)
+        .filter(|&i| initial_pattern_counts[i] > 0 || !use_keep)
         .collect();
     pattern_order.sort_by(|&a, &b| {
-        initial_pattern_counts[b]
-            .partial_cmp(&initial_pattern_counts[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
+        initial_pattern_counts[b].cmp(&initial_pattern_counts[a])
     });
 
     let kept_indices = if pattern_order.len() > limit {
@@ -151,7 +149,7 @@ where
 
     let pattern_counts: Vec<f32> = kept_indices
         .iter()
-        .map(|&i| initial_pattern_counts[i])
+        .map(|&i| initial_pattern_counts[i] as f32)
         .collect();
     let pattern_to_globals: Vec<Vec<GlobalId>> = kept_indices
         .iter()
