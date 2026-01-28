@@ -633,7 +633,7 @@ fn build_imputation_plan(
                 total_budget.min(n_ref_haps)
             };
             let abyss_rank_cutoff = ABYSS_RANK_CUTOFF.min(n_ref_haps).max(1);
-            if plan.dynamic_states.len() <= window_idx {
+            if effective_dynamic_budget > 0 && plan.dynamic_states.len() <= window_idx {
                 plan.dynamic_states
                     .push(vec![Vec::new(); n_target_haps]);
             }
@@ -655,7 +655,7 @@ fn build_imputation_plan(
                             window_hits[i][ref_idx] = window_hits[i][ref_idx].saturating_add(1);
                         }
                     }
-                    if effective_dynamic_budget > 0 {
+                    if effective_dynamic_budget > 0 && window_idx < plan.dynamic_states.len() {
                         plan.dynamic_states[window_idx][hap_idx] =
                             candidates.into_iter().map(|(g, _)| g).collect();
                     }
@@ -1385,12 +1385,10 @@ impl crate::pipelines::ImputationPipeline {
                     if window_idx < plan.dynamic_states.len()
                         && plan_idx < plan.dynamic_states[window_idx].len()
                     {
-                        for g in plan.dynamic_states[window_idx][plan_idx].iter().copied() {
-                            if !state_haps.contains(&g) {
-                                state_haps.push(g);
-                            }
-                        }
+                        state_haps.extend(plan.dynamic_states[window_idx][plan_idx].iter().copied());
                     }
+                    state_haps.sort_unstable_by_key(|g| g.as_u32());
+                    state_haps.dedup();
                     if plan_idx < plan.abyss_mask.len() {
                         let abyss = &plan.abyss_mask[plan_idx];
                         state_haps.retain(|g| !abyss[g.as_usize()]);
