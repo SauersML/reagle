@@ -1499,7 +1499,7 @@ target_samples={} target_bytes={}",
                     let mut pl_probs: Vec<f32> = Vec::new();
                     let pl = target_win.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
                     if let Some(pl) = pl {
-                        if !pl.is_empty() && !pl_is_uniform(pl) {
+                        if !pl.is_empty() {
                             let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len()).unwrap_or(0);
                             if n_pl_alleles > 0 {
                                 let mapping = alignment
@@ -2605,6 +2605,15 @@ target_samples={} target_bytes={}",
             Some(ref_gp)
         };
 
+        let pl_is_uninformative = |marker_idx: usize, sample_idx: usize| -> bool {
+            if let Some(target_m) = alignment.target_marker(MarkerIdx::new(marker_idx as u32)) {
+                if let Some(pl) = target_win.sample_pl(target_m, sample_idx) {
+                    return !pl.is_empty() && pl_is_uniform(pl);
+                }
+            }
+            false
+        };
+
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
@@ -2612,12 +2621,20 @@ target_samples={} target_bytes={}",
             let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.dosages.get(local_m).copied().unwrap_or(0.0)
             } else {
-                0.0
+                let gt = if !pl_is_uninformative(marker_idx, sample_idx) {
+                    get_genotyped_alleles(marker_idx, sample_idx)
+                } else {
+                    None
+                };
+
+                if let Some((a1, a2)) = gt {
+                    (a1 + a2) as f32
+                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.dosages.get(local_m).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                }
             };
 
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
@@ -2633,12 +2650,20 @@ target_samples={} target_bytes={}",
             if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 best_gt_from_gp(n_alleles, &gp)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                result.best_gt.get(local_m).copied().unwrap_or((0, 0))
             } else {
-                (0, 0)
+                let gt = if !pl_is_uninformative(marker_idx, sample_idx) {
+                    get_genotyped_alleles(marker_idx, sample_idx)
+                } else {
+                    None
+                };
+
+                if let Some((a1, a2)) = gt {
+                    (a1, a2)
+                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                }
             }
         };
 
