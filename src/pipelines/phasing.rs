@@ -2239,6 +2239,176 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         (finalized, pbwt_state_for_next_window)
     }
 
+    /// Initialize phase using reference panel heuristic.
+    ///
+    /// This finds the best pair of reference haplotypes that explain the target genotype
+    /// (assuming a constant match) and initializes the target phase to match them.
+    /// This helps escape "Mosaic Traps" or "Stability Traps" where the initial random
+    /// phase prevents the PBWT from finding the perfect match.
+    fn initialize_phase_heuristic(
+        &self,
+        geno: &mut MutableGenotypes,
+        hi_freq_to_orig: &[usize],
+    ) {
+        if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+            let n_samples = geno.n_haps() / 2;
+            let n_ref_haps = ref_gt.n_haplotypes();
+
+            // Process samples in parallel
+            let updates: Vec<BitVec<u8, Lsb0>> = (0..n_samples)
+                .into_par_iter()
+                .map(|s| {
+                    let hap1 = HapIdx::new((s * 2) as u32);
+                    let hap2 = HapIdx::new((s * 2 + 1) as u32);
+
+                    // Collect sample alleles for high-freq markers
+                    let s1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| geno.get(m, hap1)).collect();
+                    let s2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| geno.get(m, hap2)).collect();
+
+                    // Exact pairwise heuristic (O(N^2 * M))
+                    // Used for small/medium panels to guarantee finding the best reference pair
+                    // that explains the target genotype, avoiding PBWT 'Greedy' traps.
+
+                    let scan_len = hi_freq_to_orig.len().min(200);
+                    let mut best_score = i32::MIN;
+                    let mut best_r1 = 0;
+
+                    // Cache ref alleles for window
+                    let mut ref_matrix = vec![vec![0u8; scan_len]; n_ref_haps];
+                    for i in 0..scan_len {
+                        let m = hi_freq_to_orig[i];
+                        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                            for r in 0..n_ref_haps {
+                                let a = ref_gt.allele(ref_m, HapIdx::new(r as u32));
+                                ref_matrix[r][i] = alignment.reverse_map_allele(m, a);
+                            }
+                        } else {
+                            for r in 0..n_ref_haps {
+                                ref_matrix[r][i] = 255;
+                            }
+                        }
+                    }
+
+                    for r1 in 0..n_ref_haps {
+                        let r1_row = &ref_matrix[r1];
+                        let mut ideal_r2 = vec![255u8; scan_len];
+                        let mut r1_penalty = 0;
+
+                        for i in 0..scan_len {
+                            let a1 = s1[i];
+                            let a2 = s2[i];
+                            let r1_a = r1_row[i];
+
+                            if a1 == 255 || a2 == 255 {
+                                continue;
+                            } else if a1 == a2 {
+                                // Hom target
+                                if r1_a == a1 {
+                                    ideal_r2[i] = a1; // R2 must also be a1
+                                } else if r1_a != 255 {
+                                    // R1 mismatch at homozygous site.
+                                    r1_penalty += 5;
+                                }
+                            } else {
+                                // Het target
+                                if r1_a == a1 {
+                                    ideal_r2[i] = a2;
+                                } else if r1_a == a2 {
+                                    ideal_r2[i] = a1;
+                                } else if r1_a != 255 {
+                                    // R1 has allele not in target
+                                    r1_penalty += 5;
+                                }
+                            }
+                        }
+
+                        // Find best R2 matching ideal_r2
+                        let mut best_r2_score = i32::MIN;
+                        for r2 in 0..n_ref_haps {
+                            let r2_row = &ref_matrix[r2];
+                            let mut score = 0;
+                            for i in 0..scan_len {
+                                let ideal = ideal_r2[i];
+                                let actual = r2_row[i];
+                                if ideal != 255 && actual != 255 {
+                                    if ideal == actual {
+                                        score += 1;
+                                    } else {
+                                        score -= 2; // Mismatch penalty
+                                    }
+                                }
+                            }
+                            if score > best_r2_score {
+                                best_r2_score = score;
+                            }
+                        }
+
+                        let total_score = best_r2_score - r1_penalty;
+                        if total_score > best_score {
+                            best_score = total_score;
+                            best_r1 = r1;
+                        }
+                    }
+
+                    if s == 0 {
+                        eprintln!("Heuristic sample {}: best R1 index={}, score={}", s, best_r1, best_score);
+                    }
+
+                    // Re-construct full R1 alleles for mask construction
+                    let r1_idx = HapIdx::new(best_r1 as u32);
+                    let r1_alleles: Vec<u8> = hi_freq_to_orig
+                        .iter()
+                        .map(|&m| {
+                            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                                let ref_allele = ref_gt.allele(ref_m, r1_idx);
+                                alignment.reverse_map_allele(m, ref_allele)
+                            } else {
+                                255
+                            }
+                        })
+                        .collect();
+
+                    // Construct swap mask to match R1
+                    // We orient H1 to match R1.
+                    let n_total_markers = geno.n_markers();
+                    let mut mask = BitVec::repeat(false, n_total_markers);
+
+                    for (i, &m) in hi_freq_to_orig.iter().enumerate() {
+                        let a1 = s1[i];
+                        let a2 = s2[i];
+
+                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                            continue;
+                        }
+
+                        let r1_a = r1_alleles[i];
+                        if r1_a == 255 {
+                            continue;
+                        }
+
+                        // Align H1 to R1
+                        if r1_a == a1 {
+                            mask.set(m, false); // Already matches
+                        } else if r1_a == a2 {
+                            mask.set(m, true); // Swap to match
+                        }
+                    }
+                    mask
+                })
+                .collect();
+
+            // Apply updates sequentially
+            for (s, mask) in updates.into_iter().enumerate() {
+                let hap1 = HapIdx::new((s * 2) as u32);
+                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+                geno.swap_haplotypes(hap1, hap2, &mask);
+
+            }
+
+            eprintln!("Initialized phase using reference panel heuristic");
+        }
+    }
+
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
     ///
     /// This uses the full Forward-Backward algorithm to compute posterior probabilities
@@ -2606,6 +2776,35 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         if n_stage1_blocks == 0 {
             return Ok(());
         }
+
+        // Initialize phase using reference panel heuristic (only on first iteration)
+        if iteration == 0 && self.reference_gt.is_some() {
+            self.initialize_phase_heuristic(geno, hi_freq_to_orig);
+
+            // Re-sync sample_phases with geno which was modified by the heuristic
+            // This ensures the HMM starts with the heuristically determined phase
+            let confidence_by_sample = build_sample_confidence(target_gt);
+            let new_phases = self.create_sample_phases(geno, &confidence_by_sample);
+            for (dest, src) in sample_phases.iter_mut().zip(new_phases.into_iter()) {
+                *dest = src;
+            }
+
+            // Verify sync
+            let s = 0;
+            if s < sample_phases.len() {
+                let sp = &sample_phases[s];
+                let hap1 = HapIdx::new((s * 2) as u32);
+                let a1_geno = geno.haplotype(hap1);
+                let mut match_count = 0;
+                for m in 0..geno.n_markers() {
+                    if sp.allele1(m) == a1_geno[m] {
+                        match_count += 1;
+                    }
+                }
+                eprintln!("SamplePhase Sync Check: {}/{} matches between Geno and SP", match_count, geno.n_markers());
+            }
+        }
+
         let n_haps = geno.n_haps();
 
         // Compute total haplotype count (target + reference)
@@ -5538,92 +5737,105 @@ fn sample_dynamic_mcmc(
     )
 }
 
-/// Find the best constant pair of states that explains the target genotype.
+/// Find paths that best explain the current genotype sequence using Viterbi.
 ///
-/// This initialization heuristic performs a pairwise scan of all HMM states (which
-/// correspond to reference haplotypes in ThreadedHaps) to find the pair (i, j)
-/// that maximizes consistency with the target genotype.
-///
-/// This breaks the symmetry of the Combined HMM initialization (which cannot distinguish
-/// between phasing configurations at 0/1 sites) and helps the Gibbs sampler escape
-/// "Mosaic Traps" where H1 and H2 lock each other into high-switching local optima.
-fn find_best_constant_pair(
+/// Used to initialize MCMC with a path that respects the current phase.
+/// Uses a simplified Viterbi algorithm to handle mosaic states while preferring consistency.
+fn find_paths_from_genotypes(
     n_markers: usize,
     n_states: usize,
     seq1: &[u8],
     seq2: &[u8],
     lookup: &RefAlleleLookup,
 ) -> Option<MosaicPaths> {
-    if n_states < 2 {
+    if n_states == 0 {
         return None;
     }
 
-    // Allocate score matrix (flat vector) on heap to avoid stack overflow
-    // Size is n_states * n_states. For 280 states -> ~300KB.
-    let mut scores = vec![0.0f32; n_states * n_states];
-
-    for m in 0..n_markers {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-        if a1 == 255 && a2 == 255 {
-            continue;
+    // Helper to run Viterbi for one sequence
+    let run_viterbi = |seq: &[u8]| -> Vec<u32> {
+        let mut scores = vec![0i32; n_states];
+        // Initialize scores at marker 0
+        for k in 0..n_states {
+            if seq[0] != 255 {
+                scores[k] = if lookup.allele(0, k) == seq[0] { 10 } else { 0 };
+            }
         }
 
-        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+        // Backpointers: [marker][state] -> prev_state
+        // Flattened: marker * n_states + state
+        let mut backpointers = vec![0u32; n_markers * n_states];
 
-        for i in 0..n_states {
-            let r1 = lookup.allele(m, i);
-            if r1 == 255 {
-                continue;
+        for m in 1..n_markers {
+            // Optimization: Find index of max score once if needed, but we iterate anyway.
+            // Actually to support "any switch to best" we need the best index?
+            // "Switch" means transition from `prev_k` to `k`.
+            // Simplified model:
+            // Cost to stay (prev_k == k): 0 penalty
+            // Cost to switch (prev_k != k): -5 penalty
+            // We approximate "switch from any" as "switch from best_prev".
+
+            // Find best previous state
+            let mut best_prev_k = 0;
+            let mut best_prev_val = i32::MIN;
+            for k in 0..n_states {
+                if scores[k] > best_prev_val {
+                    best_prev_val = scores[k];
+                    best_prev_k = k;
+                }
             }
 
-            // Symmetric scan: only check j < i (lower triangle)
-            // We can infer upper triangle or just pick best from lower.
-            for j in 0..i {
-                let r2 = lookup.allele(m, j);
-                if r2 == 255 {
-                    continue;
-                }
+            let mut next_scores = vec![0i32; n_states];
+            let bp_offset = m * n_states;
+            let target = seq[m];
 
-                let compatible = if is_het {
-                    // Het: need (r1=a1, r2=a2) OR (r1=a2, r2=a1)
-                    (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+            for k in 0..n_states {
+                let emission = if target != 255 {
+                    if lookup.allele(m, k) == target { 10 } else { 0 }
                 } else {
-                    // Hom (or one missing): need r1=obs and r2=obs
-                    // If a1 or a2 is missing, we match the present one.
-                    let obs = if a1 != 255 { a1 } else { a2 };
-                    r1 == obs && r2 == obs
+                    0 // neutral
                 };
 
-                if compatible {
-                    scores[i * n_states + j] += 1.0;
+                // Transition:
+                // Option 1: Stay from k
+                let score_stay = scores[k]; // Penalty 0
+
+                // Option 2: Switch from best_prev
+                let score_switch = best_prev_val - 5; // Penalty 5 for switching
+
+                if score_stay >= score_switch {
+                    next_scores[k] = score_stay + emission;
+                    backpointers[bp_offset + k] = k as u32;
                 } else {
-                    scores[i * n_states + j] -= 1.0;
+                    next_scores[k] = score_switch + emission;
+                    backpointers[bp_offset + k] = best_prev_k as u32;
                 }
             }
+            scores = next_scores;
         }
-    }
 
-    // Find best pair
-    let mut best_score = f32::NEG_INFINITY;
-    let mut best_pair = (0, 1);
-
-    for i in 0..n_states {
-        for j in 0..i {
-            let s = scores[i * n_states + j];
-            if s > best_score {
-                best_score = s;
-                best_pair = (i, j);
+        // Traceback
+        let mut path = vec![0u32; n_markers];
+        let mut best_k = 0;
+        let mut max_score = i32::MIN;
+        for k in 0..n_states {
+            if scores[k] > max_score {
+                max_score = scores[k];
+                best_k = k;
             }
         }
-    }
 
-    // If best score is too low (worse than random), maybe don't use it?
-    // But random initialization is also bad. This is likely the "least bad" start.
-    // So we return it.
+        for m in (0..n_markers).rev() {
+            path[m] = best_k as u32;
+            if m > 0 {
+                best_k = backpointers[m * n_states + best_k] as usize;
+            }
+        }
+        path
+    };
 
-    let path1 = vec![best_pair.0 as u32; n_markers];
-    let path2 = vec![best_pair.1 as u32; n_markers];
+    let path1 = run_viterbi(seq1);
+    let path2 = run_viterbi(seq2);
 
     Some(MosaicPaths { path1, path2 })
 }
@@ -5679,7 +5891,8 @@ fn sample_swap_bits_mosaic(
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     // Attempt pairwise initialization if no initial paths provided
     let heuristic_paths = if initial_paths.is_none() {
-        find_best_constant_pair(n_markers, n_states, seq1, seq2, lookup)
+        let p = find_paths_from_genotypes(n_markers, n_states, seq1, seq2, lookup);
+        p
     } else {
         None
     };
@@ -6800,7 +7013,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_best_constant_pair() {
+    fn test_find_paths_from_genotypes() {
         use crate::model::allele_lookup::RefAlleleLookup;
 
         let n_markers = 3;
@@ -6830,18 +7043,16 @@ mod tests {
         let seq1 = vec![0, 0, 0];
         let seq2 = vec![1, 1, 1];
 
-        let paths = find_best_constant_pair(n_markers, n_states, &seq1, &seq2, &lookup).unwrap();
+        let paths = find_paths_from_genotypes(n_markers, n_states, &seq1, &seq2, &lookup).unwrap();
 
-        // Best pair should be (0, 1) or (1, 0) - Score 3.
-        // Or (2, 3) / (3, 2).
+        // Path1 should match seq1 (0, 0, 0) -> State 0
+        // Path2 should match seq2 (1, 1, 1) -> State 1
+        // (State 2 also matches 0 at M0/M2 but 1 at M1, so it shouldn't be picked for seq1 everywhere)
 
-        println!("Selected pair: ({}, {})", paths.path1[0], paths.path2[0]);
+        println!("Path1: {:?}", paths.path1);
+        println!("Path2: {:?}", paths.path2);
 
-        assert!(
-            (paths.path1[0] == 1 && paths.path2[0] == 0)
-                || (paths.path1[0] == 0 && paths.path2[0] == 1)
-                || (paths.path1[0] == 3 && paths.path2[0] == 2)
-                || (paths.path1[0] == 2 && paths.path2[0] == 3)
-        );
+        assert_eq!(paths.path1, vec![0, 0, 0]);
+        assert_eq!(paths.path2, vec![1, 1, 1]);
     }
 }
