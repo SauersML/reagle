@@ -1,0 +1,54 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.54s
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-5351816d7a872106)
+
+running 1 test
+test test_diverse_mask_scenarios ... FAILED
+
+failures:
+
+---- test_diverse_mask_scenarios stdout ----
+
+============================================================
+=== Scenario: Light masking (10%) ===
+============================================================
+Masked 130 genotypes (10%)
+Running: java -jar /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar [("ref", "/tmp/.tmpJNj1CC/ref.vcf.gz"), ("gt", "/tmp/.tmpJNj1CC/masked.vcf.gz"), ("out", "/tmp/.tmpJNj1CC/java_imputed"), ("seed", "42"), ("gp", "true")]
+Target marker index: 135 positions
+Streaming imputation: 362 ref haplotypes, 10 target samples (target_bytes=65565)
+Imputation state plan: mode=Lossless, max_states=362, ref_haps=362, threads=4, available_mb=7242, per_thread_mb=1810, est_bytes_per_state=400224
+Writing output to "/tmp/.tmpJNj1CC/rust_imputed.vcf.gz"
+Phase 2: Streaming imputation...
+Using streaming VCF reference reader (~71233 markers)
+Phase 1: Streaming phasing of target data...
+  Phasing Window 1 (135 markers, pos 20000086..20099941)
+    (First reference window)
+    (Last reference window)
+    Ref markers: 1356 (global 0..1356)
+    Compression: blocks=1, patterns min/avg/max=314/314.0/314
+
+[ALIGNMENT DIAGNOSTICS] Window 1
+  Direct Exact Matches: 135
+  Swapped (Ref/Alt):    0
+  Strand Flipped:       0
+  Both:                 0
+  Partial/Mismatching:  0
+  Imputing Window 1 (135 markers, ref global 0..1356, output 0..1356)
+Streaming imputation complete: 1356 markers
+
+Metric                            Java         Rust
+------------------------- ------------ ------------
+Concordance                     98.46%       96.92%
+Brier Score                     0.0308       0.0832
+
+thread 'test_diverse_mask_scenarios' (8312) panicked at tests/beagle_reference.rs:2732:9:
+Light masking (10%): Rust concordance (96.9231%) worse than Java (98.4615%)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_diverse_mask_scenarios
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 26 filtered out; finished in 32.56s
+
+error: test failed, to rerun pass `--test beagle_reference`
