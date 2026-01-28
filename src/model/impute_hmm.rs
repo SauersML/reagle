@@ -180,8 +180,9 @@ pub fn run_impute_hmm(
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
     if active_states > 0 {
-        let scale = total_ref_haps.max(1) as f32 / active_states.max(1) as f32;
-        ws.weights.fill(scale);
+        // Open-universe subset: each tracked state gets r/N transition mass.
+        // The remaining (N-K) mass represents recombination to unmodeled haplotypes (abyss).
+        ws.weights.fill(1.0);
     }
 
     let mut fwd_sum: f32;
