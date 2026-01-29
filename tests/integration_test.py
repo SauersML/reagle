@@ -1124,10 +1124,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                         f"MAF stratification requires the site to be present in reference_vcf ({reference_vcf})."
                     )
 
-    ref_ref, ref_alt, ref_af_list = ref_afs
-    maf = _maf_from_afs(ref_af_list)
-    if ref_af_list and len(ref_af_list) == 1:
-        af = ref_af_list[0]
+                ref_ref, ref_alt, ref_af_list = ref_afs
+                maf = _maf_from_afs(ref_af_list)
+                if ref_af_list and len(ref_af_list) == 1:
+                    af = ref_af_list[0]
 
                 if maf is None:
                     raise RuntimeError(
@@ -1135,8 +1135,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     )
 
                 maf_bin = get_maf_bin(maf)
-    site_concordant = 0
-    site_total = 0
+                site_concordant = 0
+                site_total = 0
 
     # Dosage calibration bins (predicted dosage -> mean truth dosage)
     # Bin over [0, 2] since diploid dosage is 0..2.
