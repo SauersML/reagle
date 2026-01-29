@@ -1618,7 +1618,118 @@ impl crate::pipelines::ImputationPipeline {
                     let has_hard = mapped_allele != 255
                         && (mapped_allele as usize) < n_alleles
                         && (!is_diploid || (mapped_partner != 255 && (mapped_partner as usize) < n_alleles));
-                    if has_hard {
+                    let mut pl_probs: Vec<f32> = Vec::new();
+                    let pl = target_win.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
+                    if let Some(pl) = pl {
+                        if !pl.is_empty() && !pl_is_uniform(pl) {
+                            let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len()).unwrap_or(0);
+                            if n_pl_alleles > 0 {
+                                let mapping = alignment
+                                    .allele_mappings
+                                    .get(target_m)
+                                    .and_then(|m| m.as_ref());
+                                let uniform = 1.0 / n_pl_alleles as f32;
+                                let target_priors = vec![uniform; n_pl_alleles];
+
+                                let partner = target_win
+                                    .allele(MarkerIdx::new(target_m as u32), hap_idx.other());
+                                let conf = conf.clamp(0.0, 1.0);
+                                let mut weights = vec![0.0f32; n_pl_alleles];
+                                if partner != 255 && (partner as usize) < n_pl_alleles {
+                                    let partner_idx = partner as usize;
+                                    let mut denom = 0.0f32;
+                                    for (i, &p) in target_priors.iter().enumerate() {
+                                        if i != partner_idx {
+                                            denom += p;
+                                        }
+                                    }
+                                    weights[partner_idx] = conf;
+                                    if denom > 0.0 {
+                                        let scale = (1.0 - conf) / denom;
+                                        for i in 0..n_pl_alleles {
+                                            if i != partner_idx {
+                                                weights[i] = target_priors[i] * scale;
+                                            }
+                                        }
+                                    } else if n_pl_alleles > 1 {
+                                        let uniform =
+                                            (1.0 - conf) / (n_pl_alleles as f32 - 1.0);
+                                        for i in 0..n_pl_alleles {
+                                            if i != partner_idx {
+                                                weights[i] = uniform;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    weights.copy_from_slice(&target_priors);
+                                }
+
+                                let mut cond_probs: Vec<f32> = Vec::new();
+                                pl_probs.resize(n_pl_alleles, 0.0);
+                                let mut weight_sum = 0.0f32;
+                                for b in 0..n_pl_alleles {
+                                    let w = weights[b];
+                                    if w <= 0.0 {
+                                        continue;
+                                    }
+                                    if allele_probs_cond_from_pl(pl, b as u8, None, &mut cond_probs)
+                                        .is_some()
+                                    {
+                                        for (a, &p) in cond_probs.iter().enumerate() {
+                                            if a < pl_probs.len() {
+                                                pl_probs[a] += w * p;
+                                            }
+                                        }
+                                        weight_sum += w;
+                                    }
+                                }
+                                if weight_sum > 0.0 {
+                                    normalize_probs(&mut pl_probs);
+                                    if let Some(mapping) = mapping {
+                                        let mut mapped = vec![0.0f32; n_alleles];
+                                        for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                            if t_idx < mapping.targ_to_ref.len() {
+                                                let r = mapping.targ_to_ref[t_idx];
+                                                if r >= 0 && (r as usize) < n_alleles {
+                                                    mapped[r as usize] += p;
+                                                }
+                                            }
+                                        }
+                                        if normalize_probs(&mut mapped) {
+                                            aligned_probs = mapped;
+                                            use_probs = true;
+                                        }
+                                    } else if pl_probs.len() == n_alleles {
+                                        aligned_probs = pl_probs.clone();
+                                        use_probs = true;
+                                    }
+                                } else if allele_probs_uncond_from_pl(pl, None, &mut pl_probs)
+                                    .is_some()
+                                {
+                                    if let Some(mapping) = mapping {
+                                        let mut mapped = vec![0.0f32; n_alleles];
+                                        for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                            if t_idx < mapping.targ_to_ref.len() {
+                                                let r = mapping.targ_to_ref[t_idx];
+                                                if r >= 0 && (r as usize) < n_alleles {
+                                                    mapped[r as usize] += p;
+                                                }
+                                            }
+                                        }
+                                        if normalize_probs(&mut mapped) {
+                                            aligned_probs = mapped;
+                                            use_probs = true;
+                                        }
+                                    } else if pl_probs.len() == n_alleles {
+                                        aligned_probs = pl_probs;
+                                        use_probs = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !use_probs && has_hard {
                         aligned_probs.resize(n_alleles, 0.0);
                         if is_diploid && mapped_partner != 255 && mapped_partner != mapped_allele {
                             let phase_conf = target_win
@@ -1638,152 +1749,6 @@ impl crate::pipelines::ImputationPipeline {
                                 *p = conf * *p + (1.0 - conf) * uniform;
                             }
                         }
-                        use_probs = true;
-                    }
-
-                    let mut pl_probs: Vec<f32> = Vec::new();
-                    if !use_probs {
-                        let pl = target_win.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
-                        if let Some(pl) = pl {
-                            if !pl.is_empty() && !pl_is_uniform(pl) {
-                                let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len()).unwrap_or(0);
-                                if n_pl_alleles > 0 {
-                                    let mapping = alignment
-                                        .allele_mappings
-                                        .get(target_m)
-                                        .and_then(|m| m.as_ref());
-                                    let uniform = 1.0 / n_pl_alleles as f32;
-                                    let target_priors = vec![uniform; n_pl_alleles];
-
-                                    let partner = target_win
-                                        .allele(MarkerIdx::new(target_m as u32), hap_idx.other());
-                                    let conf = conf.clamp(0.0, 1.0);
-                                    let mut weights = vec![0.0f32; n_pl_alleles];
-                                    if partner != 255 && (partner as usize) < n_pl_alleles {
-                                        let partner_idx = partner as usize;
-                                        let mut denom = 0.0f32;
-                                        for (i, &p) in target_priors.iter().enumerate() {
-                                            if i != partner_idx {
-                                                denom += p;
-                                            }
-                                        }
-                                        weights[partner_idx] = conf;
-                                        if denom > 0.0 {
-                                            let scale = (1.0 - conf) / denom;
-                                            for i in 0..n_pl_alleles {
-                                                if i != partner_idx {
-                                                    weights[i] = target_priors[i] * scale;
-                                                }
-                                            }
-                                        } else if n_pl_alleles > 1 {
-                                            let uniform =
-                                                (1.0 - conf) / (n_pl_alleles as f32 - 1.0);
-                                            for i in 0..n_pl_alleles {
-                                                if i != partner_idx {
-                                                    weights[i] = uniform;
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        weights.copy_from_slice(&target_priors);
-                                    }
-
-                                    let mut cond_probs: Vec<f32> = Vec::new();
-                                    pl_probs.resize(n_pl_alleles, 0.0);
-                                    let mut weight_sum = 0.0f32;
-                                    for b in 0..n_pl_alleles {
-                                        let w = weights[b];
-                                        if w <= 0.0 {
-                                            continue;
-                                        }
-                                        if allele_probs_cond_from_pl(pl, b as u8, None, &mut cond_probs)
-                                            .is_some()
-                                        {
-                                            for (a, &p) in cond_probs.iter().enumerate() {
-                                                if a < pl_probs.len() {
-                                                    pl_probs[a] += w * p;
-                                                }
-                                            }
-                                            weight_sum += w;
-                                        }
-                                    }
-                                    if weight_sum > 0.0 {
-                                        normalize_probs(&mut pl_probs);
-                                        if let Some(mapping) = mapping {
-                                            let mut mapped = vec![0.0f32; n_alleles];
-                                            for (t_idx, &p) in pl_probs.iter().enumerate() {
-                                                if t_idx < mapping.targ_to_ref.len() {
-                                                    let r = mapping.targ_to_ref[t_idx];
-                                                    if r >= 0 && (r as usize) < n_alleles {
-                                                        mapped[r as usize] += p;
-                                                    }
-                                                }
-                                            }
-                                            if normalize_probs(&mut mapped) {
-                                                aligned_probs = mapped;
-                                                use_probs = true;
-                                            }
-                                        } else if pl_probs.len() == n_alleles {
-                                            aligned_probs = pl_probs.clone();
-                                            use_probs = true;
-                                        }
-                                    } else if allele_probs_uncond_from_pl(pl, None, &mut pl_probs)
-                                        .is_some()
-                                    {
-                                        if let Some(mapping) = mapping {
-                                            let mut mapped = vec![0.0f32; n_alleles];
-                                            for (t_idx, &p) in pl_probs.iter().enumerate() {
-                                                if t_idx < mapping.targ_to_ref.len() {
-                                                    let r = mapping.targ_to_ref[t_idx];
-                                                    if r >= 0 && (r as usize) < n_alleles {
-                                                        mapped[r as usize] += p;
-                                                    }
-                                                }
-                                            }
-                                            if normalize_probs(&mut mapped) {
-                                                aligned_probs = mapped;
-                                                use_probs = true;
-                                            }
-                                        } else if pl_probs.len() == n_alleles {
-                                            aligned_probs = pl_probs;
-                                            use_probs = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if mapped_allele != 255 && (mapped_allele as usize) < n_alleles && !use_probs {
-                        aligned_probs.resize(n_alleles, 1.0 / n_alleles as f32);
-                        let is_het = mapped_partner != 255
-                            && (mapped_partner as usize) < n_alleles
-                            && mapped_partner != mapped_allele;
-                        let phase_conf = if is_het {
-                            target_win.sample_phase_confidence_f32(
-                                MarkerIdx::new(target_m as u32),
-                                sample_idx,
-                            )
-                        } else {
-                            1.0
-                        };
-                        for a in 0..n_alleles {
-                            let hard = if is_het {
-                                if a == mapped_allele as usize {
-                                    phase_conf
-                                } else if a == mapped_partner as usize {
-                                    1.0 - phase_conf
-                                } else {
-                                    0.0
-                                }
-                            } else if a == mapped_allele as usize {
-                                1.0
-                            } else {
-                                0.0
-                            };
-                            aligned_probs[a] = conf * hard + (1.0 - conf) * aligned_probs[a];
-                        }
-                        normalize_probs(&mut aligned_probs);
                         use_probs = true;
                     }
                 }
