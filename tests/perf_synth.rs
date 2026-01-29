@@ -83,6 +83,7 @@ fn synth_impute_runtime_under_2_min() {
             }
         }
     }).expect("reagle binary not found; set REAGLE_BIN or build target/debug/reagle");
+    eprintln!("Using reagle binary: {}", bin);
 
     let tmp = TempDir::new().expect("tempdir");
     let ref_vcf = tmp.path().join("ref.vcf");
@@ -103,8 +104,8 @@ fn synth_impute_runtime_under_2_min() {
         .arg("--gp")
         .arg("--nthreads")
         .arg("4")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn reagle");
 
