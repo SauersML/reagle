@@ -1246,6 +1246,21 @@ impl crate::pipelines::ImputationPipeline {
             dynamic_budget,
             self.config.imp_step as f64,
         )?;
+
+        // Update recombination intensity based on actual reference panel size
+        // This is critical for imputation accuracy: large panels need lower switching rates,
+        // while small panels (or sparse data) need higher rates to avoid getting stuck.
+        // We clamp to MAX_RECOMB_INTENSITY to prevent excessive switching in edge cases.
+        let n_ref_haps = plan.n_ref_haps;
+        let ne = self.config.ne;
+        self.params.recomb_intensity = (0.04 * ne / n_ref_haps as f32)
+            .min(crate::model::parameters::ModelParams::MAX_RECOMB_INTENSITY);
+
+        eprintln!(
+            "Using recombination intensity: {:.4} (Ne={}, n_ref={})",
+            self.params.recomb_intensity, ne, n_ref_haps
+        );
+
         if plan.total_budget >= plan.n_ref_haps {
             plan.dynamic_budget = 0;
         }
