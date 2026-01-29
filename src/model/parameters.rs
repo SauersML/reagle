@@ -50,6 +50,12 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
+    /// Maximum recombination intensity to prevent parameter explosion
+    pub const MAX_RECOMB_INTENSITY: f32 = 60.0;
+
+    /// Maximum mismatch probability to prevent Perfect LD traps
+    pub const MAX_MISMATCH_PROB: f32 = 0.0001;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -71,7 +77,7 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = (0.04 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
