@@ -86,10 +86,16 @@ fn available_memory_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
     let avail_bytes = sys.available_memory();
-    if avail_bytes == 0 {
-        None
+    if avail_bytes > 0 {
+        return Some(avail_bytes);
+    }
+    // Fallback: if available memory is unavailable (some CI/containers),
+    // use total memory rather than collapsing to an unusable cap.
+    let total = sys.total_memory();
+    if total > 0 {
+        Some(total)
     } else {
-        Some(avail_bytes)
+        None
     }
 }
 
