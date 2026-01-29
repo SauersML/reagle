@@ -40,6 +40,7 @@ pub struct ImputeWorkspace {
     pub bwd: Vec<f32>,
     pub emissions: Vec<f32>,
     pub fwd_history: Vec<f32>,
+    pub fwd_scales: Vec<f32>,
     pub weights: Vec<f32>,
     pub ref_alleles: Vec<u8>,
     active_states: usize,
@@ -53,6 +54,7 @@ impl ImputeWorkspace {
             bwd: vec![1.0; n_states],
             emissions: vec![1.0; n_states],
             fwd_history: vec![0.0; n_states * n_markers],
+            fwd_scales: vec![1.0; n_markers],
             weights: vec![1.0; n_states],
             ref_alleles: vec![255u8; n_states * n_markers],
             active_states: n_states,
@@ -76,6 +78,9 @@ impl ImputeWorkspace {
         }
         if self.ref_alleles.len() < want {
             self.ref_alleles.resize(want, 255);
+        }
+        if self.fwd_scales.len() < n_markers {
+            self.fwd_scales.resize(n_markers, 1.0);
         }
         self.active_states = n_states;
         self.active_markers = n_markers;
@@ -249,6 +254,13 @@ pub fn run_impute_hmm(
         if fwd_sum <= 0.0 {
             fwd_sum = 1e-30;
         }
+        ws.fwd_scales[m] = fwd_sum;
+        let inv = 1.0 / fwd_sum;
+        for i in 0..active_states {
+            ws.fwd[i] *= inv;
+        }
+        // After scaling, sum(fwd) == 1.0
+        fwd_sum = 1.0;
         ws.fwd_history[start..start + active_states]
             .copy_from_slice(&ws.fwd[..active_states]);
     }
@@ -268,25 +280,11 @@ pub fn run_impute_hmm(
             ws.emissions[i] = emission_prob_soft(ref_allele, probs, error_rate);
         }
 
-        let mut constant_term = 0.0f32;
-        for i in 0..active_states {
-            constant_term += ws.bwd[i] * ws.emissions[i];
-        }
-        let constant_full = constant_term;
-        let inv_c = 1.0 / constant_full.max(1e-30);
-        let scale = (1.0 - recomb_rate) * inv_c;
-        let shift = if active_states > 0 {
-            recomb_rate / active_states as f32
-        } else {
-            0.0
-        };
-        for i in 0..active_states {
-            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
-        }
-
         let start = m_rev * active_states;
         let fwd_slice = &ws.fwd_history[start..start + active_states];
 
+        // Compute posteriors using beta at time t (current ws.bwd), before updating
+        // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
         let mut allele_probs: Vec<f32> = Vec::new();
         let n_alleles = probs.len();
         if n_alleles > 0 {
@@ -357,6 +355,26 @@ pub fn run_impute_hmm(
                 }
             }
             prior_state_post = Some(state_post);
+        }
+
+        // Update beta for the previous marker.
+        // Scaled backward recursion:
+        //   beta_{t-1}(i) = ( (1-r) * b_t(i) * beta_t(i) + (r/N) * S_t ) / c_t
+        // where S_t = sum_j b_t(j) * beta_t(j) and c_t is the forward scale
+        // at marker t (sum of unnormalized alpha_t).
+        let mut emit_beta_sum = 0.0f32;
+        for i in 0..active_states {
+            emit_beta_sum += ws.emissions[i] * ws.bwd[i];
+        }
+        let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
+        let scale = (1.0 - recomb_rate) / c_t;
+        let shift = if total_ref_haps > 0 {
+            (recomb_rate / total_ref_haps as f32) * (emit_beta_sum / c_t)
+        } else {
+            0.0
+        };
+        for i in 0..active_states {
+            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
         }
     }
 

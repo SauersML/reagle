@@ -635,6 +635,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
     }
 
+    /// Access current model parameters (after EM updates).
+    pub fn params(&self) -> &ModelParams {
+        &self.params
+    }
+
     /// Set reference panel for reference-guided phasing
     ///
     /// When a reference panel is provided, the phasing algorithm uses it to:
