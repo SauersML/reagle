@@ -5693,10 +5693,14 @@ fn find_best_constant_pair(
         }
     }
 
-
-    // If best score is too low (worse than random), maybe don't use it?
-    // But random initialization is also bad. This is likely the "least bad" start.
-    // So we return it.
+    // Only use heuristic if the match quality is high enough.
+    // Score = Matches - Mismatches. Max score = n_markers.
+    // Threshold: matches > 75% => score > 0.5 * n_markers.
+    // Also disable for large windows to avoid biasing the global recombination estimate with a zero-switch path.
+    let threshold = 0.5 * (n_markers as f32);
+    if best_score < threshold || n_markers > 500 {
+        return None;
+    }
 
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
