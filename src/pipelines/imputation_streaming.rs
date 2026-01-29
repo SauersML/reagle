@@ -896,6 +896,11 @@ fn build_imputation_plan(
                     }
                 }
             }
+
+            if per_window_cap >= n_ref_haps {
+                abyss.fill(false);
+            }
+
             plan.abyss_mask[hap_idx] = abyss.clone();
 
             // Run LMS allocator for this target haplotype.
@@ -1118,7 +1123,7 @@ impl crate::pipelines::ImputationPipeline {
             &self.params,
         )?;
         if plan.per_window_cap >= plan.n_ref_haps {
-            eprintln!("Imputation mode: full panel per window (abyss still active)");
+            eprintln!("Imputation mode: full panel per window (abyss disabled)");
         } else {
             eprintln!(
                 "Imputation mode: LMS allocation (per_window_cap={})",
