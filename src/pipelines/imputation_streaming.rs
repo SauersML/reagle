@@ -1313,8 +1313,15 @@ impl crate::pipelines::ImputationPipeline {
             self.config.err,
         );
         if let Some(p_mismatch) = phased_p_mismatch {
-            // Log for debugging but do not apply to avoid Perfect LD Trap
-            eprintln!("  Ignoring phased p_mismatch={:.6} to avoid Perfect LD Trap", p_mismatch);
+            // Clamp the phased mismatch probability to a strict maximum (0.0001).
+            // Extremely high values (e.g. 0.02) cause "sticky" HMMs that get trapped
+            // in local optima (Perfect LD Trap). We enforce the Beagle default (0.0001)
+            // to ensure the HMM prefers switching over mismatching in rare variant scenarios.
+            let clamped = p_mismatch.min(0.0001);
+            if clamped != p_mismatch {
+                eprintln!("  Clamping phased p_mismatch={:.6} to {:.6} to avoid Perfect LD Trap", p_mismatch, clamped);
+            }
+            self.params.p_mismatch = clamped;
         }
         self.params
             .set_n_states(self.config.phase_states.min(n_ref_pool.saturating_sub(2)));
