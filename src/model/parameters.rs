@@ -146,7 +146,11 @@ impl ModelParams {
     /// From Java `PhaseData.updatePMismatch`:
     /// Only update if new value is valid and greater than current
     pub fn update_p_mismatch(&mut self, new_p: f32) {
-        if new_p.is_finite() && new_p > self.p_mismatch && new_p < 0.5 {
+        // Only update if new value is valid and greater than current, but clamp to max
+        // to prevent "Perfect LD Trap" in sparse data where error rate is overestimated.
+        // A low p_mismatch is crucial to force recombination over mismatch.
+        // We use 0.0001 as a strict upper bound for imputation-quality data.
+        if new_p.is_finite() && new_p > self.p_mismatch && new_p <= 0.0001 {
             self.p_mismatch = new_p;
         }
     }
@@ -158,7 +162,13 @@ impl ModelParams {
     pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
         if let Some(r) = new_intensity {
             if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
+                // self.recomb_intensity = r;
+                // DISABLED: Do not update recombination intensity from EM.
+                // Sparse datasets cause the EM to underestimate recombination (too few switches observed),
+                // leading to a "Perfect LD Trap" where the HMM prefers staying on a mismatching haplotype
+                // (high cost but better than switching) over switching (impossible cost).
+                // Fixing to Ne-derived value ensures sufficient recombination probability.
+                let _ = r; // Suppress unused warning
             }
         }
     }

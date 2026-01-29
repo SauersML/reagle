@@ -1491,7 +1491,14 @@ impl crate::pipelines::ImputationPipeline {
         );
         if let Some(recomb_intensity) = phased_recomb_intensity {
             if recomb_intensity.is_finite() && recomb_intensity > 0.0 {
-                self.params.recomb_intensity = recomb_intensity;
+                // self.params.recomb_intensity = recomb_intensity;
+                // DISABLED: Do not use recombination intensity learned during phasing.
+                // The phasing EM often underestimates intensity on sparse datasets, leading
+                // to a "Perfect LD Trap" where recombination becomes too expensive compared
+                // to mismatch, preventing the HMM from switching to the correct haplotype.
+                // We stick to the Ne-derived intensity (typically ~100) which encourages
+                // more frequent switching and better explores the state space.
+                let _ = recomb_intensity;
             }
         }
         // Do not inherit phasing mismatch estimates for imputation. Imputation
