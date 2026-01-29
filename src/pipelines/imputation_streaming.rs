@@ -1314,7 +1314,10 @@ impl crate::pipelines::ImputationPipeline {
         );
         if let Some(p_mismatch) = phased_p_mismatch {
             if p_mismatch.is_finite() && p_mismatch > 0.0 {
-                self.params.p_mismatch = p_mismatch;
+                // Clamp error parameter to prevent "Perfect LD Trap" where
+                // inflated error estimates cause the HMM to prefer mismatches
+                // over switching for rare variants.
+                self.params.p_mismatch = p_mismatch.min(crate::model::parameters::ModelParams::MAX_MISMATCH_PROB);
             }
         }
         self.params
