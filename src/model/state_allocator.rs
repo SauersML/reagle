@@ -7,11 +7,11 @@
 //!
 //! Key ideas (math in brief):
 //! - Window evidence for haplotype h at window w is a log-evidence score S[h,w].
-//! - Convert to nonnegative evidence L[h,w] = exp(S[h,w]).
-//!   (We clamp S to a finite range to avoid overflow while preserving ordering.)
-//! - Maintain per-window explained mass Z_w = 1 + sum_{h in A_w} L[h,w].
-//! - Marginal gain of adding h at w is:
-//!     u_{h,w} = log(Z_w + L[h,w]) - log(Z_w) - mu
+//!   This is a *selection-layer* score (from PBWT/Shannon), not a full HMM LLR.
+//! - Use log-space aggregation for stability:
+//!     logZ_w = log(1 + sum_h exp(S[h,w]))
+//!   and marginal gain:
+//!     u_{h,w} = logaddexp(logZ_w, S[h,w]) - logZ_w - mu
 //!   where mu is the Lagrangian price per window-slot.
 //! - Continuity bonus is derived from Li–Stephens stay-vs-switch odds:
 //!     a_w = exp(-rho * d_w)  (consistent with model parameters)
@@ -23,17 +23,25 @@
 //!
 //! The outer loop is coordinate ascent: repeatedly pick the haplotype with the
 //! highest DP gain, activate its interval set, update Z_w, and continue until
-//! the global slot budget is exhausted or no positive gain remains. A binary
-//! search over mu tunes the total slot usage.
+//! the global slot budget is exhausted or no positive gain remains. A coarse
+//! grid search over mu is used to hit the target budget without assuming
+//! monotonicity under the greedy outer loop.
 
 use crate::model::parameters::ModelParams;
 
 const NEG_INF: f32 = -1.0e30;
-const MAX_LOG_EVIDENCE: f32 = 50.0;
 
 #[inline]
-fn exp_score(score: f32) -> f32 {
-    score.clamp(-MAX_LOG_EVIDENCE, MAX_LOG_EVIDENCE).exp()
+fn logaddexp(a: f32, b: f32) -> f32 {
+    if a <= NEG_INF {
+        return b;
+    }
+    if b <= NEG_INF {
+        return a;
+    }
+    let m = a.max(b);
+    let d = (a - b).abs();
+    m + (-(d)).exp().ln_1p()
 }
 
 /// Allocation result for a single target haplotype:
@@ -43,7 +51,7 @@ pub struct WindowAllocation {
     pub active_by_window: Vec<Vec<usize>>,
 }
 
-/// Compute Li–Stephens continuity bonus per boundary.
+/// Compute Li–Stephens continuity transition terms per boundary.
 ///
 /// We must be consistent with the HMM parameterization. The recombination
 /// probability used by the HMM is:
@@ -56,39 +64,44 @@ pub struct WindowAllocation {
 ///     p_switch_diff = (1-a_w) * (n_pool-1)/n_pool
 ///
 /// and
-///     b_w = log(p_stay / p_switch_diff)
+///     t11 = log(p11/p00), t10 = log(p10/p00), t01 = log(p01/p00)
 ///
-/// This is the exact stay-vs-switch-to-different odds for the Li–Stephens chain.
-fn continuity_bonus(
+/// These are the exact 2-state (ON/OFF) transition log-odds relative to OFF->OFF.
+fn continuity_terms(
     boundary_cm: &[f64],
     params: &ModelParams,
     n_pool: usize,
-) -> Vec<f32> {
-    let mut b = Vec::with_capacity(boundary_cm.len());
+)-> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    const EPS: f32 = 1.0e-30;
+    let mut t11 = Vec::with_capacity(boundary_cm.len());
+    let mut t10 = Vec::with_capacity(boundary_cm.len());
+    let mut t01 = Vec::with_capacity(boundary_cm.len());
     let n_pool_f = n_pool.max(2) as f32;
     for &dist_cm in boundary_cm {
         let r_w = params.p_recomb(dist_cm);
         let a_w = (1.0 - r_w).max(0.0).min(1.0);
-        let p_stay = a_w + (1.0 - a_w) / n_pool_f;
-        let p_switch_diff = (1.0 - a_w) * (n_pool_f - 1.0) / n_pool_f;
-        let bonus = if p_stay > 0.0 && p_switch_diff > 0.0 {
-            (p_stay / p_switch_diff).ln()
-        } else {
-            0.0
-        };
-        b.push(bonus);
+        let p11 = (a_w + (1.0 - a_w) / n_pool_f).max(EPS);
+        let p10 = ((1.0 - a_w) * (n_pool_f - 1.0) / n_pool_f).max(EPS);
+        let p01 = ((1.0 - a_w) / n_pool_f).max(EPS);
+        let p00 = (1.0 - p01).max(EPS);
+        let t11_v = (p11 / p00).ln();
+        let t10_v = (p10 / p00).ln();
+        let t01_v = (p01 / p00).ln();
+        t11.push(t11_v);
+        t10.push(t10_v);
+        t01.push(t01_v);
     }
-    b
+    (t11, t10, t01)
 }
 
 /// Run the 2-state DP for a single haplotype.
 ///
 /// Inputs:
 /// - u_w: marginal gain per window (already includes mu penalty)
-/// - b_w: continuity bonus per boundary
+/// - t11/t10/t01: 2-state transition log-odds vs OFF->OFF
 ///
 /// Returns: (total_gain, active_flags)
-fn dp_intervals(u_w: &[f32], b_w: &[f32]) -> (f32, Vec<bool>) {
+fn dp_intervals(u_w: &[f32], t11: &[f32], t10: &[f32], t01: &[f32]) -> (f32, Vec<bool>) {
     let w = u_w.len();
     if w == 0 {
         return (0.0, Vec::new());
@@ -102,18 +115,20 @@ fn dp_intervals(u_w: &[f32], b_w: &[f32]) -> (f32, Vec<bool>) {
     dp1[0] = u_w[0];
 
     for i in 1..w {
-        // OFF state
-        if dp0[i - 1] >= dp1[i - 1] {
+        // OFF state: max(OFF->OFF, ON->OFF)
+        let from0 = dp0[i - 1];
+        let from1 = dp1[i - 1] + t10[i - 1];
+        if from0 >= from1 {
             dp0[i] = dp0[i - 1];
             prev0[i] = 0;
         } else {
-            dp0[i] = dp1[i - 1];
+            dp0[i] = from1;
             prev0[i] = 1;
         }
 
-        // ON state
-        let from_off = dp0[i - 1];
-        let from_on = dp1[i - 1] + b_w[i - 1];
+        // ON state: max(OFF->ON, ON->ON)
+        let from_off = dp0[i - 1] + t01[i - 1];
+        let from_on = dp1[i - 1] + t11[i - 1];
         if from_off >= from_on {
             dp1[i] = u_w[i] + from_off;
             prev1[i] = 0;
@@ -166,15 +181,22 @@ pub fn allocate_lms(
             active_by_window: vec![Vec::new(); w],
         };
     }
+    if !boundary_cm.is_empty() && boundary_cm.len() + 1 != w {
+        return WindowAllocation {
+            active_by_window: vec![Vec::new(); w],
+        };
+    }
     let n = scores_by_window[0].len();
     let mut active_by_window: Vec<Vec<usize>> = vec![Vec::new(); w];
     let mut counts = vec![0usize; w];
-    let mut z_w = vec![1.0f32; w];
+    let mut z_w = vec![0.0f32; w]; // log(1)
+    let mut selected = vec![false; n];
     let mut remaining = total_budget;
 
-    // Use pool size based on per-window cap + background.
+    // Use a fixed donor pool size for separability: background + per-window cap.
+    // This keeps the continuity terms constant during per-haplotype DP.
     let n_pool = 1 + per_window_cap.max(1);
-    let b_w = continuity_bonus(boundary_cm, params, n_pool);
+    let (t11, t10, t01) = continuity_terms(boundary_cm, params, n_pool);
 
     // Determine mu by binary search to approximately meet budget.
     // We tune mu on the fly: larger mu -> fewer activations.
@@ -186,7 +208,9 @@ pub fn allocate_lms(
     for _ in 0..5 {
         let (used, _) = simulate_allocation(
             scores_by_window,
-            &b_w,
+            &t11,
+            &t10,
+            &t01,
             mu_low,
             per_window_cap,
             abyss,
@@ -201,7 +225,9 @@ pub fn allocate_lms(
     for _ in 0..5 {
         let (used, _) = simulate_allocation(
             scores_by_window,
-            &b_w,
+            &t11,
+            &t10,
+            &t01,
             mu_high,
             per_window_cap,
             abyss,
@@ -213,22 +239,30 @@ pub fn allocate_lms(
         mu_high += 5.0;
     }
 
-    let mut mu = mu_high;
-    for _ in 0..16 {
-        let (used, _) = simulate_allocation(
+    // Coarse grid search over mu to avoid non-monotone behavior in greedy outer loop.
+    let mut mu_best = mu_high;
+    let mut best_used = 0usize;
+    let mut best_gain = NEG_INF;
+    for k in 0..17 {
+        let t = k as f32 / 16.0;
+        let mu = mu_low + t * (mu_high - mu_low);
+        let (used, gain) = simulate_allocation(
             scores_by_window,
-            &b_w,
+            &t11,
+            &t10,
+            &t01,
             mu,
             per_window_cap,
             abyss,
         );
-        if used > total_budget {
-            mu_low = mu;
-        } else {
-            mu_high = mu;
+        if used <= total_budget && (gain > best_gain || (gain == best_gain && used > best_used))
+        {
+            mu_best = mu;
+            best_used = used;
+            best_gain = gain;
         }
-        mu = 0.5 * (mu_low + mu_high);
     }
+    let mu = mu_best;
 
     // Main coordinate-ascent allocation using tuned mu.
     while remaining > 0 {
@@ -238,6 +272,9 @@ pub fn allocate_lms(
         let mut best_len = 0usize;
 
         for h in 0..n {
+            if selected[h] {
+                continue;
+            }
             if let Some(mask) = abyss {
                 if h < mask.len() && mask[h] {
                     continue;
@@ -252,12 +289,11 @@ pub fn allocate_lms(
                 if !score.is_finite() {
                     continue;
                 }
-                let l = exp_score(score);
-                let z = z_w[win];
-                let gain = (z + l).ln() - z.ln() - mu;
+                let logz = z_w[win];
+                let gain = logaddexp(logz, score) - logz - mu;
                 u_w[win] = gain;
             }
-            let (gain, active) = dp_intervals(&u_w, &b_w);
+            let (gain, active) = dp_intervals(&u_w, &t11, &t10, &t01);
             if gain > best_gain {
                 let len = active.iter().filter(|v| **v).count();
                 if len == 0 || len > remaining {
@@ -274,6 +310,7 @@ pub fn allocate_lms(
             break;
         }
         let Some(h) = best_h else { break };
+        selected[h] = true;
 
         for win in 0..w {
             if best_active[win] && counts[win] < per_window_cap {
@@ -281,7 +318,7 @@ pub fn allocate_lms(
                 counts[win] += 1;
                 let score = scores_by_window[win][h];
                 if score.is_finite() {
-                    z_w[win] += exp_score(score);
+                    z_w[win] = logaddexp(z_w[win], score);
                 }
             }
         }
@@ -296,7 +333,9 @@ pub fn allocate_lms(
 
 fn simulate_allocation(
     scores_by_window: &[Vec<f32>],
-    b_w: &[f32],
+    t11: &[f32],
+    t10: &[f32],
+    t01: &[f32],
     mu: f32,
     per_window_cap: usize,
     abyss: Option<&[bool]>,
@@ -307,9 +346,10 @@ fn simulate_allocation(
     }
     let n = scores_by_window[0].len();
     let mut counts = vec![0usize; w];
-    let mut z_w = vec![1.0f32; w];
+    let mut z_w = vec![0.0f32; w];
     let mut used = 0usize;
     let mut total_gain = 0.0f32;
+    let mut selected = vec![false; n];
 
     loop {
         let mut best_gain = 0.0f32;
@@ -318,6 +358,9 @@ fn simulate_allocation(
         let mut best_len = 0usize;
 
         for h in 0..n {
+            if selected[h] {
+                continue;
+            }
             if let Some(mask) = abyss {
                 if h < mask.len() && mask[h] {
                     continue;
@@ -332,12 +375,11 @@ fn simulate_allocation(
                 if !score.is_finite() {
                     continue;
                 }
-                let l = exp_score(score);
-                let z = z_w[win];
-                let gain = (z + l).ln() - z.ln() - mu;
+                let logz = z_w[win];
+                let gain = logaddexp(logz, score) - logz - mu;
                 u_w[win] = gain;
             }
-            let (gain, active) = dp_intervals(&u_w, b_w);
+            let (gain, active) = dp_intervals(&u_w, t11, t10, t01);
             if gain > best_gain {
                 let len = active.iter().filter(|v| **v).count();
                 if len == 0 {
@@ -354,6 +396,7 @@ fn simulate_allocation(
             break;
         }
         let Some(h) = best_h else { break };
+        selected[h] = true;
         total_gain += best_gain;
         used += best_len;
         for win in 0..w {
@@ -361,7 +404,7 @@ fn simulate_allocation(
                 counts[win] += 1;
                 let score = scores_by_window[win][h];
                 if score.is_finite() {
-                    z_w[win] += exp_score(score);
+                    z_w[win] = logaddexp(z_w[win], score);
                 }
             }
         }
