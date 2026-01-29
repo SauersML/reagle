@@ -50,6 +50,12 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
+    /// Maximum allele mismatch probability (strict clamping for sparse data)
+    pub const MAX_MISMATCH_PROB: f32 = 0.0001;
+
+    /// Maximum recombination intensity (prevents parameter explosion)
+    pub const MAX_RECOMB_INTENSITY: f32 = 60.0;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -71,7 +77,8 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let raw_recomb_intensity = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = raw_recomb_intensity.min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -147,7 +154,7 @@ impl ModelParams {
     /// Only update if new value is valid and greater than current
     pub fn update_p_mismatch(&mut self, new_p: f32) {
         if new_p.is_finite() && new_p > self.p_mismatch && new_p < 0.5 {
-            self.p_mismatch = new_p;
+            self.p_mismatch = new_p.min(Self::MAX_MISMATCH_PROB);
         }
     }
 
@@ -158,7 +165,7 @@ impl ModelParams {
     pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
         if let Some(r) = new_intensity {
             if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
+                self.recomb_intensity = r.min(Self::MAX_RECOMB_INTENSITY);
             }
         }
     }
