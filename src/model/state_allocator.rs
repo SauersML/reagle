@@ -1,30 +1,58 @@
 //! Lagrangian Marginal Stickiness allocator for prescan state selection.
 //!
 //! This module implements a *selection-layer* optimization aligned with the
-//! Li–Stephens transition physics, without claiming to be the exact HMM marginal
-//! likelihood. The goal is to allocate haplotype identities across windows under
-//! a hard RAM budget.
+//! Li–Stephens transition physics. It is not the exact HMM marginal
+//! likelihood; it is a surrogate objective that is fast, stable, and preserves
+//! identity continuity across windows under a hard RAM budget.
 //!
-//! Key ideas (math in brief):
-//! - Window evidence for haplotype h at window w is a log-evidence score S[h,w].
-//!   This is a *selection-layer* score (from PBWT/Shannon), not a full HMM LLR.
-//! - Use log-space aggregation for stability:
-//!     logZ_w = log(1 + sum_h exp(S[h,w]))
-//!   and marginal gain:
-//!     u_{h,w} = logaddexp(logZ_w, S[h,w]) - logZ_w - mu
-//!   where mu is the Lagrangian price per window-slot.
-//! - Continuity bonus is derived from Li–Stephens stay-vs-switch odds:
-//!     a_w = exp(-rho * d_w)  (consistent with model parameters)
-//!     p_stay = a_w + (1-a_w)/n_pool
-//!     p_switch_diff = (1-a_w) * (n_pool-1)/n_pool
-//!     b_w = log(p_stay / p_switch_diff)
-//! - For each haplotype, the optimal disjoint ON-intervals are found by a
-//!   2-state DP over windows (exact for this surrogate objective).
+//! Surrogate objective (math derivation, selection-layer):
 //!
-//! The outer loop is coordinate ascent: repeatedly pick the haplotype with the
-//! highest DP gain, activate its interval set, update Z_w, and continue until
-//! the global slot budget is exhausted or no positive gain remains. A coarse
-//! grid search over mu is used to hit the target budget without assuming
+//! Let S[h,w] be a log-score for haplotype h in window w (from PBWT/Shannon).
+//! We interpret exp(S[h,w]) as a nonnegative *evidence weight* (not a calibrated
+//! probability unless S is a true emission LLR).
+//!
+//! Per window, define a log-sum evidence:
+//!   Z_w = 1 + sum_h exp(S[h,w])
+//!   logZ_w = log(Z_w)
+//!
+//! This induces diminishing returns: adding another haplotype to a window that
+//! is already well explained yields less incremental gain.
+//!
+//! The marginal gain of activating haplotype h in window w is:
+//!   u_{h,w} = log( Z_w + exp(S[h,w]) ) - logZ_w - mu
+//! where mu is the Lagrangian price per window-slot (RAM constraint).
+//!
+//! We maximize a continuity-aware sum of these marginal gains across windows:
+//!   sum_w u_{h,w} y_w + sum_w b_w * y_w * y_{w+1}
+//! where y_w ∈ {0,1} indicates whether haplotype h is active in window w.
+//!
+//! Continuity (Li–Stephens physics, 2-state surrogate):
+//!
+//! Let r_w = p_recomb(d_w) be the HMM’s recombination probability at boundary w.
+//! Let a_w = 1 - r_w be the no-switch weight.
+//! For a donor pool size n_pool, the Li–Stephens copying chain has:
+//!   p11 = P(ON->ON) = a_w + (1-a_w)/n_pool
+//!   p10 = P(ON->OFF) = (1-a_w)*(n_pool-1)/n_pool
+//!   p01 = P(OFF->ON) = (1-a_w)/n_pool
+//!   p00 = P(OFF->OFF) = 1 - p01
+//!
+//! We score schedules using transition log-odds relative to OFF->OFF:
+//!   t11 = log(p11/p00), t10 = log(p10/p00), t01 = log(p01/p00)
+//! This is the exact 2-state (ON/OFF) collapse of the Li–Stephens chain for a
+//! single haplotype vs “any other donor”, and is the continuity prior used by
+//! the DP below. This preserves the HMM’s stay/switch physics in the selection
+//! layer without claiming to optimize the exact HMM marginal likelihood.
+//!
+//! Optimization:
+//!
+//! For each haplotype, we solve a 2-state DP over windows (ON/OFF) using the
+//! u_{h,w} and (t11,t10,t01) terms. This yields the optimal disjoint intervals
+//! for that haplotype under the surrogate objective. The outer loop performs
+//! greedy coordinate ascent: pick the haplotype with highest DP gain, activate
+//! its intervals, update logZ_w, and repeat until the global slot budget is
+//! exhausted or gains become nonpositive.
+//!
+//! A coarse grid search over mu is used to hit the budget without assuming
 //! monotonicity under the greedy outer loop.
 
 use crate::model::parameters::ModelParams;
@@ -45,13 +73,13 @@ fn logaddexp(a: f32, b: f32) -> f32 {
 }
 
 /// Allocation result for a single target haplotype:
-/// active haplotype ids per window (indices into reference panel).
+/// intervals per selected haplotype (reference panel indices).
 #[derive(Clone, Debug)]
 pub struct WindowAllocation {
-    pub active_by_window: Vec<Vec<usize>>,
+    pub intervals_by_hap: Vec<(usize, Vec<(u32, u32)>)>,
 }
 
-/// Compute Li–Stephens continuity transition terms per boundary.
+/// Compute continuity transition terms per boundary.
 ///
 /// We must be consistent with the HMM parameterization. The recombination
 /// probability used by the HMM is:
@@ -66,13 +94,15 @@ pub struct WindowAllocation {
 /// and
 ///     t11 = log(p11/p00), t10 = log(p10/p00), t01 = log(p01/p00)
 ///
-/// These are the exact 2-state (ON/OFF) transition log-odds relative to OFF->OFF.
+/// These are the exact 2-state (ON/OFF) transition log-odds relative to OFF->OFF
+/// under a lumped ON=“hap h” / OFF=“not h” surrogate chain. This preserves the
+/// Li–Stephens stay/switch physics in the selection layer without claiming to be
+/// the full HMM marginal likelihood.
 fn continuity_terms(
     boundary_cm: &[f64],
     params: &ModelParams,
     n_pool: usize,
 )-> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    const EPS: f32 = 1.0e-30;
     let mut t11 = Vec::with_capacity(boundary_cm.len());
     let mut t10 = Vec::with_capacity(boundary_cm.len());
     let mut t01 = Vec::with_capacity(boundary_cm.len());
@@ -80,13 +110,13 @@ fn continuity_terms(
     for &dist_cm in boundary_cm {
         let r_w = params.p_recomb(dist_cm);
         let a_w = (1.0 - r_w).max(0.0).min(1.0);
-        let p11 = (a_w + (1.0 - a_w) / n_pool_f).max(EPS);
-        let p10 = ((1.0 - a_w) * (n_pool_f - 1.0) / n_pool_f).max(EPS);
-        let p01 = ((1.0 - a_w) / n_pool_f).max(EPS);
-        let p00 = (1.0 - p01).max(EPS);
-        let t11_v = (p11 / p00).ln();
-        let t10_v = (p10 / p00).ln();
-        let t01_v = (p01 / p00).ln();
+        let p11 = a_w + (1.0 - a_w) / n_pool_f;
+        let p10 = (1.0 - a_w) * (n_pool_f - 1.0) / n_pool_f;
+        let p01 = (1.0 - a_w) / n_pool_f;
+        let p00 = 1.0 - p01;
+        let t11_v = if p11 > 0.0 && p00 > 0.0 { (p11 / p00).ln() } else { NEG_INF };
+        let t10_v = if p10 > 0.0 && p00 > 0.0 { (p10 / p00).ln() } else { NEG_INF };
+        let t01_v = if p01 > 0.0 && p00 > 0.0 { (p01 / p00).ln() } else { NEG_INF };
         t11.push(t11_v);
         t10.push(t10_v);
         t01.push(t01_v);
@@ -94,15 +124,25 @@ fn continuity_terms(
     (t11, t10, t01)
 }
 
-/// Run the 2-state DP for a single haplotype.
+/// Run the 2-state DP for a single haplotype from sparse scores.
 ///
 /// Inputs:
-/// - u_w: marginal gain per window (already includes mu penalty)
-/// - t11/t10/t01: 2-state transition log-odds vs OFF->OFF
+/// - scores: sparse (win, score) list for this haplotype (sorted by win).
+/// - logZ: current log-evidence baseline per window.
+/// - mu: per-window slot price.
+/// - t11/t10/t01: 2-state transition log-odds vs OFF->OFF.
 ///
 /// Returns: (total_gain, active_flags)
-fn dp_intervals(u_w: &[f32], t11: &[f32], t10: &[f32], t01: &[f32]) -> (f32, Vec<bool>) {
-    let w = u_w.len();
+fn dp_intervals_sparse(
+    scores: &[(usize, f32)],
+    logz: &[f32],
+    mu: f32,
+    blocked: &[bool],
+    t11: &[f32],
+    t10: &[f32],
+    t01: &[f32],
+) -> (f32, Vec<bool>) {
+    let w = logz.len();
     if w == 0 {
         return (0.0, Vec::new());
     }
@@ -111,10 +151,29 @@ fn dp_intervals(u_w: &[f32], t11: &[f32], t10: &[f32], t01: &[f32]) -> (f32, Vec
     let mut prev0 = vec![0u8; w];
     let mut prev1 = vec![0u8; w];
 
+    let mut s_idx = 0usize;
+    let mut score0 = NEG_INF;
+    if !scores.is_empty() && scores[0].0 == 0 {
+        score0 = scores[0].1;
+        s_idx = 1;
+    }
     dp0[0] = 0.0;
-    dp1[0] = u_w[0];
+    let mut u0 = logaddexp(logz[0], score0) - logz[0] - mu;
+    if blocked.get(0).copied().unwrap_or(false) {
+        u0 = NEG_INF;
+    }
+    dp1[0] = u0;
 
     for i in 1..w {
+        let mut score = NEG_INF;
+        if s_idx < scores.len() && scores[s_idx].0 == i {
+            score = scores[s_idx].1;
+            s_idx += 1;
+        }
+        let mut u_w = logaddexp(logz[i], score) - logz[i] - mu;
+        if blocked.get(i).copied().unwrap_or(false) {
+            u_w = NEG_INF;
+        }
         // OFF state: max(OFF->OFF, ON->OFF)
         let from0 = dp0[i - 1];
         let from1 = dp1[i - 1] + t10[i - 1];
@@ -130,10 +189,10 @@ fn dp_intervals(u_w: &[f32], t11: &[f32], t10: &[f32], t01: &[f32]) -> (f32, Vec
         let from_off = dp0[i - 1] + t01[i - 1];
         let from_on = dp1[i - 1] + t11[i - 1];
         if from_off >= from_on {
-            dp1[i] = u_w[i] + from_off;
+            dp1[i] = u_w + from_off;
             prev1[i] = 0;
         } else {
-            dp1[i] = u_w[i] + from_on;
+            dp1[i] = u_w + from_on;
             prev1[i] = 1;
         }
     }
@@ -158,44 +217,69 @@ fn dp_intervals(u_w: &[f32], t11: &[f32], t10: &[f32], t01: &[f32]) -> (f32, Vec
     (gain, active)
 }
 
+fn active_to_intervals(active: &[bool]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < active.len() {
+        if !active[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        while end + 1 < active.len() && active[end + 1] {
+            end += 1;
+        }
+        out.push((start as u32, end as u32));
+        i = end + 1;
+    }
+    out
+}
+
 /// Allocate active haplotypes per window for a single target haplotype.
 ///
 /// Inputs:
-/// - scores_by_window: S[h,w] as Vec[W][N], log-evidence scores.
+/// - scores_by_hap: sparse S[h,w] lists per candidate hap (log-score weights).
 /// - boundary_cm: window boundary distances (len W-1).
 /// - params: model params for recombination mapping.
 /// - total_budget: total slots allowed across all windows (K_total * W).
 /// - per_window_cap: max states per window (K_total).
 /// - abyss: optional mask of haplotypes to exclude.
-pub fn allocate_lms(
-    scores_by_window: &[Vec<f32>],
+pub fn allocate_lms_sparse(
+    scores_by_hap: &[Vec<(usize, f32)>],
+    candidate_haps: &[usize],
+    num_windows: usize,
     boundary_cm: &[f64],
     params: &ModelParams,
+    n_pool: usize,
     total_budget: usize,
     per_window_cap: usize,
-    abyss: Option<&[bool]>,
 ) -> WindowAllocation {
-    let w = scores_by_window.len();
+    let w = num_windows;
     if w == 0 || total_budget == 0 {
         return WindowAllocation {
-            active_by_window: vec![Vec::new(); w],
+            intervals_by_hap: Vec::new(),
         };
     }
     if !boundary_cm.is_empty() && boundary_cm.len() + 1 != w {
         return WindowAllocation {
-            active_by_window: vec![Vec::new(); w],
+            intervals_by_hap: Vec::new(),
         };
     }
-    let n = scores_by_window[0].len();
-    let mut active_by_window: Vec<Vec<usize>> = vec![Vec::new(); w];
+    let n = candidate_haps.len();
+    if n == 0 {
+        return WindowAllocation {
+            intervals_by_hap: Vec::new(),
+        };
+    }
+    let mut intervals_by_hap: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
     let mut counts = vec![0usize; w];
     let mut z_w = vec![0.0f32; w]; // log(1)
     let mut selected = vec![false; n];
     let mut remaining = total_budget;
 
-    // Use a fixed donor pool size for separability: background + per-window cap.
-    // This keeps the continuity terms constant during per-haplotype DP.
-    let n_pool = 1 + per_window_cap.max(1);
+    // Use a fixed donor pool size for separability. We default to the full
+    // reference panel size so continuity odds align with the actual HMM physics.
     let (t11, t10, t01) = continuity_terms(boundary_cm, params, n_pool);
 
     // Determine mu by binary search to approximately meet budget.
@@ -204,36 +288,32 @@ pub fn allocate_lms(
     let mut mu_high = 10.0f32;
 
     // Ensure bounds bracket a feasible range.
-    let mut used_low = 0usize;
     for _ in 0..5 {
         let (used, _) = simulate_allocation(
-            scores_by_window,
+            scores_by_hap,
+            w,
             &t11,
             &t10,
             &t01,
             mu_low,
             per_window_cap,
-            abyss,
         );
-        used_low = used;
-        if used_low >= total_budget {
+        if used >= total_budget {
             break;
         }
         mu_low -= 5.0;
     }
-    let mut used_high = 0usize;
     for _ in 0..5 {
         let (used, _) = simulate_allocation(
-            scores_by_window,
+            scores_by_hap,
+            w,
             &t11,
             &t10,
             &t01,
             mu_high,
             per_window_cap,
-            abyss,
         );
-        used_high = used;
-        if used_high <= total_budget {
+        if used <= total_budget {
             break;
         }
         mu_high += 5.0;
@@ -247,13 +327,13 @@ pub fn allocate_lms(
         let t = k as f32 / 16.0;
         let mu = mu_low + t * (mu_high - mu_low);
         let (used, gain) = simulate_allocation(
-            scores_by_window,
+            scores_by_hap,
+            w,
             &t11,
             &t10,
             &t01,
             mu,
             per_window_cap,
-            abyss,
         );
         if used <= total_budget && (gain > best_gain || (gain == best_gain && used > best_used))
         {
@@ -270,30 +350,15 @@ pub fn allocate_lms(
         let mut best_h = None;
         let mut best_active: Vec<bool> = Vec::new();
         let mut best_len = 0usize;
+        let blocked: Vec<bool> = counts.iter().map(|&c| c >= per_window_cap).collect();
 
         for h in 0..n {
             if selected[h] {
                 continue;
             }
-            if let Some(mask) = abyss {
-                if h < mask.len() && mask[h] {
-                    continue;
-                }
-            }
-            let mut u_w = vec![NEG_INF; w];
-            for win in 0..w {
-                if counts[win] >= per_window_cap {
-                    continue;
-                }
-                let score = scores_by_window[win][h];
-                if !score.is_finite() {
-                    continue;
-                }
-                let logz = z_w[win];
-                let gain = logaddexp(logz, score) - logz - mu;
-                u_w[win] = gain;
-            }
-            let (gain, active) = dp_intervals(&u_w, &t11, &t10, &t01);
+            let scores = &scores_by_hap[h];
+            let (gain, active) =
+                dp_intervals_sparse(scores, &z_w, mu, &blocked, &t11, &t10, &t01);
             if gain > best_gain {
                 let len = active.iter().filter(|v| **v).count();
                 if len == 0 || len > remaining {
@@ -314,13 +379,17 @@ pub fn allocate_lms(
 
         for win in 0..w {
             if best_active[win] && counts[win] < per_window_cap {
-                active_by_window[win].push(h);
                 counts[win] += 1;
-                let score = scores_by_window[win][h];
-                if score.is_finite() {
-                    z_w[win] = logaddexp(z_w[win], score);
-                }
             }
+        }
+        for &(win, score) in scores_by_hap[h].iter() {
+            if win < w && best_active[win] && score.is_finite() {
+                z_w[win] = logaddexp(z_w[win], score);
+            }
+        }
+        let intervals = active_to_intervals(&best_active);
+        if !intervals.is_empty() {
+            intervals_by_hap.push((candidate_haps[h], intervals));
         }
         if best_len > remaining {
             break;
@@ -328,23 +397,25 @@ pub fn allocate_lms(
         remaining -= best_len;
     }
 
-    WindowAllocation { active_by_window }
+    WindowAllocation {
+        intervals_by_hap,
+    }
 }
 
 fn simulate_allocation(
-    scores_by_window: &[Vec<f32>],
+    scores_by_hap: &[Vec<(usize, f32)>],
+    num_windows: usize,
     t11: &[f32],
     t10: &[f32],
     t01: &[f32],
     mu: f32,
     per_window_cap: usize,
-    abyss: Option<&[bool]>,
 ) -> (usize, f32) {
-    let w = scores_by_window.len();
+    let w = num_windows;
     if w == 0 {
         return (0, 0.0);
     }
-    let n = scores_by_window[0].len();
+    let n = scores_by_hap.len();
     let mut counts = vec![0usize; w];
     let mut z_w = vec![0.0f32; w];
     let mut used = 0usize;
@@ -356,30 +427,15 @@ fn simulate_allocation(
         let mut best_h = None;
         let mut best_active: Vec<bool> = Vec::new();
         let mut best_len = 0usize;
+        let blocked: Vec<bool> = counts.iter().map(|&c| c >= per_window_cap).collect();
 
         for h in 0..n {
             if selected[h] {
                 continue;
             }
-            if let Some(mask) = abyss {
-                if h < mask.len() && mask[h] {
-                    continue;
-                }
-            }
-            let mut u_w = vec![NEG_INF; w];
-            for win in 0..w {
-                if counts[win] >= per_window_cap {
-                    continue;
-                }
-                let score = scores_by_window[win][h];
-                if !score.is_finite() {
-                    continue;
-                }
-                let logz = z_w[win];
-                let gain = logaddexp(logz, score) - logz - mu;
-                u_w[win] = gain;
-            }
-            let (gain, active) = dp_intervals(&u_w, t11, t10, t01);
+            let scores = &scores_by_hap[h];
+            let (gain, active) =
+                dp_intervals_sparse(scores, &z_w, mu, &blocked, t11, t10, t01);
             if gain > best_gain {
                 let len = active.iter().filter(|v| **v).count();
                 if len == 0 {
@@ -402,10 +458,11 @@ fn simulate_allocation(
         for win in 0..w {
             if best_active[win] && counts[win] < per_window_cap {
                 counts[win] += 1;
-                let score = scores_by_window[win][h];
-                if score.is_finite() {
-                    z_w[win] = logaddexp(z_w[win], score);
-                }
+            }
+        }
+        for &(win, score) in scores_by_hap[h].iter() {
+            if win < w && best_active[win] && score.is_finite() {
+                z_w[win] = logaddexp(z_w[win], score);
             }
         }
     }

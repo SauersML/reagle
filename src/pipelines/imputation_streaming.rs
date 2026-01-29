@@ -7,6 +7,7 @@
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use rayon::prelude::*;
 use sysinfo::System;
@@ -113,10 +114,27 @@ fn estimate_state_budget(
 struct ImputationPlan {
     n_ref_haps: usize,
     core_states: Vec<Vec<GlobalId>>,          // per target hap (derived)
-    window_states: Vec<Vec<Vec<GlobalId>>>,   // per target hap -> per window
+    window_intervals: Vec<Vec<HapIntervals>>, // per target hap (sparse)
     abyss_mask: Vec<Vec<bool>>,               // per target hap
-    total_budget: usize,
     per_window_cap: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HapIntervals {
+    hap: GlobalId,
+    intervals: Vec<(u32, u32)>,
+}
+
+impl HapIntervals {
+    fn contains(&self, window_idx: usize) -> bool {
+        let idx = window_idx as u32;
+        for &(start, end) in self.intervals.iter() {
+            if idx >= start && idx <= end {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn estimate_scan_batch_size(
@@ -159,18 +177,51 @@ fn build_sampling_points(gen_positions: &[f64], step_cm: f64) -> Vec<bool> {
     sampling
 }
 
-fn window_boundaries_from_bounds(bounds: &[(f64, f64)]) -> Vec<f64> {
-    if bounds.len() < 2 {
+fn window_boundaries_from_handoff(handoff: &[(f64, f64)], min_step_cm: f64) -> Vec<f64> {
+    if handoff.len() < 2 {
         return Vec::new();
     }
-    let mut out = Vec::with_capacity(bounds.len() - 1);
-    for i in 0..bounds.len() - 1 {
-        let (_, end) = bounds[i];
-        let (start_next, _) = bounds[i + 1];
-        let dist = (start_next - end).max(0.0);
+    let mut out = Vec::with_capacity(handoff.len() - 1);
+    for i in 0..handoff.len() - 1 {
+        let (prev_left, _) = handoff[i];
+        let (_, next_right) = handoff[i + 1];
+        // Use handoff anchor distance in cM (gen_pos is cM here); enforce
+        // a small minimum to avoid
+        // zero-distance degeneracy across overlapping windows.
+        let dist = (next_right - prev_left).max(min_step_cm);
         out.push(dist);
     }
     out
+}
+
+fn build_sparse_scores(
+    window_scores: &[Vec<(usize, f32)>],
+    abyss: &[bool],
+) -> (Vec<usize>, Vec<Vec<(usize, f32)>>) {
+    let mut map: HashMap<usize, usize> = HashMap::new();
+    let mut candidate_haps: Vec<usize> = Vec::new();
+    let mut scores_by_hap: Vec<Vec<(usize, f32)>> = Vec::new();
+
+    for (w, list) in window_scores.iter().enumerate() {
+        for &(hap, score) in list.iter() {
+            if score <= 0.0 || !score.is_finite() {
+                continue;
+            }
+            if hap < abyss.len() && abyss[hap] {
+                continue;
+            }
+            let idx = *map.entry(hap).or_insert_with(|| {
+                candidate_haps.push(hap);
+                scores_by_hap.push(Vec::new());
+                candidate_haps.len() - 1
+            });
+            scores_by_hap[idx].push((w, score));
+        }
+    }
+    for scores in scores_by_hap.iter_mut() {
+        scores.sort_by_key(|(w, _)| *w);
+    }
+    (candidate_haps, scores_by_hap)
 }
 
 fn compute_target_freqs<TargetSpace, RefSpace>(
@@ -273,20 +324,13 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
         return;
     }
 
-        let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
+    let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
 
     let mut query_alleles = vec![255u8; batch_haps.len()];
-        let mut ref_bins: Vec<Vec<u32>> = Vec::new();
+    let mut ref_bins: Vec<Vec<u32>> = Vec::new();
 
     for m in 0..n_markers {
-        let boundary_cm = window_boundaries_from_bounds(&window_gen_bounds);
-        if window_gen_bounds.is_empty() {
-            return Err(ReagleError::vcf(
-                "Pre-scan produced no windows for LMS allocation".to_string(),
-            ));
-        }
-
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             query_alleles[i] =
                 target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
@@ -628,9 +672,8 @@ fn build_imputation_plan(
     let mut plan = ImputationPlan {
         n_ref_haps: 0,
         core_states: vec![Vec::new(); n_target_haps],
-        window_states: vec![Vec::new(); n_target_haps],
+        window_intervals: vec![Vec::new(); n_target_haps],
         abyss_mask: vec![Vec::new(); n_target_haps],
-        total_budget,
         per_window_cap,
     };
 
@@ -662,8 +705,8 @@ fn build_imputation_plan(
     let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
 
-    // Window boundary positions (genetic) are consistent across batches.
-    let mut window_gen_bounds: Vec<(f64, f64)> = Vec::new();
+    // Handoff anchor: (prev_output_end_gen_pos, next_output_start_gen_pos)
+    let mut window_handoff: Vec<(f64, f64)> = Vec::new();
 
     while batch_start < n_target_haps {
         let batch_end = (batch_start + batch_size).min(n_target_haps);
@@ -678,7 +721,7 @@ fn build_imputation_plan(
         let mut window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut best_window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
         let mut window_rank_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
-        let mut scores_by_window: Vec<Vec<Vec<f32>>> = Vec::with_capacity(batch_len);
+        let mut scores_by_window: Vec<Vec<Vec<(usize, f32)>>> = Vec::with_capacity(batch_len);
 
         for _ in 0..batch_len {
             global_scores.push(Vec::new());
@@ -792,33 +835,42 @@ fn build_imputation_plan(
                 }
             }
 
-            // Persist per-window scores for LMS allocator.
+            // Persist per-window sparse scores for LMS allocator (top-M per window).
             for i in 0..batch_len {
-                scores_by_window[i].push(window_scores[i].clone());
+                let top_m = per_window_cap
+                    .saturating_mul(4)
+                    .max(per_window_cap)
+                    .min(n_ref_haps.max(1));
+                let top = select_top_k(&window_scores[i], top_m);
+                scores_by_window[i].push(top);
             }
 
-            // Record window genetic bounds once (batch 0), reuse for all batches.
+            // Record handoff anchor points once (batch 0), reuse for all batches.
             if batch_start == 0 {
-                let gen_start = gen_maps.gen_pos(
-                    ref_window.markers.marker(MarkerIdx::new(0)).chrom,
-                    ref_window.markers.marker(MarkerIdx::new(0)).pos,
-                );
-                let gen_end = gen_maps.gen_pos(
-                    ref_window
-                        .markers
-                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                        .chrom,
-                    ref_window
-                        .markers
-                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                        .pos,
-                );
-                if window_gen_bounds.len() == window_idx {
-                    window_gen_bounds.push((gen_start, gen_end));
+                let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
+                let output_end = ref_window.output_end.min(n_ref_markers).max(1);
+                let left_idx = output_end.saturating_sub(1);
+                let right_idx = output_start.min(n_ref_markers.saturating_sub(1));
+                let left_marker = ref_window.markers.marker(MarkerIdx::new(left_idx as u32));
+                let right_marker = ref_window.markers.marker(MarkerIdx::new(right_idx as u32));
+                let left_gen = gen_maps.gen_pos(left_marker.chrom, left_marker.pos);
+                let right_gen = gen_maps.gen_pos(right_marker.chrom, right_marker.pos);
+                if window_handoff.len() == window_idx {
+                    window_handoff.push((left_gen, right_gen));
                 }
             }
             window_idx += 1;
 
+        }
+
+        let min_step_cm = (streaming_config.overlap_cm as f64)
+            .max(imp_step_cm)
+            .max(1e-6);
+        let boundary_cm = window_boundaries_from_handoff(&window_handoff, min_step_cm);
+        if window_handoff.is_empty() {
+            return Err(ReagleError::vcf(
+                "Pre-scan produced no windows for LMS allocation".to_string(),
+            ));
         }
 
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
@@ -848,67 +900,68 @@ fn build_imputation_plan(
 
             // Run LMS allocator for this target haplotype.
             let window_scores_matrix = &scores_by_window[i];
-            if window_scores_matrix.len() != window_gen_bounds.len() {
+            if window_scores_matrix.len() != window_handoff.len() {
                 return Err(ReagleError::vcf(format!(
                     "Pre-scan window count mismatch for hap {} (scores={}, bounds={})",
                     hap_idx,
                     window_scores_matrix.len(),
-                    window_gen_bounds.len()
+                    window_handoff.len()
                 )));
             }
             // LMS allocation: select a per-window active set that maximizes a
             // Li–Stephens-aligned surrogate objective under a slot budget.
             // This is a prescan-only selection layer; the actual HMM still uses
             // explicit GlobalId states and identity-preserving transitions.
-            let by_window: Vec<Vec<GlobalId>> = if per_window_cap >= n_ref_haps {
-                // Full panel per window (minus abyss).
-                let mut all: Vec<GlobalId> = Vec::new();
+            let (intervals, core) = if per_window_cap >= n_ref_haps {
+                // Full panel per window (minus abyss). Store as 1 interval per hap.
+                let mut intervals = Vec::new();
+                let mut core = Vec::new();
+                let end = window_scores_matrix.len().saturating_sub(1) as u32;
                 for h in 0..n_ref_haps {
-                    if !abyss[h] {
-                        all.push(GlobalId::new(h as u32));
+                    if abyss[h] {
+                        continue;
                     }
+                    let hap = GlobalId::new(h as u32);
+                    intervals.push(HapIntervals {
+                        hap,
+                        intervals: vec![(0, end)],
+                    });
+                    core.push(hap);
                 }
-                let mut out = Vec::with_capacity(window_scores_matrix.len());
-                for _ in 0..window_scores_matrix.len() {
-                    out.push(all.clone());
-                }
-                out
+                (intervals, core)
             } else {
-                let allocation = crate::model::state_allocator::allocate_lms(
-                    window_scores_matrix,
+                let (candidate_haps, scores_by_hap) =
+                    build_sparse_scores(window_scores_matrix, &abyss);
+                let global_slot_budget = per_window_cap
+                    .saturating_mul(window_scores_matrix.len().max(1))
+                    .max(1);
+                let allocation = crate::model::state_allocator::allocate_lms_sparse(
+                    &scores_by_hap,
+                    &candidate_haps,
+                    window_scores_matrix.len(),
                     &boundary_cm,
                     params,
-                    total_budget.saturating_mul(window_scores_matrix.len().max(1)),
+                    n_ref_haps,
+                    global_slot_budget,
                     per_window_cap.max(1),
-                    Some(&abyss),
                 );
-                let mut out: Vec<Vec<GlobalId>> =
-                    Vec::with_capacity(allocation.active_by_window.len());
-                for win in allocation.active_by_window.iter() {
-                    let mut ids: Vec<GlobalId> =
-                        win.iter().map(|h| GlobalId::new(*h as u32)).collect();
-                    ids.sort_unstable_by_key(|g| g.as_u32());
-                    ids.dedup();
-                    out.push(ids);
+                let mut intervals = Vec::new();
+                for (hap, spans) in allocation.intervals_by_hap.into_iter() {
+                    intervals.push(HapIntervals {
+                        hap: GlobalId::new(hap as u32),
+                        intervals: spans,
+                    });
                 }
-                out
+                let mut core = Vec::new();
+                let need_end = window_scores_matrix.len().saturating_sub(1) as u32;
+                for hi in intervals.iter() {
+                    if hi.intervals.len() == 1 && hi.intervals[0] == (0, need_end) {
+                        core.push(hi.hap);
+                    }
+                }
+                (intervals, core)
             };
-            plan.window_states[hap_idx] = by_window.clone();
-
-            // Derive core set as haplotypes active in all windows.
-            let mut counts = vec![0usize; n_ref_haps];
-            for win in by_window.iter() {
-                for id in win.iter() {
-                    counts[id.as_usize()] += 1;
-                }
-            }
-            let mut core: Vec<GlobalId> = Vec::new();
-            let need = window_scores_matrix.len().max(1);
-            for h in 0..n_ref_haps {
-                if counts[h] == need {
-                    core.push(GlobalId::new(h as u32));
-                }
-            }
+            plan.window_intervals[hap_idx] = intervals;
             plan.core_states[hap_idx] = core;
         }
 
@@ -1053,7 +1106,7 @@ impl crate::pipelines::ImputationPipeline {
             avail_bytes / (1024 * 1024)
         );
 
-        let mut plan = build_imputation_plan(
+        let plan = build_imputation_plan(
             &phased_target_path,
             ref_path,
             &streaming_config,
@@ -1595,9 +1648,17 @@ impl crate::pipelines::ImputationPipeline {
 
                     let plan_idx = hap_idx.as_usize();
                     let mut state_haps: Vec<GlobalId> = Vec::new();
-                    if plan_idx < plan.window_states.len() && window_idx < plan.window_states[plan_idx].len() {
-                        state_haps.extend(plan.window_states[plan_idx][window_idx].iter().copied());
-                    } else if plan_idx < plan.core_states.len() {
+                    if plan_idx < plan.window_intervals.len() {
+                        for hi in plan.window_intervals[plan_idx].iter() {
+                            if hi.contains(window_idx) {
+                                state_haps.push(hi.hap);
+                                if state_haps.len() >= plan.per_window_cap {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if state_haps.is_empty() && plan_idx < plan.core_states.len() {
                         state_haps.extend(plan.core_states[plan_idx].iter().copied());
                     }
                     state_haps.sort_unstable_by_key(|g| g.as_u32());
@@ -1605,6 +1666,20 @@ impl crate::pipelines::ImputationPipeline {
                     if plan_idx < plan.abyss_mask.len() {
                         let abyss = &plan.abyss_mask[plan_idx];
                         state_haps.retain(|g| !abyss[g.as_usize()]);
+                    }
+                    if state_haps.is_empty() {
+                        // Hard fallback: pick the first non-abyss haplotypes.
+                        if plan_idx < plan.abyss_mask.len() {
+                            let abyss = &plan.abyss_mask[plan_idx];
+                            for h in 0..plan.n_ref_haps {
+                                if !abyss.get(h).copied().unwrap_or(true) {
+                                    state_haps.push(GlobalId::new(h as u32));
+                                    if state_haps.len() >= plan.per_window_cap.max(1) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                     assert!(
                         !state_haps.is_empty(),
