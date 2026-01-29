@@ -113,40 +113,58 @@ impl ReferencePbwt {
         }
 
         let mut out = Vec::with_capacity(k);
+        let mut total_len = 0usize;
 
+        // First pass: calculate total available haplotypes
         for &(l, r) in beam.intervals() {
-            if out.len() >= k {
-                break;
-            }
             let l = l.min(n_ref as u32) as usize;
             let r = r.min(n_ref as u32) as usize;
-            if l >= r {
-                continue;
+            if r > l {
+                total_len += r - l;
             }
-            let center = (l + r) / 2;
+        }
 
-            let mut left = center;
-            let mut right = center;
-            while out.len() < k && (left > l || right < r) {
-                if left > l {
-                    left -= 1;
-                    out.push(self.ppa[left]);
-                    if out.len() >= k {
+        if total_len == 0 {
+            return Vec::new();
+        }
+
+        if total_len <= k {
+            // Take all available
+            for &(l, r) in beam.intervals() {
+                let l = l.min(n_ref as u32) as usize;
+                let r = r.min(n_ref as u32) as usize;
+                for i in l..r {
+                    out.push(self.ppa[i]);
+                }
+            }
+        } else {
+            // Uniform spaced sampling
+            for i in 0..k {
+                let target_relative_idx = (i * total_len) / k;
+                
+                // Find which interval contains target_relative_idx
+                let mut current_pos = 0;
+                for &(l, r) in beam.intervals() {
+                    let l = l.min(n_ref as u32) as usize;
+                    let r = r.min(n_ref as u32) as usize;
+                    let len = r.saturating_sub(l);
+                    if len == 0 {
+                        continue;
+                    }
+
+                    if target_relative_idx < current_pos + len {
+                        // Found in this interval
+                        let offset = target_relative_idx - current_pos;
+                        out.push(self.ppa[l + offset]);
                         break;
                     }
-                }
-                if right < r {
-                    out.push(self.ppa[right]);
-                    right += 1;
+                    current_pos += len;
                 }
             }
         }
 
         out.sort_unstable();
         out.dedup();
-        if out.len() > k {
-            out.truncate(k);
-        }
         out
     }
 
