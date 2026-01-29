@@ -85,16 +85,16 @@ const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 fn available_memory_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
-    // sysinfo reports memory values in kilobytes.
-    let avail_kb = sys.available_memory();
-    if avail_kb > 0 {
-        return Some(avail_kb.saturating_mul(1024));
+    // sysinfo reports memory values in bytes.
+    let avail_bytes = sys.available_memory();
+    if avail_bytes > 0 {
+        return Some(avail_bytes);
     }
     // Fallback: if available memory is unavailable (some CI/containers),
     // use total memory rather than collapsing to an unusable cap.
-    let total_kb = sys.total_memory();
-    if total_kb > 0 {
-        Some(total_kb.saturating_mul(1024))
+    let total_bytes = sys.total_memory();
+    if total_bytes > 0 {
+        Some(total_bytes)
     } else {
         None
     }
@@ -1620,7 +1620,24 @@ impl crate::pipelines::ImputationPipeline {
                         && (!is_diploid || (mapped_partner != 255 && (mapped_partner as usize) < n_alleles));
                     if has_hard {
                         aligned_probs.resize(n_alleles, 0.0);
-                        aligned_probs[mapped_allele as usize] = 1.0;
+                        if is_diploid && mapped_partner != 255 && mapped_partner != mapped_allele {
+                            let phase_conf = target_win
+                                .sample_phase_confidence_f32(
+                                    MarkerIdx::new(target_m as u32),
+                                    sample_idx,
+                                )
+                                .clamp(0.0, 1.0);
+                            aligned_probs[mapped_allele as usize] = phase_conf;
+                            aligned_probs[mapped_partner as usize] = 1.0 - phase_conf;
+                        } else {
+                            aligned_probs[mapped_allele as usize] = 1.0;
+                        }
+                        if conf < 1.0 {
+                            let uniform = 1.0 / n_alleles as f32;
+                            for p in aligned_probs.iter_mut() {
+                                *p = conf * *p + (1.0 - conf) * uniform;
+                            }
+                        }
                         use_probs = true;
                     }
 
