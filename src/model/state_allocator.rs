@@ -242,9 +242,8 @@ fn active_to_intervals(active: &[bool]) -> Vec<(u32, u32)> {
 /// - scores_by_hap: sparse S[h,w] lists per candidate hap (log-score weights).
 /// - boundary_cm: window boundary distances (len W-1).
 /// - params: model params for recombination mapping.
-/// - total_budget: total slots allowed across all windows (K_total * W).
-/// - per_window_cap: max states per window (K_total).
-/// - abyss: optional mask of haplotypes to exclude.
+/// - total_budget: total slots allowed across all windows (sum of per-window caps).
+/// - per_window_caps: per-window max states (global, same for all target haps).
 pub fn allocate_lms_sparse(
     scores_by_hap: &[Vec<(usize, f32)>],
     candidate_haps: &[usize],
@@ -253,10 +252,15 @@ pub fn allocate_lms_sparse(
     params: &ModelParams,
     n_pool: usize,
     total_budget: usize,
-    per_window_cap: usize,
+    per_window_caps: &[usize],
 ) -> WindowAllocation {
     let w = num_windows;
     if w == 0 || total_budget == 0 {
+        return WindowAllocation {
+            intervals_by_hap: Vec::new(),
+        };
+    }
+    if per_window_caps.len() != w {
         return WindowAllocation {
             intervals_by_hap: Vec::new(),
         };
@@ -296,7 +300,7 @@ pub fn allocate_lms_sparse(
             &t10,
             &t01,
             mu_low,
-            per_window_cap,
+            per_window_caps,
         );
         if used >= total_budget {
             break;
@@ -311,7 +315,7 @@ pub fn allocate_lms_sparse(
             &t10,
             &t01,
             mu_high,
-            per_window_cap,
+            per_window_caps,
         );
         if used <= total_budget {
             break;
@@ -333,7 +337,7 @@ pub fn allocate_lms_sparse(
             &t10,
             &t01,
             mu,
-            per_window_cap,
+            per_window_caps,
         );
         if used <= total_budget && (gain > best_gain || (gain == best_gain && used > best_used))
         {
@@ -350,7 +354,11 @@ pub fn allocate_lms_sparse(
         let mut best_h = None;
         let mut best_active: Vec<bool> = Vec::new();
         let mut best_len = 0usize;
-        let blocked: Vec<bool> = counts.iter().map(|&c| c >= per_window_cap).collect();
+        let blocked: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
 
         for h in 0..n {
             if selected[h] {
@@ -378,7 +386,7 @@ pub fn allocate_lms_sparse(
         selected[h] = true;
 
         for win in 0..w {
-            if best_active[win] && counts[win] < per_window_cap {
+            if best_active[win] && counts[win] < per_window_caps[win] {
                 counts[win] += 1;
             }
         }
@@ -409,10 +417,13 @@ fn simulate_allocation(
     t10: &[f32],
     t01: &[f32],
     mu: f32,
-    per_window_cap: usize,
+    per_window_caps: &[usize],
 ) -> (usize, f32) {
     let w = num_windows;
     if w == 0 {
+        return (0, 0.0);
+    }
+    if per_window_caps.len() != w {
         return (0, 0.0);
     }
     let n = scores_by_hap.len();
@@ -427,7 +438,11 @@ fn simulate_allocation(
         let mut best_h = None;
         let mut best_active: Vec<bool> = Vec::new();
         let mut best_len = 0usize;
-        let blocked: Vec<bool> = counts.iter().map(|&c| c >= per_window_cap).collect();
+        let blocked: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
 
         for h in 0..n {
             if selected[h] {
@@ -456,7 +471,7 @@ fn simulate_allocation(
         total_gain += best_gain;
         used += best_len;
         for win in 0..w {
-            if best_active[win] && counts[win] < per_window_cap {
+            if best_active[win] && counts[win] < per_window_caps[win] {
                 counts[win] += 1;
             }
         }
