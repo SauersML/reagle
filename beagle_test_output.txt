@@ -1,0 +1,23 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.48s
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-0f656ea77cb030a4)
+
+running 27 tests
+test test_comparison_framework_self_check ... ok
+test test_dr2_genotyped_vs_imputed ... FAILED
+test test_diverse_mask_scenarios ... FAILED
+test test_dr2_zero_variance_genotyped_marker ... ok
+test test_dosage_by_distance_from_genotyped has been running for over 60 seconds
+test test_full_workflow_rust_vs_java has been running for over 60 seconds
+test test_genotyped_dosage_correlation_with_truth has been running for over 60 seconds
+test test_genotyped_dosage_matches_hard_call has been running for over 60 seconds
+test test_full_workflow_rust_vs_java ... ok
+test test_dosage_by_distance_from_genotyped ... FAILED
+test test_genotyped_dosage_correlation_with_truth ... FAILED
+test test_genotyped_dosage_matches_hard_call ... FAILED
+test test_gl_confidence_affects_emission ... ok
+test test_imputation_bref3_ref_rust_vs_java has been running for over 60 seconds
+test test_imputation_vcf_ref_rust_vs_java has been running for over 60 seconds
+test test_imputation_vs_ground_truth has been running for over 60 seconds
+test test_java_beagle_bref3_creation has been running for over 60 seconds
+test test_imputation_bref3_ref_rust_vs_java ... ok

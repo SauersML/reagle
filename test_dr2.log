@@ -1,0 +1,186 @@
+   Compiling reagle v0.1.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.55s
+     Running tests/beagle_reference.rs (target/debug/deps/beagle_reference-0f656ea77cb030a4)
+
+running 1 test
+
+======================================================================
+=== DR2: Genotyped vs Imputed (Separate Analysis) ===
+======================================================================
+Running: java -jar /app/tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar [("ref", "/tmp/.tmp9yo2iC/ref.vcf.gz"), ("gt", "/tmp/.tmp9yo2iC/target_sparse.vcf.gz"), ("out", "/tmp/.tmp9yo2iC/java_out"), ("seed", "42"), ("gp", "true")]
+Target marker index: 135 positions
+Target is unphased; running phasing before pre-scan...
+Loading VCF...
+Loaded 135 markers, 10 samples (20 haplotypes), 0.00 MB
+Loading reference panel for phasing...
+  Detected VCF format
+  Reference: 1356 markers, 362 haplotypes
+  Aligned 135 reference markers to target
+Combined haplotype space: 20 target + 362 reference = 382 total
+Two-stage phasing: 24 high-frequency markers (MAF >= 0.002), 0 rare markers
+Stage 1 blocks: 1
+Building IBS2 segments...
+Found 0 samples with IBS2 segments, 10 total
+Iteration 1/18 (burnin)
+Applied 25 phase switches, 0 markers phased (Stage 1 FB)
+  EM update: p_mismatch=0.002670, recomb_intensity=10.1512
+Iteration 2/18 (burnin)
+Applied 5 phase switches, 0 markers phased (Stage 1 FB)
+  EM update: p_mismatch=0.005158, recomb_intensity=8.8168
+Iteration 3/18 (burnin)
+Applied 2 phase switches, 0 markers phased (Stage 1 FB)
+  EM update: p_mismatch=0.006872, recomb_intensity=6.8261
+Iteration 4/18 (burnin)
+Applied 15 phase switches, 0 markers phased (Stage 1 FB)
+  EM update: p_mismatch=0.010660, recomb_intensity=4.7123
+Iteration 5/18 (burnin)
+Applied 24 phase switches, 0 markers phased (Stage 1 FB)
+  EM update: p_mismatch=0.010660, recomb_intensity=2.5859
+Iteration 6/18 (burnin)
+Applied 3 phase switches, 0 markers phased (Stage 1 FB)
+  EM update: p_mismatch=0.011284, recomb_intensity=0.7039
+Iteration 7/18 (main)
+Applied 0 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 8/18 (main)
+Applied 0 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 9/18 (main)
+Applied 1 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 10/18 (main)
+Applied 3 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 11/18 (main)
+Applied 2 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 12/18 (main)
+Applied 14 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 13/18 (main)
+Applied 13 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 14/18 (main)
+Applied 12 phase switches, 54 markers phased (Stage 1 FB)
+Iteration 15/18 (main)
+Applied 20 phase switches, 21 markers phased (Stage 1 FB)
+Iteration 16/18 (main)
+Applied 0 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 17/18 (main)
+Applied 0 phase switches, 0 markers phased (Stage 1 FB)
+Iteration 18/18 (main)
+Applied 0 phase switches, 0 markers phased (Stage 1 FB)
+Writing output to "/tmp/.tmpII64gO/phased_target.vcf.gz"
+Phasing complete!
+Imputation plan: per_window_cap=723, threads=4, available_mb=7362
+Imputation mode: full panel per window (abyss still active)
+Writing output to "/tmp/.tmp9yo2iC/rust_out.vcf.gz"
+  Imputing Window 0 (135 markers, ref global 0..1356, output 0..1356)
+Streaming imputation complete: 1356 markers
+
+=== GENOTYPED Markers (n=135) ===
+  Java mean DR2: 0.1778
+  Rust mean DR2: 1.0000
+
+  Java genotyped markers with DR2 != 1.0:
+    pos=20000814: DR2=0.0000
+    pos=20002207: DR2=0.0000
+    pos=20003214: DR2=0.0000
+    pos=20004766: DR2=0.0000
+    pos=20005697: DR2=0.0000
+    pos=20006225: DR2=0.0000
+    pos=20008093: DR2=0.0000
+    pos=20009464: DR2=0.0000
+    pos=20010511: DR2=0.0000
+    pos=20011039: DR2=0.0000
+
+=== IMPUTED Markers (n=1221) ===
+  Java mean DR2: 0.1998
+  Rust mean DR2: 0.6777
+  Gap: 0.4778
+
+  Top 20 imputed markers where Rust DR2 is WORSE:
+      Position   Java DR2   Rust DR2        Gap
+  ------------ ---------- ---------- ----------
+      20056925     1.0000     0.0133    -0.9867
+      20058274     1.0000     0.0137    -0.9863
+      20062300     1.0000     0.0153    -0.9847
+      20063424     1.0000     0.0160    -0.9840
+      20066902     1.0000     0.0160    -0.9840
+      20064905     1.0000     0.0169    -0.9831
+      20054946     1.0000     0.0172    -0.9828
+      20065314     1.0000     0.0172    -0.9828
+      20054507     1.0000     0.0173    -0.9827
+      20054458     1.0000     0.0174    -0.9826
+      20053154     1.0000     0.0181    -0.9819
+      20052302     1.0000     0.0186    -0.9814
+      20068407     1.0000     0.0193    -0.9807
+      20068556     1.0000     0.0194    -0.9806
+      20069297     1.0000     0.0198    -0.9802
+      20090038     0.9800     0.0000    -0.9800
+      20091628     0.9800     0.0000    -0.9800
+      20091833     0.9800     0.0000    -0.9800
+      20092777     0.9800     0.0000    -0.9800
+      20092996     0.9800     0.0000    -0.9800
+
+  DIAGNOSTIC: Dosages at worst 5 markers
+
+  Position 20056925
+    Java AF=0.1000, Rust AF=0.0065
+    Sample dosages (Java | Rust):
+      Sample 0: 0.0000 | 0.0052
+      Sample 1: 0.0000 | 0.0001
+      Sample 2: 1.0000 | 0.0512
+      Sample 3: 1.0000 | 0.0482
+      Sample 4: 0.0000 | 0.0034
+
+  Position 20058274
+    Java AF=0.1000, Rust AF=0.0054
+    Sample dosages (Java | Rust):
+      Sample 0: 0.0000 | 0.0036
+      Sample 1: 0.0000 | 0.0001
+      Sample 2: 1.0000 | 0.0526
+      Sample 3: 1.0000 | 0.0361
+      Sample 4: 0.0000 | 0.0014
+
+  Position 20062300
+    Java AF=0.1000, Rust AF=0.0057
+    Sample dosages (Java | Rust):
+      Sample 0: 0.0000 | 0.0042
+      Sample 1: 0.0000 | 0.0004
+      Sample 2: 1.0000 | 0.0600
+      Sample 3: 1.0000 | 0.0341
+      Sample 4: 0.0000 | 0.0013
+
+  Position 20063424
+    Java AF=0.1000, Rust AF=0.0058
+    Sample dosages (Java | Rust):
+      Sample 0: 0.0000 | 0.0043
+      Sample 1: 0.0000 | 0.0004
+      Sample 2: 1.0000 | 0.0622
+      Sample 3: 1.0000 | 0.0336
+      Sample 4: 0.0000 | 0.0012
+
+  Position 20066902
+    Java AF=0.1000, Rust AF=0.0067
+    Sample dosages (Java | Rust):
+      Sample 0: 0.0000 | 0.0048
+      Sample 1: 0.0000 | 0.0004
+      Sample 2: 1.0000 | 0.0692
+      Sample 3: 1.0000 | 0.0326
+      Sample 4: 0.0000 | 0.0020
+
+======================================================================
+ASSERTIONS:
+  Polymorphic genotyped markers: 135/135
+  Polymorphic with DR2 < 0.9: 0
+  Imputed markers where Rust DR2 significantly worse: 337/1221
+
+  Polymorphic genotyped mean DR2: 1.0000
+
+thread 'test_dr2_genotyped_vs_imputed' (17609) panicked at tests/beagle_reference.rs:3452:5:
+IMPUTED DR2 FAIL: Rust worse than Java on 337/1221 markers - STRICT FAILURE
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test test_dr2_genotyped_vs_imputed ... FAILED
+
+failures:
+
+failures:
+    test_dr2_genotyped_vs_imputed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 26 filtered out; finished in 12.14s
+
+error: test failed, to rerun pass `--test beagle_reference`

@@ -137,7 +137,9 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        // Convert cM to Morgans
+        let dist_morgan = gen_dist_cm / 100.0;
+        let p = (-f64::exp_m1(c * dist_morgan)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
