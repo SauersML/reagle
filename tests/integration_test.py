@@ -1119,10 +1119,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                         break
 
                 if ref_key != site_key:
-                    raise RuntimeError(
-                        f"Reference AF not found for site {t_chrom}:{t_pos}. "
-                        f"MAF stratification requires the site to be present in reference_vcf ({reference_vcf})."
-                    )
+                    # Skip sites not in reference (cannot calculate MAF metrics)
+                    truth_key, truth_data, truth_multiallelic = get_next_truth()
+                    imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                    continue
 
                 ref_ref, ref_alt, ref_af_list = ref_afs
                 maf = _maf_from_afs(ref_af_list)
