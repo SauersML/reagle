@@ -47,6 +47,12 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Maximum mismatch probability (1e-4)
+    pub const MAX_MISMATCH_PROB: f32 = 0.0001;
+
+    /// Maximum recombination intensity (60.0)
+    pub const MAX_RECOMB_INTENSITY: f32 = 60.0;
+
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
@@ -71,9 +77,13 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let mut recomb_intensity = 0.04 * ne / n_haps as f32;
+        recomb_intensity = recomb_intensity.min(Self::MAX_RECOMB_INTENSITY);
 
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
+        let p_mismatch = err.unwrap_or_else(|| {
+            let p = Self::li_stephens_p_mismatch(n_haps);
+            p.min(Self::MAX_MISMATCH_PROB)
+        });
 
         Self {
             p_mismatch,
@@ -158,7 +168,7 @@ impl ModelParams {
     pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
         if let Some(r) = new_intensity {
             if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
+                self.recomb_intensity = r.min(Self::MAX_RECOMB_INTENSITY);
             }
         }
     }
@@ -379,5 +389,24 @@ mod tests {
 
         assert!((e1.sum_gen_dist - 0.8).abs() < 0.0001);
         assert_eq!(e1.n_switch_obs(), 2);
+    }
+
+    #[test]
+    fn test_parameter_clamping() {
+        // Case 1: Very small n_haps -> high calculated intensity -> should clamp
+        let n_haps = 2;
+        let ne = 1_000_000.0;
+        // Raw: 0.04 * 1e6 / 2 = 20,000.0 > 60.0
+        let params = ModelParams::for_phasing(n_haps, ne, None);
+        assert_eq!(params.recomb_intensity, ModelParams::MAX_RECOMB_INTENSITY);
+
+        // Case 2: Very small n_haps -> Li-Stephens p_mismatch -> should clamp
+        // li_stephens(2) ~ 0.08 which is > 0.0001
+        assert_eq!(params.p_mismatch, ModelParams::MAX_MISMATCH_PROB);
+
+        // Case 3: Update recomb intensity with large value
+        let mut p2 = ModelParams::new();
+        p2.update_recomb_intensity(Some(100.0));
+        assert_eq!(p2.recomb_intensity, ModelParams::MAX_RECOMB_INTENSITY);
     }
 }

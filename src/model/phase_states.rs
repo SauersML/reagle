@@ -78,9 +78,9 @@ pub struct PhaseStates {
 }
 
 const NIL: i32 = -103;
-const MIN_EVICT_GAP_DIV: usize = 20;
-const MIN_EVICT_GAP_MIN: i32 = 20;
-const MIN_SEGMENT_LEN_MIN: i32 = 20;
+const MIN_EVICT_GAP_DIV: usize = 2000;
+const MIN_EVICT_GAP_MIN: i32 = 1;
+const MIN_SEGMENT_LEN_MIN: i32 = 1;
 
 impl PhaseStates {
     /// Create a new phase state selector
