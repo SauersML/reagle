@@ -70,8 +70,19 @@ fn synth_impute_runtime_under_2_min() {
     let n_markers = 2762; // ~5% of 55,237
     let downsample_every = 20; // target ~5% markers
 
-    let bin = std::env::var("CARGO_BIN_EXE_reagle")
-        .expect("CARGO_BIN_EXE_reagle not set; ensure tests build the binary");
+    let bin = std::env::var("REAGLE_BIN").ok().or_else(|| {
+        let debug = std::path::PathBuf::from("target/debug/reagle");
+        if debug.exists() {
+            Some(debug.to_string_lossy().to_string())
+        } else {
+            let release = std::path::PathBuf::from("target/release/reagle");
+            if release.exists() {
+                Some(release.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        }
+    }).expect("reagle binary not found; set REAGLE_BIN or build target/debug/reagle");
 
     let tmp = TempDir::new().expect("tempdir");
     let ref_vcf = tmp.path().join("ref.vcf");
