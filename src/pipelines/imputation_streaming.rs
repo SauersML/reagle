@@ -85,15 +85,16 @@ const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 fn available_memory_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
-    let avail_bytes = sys.available_memory();
-    if avail_bytes > 0 {
-        return Some(avail_bytes);
+    // sysinfo reports memory values in kilobytes.
+    let avail_kb = sys.available_memory();
+    if avail_kb > 0 {
+        return Some(avail_kb.saturating_mul(1024));
     }
     // Fallback: if available memory is unavailable (some CI/containers),
     // use total memory rather than collapsing to an unusable cap.
-    let total = sys.total_memory();
-    if total > 0 {
-        Some(total)
+    let total_kb = sys.total_memory();
+    if total_kb > 0 {
+        Some(total_kb.saturating_mul(1024))
     } else {
         None
     }
