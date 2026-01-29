@@ -136,8 +136,11 @@ impl ModelParams {
     ///
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
+        // Convert cM to Morgans for correct probability scale.
+        // recomb_intensity is in "switches per Morgan".
+        let dist_morgans = gen_dist_cm / 100.0;
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        let p = (-f64::exp_m1(c * dist_morgans)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
@@ -240,7 +243,9 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // sum_gen_dist is in cM (accumulated in add_switch).
+        // Returns switches per Morgan (so we multiply switches/cM by 100).
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability
