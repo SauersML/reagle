@@ -6066,8 +6066,9 @@ impl Stage2Phaser {
     }
 
     fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
+        let dist_morgans = gen_dist_cm / 100.0;
         let c = -(self.recomb_intensity as f64);
-        (-f64::exp_m1(c * gen_dist_cm)) as f32
+        (-f64::exp_m1(c * dist_morgans)) as f32
     }
 
     fn bridge_state_probs(
