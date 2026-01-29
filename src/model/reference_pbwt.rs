@@ -1,6 +1,6 @@
 use crate::model::pbwt::{PbwtDivUpdater, PbwtState};
 
-const MAX_RANK_INTERVALS: usize = 8;
+const MAX_RANK_INTERVALS: usize = 512;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RankBeam {
@@ -112,41 +112,63 @@ impl ReferencePbwt {
             return Vec::new();
         }
 
-        let mut out = Vec::with_capacity(k);
+        // Collect valid intervals and total count
+        let mut valid_intervals = Vec::with_capacity(MAX_RANK_INTERVALS);
+        let mut total_len = 0usize;
 
         for &(l, r) in beam.intervals() {
-            if out.len() >= k {
-                break;
-            }
             let l = l.min(n_ref as u32) as usize;
             let r = r.min(n_ref as u32) as usize;
-            if l >= r {
-                continue;
+            if l < r {
+                let len = r - l;
+                valid_intervals.push((l, r, len));
+                total_len += len;
             }
-            let center = (l + r) / 2;
+        }
 
-            let mut left = center;
-            let mut right = center;
-            while out.len() < k && (left > l || right < r) {
-                if left > l {
-                    left -= 1;
-                    out.push(self.ppa[left]);
-                    if out.len() >= k {
-                        break;
+        if total_len == 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(k);
+
+        if total_len <= k {
+            // Take all
+            for (l, r, _) in valid_intervals {
+                for i in l..r {
+                    out.push(self.ppa[i]);
+                }
+            }
+        } else {
+            // Robust Uniform Sampling: evenly spaced selection across all intervals
+            // This ensures we sample from all distinct haplotype groups found by PBWT
+            let step = total_len as f64 / k as f64;
+            let mut current_pos = 0.0;
+            let mut interval_idx = 0;
+
+            // Start first sample at half-step to center the selection
+            let mut sample_point = step * 0.5;
+
+            while out.len() < k && interval_idx < valid_intervals.len() {
+                let (l, _, len) = valid_intervals[interval_idx];
+                let interval_end = current_pos + len as f64;
+
+                while sample_point < interval_end && out.len() < k {
+                    let local_offset = (sample_point - current_pos) as usize;
+                    if local_offset < len {
+                        out.push(self.ppa[l + local_offset]);
                     }
+                    sample_point += step;
                 }
-                if right < r {
-                    out.push(self.ppa[right]);
-                    right += 1;
-                }
+
+                current_pos = interval_end;
+                interval_idx += 1;
             }
         }
 
         out.sort_unstable();
         out.dedup();
-        if out.len() > k {
-            out.truncate(k);
-        }
+        // Dedup might reduce count, but that's acceptable - we want distinct haplotypes
         out
     }
 

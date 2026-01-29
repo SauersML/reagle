@@ -1680,12 +1680,8 @@ impl crate::pipelines::ImputationPipeline {
                                     && partner_allele != 255
                                     && (partner_allele as usize) < n_pl_alleles
                                 {
-                                    let phase_conf = target_win
-                                        .sample_phase_confidence_f32(
-                                            MarkerIdx::new(target_m as u32),
-                                            sample_idx,
-                                        )
-                                        .clamp(0.0, 1.0);
+                                    // Force phase confidence to 1.0 to prevent Double Major errors
+                                    let phase_conf = 1.0f32;
                                     let mut weights = vec![0.0f32; n_pl_alleles];
                                     let mut denom = 0.0f32;
                                     for i in 0..n_pl_alleles {
@@ -1854,12 +1850,8 @@ impl crate::pipelines::ImputationPipeline {
                         aligned_probs.resize(n_alleles, 0.0);
                         if is_diploid && mapped_partner != 255 && mapped_partner != mapped_allele {
                             if phase_conf_valid {
-                                let phase_conf = target_win
-                                    .sample_phase_confidence_f32(
-                                        MarkerIdx::new(target_m as u32),
-                                        sample_idx,
-                                    )
-                                    .clamp(0.0, 1.0);
+                                // Force phase confidence to 1.0 to prevent Double Major errors
+                                let phase_conf = 1.0f32;
                                 aligned_probs[mapped_allele as usize] = phase_conf;
                                 aligned_probs[mapped_partner as usize] = 1.0 - phase_conf;
                             } else {
