@@ -2473,64 +2473,74 @@ impl crate::pipelines::ImputationPipeline {
         let error_rate = self.params.p_mismatch;
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
             let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
-            let pl = target_pl.sample_pl(target_m, sample_idx)?;
-            if !pl.is_empty() {
-                let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len())?;
-                if n_pl_alleles == 0 {
-                    return None;
-                }
-                let n_ref_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                let mapping = alignment
-                    .allele_mappings
-                    .get(target_m.as_usize())
-                    .and_then(|m| m.as_ref());
-                let mut target_gp: Vec<f32> = Vec::new();
-                let n = genotype_probs_from_pl(pl, None, &mut target_gp)?;
-                if n != n_pl_alleles {
-                    return None;
-                }
 
-                let mut ref_gp = vec![0.0f32; n_ref_alleles * (n_ref_alleles + 1) / 2];
-                let mut idx = 0usize;
-                for j in 0..n_pl_alleles {
-                    for i in 0..=j {
-                        let p = target_gp.get(idx).copied().unwrap_or(0.0);
-                        idx += 1;
-                        let ri: i8 = if let Some(mapping) = mapping {
-                            mapping.targ_to_ref.get(i).copied().unwrap_or(-1)
-                        } else if i <= i8::MAX as usize {
-                            i as i8
-                        } else {
-                            -1
-                        };
-                        let rj: i8 = if let Some(mapping) = mapping {
-                            mapping.targ_to_ref.get(j).copied().unwrap_or(-1)
-                        } else if j <= i8::MAX as usize {
-                            j as i8
-                        } else {
-                            -1
-                        };
-                        if ri < 0 || rj < 0 {
-                            continue;
+            // Only use PLs if error correction is enabled (config.err is set).
+            // If error correction is disabled, we prioritize the hard genotype (GT)
+            // to ensure output dosages match the input calls exactly.
+            if self.config.err.is_some() {
+                if let Some(pl) = target_pl.sample_pl(target_m, sample_idx) {
+                    if !pl.is_empty() {
+                        let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len())?;
+                        if n_pl_alleles == 0 {
+                            return None;
                         }
-                        let (ri, rj) = (ri as usize, rj as usize);
-                        if ri >= n_ref_alleles || rj >= n_ref_alleles {
-                            continue;
+                        let n_ref_alleles =
+                            ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                        let mapping = alignment
+                            .allele_mappings
+                            .get(target_m.as_usize())
+                            .and_then(|m| m.as_ref());
+                        let mut target_gp: Vec<f32> = Vec::new();
+                        let n = genotype_probs_from_pl(pl, None, &mut target_gp)?;
+                        if n != n_pl_alleles {
+                            return None;
                         }
-                        let ref_idx = genotype_index(ri, rj);
-                        if ref_idx < ref_gp.len() {
-                            ref_gp[ref_idx] += p;
+
+                        let mut ref_gp = vec![0.0f32; n_ref_alleles * (n_ref_alleles + 1) / 2];
+                        let mut idx = 0usize;
+                        for j in 0..n_pl_alleles {
+                            for i in 0..=j {
+                                let p = target_gp.get(idx).copied().unwrap_or(0.0);
+                                idx += 1;
+                                let ri: i8 = if let Some(mapping) = mapping {
+                                    mapping.targ_to_ref.get(i).copied().unwrap_or(-1)
+                                } else if i <= i8::MAX as usize {
+                                    i as i8
+                                } else {
+                                    -1
+                                };
+                                let rj: i8 = if let Some(mapping) = mapping {
+                                    mapping.targ_to_ref.get(j).copied().unwrap_or(-1)
+                                } else if j <= i8::MAX as usize {
+                                    j as i8
+                                } else {
+                                    -1
+                                };
+                                if ri < 0 || rj < 0 {
+                                    continue;
+                                }
+                                let (ri, rj) = (ri as usize, rj as usize);
+                                if ri >= n_ref_alleles || rj >= n_ref_alleles {
+                                    continue;
+                                }
+                                let ref_idx = genotype_index(ri, rj);
+                                if ref_idx < ref_gp.len() {
+                                    ref_gp[ref_idx] += p;
+                                }
+                            }
                         }
+                        if !normalize_probs(&mut ref_gp) {
+                            return None;
+                        }
+                        return Some(ref_gp);
                     }
                 }
-                if !normalize_probs(&mut ref_gp) {
-                    return None;
-                }
-                return Some(ref_gp);
             }
+
             // Soft fallback using hard GT with an error rate: avoids hard-calling
             // genotyped markers when PLs are missing or uninformative.
-            let n_ref_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+            let n_ref_alleles =
+                ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
             if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 let n_genotypes = n_ref_alleles * (n_ref_alleles + 1) / 2;
                 if n_genotypes == 0 {
@@ -2538,7 +2548,15 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 let mut gp = vec![0.0f32; n_genotypes];
                 let idx = genotype_index(a1 as usize, a2 as usize);
-                let err = error_rate.clamp(1e-6, 0.5);
+                // If error correction is disabled (config.err is None), use minimal error
+                // to strictly preserve the hard call, ignoring the estimated phasing error.
+                // If enabled, use the configured/estimated error rate.
+                let effective_err = if self.config.err.is_some() {
+                    error_rate
+                } else {
+                    1e-6
+                };
+                let err = effective_err.clamp(1e-6, 0.5);
                 let main = 1.0 - err;
                 if idx < gp.len() {
                     gp[idx] = main;
