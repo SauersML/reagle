@@ -51,8 +51,8 @@ impl ModelParams {
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
     /// Maximum recombination intensity
-    /// Matches Java Beagle 5.5 MAX_RECOMB_INTENSITY
-    pub const MAX_RECOMB_INTENSITY: f32 = 60.0;
+    /// Matches Java Beagle 5.5 MAX_RECOMB_INTENSITY (60.0 per Morgan = 0.6 per cM)
+    pub const MAX_RECOMB_INTENSITY: f32 = 0.6;
 
     /// Create default parameters
     pub fn new() -> Self {
@@ -256,8 +256,8 @@ impl ParamEstimates {
             return None;
         }
         // sum_gen_dist is in cM (accumulated in add_switch).
-        // Returns switches per Morgan (so we multiply switches/cM by 100).
-        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
+        // Returns switches per cM (consistent with p_recomb using cM directly).
+        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
     }
 
     /// Estimate mismatch probability
