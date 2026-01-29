@@ -1324,7 +1324,6 @@ impl crate::pipelines::ImputationPipeline {
         let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
         // NOTE: imputation uses its own mismatch prior; we do not carry phasing error rates.
-        let mut phased_recomb_intensity: Option<f32> = None;
         if !is_vcf_fully_phased(&phased_target_path)? {
             eprintln!("Target is unphased; running phasing before pre-scan...");
             let tmpdir = tempfile::tempdir()?;
@@ -1333,12 +1332,17 @@ impl crate::pipelines::ImputationPipeline {
             phase_config.gt = input_target_path.clone();
             phase_config.r#ref = Some(ref_path.to_path_buf());
             phase_config.out = phased_prefix.clone();
+            // Disable EM parameter updates during internal phasing for imputation.
+            // Phasing sparse data can underestimate recombination intensity (e.g. dropping to ~18),
+            // leading to "Perfect LD Traps" where the HMM gets stuck in the wrong phase.
+            // Using fixed parameters derived from Ne (default ~100) forces enough recombination
+            // to switch away from incorrect haplotypes.
+            phase_config.em = false;
             let mut phasing = crate::pipelines::phasing::PhasingPipeline::new(
                 phase_config,
                 self.telemetry.clone(),
             );
             phasing.run()?;
-            phased_recomb_intensity = Some(phasing.params().recomb_intensity);
             phased_target_path = phased_prefix.with_extension("vcf.gz");
             phased_tmp = Some(tmpdir);
         } else {
@@ -1445,11 +1449,6 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
-        if let Some(recomb_intensity) = phased_recomb_intensity {
-            if recomb_intensity.is_finite() && recomb_intensity > 0.0 {
-                self.params.recomb_intensity = recomb_intensity;
-            }
-        }
         // Do not inherit phasing mismatch estimates for imputation. Imputation
         // should use the Li-Stephens mismatch prior (or user override) tied to
         // the reference panel, not phasing-specific error rates.
