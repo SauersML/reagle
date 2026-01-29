@@ -1204,6 +1204,7 @@ impl crate::pipelines::ImputationPipeline {
         let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
         let mut phased_p_mismatch: Option<f32> = None;
+        let mut phased_recomb_intensity: Option<f32> = None;
         if !is_vcf_fully_phased(&phased_target_path)? {
             eprintln!("Target is unphased; running phasing before pre-scan...");
             let tmpdir = tempfile::tempdir()?;
@@ -1218,6 +1219,7 @@ impl crate::pipelines::ImputationPipeline {
             );
             phasing.run()?;
             phased_p_mismatch = Some(phasing.params().p_mismatch);
+            phased_recomb_intensity = Some(phasing.params().recomb_intensity);
             phased_target_path = phased_prefix.with_extension("vcf.gz");
             phased_tmp = Some(tmpdir);
         }
@@ -1315,6 +1317,11 @@ impl crate::pipelines::ImputationPipeline {
         if let Some(p_mismatch) = phased_p_mismatch {
             if p_mismatch.is_finite() && p_mismatch > 0.0 {
                 self.params.p_mismatch = p_mismatch;
+            }
+        }
+        if let Some(recomb_intensity) = phased_recomb_intensity {
+            if recomb_intensity.is_finite() && recomb_intensity > 0.0 {
+                self.params.recomb_intensity = recomb_intensity;
             }
         }
         self.params

@@ -137,7 +137,9 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        // Convert cM to Morgans
+        let dist_morgan = gen_dist_cm / 100.0;
+        let p = (-f64::exp_m1(c * dist_morgan)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
@@ -240,7 +242,9 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // sum_gen_dist is in cM, but we want intensity in switches per Morgan.
+        // intensity = switches / (cM / 100) = switches / cM * 100
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability
@@ -343,6 +347,29 @@ mod tests {
         // Larger distance -> higher prob
         let p2 = params.p_recomb(0.01);
         assert!(p2 > p1);
+    }
+
+    #[test]
+    fn test_p_recomb_units() {
+        let mut params = ModelParams::new();
+        // Set intensity to 100 switches per Morgan
+        params.recomb_intensity = 100.0;
+
+        // At 1 cM (0.01 Morgan), expected switches = 100 * 0.01 = 1.0
+        // Probability = 1 - exp(-1.0) = 1 - 0.3678 = 0.6321
+        let p = params.p_recomb(1.0); // 1.0 cM
+        assert!((p - 0.6321).abs() < 0.001, "Expected ~0.6321, got {}", p);
+    }
+
+    #[test]
+    fn test_recomb_intensity_estimation_units() {
+        let mut est = ParamEstimates::new();
+        // Add 1 switch in 100 cM (1 Morgan)
+        est.add_switch(100.0, 1.0);
+
+        // Estimated intensity should be 1 switch per Morgan = 1.0
+        let intensity = est.recomb_intensity().unwrap();
+        assert!((intensity - 1.0).abs() < 0.001, "Expected 1.0, got {}", intensity);
     }
 
     #[test]
