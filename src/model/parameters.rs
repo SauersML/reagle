@@ -50,6 +50,12 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
+    /// Maximum mismatch probability (strict cap to prevent Perfect LD traps)
+    pub const MAX_MISMATCH_PROB: f32 = 0.0001;
+
+    /// Maximum recombination intensity
+    pub const MAX_RECOMB_INTENSITY: f32 = 200.0;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -158,7 +164,7 @@ impl ModelParams {
     pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
         if let Some(r) = new_intensity {
             if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
+                self.recomb_intensity = r.min(Self::MAX_RECOMB_INTENSITY);
             }
         }
     }
