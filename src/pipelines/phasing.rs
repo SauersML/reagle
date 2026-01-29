@@ -111,6 +111,46 @@ fn stage1_block_cm(gen_positions: &[f64]) -> f64 {
 }
 
 fn available_memory_bytes() -> Option<u64> {
+    fn read_cgroup_limit_bytes() -> Option<u64> {
+        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
+        if let Some(s) = v2 {
+            let t = s.trim();
+            if t != "max" {
+                if let Ok(v) = t.parse::<u64>() {
+                    if v > 0 && v < (1u64 << 60) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok();
+        if let Some(s) = v1 {
+            let t = s.trim();
+            if let Ok(v) = t.parse::<u64>() {
+                if v > 0 && v < (1u64 << 60) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    fn read_cgroup_available_bytes(limit: u64) -> Option<u64> {
+        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok();
+        if let Some(s) = v2 {
+            if let Ok(cur) = s.trim().parse::<u64>() {
+                return Some(limit.saturating_sub(cur));
+            }
+        }
+        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes").ok();
+        if let Some(s) = v1 {
+            if let Ok(cur) = s.trim().parse::<u64>() {
+                return Some(limit.saturating_sub(cur));
+            }
+        }
+        None
+    }
+
     let mut sys = System::new();
     sys.refresh_memory();
     let mut avail_bytes = sys.available_memory();
@@ -125,6 +165,17 @@ fn available_memory_bytes() -> Option<u64> {
             total_bytes = scaled_total;
         }
     }
+    if let Some(limit) = read_cgroup_limit_bytes() {
+        if limit > 0 {
+            total_bytes = total_bytes.min(limit);
+            if let Some(avail) = read_cgroup_available_bytes(limit) {
+                avail_bytes = avail_bytes.min(avail);
+            } else {
+                avail_bytes = avail_bytes.min(limit);
+            }
+        }
+    }
+
     if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
         return Some(avail_bytes);
     }
@@ -2180,9 +2231,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 selected.retain(|h| h / 2 != s);
             }
             if selected.is_empty() {
-                return Err(crate::error::ReagleError::vcf(
-                    "Phasing pre-scan produced empty state set".to_string(),
-                ));
+                let fallback_cap = per_window_cap.min(n_ref_haps.max(1)).max(1);
+                let mut fallback: Vec<usize> = (0..fallback_cap).collect();
+                if ref_gt.is_none() {
+                    fallback.retain(|h| h / 2 != s);
+                }
+                if fallback.is_empty() {
+                    fallback.push(0);
+                }
+                selected = fallback;
             }
 
             let mut th = crate::model::states::ThreadedHaps::new(
@@ -2619,65 +2676,90 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
             let prior_paths = &mcmc_paths[..];
             let telemetry = self.telemetry.clone();
+            let block_starts: Arc<[usize]> = if use_dynamic_mcmc {
+                Arc::from([])
+            } else {
+                blocks_to_starts(stage1_blocks, n_hi_freq)
+                    .into_boxed_slice()
+                    .into()
+            };
             let sample_iter = || {
                 sample_phases.par_iter().enumerate().map(|(s, sp)| {
-                    let n_hi_freq = hi_freq_to_orig.len();
+                    THREAD_WORKSPACE.with(|ws| {
+                        let mut workspace = ws.borrow_mut();
+                        if workspace.is_none() {
+                            *workspace =
+                                Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
+                        }
+                        let ws = workspace.as_mut().unwrap();
+                        ws.clear();
 
-                    let threaded_haps = &threaded_haps_vec[s];
-                    let n_states = threaded_haps.n_states();
+                        let n_hi_freq = hi_freq_to_orig.len();
+                        let threaded_haps = &threaded_haps_vec[s];
+                        let n_states = threaded_haps.n_states();
 
-                    // Extract alleles from SamplePhase for SUBSET of markers
-                    let seq1: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele1(m)).collect();
-                    let seq2: Vec<u8> = hi_freq_to_orig.iter().map(|&m| sp.allele2(m)).collect();
-                    let sample_conf: Vec<f32> =
-                        hi_freq_to_orig.iter().map(|&m| sp.confidence(m)).collect();
-                    let sample_seed = (self.config.seed as u64)
-                        .wrapping_add(s as u64)
-                        .wrapping_add((iteration as u64) << 32)
-                        .wrapping_add(0xFEED_FACE_1234u64);
+                        // Extract alleles/confidence for SUBSET of markers using reused buffers
+                        ws.seq1.clear();
+                        ws.seq2.clear();
+                        ws.sample_conf.clear();
+                        ws.seq1.reserve(n_hi_freq);
+                        ws.seq2.reserve(n_hi_freq);
+                        ws.sample_conf.reserve(n_hi_freq);
+                        for &m in hi_freq_to_orig {
+                            ws.seq1.push(sp.allele1(m));
+                            ws.seq2.push(sp.allele2(m));
+                            ws.sample_conf.push(sp.confidence(m));
+                        }
+                        let seq1 = std::mem::take(&mut ws.seq1);
+                        let seq2 = std::mem::take(&mut ws.seq2);
+                        let sample_conf = std::mem::take(&mut ws.sample_conf);
 
-                    // Collect EM statistics if requested
-                    if let Some(atomic) = atomic_estimates {
-                        let hmm = MosaicHmm::new(
-                            subset_view,
-                            &self.params,
-                            n_states,
-                            stage1_p_recomb.to_vec(),
-                        );
-                        let mut local_est = crate::model::parameters::ParamEstimates::new();
-                        hmm.collect_stats(&seq1, &threaded_haps, stage1_gen_dists, &mut local_est);
-                        hmm.collect_stats(&seq2, &threaded_haps, stage1_gen_dists, &mut local_est);
-                        atomic.add_estimation_data(&local_est);
-                    }
+                        let sample_seed = (self.config.seed as u64)
+                            .wrapping_add(s as u64)
+                            .wrapping_add((iteration as u64) << 32)
+                            .wrapping_add(0xFEED_FACE_1234u64);
 
-                    // Identify UNPHASED heterozygote positions in hi-freq marker space
-                    let het_positions: Vec<usize> = (0..n_hi_freq)
-                        .filter(|&i| {
+                        // Collect EM statistics if requested
+                        if let Some(atomic) = atomic_estimates {
+                            let hmm = MosaicHmm::new(
+                                subset_view,
+                                &self.params,
+                                n_states,
+                                stage1_p_recomb.to_vec(),
+                            );
+                            let mut local_est = crate::model::parameters::ParamEstimates::new();
+                            hmm.collect_stats(&seq1, &threaded_haps, stage1_gen_dists, &mut local_est);
+                            hmm.collect_stats(&seq2, &threaded_haps, stage1_gen_dists, &mut local_est);
+                            atomic.add_estimation_data(&local_est);
+                        }
+
+                        // Identify UNPHASED heterozygote positions in hi-freq marker space
+                        ws.het_positions.clear();
+                        for i in 0..n_hi_freq {
                             let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
                             let a2 = seq2[i];
-                            a1 != 255 && a2 != 255 && a1 != a2 && sp.is_unphased(m)
-                        })
-                        .collect();
-
-                    if het_positions.is_empty() {
-                        // No hets to phase: no swaps needed, no LR values
-                        return (vec![false; n_hi_freq], Vec::new(), Vec::new(), None);
-                    }
-
-                    let p_err = self.params.p_mismatch;
-                    let p_no_err = 1.0 - p_err;
-
-                    let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
-                        // SHAPEIT5-style dynamic MCMC: re-select states each step
-                        let (swap_bits, swap_lr, swap_probs, new_paths) = THREAD_WORKSPACE.with(|ws| {
-                            let mut workspace = ws.borrow_mut();
-                            if workspace.is_none() {
-                                *workspace =
-                                    Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
+                            if a1 != 255 && a2 != 255 && a1 != a2 && sp.is_unphased(m) {
+                                ws.het_positions.push(i);
                             }
-                            let ws = workspace.as_mut().unwrap();
-                            if self.config.profile {
+                        }
+                        let het_positions = std::mem::take(&mut ws.het_positions);
+
+                        if het_positions.is_empty() {
+                            // No hets to phase: no swaps needed, no LR values
+                            ws.seq1 = seq1;
+                            ws.seq2 = seq2;
+                            ws.sample_conf = sample_conf;
+                            ws.het_positions = het_positions;
+                            return (vec![false; n_hi_freq], Vec::new(), Vec::new(), None);
+                        }
+
+                        let p_err = self.params.p_mismatch;
+                        let p_no_err = 1.0 - p_err;
+
+                        let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
+                            // SHAPEIT5-style dynamic MCMC: re-select states each step
+                            let (swap_bits, swap_lr, swap_probs, new_paths) = if self.config.profile {
                                 info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
                                     sample_dynamic_mcmc(
                                         n_hi_freq,
@@ -2717,19 +2799,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     prior_paths.get(s).and_then(|p| p.as_ref()),
                                     ws,
                                 )
-                            }
-                        });
-                        (swap_bits, swap_lr, swap_probs, Some(new_paths))
-                    } else {
-                        // Classic Beagle-style: static state space MCMC with thread-local workspace
-                        THREAD_WORKSPACE.with(|ws| {
-                            let mut workspace = ws.borrow_mut();
-                            if workspace.is_none() {
-                                *workspace =
-                                    Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
-                            }
-                            let ws = workspace.as_mut().unwrap();
-                            ws.clear(); // Explicit reset between samples
+                            };
+                            (swap_bits, swap_lr, swap_probs, Some(new_paths))
+                        } else {
+                            // Classic Beagle-style: static state space MCMC with thread-local workspace
                             let lookup = if self.config.profile {
                                 info_span!("prep_allele_lookup", sample = s).in_scope(|| {
                                     RefAlleleLookup::new_from_threaded_with_buffer(
@@ -2761,10 +2834,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 )
                             };
 
-                            let block_starts: Arc<[usize]> =
-                                blocks_to_starts(stage1_blocks, n_hi_freq)
-                                    .into_boxed_slice()
-                                    .into();
+                            let block_starts = block_starts.clone();
                             let result = if self.config.profile {
                                 info_span!("run_mcmc_math", sample = s).in_scope(|| {
                                     sample_swap_bits_mosaic(
@@ -2780,7 +2850,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                             sample: s,
                                             subset_to_orig: Some(hi_freq_to_orig),
                                         }),
-                                        block_starts.clone(),
+                                        block_starts,
                                         &het_positions,
                                         prior_paths.get(s).and_then(|p| p.as_ref()),
                                         sample_seed,
@@ -2818,50 +2888,55 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             };
                             ws.lookup = lookup.into_buffer();
                             (result.0, result.1, result.2, Some(result.3))
-                        })
-                    };
+                        };
 
-                    let mut swap_mask = vec![false; n_hi_freq];
-                    let mut current_phase = 0u8;
-                    let mut phase_idx = 0usize;
-                    for i in 0..n_hi_freq {
-                        let m = hi_freq_to_orig[i];
-                        let a1 = seq1[i];
-                        let a2 = seq2[i];
-                        let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-                        let is_phased_het = is_het && !sp.is_unphased(m);
+                        let mut swap_mask = vec![false; n_hi_freq];
+                        let mut current_phase = 0u8;
+                        let mut phase_idx = 0usize;
+                        for i in 0..n_hi_freq {
+                            let m = hi_freq_to_orig[i];
+                            let a1 = seq1[i];
+                            let a2 = seq2[i];
+                            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                            let is_phased_het = is_het && !sp.is_unphased(m);
 
-                        // Phased heterozygotes are anchors: do not swap them and
-                        // do not propagate swap state across them.
-                        if is_phased_het {
-                            swap_mask[i] = false;
-                            current_phase = 0;
-                            continue;
+                            // Phased heterozygotes are anchors: do not swap them and
+                            // do not propagate swap state across them.
+                            if is_phased_het {
+                                swap_mask[i] = false;
+                                current_phase = 0;
+                                continue;
+                            }
+
+                            if phase_idx < het_positions.len() && het_positions[phase_idx] == i {
+                                current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
+                                phase_idx += 1;
+                            }
+                            swap_mask[i] = current_phase == 1;
                         }
 
-                        if phase_idx < het_positions.len() && het_positions[phase_idx] == i {
-                            current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
-                            phase_idx += 1;
+                        let het_lr_values: Vec<(usize, f32)> = het_positions
+                            .iter()
+                            .copied()
+                            .zip(swap_lr.into_iter())
+                            .collect();
+                        let het_phase_values: Vec<(usize, f32)> = het_positions
+                            .iter()
+                            .copied()
+                            .zip(swap_probs.into_iter())
+                            .collect();
+
+                        ws.seq1 = seq1;
+                        ws.seq2 = seq2;
+                        ws.sample_conf = sample_conf;
+                        ws.het_positions = het_positions;
+
+                        if let Some(bb) = telemetry.as_ref() {
+                            bb.add_samples(1);
                         }
-                        swap_mask[i] = current_phase == 1;
-                    }
 
-                    let het_lr_values: Vec<(usize, f32)> = het_positions
-                        .iter()
-                        .copied()
-                        .zip(swap_lr.into_iter())
-                        .collect();
-                    let het_phase_values: Vec<(usize, f32)> = het_positions
-                        .iter()
-                        .copied()
-                        .zip(swap_probs.into_iter())
-                        .collect();
-
-                    if let Some(bb) = telemetry.as_ref() {
-                        bb.add_samples(1);
-                    }
-
-                    (swap_mask, het_lr_values, het_phase_values, new_paths)
+                        (swap_mask, het_lr_values, het_phase_values, new_paths)
+                    })
                 })
             };
 
@@ -5159,6 +5234,12 @@ fn sample_dynamic_mcmc(
         hap1_idx: u32,
         rng: &mut impl rand::Rng,
     ) {
+        // If there are no other haplotypes to sample from, bail out to avoid an infinite loop.
+        if n_haps <= 2 {
+            neighbors.clear();
+            return;
+        }
+
         let target = n_states.min((n_haps.saturating_sub(2)) as usize).max(1);
         if neighbors.len() > target {
             neighbors.truncate(target);
@@ -5172,6 +5253,10 @@ fn sample_dynamic_mcmc(
             if !neighbors.contains(&h) {
                 neighbors.push(h);
             }
+        }
+
+        if neighbors.is_empty() {
+            return;
         }
 
         let mix_count = (target / 10).max(4).min(target);
@@ -5449,20 +5534,24 @@ fn sample_dynamic_mcmc(
 /// This breaks the symmetry of the Combined HMM initialization (which cannot distinguish
 /// between phasing configurations at 0/1 sites) and helps the Gibbs sampler escape
 /// "Mosaic Traps" where H1 and H2 lock each other into high-switching local optima.
-fn find_best_constant_pair(
+fn find_best_constant_pair_with_buffer(
     n_markers: usize,
     n_states: usize,
     seq1: &[u8],
     seq2: &[u8],
     lookup: &RefAlleleLookup,
+    scores: &mut Vec<f32>,
 ) -> Option<MosaicPaths> {
     if n_states < 2 {
         return None;
     }
 
-    // Allocate score matrix (flat vector) on heap to avoid stack overflow
-    // Size is n_states * n_states. For 280 states -> ~300KB.
-    let mut scores = vec![0.0f32; n_states * n_states];
+    let need = n_states * n_states;
+    if scores.len() < need {
+        scores.resize(need, 0.0);
+    } else {
+        scores[..need].fill(0.0);
+    }
 
     for m in 0..n_markers {
         let a1 = seq1[m];
@@ -5582,7 +5671,14 @@ fn sample_swap_bits_mosaic(
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     // Attempt pairwise initialization if no initial paths provided
     let heuristic_paths = if initial_paths.is_none() {
-        find_best_constant_pair(n_markers, n_states, seq1, seq2, lookup)
+        find_best_constant_pair_with_buffer(
+            n_markers,
+            n_states,
+            seq1,
+            seq2,
+            lookup,
+            &mut workspace.scores,
+        )
     } else {
         None
     };
@@ -5594,9 +5690,18 @@ fn sample_swap_bits_mosaic(
         FwdCheckpoints::from_buffer(block_starts.clone(), n_states, combined_data);
 
     if start_paths.is_none() {
-        let dummy_target = vec![255u8; n_markers];
-        let dummy_partner = vec![255u8; n_markers];
-        let dummy_combined = vec![true; n_markers];
+        if workspace.dummy_target.len() < n_markers {
+            workspace.dummy_target.resize(n_markers, 255);
+            workspace.dummy_partner.resize(n_markers, 255);
+            workspace.dummy_combined.resize(n_markers, true);
+        } else {
+            workspace.dummy_target[..n_markers].fill(255);
+            workspace.dummy_partner[..n_markers].fill(255);
+            workspace.dummy_combined[..n_markers].fill(true);
+        }
+        let dummy_target = &workspace.dummy_target[..n_markers];
+        let dummy_partner = &workspace.dummy_partner[..n_markers];
+        let dummy_combined = &workspace.dummy_combined[..n_markers];
         let fwd = &mut workspace.fwd[..n_states];
         let fwd_prior = &mut workspace.fwd_prior[..n_states];
         let ref_alleles = &mut workspace.ref_alleles[..n_states];
@@ -5692,9 +5797,18 @@ fn sample_swap_bits_mosaic(
     }
 
     let lr_samples = lr_samples_param.max(1);
-    let mut swap_counts = vec![0u32; het_positions.len()];
-    let mut obs_counts = vec![0u32; het_positions.len()];
-    let mut last_orients = vec![0u8; het_positions.len()];
+    if workspace.swap_counts.len() < het_positions.len() {
+        workspace.swap_counts.resize(het_positions.len(), 0);
+        workspace.obs_counts.resize(het_positions.len(), 0);
+        workspace.last_orients.resize(het_positions.len(), 0);
+    } else {
+        workspace.swap_counts[..het_positions.len()].fill(0);
+        workspace.obs_counts[..het_positions.len()].fill(0);
+        workspace.last_orients[..het_positions.len()].fill(0);
+    }
+    let swap_counts = &mut workspace.swap_counts[..het_positions.len()];
+    let obs_counts = &mut workspace.obs_counts[..het_positions.len()];
+    let last_orients = &mut workspace.last_orients[..het_positions.len()];
     let mut new_paths = MosaicPaths {
         path1: Vec::new(),
         path2: Vec::new(),
@@ -6708,7 +6822,16 @@ mod tests {
         let seq1 = vec![0, 0, 0];
         let seq2 = vec![1, 1, 1];
 
-        let paths = find_best_constant_pair(n_markers, n_states, &seq1, &seq2, &lookup).unwrap();
+        let mut scores = Vec::new();
+        let paths = find_best_constant_pair_with_buffer(
+            n_markers,
+            n_states,
+            &seq1,
+            &seq2,
+            &lookup,
+            &mut scores,
+        )
+        .unwrap();
 
         // Best pair should be (0, 1) or (1, 0) - Score 3.
         // Or (2, 3) / (3, 2).
