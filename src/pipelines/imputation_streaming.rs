@@ -2832,6 +2832,7 @@ mod tests {
             Some(&ref_genotypes),
             &ref_allele_freqs,
             &target_win,
+            None,
             &alignment,
             &mut writer,
             &mut quality,
