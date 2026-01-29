@@ -157,7 +157,9 @@ impl ModelParams {
     /// Only update if new value is valid and greater than current
     pub fn update_p_mismatch(&mut self, new_p: f32) {
         if new_p.is_finite() && new_p > self.p_mismatch && new_p < 0.5 {
-            self.p_mismatch = new_p;
+            // Strictly clamp to MAX_MISMATCH_PROB to prevent "Perfect LD Trap"
+            // where the model learns to tolerate mismatches instead of switching.
+            self.p_mismatch = new_p.min(Self::MAX_MISMATCH_PROB);
         }
     }
 
@@ -168,6 +170,7 @@ impl ModelParams {
     pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
         if let Some(r) = new_intensity {
             if r.is_finite() && r > 0.0 {
+                // Clamp to prevent parameter explosion in small/sparse datasets
                 self.recomb_intensity = r.min(Self::MAX_RECOMB_INTENSITY);
             }
         }
@@ -408,5 +411,21 @@ mod tests {
         let mut p2 = ModelParams::new();
         p2.update_recomb_intensity(Some(100.0));
         assert_eq!(p2.recomb_intensity, ModelParams::MAX_RECOMB_INTENSITY);
+    }
+
+    #[test]
+    fn test_update_clamping() {
+        let mut params = ModelParams::new();
+        params.p_mismatch = 0.00001; // Start small
+
+        // Update with large value -> should clamp to MAX_MISMATCH_PROB (0.0001)
+        params.update_p_mismatch(0.01);
+        assert_eq!(params.p_mismatch, ModelParams::MAX_MISMATCH_PROB);
+
+        // Update with small value -> should update normally if > current
+        let mut params2 = ModelParams::new();
+        params2.p_mismatch = 0.00001;
+        params2.update_p_mismatch(0.00005);
+        assert_eq!(params2.p_mismatch, 0.00005);
     }
 }

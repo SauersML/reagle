@@ -28,7 +28,7 @@ def run_benchmark(person, file_path, format):
     run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--gt", "target.vcf.gz", "--out", "reagle_out", "--chrom", "chr22"])
 
     # 3. Run Beagle
-    print("=== Running Beagle ===")
+    print("=== Running Beagle (Fixed) ===")
     # Reference panels used for Beagle imputation must be fully phased and contain no missing data.
     # We create a derivative panel that fills missing calls with homozygous reference and forces phased separators.
     # The original ref.vcf.gz is preserved for Reagle to ensure no loss of data in the primary pipeline.
