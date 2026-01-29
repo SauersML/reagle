@@ -73,6 +73,7 @@ pub struct ReferencePbwt {
     prefix_counts: Vec<u32>,
     counts: Vec<u32>,
     offsets: Vec<u32>,
+    inv_ppa: Vec<u32>,
 }
 
 impl ReferencePbwt {
@@ -85,6 +86,7 @@ impl ReferencePbwt {
             prefix_counts: Vec::new(),
             counts: Vec::new(),
             offsets: Vec::new(),
+            inv_ppa: (0..n_ref_haps as u32).collect(),
         }
     }
 
@@ -94,9 +96,21 @@ impl ReferencePbwt {
             if state.ppa.len() == n_ref_haps && state.div.len() == n_ref_haps {
                 pbwt.ppa = state.ppa.clone();
                 pbwt.div = state.div.clone();
+                pbwt.update_inv_ppa();
             }
         }
         pbwt
+    }
+
+    fn update_inv_ppa(&mut self) {
+        if self.inv_ppa.len() != self.ppa.len() {
+            self.inv_ppa.resize(self.ppa.len(), 0);
+        }
+        for (i, &hap) in self.ppa.iter().enumerate() {
+            if (hap as usize) < self.inv_ppa.len() {
+                self.inv_ppa[hap as usize] = i as u32;
+            }
+        }
     }
 
     pub fn get_state(&self, marker_pos: usize) -> PbwtState {
@@ -377,6 +391,7 @@ impl ReferencePbwt {
     pub fn finalize_step(&mut self, ref_alleles: &[u8], n_alleles: usize, marker: usize) {
         self.updater
             .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
+        self.update_inv_ppa();
     }
 
     pub fn advance_with_rephase(
@@ -387,6 +402,7 @@ impl ReferencePbwt {
         query_alleles: &mut [u8],
         beams: &mut [RankBeam],
         swaps_out: &mut [bool],
+        hints: Option<&[u32]>,
     ) {
         self.prepare_step(ref_alleles, n_alleles);
 
@@ -415,16 +431,87 @@ impl ReferencePbwt {
                 // Smoothed Consistency Scoring: len / (count + 1)
                 // This balances maximizing match length with preferring unique/rare haplotypes (high consistency),
                 // but avoids over-penalizing common haplotypes by adding +1 smoothing.
-                let score_keep =
+                // Smoothed Consistency Scoring: len / (count + 1)
+                // This balances maximizing match length with preferring unique/rare haplotypes (high consistency),
+                // but avoids over-penalizing common haplotypes by adding +1 smoothing.
+                let mut score_keep =
                     ((len_keep_h1 as f32) / (count_a1 + 1.0)) * ((len_keep_h2 as f32) / (count_a2 + 1.0));
 
                 let len_swap_h1 = self.match_len(&beams[h1], a2, n_alleles);
                 let len_swap_h2 = self.match_len(&beams[h2], a1, n_alleles);
 
                 // For swap: h1 gets a2 (so we use count_a2), h2 gets a1 (so we use count_a1)
-                let score_swap =
+                let mut score_swap =
                     ((len_swap_h1 as f32) / (count_a2 + 1.0)) * ((len_swap_h2 as f32) / (count_a1 + 1.0));
 
+                if let Some(hints_vec) = hints {
+                    // Boost scores if the hint haplotype is compatible and present in the beam
+                    let boost = 1000.0;
+                    
+                    // Check H1 hint
+                    if h1 < hints_vec.len() {
+                        let h_hint = hints_vec[h1] as usize;
+                        if h_hint < self.inv_ppa.len() {
+                            let rank = self.inv_ppa[h_hint];
+                            let ref_al = self.permuted_ref[self.inv_ppa[h_hint] as usize]; 
+                            // Note: permuted_ref stores alleles in PPA order. 
+                            // ref_alleles passed to this function are in Hap order.
+                            // Better use ref_alleles directly if available, but they are permuted inside prepare_step.
+                            // Wait, ref_alleles passed to advance_with_rephase are NOT permuted yet?
+                            // prepare_step fills self.permuted_ref from ref_alleles[ppa[i]].
+                            // So self.permuted_ref[rank] is the allele for the haplotype at rank .
+                            // Since rank = inv_ppa[h_hint], the haplotype at rank is .
+                            // So self.permuted_ref[rank] IS the allele of .
+                            
+                            let hint_allele = self.permuted_ref[rank as usize];
+                            
+                            // Check if hint is in beam[h1]
+                            // Beams are intervals of ranks.
+                            let mut in_beam = false;
+                            for &(l, r) in beams[h1].intervals() {
+                                if rank >= l && rank < r {
+                                    in_beam = true;
+                                    break;
+                                }
+                            }
+                            
+                            if in_beam {
+                                if hint_allele == a1 {
+                                    score_keep += boost;
+                                } else if hint_allele == a2 {
+                                    score_swap += boost;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Check H2 hint
+                    if h2 < hints_vec.len() {
+                        let h_hint = hints_vec[h2] as usize;
+                        if h_hint < self.inv_ppa.len() {
+                            let rank = self.inv_ppa[h_hint];
+                            let hint_allele = self.permuted_ref[rank as usize];
+                            
+                            let mut in_beam = false;
+                            for &(l, r) in beams[h2].intervals() {
+                                if rank >= l && rank < r {
+                                    in_beam = true;
+                                    break;
+                                }
+                            }
+                            
+                            if in_beam {
+                                if hint_allele == a2 {
+                                    score_keep += boost;
+                                } else if hint_allele == a1 {
+                                    score_swap += boost;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if score_swap > score_keep {
                 if score_swap > score_keep {
                     query_alleles[h1] = a2;
                     query_alleles[h2] = a1;
