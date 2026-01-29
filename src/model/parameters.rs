@@ -50,6 +50,12 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
+    /// Maximum recombination intensity to prevent parameter explosion
+    pub const MAX_RECOMB_INTENSITY: f32 = 60.0;
+
+    /// Maximum mismatch probability to force strict matching in sparse data
+    pub const MAX_MISMATCH_PROB: f32 = 0.0001;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -72,8 +78,11 @@ impl ModelParams {
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
         let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = recomb_intensity.min(Self::MAX_RECOMB_INTENSITY);
 
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
+        // Default to MAX_MISMATCH_PROB (0.0001) instead of Li-Stephens to force
+        // strict matching in sparse data, aiding resolution of 'Isolated Marker Traps'.
+        let p_mismatch = err.unwrap_or(Self::MAX_MISMATCH_PROB);
 
         Self {
             p_mismatch,
@@ -96,6 +105,7 @@ impl ModelParams {
     /// ```
     ///
     /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
+    #[cfg(test)]
     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
         if n_haps <= 1 {
             return 0.0001;
