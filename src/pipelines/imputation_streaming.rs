@@ -2474,10 +2474,17 @@ impl crate::pipelines::ImputationPipeline {
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
             let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
 
-            // Only use PLs if error correction is enabled (config.err is set).
-            // If error correction is disabled, we prioritize the hard genotype (GT)
-            // to ensure output dosages match the input calls exactly.
-            if self.config.err.is_some() {
+            // Determine if we should prioritize hard genotype calls.
+            // If config.err is None, we generally want to preserve GT.
+            // However, if GT is missing (./.), we should still use PLs if available.
+            // The previous logic was too strict, blocking PLs even for imputed markers
+            // if they had a target marker mapping (which happens if they are in the target VCF
+            // but potentially missing/./.).
+
+            let has_hard_gt = get_genotyped_alleles(marker_idx, sample_idx).is_some();
+            let force_hard_call = self.config.err.is_none() && has_hard_gt;
+
+            if !force_hard_call {
                 if let Some(pl) = target_pl.sample_pl(target_m, sample_idx) {
                     if !pl.is_empty() {
                         let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len())?;
