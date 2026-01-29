@@ -1278,7 +1278,8 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let mut ref_reader = open_ref_reader(ref_path)?;
-        let target_path_for_impute = if target_was_unphased && full_panel {
+        let target_was_unphased_for_impute = !is_vcf_fully_phased(&input_target_path)?;
+        let target_path_for_impute = if target_was_unphased_for_impute && full_panel {
             // For full-panel imputation on originally unphased targets, prefer
             // the unphased genotypes to preserve marginal genotype likelihoods.
             input_target_path.clone()
