@@ -286,7 +286,13 @@ pub fn run_impute_hmm(
         // Compute posteriors using beta at time t (current ws.bwd), before updating
         // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
         let mut allele_probs: Vec<f32> = Vec::new();
-        let n_alleles = probs.len();
+        let n_alleles = if !probs.is_empty() {
+            probs.len()
+        } else if m_rev < ref_allele_freqs.len() {
+            ref_allele_freqs[m_rev].len()
+        } else {
+            0
+        };
         if n_alleles > 0 {
             allele_probs.resize(n_alleles, 0.0f32);
             let mut total = 0.0f32;

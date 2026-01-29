@@ -328,12 +328,28 @@ jobs:
         working-directory: .
         run: python3 tests/integration_test.py metrics
 
+      - name: Install plotting dependencies
+        run: python3 -m pip install --quiet matplotlib
+
+      - name: Generate plots
+        working-directory: .
+        run: python3 tests/plot_metrics.py
+
       - name: Upload metrics
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: imputation-metrics
-          path: tests/data/*_metrics.txt
+          path: |
+            tests/data/*_metrics.txt
+            tests/data/*_metrics.json
+
+      - name: Upload plots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: imputation-plots
+          path: tests/data/plots/*.png
           retention-days: 30
 
   # Job 5b: Calculate metrics (5% of chr22)

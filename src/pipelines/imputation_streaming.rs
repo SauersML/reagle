@@ -78,13 +78,25 @@ fn available_memory_bytes() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
     // sysinfo reports memory values in bytes.
-    let avail_bytes = sys.available_memory();
+    let mut avail_bytes = sys.available_memory();
+    let mut total_bytes = sys.total_memory();
+    // Some sysinfo versions report memory in KiB. Detect and normalize.
+    // Heuristic: if total < 1 GiB but total*1024 looks like a plausible RAM size,
+    // treat the values as KiB. This avoids collapsing available memory to ~0.
+    if total_bytes > 0 {
+        let scaled_total = total_bytes.saturating_mul(1024);
+        let looks_like_kib =
+            total_bytes < 1_073_741_824 && scaled_total >= 1_073_741_824 && scaled_total <= (1u64 << 50);
+        if looks_like_kib {
+            avail_bytes = avail_bytes.saturating_mul(1024);
+            total_bytes = scaled_total;
+        }
+    }
     if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
         return Some(avail_bytes);
     }
     // Fallback: if available memory is unavailable (some CI/containers),
     // use total memory rather than collapsing to an unusable cap.
-    let total_bytes = sys.total_memory();
     if total_bytes > 0 {
         Some(total_bytes)
     } else {
@@ -137,6 +149,71 @@ impl HapIntervals {
         }
         false
     }
+}
+
+fn log_imputation_plan_summary(plan: &ImputationPlan) {
+    let n_target_haps = plan.core_states.len();
+    if n_target_haps == 0 {
+        eprintln!("Imputation plan: no target haplotypes");
+        return;
+    }
+    let n_windows = plan.per_window_caps.len();
+    let mut core_min = usize::MAX;
+    let mut core_max = 0usize;
+    let mut core_sum = 0usize;
+    let mut dynamic_min = usize::MAX;
+    let mut dynamic_max = 0usize;
+    let mut dynamic_sum = 0usize;
+    let mut abyss_min = usize::MAX;
+    let mut abyss_max = 0usize;
+    let mut abyss_sum = 0usize;
+
+    for hap_idx in 0..n_target_haps {
+        let core = plan.core_states.get(hap_idx).map(|v| v.len()).unwrap_or(0);
+        let intervals = plan
+            .window_intervals
+            .get(hap_idx)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let dynamic = intervals.saturating_sub(core);
+        let abyss = plan
+            .abyss_mask
+            .get(hap_idx)
+            .map(|v| v.iter().filter(|&&b| b).count())
+            .unwrap_or(0);
+
+        core_min = core_min.min(core);
+        core_max = core_max.max(core);
+        core_sum += core;
+
+        dynamic_min = dynamic_min.min(dynamic);
+        dynamic_max = dynamic_max.max(dynamic);
+        dynamic_sum += dynamic;
+
+        abyss_min = abyss_min.min(abyss);
+        abyss_max = abyss_max.max(abyss);
+        abyss_sum += abyss;
+    }
+
+    let denom = n_target_haps as f64;
+    let core_avg = core_sum as f64 / denom;
+    let dynamic_avg = dynamic_sum as f64 / denom;
+    let abyss_avg = abyss_sum as f64 / denom;
+
+    eprintln!(
+        "Imputation plan hap counts (target_haps={}, windows={}): core_global[min/avg/max]={}/{:.1}/{}, dynamic_window[min/avg/max]={}/{:.1}/{}, abyss[min/avg/max]={}/{:.1}/{}",
+        n_target_haps,
+        n_windows,
+        core_min,
+        core_avg,
+        core_max,
+        dynamic_min,
+        dynamic_avg,
+        dynamic_max,
+        abyss_min,
+        abyss_avg,
+        abyss_max
+    );
 }
 
 fn estimate_scan_batch_size(
@@ -780,6 +857,11 @@ fn build_imputation_plan(
                 "Pre-scan produced no windows for allocation".to_string(),
             ));
         }
+        eprintln!(
+            "Pre-scan: skipped (full panel global mode); ref_haps={}, windows={}",
+            n_ref_haps,
+            num_windows
+        );
         plan.per_window_cap = n_ref_haps.max(1);
         plan.per_window_caps = per_window_caps;
         for hap_idx in 0..n_target_haps {
@@ -804,6 +886,13 @@ fn build_imputation_plan(
         window_handoff.clear();
         per_window_caps.clear();
     }
+
+    eprintln!(
+        "Pre-scan: enabled (LMS allocation); target_haps={}, ref_haps={}, batch_size={}",
+        n_target_haps,
+        n_ref_haps,
+        batch_size
+    );
 
     while batch_start < n_target_haps {
         let batch_end = (batch_start + batch_size).min(n_target_haps);
@@ -1220,6 +1309,8 @@ impl crate::pipelines::ImputationPipeline {
             phased_p_mismatch = Some(phasing.params().p_mismatch);
             phased_target_path = phased_prefix.with_extension("vcf.gz");
             phased_tmp = Some(tmpdir);
+        } else {
+            eprintln!("Target already phased; skipping phasing before pre-scan.");
         }
 
         let mut n_threads = self
@@ -1280,6 +1371,7 @@ impl crate::pipelines::ImputationPipeline {
                 plan.per_window_cap
             );
         }
+        log_imputation_plan_summary(&plan);
 
         let mut ref_reader = open_ref_reader(ref_path)?;
         let target_was_unphased_for_impute = !is_vcf_fully_phased(&input_target_path)?;
@@ -1290,6 +1382,11 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             phased_target_path.clone()
         };
+        if target_was_unphased_for_impute {
+            eprintln!("Target was unphased at input; using phased target for imputation.");
+        } else {
+            eprintln!("Target already phased; using phased target directly for imputation.");
+        }
         let mut target_reader = StreamingVcfReader::open(
             &target_path_for_impute,
             gen_maps.clone(),
@@ -1436,7 +1533,7 @@ impl crate::pipelines::ImputationPipeline {
                 ref_window.global_start,
                 ref_window.output_start,
                 ref_window.output_end,
-                !target_was_unphased_for_impute,
+                true,
             )?;
 
             total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
@@ -1572,17 +1669,45 @@ impl crate::pipelines::ImputationPipeline {
                 .marker(MarkerIdx::new(0))
                 .chrom;
             if let Some(gen_map) = gen_maps.get(chrom) {
-                crate::data::genetic_map::MarkerMap::create(ref_markers, gen_map)
+                // Use cluster cM as a minimum genetic distance between adjacent markers.
+                // This mirrors Beagle-style marker clustering and prevents per-marker
+                // recombination rates from collapsing in very short regions.
+                let min_dist = self.config.cluster.max(1e-8) as f64;
+                crate::data::genetic_map::MarkerMap::from_gen_map_with_min_dist(
+                    ref_markers,
+                    gen_map,
+                    min_dist,
+                )
             } else {
                 crate::data::genetic_map::MarkerMap::from_positions(ref_markers)
             }
         };
         let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
+        if let (Some(first), Some(last)) = (gen_positions.first(), gen_positions.last()) {
+            let total_cm = (last - first).abs();
+            eprintln!(
+                "    genetic span: {:.6} cM across {} markers",
+                total_cm,
+                gen_positions.len()
+            );
+        }
         let mut p_recomb: Vec<f32> = Vec::with_capacity(n_ref_markers);
         p_recomb.push(0.0f32);
         for m in 1..n_ref_markers {
             let dist_cm = (gen_positions[m] - gen_positions[m - 1]).abs();
             p_recomb.push(self.params.p_recomb(dist_cm));
+        }
+
+        if let Some(min) = p_recomb.iter().copied().reduce(f32::min) {
+            let max = p_recomb
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mean = p_recomb.iter().copied().sum::<f32>() / p_recomb.len().max(1) as f32;
+            eprintln!(
+                "    p_recomb stats: min={:.6} mean={:.6} max={:.6}",
+                min, mean, max
+            );
         }
 
         if let Some(overlap) = imp_overlap {
@@ -1616,6 +1741,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let target_samples = target_win.samples_arc();
         let target_pl_matrix = target_pl.unwrap_or(target_win);
+        let err_rate = self.params.p_mismatch.clamp(1e-6, 0.5);
         let build_input_probs = |hap_idx: HapIdx, sample_idx: usize| -> TargetAlleleProbs {
             let mut offsets = Vec::with_capacity(n_ref_markers + 1);
             let mut probs: Vec<f32> = Vec::new();
@@ -1628,7 +1754,7 @@ impl crate::pipelines::ImputationPipeline {
 
                 if let Some(target_m_idx) = target_m_idx {
                     let target_m = target_m_idx.as_usize();
-                    let conf = target_pl_matrix
+                    let mut conf = target_pl_matrix
                         .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx);
                     let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap_idx);
                     let partner_allele =
@@ -1659,9 +1785,16 @@ impl crate::pipelines::ImputationPipeline {
 
                     let is_diploid =
                         target_samples.is_diploid(SampleIdx::new(sample_idx as u32));
-                    let has_hard = mapped_allele != 255
+                    let mut has_hard = mapped_allele != 255
                         && (mapped_allele as usize) < n_alleles
-                        && (!is_diploid || (mapped_partner != 255 && (mapped_partner as usize) < n_alleles));
+                        && (!is_diploid
+                            || (mapped_partner != 255 && (mapped_partner as usize) < n_alleles));
+                    // If the input was unphased, avoid hard-allele emissions unless
+                    // we have PL/GL evidence; otherwise we over-clamp the HMM to a
+                    // potentially incorrect phase assignment.
+                    if !phase_conf_valid {
+                        has_hard = false;
+                    }
                     let mut pl_probs: Vec<f32> = Vec::new();
                     let pl = target_pl_matrix.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
                     if let Some(pl) = pl {
@@ -1851,6 +1984,11 @@ impl crate::pipelines::ImputationPipeline {
                     }
 
                     if !use_probs && has_hard {
+                        // If we only have hard GT (no PL/GL evidence), soften confidence
+                        // using the global mismatch rate to avoid over-clamping emissions.
+                        if pl.is_none() || pl.as_ref().map_or(true, |v| v.is_empty()) {
+                            conf = conf.min(1.0 - err_rate);
+                        }
                         aligned_probs.resize(n_alleles, 0.0);
                         if is_diploid && mapped_partner != 255 && mapped_partner != mapped_allele {
                             if phase_conf_valid {
@@ -2562,13 +2700,13 @@ impl crate::pipelines::ImputationPipeline {
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                dosage_from_gp(n_alleles, &gp)
+            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1 + a2) as f32
+            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                dosage_from_gp(n_alleles, &gp)
             } else {
                 0.0
             };
@@ -2583,13 +2721,13 @@ impl crate::pipelines::ImputationPipeline {
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                best_gt_from_gp(n_alleles, &gp)
+            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                (a1, a2)
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
+            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                best_gt_from_gp(n_alleles, &gp)
             } else {
                 (0, 0)
             }
@@ -2619,21 +2757,23 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 if let Some(stats) = quality.get_mut(marker_idx) {
                     for s in 0..n_samples {
-                        let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
-                        if !stats.is_imputed {
+                        let (v1, v2) = get_hap_probs(marker_idx, s);
+                        let (v1, v2) = if !stats.is_imputed {
                             if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
-                                v1 = a1 as f32;
-                                v2 = a2 as f32;
+                                (a1 as f32, a2 as f32)
                             } else if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
                                 let n_alleles = ref_markers
                                     .marker(MarkerIdx::new(marker_idx as u32))
                                     .n_alleles();
                                 let dosage = dosage_from_gp(n_alleles, &gp);
                                 let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
+                                (p_alt, p_alt)
+                            } else {
+                                (v1, v2)
                             }
-                        }
+                        } else {
+                            (v1, v2)
+                        };
                         stats.add_sample_biallelic(v1, v2);
                     }
                 }
@@ -2645,21 +2785,23 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 if let Some(stats) = quality.get_mut(marker_idx) {
                     for s in 0..n_samples {
-                        let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
-                        if !stats.is_imputed {
+                        let (v1, v2) = get_hap_probs(marker_idx, s);
+                        let (v1, v2) = if !stats.is_imputed {
                             if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
-                                v1 = a1 as f32;
-                                v2 = a2 as f32;
+                                (a1 as f32, a2 as f32)
                             } else if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
                                 let n_alleles = ref_markers
                                     .marker(MarkerIdx::new(marker_idx as u32))
                                     .n_alleles();
                                 let dosage = dosage_from_gp(n_alleles, &gp);
                                 let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
-                                v1 = p_alt;
-                                v2 = p_alt;
+                                (p_alt, p_alt)
+                            } else {
+                                (v1, v2)
                             }
-                        }
+                        } else {
+                            (v1, v2)
+                        };
                         stats.add_sample_biallelic(v1, v2);
                     }
                 }

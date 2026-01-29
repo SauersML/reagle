@@ -542,8 +542,8 @@ def _stream_vcf_lines(cmd):
         raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr)
 
 
-def _parse_truth_line(line, samples):
-    """Parse a truth VCF line into (key, sample_data_dict, is_multiallelic)."""
+def _parse_truth_line(line, sample_indices):
+    """Parse a truth VCF line into (key, sample_data_list, is_multiallelic)."""
     parts = line.split('\t')
     if len(parts) < 5:
         return None, None, False
@@ -552,22 +552,26 @@ def _parse_truth_line(line, samples):
     key = (chrom, pos, ref, alt)
     is_multiallelic = ',' in alt
     gts = parts[4:]
-    sample_data = {}
-    for i, gt_str in enumerate(gts):
-        if i < len(samples):
-            gt_field = gt_str.split(':')[0]
+    sample_data = []
+    for idx in sample_indices:
+        if idx < len(gts):
+            gt_field = gts[idx].split(':')[0]
             gt = parse_genotype(gt_field)
             is_phased = '|' in gt_field
-            sample_data[samples[i]] = (
-                gt,
-                _gt_nonref_dosage(gt) if gt is not None else None,
-                is_phased,
+            sample_data.append(
+                (
+                    gt,
+                    _gt_nonref_dosage(gt) if gt is not None else None,
+                    is_phased,
+                )
             )
+        else:
+            sample_data.append((None, None, False))
     return key, sample_data, is_multiallelic
 
 
-def _parse_imputed_line(line, samples):
-    """Parse an imputed VCF line into (key, sample_data_dict, is_multiallelic)."""
+def _parse_imputed_line(line, sample_indices):
+    """Parse an imputed VCF line into (key, sample_data_list, is_multiallelic)."""
     parts = line.split('\t')
     if len(parts) < 5:
         return None, None, False
@@ -576,22 +580,23 @@ def _parse_imputed_line(line, samples):
     key = (chrom, pos, ref, alt)
     is_multiallelic = ',' in alt
     sample_data_list = parts[4:]
-    sample_data = {}
-    for i, data_str in enumerate(sample_data_list):
-        if i < len(samples):
+    sample_data = []
+    for idx in sample_indices:
+        if idx < len(sample_data_list):
+            data_str = sample_data_list[idx]
             fields = data_str.split(':')
             gt_field = fields[0]
             gt = parse_genotype(gt_field)
             is_phased = '|' in gt_field
-            
+
             # Expecting GT:DS:GP from bcftools query
             ds = None
             gp = None
-            
+
             # Parse DS (Estimated Dosage) - may be multiallelic (comma-separated)
             if len(fields) > 1 and fields[1] != '.':
                 ds = _parse_ds_field(fields[1])
-            
+
             # Parse GP (Genotype Probabilities)
             if len(fields) > 2 and fields[2] != '.':
                 try:
@@ -600,12 +605,14 @@ def _parse_imputed_line(line, samples):
                         gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
                 except:
                     pass
-            
+
             # Fallback to hard-call nonref dosage if DS missing
             if ds is None and gt is not None:
                 ds = _gt_nonref_dosage(gt)
 
-            sample_data[samples[i]] = (gt, ds, is_phased, gp)
+            sample_data.append((gt, ds, is_phased, gp))
+        else:
+            sample_data.append((None, None, False, None))
     return key, sample_data, is_multiallelic
 
 
@@ -670,6 +677,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     """
     import time
     start_time = time.time()
+    diag_start = start_time
 
     if not imputed_vcf or not os.path.exists(imputed_vcf):
         print("Imputed VCF not found")
@@ -691,6 +699,13 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         return None
     common_samples_list = [s for s in truth_samples if s in common_samples]
     print(f"Common samples: {len(common_samples_list)}") 
+
+    # Precompute sample index mappings for faster parsing
+    truth_index = {s: i for i, s in enumerate(truth_samples)}
+    imputed_index = {s: i for i, s in enumerate(imputed_samples)}
+    truth_indices = [truth_index[s] for s in common_samples_list]
+    imputed_indices = [imputed_index[s] for s in common_samples_list]
+    n_common = len(common_samples_list)
     
     # ============================================================
     # DIAGNOSTIC OUTPUT - VCF Analysis
@@ -778,6 +793,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     print("\n" + "="*60)
     print("END DIAGNOSTIC OUTPUT")
     print("="*60 + "\n")
+    diag_elapsed = time.time() - diag_start
     
     input_sites = load_input_sites(input_vcf)
     if input_sites is not None:
@@ -825,6 +841,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     if not reference_vcf or not os.path.exists(reference_vcf):
         raise RuntimeError("reference_vcf is required for MAF stratification but was not provided or does not exist")
 
+    af_start = time.time()
     try:
         ref_cmd = (
             f"bcftools +fill-tags {reference_vcf} -Ou -- -t AF "
@@ -839,6 +856,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     except Exception as e:
         raise RuntimeError(f"Could not initialize reference AF stream from {reference_vcf}: {e}")
 
+    af_elapsed = time.time() - af_start
     # Calculate metrics
     unphased_concordant = 0  # Genotype match ignoring phase (0|1 == 1|0)
     total_compared = 0
@@ -855,13 +873,20 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     # Classes: 0=HomRef, 1=Het, 2=HomAlt
     confusion = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
 
-    # Per-sample tracking - use online stats instead of storing all dosages
-    sample_metrics = defaultdict(lambda: {
-        "concordant": 0, "total": 0,
-        "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0,
-        "switch_errors": 0, "switch_opportunities": 0,
-        "sen_sum": 0.0, "sen_min": 1.0, "sen_max": 0.0, "sen_count": 0
-    })
+    # Per-sample tracking (arrays aligned to common_samples_list for speed)
+    sample_concordant = [0] * n_common
+    sample_total = [0] * n_common
+    sample_sum_t = [0.0] * n_common
+    sample_sum_i = [0.0] * n_common
+    sample_sum_ti = [0.0] * n_common
+    sample_sum_tt = [0.0] * n_common
+    sample_sum_ii = [0.0] * n_common
+    sample_switch_errors = [0] * n_common
+    sample_switch_opportunities = [0] * n_common
+    sample_sen_sum = [0.0] * n_common
+    sample_sen_min = [1.0] * n_common
+    sample_sen_max = [0.0] * n_common
+    sample_sen_count = [0] * n_common
 
     # For IQS calculation: track per-site concordance and expected concordance
     site_iqs_sum = 0.0
@@ -894,10 +919,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     # For N50 Phasing Block Length
     # sample -> list of block lengths (in bp)
     phase_blocks = defaultdict(list)
-    # sample -> start position of current block
-    current_block_start = {}
-    # sample -> last heterozygous position used for switch tracking
-    last_het_pos = {}
+    # Per-sample phase tracking
+    current_block_start = [-1] * n_common
+    last_het_pos = [-1] * n_common
 
     # MAF bins for stratified analysis - FINER BINS for rare variants
     def get_maf_bin(maf):
@@ -981,14 +1005,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     def get_next_truth():
         try:
             line = next(truth_iter)
-            return _parse_truth_line(line, truth_samples)
+            return _parse_truth_line(line, truth_indices)
         except StopIteration:
             return None, None, False
 
     def get_next_imputed():
         try:
             line = next(imputed_iter)
-            return _parse_imputed_line(line, imputed_samples)
+            return _parse_imputed_line(line, imputed_indices)
         except StopIteration:
             return None, None, False
 
@@ -997,11 +1021,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     imp_key, imp_data, imp_multiallelic = get_next_imputed()
 
     # Track previous het for switch error calculation per sample
-    prev_het = {}  # sample -> (site, truth_gt, imputed_gt, maf_bin)
+    prev_het = [None] * n_common  # (site, truth_gt, imputed_gt, maf_bin) per sample
     common_sites_count = 0
     last_pos = 0
 
     print("Streaming and comparing...")
+    loop_start = time.time()
     
     # Merge-join loop
     def gt_class(gt):
@@ -1099,10 +1124,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                         f"MAF stratification requires the site to be present in reference_vcf ({reference_vcf})."
                     )
 
-                ref_ref, ref_alt, ref_af_list = ref_afs
-                maf = _maf_from_afs(ref_af_list)
-                if ref_af_list and len(ref_af_list) == 1:
-                    af = ref_af_list[0]
+    ref_ref, ref_alt, ref_af_list = ref_afs
+    maf = _maf_from_afs(ref_af_list)
+    if ref_af_list and len(ref_af_list) == 1:
+        af = ref_af_list[0]
 
                 if maf is None:
                     raise RuntimeError(
@@ -1110,12 +1135,19 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     )
 
                 maf_bin = get_maf_bin(maf)
-                site_concordant = 0
-                site_total = 0
+    site_concordant = 0
+    site_total = 0
 
-                for sample in common_samples_list:
-                    t_entry = truth_site.get(sample)
-                    i_entry = imputed_site.get(sample)
+    # Dosage calibration bins (predicted dosage -> mean truth dosage)
+    # Bin over [0, 2] since diploid dosage is 0..2.
+    ds_calib_bins = 20
+    ds_calib_sum_pred = [0.0] * ds_calib_bins
+    ds_calib_sum_truth = [0.0] * ds_calib_bins
+    ds_calib_count = [0] * ds_calib_bins
+
+                for sample_idx, _sample in enumerate(common_samples_list):
+                    t_entry = truth_site[sample_idx] if truth_site is not None else None
+                    i_entry = imputed_site[sample_idx] if imputed_site is not None else None
                     t_gt, t_dos, t_phased = (t_entry if t_entry else (None, None, False))
                     i_gt, i_dos, i_phased, i_gp = (i_entry if i_entry else (None, None, False, None))
 
@@ -1141,19 +1173,29 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     t_class = gt_class(t_gt)
                     i_class = gt_class(i_gt)
 
-                    if t_class is None or i_dos is None:
-                        continue
+        if t_class is None or i_dos is None:
+            continue
 
                     if i_class is None and i_gt is not None:
                         continue
 
-                    # Hellinger score (biallelic only in this harness)
-                    if i_gp is not None and t_class is not None and len(i_gp) == 3:
-                        t_gp = (1.0, 0.0, 0.0) if t_class == 0 else ((0.0, 1.0, 0.0) if t_class == 1 else (0.0, 0.0, 1.0))
-                        bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
-                        hellinger_dist = math.sqrt(max(0, 1 - bc))
-                        hellinger_sum += hellinger_dist
-                        hellinger_count += 1
+        # Hellinger score (biallelic only in this harness)
+        if i_gp is not None and t_class is not None and len(i_gp) == 3:
+            t_gp = (1.0, 0.0, 0.0) if t_class == 0 else ((0.0, 1.0, 0.0) if t_class == 1 else (0.0, 0.0, 1.0))
+            bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
+            hellinger_dist = math.sqrt(max(0, 1 - bc))
+            hellinger_sum += hellinger_dist
+            hellinger_count += 1
+
+        # Dosage calibration bins
+        if i_dos is not None:
+            pred = max(0.0, min(2.0, float(i_dos)))
+            bin_idx = int((pred / 2.0) * ds_calib_bins)
+            if bin_idx >= ds_calib_bins:
+                bin_idx = ds_calib_bins - 1
+            ds_calib_sum_pred[bin_idx] += pred
+            ds_calib_sum_truth[bin_idx] += float(t_dos)
+            ds_calib_count[bin_idx] += 1
 
                     total_compared += 1
                     site_total += 1
@@ -1184,18 +1226,18 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     maf_bins[maf_bin]["total"] += 1
 
                     # Sample stats
-                    sample_metrics[sample]["total"] += 1
-                    sample_metrics[sample]["sum_t"] += t_dos
-                    sample_metrics[sample]["sum_i"] += i_dos
-                    sample_metrics[sample]["sum_ti"] += t_dos * i_dos
-                    sample_metrics[sample]["sum_tt"] += t_dos * t_dos
-                    sample_metrics[sample]["sum_ii"] += i_dos * i_dos
-                    sample_metrics[sample]["sen_sum"] += sen
-                    sample_metrics[sample]["sen_count"] += 1
-                    if sen < sample_metrics[sample]["sen_min"]:
-                        sample_metrics[sample]["sen_min"] = sen
-                    if sen > sample_metrics[sample]["sen_max"]:
-                        sample_metrics[sample]["sen_max"] = sen
+                    sample_total[sample_idx] += 1
+                    sample_sum_t[sample_idx] += t_dos
+                    sample_sum_i[sample_idx] += i_dos
+                    sample_sum_ti[sample_idx] += t_dos * i_dos
+                    sample_sum_tt[sample_idx] += t_dos * t_dos
+                    sample_sum_ii[sample_idx] += i_dos * i_dos
+                    sample_sen_sum[sample_idx] += sen
+                    sample_sen_count[sample_idx] += 1
+                    if sen < sample_sen_min[sample_idx]:
+                        sample_sen_min[sample_idx] = sen
+                    if sen > sample_sen_max[sample_idx]:
+                        sample_sen_max[sample_idx] = sen
 
                     if i_class is not None:
                         confusion[t_class][i_class] += 1
@@ -1209,7 +1251,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                             unphased_concordant += 1
                             site_concordant += 1
                             maf_bins[maf_bin]["unphased_concordant"] += 1
-                            sample_metrics[sample]["concordant"] += 1
+                            sample_concordant[sample_idx] += 1
 
                     # Non-ref concordance
                     if t_class > 0 and i_class is not None:
@@ -1221,29 +1263,30 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
                     # Switch errors
                     if t_class == 1 and i_class == 1 and t_phased and i_phased:
+                        sample_name = common_samples_list[sample_idx]
                         pos = site[1]
-                        if sample not in current_block_start:
-                            current_block_start[sample] = pos
+                        if current_block_start[sample_idx] < 0:
+                            current_block_start[sample_idx] = pos
 
-                        if sample in prev_het:
-                            prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample]
+                        if prev_het[sample_idx] is not None:
+                            prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample_idx]
                             t_same_phase = (t_gt[0] == prev_t_gt[0])
                             i_same_phase = (i_gt[0] == prev_i_gt[0])
 
                             if t_same_phase != i_same_phase:
-                                block_len = pos - current_block_start[sample]
-                                phase_blocks[sample].append(block_len)
-                                current_block_start[sample] = pos
+                                block_len = pos - current_block_start[sample_idx]
+                                phase_blocks[sample_name].append(block_len)
+                                current_block_start[sample_idx] = pos
 
                                 switch_errors += 1
-                                sample_metrics[sample]["switch_errors"] += 1
+                                sample_switch_errors[sample_idx] += 1
                                 maf_bins[maf_bin]["switch_errors"] += 1
 
                             switch_opportunities += 1
-                            sample_metrics[sample]["switch_opportunities"] += 1
+                            sample_switch_opportunities[sample_idx] += 1
                             maf_bins[maf_bin]["switch_opportunities"] += 1
-                        prev_het[sample] = (site, t_gt, i_gt, maf_bin)
-                        last_het_pos[sample] = pos
+                        prev_het[sample_idx] = (site, t_gt, i_gt, maf_bin)
+                        last_het_pos[sample_idx] = pos
 
                     # Masked-snp metrics (proxy quality)
                     if is_input_site and mask_pick(t_chrom, t_pos, maf_bin):
@@ -1312,13 +1355,16 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
              imp_key, imp_data, imp_multiallelic = get_next_imputed()
 
     print(f"Common sites: {common_sites_count}")
+    loop_elapsed = time.time() - loop_start
 
     # Close final phase blocks
-    for sample, start_pos in current_block_start.items():
-        end_pos = last_het_pos.get(sample)
-        if end_pos is not None and end_pos >= start_pos:
+    for i, start_pos in enumerate(current_block_start):
+        if start_pos < 0:
+            continue
+        end_pos = last_het_pos[i]
+        if end_pos >= start_pos:
             block_len = end_pos - start_pos
-            phase_blocks[sample].append(block_len)
+            phase_blocks[common_samples_list[i]].append(block_len)
 
     # Calculate overall metrics
     metrics = {}
@@ -1480,9 +1526,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             metrics["r_squared"] = None
 
         # Hellinger Score (if GP field was available)
-        if hellinger_count > 0:
-            metrics["hellinger_score"] = hellinger_sum / hellinger_count
-            metrics["hellinger_n"] = hellinger_count
+    if hellinger_count > 0:
+        metrics["hellinger_score"] = hellinger_sum / hellinger_count
+        metrics["hellinger_n"] = hellinger_count
 
         # Calculate Rare Variant R² stats (MAF < 1%) from online stats
         rare_stats = {
@@ -1522,23 +1568,23 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         sample_sen_mins = []
         sample_sen_maxs = []
 
-        for sample, data in sample_metrics.items():
-            if data["total"] > 0:
-                sample_concordances.append(data["concordant"] / data["total"])
-            n = data["total"]
+        for i in range(n_common):
+            n = sample_total[i]
+            if n > 0:
+                sample_concordances.append(sample_concordant[i] / n)
             if n > 1:
-                mean_t = data["sum_t"] / n
-                mean_i = data["sum_i"] / n
-                cov = data["sum_ti"] / n - mean_t * mean_i
-                var_t = data["sum_tt"] / n - mean_t * mean_t
-                var_i = data["sum_ii"] / n - mean_i * mean_i
+                mean_t = sample_sum_t[i] / n
+                mean_i = sample_sum_i[i] / n
+                cov = sample_sum_ti[i] / n - mean_t * mean_i
+                var_t = sample_sum_tt[i] / n - mean_t * mean_t
+                var_i = sample_sum_ii[i] / n - mean_i * mean_i
                 if var_t > 0 and var_i > 0:
                     r = cov / math.sqrt(var_t * var_i)
                     sample_r2s.append(r ** 2)
-            if data["sen_count"] > 0:
-                sample_sen_means.append(data["sen_sum"] / data["sen_count"])
-                sample_sen_mins.append(data["sen_min"])
-                sample_sen_maxs.append(data["sen_max"])
+            if sample_sen_count[i] > 0:
+                sample_sen_means.append(sample_sen_sum[i] / sample_sen_count[i])
+                sample_sen_mins.append(sample_sen_min[i])
+                sample_sen_maxs.append(sample_sen_max[i])
         
         if sample_concordances:
             metrics["sample_concordance_mean"] = sum(sample_concordances) / len(sample_concordances)
@@ -1618,9 +1664,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         
         # Per-sample switch error summary
         sample_switch_rates = []
-        for sample, data in sample_metrics.items():
-            if data["switch_opportunities"] > 0:
-                sample_switch_rates.append(data["switch_errors"] / data["switch_opportunities"])
+        for i in range(n_common):
+            if sample_switch_opportunities[i] > 0:
+                sample_switch_rates.append(
+                    sample_switch_errors[i] / sample_switch_opportunities[i]
+                )
         if sample_switch_rates:
             metrics["sample_switch_error_mean"] = sum(sample_switch_rates) / len(sample_switch_rates)
             metrics["sample_switch_error_max"] = max(sample_switch_rates)
@@ -1628,6 +1676,31 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
     elapsed = time.time() - start_time
     metrics["calculation_time_sec"] = elapsed
+    metrics["diagnostic_time_sec"] = diag_elapsed
+    metrics["af_time_sec"] = af_elapsed
+    metrics["metrics_loop_time_sec"] = loop_elapsed
+
+    # Dosage calibration summary (predicted dosage bins)
+    ds_calibration = []
+    for i in range(ds_calib_bins):
+        count = ds_calib_count[i]
+        if count > 0:
+            mean_pred = ds_calib_sum_pred[i] / count
+            mean_truth = ds_calib_sum_truth[i] / count
+        else:
+            mean_pred = None
+            mean_truth = None
+        bin_lo = (i / ds_calib_bins) * 2.0
+        bin_hi = ((i + 1) / ds_calib_bins) * 2.0
+        ds_calibration.append({
+            "bin": i,
+            "bin_lo": bin_lo,
+            "bin_hi": bin_hi,
+            "mean_pred": mean_pred,
+            "mean_truth": mean_truth,
+            "count": count,
+        })
+    metrics["ds_calibration"] = ds_calibration
 
     # Save metrics to JSON for exact aggregation
     with open(output_prefix + "_metrics.json", "w") as f:
@@ -1645,6 +1718,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         print(f"   Sites compared: {sites:,}" if sites is not None else "   Sites compared: N/A")
         print(f"   Genotypes compared: {genotypes:,}" if genotypes is not None else "   Genotypes compared: N/A")
         print(f"   Calculation time: {metrics.get('calculation_time_sec', 0):.1f}s")
+        if metrics.get("diagnostic_time_sec") is not None:
+            print(f"     Diagnostics:  {metrics.get('diagnostic_time_sec', 0):.1f}s")
+        if metrics.get("af_time_sec") is not None:
+            print(f"     AF extraction:{metrics.get('af_time_sec', 0):.1f}s")
+        if metrics.get("metrics_loop_time_sec") is not None:
+            print(f"     Metrics loop:{metrics.get('metrics_loop_time_sec', 0):.1f}s")
         
         print(f"\n🎯 ACCURACY METRICS")
         print(f"   Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")

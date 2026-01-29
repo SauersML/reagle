@@ -1004,6 +1004,151 @@ fn test_imputation_bref3_ref_rust_vs_java() {
 
 #[test]
 #[serial]
+fn test_phasing_multi_window_long_map_vs_java() {
+    let files = setup_test_files();
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy target to work dir
+    let gt_path = work_dir.path().join("target.vcf.gz");
+    fs::copy(&files.target_vcf, &gt_path).expect("Copy target VCF");
+
+    // Create a linear genetic map with a large span to force multi-window traversal.
+    let map_path = work_dir.path().join("long_span.map");
+    let _ = write_linear_map_for_span(&gt_path, &map_path, 90.0);
+
+    // Run Java BEAGLE phasing with map
+    let java_out = work_dir.path().join("java_phased_long");
+    let java_output = run_beagle(
+        &files.beagle_jar,
+        &[
+            ("gt", gt_path.to_str().unwrap()),
+            ("map", map_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java phasing failed");
+
+    let java_vcf = work_dir.path().join("java_phased_long.vcf.gz");
+
+    // Run Rust phasing with the same map and window sizing.
+    let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_phased_long");
+    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 30.0, 2.0);
+    assert!(
+        rust_result.is_ok(),
+        "Rust phasing failed: {:?}",
+        rust_result.err()
+    );
+
+    let rust_vcf = work_dir.path().join("rust_phased_long.vcf.gz");
+
+    // Compare outputs
+    let (_, java_records) = parse_vcf(&java_vcf);
+    let (_, rust_records) = parse_vcf(&rust_vcf);
+
+    println!(
+        "[long-map phasing] Java: {} records, Rust: {} records",
+        java_records.len(),
+        rust_records.len()
+    );
+
+    assert_eq!(
+        java_records.len(),
+        rust_records.len(),
+        "Record count mismatch (long-map phasing)"
+    );
+
+    let mut concordant = 0;
+    let mut total = 0;
+    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+        for (j_gt, r_gt) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()) {
+            total += 1;
+            if normalize_gt_unphased(&j_gt.gt) == normalize_gt_unphased(&r_gt.gt) {
+                concordant += 1;
+            }
+        }
+    }
+
+    let concordance = concordant as f64 / total as f64;
+    println!(
+        "[long-map phasing] Concordance: {:.2}% ({}/{})",
+        concordance * 100.0,
+        concordant,
+        total
+    );
+    assert!(
+        concordance > 0.95,
+        "Long-map phasing concordance too low: {:.2}%",
+        concordance * 100.0
+    );
+}
+
+#[test]
+#[serial]
+fn test_imputation_multi_window_long_map_vs_java() {
+    let files = setup_test_files();
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    // Copy files to work dir
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    let gt_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&files.ref_vcf, &ref_path).expect("Copy ref VCF");
+    fs::copy(&files.target_sparse_vcf, &gt_path).expect("Copy target VCF");
+
+    // Create a linear genetic map with a large span to force multi-window traversal.
+    let map_path = work_dir.path().join("long_span.map");
+    let _ = write_linear_map_for_span(&ref_path, &map_path, 90.0);
+
+    // Run Java BEAGLE with map
+    let java_out = work_dir.path().join("java_imputed_long");
+    let java_output = run_beagle(
+        &files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", gt_path.to_str().unwrap()),
+            ("map", map_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java imputation failed");
+
+    let java_vcf = work_dir.path().join("java_imputed_long.vcf.gz");
+
+    // Run Rust with the same map and explicit window sizing.
+    let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_imputed_long");
+    let rust_result = run_rust_imputation_with_map(
+        &gt_vcf,
+        &ref_vcf,
+        &map_path,
+        &rust_out,
+        42,
+        30.0,
+        2.0,
+    );
+    assert!(
+        rust_result.is_ok(),
+        "Rust imputation failed: {:?}",
+        rust_result.err()
+    );
+
+    let rust_vcf = work_dir.path().join("rust_imputed_long.vcf.gz");
+    compare_imputation_results(
+        "long-map multi-window",
+        &gt_path,
+        &java_vcf,
+        &rust_vcf,
+    );
+}
+
+#[test]
+#[serial]
 fn test_full_workflow_rust_vs_java() {
     // Run full workflow on all data sources
     for source in get_all_data_sources() {
@@ -2141,6 +2286,63 @@ fn decompress_vcf_for_rust(gz_path: &Path, work_dir: &Path) -> PathBuf {
     vcf_path
 }
 
+/// Find chrom/min/max positions from a gzipped VCF.
+fn vcf_min_max_pos(vcf_gz: &Path) -> (String, u64, u64) {
+    let output = Command::new("gzip")
+        .args(["-dc", vcf_gz.to_str().unwrap()])
+        .output()
+        .expect("Failed to run gzip");
+
+    assert!(output.status.success(), "gzip decompression failed");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut chrom = String::new();
+    let mut min_pos: Option<u64> = None;
+    let mut max_pos: Option<u64> = None;
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let c = parts.next().unwrap_or("");
+        let pos_str = parts.next().unwrap_or("0");
+        let pos: u64 = pos_str.parse().unwrap_or(0);
+        if chrom.is_empty() {
+            chrom = c.to_string();
+        }
+        min_pos = Some(min_pos.map_or(pos, |p| p.min(pos)));
+        max_pos = Some(max_pos.map_or(pos, |p| p.max(pos)));
+    }
+    let min_pos = min_pos.expect("No VCF records found");
+    let max_pos = max_pos.expect("No VCF records found");
+    (chrom, min_pos, max_pos)
+}
+
+/// Write a simple linear PLINK map with a specified genetic span.
+fn write_linear_map_for_span(
+    vcf_gz: &Path,
+    map_path: &Path,
+    total_cm: f64,
+) -> (String, u64, u64) {
+    let (chrom, min_pos, max_pos) = vcf_min_max_pos(vcf_gz);
+    let span_bp = max_pos.saturating_sub(min_pos).max(1);
+    let span_mb = span_bp as f64 / 1_000_000.0;
+    let rate = if span_mb > 0.0 {
+        total_cm / span_mb
+    } else {
+        1.0
+    };
+    let content = format!(
+        "{chrom}\t{min_pos}\t{rate}\t0.0\n{chrom}\t{max_pos}\t{rate}\t{total_cm}\n",
+        chrom = chrom,
+        min_pos = min_pos,
+        max_pos = max_pos,
+        rate = rate,
+        total_cm = total_cm
+    );
+    fs::write(map_path, content).expect("Write map file");
+    (chrom, min_pos, max_pos)
+}
+
 /// Helper to run Rust phasing pipeline
 fn run_rust_phasing(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
     let config = Config::parse_from([
@@ -2151,6 +2353,34 @@ fn run_rust_phasing(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Res
         out_prefix.to_str().unwrap(),
         "--seed",
         &seed.to_string(),
+    ]);
+    let mut pipeline = PhasingPipeline::new(config, None);
+    pipeline.run_auto()
+}
+
+/// Helper to run Rust phasing pipeline with map/window settings
+fn run_rust_phasing_with_map(
+    gt_path: &Path,
+    map_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    window_cm: f32,
+    overlap_cm: f32,
+) -> reagle::Result<()> {
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--map",
+        map_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+        "--window",
+        &window_cm.to_string(),
+        "--overlap",
+        &overlap_cm.to_string(),
     ]);
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run_auto()
@@ -2174,6 +2404,38 @@ fn run_rust_imputation(
         "--seed",
         &seed.to_string(),
         "--gp",
+    ]);
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
+/// Helper to run Rust imputation pipeline with map/window settings.
+fn run_rust_imputation_with_map(
+    gt_path: &Path,
+    ref_path: &Path,
+    map_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    window_cm: f32,
+    overlap_cm: f32,
+) -> reagle::Result<()> {
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--map",
+        map_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+        "--gp",
+        "--window",
+        &window_cm.to_string(),
+        "--overlap",
+        &overlap_cm.to_string(),
     ]);
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
