@@ -34,7 +34,7 @@ def run_benchmark(person, file_path, format):
     # The original ref.vcf.gz is preserved for Reagle to ensure no loss of data in the primary pipeline.
     # Fill missing genotypes with 0|0 (homozygous reference) to prevent Beagle from dropping sites/samples
     # due to missing data, and ensure all genotypes are fully phased.
-    run_cmd("bcftools +setGT ref.vcf.gz -Ou -- -t . -n 0|0 | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
+    run_cmd("bcftools +setGT ref.vcf.gz -Ou -- -t . -n '0|0' | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
     run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
 
     beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"

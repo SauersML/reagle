@@ -1314,8 +1314,8 @@ impl crate::pipelines::ImputationPipeline {
         );
         if let Some(p_mismatch) = phased_p_mismatch {
             if p_mismatch.is_finite() && p_mismatch > 0.0 {
-                self.params.p_mismatch =
-                    p_mismatch.min(crate::model::parameters::ModelParams::MAX_MISMATCH_PROB);
+                    self.params.p_mismatch =
+                        p_mismatch.min(crate::model::parameters::ModelParams::MAX_MISMATCH_PROB);
             }
         }
         self.params
