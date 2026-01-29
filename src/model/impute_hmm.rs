@@ -125,12 +125,15 @@ fn emission_prob_soft(ref_allele: u8, target_probs: &[f32], error_rate: f32) -> 
         return 1.0;
     }
     if ref_allele == 255 {
-        // Strongly penalize missing reference data to force the HMM to use
-        // informative haplotypes (those with non-missing alleles).
-        // If we allow missing states to have high probability, the HMM can
-        // get stuck in a "missing cloud" and fail to impute rare variants
-        // that are present in only a subset of the reference panel.
-        return 1e-6;
+        // Penalize missing reference data to prefer informative haplotypes.
+        // Assuming uniform prior on the missing allele:
+        // P(obs) = Sum_a P(obs|a) * P(a) = Sum_a P(obs|a) * (1/N)
+        // If obs is hard call to A, P(obs|A)~1, others~0. Sum ~ 1/N.
+        return if n_alleles > 1 {
+            1.0 / n_alleles as f32
+        } else {
+            1.0
+        };
     }
     if n_alleles == 0 {
         return 1.0;

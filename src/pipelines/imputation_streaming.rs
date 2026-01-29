@@ -1293,6 +1293,12 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        // Heuristic: for imputation, we trust the reference panel more than phasing defaults.
+        // A lower mismatch probability encourages the HMM to use recombination to find
+        // exact matches (rare variants) rather than tolerating mismatches on common haplotypes.
+        if self.config.err.is_none() {
+            self.params.p_mismatch = self.params.p_mismatch.min(1e-5);
+        }
         self.params
             .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
 
@@ -1548,11 +1554,15 @@ impl crate::pipelines::ImputationPipeline {
         // Create local parameters with adjusted recombination intensity
         let n_target_haps = target_win.n_haplotypes();
         let n_total_eff = n_target_haps + n_ref_eff;
-        let local_params = crate::model::parameters::ModelParams::for_phasing(
+        let mut local_params = crate::model::parameters::ModelParams::for_phasing(
             n_total_eff,
             self.config.ne,
             self.config.err,
         );
+        // Enforce lower mismatch prob for imputation to resolve rare variants
+        if self.config.err.is_none() {
+            local_params.p_mismatch = local_params.p_mismatch.min(1e-5);
+        }
 
         let mut gen_positions: Vec<f64> = Vec::with_capacity(n_ref_markers);
         for m in 0..n_ref_markers {
