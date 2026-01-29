@@ -47,6 +47,9 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Maximum recombination intensity
+    pub const MAX_RECOMB_INTENSITY: f32 = 60.0;
+
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
@@ -71,7 +74,7 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = (0.04 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -137,7 +140,8 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        // Convert cM to Morgans (divide by 100.0)
+        let p = (-f64::exp_m1(c * gen_dist_cm / 100.0)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
