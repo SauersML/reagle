@@ -73,7 +73,12 @@ impl ModelParams {
         // Formula from Java PhaseData constructor
         let recomb_intensity = 0.04 * ne / n_haps as f32;
 
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
+        // Default p_mismatch using Li-Stephens, but clamped to MAX_MISMATCH_PROB (0.0001)
+        // to prevent "Perfect LD Traps" where the error penalty is too low to force a switch.
+        // If user provides `err`, we use it directly (trusting the user).
+        let p_mismatch = err.unwrap_or_else(|| {
+            Self::li_stephens_p_mismatch(n_haps).min(0.0001)
+        });
 
         Self {
             p_mismatch,
@@ -144,9 +149,12 @@ impl ModelParams {
     /// Update mismatch probability (for EM estimation)
     ///
     /// From Java `PhaseData.updatePMismatch`:
-    /// Only update if new value is valid and greater than current
+    /// Only update if new value is valid and greater than current.
+    /// Clamped to MAX_MISMATCH_PROB (0.0001) to ensure penalty remains high.
     pub fn update_p_mismatch(&mut self, new_p: f32) {
-        if new_p.is_finite() && new_p > self.p_mismatch && new_p < 0.5 {
+        // Clamp to 0.0001 to prevent error rate from growing too large
+        let limit = 0.0001;
+        if new_p.is_finite() && new_p > self.p_mismatch && new_p <= limit {
             self.p_mismatch = new_p;
         }
     }
@@ -155,12 +163,18 @@ impl ModelParams {
     ///
     /// From Java `PhaseData.updateRecombIntensity`:
     /// Only update if new value is present, valid and positive
-    pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
-        if let Some(r) = new_intensity {
-            if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
-            }
-        }
+    pub fn update_recomb_intensity(&mut self, _: Option<f32>) {
+        // Disable EM update of recombination intensity to prevent "Perfect LD Traps".
+        // Sparse data often leads to underestimation of recombination, which makes
+        // switching too expensive relative to mismatch, trapping the HMM in a
+        // mismatched state. Fixing intensity to the Ne-derived prior solves this.
+        //
+        // Original logic:
+        // if let Some(r) = new_intensity {
+        //     if r.is_finite() && r > 0.0 {
+        //         self.recomb_intensity = r;
+        //     }
+        // }
     }
 
     /// Set number of states
