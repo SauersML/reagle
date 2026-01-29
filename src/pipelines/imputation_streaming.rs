@@ -1574,6 +1574,7 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         let target_samples = target_win.samples_arc();
+        let target_was_unphased = target_was_unphased;
         let build_input_probs = |hap_idx: HapIdx, sample_idx: usize| -> TargetAlleleProbs {
             let mut offsets = Vec::with_capacity(n_ref_markers + 1);
             let mut probs: Vec<f32> = Vec::new();
