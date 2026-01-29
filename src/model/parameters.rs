@@ -47,6 +47,9 @@ impl ModelParams {
     /// Default initial LR threshold
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
+    /// Maximum mismatch probability to prevent Perfect LD traps
+    pub const MAX_MISMATCH_PROB: f32 = 0.0001;
+
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
