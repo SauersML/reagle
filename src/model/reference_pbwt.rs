@@ -138,27 +138,69 @@ impl ReferencePbwt {
                 }
             }
         } else {
-            // Uniform spaced sampling
-            for i in 0..k {
-                let target_relative_idx = (i * total_len) / k;
+            // Sample k haplotypes from available intervals using a center-out strategy
+            // expanding from the middle of each interval proportionally.
+            // This heuristic prefers "central" matches which often share longer prefixes
+            // due to PBWT sorting properties.
+            let mut remaining = k;
 
-                // Find which interval contains target_relative_idx
-                let mut current_pos = 0;
-                for &(l, r) in beam.intervals() {
-                    let l = l.min(n_ref as u32) as usize;
-                    let r = r.min(n_ref as u32) as usize;
-                    let len = r.saturating_sub(l);
-                    if len == 0 {
-                        continue;
-                    }
+            // Simple round-robin or proportional allocation could be used.
+            // Here we try to take equally from each interval if possible,
+            // or take top matches.
+            // Reverting to a simple strategy: take middle of largest interval?
+            // Actually, with multiple intervals, uniform sampling across them is theoretically sound,
+            // but empirically the "center-out" from the single best interval (if k small)
+            // or localized sampling worked better.
+            //
+            // Let's implement a deterministic "best span" selection.
+            // RankBeam keeps intervals.
+            // We iterate intervals and pick center-out from each until we fill k.
+            // This effectively samples dense clusters.
 
-                    if target_relative_idx < current_pos + len {
-                        // Found in this interval
-                        let offset = target_relative_idx - current_pos;
-                        out.push(self.ppa[l + offset]);
-                        break;
+            // Interleave selection from all intervals to avoid bias to the first one
+            // (which corresponds to lowest index / 'best' sort order?)
+            // Actually PBWT sort order isn't "best first".
+            // Let's go back to the previous logic but adapted for multiple intervals:
+            // For each interval, pick (k * len / total_len) items, center-out.
+
+            for &(l, r) in beam.intervals() {
+                let l = l.min(n_ref as u32) as usize;
+                let r = r.min(n_ref as u32) as usize;
+                let len = r.saturating_sub(l);
+                if len == 0 {
+                    continue;
+                }
+
+                let take = (len * k + total_len - 1) / total_len; // Ceil division
+                let take = take.min(remaining).min(len);
+
+                if take > 0 {
+                    let mut left = l + len / 2;
+                    let mut right = left + 1;
+                    let mut count = 0;
+                    while count < take {
+                        if left >= l {
+                            out.push(self.ppa[left]);
+                            count += 1;
+                            if count == take {
+                                break;
+                            }
+                            if left > 0 {
+                                left -= 1;
+                            } else {
+                                left = usize::MAX; // Stop going left
+                            }
+                        }
+                        if right < r {
+                            out.push(self.ppa[right]);
+                            count += 1;
+                            right += 1;
+                        }
                     }
-                    current_pos += len;
+                    remaining -= take;
+                }
+                if remaining == 0 {
+                    break;
                 }
             }
         }
