@@ -1504,6 +1504,8 @@ impl crate::pipelines::ImputationPipeline {
             .first()
             .map(|c| c.n_haplotypes())
             .unwrap_or(0);
+        let mut non_missing_counts = Vec::with_capacity(n_ref_markers);
+
         for m in 0..n_ref_markers {
             let n_alleles = ref_markers.marker(MarkerIdx::new(m as u32)).n_alleles();
             let mut counts = vec![0u32; n_alleles.max(1)];
@@ -1519,6 +1521,7 @@ impl crate::pipelines::ImputationPipeline {
                     total += 1;
                 }
             }
+            non_missing_counts.push(total);
             let mut freqs = vec![0.0f32; counts.len()];
             if total > 0 {
                 let inv = 1.0 / total as f32;
@@ -1528,6 +1531,28 @@ impl crate::pipelines::ImputationPipeline {
             }
             ref_allele_freqs[m] = freqs;
         }
+
+        // Calculate effective reference size for recombination intensity.
+        // If the reference panel is sparse (lots of missing data), using the raw
+        // n_ref_haps (e.g. 3809) with Ne=1M results in very low recombination
+        // probabilities (sticky HMM), causing traps.
+        // We use the median number of present haplotypes as a better estimate of n.
+        non_missing_counts.sort_unstable();
+        let n_ref_eff = if !non_missing_counts.is_empty() {
+            non_missing_counts[non_missing_counts.len() / 2] as usize
+        } else {
+            n_ref_haps
+        };
+        let n_ref_eff = n_ref_eff.max(1);
+
+        // Create local parameters with adjusted recombination intensity
+        let n_target_haps = target_win.n_haplotypes();
+        let n_total_eff = n_target_haps + n_ref_eff;
+        let local_params = crate::model::parameters::ModelParams::for_phasing(
+            n_total_eff,
+            self.config.ne,
+            self.config.err,
+        );
 
         let mut gen_positions: Vec<f64> = Vec::with_capacity(n_ref_markers);
         for m in 0..n_ref_markers {
@@ -1539,7 +1564,7 @@ impl crate::pipelines::ImputationPipeline {
         p_recomb.push(0.0f32);
         for m in 1..n_ref_markers {
             let dist_cm = (gen_positions[m] - gen_positions[m - 1]).abs();
-            p_recomb.push(self.params.p_recomb(dist_cm));
+            p_recomb.push(local_params.p_recomb(dist_cm));
         }
 
         if let Some(overlap) = imp_overlap {

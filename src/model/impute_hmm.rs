@@ -120,13 +120,18 @@ fn fill_ref_alleles(col: &GenotypeColumn, state_haps: &[GlobalId], out: &mut [u8
 
 #[inline]
 fn emission_prob_soft(ref_allele: u8, target_probs: &[f32], error_rate: f32) -> f32 {
-    if target_probs.is_empty() {
+    let n_alleles = target_probs.len();
+    if n_alleles == 0 {
         return 1.0;
     }
     if ref_allele == 255 {
-        return 1.0;
+        // Strongly penalize missing reference data to force the HMM to use
+        // informative haplotypes (those with non-missing alleles).
+        // If we allow missing states to have high probability, the HMM can
+        // get stuck in a "missing cloud" and fail to impute rare variants
+        // that are present in only a subset of the reference panel.
+        return 1e-6;
     }
-    let n_alleles = target_probs.len();
     if n_alleles == 0 {
         return 1.0;
     }
