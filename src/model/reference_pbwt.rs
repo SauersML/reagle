@@ -138,69 +138,41 @@ impl ReferencePbwt {
                 }
             }
         } else {
-            // Sample k haplotypes from available intervals using a center-out strategy
-            // expanding from the middle of each interval proportionally.
-            // This heuristic prefers "central" matches which often share longer prefixes
-            // due to PBWT sorting properties.
-            let mut remaining = k;
-
-            // Simple round-robin or proportional allocation could be used.
-            // Here we try to take equally from each interval if possible,
-            // or take top matches.
-            // Reverting to a simple strategy: take middle of largest interval?
-            // Actually, with multiple intervals, uniform sampling across them is theoretically sound,
-            // but empirically the "center-out" from the single best interval (if k small)
-            // or localized sampling worked better.
+            // Uniformly sample across the total length of all intervals.
+            // This ensures we get a representative set of haplotypes from the beam,
+            // rather than biasing towards specific intervals or centers.
             //
-            // Let's implement a deterministic "best span" selection.
-            // RankBeam keeps intervals.
-            // We iterate intervals and pick center-out from each until we fill k.
-            // This effectively samples dense clusters.
+            // Conceptually: Treat all intervals as one contiguous range [0, total_len).
+            // Sample k indices from this range: idx_i = (i * total_len) / k
+            // Then map these indices back to the specific interval.
 
-            // Interleave selection from all intervals to avoid bias to the first one
-            // (which corresponds to lowest index / 'best' sort order?)
-            // Actually PBWT sort order isn't "best first".
-            // Let's go back to the previous logic but adapted for multiple intervals:
-            // For each interval, pick (k * len / total_len) items, center-out.
+            for i in 0..k {
+                // Calculate target index in the virtual contiguous range [0, total_len)
+                // Use rounding to distribute points evenly
+                let target_relative_idx = (i * total_len) / k;
 
-            for &(l, r) in beam.intervals() {
-                let l = l.min(n_ref as u32) as usize;
-                let r = r.min(n_ref as u32) as usize;
-                let len = r.saturating_sub(l);
-                if len == 0 {
-                    continue;
-                }
+                let mut current_pos = 0;
+                // Find which interval this index falls into
+                for &(l, r) in beam.intervals() {
+                    let l = l.min(n_ref as u32) as usize;
+                    let r = r.min(n_ref as u32) as usize;
+                    let len = r.saturating_sub(l);
 
-                let take = (len * k + total_len - 1) / total_len; // Ceil division
-                let take = take.min(remaining).min(len);
-
-                if take > 0 {
-                    let mut left = l + len / 2;
-                    let mut right = left + 1;
-                    let mut count = 0;
-                    while count < take {
-                        if left >= l {
-                            out.push(self.ppa[left]);
-                            count += 1;
-                            if count == take {
-                                break;
-                            }
-                            if left > 0 {
-                                left -= 1;
-                            } else {
-                                left = usize::MAX; // Stop going left
-                            }
-                        }
-                        if right < r {
-                            out.push(self.ppa[right]);
-                            count += 1;
-                            right += 1;
-                        }
+                    if len == 0 {
+                        continue;
                     }
-                    remaining -= take;
-                }
-                if remaining == 0 {
-                    break;
+
+                    if target_relative_idx < current_pos + len {
+                        // Found it! The index is in this interval.
+                        let offset = target_relative_idx - current_pos;
+                        let ppa_idx = l + offset;
+                        // Safety check (should be guaranteed by l, r clamping above)
+                        if ppa_idx < self.ppa.len() {
+                            out.push(self.ppa[ppa_idx]);
+                        }
+                        break;
+                    }
+                    current_pos += len;
                 }
             }
         }
