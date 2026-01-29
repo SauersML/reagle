@@ -483,7 +483,18 @@ struct ProgressSnapshot {
 }
 
 fn select_progress_metric(snap: &TelemetrySnapshot) -> ProgressSnapshot {
-    if snap.stage == Stage::Imputation && snap.total_samples > 0 {
+    if matches!(
+        snap.stage,
+        Stage::PhasingBurnin | Stage::PhasingMain | Stage::PhasingStage2
+    ) && snap.total_samples > 0
+    {
+        ProgressSnapshot {
+            metric: ProgressMetric::Samples,
+            done: snap.samples_processed,
+            total: snap.total_samples,
+            unit: "samp",
+        }
+    } else if snap.stage == Stage::Imputation && snap.total_samples > 0 {
         ProgressSnapshot {
             metric: ProgressMetric::Samples,
             done: snap.samples_processed,
@@ -518,8 +529,10 @@ fn select_progress_metric(snap: &TelemetrySnapshot) -> ProgressSnapshot {
 fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty: bool) {
     let interval = Duration::from_secs(config.interval_secs);
     let mut last_progress = 0u64;
+    let mut last_total = 0u64;
     let mut last_metric = ProgressMetric::None;
     let mut last_time = Instant::now();
+    let mut reset_time = Instant::now();
     #[cfg(target_os = "linux")]
     let mut last_cpu_ticks = get_cpu_ticks();
 
@@ -537,7 +550,10 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
         // Calculate velocity based on the active progress metric.
         let now = Instant::now();
         let dt = now.duration_since(last_time).as_secs_f64();
-        let (progress_velocity, reset_window) = if progress.metric != last_metric {
+        let (progress_velocity, reset_window) = if progress.metric != last_metric
+            || progress.total != last_total
+            || progress.done < last_progress
+        {
             (0.0, true)
         } else if dt > 0.1 {
             (
@@ -551,6 +567,8 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
             last_progress = progress.done;
             last_time = now;
             last_metric = progress.metric;
+            last_total = progress.total;
+            reset_time = now;
         } else {
             last_progress = progress.done;
             last_time = now;
@@ -575,10 +593,19 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
             }
         };
 
+        let window_dt = now.duration_since(reset_time).as_secs_f64();
+        let velocity_for_display = if progress_velocity > 0.0 {
+            progress_velocity
+        } else if progress.done > 0 && window_dt > 0.1 {
+            progress.done as f64 / window_dt
+        } else {
+            0.0
+        };
+
         // ETA calculation based on the active progress metric.
-        let eta_str = if progress_velocity > 0.0 && progress.total > progress.done {
+        let eta_str = if velocity_for_display > 0.0 && progress.total > progress.done {
             let remaining = progress.total - progress.done;
-            let eta_secs = remaining as f64 / progress_velocity;
+            let eta_secs = remaining as f64 / velocity_for_display;
             format_duration(eta_secs)
         } else {
             "unknown".to_string()
@@ -626,7 +653,7 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
                 vsz_mb,
                 swap_mb,
                 cpu_pct,
-                progress_velocity,
+                velocity_for_display,
                 is_stalled,
                 show_extra,
             );
@@ -676,7 +703,7 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
                 vsz_mb,
                 swap_mb,
                 cpu_pct,
-                progress_velocity,
+                velocity_for_display,
                 is_stalled,
                 show_extra,
             );
@@ -710,15 +737,15 @@ fn print_tty_progress(
 ) {
     // Build window/iteration context
     let window_str = if snap.total_windows > 0 {
-        format!("W{}/{}", snap.current_window, snap.total_windows)
+        format!("Window {}/{}", snap.current_window, snap.total_windows)
     } else if snap.current_window > 0 {
-        format!("W{}", snap.current_window)
+        format!("Window {}", snap.current_window)
     } else {
         String::new()
     };
 
     let iter_str = if snap.total_iterations > 0 {
-        format!("I{}/{}", snap.current_iteration, snap.total_iterations)
+        format!("Iter {}/{}", snap.current_iteration, snap.total_iterations)
     } else {
         String::new()
     };
@@ -732,7 +759,7 @@ fn print_tty_progress(
 
     // Sample progress
     let sample_str = if snap.total_samples > 0 {
-        format!("S{}/{}", snap.samples_processed, snap.total_samples)
+        format!("Samples {}/{}", snap.samples_processed, snap.total_samples)
     } else {
         String::new()
     };

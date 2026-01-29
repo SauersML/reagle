@@ -76,6 +76,46 @@ const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 
 fn available_memory_bytes() -> Option<u64> {
+    fn read_cgroup_limit_bytes() -> Option<u64> {
+        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
+        if let Some(s) = v2 {
+            let t = s.trim();
+            if t != "max" {
+                if let Ok(v) = t.parse::<u64>() {
+                    if v > 0 && v < (1u64 << 60) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok();
+        if let Some(s) = v1 {
+            let t = s.trim();
+            if let Ok(v) = t.parse::<u64>() {
+                if v > 0 && v < (1u64 << 60) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    fn read_cgroup_available_bytes(limit: u64) -> Option<u64> {
+        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok();
+        if let Some(s) = v2 {
+            if let Ok(cur) = s.trim().parse::<u64>() {
+                return Some(limit.saturating_sub(cur));
+            }
+        }
+        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes").ok();
+        if let Some(s) = v1 {
+            if let Ok(cur) = s.trim().parse::<u64>() {
+                return Some(limit.saturating_sub(cur));
+            }
+        }
+        None
+    }
+
     let mut sys = System::new();
     sys.refresh_memory();
     // sysinfo reports memory values in bytes.
@@ -93,11 +133,20 @@ fn available_memory_bytes() -> Option<u64> {
             total_bytes = scaled_total;
         }
     }
+    if let Some(limit) = read_cgroup_limit_bytes() {
+        if limit > 0 {
+            total_bytes = total_bytes.min(limit);
+            if let Some(avail) = read_cgroup_available_bytes(limit) {
+                avail_bytes = avail_bytes.min(avail);
+            } else {
+                avail_bytes = avail_bytes.min(limit);
+            }
+        }
+    }
+
     if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
         return Some(avail_bytes);
     }
-    // Fallback: if available memory is unavailable (some CI/containers),
-    // use total memory rather than collapsing to an unusable cap.
     if total_bytes > 0 {
         Some(total_bytes)
     } else {
@@ -779,7 +828,6 @@ fn build_imputation_plan(
     gen_maps: &GeneticMaps,
     target_positions: &TargetMarkerIndex,
     per_window_cap: usize,
-    state_cap: usize,
     available_bytes: u64,
     n_threads: usize,
     imp_step_cm: f64,
@@ -792,13 +840,12 @@ fn build_imputation_plan(
         return Err(ReagleError::vcf("No target samples for pre-scan".to_string()));
     }
 
-    let state_cap = state_cap.max(1);
     let mut plan = ImputationPlan {
         n_ref_haps: 0,
         core_states: vec![Vec::new(); n_target_haps],
         window_intervals: vec![Vec::new(); n_target_haps],
         abyss_mask: vec![Vec::new(); n_target_haps],
-        per_window_cap: per_window_cap.min(state_cap).max(1),
+        per_window_cap: per_window_cap.max(1),
         per_window_caps: Vec::new(),
     };
 
@@ -882,7 +929,7 @@ fn build_imputation_plan(
                 }
                 per_window_cap_window
             };
-            let cap = state_cap.min(n_ref_haps).max(1);
+            let cap = n_ref_haps.max(1);
             per_window_cap_window = per_window_cap_window.min(cap).max(1);
             per_window_caps.push(per_window_cap_window);
 
@@ -899,8 +946,7 @@ fn build_imputation_plan(
     }
 
     let can_full_panel =
-        !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps)
-            && state_cap >= n_ref_haps;
+        !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps);
     if can_full_panel {
         let num_windows = per_window_caps.len();
         if num_windows == 0 {
@@ -933,12 +979,6 @@ fn build_imputation_plan(
         }
         return Ok(plan);
     } else {
-        if !per_window_caps.is_empty() && state_cap < n_ref_haps {
-            eprintln!(
-                "Pre-scan: forced (state_cap={} < ref_haps={}); enabling LMS allocation",
-                state_cap, n_ref_haps
-            );
-        }
         // Reset for prescan path (we rebuilt these in the fast-path probe).
         window_handoff.clear();
         per_window_caps.clear();
@@ -998,7 +1038,7 @@ fn build_imputation_plan(
             if per_window_cap_window == 0 {
                 per_window_cap_window = 1;
             }
-            let cap = state_cap.min(n_ref_haps).max(1);
+            let cap = n_ref_haps.max(1);
             per_window_cap_window = per_window_cap_window.min(cap).max(1);
             if batch_start == 0 {
                 per_window_caps.push(per_window_cap_window);
@@ -1392,7 +1432,6 @@ impl crate::pipelines::ImputationPipeline {
             avail_bytes = 0;
         }
         let min_states = 64usize;
-        let state_cap = self.config.imp_states.max(1);
         let mut raw_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers);
         loop {
             let total_budget = raw_budget.max(1);
@@ -1409,12 +1448,11 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             total_budget
         };
-        let per_window_cap = per_window_cap.min(state_cap).max(1);
+        let per_window_cap = per_window_cap.max(1);
 
         eprintln!(
-            "Imputation plan: per_window_cap={}, state_cap={}, threads={}, available_mb={}",
+            "Imputation plan: per_window_cap={}, threads={}, available_mb={}",
             per_window_cap,
-            state_cap,
             n_threads,
             avail_bytes / (1024 * 1024)
         );
@@ -1426,7 +1464,6 @@ impl crate::pipelines::ImputationPipeline {
             &gen_maps,
             &target_positions_map,
             per_window_cap,
-            state_cap,
             if force_full_panel { 0 } else { avail_bytes },
             n_threads,
             self.config.imp_step as f64,
@@ -1498,7 +1535,7 @@ impl crate::pipelines::ImputationPipeline {
         // should use the Li-Stephens mismatch prior (or user override) tied to
         // the reference panel, not phasing-specific error rates.
         self.params
-            .set_n_states(self.config.imp_states.min(n_ref_pool.saturating_sub(2)));
+            .set_n_states(n_ref_pool.saturating_sub(2).max(1));
 
         let target_samples = target_reader.samples_arc();
         let n_target_samples = target_samples.len();

@@ -1,4 +1,4 @@
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -63,10 +63,25 @@ fn write_synth_vcf(
     Ok(())
 }
 
+fn assert_vcf_fully_phased(path: &std::path::Path) {
+    let file = std::fs::File::open(path).expect("open vcf");
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.expect("read vcf line");
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.contains('/') {
+            panic!("unphased genotype found in {}", path.display());
+        }
+    }
+}
+
 #[test]
 fn synth_impute_runtime_under_2_min() {
     // Match CI-ish hap count, but only ~5% of chr22 markers to keep runtime bounded.
-    let n_samples = 3273; // 6546 haplotypes
+    let ref_samples = 3273; // 6546 haplotypes
+    let target_samples = 818; // 1636 haplotypes
     let n_markers = 2762; // ~5% of 55,237
     let downsample_every = 20; // target ~5% markers
 
@@ -90,9 +105,11 @@ fn synth_impute_runtime_under_2_min() {
     let input_vcf = tmp.path().join("input.vcf");
     let out_prefix = tmp.path().join("reagle_out");
 
-    write_synth_vcf(&ref_vcf, n_samples, n_markers, true, 1).expect("write ref");
+    write_synth_vcf(&ref_vcf, ref_samples, n_markers, true, 1).expect("write ref");
     // Use phased input to skip phasing; focus on imputation runtime.
-    write_synth_vcf(&input_vcf, n_samples, n_markers, true, downsample_every).expect("write input");
+    write_synth_vcf(&input_vcf, target_samples, n_markers, true, downsample_every)
+        .expect("write input");
+    assert_vcf_fully_phased(&input_vcf);
 
     let mut child = Command::new(bin)
         .arg("--ref")

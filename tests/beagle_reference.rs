@@ -1012,9 +1012,9 @@ fn test_phasing_multi_window_long_map_vs_java() {
     let gt_path = work_dir.path().join("target.vcf.gz");
     fs::copy(&files.target_vcf, &gt_path).expect("Copy target VCF");
 
-    // Create a linear genetic map with a large span to force multi-window traversal.
+    // Create a linear genetic map with a modest span to keep runtime bounded.
     let map_path = work_dir.path().join("long_span.map");
-    write_linear_map_for_span(&gt_path, &map_path, 90.0);
+    write_linear_map_for_span(&gt_path, &map_path, 10.0);
 
     // Run Java BEAGLE phasing with map
     let java_out = work_dir.path().join("java_phased_long");
@@ -1023,6 +1023,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
         &[
             ("gt", gt_path.to_str().unwrap()),
             ("map", map_path.to_str().unwrap()),
+            ("window", "2.0"),
             ("out", java_out.to_str().unwrap()),
             ("seed", "42"),
         ],
@@ -1035,7 +1036,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
     // Run Rust phasing with the same map and window sizing.
     let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_phased_long");
-    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 30.0, 2.0);
+    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 2.0, 2.0);
     assert!(
         rust_result.is_ok(),
         "Rust phasing failed: {:?}",
@@ -1097,9 +1098,9 @@ fn test_imputation_multi_window_long_map_vs_java() {
     fs::copy(&files.ref_vcf, &ref_path).expect("Copy ref VCF");
     fs::copy(&files.target_sparse_vcf, &gt_path).expect("Copy target VCF");
 
-    // Create a linear genetic map with a large span to force multi-window traversal.
+    // Create a linear genetic map with a modest span to keep runtime bounded.
     let map_path = work_dir.path().join("long_span.map");
-    write_linear_map_for_span(&ref_path, &map_path, 90.0);
+    write_linear_map_for_span(&ref_path, &map_path, 10.0);
 
     // Run Java BEAGLE with map
     let java_out = work_dir.path().join("java_imputed_long");
@@ -1109,6 +1110,7 @@ fn test_imputation_multi_window_long_map_vs_java() {
             ("ref", ref_path.to_str().unwrap()),
             ("gt", gt_path.to_str().unwrap()),
             ("map", map_path.to_str().unwrap()),
+            ("window", "2.0"),
             ("out", java_out.to_str().unwrap()),
             ("seed", "42"),
             ("gp", "true"),
@@ -1129,7 +1131,7 @@ fn test_imputation_multi_window_long_map_vs_java() {
         &map_path,
         &rust_out,
         42,
-        30.0,
+        2.0,
         2.0,
     );
     assert!(

@@ -33,6 +33,11 @@ pub struct ThreadWorkspace {
     pub hap2_partner_allele: Vec<u8>,
     pub hap1_use_combined: Vec<bool>,
     pub hap2_use_combined: Vec<bool>,
+    /// Reusable per-sample buffers to avoid hot-loop allocations
+    pub seq1: Vec<u8>,
+    pub seq2: Vec<u8>,
+    pub sample_conf: Vec<f32>,
+    pub het_positions: Vec<usize>,
     /// Forward block buffer for checkpoint recompute
     pub fwd_block: Vec<f32>,
     /// FFBS forward buffers for dynamic MCMC (haploid constrained)
@@ -44,6 +49,14 @@ pub struct ThreadWorkspace {
     pub combined_checkpoint_data: Vec<f32>,
     pub hap1_checkpoint_data: Vec<f32>,
     pub hap2_checkpoint_data: Vec<f32>,
+    /// Reusable buffers for initialization/scoring in phasing
+    pub scores: Vec<f32>,
+    pub swap_counts: Vec<u32>,
+    pub obs_counts: Vec<u32>,
+    pub last_orients: Vec<u8>,
+    pub dummy_target: Vec<u8>,
+    pub dummy_partner: Vec<u8>,
+    pub dummy_combined: Vec<bool>,
     /// Cached marker count
     n_markers: usize,
     /// Number of states (cached for convenience)
@@ -76,6 +89,10 @@ impl ThreadWorkspace {
             hap2_partner_allele: Vec::new(),
             hap1_use_combined: Vec::new(),
             hap2_use_combined: Vec::new(),
+            seq1: Vec::new(),
+            seq2: Vec::new(),
+            sample_conf: Vec::new(),
+            het_positions: Vec::new(),
             fwd_block: Vec::new(),
             ffbs_fwd_curr: Vec::new(),
             ffbs_fwd_prev: Vec::new(),
@@ -84,6 +101,13 @@ impl ThreadWorkspace {
             combined_checkpoint_data: Vec::new(),
             hap1_checkpoint_data: Vec::new(),
             hap2_checkpoint_data: Vec::new(),
+            scores: Vec::new(),
+            swap_counts: Vec::new(),
+            obs_counts: Vec::new(),
+            last_orients: Vec::new(),
+            dummy_target: Vec::new(),
+            dummy_partner: Vec::new(),
+            dummy_combined: Vec::new(),
             n_markers: 0,
             n_states,
         }

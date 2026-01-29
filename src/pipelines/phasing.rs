@@ -5234,9 +5234,12 @@ fn sample_dynamic_mcmc(
         hap1_idx: u32,
         rng: &mut impl rand::Rng,
     ) {
-        // If there are no other haplotypes to sample from, bail out to avoid an infinite loop.
+        // If there are no other haplotypes to sample from, fall back to self so we can proceed.
+        // This avoids an infinite loop for single-sample or haploid inputs.
         if n_haps <= 2 {
             neighbors.clear();
+            let self_hap = hap1_idx.min(n_haps.saturating_sub(1));
+            neighbors.push(self_hap);
             return;
         }
 
