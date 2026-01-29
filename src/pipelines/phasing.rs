@@ -60,7 +60,7 @@ impl std::ops::Deref for StreamWindowWithResult {
 use crate::data::alignment::MarkerAlignment;
 use crate::model::allele_lookup::RefAlleleLookup;
 use crate::model::types::GlobalId;
-use crate::model::hmm::BeagleHmm;
+use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::pbwt::PbwtState;
 use crate::model::pbwt_streaming::PbwtWavefront;
@@ -2395,7 +2395,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             // Collect EM statistics if requested (using original sequences)
                             // Only create HMM when needed to avoid unnecessary p_recomb.clone()
                             if n_states_full > final_states {
-                                let hmm_full = BeagleHmm::new(
+                                let hmm_full = MosaicHmm::new(
                                     ref_view,
                                     &self.params,
                                     n_states_full,
@@ -2458,7 +2458,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
 
                             if let Some(atomic) = atomic_estimates {
-                                let hmm = BeagleHmm::new(
+                                let hmm = MosaicHmm::new(
                                     ref_view,
                                     &self.params,
                                     n_states,
@@ -2766,7 +2766,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                     // Collect EM statistics if requested
                     if let Some(atomic) = atomic_estimates {
-                        let hmm = BeagleHmm::new(
+                        let hmm = MosaicHmm::new(
                             subset_view,
                             &self.params,
                             n_states,
@@ -3345,7 +3345,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     let seq2: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele2(m)).collect();
                     let seq_conf: Vec<f32> =
                         hi_freq_markers.iter().map(|&m| sp.confidence(m)).collect();
-                    let hmm = BeagleHmm::new(
+                    let hmm = MosaicHmm::new(
                         subset_view,
                         &self.params,
                         n_states,

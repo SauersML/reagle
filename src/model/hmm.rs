@@ -197,7 +197,7 @@ impl HmmUpdater {
 }
 
 // ============================================================================
-// BeagleHmm: Memory-Efficient Mosaic HMM with A-B-C Loop Pattern
+// MosaicHmm: Memory-Efficient Mosaic HMM with A-B-C Loop Pattern
 // ============================================================================
 
 use crate::model::pl_emission::{
@@ -216,7 +216,7 @@ use crate::model::states::{AlleleScratch, MosaicCursor, StateSwitch, ThreadedHap
 /// - **Phase A**: State maintenance (integer logic, branch-predictable)
 /// - **Phase B**: Allele materialization (memory fetch into contiguous scratch)
 /// - **Phase C**: Math kernel (SIMD-vectorizable on flat data)
-pub struct BeagleHmm<'a, TargetSpace = crate::data::AnyMarkerSpace, RefSpace = crate::data::AnyMarkerSpace> {
+pub struct MosaicHmm<'a, TargetSpace = crate::data::AnyMarkerSpace, RefSpace = crate::data::AnyMarkerSpace> {
     /// Reference panel genotypes
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     /// Model parameters
@@ -227,8 +227,8 @@ pub struct BeagleHmm<'a, TargetSpace = crate::data::AnyMarkerSpace, RefSpace = c
     p_recomb: Vec<f32>,
 }
 
-impl<'a, TargetSpace, RefSpace> BeagleHmm<'a, TargetSpace, RefSpace> {
-    /// Create a new BeagleHmm
+impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
+    /// Create a new MosaicHmm
     pub fn new(
         ref_gt: impl Into<GenotypeView<'a, TargetSpace, RefSpace>>,
         params: &'a ModelParams,
@@ -1097,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn test_beagle_hmm_forward_backward() {
+    fn test_mosaic_hmm_forward_backward() {
         let ref_panel = make_test_ref_panel();
         let params = ModelParams::for_phasing(6, 10000.0, None);
         let p_recomb = vec![0.0, 0.01, 0.01, 0.01, 0.01];
@@ -1120,7 +1120,7 @@ mod tests {
         threaded_haps.push_new(GlobalId::new(4));
         threaded_haps.add_segment(2, GlobalId::new(5), 2);
 
-        let hmm = BeagleHmm::new(&ref_panel, &params, n_states, p_recomb);
+        let hmm = MosaicHmm::new(&ref_panel, &params, n_states, p_recomb);
 
         let target_alleles = vec![0, 0, 0, 1, 0]; // Should match haplotype 0 or 4
         let mut fwd = Vec::new();

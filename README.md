@@ -2,7 +2,7 @@
 
 # Reagle: High-Performance Genotype Phasing and Imputation
 
-Reagle is a phasing and imputation program written in Rust which uses modified algorithms from the [BEAGLE](https://faculty.washington.edu/browning/beagle/beagle.html)
+Reagle is a phasing and imputation program written in Rust, inspired by and using modified algorithms from [BEAGLE](https://faculty.washington.edu/browning/beagle/beagle.html)
 software for genotype imputation, and algorithms mostly from [SHAPEIT5](https://github.com/odelaneau/shapeit5) for phasing.
 
 ## Limitations

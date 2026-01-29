@@ -1,6 +1,6 @@
 //! # Reagle: High-Performance Genotype Phasing and Imputation
 //!
-//! A Rust reimplementation of Beagle, optimized for modern hardware.
+//! A Rust imputation/phasing engine inspired by Beagle, optimized for modern hardware.
 //!
 //! ## Usage
 //! ```bash

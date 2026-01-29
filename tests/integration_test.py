@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration test for Reagle (Rust Beagle implementation).
+Integration test for Reagle (Beagle-inspired Rust implementation).
 
 This test:
 1. Downloads HGDP+1kG chr22 reference panel from gnomAD

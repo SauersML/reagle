@@ -1,7 +1,7 @@
 //! # Reagle Library
 //!
 //! High-performance genotype phasing and imputation library.
-//! A Rust reimplementation of Beagle.
+//! A Rust imputation/phasing engine inspired by Beagle.
 //!
 //! ## Modules
 //! - `config`: CLI argument parsing and validation
@@ -29,7 +29,7 @@ pub use data::storage::GenotypeMatrix;
 pub use error::{ReagleError, Result};
 pub use io::bref3::Bref3Reader;
 pub use io::vcf::{VcfReader, VcfWriter};
-pub use model::hmm::BeagleHmm;
+pub use model::hmm::MosaicHmm;
 pub use model::parameters::ModelParams;
 pub use model::states::ThreadedHaps;
 
