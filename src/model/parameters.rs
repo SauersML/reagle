@@ -50,6 +50,10 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
+    /// Maximum recombination intensity
+    /// Matches Java Beagle 5.5 MAX_RECOMB_INTENSITY
+    pub const MAX_RECOMB_INTENSITY: f32 = 60.0;
+
     /// Create default parameters
     pub fn new() -> Self {
         Self {
@@ -71,9 +75,16 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let mut recomb_intensity = 0.04 * ne / n_haps as f32;
+        recomb_intensity = recomb_intensity.min(Self::MAX_RECOMB_INTENSITY);
 
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
+        // Use a fixed low error rate (matching Beagle 5 default behavior effectively)
+        // rather than Li-Stephens, to allow switching to rare haplotypes.
+        // Li-Stephens (~0.002) is too high relative to transition probability (~1e-5)
+        // for rare variants in sparse panels, causing the "Perfect LD Trap".
+        // We use 1e-10 to force the HMM to prefer switching (recombination) over
+        // mismatching when fitting rare variants in sparse data.
+        let p_mismatch = err.unwrap_or(1e-10);
 
         Self {
             p_mismatch,
@@ -96,6 +107,7 @@ impl ModelParams {
     /// ```
     ///
     /// Based on Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
+    #[cfg(test)]
     pub fn li_stephens_p_mismatch(n_haps: usize) -> f32 {
         if n_haps <= 1 {
             return 0.0001;
@@ -136,8 +148,11 @@ impl ModelParams {
     ///
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
+        // Convert cM to Morgans for correct probability scale.
+        // recomb_intensity is in "switches per Morgan".
+        let dist_morgans = gen_dist_cm / 100.0;
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        let p = (-f64::exp_m1(c * dist_morgans)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
@@ -158,7 +173,7 @@ impl ModelParams {
     pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
         if let Some(r) = new_intensity {
             if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
+                self.recomb_intensity = r.min(Self::MAX_RECOMB_INTENSITY);
             }
         }
     }
@@ -240,7 +255,9 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // sum_gen_dist is in cM (accumulated in add_switch).
+        // Returns switches per Morgan (so we multiply switches/cM by 100).
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability

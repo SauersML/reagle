@@ -1312,13 +1312,8 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
-        // Do not update p_mismatch from phasing.
-        // Phasing on sparse data (Stage 1) can overestimate error rates,
-        // causing Imputation HMM to become "lazy" (trapped in mismatch state)
-        // instead of switching to rare haplotypes.
-        // Keeping the default (0.0001) ensures strong mismatch penalty.
         if let Some(p_mismatch) = phased_p_mismatch {
-            // Log for debugging but do not apply
+            // Log for debugging but do not apply to avoid Perfect LD Trap
             eprintln!("  Ignoring phased p_mismatch={:.6} to avoid Perfect LD Trap", p_mismatch);
         }
         self.params
@@ -2372,28 +2367,6 @@ impl crate::pipelines::ImputationPipeline {
             }
         };
 
-        let get_posteriors_for_writer = if include_posteriors {
-            Some(|marker_idx: usize, sample_idx: usize| {
-                let local_m = marker_idx.saturating_sub(output_start);
-                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                    if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
-                        let post1 = p1
-                            .get(local_m)
-                            .cloned()
-                            .unwrap_or_else(|| default_posteriors(marker_idx).0);
-                        let post2 = p2
-                            .get(local_m)
-                            .cloned()
-                            .unwrap_or_else(|| default_posteriors(marker_idx).1);
-                        return (post1, post2);
-                    }
-                }
-                default_posteriors(marker_idx)
-            })
-        } else {
-            None
-        };
-
         let samples = target_win.samples_arc();
         let target_pl = target_pl.unwrap_or(target_win);
 
@@ -2432,6 +2405,56 @@ impl crate::pipelines::ImputationPipeline {
             } else {
                 Some((a1, a2))
             }
+        };
+
+        let get_posteriors_for_writer = if include_posteriors {
+            Some(|marker_idx: usize, sample_idx: usize| {
+                // If genotyping error is disabled, trust the hard call if present
+                if self.config.err.is_none() {
+                    if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                        let n_alleles =
+                            ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                        let mut p1 = vec![0.0f32; n_alleles];
+                        let mut p2 = vec![0.0f32; n_alleles];
+                        if (a1 as usize) < n_alleles {
+                            p1[a1 as usize] = 1.0;
+                        }
+                        if (a2 as usize) < n_alleles {
+                            p2[a2 as usize] = 1.0;
+                        }
+                        return (
+                            if n_alleles == 2 {
+                                AllelePosteriors::Biallelic(p1[1])
+                            } else {
+                                AllelePosteriors::Multiallelic(p1)
+                            },
+                            if n_alleles == 2 {
+                                AllelePosteriors::Biallelic(p2[1])
+                            } else {
+                                AllelePosteriors::Multiallelic(p2)
+                            },
+                        );
+                    }
+                }
+
+                let local_m = marker_idx.saturating_sub(output_start);
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
+                        let post1 = p1
+                            .get(local_m)
+                            .cloned()
+                            .unwrap_or_else(|| default_posteriors(marker_idx).0);
+                        let post2 = p2
+                            .get(local_m)
+                            .cloned()
+                            .unwrap_or_else(|| default_posteriors(marker_idx).1);
+                        return (post1, post2);
+                    }
+                }
+                default_posteriors(marker_idx)
+            })
+        } else {
+            None
         };
 
         let genotype_index = |a: usize, b: usize| -> usize {
@@ -2476,6 +2499,23 @@ impl crate::pipelines::ImputationPipeline {
 
         let error_rate = self.params.p_mismatch;
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
+            // If genotyping error is disabled, trust the hard call if present, ignoring PLs
+            if self.config.err.is_none() {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    let n_genotypes = n_alleles * (n_alleles + 1) / 2;
+                    if n_genotypes == 0 {
+                        return None;
+                    }
+                    let mut gp = vec![0.0f32; n_genotypes];
+                    let idx = genotype_index(a1 as usize, a2 as usize);
+                    if idx < gp.len() {
+                        gp[idx] = 1.0;
+                    }
+                    return Some(gp);
+                }
+            }
+
             let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
             let pl = target_pl.sample_pl(target_m, sample_idx)?;
             if !pl.is_empty() {
@@ -2566,6 +2606,13 @@ impl crate::pipelines::ImputationPipeline {
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
+            // Check hard call override FIRST
+            if self.config.err.is_none() {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    return (a1 + a2) as f32;
+                }
+            }
+
             let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
