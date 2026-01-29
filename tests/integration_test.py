@@ -1124,10 +1124,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                         f"MAF stratification requires the site to be present in reference_vcf ({reference_vcf})."
                     )
 
-    ref_ref, ref_alt, ref_af_list = ref_afs
-    maf = _maf_from_afs(ref_af_list)
-    if ref_af_list and len(ref_af_list) == 1:
-        af = ref_af_list[0]
+                ref_ref, ref_alt, ref_af_list = ref_afs
+                maf = _maf_from_afs(ref_af_list)
+                if ref_af_list and len(ref_af_list) == 1:
+                    af = ref_af_list[0]
 
                 if maf is None:
                     raise RuntimeError(
@@ -1135,15 +1135,15 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     )
 
                 maf_bin = get_maf_bin(maf)
-    site_concordant = 0
-    site_total = 0
+                site_concordant = 0
+                site_total = 0
 
-    # Dosage calibration bins (predicted dosage -> mean truth dosage)
-    # Bin over [0, 2] since diploid dosage is 0..2.
-    ds_calib_bins = 20
-    ds_calib_sum_pred = [0.0] * ds_calib_bins
-    ds_calib_sum_truth = [0.0] * ds_calib_bins
-    ds_calib_count = [0] * ds_calib_bins
+                # Dosage calibration bins (predicted dosage -> mean truth dosage)
+                # Bin over [0, 2] since diploid dosage is 0..2.
+                ds_calib_bins = 20
+                ds_calib_sum_pred = [0.0] * ds_calib_bins
+                ds_calib_sum_truth = [0.0] * ds_calib_bins
+                ds_calib_count = [0] * ds_calib_bins
 
                 for sample_idx, _sample in enumerate(common_samples_list):
                     t_entry = truth_site[sample_idx] if truth_site is not None else None
@@ -1173,29 +1173,29 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     t_class = gt_class(t_gt)
                     i_class = gt_class(i_gt)
 
-        if t_class is None or i_dos is None:
-            continue
+                    if t_class is None or i_dos is None:
+                        continue
 
                     if i_class is None and i_gt is not None:
                         continue
 
-        # Hellinger score (biallelic only in this harness)
-        if i_gp is not None and t_class is not None and len(i_gp) == 3:
-            t_gp = (1.0, 0.0, 0.0) if t_class == 0 else ((0.0, 1.0, 0.0) if t_class == 1 else (0.0, 0.0, 1.0))
-            bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
-            hellinger_dist = math.sqrt(max(0, 1 - bc))
-            hellinger_sum += hellinger_dist
-            hellinger_count += 1
+                    # Hellinger score (biallelic only in this harness)
+                    if i_gp is not None and t_class is not None and len(i_gp) == 3:
+                        t_gp = (1.0, 0.0, 0.0) if t_class == 0 else ((0.0, 1.0, 0.0) if t_class == 1 else (0.0, 0.0, 1.0))
+                        bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
+                        hellinger_dist = math.sqrt(max(0, 1 - bc))
+                        hellinger_sum += hellinger_dist
+                        hellinger_count += 1
 
-        # Dosage calibration bins
-        if i_dos is not None:
-            pred = max(0.0, min(2.0, float(i_dos)))
-            bin_idx = int((pred / 2.0) * ds_calib_bins)
-            if bin_idx >= ds_calib_bins:
-                bin_idx = ds_calib_bins - 1
-            ds_calib_sum_pred[bin_idx] += pred
-            ds_calib_sum_truth[bin_idx] += float(t_dos)
-            ds_calib_count[bin_idx] += 1
+                    # Dosage calibration bins
+                    if i_dos is not None:
+                        pred = max(0.0, min(2.0, float(i_dos)))
+                        bin_idx = int((pred / 2.0) * ds_calib_bins)
+                        if bin_idx >= ds_calib_bins:
+                            bin_idx = ds_calib_bins - 1
+                        ds_calib_sum_pred[bin_idx] += pred
+                        ds_calib_sum_truth[bin_idx] += float(t_dos)
+                        ds_calib_count[bin_idx] += 1
 
                     total_compared += 1
                     site_total += 1
@@ -1270,8 +1270,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
                         if prev_het[sample_idx] is not None:
                             prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample_idx]
-                            t_same_phase = (t_gt[0] == prev_t_gt[0])
-                            i_same_phase = (i_gt[0] == prev_i_gt[0])
+                            # Phase consistency should be based on cis/trans (ref vs non-ref),
+                            # not raw allele identity. This avoids false switches at multiallelic
+                            # hets like 0|2 vs 0|1.
+                            t_same_phase = ((t_gt[0] != 0) == (prev_t_gt[0] != 0))
+                            i_same_phase = ((i_gt[0] != 0) == (prev_i_gt[0] != 0))
 
                             if t_same_phase != i_same_phase:
                                 block_len = pos - current_block_start[sample_idx]
