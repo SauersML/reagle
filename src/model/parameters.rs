@@ -148,10 +148,11 @@ impl ModelParams {
     ///
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
-        // Use cM directly. recomb_intensity is calculated relative to cM distance
-        // in ParamEstimates (accumulated cM).
+        // Convert cM to Morgans for correct probability scale.
+        // recomb_intensity is in "switches per Morgan".
+        let dist_morgans = gen_dist_cm / 100.0;
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        let p = (-f64::exp_m1(c * dist_morgans)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
