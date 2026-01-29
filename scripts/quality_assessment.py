@@ -33,7 +33,8 @@ def run_benchmark(person, file_path, format):
     # We create a derivative panel that excludes sites with missing calls and forces phased separators.
     # The original ref.vcf.gz is preserved for Reagle to ensure no loss of data in the primary pipeline.
     # Note: setGT must be run before filtering missing sites; otherwise sparse panels are emptied.
-    run_cmd("bcftools +setGT ref.vcf.gz -Ou -- -t a -n p | bcftools view -g ^miss -Oz -o ref_beagle.vcf.gz", shell=True)
+    # We remove the explicit missing filter because setGT fills them, ensuring the VCF isn't empty.
+    run_cmd("bcftools +setGT ref.vcf.gz -Ou -- -t a -n p | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
     run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
 
     beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
