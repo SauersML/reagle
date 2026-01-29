@@ -136,10 +136,11 @@ impl ModelParams {
     ///
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
-        // Convert cM to Morgans for Li-Stephens formula consistency
-        let dist_morgans = gen_dist_cm / 100.0;
         let c = -(self.recomb_intensity as f64);
-        let p = (-f64::exp_m1(c * dist_morgans)) as f32;
+        // We use exp_m1 for better precision with small probabilities
+        // P = 1 - exp(-rate * dist) = -expm1(-rate * dist)
+        // rate includes 0.04 factor (4 * 0.01) so we use cM directly
+        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 

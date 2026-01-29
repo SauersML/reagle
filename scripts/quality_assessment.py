@@ -31,10 +31,11 @@ def run_benchmark(person, file_path, format):
     print("=== Running Beagle ===")
     # Reference panels used for Beagle imputation must be fully phased and contain no missing data.
     # We create a derivative panel that forces phased separators.
-    # Note: We do NOT exclude missing sites (-g ^miss) because sparse panels (padded with novel sites)
-    # may have missing data for all haplotypes at some sites, which would empty the VCF.
-    # Beagle 5.4+ handles missing reference data correctly.
-    run_cmd("bcftools +setGT ref.vcf.gz -- -t a -n p | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
+    # Note: We filter out sites that are mostly missing (novel sites added by padding) to avoid
+    # Beagle crashing on sites with no reference data. We fill remaining sporadic missing calls
+    # with 0|0 to satisfy Beagle's requirement for fully phased/complete reference.
+    # F_MISSING < 0.5 keeps sites where at least 50% of reference samples have data.
+    run_cmd("bcftools view -i 'F_MISSING<0.5' ref.vcf.gz -Ou | bcftools +setGT - -- -t . -n 0 | bcftools +setGT - -- -t a -n p | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
     run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
 
     beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
