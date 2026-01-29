@@ -54,12 +54,15 @@ impl ModelParams {
     pub const MAX_RECOMB_INTENSITY: f32 = 60.0;
 
     /// Maximum mismatch probability to prevent Perfect LD traps
-    pub const MAX_MISMATCH_PROB: f32 = 0.0001;
+    /// Lowered to 1e-5 to strictly penalize mismatches in sparse data,
+    /// ensuring the HMM prefers switching to carrier haplotypes (LD)
+    /// over generating rare alleles via mismatch.
+    pub const MAX_MISMATCH_PROB: f32 = 0.00001;
 
     /// Create default parameters
     pub fn new() -> Self {
         Self {
-            p_mismatch: 0.0001,
+            p_mismatch: 0.00001,
             recomb_intensity: 1.0,
             n_states: Self::DEFAULT_PHASE_STATES,
             burnin: Self::DEFAULT_BURNIN,
