@@ -250,7 +250,7 @@ def prepare_truth(source, output_vcf):
 
     subprocess.check_call(["bcftools", "view", truth_raw_vcf, "-Oz", "-o", truth_hg38_vcf])
     subprocess.check_call(["bcftools", "index", "-f", truth_hg38_vcf])
-    _update_panel_if_present(truth_output_dir, panel_path)
+    # _update_panel_if_present(truth_output_dir, panel_path)
 
     # Rename chroms (22 -> chr22) to match reference panel which uses chr22 notation
     with open("chr_map.txt", "w") as f:
@@ -317,7 +317,7 @@ def run_conversion(input_path, output_vcf):
     subprocess.check_call(filter_cmd, shell=True)
     subprocess.check_call(["bcftools", "index", "-f", output_vcf])
     print("Conversion complete.")
-    _update_panel_if_present(temp_output_dir, panel_path)
+    # _update_panel_if_present(temp_output_dir, panel_path)
 
     # Cleanup extracted if it was temp
     if "extracted" in raw_file:
