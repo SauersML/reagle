@@ -167,7 +167,7 @@ fn window_boundaries_from_bounds(bounds: &[(f64, f64)]) -> Vec<f64> {
     for i in 0..bounds.len() - 1 {
         let (_, end) = bounds[i];
         let (start_next, _) = bounds[i + 1];
-        let dist = (start_next - end).abs();
+        let dist = (start_next - end).max(0.0);
         out.push(dist);
     }
     out
