@@ -210,7 +210,7 @@ impl Bref3Reader {
         let n_ids = read_byte(&mut self.reader)? as usize;
         if n_ids > 0 {
             for _ in 0..n_ids {
-                let _ = read_utf8_string(&mut self.reader)?;
+                read_utf8_string(&mut self.reader)?;
             }
         }
         let id = None;

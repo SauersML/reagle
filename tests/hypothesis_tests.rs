@@ -10,10 +10,8 @@ use std::path::Path;
 use clap::Parser;
 use reagle::data::ChromIdx;
 use reagle::model::ibs2::Ibs2;
-use reagle::model::phase_states::PhaseStates;
 use reagle::model::phase_ibs::BidirectionalPhaseIbs;
 use reagle::model::pl_emission::allele_probs_uncond_from_pl;
-use reagle::model::types::GlobalId;
 use reagle::pipelines::phasing::PhasingPipeline;
 use reagle::{Config, GeneticMaps, ImputationPipeline, MarkerIdx, SampleIdx, VcfReader};
 
@@ -247,45 +245,6 @@ fn test_missing_confidence_is_not_full_by_default() {
         conf < 0.9,
         "Expected missing confidence to be < 0.9, got {} (hypothesis NOT disproven)",
         conf
-    );
-}
-
-#[test]
-fn test_phase_states_churn_on_oversubscription() {
-    // Hypothesis: adding 2x max_states unique neighbors per marker causes full churn.
-    // This test should FAIL if that hypothesis is true.
-    let n_markers = 10;
-    let max_states = 8;
-    let mut ps = PhaseStates::new(max_states, n_markers);
-    let sample = 100u32;
-
-    // Marker 0: add haps 0..7 and 8..15 (disjoint, 16 total)
-    let neighbors_a: Vec<u32> = (0..max_states as u32).collect();
-    let neighbors_b: Vec<u32> = (max_states as u32..(2 * max_states) as u32).collect();
-    ps.add_neighbors_at_marker(sample, 0, &neighbors_a, &neighbors_b);
-
-    // Marker 1: add a completely different set 16..31
-    let neighbors_c: Vec<u32> =
-        ((2 * max_states) as u32..(4 * max_states) as u32).collect();
-    ps.add_neighbors_at_marker(sample, 1, &neighbors_c, &neighbors_c);
-
-    let th = ps.finalize_streaming(sample, 1000);
-    let mut buffer = vec![GlobalId::from(0u32); th.n_states()];
-    th.materialize_at(0, &mut buffer);
-    let first = buffer.clone();
-    th.materialize_at(1, &mut buffer);
-    let second = buffer.clone();
-
-    let mut unchanged = 0usize;
-    for (a, b) in first.iter().zip(second.iter()) {
-        if a == b {
-            unchanged += 1;
-        }
-    }
-    eprintln!("unchanged states after oversubscription = {}", unchanged);
-    assert!(
-        unchanged > 0,
-        "All states churned after oversubscription (hypothesis NOT disproven)"
     );
 }
 

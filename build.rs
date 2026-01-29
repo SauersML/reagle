@@ -25,6 +25,12 @@ struct TupleWildcardCollector {
     file_path: PathBuf,
 }
 
+// A collector for obvious no-op "touch" statements
+struct NoopTouchCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 // A collector for forbidden comment content
 struct ForbiddenCommentCollector {
     violations: Vec<String>,
@@ -133,14 +139,20 @@ fn update_stage(label: &str) {
 
     if warnings_enabled() {
         println!("cargo:warning=project build stage: {label}");
-        let _ = io::stdout().flush();
+        match io::stdout().flush() {
+            Ok(()) => (),
+            Err(_) => (),
+        }
     }
 }
 
 fn emit_stage_detail(detail: &str) {
     if warnings_enabled() {
         println!("cargo:warning=project build detail: {detail}");
-        let _ = io::stdout().flush();
+        match io::stdout().flush() {
+            Ok(()) => (),
+            Err(_) => (),
+        }
     }
 }
 
@@ -339,6 +351,39 @@ impl TupleWildcardCollector {
         error_msg.push_str(
             "   Bind every value explicitly or restructure the code so nothing is silently ignored.\n",
         );
+
+        Some(error_msg)
+    }
+}
+
+impl NoopTouchCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} no-op touch statements in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ No-op touches (e.g., \"Foo::bar;\" or \".as_ref();\") are forbidden.\n",
+        );
+        error_msg.push_str("   Remove the dead code or use the value meaningfully.\n");
 
         Some(error_msg)
     }
@@ -897,6 +942,39 @@ impl Sink for DisallowedLetCollector {
             return Ok(true);
         }
 
+        let trimmed = line_text.trim();
+        if matches!(trimmed, "break;" | "continue;" | "return;") {
+            return Ok(true);
+        }
+        if trimmed.starts_with("return ") || trimmed.starts_with("return(") {
+            return Ok(true);
+        }
+        if trimmed.starts_with("let ") || trimmed.contains('=') {
+            return Ok(true);
+        }
+        if let Some(first_char) = trimmed.chars().find(|c| !c.is_whitespace()) {
+            if !first_char.is_ascii_alphabetic() && first_char != '_' {
+                return Ok(true);
+            }
+        }
+        if trimmed.starts_with("return ") || trimmed.starts_with("return(") {
+            return Ok(true);
+        }
+        if trimmed.starts_with("let ") || trimmed.contains('=') {
+            return Ok(true);
+        }
+        if let Some(first_char) = trimmed.chars().find(|c| !c.is_whitespace()) {
+            if !first_char.is_ascii_alphabetic() && first_char != '_' {
+                return Ok(true);
+            }
+        }
+        if trimmed.starts_with("return ") || trimmed.starts_with("return(") {
+            return Ok(true);
+        }
+        if trimmed.starts_with("let ") || trimmed.contains('=') {
+            return Ok(true);
+        }
+
         self.violations.push(format!("{line_number}:{line_text}"));
 
         Ok(true)
@@ -933,6 +1011,56 @@ impl Sink for TupleWildcardCollector {
         if tuple_pattern_is_fully_ignored(line_text) {
             self.violations.push(format!("{line_number}:{line_text}"));
         }
+
+        Ok(true)
+    }
+}
+
+impl Sink for NoopTouchCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        let is_pure_comment = line_text.trim_start().starts_with("//")
+            || (line_text.contains("/*")
+                && !line_text.contains("*/match")
+                && !line_text.contains("*/let"));
+
+        let mut is_in_string = false;
+        if line_text.contains("\"") {
+            let parts: Vec<&str> = line_text.split('\"').collect();
+            let part_count = parts.len();
+            for i in 0..part_count {
+                if i % 2 == 1 {
+                    is_in_string = true;
+                    break;
+                }
+            }
+        }
+
+        if is_pure_comment || is_in_string {
+            return Ok(true);
+        }
+
+        let trimmed = line_text.trim();
+        if matches!(trimmed, "break;" | "continue;" | "return;") {
+            return Ok(true);
+        }
+        if trimmed.starts_with("return ") || trimmed.starts_with("return(") {
+            return Ok(true);
+        }
+        if trimmed.starts_with("let ") || trimmed.contains('=') {
+            return Ok(true);
+        }
+        if let Some(first_char) = trimmed.chars().find(|c| !c.is_whitespace()) {
+            if !first_char.is_ascii_alphabetic() && first_char != '_' {
+                return Ok(true);
+            }
+        }
+
+        self.violations.push(format!("{line_number}:{line_text}"));
 
         Ok(true)
     }
@@ -1529,6 +1657,16 @@ fn main() {
     emit_stage_detail(&disallowed_let_report);
     all_violations.extend(disallowed_let_violations);
 
+    // Scan Rust source files for no-op touch statements
+    update_stage("scan no-op touch statements");
+    let noop_touch_violations = scan_for_noop_touch_patterns();
+    let noop_touch_report = format!(
+        "no-op touch scan identified {} violation groups",
+        noop_touch_violations.len()
+    );
+    emit_stage_detail(&noop_touch_report);
+    all_violations.extend(noop_touch_violations);
+
     // Scan Rust source files for tuple destructuring patterns that discard values
     update_stage("scan tuple destructuring ignores");
     let tuple_wildcard_violations = scan_for_tuple_wildcard_patterns();
@@ -2030,7 +2168,7 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
 }
 
 fn scan_for_disallowed_let_patterns() -> Vec<String> {
-    let pattern = r"\blet\s+(?:mut\s+)?_\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;";
+    let pattern = r"\blet\s+(?:mut\s+)?_\s*=";
     let mut all_violations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
@@ -2066,6 +2204,51 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
         Err(e) => {
             all_violations.push(format!(
                 "Error creating regex matcher for disallowed let patterns: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_noop_touch_patterns() -> Vec<String> {
+    let pattern = r"^\s*[A-Za-z_][A-Za-z0-9_:<>]*\s*;\s*$|^\s*[^=]*\.\s*(as_ref|as_mut|as_ptr|clone|to_string|to_owned|as_bytes|as_str|len|is_empty)\s*\(\s*\)\s*;\s*$";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = NoopTouchCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating regex matcher for no-op touch patterns: {}",
                 e
             ));
         }

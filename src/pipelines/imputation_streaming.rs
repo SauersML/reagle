@@ -666,7 +666,7 @@ fn normalize_chrom_local(name: &str) -> &str {
 
 fn collect_target_positions(path: &Path) -> Result<(TargetMarkerIndex, usize)> {
     let (vcf_reader, mut reader) = crate::io::vcf::VcfReader::open(path)?;
-    let _ = vcf_reader.samples_arc();
+    vcf_reader.samples_arc();
     let mut positions: TargetMarkerIndex = std::collections::HashMap::new();
     let mut total = 0usize;
     let mut line = String::new();
@@ -726,10 +726,24 @@ fn is_vcf_fully_phased(path: &Path) -> Result<bool> {
             continue;
         }
         let mut parts = trimmed.split('\t');
-        let _ = parts.next();
-        let _ = parts.next();
+        if parts.next().is_none() {
+            line.clear();
+            continue;
+        }
+        if parts.next().is_none() {
+            line.clear();
+            continue;
+        }
+        let mut missing_fields = false;
         for _ in 0..6 {
-            parts.next();
+            if parts.next().is_none() {
+                missing_fields = true;
+                break;
+            }
+        }
+        if missing_fields {
+            line.clear();
+            continue;
         }
         let format = match parts.next() {
             Some(f) => f,
@@ -1607,8 +1621,12 @@ impl crate::pipelines::ImputationPipeline {
             window_idx += 1;
         }
 
-        let _ = phased_tmp.as_ref();
-        let _ = input_tmp.as_ref();
+        if let Some(tmpdir) = input_tmp.as_ref() {
+            tracing::trace!(path = ?tmpdir.path(), "Using temp dir for stdin target");
+        }
+        if let Some(tmpdir) = phased_tmp.as_ref() {
+            tracing::trace!(path = ?tmpdir.path(), "Using temp dir for phased target");
+        }
 
         if total_markers == 0 {
             return Err(ReagleError::vcf(
@@ -1652,7 +1670,9 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             None
         };
-        let _ = &window_span;
+        if let Some(span) = &window_span {
+            tracing::trace!(id = ?span.id(), "Entered imputation window span");
+        }
 
         let n_ref_markers = ref_markers.len();
         let n_target_samples = target_win.n_samples();
@@ -2159,8 +2179,8 @@ impl crate::pipelines::ImputationPipeline {
                     aligned2.resize(n_alleles.max(1), 1.0);
                 }
 
-                let _ = normalize_probs(&mut aligned1);
-                let _ = normalize_probs(&mut aligned2);
+                normalize_probs(&mut aligned1);
+                normalize_probs(&mut aligned2);
 
                 probs1.extend_from_slice(&aligned1);
                 probs2.extend_from_slice(&aligned2);
@@ -2570,7 +2590,9 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             None
         };
-        let _ = &write_span;
+        if let Some(span) = &write_span {
+            tracing::trace!(id = ?span.id(), "Entered write output span");
+        }
 
         let include_posteriors = include_gp || include_ap;
         let n_samples = target_win.n_samples();

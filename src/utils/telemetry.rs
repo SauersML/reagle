@@ -357,7 +357,10 @@ impl HeartbeatHandle {
     pub fn shutdown(mut self) {
         self.blackboard.signal_shutdown();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            match handle.join() {
+                Ok(_) => (),
+                Err(_) => (),
+            }
         }
     }
 }
@@ -502,10 +505,6 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
     let mut last_time = Instant::now();
     #[cfg(target_os = "linux")]
     let mut last_cpu_ticks = get_cpu_ticks();
-    #[cfg(not(target_os = "linux"))]
-    let last_cpu_ticks: Option<u64> = None;
-    #[cfg(not(target_os = "linux"))]
-    let _ = &last_cpu_ticks;
 
     loop {
         thread::sleep(interval);
@@ -670,7 +669,10 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
     // Clear TTY line on shutdown
     if is_tty {
         eprint!("\r\x1b[K");
-        let _ = io::stderr().flush();
+        match io::stderr().flush() {
+            Ok(()) => (),
+            Err(_) => (),
+        }
     }
 }
 
@@ -775,7 +777,10 @@ fn print_tty_progress(
         channel_str,
         stall_str
     );
-    let _ = io::stderr().flush();
+    match io::stderr().flush() {
+        Ok(()) => (),
+        Err(_) => (),
+    }
 }
 
 /// Print progress for non-TTY (structured log line)

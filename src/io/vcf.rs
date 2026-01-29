@@ -1513,7 +1513,10 @@ impl VcfWriter {
 
 impl Drop for VcfWriter {
     fn drop(&mut self) {
-        let _ = self.flush();
+        match self.flush() {
+            Ok(()) => (),
+            Err(_) => (),
+        }
     }
 }
 

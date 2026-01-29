@@ -464,8 +464,7 @@ impl Ibs2Sets {
                             step_results[s_idx] = Some(Arc::clone(&arc_samples));
                         } else {
                             // Clone the inner Vec from the existing Arc
-                            let mut merged: Vec<u32> =
-                                (**step_results[s_idx].as_ref().unwrap()).clone();
+                            let mut merged: Vec<u32> = (**step_results[s_idx].as_ref().unwrap()).clone();
                             merged.extend(arc_samples.iter().copied());
                             merged.sort_unstable();
                             merged.dedup();

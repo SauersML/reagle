@@ -2228,12 +2228,14 @@ fn test_phasing_confidence() {
 
     // Run phasing in memory
     let result = pipeline.phase_in_memory_with_overlap(
-        &target_gt, &gen_maps, None, // No overlap from previous window
-        None, None, None,
+        &target_gt,
+        &gen_maps,
+        None, // No overlap from previous window
+        None,
     );
 
     assert!(result.is_ok(), "Phasing should succeed");
-    let (phased, _, _) = result.unwrap();
+    let (phased, _) = result.unwrap();
 
     // Debug: check if any genotypes changed
     let mut changed_count = 0;

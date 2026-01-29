@@ -1,4 +1,4 @@
-use crate::model::pbwt::{PbwtDivUpdater, PbwtState};
+use crate::model::pbwt::PbwtDivUpdater;
 
 const MAX_RANK_INTERVALS: usize = 8;
 
@@ -86,21 +86,6 @@ impl ReferencePbwt {
             counts: Vec::new(),
             offsets: Vec::new(),
         }
-    }
-
-    pub fn with_state(n_ref_haps: usize, state: Option<&PbwtState>) -> Self {
-        let mut pbwt = Self::new(n_ref_haps);
-        if let Some(state) = state {
-            if state.ppa.len() == n_ref_haps && state.div.len() == n_ref_haps {
-                pbwt.ppa = state.ppa.clone();
-                pbwt.div = state.div.clone();
-            }
-        }
-        pbwt
-    }
-
-    pub fn get_state(&self, marker_pos: usize) -> PbwtState {
-        PbwtState::new(self.ppa.clone(), self.div.clone(), marker_pos)
     }
 
     pub fn select_donors(&self, beam: &RankBeam, k: usize) -> Vec<u32> {
@@ -262,34 +247,6 @@ impl ReferencePbwt {
         }
     }
 
-    pub fn match_len(&self, beam: &RankBeam, allele: u8, n_alleles: usize) -> u32 {
-        if allele == 255 {
-            return 0;
-        }
-        let n_ref = self.ppa.len();
-        let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
-        let b = Self::bin_for_allele(allele, n_alleles);
-
-        if b >= n_bins {
-            return 0;
-        }
-
-        let mut total = 0;
-        for &(l, r) in beam.intervals() {
-            let nl = self.offsets[b] + self.rank(b, l, n_ref);
-            let nr = self.offsets[b] + self.rank(b, r, n_ref);
-            if nr > nl {
-                total += nr - nl;
-            }
-        }
-        total
-    }
-
-    pub fn update_beams(&self, beams: &mut [RankBeam], query_alleles: &[u8], n_alleles: usize) {
-        let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
-        self.update_beams_with_scratch(beams, query_alleles, n_alleles, &mut scratch);
-    }
-
     pub fn update_beams_with_scratch(
         &self,
         beams: &mut [RankBeam],
@@ -379,65 +336,4 @@ impl ReferencePbwt {
             .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
     }
 
-    pub fn advance_with_rephase(
-        &mut self,
-        ref_alleles: &[u8],
-        n_alleles: usize,
-        marker: usize,
-        query_alleles: &mut [u8],
-        beams: &mut [RankBeam],
-        swaps_out: &mut [bool],
-    ) {
-        self.prepare_step(ref_alleles, n_alleles);
-
-        let n_samples = query_alleles.len() / 2;
-        // Greedy Local Rephasing
-        for s in 0..n_samples {
-            let h1 = s * 2;
-            let h2 = h1 + 1;
-
-            if h2 >= beams.len() {
-                continue;
-            }
-
-            let a1 = query_alleles[h1];
-            let a2 = query_alleles[h2];
-
-            if a1 != a2 && a1 != 255 && a2 != 255 {
-                let len_keep_h1 = self.match_len(&beams[h1], a1, n_alleles);
-                let len_keep_h2 = self.match_len(&beams[h2], a2, n_alleles);
-
-                let b1 = Self::bin_for_allele(a1, n_alleles);
-                let count_a1 = self.counts[b1].max(1) as f32;
-                let b2 = Self::bin_for_allele(a2, n_alleles);
-                let count_a2 = self.counts[b2].max(1) as f32;
-
-                // Smoothed Consistency Scoring: len / (count + 1)
-                // This balances maximizing match length with preferring unique/rare haplotypes (high consistency),
-                // but avoids over-penalizing common haplotypes by adding +1 smoothing.
-                let score_keep =
-                    ((len_keep_h1 as f32) / (count_a1 + 1.0)) * ((len_keep_h2 as f32) / (count_a2 + 1.0));
-
-                let len_swap_h1 = self.match_len(&beams[h1], a2, n_alleles);
-                let len_swap_h2 = self.match_len(&beams[h2], a1, n_alleles);
-
-                // For swap: h1 gets a2 (so we use count_a2), h2 gets a1 (so we use count_a1)
-                let score_swap =
-                    ((len_swap_h1 as f32) / (count_a2 + 1.0)) * ((len_swap_h2 as f32) / (count_a1 + 1.0));
-
-                if score_swap > score_keep {
-                    query_alleles[h1] = a2;
-                    query_alleles[h2] = a1;
-                    swaps_out[s] = true;
-                } else {
-                    swaps_out[s] = false;
-                }
-            } else {
-                swaps_out[s] = false;
-            }
-        }
-
-        self.update_beams(beams, query_alleles, n_alleles);
-        self.finalize_step(ref_alleles, n_alleles, marker);
-    }
 }

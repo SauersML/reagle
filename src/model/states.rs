@@ -54,16 +54,6 @@ impl ThreadedHaps {
         }
     }
 
-    /// Clear all states (keeps capacity)
-    pub fn clear(&mut self) {
-        self.segments_hap.clear();
-        self.segments_end.clear();
-        self.segments_next.clear();
-        self.state_heads.clear();
-        self.state_tails.clear();
-        self.state_cursors.clear();
-    }
-
     /// Number of active states
     pub fn n_states(&self) -> usize {
         self.state_heads.len()

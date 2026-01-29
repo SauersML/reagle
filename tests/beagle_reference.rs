@@ -1014,7 +1014,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
 
     // Create a linear genetic map with a large span to force multi-window traversal.
     let map_path = work_dir.path().join("long_span.map");
-    let _ = write_linear_map_for_span(&gt_path, &map_path, 90.0);
+    write_linear_map_for_span(&gt_path, &map_path, 90.0);
 
     // Run Java BEAGLE phasing with map
     let java_out = work_dir.path().join("java_phased_long");
@@ -1099,7 +1099,7 @@ fn test_imputation_multi_window_long_map_vs_java() {
 
     // Create a linear genetic map with a large span to force multi-window traversal.
     let map_path = work_dir.path().join("long_span.map");
-    let _ = write_linear_map_for_span(&ref_path, &map_path, 90.0);
+    write_linear_map_for_span(&ref_path, &map_path, 90.0);
 
     // Run Java BEAGLE with map
     let java_out = work_dir.path().join("java_imputed_long");

@@ -12,17 +12,16 @@
 //!
 //! This implements Beagle's two-stage phasing algorithm for handling rare variants.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bitvec::prelude::*;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use tracing::{info, info_span, instrument};
+use tracing::{info_span, instrument};
 
 use crate::config::Config;
 use crate::data::genetic_map::{GeneticMaps, MarkerMap};
-use crate::data::haplotype::Samples;
 use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::phase_state::Phased;
@@ -62,18 +61,22 @@ use crate::model::allele_lookup::RefAlleleLookup;
 use crate::model::types::GlobalId;
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
-use crate::model::pbwt::PbwtState;
-use crate::model::pbwt_streaming::PbwtWavefront;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
-
-use crate::model::phase_states::PhaseStates;
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
+use crate::model::state_allocator::allocate_lms_sparse;
 use crate::utils::telemetry::{Stage, TelemetryBlackboard};
 use mini_mcmc::core::{MarkovChain, Trace};
+use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
+const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
+const PBWT_PER_WINDOW_MULT: usize = 8;
+const PBWT_MIN_PER_HAP: usize = 64;
+const PBWT_MAX_PER_HAP: usize = 256;
+const SCAN_RAM_FRACTION: f64 = 0.10;
+const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 
 fn partition_markers_by_cm(gen_positions: &[f64], block_cm: f64) -> Vec<(usize, usize)> {
     if gen_positions.is_empty() {
@@ -105,6 +108,368 @@ fn stage1_block_cm(gen_positions: &[f64]) -> f64 {
     let avg = span / (gen_positions.len().saturating_sub(1).max(1) as f64);
     let block = avg * STAGE1_BLOCK_TARGET_MARKERS as f64;
     block.clamp(STAGE1_BLOCK_MIN_CM, STAGE1_BLOCK_MAX_CM)
+}
+
+fn available_memory_bytes() -> Option<u64> {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let mut avail_bytes = sys.available_memory();
+    let mut total_bytes = sys.total_memory();
+    if total_bytes > 0 {
+        let scaled_total = total_bytes.saturating_mul(1024);
+        let looks_like_kib = total_bytes < 1_073_741_824
+            && scaled_total >= 1_073_741_824
+            && scaled_total <= (1u64 << 50);
+        if looks_like_kib {
+            avail_bytes = avail_bytes.saturating_mul(1024);
+            total_bytes = scaled_total;
+        }
+    }
+    if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
+        return Some(avail_bytes);
+    }
+    if total_bytes > 0 {
+        Some(total_bytes)
+    } else {
+        None
+    }
+}
+
+fn estimate_scan_batch_size(available_bytes: u64, n_ref_haps: usize, n_target_haps: usize) -> usize {
+    if available_bytes == 0 || n_ref_haps == 0 || n_target_haps == 0 {
+        return 1;
+    }
+    let per_hap_bytes = (n_ref_haps as u64).saturating_mul(20);
+    if per_hap_bytes == 0 {
+        return 1;
+    }
+    let budget = (available_bytes as f64 * SCAN_RAM_FRACTION) as u64;
+    let mut batch = (budget / per_hap_bytes) as usize;
+    if batch == 0 {
+        batch = 1;
+    }
+    batch.min(n_target_haps)
+}
+
+fn build_sampling_points(gen_positions: &[f64], step_cm: f64) -> Vec<bool> {
+    let n = gen_positions.len();
+    let mut sampling = vec![false; n];
+    if n == 0 {
+        return sampling;
+    }
+    let step = step_cm.max(1e-6);
+    let mut next_cm = gen_positions[0];
+    for m in 0..n {
+        let cm = gen_positions[m];
+        if cm >= next_cm {
+            sampling[m] = true;
+            next_cm = cm + step;
+        }
+    }
+    sampling[n - 1] = true;
+    sampling
+}
+
+fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+    if k == 0 || scores.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(usize, f32)> = scores
+        .iter()
+        .enumerate()
+        .filter(|&(_, &s)| s.is_finite() && s > 0.0)
+        .map(|(i, &s)| (i, s))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if ranked.len() > k {
+        ranked.truncate(k);
+    }
+    ranked
+}
+
+fn build_sparse_scores(
+    window_scores: &[Vec<(usize, f32)>],
+    abyss: &[bool],
+) -> (Vec<usize>, Vec<Vec<(usize, f32)>>) {
+    let mut map: HashMap<usize, usize> = HashMap::new();
+    let mut candidate_haps: Vec<usize> = Vec::new();
+    let mut scores_by_hap: Vec<Vec<(usize, f32)>> = Vec::new();
+
+    for (w, list) in window_scores.iter().enumerate() {
+        for &(hap, score) in list.iter() {
+            if score <= 0.0 || !score.is_finite() {
+                continue;
+            }
+            if hap < abyss.len() && abyss[hap] {
+                continue;
+            }
+            let idx = *map.entry(hap).or_insert_with(|| {
+                candidate_haps.push(hap);
+                scores_by_hap.push(Vec::new());
+                candidate_haps.len() - 1
+            });
+            scores_by_hap[idx].push((w, score));
+        }
+    }
+    for scores in scores_by_hap.iter_mut() {
+        scores.sort_by_key(|(w, _)| *w);
+    }
+    (candidate_haps, scores_by_hap)
+}
+
+fn compute_ref_freqs<TargetSpace, RefSpace>(
+    target_gt: &GenotypeMatrix<impl crate::data::storage::phase_state::PhaseState, TargetSpace>,
+    ref_columns: &[GenotypeColumn],
+    alignment: Option<&MarkerAlignment<TargetSpace, RefSpace>>,
+) -> Vec<Vec<f32>> {
+    let n_markers = target_gt.n_markers();
+    let n_ref_haps = ref_columns
+        .first()
+        .map(|c| c.n_haplotypes())
+        .unwrap_or(0);
+    let mut freqs: Vec<Vec<f32>> = Vec::with_capacity(n_markers);
+    for m in 0..n_markers {
+        let n_alleles = target_gt
+            .markers()
+            .marker(MarkerIdx::new(m as u32))
+            .n_alleles();
+        let mut counts = vec![0u32; n_alleles.max(1)];
+        let mut total = 0u32;
+        if let Some(alignment) = alignment {
+            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+                for rh in 0..n_ref_haps {
+                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                    let mapped = alignment.reverse_map_allele(m, ref_a);
+                    if mapped == 255 {
+                        continue;
+                    }
+                    let idx = mapped as usize;
+                    if idx < counts.len() {
+                        counts[idx] += 1;
+                        total += 1;
+                    }
+                }
+            }
+        } else if m < ref_columns.len() {
+            for rh in 0..n_ref_haps {
+                let ref_a = ref_columns[m].get(HapIdx::new(rh as u32));
+                if ref_a == 255 {
+                    continue;
+                }
+                let idx = ref_a as usize;
+                if idx < counts.len() {
+                    counts[idx] += 1;
+                    total += 1;
+                }
+            }
+        }
+        let mut out = vec![0.0f32; counts.len()];
+        if total > 0 {
+            let inv = 1.0 / total as f32;
+            for (i, c) in counts.into_iter().enumerate() {
+                out[i] = c as f32 * inv;
+            }
+        }
+        freqs.push(out);
+    }
+    freqs
+}
+
+fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
+    batch_haps: &[usize],
+    geno: &MutableGenotypes,
+    ref_columns: &[GenotypeColumn],
+    alignment: Option<&MarkerAlignment<TargetSpace, RefSpace>>,
+    freqs: &[Vec<f32>],
+    window: (usize, usize),
+    k_per_hap: usize,
+    sampling: &[bool],
+    window_scores: &mut [Vec<f32>],
+    exclude_self: bool,
+    marker_map: Option<&[usize]>,
+) {
+    let n_ref_haps = ref_columns
+        .first()
+        .map(|c| c.n_haplotypes())
+        .unwrap_or(0);
+    if batch_haps.is_empty() || n_ref_haps == 0 {
+        return;
+    }
+    let (start, end) = window;
+    if start >= end {
+        return;
+    }
+
+    let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
+    let mut beams_fwd: Vec<RankBeam> = (0..batch_haps.len())
+        .map(|_| RankBeam::full(n_ref_haps as u32))
+        .collect();
+    let mut ref_alleles = vec![0u8; n_ref_haps];
+    let mut query_alleles = vec![0u8; batch_haps.len()];
+
+    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+
+    for m in start..end {
+        let local_idx = m - start;
+        let orig_m = marker_map
+            .and_then(|map| map.get(m).copied())
+            .unwrap_or(m);
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+        }
+
+        if let Some(alignment) = alignment {
+            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                for rh in 0..n_ref_haps {
+                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                    ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
+                }
+            } else {
+                ref_alleles.fill(255);
+            }
+        } else if orig_m < ref_columns.len() {
+            for rh in 0..n_ref_haps {
+                ref_alleles[rh] = ref_columns[orig_m].get(HapIdx::new(rh as u32));
+            }
+        } else {
+            ref_alleles.fill(255);
+        }
+
+        let mut is_biallelic = true;
+        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+            if a >= 2 && a != 255 {
+                is_biallelic = false;
+                break;
+            }
+        }
+        let n_alleles = if is_biallelic { 2 } else { 256 };
+
+        pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, local_idx, &query_alleles, &mut beams_fwd);
+
+        if sampling.get(local_idx).copied().unwrap_or(false) {
+            for (i, &hap_idx) in batch_haps.iter().enumerate() {
+                let targ = query_alleles[i];
+                if targ == 255 {
+                    continue;
+                }
+                let freq = freqs
+                    .get(orig_m)
+                    .and_then(|f| f.get(targ as usize))
+                    .copied()
+                    .unwrap_or(0.0);
+                if freq <= 0.0 {
+                    continue;
+                }
+                let weight = -(freq.max(min_freq)).ln();
+                let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
+                for d in donors {
+                    let idx = d as usize;
+                    if idx >= n_ref_haps {
+                        continue;
+                    }
+                    if exclude_self && idx / 2 == hap_idx / 2 {
+                        continue;
+                    }
+                    let ref_a = ref_alleles[idx];
+                    if ref_a == 255 || ref_a != targ {
+                        continue;
+                    }
+                    let w = &mut window_scores[i][idx];
+                    if w.is_finite() {
+                        *w += weight;
+                    } else {
+                        *w = weight;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
+    let mut beams_bwd: Vec<RankBeam> = (0..batch_haps.len())
+        .map(|_| RankBeam::full(n_ref_haps as u32))
+        .collect();
+    for (rev_step, m) in (start..end).rev().enumerate() {
+        let local_idx = end - start - 1 - rev_step;
+        let orig_m = marker_map
+            .and_then(|map| map.get(m).copied())
+            .unwrap_or(m);
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+        }
+
+        if let Some(alignment) = alignment {
+            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                for rh in 0..n_ref_haps {
+                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                    ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
+                }
+            } else {
+                ref_alleles.fill(255);
+            }
+        } else if orig_m < ref_columns.len() {
+            for rh in 0..n_ref_haps {
+                ref_alleles[rh] = ref_columns[orig_m].get(HapIdx::new(rh as u32));
+            }
+        } else {
+            ref_alleles.fill(255);
+        }
+
+        let mut is_biallelic = true;
+        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+            if a >= 2 && a != 255 {
+                is_biallelic = false;
+                break;
+            }
+        }
+        let n_alleles = if is_biallelic { 2 } else { 256 };
+
+        pbwt_bwd.advance_with_beams(
+            &ref_alleles,
+            n_alleles,
+            rev_step,
+            &query_alleles,
+            &mut beams_bwd,
+        );
+
+        if sampling.get(local_idx).copied().unwrap_or(false) {
+            for (i, &hap_idx) in batch_haps.iter().enumerate() {
+                let targ = query_alleles[i];
+                if targ == 255 {
+                    continue;
+                }
+                let freq = freqs
+                    .get(orig_m)
+                    .and_then(|f| f.get(targ as usize))
+                    .copied()
+                    .unwrap_or(0.0);
+                if freq <= 0.0 {
+                    continue;
+                }
+                let weight = -(freq.max(min_freq)).ln();
+                let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
+                for d in donors {
+                    let idx = d as usize;
+                    if idx >= n_ref_haps {
+                        continue;
+                    }
+                    if exclude_self && idx / 2 == hap_idx / 2 {
+                        continue;
+                    }
+                    let ref_a = ref_alleles[idx];
+                    if ref_a == 255 || ref_a != targ {
+                        continue;
+                    }
+                    let w = &mut window_scores[i][idx];
+                    if w.is_finite() {
+                        *w += weight;
+                    } else {
+                        *w = weight;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Phasing pipeline
@@ -908,7 +1273,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             self.run_phase_baum_iteration_stage1(
                 &target_gt,
                 &mut geno,
-                samples.as_ref(),
                 &stage1_p_recomb,
                 &stage1_gen_dists,
                 &hi_freq_to_orig,
@@ -972,20 +1336,22 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 bb.set_markers_processed(0);
                 bb.set_samples_processed(0);
             }
-            let _ = self.phase_rare_markers_with_hmm(
+            let stage2_handoff = self.phase_rare_markers_with_hmm(
                 &target_gt,
                 &mut geno,
-                samples.as_ref(),
                 &hi_freq_markers,
                 &gen_positions,
                 &hi_freq_gen_positions,
                 &stage1_p_recomb,
-                &ibs2,
                 &mut sample_phases,
                 &maf,
                 rare_threshold,
                 None,
                 None,
+            );
+            tracing::trace!(
+                has_handoff = stage2_handoff.is_some(),
+                "Stage 2 HMM overlap handoff computed"
             );
             if let Some(bb) = &self.telemetry {
                 bb.set_markers_processed(rare_markers.len() as u64);
@@ -1070,9 +1436,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         // PhasedOverlap contains state probabilities used for PBWT state handoff
         let mut phased_overlap: Option<PhasedOverlap> = None;
 
-        // Track PBWT state from previous window for state continuity
-        let mut pbwt_state: Option<PbwtState> = None;
-
         // Double-buffered windows
         let mut current_window: Option<StreamWindowWithResult> = None;
         let mut next_window_opt = reader.next_window()?;
@@ -1098,20 +1461,14 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
             // Set the phased overlap from previous window
             window.phased_overlap = phased_overlap.take();
-            // Note: PBWT state handoff is handled separately via PbwtState
-
             // Phase this window with overlap constraint
-            let (phased, next_overlap_handoff, next_pbwt_state) = self
+            let (phased, next_overlap_handoff) = self
                 .phase_in_memory_with_overlap(
                     &window.genotypes,
                     &gen_maps,
                     window.phased_overlap.as_ref(),
                     Some(window.output_end),
-                    pbwt_state.as_ref(),
-                    Some(window.output_end),
                 )?;
-
-            pbwt_state = next_pbwt_state;
 
             // Extract overlap for next window (contains identity-aware priors for handoff)
             if !window.is_last() {
@@ -1230,8 +1587,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             .map(|m| m.len())
             .unwrap_or(0);
         let estimated_markers = file_size / 100;
-        let _ = self.params();
-
         let use_streaming = estimated_markers > self.config.window_markers as u64;
 
         if use_streaming {
@@ -1258,12 +1613,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         gen_maps: &GeneticMaps,
         phased_overlap: Option<&PhasedOverlap>,
         next_overlap_start: Option<usize>,
-        pbwt_state: Option<&PbwtState>,
-        pbwt_handoff_at: Option<usize>,
     ) -> Result<(
         GenotypeMatrix<crate::data::storage::phase_state::Phased>,
         Option<Stage2OverlapHandoff>,
-        Option<PbwtState>,
     )> {
         let n_markers = target_gt.n_markers();
         let n_haps = target_gt.n_haplotypes();
@@ -1288,7 +1640,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         if n_markers == 0 {
-            return Ok((target_gt.clone().into_phased(), None, None));
+            return Ok((target_gt.clone().into_phased(), None));
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
@@ -1334,8 +1686,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
             .collect();
 
-        let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
-
         let n_burnin = self.config.burnin.min(3);
         let n_iterations = self.config.iterations.min(6);
         let total_iterations = n_burnin + n_iterations;
@@ -1366,8 +1716,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         let mut mcmc_paths: Vec<Option<MosaicPaths>> = vec![None; n_samples];
 
-        let mut pbwt_state_for_next_window: Option<PbwtState> = None;
-
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
             self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
@@ -1392,24 +1740,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             // Use existing run_phase_baum_iteration - overlap constraint is handled
             // via the initial geno state set by apply_overlap_constraint
-            let pbwt_state_next = self.run_phase_baum_iteration(
+            self.run_phase_baum_iteration(
                 target_gt,
                 &mut geno,
                 &p_recomb,
                 &gen_dists,
-                &ibs2,
                 &mut mcmc_paths,
                 atomic_estimates.as_ref(),
                 &confidence_by_sample,
-                pbwt_state,
-                pbwt_handoff_at,
             )?;
-
-            if it + 1 == total_iterations {
-                // Only propagate the final iteration's PBWT state to the next window.
-                // Earlier iterations are intermediate and not used for output.
-                pbwt_state_for_next_window = pbwt_state_next;
-            }
             if let Some(bb) = &self.telemetry {
                 bb.set_samples_processed(n_samples as u64);
                 bb.set_markers_processed(n_markers as u64);
@@ -1505,12 +1844,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             let handoff = self.phase_rare_markers_with_hmm(
                 target_gt,
                 &mut geno,
-                samples.as_ref(),
                 &hi_freq_markers,
                 &gen_positions_vec,
                 &hi_freq_gen_positions,
                 &stage1_p_recomb,
-                &ibs2,
                 &mut sample_phases,
                 &maf,
                 rare_threshold,
@@ -1532,7 +1869,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         Ok((
             self.build_final_matrix(target_gt, &geno, &sample_phases),
             next_overlap_handoff,
-            pbwt_state_for_next_window,
         ))
     }
 
@@ -1684,577 +2020,183 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         BidirectionalPhaseIbs::build_for_subset(alleles_by_marker, n_haps, n_subset, marker_indices)
     }
 
-    /// Build composite haplotypes for all samples using streaming PBWT
-    ///
-    /// This streaming approach uses O(N) memory instead of O(M*N) for the PBWT index.
-    /// It processes markers sequentially, updating PhaseStates at sampling points.
-    ///
-    /// # Algorithm
-    /// 1. Forward pass (markers 0->M): collect forward PBWT neighbors at sampling points
-    /// 2. Backward pass (markers M->0): collect backward PBWT neighbors at sampling points
-    /// 3. Finalize: build ThreadedHaps for each sample
-    ///
-    /// # Returns
-    /// Vector of ThreadedHaps, one per sample
-    fn build_composite_haps_streaming<RefPanelSpace>(
+    fn build_phasing_prescan_states<RefPanelSpace>(
         &self,
-        target_geno: &mut MutableGenotypes,
+        target_gt: &GenotypeMatrix,
+        target_geno: &MutableGenotypes,
         ref_gt: Option<&GenotypeMatrix<crate::data::storage::phase_state::Phased, RefPanelSpace>>,
         alignment: Option<&MarkerAlignment<crate::data::AnyMarkerSpace, RefPanelSpace>>,
         n_markers: usize,
-        n_total_haps: usize,
         n_samples: usize,
-        ibs2: &Ibs2,
-        n_candidates: usize,
-        max_states: usize,
-        pbwt_state: Option<&PbwtState>,
-        marker_to_global: Option<&[usize]>,
         gen_positions: &[f64],
         step_cm: f32,
-    ) -> (Vec<crate::model::states::ThreadedHaps>, Option<PbwtState>) {
-        // Compute sampling points using genetic distance steps
-        let step_cm = step_cm.max(1e-4) as f64;
-        let mut sampling_points = vec![false; n_markers];
-        let mut next_cm = gen_positions.first().copied().unwrap_or(0.0);
-        for m in 0..n_markers {
-            let cm = gen_positions.get(m).copied().unwrap_or(next_cm);
-            if cm < next_cm && m + 1 < n_markers {
-                continue;
-            }
-            sampling_points[m] = true;
-            next_cm = cm + step_cm;
+        marker_map: Option<&[usize]>,
+    ) -> Result<Vec<crate::model::states::ThreadedHaps>> {
+        let n_haps = target_geno.n_haps();
+        let n_ref_haps = ref_gt.map(|r| r.n_haplotypes()).unwrap_or(n_haps).max(1);
+        let per_window_cap = self.config.phase_states.min(n_ref_haps).max(1);
+        let step_cm = PBWT_SELECT_BLOCK_CM.max(step_cm as f64);
+
+        let window_blocks = partition_markers_by_cm(gen_positions, stage1_block_cm(gen_positions));
+        if window_blocks.is_empty() {
+            return Err(crate::error::ReagleError::vcf(
+                "Pre-scan produced no windows for phasing".to_string(),
+            ));
         }
-        if n_markers > 0 {
-            sampling_points[n_markers - 1] = true;
-        }
-        let donor_blocks = partition_markers_by_cm(gen_positions, stage1_block_cm(gen_positions));
-        if !donor_blocks.is_empty() {
-            sampling_points.fill(false);
-            for &(s, e) in &donor_blocks {
-                if s < n_markers {
-                    sampling_points[s] = true;
-                }
-                if e > 0 {
-                    let last = e.saturating_sub(1).min(n_markers.saturating_sub(1));
-                    sampling_points[last] = true;
-                }
-            }
-            if n_markers > 0 {
-                sampling_points[n_markers - 1] = true;
-            }
+        let num_windows = window_blocks.len();
+
+        let mut boundary_cm = Vec::with_capacity(num_windows.saturating_sub(1));
+        for w in 0..num_windows.saturating_sub(1) {
+            let (_, end) = window_blocks[w];
+            let (next_start, _) = window_blocks[w + 1];
+            let left = gen_positions[end.saturating_sub(1).min(gen_positions.len().saturating_sub(1))];
+            let right = gen_positions[next_start.min(gen_positions.len().saturating_sub(1))];
+            let dist = (right - left).abs().max(step_cm);
+            boundary_cm.push(dist);
         }
 
-        // Create PhaseStates for all samples
-        let mut phase_states: Vec<PhaseStates> = (0..n_samples)
-            .map(|_| {
-                let mut ps = PhaseStates::new(max_states, n_markers);
-                ps.reset_for_streaming();
-                ps
-            })
-            .collect();
-
-        let n_target_haps = target_geno.n_haps();
-        let has_ref = ref_gt.is_some() && alignment.is_some();
-
-        if !has_ref {
-            // This function is only used for reference-guided streaming.
-            // No-reference case uses build_composite_haps_streaming_direct().
-            let empty_count = AtomicUsize::new(0);
-            let finalized: Vec<crate::model::states::ThreadedHaps> = phase_states
-                .into_par_iter()
-                .enumerate()
-                .map(|(s, mut ps)| {
-                    if !ps.has_ibs_matches() {
-                        empty_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    ps.finalize_streaming(s as u32, n_total_haps)
+        let n_full_markers = target_gt.n_markers();
+        let ref_columns: Vec<GenotypeColumn> = if let Some(ref_gt) = ref_gt {
+            (0..ref_gt.n_markers())
+                .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
+                .collect()
+        } else {
+            (0..n_full_markers)
+                .map(|m| {
+                    let alleles = target_geno.marker_alleles(m);
+                    let n_alleles = target_gt
+                        .markers()
+                        .marker(MarkerIdx::new(m as u32))
+                        .n_alleles()
+                        .max(1);
+                    GenotypeColumn::from_alleles(&alleles, n_alleles)
                 })
-                .collect();
-            let empty = empty_count.load(Ordering::Relaxed);
-            if empty > 0 {
-                info!(
-                    "finalize_streaming: {} of {} samples had no IBS matches (random fill)",
-                    empty, n_samples
-                );
-            } else {
-                info!(
-                    "finalize_streaming: all {} samples had IBS matches",
-                    n_samples
-                );
-            }
-            return (finalized, None);
-        }
-
-        let n_ref_haps = n_total_haps.saturating_sub(n_target_haps);
-        let ref_gt = ref_gt.expect("reference");
-        let alignment = alignment.expect("alignment");
-
-        let donor_blocks = partition_markers_by_cm(gen_positions, stage1_block_cm(gen_positions));
-        if !donor_blocks.is_empty() {
-            sampling_points.fill(false);
-            for &(s, e) in &donor_blocks {
-                if s < n_markers {
-                    sampling_points[s] = true;
-                }
-                if e > 0 {
-                    let last = e.saturating_sub(1).min(n_markers.saturating_sub(1));
-                    sampling_points[last] = true;
-                }
-            }
-            if n_markers > 0 {
-                sampling_points[n_markers - 1] = true;
-            }
-        }
-        let mut pbwt_fwd = ReferencePbwt::with_state(n_ref_haps, pbwt_state);
-        let mut beams_fwd: Vec<RankBeam> = (0..n_target_haps)
-            .map(|_| RankBeam::full(n_ref_haps as u32))
-            .collect();
-
-        let mut ref_alleles = vec![0u8; n_ref_haps];
-        let mut query_alleles = vec![0u8; n_target_haps];
-
-        let mut donors_fwd: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
-        let mut swaps_buffer = vec![false; n_samples];
-
-        let mut block_idx_fwd = 0usize;
-        let mut next_block_start_fwd = if !donor_blocks.is_empty() {
-            donor_blocks[0].0
-        } else {
-            n_markers
+                .collect()
         };
 
-                // Forward pass: reference-only PBWT + query beams for target haplotypes
+        let freqs = compute_ref_freqs(target_gt, &ref_columns, alignment);
+        let avail = available_memory_bytes().unwrap_or(0);
+        let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_haps).max(1);
 
-                for m in 0..n_markers {
+        let mut scores_by_window_by_hap: Vec<Vec<Vec<(usize, f32)>>> =
+            vec![Vec::with_capacity(num_windows); n_haps];
 
-                    let orig_m = marker_to_global
+        for &(start, end) in &window_blocks {
+            let sampling = build_sampling_points(&gen_positions[start..end], step_cm);
+            let k_per_hap = per_window_cap
+                .saturating_mul(PBWT_PER_WINDOW_MULT)
+                .max(PBWT_MIN_PER_HAP)
+                .min(PBWT_MAX_PER_HAP)
+                .max(1)
+                .min(n_ref_haps.max(1));
 
-                        .and_then(|map| map.get(m).copied())
+            let mut batch_start = 0usize;
+            while batch_start < n_haps {
+                let batch_end = (batch_start + batch_size).min(n_haps);
+                let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
+                let mut window_scores: Vec<Vec<f32>> =
+                    vec![vec![f32::NEG_INFINITY; n_ref_haps]; batch_haps.len()];
 
-                        .unwrap_or(m);
+                score_window_batch_pbwt_segment(
+                    &batch_haps,
+                    target_geno,
+                    &ref_columns,
+                    alignment,
+                    &freqs,
+                    (start, end),
+                    k_per_hap,
+                    &sampling,
+                    &mut window_scores,
+                    ref_gt.is_none(),
+                    marker_map,
+                );
 
-        
+                let top_m = per_window_cap
+                    .saturating_mul(PBWT_PER_WINDOW_MULT)
+                    .max(per_window_cap)
+                    .min(n_ref_haps.max(1));
+                for (i, &hap_idx) in batch_haps.iter().enumerate() {
+                    let top = select_top_k(&window_scores[i], top_m);
+                    scores_by_window_by_hap[hap_idx].push(top);
+                }
 
-            // Build query alleles (target haps)
-            for h in 0..n_target_haps {
-                query_alleles[h] = target_geno.get(orig_m, HapIdx::new(h as u32));
+                batch_start = batch_end;
             }
+        }
 
-            // Build reference alleles aligned into target encoding
-            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
-                for rh in 0..n_ref_haps {
-                    let ref_a = ref_gt.allele(ref_m, HapIdx::new(rh as u32));
-                    ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
-                }
-            } else {
-                ref_alleles.fill(255);
-            }
+        let per_window_caps = vec![per_window_cap; num_windows];
+        let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
+        let mut out: Vec<crate::model::states::ThreadedHaps> = Vec::with_capacity(n_samples);
 
-            // Determine allele cardinality for PBWT update
-            let mut is_biallelic = true;
-            for &a in ref_alleles.iter().chain(query_alleles.iter()) {
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
-                }
-            }
-            let n_alleles = if is_biallelic { 2 } else { 256 };
-
-            pbwt_fwd.advance_with_rephase(
-                &ref_alleles,
-                n_alleles,
-                m,
-                &mut query_alleles,
-                &mut beams_fwd,
-                &mut swaps_buffer,
-            );
-
-            // Apply swaps to MutableGenotypes to maintain consistency
-            for (s, &swapped) in swaps_buffer.iter().enumerate() {
-                if swapped {
-                    let h1 = HapIdx::new((s * 2) as u32);
-                    let h2 = HapIdx::new((s * 2 + 1) as u32);
-                    let a1 = query_alleles[s * 2];
-                    let a2 = query_alleles[s * 2 + 1];
-                    target_geno.set(orig_m, h1, a1);
-                    target_geno.set(orig_m, h2, a2);
-                }
-            }
-
-            // Block-static donors: (re)select donors once per genetic-distance block
-            if m == next_block_start_fwd {
-                for h in 0..n_target_haps {
-                    let mut ds = pbwt_fwd.select_donors(&beams_fwd[h], n_candidates);
-                    let offset = n_target_haps as u32;
-                    for x in &mut ds {
-                        *x += offset;
-                    }
-                    donors_fwd[h] = ds;
-                }
-
-                block_idx_fwd += 1;
-                if block_idx_fwd < donor_blocks.len() {
-                    next_block_start_fwd = donor_blocks[block_idx_fwd].0;
-                } else {
-                    next_block_start_fwd = n_markers;
-                }
-            }
-
-            // At sampling points, collect forward donors for all samples
-            if sampling_points.get(m).copied().unwrap_or(false) {
-                for s in 0..n_samples {
-                    let h1 = s * 2;
-                    let h2 = h1 + 1;
-                    let n1 = donors_fwd.get(h1).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let n2 = donors_fwd.get(h2).map(|v| v.as_slice()).unwrap_or(&[]);
-                    phase_states[s].add_neighbors_at_marker(s as u32, m, n1, n2);
-                }
-
-                // Also add IBS2 neighbors
-                for s in 0..n_samples {
-                    let sample = SampleIdx::new(s as u32);
-                    let global_m = marker_to_global
-                        .and_then(|map| map.get(m).copied())
-                        .unwrap_or(m);
-                    for seg in ibs2.segments(sample) {
-                        if seg.contains(global_m) {
-                            let other_s = seg.other_sample;
-                            if other_s != sample {
-                                let neighbors: [u32; 2] = [other_s.hap1().0, other_s.hap2().0];
-                                phase_states[s]
-                                    .add_neighbors_at_marker(s as u32, m, &neighbors, &neighbors);
+        for s in 0..n_samples {
+            let hap1 = s * 2;
+            let hap2 = s * 2 + 1;
+            let mut window_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_windows);
+            for w in 0..num_windows {
+                let mut merged: HashMap<usize, f32> = HashMap::new();
+                for &(h, score) in scores_by_window_by_hap[hap1][w]
+                    .iter()
+                    .chain(scores_by_window_by_hap[hap2][w].iter())
+                {
+                    merged
+                        .entry(h)
+                        .and_modify(|v| {
+                            if score > *v {
+                                *v = score;
                             }
-                        }
-                    }
+                        })
+                        .or_insert(score);
                 }
-            }
-        }
-
-        // Backward pass: build PBWT on reversed marker order and query beams again
-        let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
-        let mut beams_bwd: Vec<RankBeam> = (0..n_target_haps)
-            .map(|_| RankBeam::full(n_ref_haps as u32))
-            .collect();
-
-        let mut donors_bwd: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
-        let mut block_idx_bwd = donor_blocks.len();
-        let mut next_block_end_bwd = 0usize;
-        if block_idx_bwd > 0 {
-            block_idx_bwd -= 1;
-            next_block_end_bwd = donor_blocks[block_idx_bwd].1;
-        }
-
-                for (rev_step, m) in (0..n_markers).rev().enumerate() {
-
-                    let orig_m = marker_to_global
-
-                        .and_then(|map| map.get(m).copied())
-
-                        .unwrap_or(m);
-
-        
-
-            for h in 0..n_target_haps {
-                query_alleles[h] = target_geno.get(orig_m, HapIdx::new(h as u32));
-            }
-
-            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
-                for rh in 0..n_ref_haps {
-                    let ref_a = ref_gt.allele(ref_m, HapIdx::new(rh as u32));
-                    ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
+                let mut list: Vec<(usize, f32)> = merged.into_iter().collect();
+                list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let cap = per_window_cap
+                    .saturating_mul(PBWT_PER_WINDOW_MULT)
+                    .max(per_window_cap)
+                    .min(n_ref_haps.max(1));
+                if list.len() > cap {
+                    list.truncate(cap);
                 }
-            } else {
-                ref_alleles.fill(255);
+                window_scores.push(list);
             }
 
-            let mut is_biallelic = true;
-            for &a in ref_alleles.iter().chain(query_alleles.iter()) {
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
-                }
-            }
-            let n_alleles = if is_biallelic { 2 } else { 256 };
-
-            pbwt_bwd.advance_with_rephase(
-                &ref_alleles,
-                n_alleles,
-                rev_step,
-                &mut query_alleles,
-                &mut beams_bwd,
-                &mut swaps_buffer,
+            let abyss = vec![false; n_ref_haps];
+            let (candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
+            let allocation = allocate_lms_sparse(
+                &scores_by_hap,
+                &candidate_haps,
+                num_windows,
+                &boundary_cm,
+                &self.params,
+                n_ref_haps,
+                global_slot_budget,
+                &per_window_caps,
             );
 
-            // Apply swaps to MutableGenotypes to maintain consistency
-            for (s, &swapped) in swaps_buffer.iter().enumerate() {
-                if swapped {
-                    let h1 = HapIdx::new((s * 2) as u32);
-                    let h2 = HapIdx::new((s * 2 + 1) as u32);
-                    let a1 = query_alleles[s * 2];
-                    let a2 = query_alleles[s * 2 + 1];
-                    target_geno.set(orig_m, h1, a1);
-                    target_geno.set(orig_m, h2, a2);
-                }
+            let mut selected: Vec<usize> =
+                allocation.intervals_by_hap.into_iter().map(|(h, _)| h).collect();
+            selected.sort_unstable();
+            selected.dedup();
+            if ref_gt.is_none() {
+                selected.retain(|h| h / 2 != s);
+            }
+            if selected.is_empty() {
+                return Err(crate::error::ReagleError::vcf(
+                    "Phasing pre-scan produced empty state set".to_string(),
+                ));
             }
 
-            // Block-static donors for backward traversal: select at block end-1
-            if m + 1 == next_block_end_bwd {
-                for h in 0..n_target_haps {
-                    let mut ds = pbwt_bwd.select_donors(&beams_bwd[h], n_candidates);
-                    let offset = n_target_haps as u32;
-                    for x in &mut ds {
-                        *x += offset;
-                    }
-                    donors_bwd[h] = ds;
-                }
-
-                if block_idx_bwd > 0 {
-                    block_idx_bwd -= 1;
-                    next_block_end_bwd = donor_blocks[block_idx_bwd].1;
-                } else {
-                    next_block_end_bwd = 0;
-                }
-            }
-
-            if sampling_points.get(m).copied().unwrap_or(false) {
-                for s in 0..n_samples {
-                    let h1 = s * 2;
-                    let h2 = h1 + 1;
-                    let n1 = donors_bwd.get(h1).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let n2 = donors_bwd.get(h2).map(|v| v.as_slice()).unwrap_or(&[]);
-                    phase_states[s].add_neighbors_at_marker(s as u32, m, n1, n2);
-                }
-            }
-        }
-
-        // Finalize: convert PhaseStates to ThreadedHaps (parallel)
-        let empty_count = AtomicUsize::new(0);
-        let finalized: Vec<crate::model::states::ThreadedHaps> = phase_states
-            .into_par_iter()
-            .enumerate()
-            .map(|(s, mut ps)| {
-                if !ps.has_ibs_matches() {
-                    empty_count.fetch_add(1, Ordering::Relaxed);
-                }
-                ps.finalize_streaming(s as u32, n_total_haps)
-            })
-            .collect();
-        let empty = empty_count.load(Ordering::Relaxed);
-        if empty > 0 {
-            info!(
-                "finalize_streaming: {} of {} samples had no IBS matches (random fill)",
-                empty, n_samples
+            let mut th = crate::model::states::ThreadedHaps::new(
+                selected.len(),
+                selected.len(),
+                n_markers,
             );
-        } else {
-            info!(
-                "finalize_streaming: all {} samples had IBS matches",
-                n_samples
-            );
-        }
-        let last_marker = if n_markers == 0 {
-            0usize
-        } else {
-            marker_to_global
-                .and_then(|map| map.get(n_markers - 1).copied())
-                .unwrap_or(n_markers - 1)
-        };
-        let pbwt_state_next = if n_ref_haps > 0 && n_markers > 0 {
-            Some(pbwt_fwd.get_state(last_marker))
-        } else {
-            None
-        };
-        (finalized, pbwt_state_next)
-    }
-
-    /// Build composite haplotypes using direct MutableGenotypes access (no reference panel).
-    ///
-    /// This is an optimized version of build_composite_haps_streaming for the case where
-    /// there is no reference panel. It uses bulk slice access instead of per-allele closures,
-    /// reducing overhead from O(n_markers × n_haps) function calls to O(n_markers) slice copies.
-    fn build_composite_haps_streaming_direct(
-        &self,
-        geno: &mut MutableGenotypes,
-        samples: &Samples,
-        n_markers: usize,
-        n_samples: usize,
-        ibs2: &Ibs2,
-        n_candidates: usize,
-        max_states: usize,
-        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
-        pbwt_handoff_at: Option<usize>,
-        gen_positions: &[f64],
-        step_cm: f32,
-    ) -> (Vec<crate::model::states::ThreadedHaps>, Option<PbwtState>) {
-        let n_haps = geno.n_haps();
-
-        // Compute sampling points using genetic distance steps
-        let step_cm = step_cm.max(1e-4) as f64;
-        let mut sampling_points = vec![false; n_markers];
-        let mut next_cm = gen_positions.first().copied().unwrap_or(0.0);
-        for m in 0..n_markers {
-            let cm = gen_positions.get(m).copied().unwrap_or(next_cm);
-            if cm < next_cm && m + 1 < n_markers {
-                continue;
+            for h in selected {
+                th.push_new(GlobalId::new(h as u32));
             }
-            sampling_points[m] = true;
-            next_cm = cm + step_cm;
-        }
-        if n_markers > 0 {
-            sampling_points[n_markers - 1] = true;
+            out.push(th);
         }
 
-        // Create PhaseStates for all samples
-        let mut phase_states: Vec<PhaseStates> = (0..n_samples)
-            .map(|_| {
-                let mut ps = PhaseStates::new(max_states, n_markers);
-                ps.reset_for_streaming();
-                ps
-            })
-            .collect();
-
-        // Create wavefront
-        let mut wavefront = PbwtWavefront::with_state(n_haps, n_markers, pbwt_state);
-
-        let mut pbwt_state_for_next_window: Option<PbwtState> = None;
-
-        // Forward pass - use direct slice access
-        for m in 0..n_markers {
-            // Direct slice access instead of per-haplotype closure calls
-            let mut marker_alleles = geno.marker_alleles(m);
-
-            // Greedy local rephase: extend PBWT matches before advancing.
-            wavefront.prepare_fwd_queries();
-            for s in 0..n_samples {
-                if !samples.is_diploid(SampleIdx::new(s as u32)) {
-                    continue;
-                }
-                let h1 = s * 2;
-                let h2 = h1 + 1;
-                let a1 = marker_alleles[h1];
-                let a2 = marker_alleles[h2];
-
-                if a1 == a2 || a1 > 1 || a2 > 1 {
-                    continue;
-                }
-
-                let keep = wavefront.fwd_match_len_with_allele(h1 as u32, a1, &marker_alleles)
-                    + wavefront.fwd_match_len_with_allele(h2 as u32, a2, &marker_alleles);
-                let swap = wavefront.fwd_match_len_with_allele(h1 as u32, a2, &marker_alleles)
-                    + wavefront.fwd_match_len_with_allele(h2 as u32, a1, &marker_alleles);
-
-                if swap > keep {
-                    marker_alleles[h1] = a2;
-                    marker_alleles[h2] = a1;
-                    geno.set(m, HapIdx::new(h1 as u32), a2);
-                    geno.set(m, HapIdx::new(h2 as u32), a1);
-                }
-            }
-
-            // Biallelic check with SIMD-friendly iteration
-            let is_biallelic = marker_alleles.iter().all(|&a| a < 2 || a == 255);
-            let n_alleles = if is_biallelic { 2 } else { 256 };
-
-            // Advance wavefront
-            wavefront.advance_forward(&marker_alleles, n_alleles);
-
-            if pbwt_state_for_next_window.is_none() {
-                if let Some(handoff) = pbwt_handoff_at {
-                    if m + 1 == handoff {
-                        pbwt_state_for_next_window = Some(wavefront.get_state());
-                    }
-                }
-            }
-
-            // At sampling points, collect forward neighbors
-            if sampling_points.get(m).copied().unwrap_or(false) {
-                wavefront.prepare_fwd_queries();
-
-                let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
-                    .into_par_iter()
-                    .map(|s| {
-                        let h1 = (s * 2) as u32;
-                        let h2 = h1 + 1;
-                        let n1 = wavefront.find_fwd_neighbors_readonly(h1, n_candidates);
-                        let n2 = wavefront.find_fwd_neighbors_readonly(h2, n_candidates);
-                        (n1, n2)
-                    })
-                    .collect();
-
-                for (s, (n1, n2)) in neighbors_per_sample.into_iter().enumerate() {
-                    phase_states[s].add_neighbors_at_marker(s as u32, m, &n1, &n2);
-                }
-
-                // Add IBS2 neighbors
-                for s in 0..n_samples {
-                    let sample = SampleIdx::new(s as u32);
-                    for seg in ibs2.segments(sample) {
-                        if seg.contains(m) {
-                            // Use stack-allocated array instead of Vec for IBS2 neighbors
-                            let neighbors: [u32; 2] =
-                                [seg.other_sample.hap1().0, seg.other_sample.hap2().0];
-                            phase_states[s]
-                                .add_neighbors_at_marker(s as u32, m, &neighbors, &neighbors);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Backward pass - use direct slice access
-        wavefront.reset_backward();
-        for m in (0..n_markers).rev() {
-            let marker_alleles = geno.marker_alleles(m);
-
-            let is_biallelic = marker_alleles.iter().all(|&a| a < 2 || a == 255);
-            let n_alleles = if is_biallelic { 2 } else { 256 };
-
-            wavefront.advance_backward(&marker_alleles, n_alleles);
-
-            if sampling_points.get(m).copied().unwrap_or(false) {
-                wavefront.prepare_bwd_queries();
-
-                let neighbors_per_sample: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples)
-                    .into_par_iter()
-                    .map(|s| {
-                        let h1 = (s * 2) as u32;
-                        let h2 = h1 + 1;
-                        let n1 = wavefront.find_bwd_neighbors_readonly(h1, n_candidates);
-                        let n2 = wavefront.find_bwd_neighbors_readonly(h2, n_candidates);
-                        (n1, n2)
-                    })
-                    .collect();
-
-                for (s, (n1, n2)) in neighbors_per_sample.into_iter().enumerate() {
-                    phase_states[s].add_neighbors_at_marker(s as u32, m, &n1, &n2);
-                }
-            }
-        }
-
-        // Finalize
-        let empty_count = AtomicUsize::new(0);
-        let finalized: Vec<crate::model::states::ThreadedHaps> = phase_states
-            .into_par_iter()
-            .enumerate()
-            .map(|(s, mut ps)| {
-                if !ps.has_ibs_matches() {
-                    empty_count.fetch_add(1, Ordering::Relaxed);
-                }
-                ps.finalize_streaming(s as u32, n_haps)
-            })
-            .collect();
-        let empty = empty_count.load(Ordering::Relaxed);
-        if empty > 0 {
-            info!(
-                "finalize_streaming: {} of {} samples had no IBS matches (random fill)",
-                empty, n_samples
-            );
-        } else {
-            info!(
-                "finalize_streaming: all {} samples had IBS matches",
-                n_samples
-            );
-        }
-        (finalized, pbwt_state_for_next_window)
+        Ok(out)
     }
 
     /// Run a single phasing iteration using Forward-Backward Li-Stephens HMM
@@ -2269,17 +2211,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         geno: &mut MutableGenotypes,
         p_recomb: &[f32],
         gen_dists: &[f64],
-        ibs2: &Ibs2,
         mcmc_paths: &mut [Option<MosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
-        pbwt_state: Option<&crate::model::pbwt::PbwtState>,
-        pbwt_handoff_at: Option<usize>,
-    ) -> Result<Option<PbwtState>> {
+    ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
-        let samples = target_gt.samples_arc();
         let mut gen_positions = Vec::with_capacity(n_markers);
         gen_positions.push(0.0);
         for i in 1..n_markers {
@@ -2303,44 +2241,21 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // Build composite haplotypes for all samples using streaming PBWT
         // This uses O(N) memory instead of O(M*N) for the PBWT index
         let final_states = self.params.n_states.min(n_total_haps).max(1);
-        let n_candidates = final_states;
-        let state_pool = n_total_haps.max(1);
-        let (threaded_haps_vec, pbwt_state_next) =
-            tracing::info_span!("streaming_pbwt").in_scope(|| {
-                if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                    self.build_composite_haps_streaming(
-                        geno,
-                        Some(ref_gt),
-                        Some(alignment),
-                        n_markers,
-                        n_total_haps,
-                        n_samples,
-                        ibs2,
-                        n_candidates,
-                        state_pool,
-                        pbwt_state,
-                        None,
-                        &gen_positions,
-                        self.config.imp_step,
-                    )
-                } else {
-                    // Use optimized direct access version for no-reference case
-                    self.build_composite_haps_streaming_direct(
-                        geno,
-                        samples.as_ref(),
-                        n_markers,
-                        n_samples,
-                        ibs2,
-                        n_candidates,
-                        n_haps.max(1),
-                        pbwt_state,
-                        pbwt_handoff_at,
-                        &gen_positions,
-                        self.config.imp_step,
-                    )
-                }
-            });
-
+        let ref_gt = self.reference_gt.as_ref().map(|v| v.as_ref());
+        let threaded_haps_vec =
+            tracing::info_span!("prescan_selection").in_scope(|| {
+                self.build_phasing_prescan_states(
+                    target_gt,
+                    geno,
+                    ref_gt,
+                    self.alignment.as_ref(),
+                    n_markers,
+                    n_samples,
+                    &gen_positions,
+                    self.config.imp_step,
+                    None,
+                )
+            })?;
         let swap_results: Vec<(BitVec<u8, Lsb0>, Option<MosaicPaths>)> =
             info_span!("build_composite_view").in_scope(|| {
                 // Immutable borrow of geno for the entire read phase
@@ -2599,7 +2514,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
         });
 
-        Ok(pbwt_state_next)
+        Ok(())
     }
 
     /// Run Stage 1 phasing iteration on HIGH-FREQUENCY markers only using FB HMM
@@ -2609,7 +2524,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        samples: &Samples,
         stage1_p_recomb: &[f32],
         stage1_gen_dists: &[f64],
         hi_freq_to_orig: &[usize],
@@ -2627,88 +2541,39 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
         let n_haps = geno.n_haps();
 
-        // Compute total haplotype count (target + reference)
-        let n_ref_haps = self
-            .reference_gt
-            .as_ref()
-            .map(|r| r.n_haplotypes())
-            .unwrap_or(0);
-        let n_total_haps = n_haps + n_ref_haps;
         let n_samples = sample_phases.len();
         let n_hi_freq = hi_freq_to_orig.len();
 
-        let n_candidates = self.params.n_states.min(n_total_haps).max(1);
-        let (threaded_haps_vec, _) =
-            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                if self.config.profile {
-                    info_span!("phase_pbwt_build", markers = n_hi_freq, samples = n_samples)
-                        .in_scope(|| {
-                            self.build_composite_haps_streaming(
-                                geno,
-                                Some(ref_gt),
-                                Some(alignment),
-                                n_hi_freq,
-                                n_total_haps,
-                                n_samples,
-                                ibs2,
-                                n_candidates,
-                                self.params.n_states,
-                                None,
-                                Some(hi_freq_to_orig),
-                                hi_freq_gen_positions,
-                                self.config.imp_step,
-                            )
-                        })
-                } else {
-                    self.build_composite_haps_streaming(
+        let ref_gt = self.reference_gt.as_ref().map(|v| v.as_ref());
+        let threaded_haps_vec = if self.config.profile {
+            info_span!("phase_prescan_build", markers = n_hi_freq, samples = n_samples).in_scope(
+                || {
+                    self.build_phasing_prescan_states(
+                        target_gt,
                         geno,
-                        Some(ref_gt),
-                        Some(alignment),
+                        ref_gt,
+                        self.alignment.as_ref(),
                         n_hi_freq,
-                        n_total_haps,
                         n_samples,
-                        ibs2,
-                        n_candidates,
-                        self.params.n_states,
-                        None,
-                        Some(hi_freq_to_orig),
                         hi_freq_gen_positions,
                         self.config.imp_step,
+                        Some(hi_freq_to_orig),
                     )
-                }
-            } else if self.config.profile {
-                info_span!("phase_pbwt_build", markers = n_hi_freq, samples = n_samples).in_scope(
-                    || {
-                        self.build_composite_haps_streaming_direct(
-                            geno,
-                            samples,
-                            n_hi_freq,
-                            n_samples,
-                            ibs2,
-                            n_candidates,
-                            self.params.n_states,
-                            None,
-                            None,
-                            hi_freq_gen_positions,
-                            self.config.imp_step,
-                        )
-                    },
-                )
-            } else {
-                self.build_composite_haps_streaming_direct(
-                    geno,
-                    samples,
-                    n_hi_freq,
-                    n_samples,
-                    ibs2,
-                    n_candidates,
-                    self.params.n_states,
-                    None,
-                    None,
-                    hi_freq_gen_positions,
-                    self.config.imp_step,
-                )
-            };
+                },
+            )?
+        } else {
+            self.build_phasing_prescan_states(
+                target_gt,
+                geno,
+                ref_gt,
+                self.alignment.as_ref(),
+                n_hi_freq,
+                n_samples,
+                hi_freq_gen_positions,
+                self.config.imp_step,
+                Some(hi_freq_to_orig),
+            )?
+        };
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
         // We use a scoped immutable borrow that ends before the apply phase.
@@ -3120,12 +2985,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         &self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        samples: &Samples,
         hi_freq_markers: &[usize],
         gen_positions: &[f64],
         hi_freq_gen_positions: &[f64],
         stage1_p_recomb: &[f32],
-        ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
         maf: &[f32],
         rare_threshold: f32,
@@ -3134,6 +2997,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
     ) -> Option<Stage2OverlapHandoff> {
         let n_markers = geno.n_markers();
         let n_haps = geno.n_haps();
+        let n_ref_haps = self
+            .reference_gt
+            .as_ref()
+            .map(|r| r.n_haplotypes())
+            .unwrap_or(0);
+        let n_total_haps = n_haps + n_ref_haps;
         let n_stage1 = hi_freq_markers.len();
         let seed = self.config.seed;
         let n_haps_f = target_gt.n_haplotypes() as f32;
@@ -3197,12 +3066,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         // Compute total haplotype count (target + reference)
-        let n_ref_haps = self
-            .reference_gt
-            .as_ref()
-            .map(|r| r.n_haplotypes())
-            .unwrap_or(0);
-        let n_total_haps = n_haps + n_ref_haps;
 
         // Determine Stage 1 markers involved in the NEXT overlap region (for export)
         let next_overlap_indices = if let Some(start) = next_overlap_start {
@@ -3248,39 +3111,24 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         );
 
         let n_samples = n_haps / 2;
-        let n_candidates = self.params.n_states.min(n_total_haps).max(1);
-        let (threaded_haps_vec, _) =
-            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                self.build_composite_haps_streaming(
-                    geno,
-                    Some(ref_gt),
-                    Some(alignment),
-                    n_stage1,
-                    n_total_haps,
-                    n_samples,
-                    ibs2,
-                    n_candidates,
-                    self.params.n_states,
-                    None,
-                    Some(hi_freq_markers),
-                    hi_freq_gen_positions,
-                    self.config.imp_step,
-                )
-            } else {
-                self.build_composite_haps_streaming_direct(
-                    geno,
-                    samples,
-                    n_stage1,
-                    n_samples,
-                    ibs2,
-                    n_candidates,
-                    self.params.n_states,
-                    None,
-                    None,
-                    hi_freq_gen_positions,
-                    self.config.imp_step,
-                )
-            };
+        let ref_gt = self.reference_gt.as_ref().map(|v| v.as_ref());
+        let threaded_haps_vec = match self.build_phasing_prescan_states(
+            target_gt,
+            geno,
+            ref_gt,
+            self.alignment.as_ref(),
+            n_stage1,
+            n_samples,
+            hi_freq_gen_positions,
+            self.config.imp_step,
+            Some(hi_freq_markers),
+        ) {
+            Ok(states) => states,
+            Err(err) => {
+                eprintln!("Stage 2 prescan failed: {err}");
+                return None;
+            }
+        };
 
         // No clone needed: we only read geno during computation; local rephase
         // happens during threaded hap construction above.
@@ -6475,10 +6323,10 @@ mod tests {
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
 
         // Run phasing (with no overlap from previous window)
-        let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None, None, None);
+        let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None);
 
         assert!(result.is_ok());
-        let (phased, _, _) = result.unwrap();
+        let (phased, _) = result.unwrap();
         assert_eq!(phased.n_markers(), n_markers);
         assert_eq!(phased.n_haplotypes(), n_samples * 2);
 
@@ -6641,10 +6489,10 @@ mod tests {
         );
 
         // In combined mode, conditioning on partner should have no effect.
-        let _ = compute_pl_allele_probs(Some(&pl), true, 0, &mut allele_probs)
+        compute_pl_allele_probs(Some(&pl), true, 0, &mut allele_probs)
             .expect("expected biallelic PL to be parsed");
         let probs_partner0 = allele_probs.clone();
-        let _ = compute_pl_allele_probs(Some(&pl), true, 1, &mut allele_probs)
+        compute_pl_allele_probs(Some(&pl), true, 1, &mut allele_probs)
             .expect("expected biallelic PL to be parsed");
         let probs_partner1 = allele_probs.clone();
         assert!(
