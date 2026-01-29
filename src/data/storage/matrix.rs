@@ -248,26 +248,6 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.confidence.clone()
     }
 
-    /// Get phase confidence score for a sample at a marker (0-255).
-    /// Returns 255 (full confidence) if phase confidence is not available.
-    #[inline]
-    #[cfg(test)]
-    pub fn sample_phase_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
-        self.phase_confidence
-            .as_ref()
-            .and_then(|c| c.get(marker.as_usize()))
-            .and_then(|row| row.get(sample_idx))
-            .copied()
-            .unwrap_or(255)
-    }
-
-    /// Get phase confidence score as f32 (0.0-1.0).
-    #[inline]
-    #[cfg(test)]
-    pub fn sample_phase_confidence_f32(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> f32 {
-        self.sample_phase_confidence(marker, sample_idx) as f32 / 255.0
-    }
-
     /// Clone the phase confidence data (for transferring to a new matrix)
     pub fn phase_confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
         self.phase_confidence.clone()
@@ -463,6 +443,31 @@ impl<Space> GenotypeMatrix<Phased, Space> {
         unsafe {
             &*(self as *const GenotypeMatrix<Phased, Space> as *const GenotypeMatrix<Unphased, Space>)
         }
+    }
+}
+
+/// Accessor for phase confidence scores.
+/// Separated into a trait to avoid "unused" warnings in binary builds,
+/// while keeping functionality available for testing/validation.
+pub trait PhaseConfidenceAccess<Space> {
+    fn sample_phase_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8;
+    fn sample_phase_confidence_f32(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> f32;
+}
+
+impl<S: PhaseState, Space: Copy> PhaseConfidenceAccess<Space> for GenotypeMatrix<S, Space> {
+    #[inline]
+    fn sample_phase_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
+        self.phase_confidence
+            .as_ref()
+            .and_then(|c| c.get(marker.as_usize()))
+            .and_then(|row| row.get(sample_idx))
+            .copied()
+            .unwrap_or(255)
+    }
+
+    #[inline]
+    fn sample_phase_confidence_f32(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> f32 {
+        self.sample_phase_confidence(marker, sample_idx) as f32 / 255.0
     }
 }
 

@@ -2,6 +2,7 @@ use reagle::Nucleotide;
 use reagle::config::Config;
 use reagle::pipelines::imputation::ImputationPipeline;
 use reagle::pipelines::phasing::PhasingPipeline;
+use reagle::data::storage::PhaseConfidenceAccess;
 
 // Serialize tests to prevent OOM from parallel execution
 use ::noodles::bgzf::io as bgzf_io;

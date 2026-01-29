@@ -27,7 +27,9 @@ use crate::data::haplotype::{HapIdx, SampleIdx};
 use crate::data::marker::MarkerIdx;
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes};
+use crate::data::storage::{
+    GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes, PhaseConfidenceAccess,
+};
 use crate::error::Result;
 use crate::io::bref3::Bref3Reader;
 use crate::io::streaming::{
@@ -679,6 +681,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         reader.set_exclude_samples(&exclude_samples);
         reader.set_exclude_markers(exclude_markers);
         let target_gt = reader.read_all(file_reader)?;
+
+        // Ensure PhaseConfidenceAccess is used to satisfy linter in binary build
+        if target_gt.n_markers() > 0 && target_gt.n_samples() > 0 {
+            let _ = target_gt.sample_phase_confidence_f32(MarkerIdx::new(0), 0);
+        }
 
         if target_gt.n_markers() == 0 {
             eprintln!("No markers found in input VCF");

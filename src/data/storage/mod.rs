@@ -16,6 +16,7 @@ pub mod view;
 pub use dense::DenseColumn;
 pub use dictionary::DictionaryColumn;
 pub use matrix::GenotypeMatrix;
+pub use matrix::PhaseConfidenceAccess;
 pub use mutable::MutableGenotypes;
 pub use phase_state::PhaseState;
 pub use seq_coded::{SeqCodedBlock, SeqCodedColumn};
