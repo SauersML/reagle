@@ -2474,26 +2474,6 @@ impl crate::pipelines::ImputationPipeline {
         let use_hard_call_fallback = self.config.err.is_none();
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
             let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
-
-            // If we are trusting hard calls (no error correction), assume GT overrides PL
-            // if GT is present. This matches standard behavior where explicit GT is "truth".
-            if use_hard_call_fallback {
-                let n_ref_alleles = ref_markers
-                    .marker(MarkerIdx::new(marker_idx as u32))
-                    .n_alleles();
-                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                    let n_genotypes = n_ref_alleles * (n_ref_alleles + 1) / 2;
-                    if n_genotypes > 0 {
-                        let mut gp = vec![0.0f32; n_genotypes];
-                        let idx = genotype_index(a1 as usize, a2 as usize);
-                        if idx < gp.len() {
-                            gp[idx] = 1.0;
-                            return Some(gp);
-                        }
-                    }
-                }
-            }
-
             let pl_opt = target_pl.sample_pl(target_m, sample_idx);
 
             if let Some(pl) = pl_opt {
@@ -2568,8 +2548,12 @@ impl crate::pipelines::ImputationPipeline {
                 let mut gp = vec![0.0f32; n_genotypes];
                 let idx = genotype_index(a1 as usize, a2 as usize);
 
-                // We already handled use_hard_call_fallback case above, so here err > 0.
-                let err = error_rate.clamp(1e-6, 0.5);
+                // If explicit error correction is disabled, trust hard calls exactly.
+                let err = if use_hard_call_fallback {
+                    0.0
+                } else {
+                    error_rate.clamp(1e-6, 0.5)
+                };
 
                 let main = 1.0 - err;
                 if idx < gp.len() {
