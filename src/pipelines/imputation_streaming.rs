@@ -32,7 +32,7 @@ use crate::model::pl_emission::{
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
 use crate::model::types::GlobalId;
 use crate::model::impute_hmm::{
-    ImputeWorkspace, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
+    ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
 };
 use crate::model::transition_matrix::TransitionMatrix;
 use crate::pipelines::imputation::AllelePosteriors;
@@ -70,6 +70,7 @@ const PBWT_MAX_PER_HAP: usize = 256;
 const ABYSS_RANK_BASE: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const STATE_BUDGET_SAFETY: f64 = 0.6;
+const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
@@ -466,7 +467,12 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
             for &rh in bins {
                 let idx = rh as usize;
                 global_scores[i][idx] += weight;
-                window_scores[i][idx] += weight;
+                let w = &mut window_scores[i][idx];
+                if w.is_finite() {
+                    *w += weight;
+                } else {
+                    *w = weight;
+                }
             }
         }
     }
@@ -566,7 +572,12 @@ fn score_window_batch_pbwt<TargetSpace, RefSpace>(
                             continue;
                         }
                         global_scores[i][idx] += weight;
-                        window_scores[i][idx] += weight;
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
+                        }
                     }
                 }
             }
@@ -632,7 +643,12 @@ fn score_window_batch_pbwt<TargetSpace, RefSpace>(
                             continue;
                         }
                         global_scores[i][idx] += weight;
-                        window_scores[i][idx] += weight;
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
+                        }
                     }
                 }
             }
@@ -727,6 +743,11 @@ fn is_vcf_fully_phased(path: &Path) -> Result<bool> {
         for sample in parts {
             let mut fields = sample.split(':');
             let gt = fields.nth(gt_idx).unwrap_or("");
+            // Missing genotypes (e.g. "./.", ".|.", "0/.") should not force
+            // the entire file to be treated as unphased.
+            if gt.contains('.') {
+                continue;
+            }
             if gt.contains('/') {
                 line.clear();
                 return Ok(false);
@@ -773,7 +794,7 @@ fn build_imputation_plan(
         let per_thread = budget / n_threads as u64;
         (per_thread as f64 * STATE_BUDGET_SAFETY) as u64
     };
-    let force_full_panel = available_bytes == 0;
+    let force_full_panel = available_bytes < MIN_AVAIL_BYTES_FOR_PLANNING;
     let mut ref_reader = open_ref_reader(ref_path)?;
     let mut n_ref_haps = 0usize;
     loop {
@@ -828,7 +849,17 @@ fn build_imputation_plan(
                 let mut per_window_cap_window = if per_state_bytes == 0 {
                     0
                 } else {
-                    (safe_bytes_per_thread as usize) / per_state_bytes
+                    let full_panel_bytes = per_state_bytes
+                        .saturating_mul(n_ref_haps)
+                        .saturating_mul(n_threads.max(1));
+                    let can_fit_full_panel = available_bytes > 0
+                        && full_panel_bytes as f64
+                            <= (available_bytes as f64 * FULL_PANEL_RAM_FRACTION);
+                    if can_fit_full_panel {
+                        n_ref_haps
+                    } else {
+                        (safe_bytes_per_thread as usize) / per_state_bytes
+                    }
                 };
                 if per_window_cap_window == 0 {
                     per_window_cap_window = 1;
@@ -975,14 +1006,14 @@ fn build_imputation_plan(
             for i in 0..batch_len {
                 if global_scores[i].len() != n_ref_haps {
                     global_scores[i] = vec![0.0f32; n_ref_haps];
-                    window_scores[i] = vec![0.0f32; n_ref_haps];
-                    best_window_scores[i] = vec![0.0f32; n_ref_haps];
+                    window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                    best_window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
                     window_rank_hits[i] = vec![0u32; n_ref_haps];
                 }
             }
 
             for w in window_scores.iter_mut() {
-                w.fill(0.0);
+                w.fill(f32::NEG_INFINITY);
             }
 
             let k_per_hap = per_window_cap_window
@@ -1292,7 +1323,8 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
-        let mut phased_p_mismatch: Option<f32> = None;
+        // NOTE: imputation uses its own mismatch prior; we do not carry phasing error rates.
+        let mut phased_recomb_intensity: Option<f32> = None;
         if !is_vcf_fully_phased(&phased_target_path)? {
             eprintln!("Target is unphased; running phasing before pre-scan...");
             let tmpdir = tempfile::tempdir()?;
@@ -1306,7 +1338,7 @@ impl crate::pipelines::ImputationPipeline {
                 self.telemetry.clone(),
             );
             phasing.run()?;
-            phased_p_mismatch = Some(phasing.params().p_mismatch);
+            phased_recomb_intensity = Some(phasing.params().recomb_intensity);
             phased_target_path = phased_prefix.with_extension("vcf.gz");
             phased_tmp = Some(tmpdir);
         } else {
@@ -1318,7 +1350,12 @@ impl crate::pipelines::ImputationPipeline {
             .nthreads
             .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
             .unwrap_or(1);
-        let avail_bytes = available_memory_bytes().unwrap_or(0);
+        let mut avail_bytes = available_memory_bytes().unwrap_or(0);
+        if avail_bytes < MIN_AVAIL_BYTES_FOR_PLANNING {
+            // Treat unknown/low memory as "planning disabled" to avoid
+            // tiny caps in CI/small test runs.
+            avail_bytes = 0;
+        }
         let min_states = 64usize;
         let mut raw_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers);
         loop {
@@ -1375,15 +1412,13 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut ref_reader = open_ref_reader(ref_path)?;
         let target_was_unphased_for_impute = !is_vcf_fully_phased(&input_target_path)?;
-        let target_path_for_impute = if target_was_unphased_for_impute {
-            // Use the phased output for imputation to provide haplotype-resolved
-            // emissions; this preserves long-range LD signal for HMM inference.
-            phased_target_path.clone()
-        } else {
-            phased_target_path.clone()
-        };
+        // Always use phased target haplotypes for emissions to preserve LD signal.
+        // If the input was unphased, we will still treat phase as uncertain in
+        // the emission model (heterozygotes → 0.5/0.5 per haplotype).
+        let use_phased_for_impute = true;
+        let target_path_for_impute = phased_target_path.clone();
         if target_was_unphased_for_impute {
-            eprintln!("Target was unphased at input; using phased target for imputation.");
+            eprintln!("Target was unphased at input; using phased target for imputation (phase-uncertain emissions).");
         } else {
             eprintln!("Target already phased; using phased target directly for imputation.");
         }
@@ -1392,7 +1427,8 @@ impl crate::pipelines::ImputationPipeline {
             gen_maps.clone(),
             streaming_config.clone(),
         )?;
-        let mut target_reader_pl = if target_was_unphased_for_impute {
+        let mut target_reader_pl = if use_phased_for_impute {
+            // Pull PL/GL from the original target VCF (if present).
             Some(StreamingVcfReader::open(
                 &input_target_path,
                 gen_maps.clone(),
@@ -1409,11 +1445,14 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
-        if let Some(p_mismatch) = phased_p_mismatch {
-            if p_mismatch.is_finite() && p_mismatch > 0.0 {
-                self.params.p_mismatch = p_mismatch;
+        if let Some(recomb_intensity) = phased_recomb_intensity {
+            if recomb_intensity.is_finite() && recomb_intensity > 0.0 {
+                self.params.recomb_intensity = recomb_intensity;
             }
         }
+        // Do not inherit phasing mismatch estimates for imputation. Imputation
+        // should use the Li-Stephens mismatch prior (or user override) tied to
+        // the reference panel, not phasing-specific error rates.
         self.params
             .set_n_states(self.config.phase_states.min(n_ref_pool.saturating_sub(2)));
 
@@ -1533,6 +1572,10 @@ impl crate::pipelines::ImputationPipeline {
                 ref_window.global_start,
                 ref_window.output_start,
                 ref_window.output_end,
+                // Use phase confidence from the phased target haplotypes. If the
+                // input was unphased, the phasing pipeline provides calibrated
+                // phase confidence for heterozygotes, which we should leverage
+                // to preserve LD signal in imputation emissions.
                 true,
             )?;
 
@@ -1634,52 +1677,24 @@ impl crate::pipelines::ImputationPipeline {
             })
             .collect();
 
-        let mut ref_allele_freqs: Vec<Vec<f32>> = vec![Vec::new(); n_ref_markers];
-        let n_ref_haps = ref_columns
-            .first()
-            .map(|c| c.n_haplotypes())
-            .unwrap_or(0);
-        for m in 0..n_ref_markers {
-            let n_alleles = ref_markers.marker(MarkerIdx::new(m as u32)).n_alleles();
-            let mut counts = vec![0u32; n_alleles.max(1)];
-            let mut total = 0u32;
-            for h in 0..n_ref_haps {
-                let a = ref_columns[m].get(HapIdx::new(h as u32));
-                if a == 255 {
-                    continue;
-                }
-                let idx = a as usize;
-                if idx < counts.len() {
-                    counts[idx] += 1;
-                    total += 1;
-                }
-            }
-            let mut freqs = vec![0.0f32; counts.len()];
-            if total > 0 {
-                let inv = 1.0 / total as f32;
-                for (i, c) in counts.into_iter().enumerate() {
-                    freqs[i] = c as f32 * inv;
-                }
-            }
-            ref_allele_freqs[m] = freqs;
-        }
+        let ref_allele_freqs = RefAlleleFreqs::new(ref_columns, ref_markers);
 
         let marker_map = {
             let chrom = ref_markers
                 .marker(MarkerIdx::new(0))
                 .chrom;
             if let Some(gen_map) = gen_maps.get(chrom) {
-                // Use cluster cM as a minimum genetic distance between adjacent markers.
-                // This mirrors Beagle-style marker clustering and prevents per-marker
-                // recombination rates from collapsing in very short regions.
-                let min_dist = self.config.cluster.max(1e-8) as f64;
-                crate::data::genetic_map::MarkerMap::from_gen_map_with_min_dist(
+                // External map: use Beagle-style minimum distance derived from the map.
+                crate::data::genetic_map::MarkerMap::create(ref_markers, gen_map)
+            } else {
+                // No external map: use linear map (1 cM per Mb) with a tiny
+                // minimum distance to avoid zero genetic distance. This mirrors
+                // Beagle's MIN_CM_DIST behavior without inflating recombination.
+                let min_dist = 1e-7_f64;
+                crate::data::genetic_map::MarkerMap::from_positions_with_min_dist(
                     ref_markers,
-                    gen_map,
                     min_dist,
                 )
-            } else {
-                crate::data::genetic_map::MarkerMap::from_positions(ref_markers)
             }
         };
         let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
@@ -1721,6 +1736,83 @@ impl crate::pipelines::ImputationPipeline {
             }
         }
 
+        let per_window_cap_local = plan
+            .per_window_caps
+            .get(window_idx)
+            .copied()
+            .unwrap_or(plan.per_window_cap)
+            .max(1);
+        let mut state_haps_by_hap: Vec<Vec<GlobalId>> = Vec::with_capacity(n_target_samples * 2);
+        for hap_idx in 0..(n_target_samples * 2) {
+            let mut state_haps: Vec<GlobalId> = Vec::new();
+            if hap_idx < plan.window_intervals.len() {
+                for hi in plan.window_intervals[hap_idx].iter() {
+                    if hi.contains(window_idx) {
+                        state_haps.push(hi.hap);
+                        if state_haps.len() >= per_window_cap_local {
+                            break;
+                        }
+                    }
+                }
+            }
+            if state_haps.is_empty() && hap_idx < plan.core_states.len() {
+                state_haps.extend(plan.core_states[hap_idx].iter().copied());
+            }
+            state_haps.sort_unstable_by_key(|g| g.as_u32());
+            state_haps.dedup();
+            if hap_idx < plan.abyss_mask.len() {
+                let abyss = &plan.abyss_mask[hap_idx];
+                state_haps.retain(|g| !abyss[g.as_usize()]);
+            }
+            if state_haps.is_empty() {
+                // Hard fallback: pick the first non-abyss haplotypes.
+                if hap_idx < plan.abyss_mask.len() {
+                    let abyss = &plan.abyss_mask[hap_idx];
+                    for h in 0..plan.n_ref_haps {
+                        if !abyss.get(h).copied().unwrap_or(true) {
+                            state_haps.push(GlobalId::new(h as u32));
+                            if state_haps.len() >= per_window_cap_local {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(
+                !state_haps.is_empty(),
+                "State selection produced empty haplotype set"
+            );
+            state_haps_by_hap.push(state_haps);
+        }
+
+        let prior_mappers_by_hap: Option<Vec<Option<TransitionMatrix>>> =
+            imp_overlap.and_then(|o| o.hap_priors()).map(|hp| {
+                let mut out: Vec<Option<TransitionMatrix>> = Vec::with_capacity(n_target_samples * 2);
+                for hap_idx in 0..(n_target_samples * 2) {
+                    let priors = hp.get(hap_idx);
+                    if let Some(p) = priors {
+                        if p.is_empty() {
+                            out.push(None);
+                            continue;
+                        }
+                        let prev_states: Vec<GlobalId> =
+                            p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
+                        let next_states = state_haps_by_hap
+                            .get(hap_idx)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        if next_states.is_empty() {
+                            out.push(None);
+                        } else {
+                            out.push(Some(TransitionMatrix::build(&prev_states, next_states)));
+                        }
+                    } else {
+                        out.push(None);
+                    }
+                }
+                out
+            });
+
         let normalize_probs = |probs: &mut [f32]| -> bool {
             let mut sum = 0.0f32;
             for p in probs.iter_mut() {
@@ -1739,258 +1831,282 @@ impl crate::pipelines::ImputationPipeline {
             }
         };
 
+
         let target_samples = target_win.samples_arc();
         let target_pl_matrix = target_pl.unwrap_or(target_win);
         let err_rate = self.params.p_mismatch.clamp(1e-6, 0.5);
-        let build_input_probs = |hap_idx: HapIdx, sample_idx: usize| -> TargetAlleleProbs {
-            let mut offsets = Vec::with_capacity(n_ref_markers + 1);
-            let mut probs: Vec<f32> = Vec::new();
-            offsets.push(0);
+        let build_input_probs_pair = |hap1: HapIdx, hap2: HapIdx, sample_idx: usize| -> (TargetAlleleProbs, TargetAlleleProbs) {
+            let mut offsets1 = Vec::with_capacity(n_ref_markers + 1);
+            let mut offsets2 = Vec::with_capacity(n_ref_markers + 1);
+            let mut probs1: Vec<f32> = Vec::new();
+            let mut probs2: Vec<f32> = Vec::new();
+            offsets1.push(0);
+            offsets2.push(0);
 
             for (ref_m, target_m_idx) in alignment.ref_to_target.iter().enumerate() {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles();
-                let mut aligned_probs: Vec<f32> = Vec::new();
-                let mut use_probs = false;
+                let mut aligned1: Vec<f32> = Vec::new();
+                let mut aligned2: Vec<f32> = Vec::new();
+                let mut use1 = false;
+                let mut use2 = false;
 
                 if let Some(target_m_idx) = target_m_idx {
                     let target_m = target_m_idx.as_usize();
-                    let mut conf = target_pl_matrix
+                    let conf_base = target_pl_matrix
                         .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx);
-                    let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap_idx);
-                    let partner_allele =
-                        target_win.allele(MarkerIdx::new(target_m as u32), hap_idx.other());
+                    let mut conf1 = conf_base;
+                    let mut conf2 = conf_base;
+                    let allele1 = target_win.allele(MarkerIdx::new(target_m as u32), hap1);
+                    let allele2 = target_win.allele(MarkerIdx::new(target_m as u32), hap2);
 
-                    let (mapped_allele, mapped_partner) = if let Some(mapping) = alignment
+                    let (mapped1, mapped2) = if let Some(mapping) = alignment
                         .allele_mappings
                         .get(target_m)
                         .and_then(|m| m.as_ref())
                     {
-                        if (allele as usize) < mapping.targ_to_ref.len() {
-                            let r = mapping.targ_to_ref[allele as usize];
-                            let mapped_allele = if r >= 0 { r as u8 } else { 255 };
-                            let mapped_partner =
-                                if (partner_allele as usize) < mapping.targ_to_ref.len() {
-                                    let rp = mapping.targ_to_ref[partner_allele as usize];
-                                    if rp >= 0 { rp as u8 } else { 255 }
-                                } else {
-                                    255
-                                };
-                            (mapped_allele, mapped_partner)
+                        let mapped1 = if (allele1 as usize) < mapping.targ_to_ref.len() {
+                            let r = mapping.targ_to_ref[allele1 as usize];
+                            if r >= 0 { r as u8 } else { 255 }
                         } else {
-                            (255, 255)
-                        }
+                            255
+                        };
+                        let mapped2 = if (allele2 as usize) < mapping.targ_to_ref.len() {
+                            let r = mapping.targ_to_ref[allele2 as usize];
+                            if r >= 0 { r as u8 } else { 255 }
+                        } else {
+                            255
+                        };
+                        (mapped1, mapped2)
                     } else {
-                        (allele, partner_allele)
+                        (allele1, allele2)
                     };
 
                     let is_diploid =
                         target_samples.is_diploid(SampleIdx::new(sample_idx as u32));
-                    let mut has_hard = mapped_allele != 255
-                        && (mapped_allele as usize) < n_alleles
+                    let has_hard = mapped1 != 255
+                        && (mapped1 as usize) < n_alleles
                         && (!is_diploid
-                            || (mapped_partner != 255 && (mapped_partner as usize) < n_alleles));
-                    // If the input was unphased, avoid hard-allele emissions unless
-                    // we have PL/GL evidence; otherwise we over-clamp the HMM to a
-                    // potentially incorrect phase assignment.
-                    if !phase_conf_valid {
-                        has_hard = false;
-                    }
-                    let mut pl_probs: Vec<f32> = Vec::new();
+                            || (mapped2 != 255 && (mapped2 as usize) < n_alleles));
+                    // If phase confidence is unavailable (unphased input), we still
+                    // use hard genotype information but avoid committing to a phase:
+                    // heterozygotes are represented as 0.5/0.5 per haplotype.
+
                     let pl = target_pl_matrix.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
-                    if let Some(pl) = pl {
-                        if !pl.is_empty() {
-                            let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len()).unwrap_or(0);
-                            if n_pl_alleles > 0 {
-                                let mapping = alignment
-                                    .allele_mappings
-                                    .get(target_m)
-                                    .and_then(|m| m.as_ref());
-                                // Prefer haplotype-conditional allele probabilities when we have
-                                // a phased partner allele. If phase is uncertain, mix conditional
-                                // posteriors using phase confidence.
-                                let mut used_conditional = false;
-                                if phase_conf_valid
-                                    && partner_allele != 255
-                                    && (partner_allele as usize) < n_pl_alleles
+                    let mapping = alignment
+                        .allele_mappings
+                        .get(target_m)
+                        .and_then(|m| m.as_ref());
+
+                    // If the input is unphased, avoid conditioning on a partner
+                    // allele. Use unconditional allele probabilities from PL
+                    // (if present) for both haplotypes.
+                    if !phase_conf_valid {
+                        if let Some(pl) = pl {
+                            if !pl.is_empty() {
+                                let mut pl_probs: Vec<f32> = Vec::new();
+                                if allele_probs_uncond_from_pl(pl, None, &mut pl_probs)
+                                    .is_some()
                                 {
-                                    let phase_conf = target_win
-                                        .sample_phase_confidence_f32(
-                                            MarkerIdx::new(target_m as u32),
-                                            sample_idx,
-                                        )
-                                        .clamp(0.0, 1.0);
-                                    let mut weights = vec![0.0f32; n_pl_alleles];
-                                    let mut denom = 0.0f32;
-                                    for i in 0..n_pl_alleles {
-                                        if i != partner_allele as usize {
-                                            denom += 1.0;
-                                        }
-                                    }
-                                    weights[partner_allele as usize] = phase_conf;
-                                    if denom > 0.0 {
-                                        let scale = (1.0 - phase_conf) / denom;
-                                        for i in 0..n_pl_alleles {
-                                            if i != partner_allele as usize {
-                                                weights[i] = scale;
-                                            }
-                                        }
-                                    }
-
-                                    let mut cond_probs: Vec<f32> = Vec::new();
-                                    pl_probs.resize(n_pl_alleles, 0.0);
-                                    let mut weight_sum = 0.0f32;
-                                    for b in 0..n_pl_alleles {
-                                        let w = weights[b];
-                                        if w <= 0.0 {
-                                            continue;
-                                        }
-                                        if allele_probs_cond_from_pl(pl, b as u8, None, &mut cond_probs)
-                                            .is_some()
-                                        {
-                                            for (a, &p) in cond_probs.iter().enumerate() {
-                                                if a < pl_probs.len() {
-                                                    pl_probs[a] += w * p;
-                                                }
-                                            }
-                                            weight_sum += w;
-                                        }
-                                    }
-                                    if weight_sum > 0.0 {
-                                        normalize_probs(&mut pl_probs);
-                                        if let Some(mapping) = mapping {
-                                            let mut mapped = vec![0.0f32; n_alleles];
-                                            for (t_idx, &p) in pl_probs.iter().enumerate() {
-                                                if t_idx < mapping.targ_to_ref.len() {
-                                                    let r = mapping.targ_to_ref[t_idx];
-                                                    if r >= 0 && (r as usize) < n_alleles {
-                                                        mapped[r as usize] += p;
-                                                    }
-                                                }
-                                            }
-                                            if normalize_probs(&mut mapped) {
-                                                aligned_probs = mapped;
-                                                use_probs = true;
-                                                used_conditional = true;
-                                            }
-                                        } else if pl_probs.len() == n_alleles {
-                                            aligned_probs = pl_probs.clone();
-                                            use_probs = true;
-                                            used_conditional = true;
-                                        }
-                                    }
-                                }
-
-                                if !used_conditional
-                                    && allele_probs_uncond_from_pl(pl, None, &mut pl_probs).is_some()
-                                {
-                                    if let Some(mapping) = mapping {
-                                        let mut mapped = vec![0.0f32; n_alleles];
-                                        for (t_idx, &p) in pl_probs.iter().enumerate() {
-                                            if t_idx < mapping.targ_to_ref.len() {
-                                                let r = mapping.targ_to_ref[t_idx];
-                                                if r >= 0 && (r as usize) < n_alleles {
-                                                    mapped[r as usize] += p;
-                                                }
-                                            }
-                                        }
-                                        if normalize_probs(&mut mapped) {
-                                            aligned_probs = mapped;
-                                            use_probs = true;
-                                        }
-                                    } else if pl_probs.len() == n_alleles {
-                                        aligned_probs = pl_probs;
-                                        use_probs = true;
-                                    }
-                                } else if !used_conditional {
-                                    let uniform = 1.0 / n_pl_alleles as f32;
-                                    let target_priors = vec![uniform; n_pl_alleles];
-
-                                    let partner = target_win
-                                        .allele(MarkerIdx::new(target_m as u32), hap_idx.other());
-                                    let conf = conf.clamp(0.0, 1.0);
-                                    let mut weights = vec![0.0f32; n_pl_alleles];
-                                    if partner != 255 && (partner as usize) < n_pl_alleles {
-                                        let partner_idx = partner as usize;
-                                        let mut denom = 0.0f32;
-                                        for (i, &p) in target_priors.iter().enumerate() {
-                                            if i != partner_idx {
-                                                denom += p;
-                                            }
-                                        }
-                                        weights[partner_idx] = conf;
-                                        if denom > 0.0 {
-                                            let scale = (1.0 - conf) / denom;
-                                            for i in 0..n_pl_alleles {
-                                                if i != partner_idx {
-                                                    weights[i] = target_priors[i] * scale;
-                                                }
-                                            }
-                                        } else if n_pl_alleles > 1 {
-                                            let uniform =
-                                                (1.0 - conf) / (n_pl_alleles as f32 - 1.0);
-                                            for i in 0..n_pl_alleles {
-                                                if i != partner_idx {
-                                                    weights[i] = uniform;
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        weights.copy_from_slice(&target_priors);
-                                    }
-
-                                    let mut cond_probs: Vec<f32> = Vec::new();
-                                    pl_probs.resize(n_pl_alleles, 0.0);
-                                    let mut weight_sum = 0.0f32;
-                                    for b in 0..n_pl_alleles {
-                                        let w = weights[b];
-                                        if w <= 0.0 {
-                                            continue;
-                                        }
-                                        if allele_probs_cond_from_pl(pl, b as u8, None, &mut cond_probs)
-                                            .is_some()
-                                        {
-                                            for (a, &p) in cond_probs.iter().enumerate() {
-                                                if a < pl_probs.len() {
-                                                    pl_probs[a] += w * p;
-                                                }
-                                            }
-                                            weight_sum += w;
-                                        }
-                                    }
-                                    if weight_sum > 0.0 {
-                                        normalize_probs(&mut pl_probs);
-                                        if let Some(mapping) = mapping {
-                                            let mut mapped = vec![0.0f32; n_alleles];
-                                            for (t_idx, &p) in pl_probs.iter().enumerate() {
-                                                if t_idx < mapping.targ_to_ref.len() {
-                                                    let r = mapping.targ_to_ref[t_idx];
-                                                    if r >= 0 && (r as usize) < n_alleles {
-                                                        mapped[r as usize] += p;
-                                                    }
-                                                }
-                                            }
-                                            if normalize_probs(&mut mapped) {
-                                                aligned_probs = mapped;
-                                                use_probs = true;
-                                            }
-                                        } else if pl_probs.len() == n_alleles {
-                                            aligned_probs = pl_probs.clone();
-                                            use_probs = true;
-                                        }
+                                    if pl_probs.len() == n_alleles {
+                                        aligned1 = pl_probs.clone();
+                                        aligned2 = pl_probs;
+                                        use1 = true;
+                                        use2 = true;
                                     }
                                 }
                             }
                         }
                     }
 
-                    if !use_probs && has_hard {
-                        // If we only have hard GT (no PL/GL evidence), soften confidence
-                        // using the global mismatch rate to avoid over-clamping emissions.
-                        if pl.is_none() || pl.as_ref().map_or(true, |v| v.is_empty()) {
-                            conf = conf.min(1.0 - err_rate);
+                    let compute_from_pl = |partner_allele: u8, out: &mut Vec<f32>, used: &mut bool| {
+                        let mut pl_probs: Vec<f32> = Vec::new();
+                        if let Some(pl) = pl {
+                            if !pl.is_empty() {
+                                let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len()).unwrap_or(0);
+                                if n_pl_alleles > 0 {
+                                    let mut used_conditional = false;
+                                    if phase_conf_valid
+                                        && partner_allele != 255
+                                        && (partner_allele as usize) < n_pl_alleles
+                                    {
+                                        let phase_conf = target_win
+                                            .sample_phase_confidence_f32(
+                                                MarkerIdx::new(target_m as u32),
+                                                sample_idx,
+                                            )
+                                            .clamp(0.0, 1.0);
+                                        let mut weights = vec![0.0f32; n_pl_alleles];
+                                        let mut denom = 0.0f32;
+                                        for i in 0..n_pl_alleles {
+                                            if i != partner_allele as usize {
+                                                denom += 1.0;
+                                            }
+                                        }
+                                        weights[partner_allele as usize] = phase_conf;
+                                        if denom > 0.0 {
+                                            let scale = (1.0 - phase_conf) / denom;
+                                            for i in 0..n_pl_alleles {
+                                                if i != partner_allele as usize {
+                                                    weights[i] = scale;
+                                                }
+                                            }
+                                        }
+
+                                        let mut cond_probs: Vec<f32> = Vec::new();
+                                        pl_probs.resize(n_pl_alleles, 0.0);
+                                        let mut weight_sum = 0.0f32;
+                                        for b in 0..n_pl_alleles {
+                                            let w = weights[b];
+                                            if w <= 0.0 {
+                                                continue;
+                                            }
+                                            if allele_probs_cond_from_pl(pl, b as u8, None, &mut cond_probs)
+                                                .is_some()
+                                            {
+                                                for (a, &p) in cond_probs.iter().enumerate() {
+                                                    if a < pl_probs.len() {
+                                                        pl_probs[a] += w * p;
+                                                    }
+                                                }
+                                                weight_sum += w;
+                                            }
+                                        }
+                                        if weight_sum > 0.0 {
+                                            normalize_probs(&mut pl_probs);
+                                            if let Some(mapping) = mapping {
+                                                let mut mapped = vec![0.0f32; n_alleles];
+                                                for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                                    if t_idx < mapping.targ_to_ref.len() {
+                                                        let r = mapping.targ_to_ref[t_idx];
+                                                        if r >= 0 && (r as usize) < n_alleles {
+                                                            mapped[r as usize] += p;
+                                                        }
+                                                    }
+                                                }
+                                                if normalize_probs(&mut mapped) {
+                                                    *out = mapped;
+                                                    *used = true;
+                                                    used_conditional = true;
+                                                }
+                                            } else if pl_probs.len() == n_alleles {
+                                                *out = pl_probs.clone();
+                                                *used = true;
+                                                used_conditional = true;
+                                            }
+                                        }
+                                    }
+
+                                    if !used_conditional
+                                        && allele_probs_uncond_from_pl(pl, None, &mut pl_probs).is_some()
+                                    {
+                                        if let Some(mapping) = mapping {
+                                            let mut mapped = vec![0.0f32; n_alleles];
+                                            for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                                if t_idx < mapping.targ_to_ref.len() {
+                                                    let r = mapping.targ_to_ref[t_idx];
+                                                    if r >= 0 && (r as usize) < n_alleles {
+                                                        mapped[r as usize] += p;
+                                                    }
+                                                }
+                                            }
+                                            if normalize_probs(&mut mapped) {
+                                                *out = mapped;
+                                                *used = true;
+                                            }
+                                        } else if pl_probs.len() == n_alleles {
+                                            *out = pl_probs.clone();
+                                            *used = true;
+                                        }
+                                    } else if !used_conditional {
+                                        let uniform = 1.0 / n_pl_alleles as f32;
+                                        let target_priors = vec![uniform; n_pl_alleles];
+
+                                        let conf = conf_base.clamp(0.0, 1.0);
+                                        let mut weights = vec![0.0f32; n_pl_alleles];
+                                        if partner_allele != 255 && (partner_allele as usize) < n_pl_alleles {
+                                            let partner_idx = partner_allele as usize;
+                                            let mut denom = 0.0f32;
+                                            for (i, &p) in target_priors.iter().enumerate() {
+                                                if i != partner_idx {
+                                                    denom += p;
+                                                }
+                                            }
+                                            weights[partner_idx] = conf;
+                                            if denom > 0.0 {
+                                                let scale = (1.0 - conf) / denom;
+                                                for i in 0..n_pl_alleles {
+                                                    if i != partner_idx {
+                                                        weights[i] = target_priors[i] * scale;
+                                                    }
+                                                }
+                                            } else if n_pl_alleles > 1 {
+                                                let uniform =
+                                                    (1.0 - conf) / (n_pl_alleles as f32 - 1.0);
+                                                for i in 0..n_pl_alleles {
+                                                    if i != partner_idx {
+                                                        weights[i] = uniform;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            weights.copy_from_slice(&target_priors);
+                                        }
+
+                                        let mut cond_probs: Vec<f32> = Vec::new();
+                                        pl_probs.resize(n_pl_alleles, 0.0);
+                                        let mut weight_sum = 0.0f32;
+                                        for b in 0..n_pl_alleles {
+                                            let w = weights[b];
+                                            if w <= 0.0 {
+                                                continue;
+                                            }
+                                            if allele_probs_cond_from_pl(pl, b as u8, None, &mut cond_probs)
+                                                .is_some()
+                                            {
+                                                for (a, &p) in cond_probs.iter().enumerate() {
+                                                    if a < pl_probs.len() {
+                                                        pl_probs[a] += w * p;
+                                                    }
+                                                }
+                                                weight_sum += w;
+                                            }
+                                        }
+                                        if weight_sum > 0.0 {
+                                            normalize_probs(&mut pl_probs);
+                                            if let Some(mapping) = mapping {
+                                                let mut mapped = vec![0.0f32; n_alleles];
+                                                for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                                    if t_idx < mapping.targ_to_ref.len() {
+                                                        let r = mapping.targ_to_ref[t_idx];
+                                                        if r >= 0 && (r as usize) < n_alleles {
+                                                            mapped[r as usize] += p;
+                                                        }
+                                                    }
+                                                }
+                                                if normalize_probs(&mut mapped) {
+                                                    *out = mapped;
+                                                    *used = true;
+                                                }
+                                            } else if pl_probs.len() == n_alleles {
+                                                *out = pl_probs.clone();
+                                                *used = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        aligned_probs.resize(n_alleles, 0.0);
-                        if is_diploid && mapped_partner != 255 && mapped_partner != mapped_allele {
+                    };
+
+                    compute_from_pl(allele2, &mut aligned1, &mut use1);
+                    compute_from_pl(allele1, &mut aligned2, &mut use2);
+
+                    if !use1 && has_hard {
+                        if pl.is_none() || pl.as_ref().map_or(true, |v| v.is_empty()) {
+                            conf1 = conf1.min(1.0 - err_rate);
+                        }
+                        aligned1.resize(n_alleles, 0.0);
+                        if is_diploid && mapped2 != 255 && mapped2 != mapped1 {
                             if phase_conf_valid {
                                 let phase_conf = target_win
                                     .sample_phase_confidence_f32(
@@ -1998,38 +2114,63 @@ impl crate::pipelines::ImputationPipeline {
                                         sample_idx,
                                     )
                                     .clamp(0.0, 1.0);
-                                aligned_probs[mapped_allele as usize] = phase_conf;
-                                aligned_probs[mapped_partner as usize] = 1.0 - phase_conf;
+                                aligned1[mapped1 as usize] = phase_conf;
+                                aligned1[mapped2 as usize] = 1.0 - phase_conf;
                             } else {
-                                aligned_probs[mapped_allele as usize] = 0.5;
-                                aligned_probs[mapped_partner as usize] = 0.5;
+                                aligned1[mapped1 as usize] = 0.5;
+                                aligned1[mapped2 as usize] = 0.5;
                             }
                         } else {
-                            aligned_probs[mapped_allele as usize] = 1.0;
+                            aligned1[mapped1 as usize] = conf1.clamp(0.0, 1.0);
                         }
-                        if conf < 1.0 {
-                            let uniform = 1.0 / n_alleles as f32;
-                            for p in aligned_probs.iter_mut() {
-                                *p = conf * *p + (1.0 - conf) * uniform;
+                        use1 = true;
+                    }
+
+                    if !use2 && has_hard {
+                        if pl.is_none() || pl.as_ref().map_or(true, |v| v.is_empty()) {
+                            conf2 = conf2.min(1.0 - err_rate);
+                        }
+                        aligned2.resize(n_alleles, 0.0);
+                        if is_diploid && mapped1 != 255 && mapped1 != mapped2 {
+                            if phase_conf_valid {
+                                let phase_conf = target_win
+                                    .sample_phase_confidence_f32(
+                                        MarkerIdx::new(target_m as u32),
+                                        sample_idx,
+                                    )
+                                    .clamp(0.0, 1.0);
+                                aligned2[mapped2 as usize] = phase_conf;
+                                aligned2[mapped1 as usize] = 1.0 - phase_conf;
+                            } else {
+                                aligned2[mapped2 as usize] = 0.5;
+                                aligned2[mapped1 as usize] = 0.5;
                             }
+                        } else {
+                            aligned2[mapped2 as usize] = conf2.clamp(0.0, 1.0);
                         }
-                        use_probs = true;
+                        use2 = true;
                     }
                 }
 
-                if use_probs {
-                    probs.extend_from_slice(&aligned_probs);
-                } else {
-                    let uniform = 1.0 / n_alleles as f32;
-                    for _ in 0..n_alleles {
-                        probs.push(uniform);
-                    }
+                if !use1 {
+                    aligned1.resize(n_alleles.max(1), 1.0);
+                }
+                if !use2 {
+                    aligned2.resize(n_alleles.max(1), 1.0);
                 }
 
-                offsets.push(probs.len());
+                let _ = normalize_probs(&mut aligned1);
+                let _ = normalize_probs(&mut aligned2);
+
+                probs1.extend_from_slice(&aligned1);
+                probs2.extend_from_slice(&aligned2);
+                offsets1.push(probs1.len());
+                offsets2.push(probs2.len());
             }
-
-            TargetAlleleProbs::new(offsets, probs)
+            (
+                TargetAlleleProbs::new(offsets1, probs1),
+                TargetAlleleProbs::new(offsets2, probs2),
+            )
         };
 
         thread_local! {
@@ -2065,52 +2206,16 @@ impl crate::pipelines::ImputationPipeline {
 
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
+                let (input_probs_h1, input_probs_h2) = build_input_probs_pair(h1_idx, h2_idx, s);
                 let mut process_haplotype = |hap_idx: HapIdx,
-                                         priors: Option<&HaplotypePriors>|
+                                         priors: Option<&HaplotypePriors>,
+                                         input_probs: &TargetAlleleProbs|
                  -> (Vec<AllelePosteriors>, HaplotypePriors) {
-                    let input_probs = build_input_probs(hap_idx, s);
-
                     let plan_idx = hap_idx.as_usize();
-                    let per_window_cap_local = plan
-                        .per_window_caps
-                        .get(window_idx)
-                        .copied()
-                        .unwrap_or(plan.per_window_cap)
-                        .max(1);
-                    let mut state_haps: Vec<GlobalId> = Vec::new();
-                    if plan_idx < plan.window_intervals.len() {
-                        for hi in plan.window_intervals[plan_idx].iter() {
-                            if hi.contains(window_idx) {
-                                state_haps.push(hi.hap);
-                                if state_haps.len() >= per_window_cap_local {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if state_haps.is_empty() && plan_idx < plan.core_states.len() {
-                        state_haps.extend(plan.core_states[plan_idx].iter().copied());
-                    }
-                    state_haps.sort_unstable_by_key(|g| g.as_u32());
-                    state_haps.dedup();
-                    if plan_idx < plan.abyss_mask.len() {
-                        let abyss = &plan.abyss_mask[plan_idx];
-                        state_haps.retain(|g| !abyss[g.as_usize()]);
-                    }
-                    if state_haps.is_empty() {
-                        // Hard fallback: pick the first non-abyss haplotypes.
-                        if plan_idx < plan.abyss_mask.len() {
-                            let abyss = &plan.abyss_mask[plan_idx];
-                            for h in 0..plan.n_ref_haps {
-                                if !abyss.get(h).copied().unwrap_or(true) {
-                                    state_haps.push(GlobalId::new(h as u32));
-                                    if state_haps.len() >= per_window_cap_local {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let state_haps = state_haps_by_hap
+                        .get(plan_idx)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
                     assert!(
                         !state_haps.is_empty(),
                         "State selection produced empty haplotype set"
@@ -2127,10 +2232,18 @@ impl crate::pipelines::ImputationPipeline {
                             }
                             return None;
                         }
-                        let prev_states: Vec<GlobalId> =
-                            p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
-                        let mapper = TransitionMatrix::build(&prev_states, &state_haps);
-                        let mapped = mapper.map(p.probs()).into_vec();
+                        let mapper = prior_mappers_by_hap
+                            .as_ref()
+                            .and_then(|v| v.get(plan_idx))
+                            .and_then(|m| m.as_ref());
+                        let mapped = if let Some(mapper) = mapper {
+                            mapper.map(p.probs()).into_vec()
+                        } else {
+                            let prev_states: Vec<GlobalId> =
+                                p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
+                            let mapper = TransitionMatrix::build(&prev_states, state_haps);
+                            mapper.map(p.probs()).into_vec()
+                        };
                         if mapped.iter().all(|v| !v.is_finite() || *v <= 0.0) && !warned_empty_map {
                             warn!(
                                 "State handoff mapped to empty priors for window {} (state set mismatch)",
@@ -2148,9 +2261,9 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         let ws = ws_opt.as_mut().unwrap();
                         run_impute_hmm(
-                            &state_haps,
+                            state_haps,
                             ref_columns,
-                            &input_probs,
+                            input_probs,
                             &p_recomb,
                             self.params.p_mismatch,
                             prior_marker_idx,
@@ -2176,8 +2289,8 @@ impl crate::pipelines::ImputationPipeline {
                     (posteriors, next_priors)
                 };
 
-                let (post1_full, p1_out) = process_haplotype(h1_idx, priors_h1);
-                let (post2_full, p2_out) = process_haplotype(h2_idx, priors_h2);
+                let (post1_full, p1_out) = process_haplotype(h1_idx, priors_h1, &input_probs_h1);
+                let (post2_full, p2_out) = process_haplotype(h2_idx, priors_h2, &input_probs_h2);
 
                 let output_len = output_end.saturating_sub(output_start);
                 let mut dosages = Vec::with_capacity(output_len);
@@ -2368,7 +2481,6 @@ impl crate::pipelines::ImputationPipeline {
         self.write_imputed_window_streaming(
             ref_markers,
             ref_genotypes,
-            &ref_allele_freqs,
             target_win,
             target_pl,
             alignment,
@@ -2426,7 +2538,6 @@ impl crate::pipelines::ImputationPipeline {
         &self,
         ref_markers: &crate::data::marker::Markers<RefMarkerSpace>,
         ref_genotypes: Option<&GenotypeMatrix<Phased, RefPhaseSpace>>,
-        ref_allele_freqs: &[Vec<f32>],
         target_win: &GenotypeMatrix<Phased, TargetSpace>,
         target_pl: Option<&GenotypeMatrix<Phased, TargetSpace>>,
         alignment: &MarkerAlignment<TargetSpace, RefMarkerSpace>,
@@ -2462,7 +2573,6 @@ impl crate::pipelines::ImputationPipeline {
         let _ = &write_span;
 
         let include_posteriors = include_gp || include_ap;
-        let _ = ref_allele_freqs.len();
         let n_samples = target_win.n_samples();
         let mut result_by_sample: Vec<Option<&SampleImputationResult>> = vec![None; n_samples];
         for result in all_results {
@@ -2967,12 +3077,9 @@ mod tests {
 
         let pipeline = ImputationPipeline::new(Config::default(), None);
         let ref_is_biallelic = vec![true; ref_markers.len()];
-        let ref_allele_freqs = vec![vec![0.5, 0.5]; ref_markers.len()];
-
         let result = pipeline.write_imputed_window_streaming(
             &ref_markers,
             Some(&ref_genotypes),
-            &ref_allele_freqs,
             &target_win,
             None,
             &alignment,

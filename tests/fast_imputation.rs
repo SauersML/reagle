@@ -2078,6 +2078,7 @@ fn test_phasing_confidence() {
         mcmc_burnin: 3,
         dynamic_mcmc: false,
         mcmc_steps: 10,
+        mcmc_lr_samples: 32,
         phase_states: 80,
         rare: 0.002,
         impute: false,

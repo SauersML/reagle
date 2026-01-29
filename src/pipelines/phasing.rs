@@ -1230,6 +1230,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             .map(|m| m.len())
             .unwrap_or(0);
         let estimated_markers = file_size / 100;
+        let _ = self.params();
 
         let use_streaming = estimated_markers > self.config.window_markers as u64;
 
@@ -2549,6 +2550,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         },
                                         sample_seed,
                                         self.config.mcmc_burnin,
+                                        self.config.mcmc_lr_samples,
                                         p_no_err,
                                         p_err,
                                         ws,
@@ -2918,6 +2920,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         prior_paths.get(s).and_then(|p| p.as_ref()),
                                         sample_seed,
                                         self.config.mcmc_burnin,
+                                        self.config.mcmc_lr_samples,
                                         p_no_err,
                                         p_err,
                                         ws,
@@ -2942,6 +2945,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     prior_paths.get(s).and_then(|p| p.as_ref()),
                                     sample_seed,
                                     self.config.mcmc_burnin,
+                                    self.config.mcmc_lr_samples,
                                     p_no_err,
                                     p_err,
                                     ws,
@@ -2956,6 +2960,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     let mut current_phase = 0u8;
                     let mut phase_idx = 0usize;
                     for i in 0..n_hi_freq {
+                        let m = hi_freq_to_orig[i];
+                        let a1 = seq1[i];
+                        let a2 = seq2[i];
+                        let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                        let is_phased_het = is_het && !sp.is_unphased(m);
+
+                        // Phased heterozygotes are anchors: do not swap them and
+                        // do not propagate swap state across them.
+                        if is_phased_het {
+                            swap_mask[i] = false;
+                            current_phase = 0;
+                            continue;
+                        }
+
                         if phase_idx < het_positions.len() && het_positions[phase_idx] == i {
                             current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
                             phase_idx += 1;
@@ -5691,6 +5709,7 @@ fn sample_swap_bits_mosaic(
     initial_paths: Option<&MosaicPaths>,
     seed: u64,
     burnin: usize,
+    lr_samples_param: usize,
     p_no_err: f32,
     p_err: f32,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
@@ -5824,7 +5843,7 @@ fn sample_swap_bits_mosaic(
         chain.step();
     }
 
-    const LR_SAMPLES: usize = 4;
+    let lr_samples = lr_samples_param.max(1);
     let mut swap_counts = vec![0u32; het_positions.len()];
     let mut obs_counts = vec![0u32; het_positions.len()];
     let mut last_orients = vec![0u8; het_positions.len()];
@@ -5833,10 +5852,10 @@ fn sample_swap_bits_mosaic(
         path2: Vec::new(),
     };
 
-    for sample_idx in 0..LR_SAMPLES {
+    for sample_idx in 0..lr_samples {
         chain.step();
         let (path1, path2) = chain.paths();
-        let is_last = sample_idx + 1 == LR_SAMPLES;
+        let is_last = sample_idx + 1 == lr_samples;
 
         for (i, &m) in het_positions.iter().enumerate() {
             let a1 = seq1[m];
@@ -6342,6 +6361,7 @@ mod tests {
             mcmc_burnin: 1,
             dynamic_mcmc: false,
             mcmc_steps: 3,
+            mcmc_lr_samples: 32,
             phase_states: 280,
             rare: 0.002,
             impute: true,
@@ -6429,6 +6449,7 @@ mod tests {
             mcmc_burnin: 1,
             dynamic_mcmc: false,
             mcmc_steps: 3,
+            mcmc_lr_samples: 32,
             phase_states: 10,
             rare: 0.002,
             impute: true,

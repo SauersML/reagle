@@ -66,6 +66,10 @@ pub struct Config {
     #[arg(long = "mcmc-steps", default_value = "3")]
     pub mcmc_steps: usize,
 
+    /// Number of MCMC samples used to estimate phase LR (higher = more stable)
+    #[arg(long = "mcmc-lr-samples", default_value = "32")]
+    pub mcmc_lr_samples: usize,
+
     /// Model states for phasing (more states = better accuracy)
     #[arg(long = "phase-states", default_value = "400")]
     pub phase_states: usize,
@@ -164,6 +168,7 @@ impl Default for Config {
             mcmc_burnin: 2,
             dynamic_mcmc: false,
             mcmc_steps: 3,
+            mcmc_lr_samples: 32,
             phase_states: 400,
             rare: 0.002,
             impute: true,
@@ -281,6 +286,12 @@ impl Config {
         if self.window < 1.1 * self.overlap {
             return Err(ReagleError::config(
                 "The 'window' parameter must be at least 1.1 times the 'overlap' parameter",
+            ));
+        }
+
+        if self.mcmc_lr_samples == 0 {
+            return Err(ReagleError::config(
+                "mcmc-lr-samples must be positive",
             ));
         }
 
