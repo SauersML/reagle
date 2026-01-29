@@ -1772,12 +1772,22 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
 
     // Compress the masked file
     let masked_gz = work_dir.path().join("masked.vcf.gz");
-    let status = Command::new("gzip")
-        .args(["-c"])
-        .stdin(File::open(&masked_path).unwrap())
-        .stdout(File::create(&masked_gz).unwrap())
+        // Use bcftools to produce BGZF and index
+        let status = Command::new("bcftools")
+            .args([
+                "view",
+                "-Oz",
+                "-o",
+                masked_gz.to_str().unwrap(),
+                masked_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("bcftools view failed");
+        assert!(status.success());
+        let status = Command::new("bcftools")
+            .args(["index", "-f", masked_gz.to_str().unwrap()])
         .status()
-        .expect("gzip failed");
+            .expect("bcftools index failed");
     assert!(status.success());
 
     // Run Java BEAGLE
@@ -2077,12 +2087,22 @@ fn test_comparison_framework_self_check() {
 
     // Compress
     let masked_gz = work_dir.path().join("masked.vcf.gz");
-    let status = Command::new("gzip")
-        .args(["-c"])
-        .stdin(File::open(&masked_path).unwrap())
-        .stdout(File::create(&masked_gz).unwrap())
+    // Use bcftools to produce BGZF and index
+    let status = Command::new("bcftools")
+        .args([
+            "view",
+            "-Oz",
+            "-o",
+            masked_gz.to_str().unwrap(),
+            masked_path.to_str().unwrap(),
+        ])
         .status()
-        .expect("gzip");
+        .expect("bcftools view failed");
+    assert!(status.success());
+    let status = Command::new("bcftools")
+        .args(["index", "-f", masked_gz.to_str().unwrap()])
+        .status()
+        .expect("bcftools index failed");
     assert!(status.success());
 
     // Run BEAGLE
@@ -2783,12 +2803,22 @@ fn test_diverse_mask_scenarios() {
 
         // Compress masked file
         let masked_gz = work_dir.path().join("masked.vcf.gz");
-        let status = Command::new("gzip")
-            .args(["-c"])
-            .stdin(File::open(&masked_path).unwrap())
-            .stdout(File::create(&masked_gz).unwrap())
+    // Use bcftools to produce BGZF and index
+    let status = Command::new("bcftools")
+        .args([
+            "view",
+            "-Oz",
+            "-o",
+            masked_gz.to_str().unwrap(),
+            masked_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("bcftools view failed");
+    assert!(status.success());
+    let status = Command::new("bcftools")
+        .args(["index", "-f", masked_gz.to_str().unwrap()])
             .status()
-            .expect("gzip failed");
+        .expect("bcftools index failed");
         assert!(status.success());
 
         // Run Java BEAGLE
@@ -2899,12 +2929,22 @@ fn test_multiple_seeds_consistency() {
 
         // Compress
         let masked_gz = work_dir.path().join("masked.vcf.gz");
-        let status = Command::new("gzip")
-            .args(["-c"])
-            .stdin(File::open(&masked_path).unwrap())
-            .stdout(File::create(&masked_gz).unwrap())
+        // Use bcftools to produce BGZF and index
+        let status = Command::new("bcftools")
+            .args([
+                "view",
+                "-Oz",
+                "-o",
+                masked_gz.to_str().unwrap(),
+                masked_path.to_str().unwrap(),
+            ])
             .status()
-            .expect("gzip failed");
+            .expect("bcftools view failed");
+        assert!(status.success());
+        let status = Command::new("bcftools")
+            .args(["index", "-f", masked_gz.to_str().unwrap()])
+            .status()
+            .expect("bcftools index failed");
         assert!(status.success());
 
         // Run Java
@@ -3036,12 +3076,22 @@ fn test_per_sample_imputation_accuracy() {
 
     // Compress
     let masked_gz = work_dir.path().join("masked.vcf.gz");
-    let status = Command::new("gzip")
-        .args(["-c"])
-        .stdin(File::open(&masked_path).unwrap())
-        .stdout(File::create(&masked_gz).unwrap())
+    // Use bcftools to produce BGZF and index
+    let status = Command::new("bcftools")
+        .args([
+            "view",
+            "-Oz",
+            "-o",
+            masked_gz.to_str().unwrap(),
+            masked_path.to_str().unwrap(),
+        ])
         .status()
-        .expect("gzip failed");
+        .expect("bcftools view failed");
+    assert!(status.success());
+    let status = Command::new("bcftools")
+        .args(["index", "-f", masked_gz.to_str().unwrap()])
+        .status()
+        .expect("bcftools index failed");
     assert!(status.success());
 
     // Run Java

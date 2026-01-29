@@ -650,7 +650,7 @@ fn is_vcf_fully_phased(path: &Path) -> Result<bool> {
         for sample in parts {
             let mut fields = sample.split(':');
             let gt = fields.nth(gt_idx).unwrap_or("");
-            if gt.contains('/') {
+            if gt.contains('/') || gt.contains('.') {
                 line.clear();
                 return Ok(false);
             }
@@ -2490,8 +2490,16 @@ impl crate::pipelines::ImputationPipeline {
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
             let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
 
-            // Only check PLs if genotype preservation is NOT enforced
-            if !genotype_preservation {
+            // Only check PLs if genotype preservation is NOT enforced, OR if the
+            // sample is not genotyped (GT is missing/./.). In the latter case,
+            // we want to use input PLs (if any) as a better prior than uniform.
+            // Note: Check target_pl (raw input) for missingness, not target_win
+            // (which may have been imputed by phasing).
+            let h1 = HapIdx::new((sample_idx * 2) as u32);
+            let raw_a1 = target_pl.allele(target_m, h1);
+            let is_genotyped = raw_a1 != 255;
+
+            if !genotype_preservation || !is_genotyped {
                 let pl = target_pl.sample_pl(target_m, sample_idx)?;
                 if !pl.is_empty() {
                     let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len())?;
