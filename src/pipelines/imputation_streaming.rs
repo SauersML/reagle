@@ -1312,10 +1312,14 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        // Do not update p_mismatch from phasing.
+        // Phasing on sparse data (Stage 1) can overestimate error rates,
+        // causing Imputation HMM to become "lazy" (trapped in mismatch state)
+        // instead of switching to rare haplotypes.
+        // Keeping the default (0.0001) ensures strong mismatch penalty.
         if let Some(p_mismatch) = phased_p_mismatch {
-            if p_mismatch.is_finite() && p_mismatch > 0.0 {
-                self.params.p_mismatch = p_mismatch;
-            }
+            // Log for debugging but do not apply
+            eprintln!("  Ignoring phased p_mismatch={:.6} to avoid Perfect LD Trap", p_mismatch);
         }
         self.params
             .set_n_states(self.config.phase_states.min(n_ref_pool.saturating_sub(2)));
