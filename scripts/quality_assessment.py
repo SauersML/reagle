@@ -32,8 +32,9 @@ def run_benchmark(person, file_path, format):
     # Reference panels used for Beagle imputation must be fully phased and contain no missing data.
     # We create a derivative panel that excludes sites with missing calls and forces phased separators.
     # The original ref.vcf.gz is preserved for Reagle to ensure no loss of data in the primary pipeline.
-    # We fill missing genotypes FIRST to prevent filtering out sparse sites, then ensure output is valid.
-    run_cmd("bcftools +setGT ref.vcf.gz -Ou -- -t . -n 0|0 | bcftools view -g ^miss -Oz -o ref_beagle.vcf.gz", shell=True)
+    # We fill missing genotypes FIRST to prevent filtering out sparse sites. We remove the 'view -g ^miss' filter
+    # because setGT should have handled it, and aggressive filtering causes empty VCFs in sparse test cases.
+    run_cmd("bcftools +setGT ref.vcf.gz -Ou -- -t . -n 0|0 | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
     run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
 
     beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
