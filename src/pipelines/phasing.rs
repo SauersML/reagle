@@ -2373,6 +2373,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     } else {
                         GenotypeView::Mutable(ref_geno)
                     };
+                    if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                        GenotypeView::Composite {
+                            target: ref_geno,
+                            reference: ref_gt,
+                            alignment,
+                            n_target_haps: n_haps,
+                        }
+                    } else {
+                        GenotypeView::Mutable(ref_geno)
+                    };
 
                 let prior_paths = &mcmc_paths[..];
                 // Initialize with empty/default values - will be overwritten by parallel iter
@@ -2730,14 +2740,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 // Use Composite view when reference panel is available
                 let ref_view: GenotypeView<'_, crate::data::AnyMarkerSpace, RefSpace> =
                     if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                        GenotypeView::Composite {
+                        GenotypeView::CompositeSubset {
                             target: ref_geno,
                             reference: ref_gt,
                             alignment,
+                            subset: hi_freq_to_orig,
                             n_target_haps: n_haps,
                         }
                     } else {
-                        GenotypeView::Mutable(ref_geno)
+                        GenotypeView::MutableSubset {
+                            geno: ref_geno,
+                            subset: hi_freq_to_orig,
+                        }
                     };
 
                 let prior_paths = &mcmc_paths[..];
