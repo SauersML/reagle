@@ -1267,7 +1267,8 @@ impl crate::pipelines::ImputationPipeline {
             .copied()
             .min()
             .unwrap_or(plan.per_window_cap);
-        if full_panel_cap >= plan.n_ref_haps {
+        let full_panel = full_panel_cap >= plan.n_ref_haps;
+        if full_panel {
             eprintln!("Imputation mode: full panel per window (abyss still active)");
         } else {
             eprintln!(
@@ -1277,8 +1278,15 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let mut ref_reader = open_ref_reader(ref_path)?;
+        let target_path_for_impute = if target_was_unphased && full_panel {
+            // For full-panel imputation on originally unphased targets, prefer
+            // the unphased genotypes to preserve marginal genotype likelihoods.
+            input_target_path.clone()
+        } else {
+            phased_target_path.clone()
+        };
         let mut target_reader = StreamingVcfReader::open(
-            &phased_target_path,
+            &target_path_for_impute,
             gen_maps.clone(),
             streaming_config.clone(),
         )?;
