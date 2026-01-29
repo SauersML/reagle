@@ -112,41 +112,64 @@ impl ReferencePbwt {
             return Vec::new();
         }
 
-        let mut out = Vec::with_capacity(k);
-
+        let mut total_len = 0;
         for &(l, r) in beam.intervals() {
-            if out.len() >= k {
-                break;
-            }
             let l = l.min(n_ref as u32) as usize;
             let r = r.min(n_ref as u32) as usize;
-            if l >= r {
-                continue;
+            if r > l {
+                total_len += r - l;
             }
-            let center = (l + r) / 2;
+        }
 
-            let mut left = center;
-            let mut right = center;
-            while out.len() < k && (left > l || right < r) {
-                if left > l {
-                    left -= 1;
-                    out.push(self.ppa[left]);
+        let mut out = Vec::with_capacity(k);
+
+        if total_len <= k {
+            // Take all
+            for &(l, r) in beam.intervals() {
+                let l = l.min(n_ref as u32) as usize;
+                let r = r.min(n_ref as u32) as usize;
+                for i in l..r {
+                    out.push(self.ppa[i]);
+                }
+            }
+        } else {
+            // Uniform sampling
+            // Step size to get exactly k samples
+            let step = total_len as f64 / k as f64;
+            let mut current = 0.0;
+            let mut interval_start = 0.0;
+
+            for &(l, r) in beam.intervals() {
+                let l = l.min(n_ref as u32) as usize;
+                let r = r.min(n_ref as u32) as usize;
+                if r <= l {
+                    continue;
+                }
+                let len = (r - l) as f64;
+                let interval_end = interval_start + len;
+
+                // While the next sampling point is within this interval
+                while current < interval_end {
+                    // Map current sampling point to local index
+                    let local_offset = (current - interval_start).floor() as usize;
+                    if local_offset < (r - l) {
+                        out.push(self.ppa[l + local_offset]);
+                    }
+                    current += step;
                     if out.len() >= k {
                         break;
                     }
                 }
-                if right < r {
-                    out.push(self.ppa[right]);
-                    right += 1;
+                interval_start = interval_end;
+                if out.len() >= k {
+                    break;
                 }
             }
         }
 
         out.sort_unstable();
         out.dedup();
-        if out.len() > k {
-            out.truncate(k);
-        }
+        // Dedup might reduce count, but that's acceptable (better than duplicates)
         out
     }
 
@@ -322,13 +345,17 @@ impl ReferencePbwt {
                         let nr = self.offsets[b] + self.rank(b, r, n_ref);
                         if nl < nr {
                             let len = nr - nl;
-                            let score = len.saturating_mul(self.counts[b]);
+                        // Use match length as score; do not weight by count (frequency).
+                        // Weighting by frequency (len * count) biases state selection towards
+                        // common haplotypes when data is missing, causing loss of rare variants.
+                        let score = len;
                             scratch.push((nl, nr, score));
                         }
                     }
                 }
 
-                scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+            // Stable sort by score (descending) to preserve bin order for ties
+            scratch.sort_by(|a, b| b.2.cmp(&a.2));
                 let keep = scratch.len().min(MAX_RANK_INTERVALS);
                 for i in 0..keep {
                     next.intervals[i] = (scratch[i].0, scratch[i].1);
@@ -354,13 +381,13 @@ impl ReferencePbwt {
                             let nr = self.offsets[b] + self.rank(b, r, n_ref);
                             if nl < nr {
                                 let len = nr - nl;
-                                let score = len.saturating_mul(self.counts[b]);
+                                let score = len;
                                 scratch.push((nl, nr, score));
                             }
                         }
                     }
 
-                    scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                    scratch.sort_by(|a, b| b.2.cmp(&a.2));
                     let keep = scratch.len().min(MAX_RANK_INTERVALS);
                     for i in 0..keep {
                         next.intervals[i] = (scratch[i].0, scratch[i].1);
