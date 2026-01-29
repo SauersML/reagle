@@ -537,7 +537,13 @@ pub fn run_impute_hmm<Space>(
                 let numerator = mismatch_sum + (prior_alpha - 1.0) as f64;
                 let denom = mismatch_markers + prior_denom as f64;
                 let e_map = (numerator / denom).clamp(1e-8, 0.5 - 1e-8) as f32;
-                current_error = e_map;
+                // Prevent error rate from dropping below the initial prior/estimate
+                // to avoid overfitting to perfect LD regions (Perfect LD Trap).
+                // We enforce a minimum of 1e-3 to ensure mismatch cost (~6.9) is
+                // comparable to recombination cost in high-LD regions (~6.7),
+                // allowing the HMM to prefer mismatch over recombination when
+                // inferring rare variants.
+                current_error = e_map.max(error_rate).max(1e-3);
             }
         } else {
             final_posteriors = posteriors;
