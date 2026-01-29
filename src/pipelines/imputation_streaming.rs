@@ -1203,10 +1203,9 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
-        let mut target_was_unphased = false;
-        if !is_vcf_fully_phased(&phased_target_path)? {
+        let target_was_unphased = !is_vcf_fully_phased(&input_target_path)?;
+        if target_was_unphased {
             eprintln!("Target is unphased; running phasing before pre-scan...");
-            target_was_unphased = true;
             let tmpdir = tempfile::tempdir()?;
             let phased_prefix = tmpdir.path().join("phased_target");
             let mut phase_config = self.config.clone();
