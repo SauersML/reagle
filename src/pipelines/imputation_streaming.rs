@@ -1203,8 +1203,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
-        let target_was_unphased = !is_vcf_fully_phased(&input_target_path)?;
-        if target_was_unphased {
+        if !is_vcf_fully_phased(&phased_target_path)? {
             eprintln!("Target is unphased; running phasing before pre-scan...");
             let tmpdir = tempfile::tempdir()?;
             let phased_prefix = tmpdir.path().join("phased_target");
@@ -1573,7 +1572,6 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         let target_samples = target_win.samples_arc();
-        let target_was_unphased = target_was_unphased;
         let build_input_probs = |hap_idx: HapIdx, sample_idx: usize| -> TargetAlleleProbs {
             let mut offsets = Vec::with_capacity(n_ref_markers + 1);
             let mut probs: Vec<f32> = Vec::new();
@@ -1734,21 +1732,14 @@ impl crate::pipelines::ImputationPipeline {
                     if !use_probs && has_hard {
                         aligned_probs.resize(n_alleles, 0.0);
                         if is_diploid && mapped_partner != 255 && mapped_partner != mapped_allele {
-                            if target_was_unphased {
-                                // For originally unphased targets, treat heterozygotes as
-                                // marginal (0.5/0.5) so each hap HMM can explore both paths.
-                                aligned_probs[mapped_allele as usize] = 0.5;
-                                aligned_probs[mapped_partner as usize] = 0.5;
-                            } else {
-                                let phase_conf = target_win
-                                    .sample_phase_confidence_f32(
-                                        MarkerIdx::new(target_m as u32),
-                                        sample_idx,
-                                    )
-                                    .clamp(0.0, 1.0);
-                                aligned_probs[mapped_allele as usize] = phase_conf;
-                                aligned_probs[mapped_partner as usize] = 1.0 - phase_conf;
-                            }
+                            let phase_conf = target_win
+                                .sample_phase_confidence_f32(
+                                    MarkerIdx::new(target_m as u32),
+                                    sample_idx,
+                                )
+                                .clamp(0.0, 1.0);
+                            aligned_probs[mapped_allele as usize] = phase_conf;
+                            aligned_probs[mapped_partner as usize] = 1.0 - phase_conf;
                         } else {
                             aligned_probs[mapped_allele as usize] = 1.0;
                         }
