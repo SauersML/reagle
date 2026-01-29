@@ -779,6 +779,7 @@ fn build_imputation_plan(
     gen_maps: &GeneticMaps,
     target_positions: &TargetMarkerIndex,
     per_window_cap: usize,
+    state_cap: usize,
     available_bytes: u64,
     n_threads: usize,
     imp_step_cm: f64,
@@ -791,12 +792,13 @@ fn build_imputation_plan(
         return Err(ReagleError::vcf("No target samples for pre-scan".to_string()));
     }
 
+    let state_cap = state_cap.max(1);
     let mut plan = ImputationPlan {
         n_ref_haps: 0,
         core_states: vec![Vec::new(); n_target_haps],
         window_intervals: vec![Vec::new(); n_target_haps],
         abyss_mask: vec![Vec::new(); n_target_haps],
-        per_window_cap,
+        per_window_cap: per_window_cap.min(state_cap).max(1),
         per_window_caps: Vec::new(),
     };
 
@@ -880,7 +882,8 @@ fn build_imputation_plan(
                 }
                 per_window_cap_window
             };
-            per_window_cap_window = per_window_cap_window.min(n_ref_haps).max(1);
+            let cap = state_cap.min(n_ref_haps).max(1);
+            per_window_cap_window = per_window_cap_window.min(cap).max(1);
             per_window_caps.push(per_window_cap_window);
 
             let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
@@ -895,7 +898,10 @@ fn build_imputation_plan(
         }
     }
 
-    if !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps) {
+    let can_full_panel =
+        !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps)
+            && state_cap >= n_ref_haps;
+    if can_full_panel {
         let num_windows = per_window_caps.len();
         if num_windows == 0 {
             return Err(ReagleError::vcf(
@@ -927,6 +933,12 @@ fn build_imputation_plan(
         }
         return Ok(plan);
     } else {
+        if !per_window_caps.is_empty() && state_cap < n_ref_haps {
+            eprintln!(
+                "Pre-scan: forced (state_cap={} < ref_haps={}); enabling LMS allocation",
+                state_cap, n_ref_haps
+            );
+        }
         // Reset for prescan path (we rebuilt these in the fast-path probe).
         window_handoff.clear();
         per_window_caps.clear();
@@ -986,7 +998,8 @@ fn build_imputation_plan(
             if per_window_cap_window == 0 {
                 per_window_cap_window = 1;
             }
-            per_window_cap_window = per_window_cap_window.min(n_ref_haps).max(1);
+            let cap = state_cap.min(n_ref_haps).max(1);
+            per_window_cap_window = per_window_cap_window.min(cap).max(1);
             if batch_start == 0 {
                 per_window_caps.push(per_window_cap_window);
             }
@@ -1273,6 +1286,14 @@ impl crate::pipelines::ImputationPipeline {
             max_markers: self.config.window_markers,
         };
 
+        if let Some(bb) = &self.telemetry {
+            bb.set_stage(crate::utils::telemetry::Stage::LoadingData);
+            bb.set_producer_stage(crate::utils::telemetry::Stage::LoadingData);
+            bb.set_consumer_stage(crate::utils::telemetry::Stage::LoadingData);
+            bb.set_op("Preparing input");
+            bb.set_producer_op("Preparing input");
+        }
+
         let (target_positions_map, target_marker_count) =
             collect_target_positions(&self.config.gt)?;
         let target_positions = if target_marker_count == 0 {
@@ -1371,6 +1392,7 @@ impl crate::pipelines::ImputationPipeline {
             avail_bytes = 0;
         }
         let min_states = 64usize;
+        let state_cap = self.config.imp_states.max(1);
         let mut raw_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers);
         loop {
             let total_budget = raw_budget.max(1);
@@ -1387,10 +1409,12 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             total_budget
         };
+        let per_window_cap = per_window_cap.min(state_cap).max(1);
 
         eprintln!(
-            "Imputation plan: per_window_cap={}, threads={}, available_mb={}",
+            "Imputation plan: per_window_cap={}, state_cap={}, threads={}, available_mb={}",
             per_window_cap,
+            state_cap,
             n_threads,
             avail_bytes / (1024 * 1024)
         );
@@ -1402,6 +1426,7 @@ impl crate::pipelines::ImputationPipeline {
             &gen_maps,
             &target_positions_map,
             per_window_cap,
+            state_cap,
             if force_full_panel { 0 } else { avail_bytes },
             n_threads,
             self.config.imp_step as f64,
@@ -1423,6 +1448,11 @@ impl crate::pipelines::ImputationPipeline {
             );
         }
         log_imputation_plan_summary(&plan);
+
+        if let Some(bb) = &self.telemetry {
+            bb.set_total_windows(plan.per_window_caps.len() as u64);
+            bb.set_current_window(0);
+        }
 
         let mut ref_reader = open_ref_reader(ref_path)?;
         let target_was_unphased_for_impute = !is_vcf_fully_phased(&input_target_path)?;
@@ -1468,7 +1498,7 @@ impl crate::pipelines::ImputationPipeline {
         // should use the Li-Stephens mismatch prior (or user override) tied to
         // the reference panel, not phasing-specific error rates.
         self.params
-            .set_n_states(self.config.phase_states.min(n_ref_pool.saturating_sub(2)));
+            .set_n_states(self.config.imp_states.min(n_ref_pool.saturating_sub(2)));
 
         let target_samples = target_reader.samples_arc();
         let n_target_samples = target_samples.len();
@@ -1489,6 +1519,12 @@ impl crate::pipelines::ImputationPipeline {
         let mut window_idx = 0usize;
 
         loop {
+            if let Some(bb) = &self.telemetry {
+                bb.set_producer_stage(crate::utils::telemetry::Stage::LoadingData);
+                bb.set_producer_op(&format!("Loading ref window {}", window_idx + 1));
+                bb.set_op(&format!("Loading ref window {}", window_idx + 1));
+                bb.set_current_window((window_idx + 1) as u64);
+            }
             let ref_window = ref_reader.next_window(
                 &streaming_config,
                 &gen_maps,
@@ -1676,15 +1712,36 @@ impl crate::pipelines::ImputationPipeline {
 
         let n_ref_markers = ref_markers.len();
         let n_target_samples = target_win.n_samples();
+        let output_markers = output_end.saturating_sub(output_start);
 
         if output_start >= output_end || n_ref_markers == 0 {
             return Ok(None);
         }
         if let Some(bb) = &self.telemetry {
-            bb.set_total_markers((output_end - output_start) as u64);
+            bb.set_stage(crate::utils::telemetry::Stage::Imputation);
+            bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
+            bb.set_producer_stage(crate::utils::telemetry::Stage::Imputation);
+            bb.set_total_windows(plan.per_window_caps.len() as u64);
+            bb.set_current_window((window_idx + 1) as u64);
+            bb.set_total_markers(output_markers as u64);
             bb.set_markers_processed(0);
             bb.set_total_samples(n_target_samples as u64);
             bb.set_samples_processed(0);
+            bb.set_op(&format!(
+                "Imputing window {} ({} markers)",
+                window_idx + 1,
+                output_markers
+            ));
+            bb.set_producer_op(&format!(
+                "Imputing window {} ({} markers)",
+                window_idx + 1,
+                output_markers
+            ));
+            bb.set_consumer_op(&format!(
+                "Imputing window {} ({} markers)",
+                window_idx + 1,
+                output_markers
+            ));
         }
 
         let ref_is_biallelic: Vec<bool> = (0..n_ref_markers)
@@ -2211,6 +2268,7 @@ impl crate::pipelines::ImputationPipeline {
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
         }
 
+        let telemetry = self.telemetry.clone();
         let sample_results: Vec<ImputeResult> = (0..n_target_samples)
             .into_par_iter()
             .map(|s| {
@@ -2450,6 +2508,10 @@ impl crate::pipelines::ImputationPipeline {
                     (Some(h1), Some(h2)) => Some((h1, h2)),
                     _ => None,
                 };
+
+                if let Some(bb) = telemetry.as_ref() {
+                    bb.add_samples(1);
+                }
 
                 ImputeResult {
                     result: SampleImputationResult {

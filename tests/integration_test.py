@@ -2081,9 +2081,9 @@ def stage_prepare(keep_phased=False):
 
 
 def stage_prepare_profile(keep_phased=False):
-    """Prepare reduced data (middle 5% of chr22 target markers) for profiling runs."""
+    """Prepare reduced data (middle 5% of chr22 reference markers) for profiling runs."""
     print("=" * 60)
-    print("STAGE: PREPARE PROFILE - Middle 5% of chr22 (target markers)")
+    print("STAGE: PREPARE PROFILE - Middle 5% of chr22 (reference markers)")
     print("=" * 60)
 
     paths = get_paths()
@@ -2138,27 +2138,46 @@ def stage_prepare_profile(keep_phased=False):
 
     # Load GSA sites for chr22
     gsa_sites = load_gsa_sites(str(paths['gsa_file']), chrom="22")
-    gsa_positions = sorted([pos for chrom, pos in gsa_sites])
 
-    if not gsa_positions:
+    if not gsa_sites:
         raise RuntimeError("No GSA sites found for chr22")
-
-    # Compute region based on MIDDLE 5% of TARGET (GSA) markers
-    total_markers = len(gsa_positions)
-    window_size = max(1, int(total_markers * 0.05))
-    start_idx = (total_markers - window_size) // 2
-    end_idx = start_idx + window_size
-
-    min_pos = gsa_positions[start_idx]
-    end_pos = gsa_positions[end_idx - 1]
 
     # Find chromosome label from VCF
     chrom_label = find_chrom_label(paths['chr22_vcf'], "22") or "chr22"
+
+    # Compute region based on MIDDLE 5% of REFERENCE markers
+    ref_positions = []
+    with _open_maybe_gzip(paths['chr22_vcf']) as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            if fields[0] != chrom_label:
+                continue
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            ref_positions.append(pos)
+
+    if not ref_positions:
+        raise RuntimeError("No reference markers found for chr22")
+
+    total_ref = len(ref_positions)
+    window_size = max(1, int(total_ref * 0.05))
+    start_idx = (total_ref - window_size) // 2
+    end_idx = start_idx + window_size
+
+    min_pos = ref_positions[start_idx]
+    end_pos = ref_positions[end_idx - 1]
+
     region = f"{chrom_label}:{min_pos}-{end_pos}"
 
-    print(f"Profiling region based on middle 5% of {total_markers} GSA markers:")
+    print(f"Profiling region based on middle 5% of {total_ref} reference markers:")
     print(f"  Region: {region} (positions {min_pos}..{end_pos})")
-    print(f"  Target markers in region: {window_size} (indices {start_idx}-{end_idx-1})")
+    print(f"  Reference markers in region: {window_size} (indices {start_idx}-{end_idx-1})")
 
     # Create trimmed VCF covering this region
     trimmed_vcf = paths['data_dir'] / "hgdp1kg_chr22.profile5.vcf.gz"
