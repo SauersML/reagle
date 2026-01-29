@@ -1398,6 +1398,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &p_recomb,
                 &gen_dists,
                 &ibs2,
+                &mut sample_phases,
                 &mut mcmc_paths,
                 atomic_estimates.as_ref(),
                 &confidence_by_sample,
@@ -2270,6 +2271,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         p_recomb: &[f32],
         gen_dists: &[f64],
         ibs2: &Ibs2,
+        sample_phases: &mut [SamplePhase],
         mcmc_paths: &mut [Option<MosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
@@ -2341,33 +2343,49 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             });
 
-        let swap_results: Vec<(BitVec<u8, Lsb0>, Option<MosaicPaths>)> =
-            info_span!("build_composite_view").in_scope(|| {
-                // Immutable borrow of geno for the entire read phase
-                let ref_geno: &MutableGenotypes = geno;
+        let swap_results: Vec<(
+            BitVec<u8, Lsb0>,
+            Vec<(usize, f32)>,
+            Vec<(usize, f32)>,
+            Option<MosaicPaths>,
+        )> = info_span!("build_composite_view").in_scope(|| {
+            // Immutable borrow of geno for the entire read phase
+            let ref_geno: &MutableGenotypes = geno;
 
-                // Use Composite view when reference panel is available
-                let ref_view: GenotypeView<'_, crate::data::AnyMarkerSpace, RefSpace> =
-                    if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                        GenotypeView::Composite {
-                            target: ref_geno,
-                            reference: ref_gt,
-                            alignment,
-                            n_target_haps: n_haps,
-                        }
-                    } else {
-                        GenotypeView::Mutable(ref_geno)
-                    };
+            // Use Composite view when reference panel is available
+            let ref_view: GenotypeView<'_, crate::data::AnyMarkerSpace, RefSpace> =
+                if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                    GenotypeView::Composite {
+                        target: ref_geno,
+                        reference: ref_gt,
+                        alignment,
+                        n_target_haps: n_haps,
+                    }
+                } else {
+                    GenotypeView::Mutable(ref_geno)
+                };
 
-                let prior_paths = &mcmc_paths[..];
-                let mut swap_results: Vec<(BitVec<u8, Lsb0>, Option<MosaicPaths>)> =
-                    vec![(BitVec::repeat(false, n_markers), None); n_samples];
+            let prior_paths = &mcmc_paths[..];
+            let mut swap_results: Vec<(
+                BitVec<u8, Lsb0>,
+                Vec<(usize, f32)>,
+                Vec<(usize, f32)>,
+                Option<MosaicPaths>,
+            )> = vec![
+                (
+                    BitVec::repeat(false, n_markers),
+                    Vec::new(),
+                    Vec::new(),
+                    None
+                );
+                n_samples
+            ];
 
-                tracing::info_span!("hmm_samples").in_scope(|| {
-                    swap_results
-                        .par_iter_mut()
-                        .enumerate()
-                        .for_each(|(s, (mask, paths_out))| {
+            tracing::info_span!("hmm_samples").in_scope(|| {
+                swap_results
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(s, (mask, het_lr_out, het_phase_out, paths_out))| {
                             let sample_idx = SampleIdx::new(s as u32);
                             let hap1 = sample_idx.hap1();
                             let hap2 = sample_idx.hap2();
@@ -2576,21 +2594,63 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     mask.set(m, true);
                                 }
                             }
+
+                            // Store LR and Phase probabilities for confidence
+                            *het_lr_out = het_positions
+                                .iter()
+                                .copied()
+                                .zip(swap_lr.into_iter())
+                                .collect();
+                            *het_phase_out = het_positions
+                                .iter()
+                                .copied()
+                                .zip(swap_probs.into_iter())
+                                .collect();
                         })
                 });
 
-                swap_results
-            }); // ref_geno borrow ends here
+            swap_results
+        }); // ref_geno borrow ends here
 
         // Apply Swaps
         // After computing swap masks for all samples, apply them sequentially.
         // This is done sequentially because swap_haplotypes requires mutable access.
         info_span!("apply_swaps").in_scope(|| {
-            for (s, (mask, paths)) in swap_results.into_iter().enumerate() {
+            // Unzip swap_results for iteration
+            for (s, (mask, het_lr_values, het_phase_values, paths)) in
+                swap_results.into_iter().enumerate()
+            {
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
                 let hap2 = sample_idx.hap2();
+
+                // Update MutableGenotypes
                 geno.swap_haplotypes(hap1, hap2, &mask);
+
+                // Update SamplePhase (critical for confidence and subsequent steps)
+                if s < sample_phases.len() {
+                    let sp = &mut sample_phases[s];
+
+                    // 1. Apply swaps to SamplePhase internal state
+                    // We iterate through the mask to find swapped markers
+                    for m in mask.iter_ones() {
+                        sp.swap_alleles(m);
+                    }
+
+                    // 2. Update phase confidence
+                    for (m, p_orient) in het_phase_values {
+                        sp.set_phase_confidence(m, p_orient);
+                    }
+
+                    // 3. Mark confident sites as phased
+                    let lr_threshold = self.params.lr_threshold;
+                    for (m, lr) in het_lr_values {
+                        if lr >= lr_threshold {
+                            sp.mark_phased(m);
+                        }
+                    }
+                }
+
                 if let Some(paths) = paths {
                     if let Some(slot) = mcmc_paths.get_mut(s) {
                         *slot = Some(paths);
@@ -2598,6 +2658,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
         });
+
+        // Sync final phase state from SamplePhase to MutableGenotypes
+        // This ensures that any logic relying on SamplePhase (like Stage 2) uses consistent data
+        // self.sync_sample_phases_to_geno(sample_phases, geno);
+        // NOTE: We updated both geno and sample_phases in the loop above, so they should be in sync.
+        // Calling sync here would be redundant but safe. Let's rely on the loop updates.
 
         Ok(pbwt_state_next)
     }
