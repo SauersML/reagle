@@ -1230,7 +1230,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             .map(|m| m.len())
             .unwrap_or(0);
         let estimated_markers = file_size / 100;
-        let _ = self.params();
 
         let use_streaming = estimated_markers > self.config.window_markers as u64;
 

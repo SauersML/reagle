@@ -1323,6 +1323,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
+        let mut learned_recomb = None;
         // NOTE: imputation uses its own mismatch prior; we do not carry phasing error rates.
         if !is_vcf_fully_phased(&phased_target_path)? {
             eprintln!("Target is unphased; running phasing before pre-scan...");
@@ -1332,17 +1333,15 @@ impl crate::pipelines::ImputationPipeline {
             phase_config.gt = input_target_path.clone();
             phase_config.r#ref = Some(ref_path.to_path_buf());
             phase_config.out = phased_prefix.clone();
-            // Disable EM parameter updates during internal phasing for imputation.
-            // Phasing sparse data can underestimate recombination intensity (e.g. dropping to ~18),
-            // leading to "Perfect LD Traps" where the HMM gets stuck in the wrong phase.
-            // Using fixed parameters derived from Ne (default ~100) forces enough recombination
-            // to switch away from incorrect haplotypes.
-            phase_config.em = false;
+            // We allow EM updates during phasing to learn the recombination map,
+            // but we do NOT use the learned error rate for imputation to avoid
+            // the "Perfect LD Trap" (over-smoothing).
             let mut phasing = crate::pipelines::phasing::PhasingPipeline::new(
                 phase_config,
                 self.telemetry.clone(),
             );
             phasing.run()?;
+            learned_recomb = Some(phasing.params().recomb_intensity);
             phased_target_path = phased_prefix.with_extension("vcf.gz");
             phased_tmp = Some(tmpdir);
         } else {
@@ -1449,6 +1448,10 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        // Carry over learned recombination intensity if available
+        if let Some(r) = learned_recomb {
+            self.params.update_recomb_intensity(Some(r));
+        }
         // Do not inherit phasing mismatch estimates for imputation. Imputation
         // should use the Li-Stephens mismatch prior (or user override) tied to
         // the reference panel, not phasing-specific error rates.
@@ -2809,10 +2812,17 @@ impl crate::pipelines::ImputationPipeline {
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            // If error correction is enabled (config.err is Some), prioritize HMM dosage
+            // over hard genotype calls to allow correction.
+            let prefer_hard = self.config.err.is_none();
+            let dosage = if prefer_hard && get_genotyped_alleles(marker_idx, sample_idx).is_some() {
+                let (a1, a2) = get_genotyped_alleles(marker_idx, sample_idx).unwrap();
                 (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
+            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                // Fallback to hard call if no HMM result but hard call exists
+                (a1 + a2) as f32
             } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
                 dosage_from_gp(n_alleles, &gp)
