@@ -141,13 +141,6 @@ impl DictionaryColumn {
         allele
     }
 
-    /// Whether any haplotype is missing at this marker offset.
-    pub fn has_missing(&self, marker_offset: usize) -> bool {
-        let bits_per_marker = self.bits_per_allele as usize + 1;
-        let missing_bit = marker_offset * bits_per_marker + (bits_per_marker - 1);
-        self.patterns.iter().any(|pattern| pattern[missing_bit])
-    }
-
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.hap_to_pattern.len()

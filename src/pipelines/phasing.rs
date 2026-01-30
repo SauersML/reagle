@@ -1491,7 +1491,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // Create SamplePhase instances to track phase state (with confidence)
         let confidence_by_sample = build_sample_confidence(&target_gt);
-        let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample);
+        let phase_mask = target_gt.phase_mask();
+        let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample, phase_mask);
 
         let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
         let ref_gt = self.reference_gt.as_ref().map(|v| v.as_ref());
@@ -2049,11 +2050,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let confidence_by_sample = build_sample_confidence(&target_gt);
         // Note: sample_phases tracks phase state per marker but run_phase_baum_iteration
         // updates geno directly. The overlap constraint is applied via apply_overlap_constraint.
+        let phase_mask = target_gt.phase_mask();
         let mut sample_phases = self.create_sample_phases_with_overlap(
             &geno,
             &missing_mask,
             overlap_markers,
             &confidence_by_sample,
+            phase_mask,
         );
 
         let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
@@ -2245,6 +2248,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         missing_mask: &[BitBox<u8, Lsb0>],
         overlap_markers: usize,
         confidence_by_sample: &[Vec<f32>],
+        phase_mask: Option<&Vec<Vec<u8>>>,
     ) -> Vec<SamplePhase> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
@@ -2266,14 +2270,22 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .collect();
 
                 // Hets in the overlap region are already phased (from previous window)
-                // Only hets AFTER the overlap region start as unphased
+                // Only hets AFTER the overlap region start as unphased (per input phase mask)
                 let unphased: Vec<usize> = (overlap_markers..n_markers)
                     .filter(|&m| {
                         let a1 = alleles1[m];
                         let a2 = alleles2[m];
-                        a1 != a2
-                            && !missing_mask[hap1.as_usize()][m]
-                            && !missing_mask[hap2.as_usize()][m]
+                        if a1 == a2 {
+                            return false;
+                        }
+                        if missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m] {
+                            return false;
+                        }
+                        match phase_mask.and_then(|mask| mask.get(m).and_then(|row| row.get(s))) {
+                            Some(&0) => true,
+                            Some(&_) => false,
+                            None => true,
+                        }
                     })
                     .collect();
 
@@ -2290,6 +2302,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         &self,
         geno: &MutableGenotypes,
         confidence_by_sample: &[Vec<f32>],
+        phase_mask: Option<&Vec<Vec<u8>>>,
     ) -> Vec<SamplePhase> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
@@ -2309,12 +2322,19 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .filter(|&m| geno.is_missing(m, hap1) || geno.is_missing(m, hap2))
                     .collect();
 
-                // Initially all hets are unphased (het = different alleles, neither missing)
+                // Unphased hets: only those explicitly unphased in the input phase mask
                 let unphased: Vec<usize> = (0..n_markers)
                     .filter(|&m| {
                         let a1 = alleles1[m];
                         let a2 = alleles2[m];
-                        a1 != a2 && a1 != 255 && a2 != 255
+                        if a1 == a2 || a1 == 255 || a2 == 255 {
+                            return false;
+                        }
+                        match phase_mask.and_then(|mask| mask.get(m).and_then(|row| row.get(s))) {
+                            Some(&0) => true,
+                            Some(&_) => false,
+                            None => true,
+                        }
                     })
                     .collect();
 

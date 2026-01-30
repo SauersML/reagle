@@ -388,6 +388,7 @@ impl VcfReader {
             let mut has_any_confidence = false;
             let mut all_likelihoods_pl: Vec<Option<Vec<Vec<u16>>>> = Vec::new();
             let mut has_any_likelihoods = false;
+            let mut all_phase_masks: Vec<Vec<u8>> = Vec::new();
 
             let mut line = String::new();
             let mut line_num = 0usize;
@@ -412,8 +413,14 @@ impl VcfReader {
                 }
 
                 // Parse VCF record
-                let (marker, mut alleles, is_phased, mut confidences, mut likelihoods_pl) =
-                    self.parse_record(line, &mut markers, line_num)?;
+                let (
+                    marker,
+                    mut alleles,
+                    is_phased,
+                    mut confidences,
+                    mut likelihoods_pl,
+                    mut phase_mask,
+                ) = self.parse_record(line, &mut markers, line_num)?;
 
                 // Track if any marker is unphased
                 if !is_phased {
@@ -463,6 +470,14 @@ impl VcfReader {
                         }
                         likelihoods_pl = Some(filtered_pl);
                     }
+
+                    let mut filtered_phase = Vec::with_capacity(include_indices.len());
+                    for &sample_idx in include_indices {
+                        if sample_idx < phase_mask.len() {
+                            filtered_phase.push(phase_mask[sample_idx]);
+                        }
+                    }
+                    phase_mask = filtered_phase;
                 }
 
                 // Store confidence scores
@@ -475,6 +490,7 @@ impl VcfReader {
                     has_any_likelihoods = true;
                 }
                 all_likelihoods_pl.push(likelihoods_pl);
+                all_phase_masks.push(phase_mask);
 
                 // Calculate actual number of alleles: 1 REF + N ALT
                 let n_alleles = 1 + marker.alt_alleles.len();
@@ -517,6 +533,11 @@ impl VcfReader {
                         .map(|c| c.unwrap_or_else(|| vec![255; n_samples]))
                         .collect(),
                 )
+            } else {
+                None
+            };
+            let phase_mask_opt = if all_phase_masks.len() == columns.len() {
+                Some(all_phase_masks)
             } else {
                 None
             };
@@ -576,7 +597,7 @@ impl VcfReader {
             } else {
                 GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
             };
-            Ok(matrix)
+            Ok(matrix.with_phase_mask(phase_mask_opt))
         })
     }
 
@@ -653,6 +674,7 @@ impl VcfReader {
         bool,
         Option<Vec<u8>>,
         Option<Vec<Vec<u16>>>,
+        Vec<u8>,
     )> {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 10 {
@@ -712,6 +734,7 @@ impl VcfReader {
         let n_samples = self.samples.len();
         let mut alleles = Vec::with_capacity(n_samples * 2);
         let mut is_phased = true;
+        let mut phase_mask: Vec<u8> = Vec::with_capacity(n_samples);
         // Confidence scores (only populated if GL field is present)
         let mut confidences: Option<Vec<u8>> = gl_idx.map(|_| Vec::with_capacity(n_samples));
         let mut likelihoods_pl: Option<Vec<Vec<u16>>> = if pl_idx.is_some() || gl_idx.is_some() {
@@ -737,9 +760,11 @@ impl VcfReader {
             // Parse genotype (handle both phased | and unphased /)
             let (a1, a2, phased, is_haploid) = parse_genotype(gt_field)?;
 
+            let is_missing = a1 == 255 || a2 == 255;
             if !phased {
                 is_phased = false;
             }
+            phase_mask.push(if phased && !is_missing { 1 } else { 0 });
 
             // Track haploid samples - once detected as haploid, stays haploid
             if is_haploid {
@@ -785,7 +810,14 @@ impl VcfReader {
 
         let marker = Marker::with_end(chrom_idx, pos, end_pos, id, ref_allele, alt_alleles);
 
-        Ok((marker, alleles, is_phased, confidences, likelihoods_pl))
+        Ok((
+            marker,
+            alleles,
+            is_phased,
+            confidences,
+            likelihoods_pl,
+            phase_mask,
+        ))
     }
 
     /// Rebuild Samples with detected ploidy information
@@ -1154,9 +1186,9 @@ impl VcfWriter {
     ///
     /// Eliminates O(n_markers * n_samples) flat_dosages allocation by using
     /// closures to access sample-major data directly during write.
-    pub fn write_imputed_streaming<S, Space, F, B, G, H>(
+    pub fn write_imputed_streaming<Space, F, B, G, H>(
         &mut self,
-        matrix: &GenotypeMatrix<S, Space>,
+        markers: &Markers<Space>,
         get_dosage: F,
         get_best_gt: B,
         get_posteriors: Option<G>,
@@ -1169,7 +1201,6 @@ impl VcfWriter {
         telemetry: Option<&Arc<TelemetryBlackboard>>,
     ) -> Result<()>
     where
-        S: PhaseState,
         F: Fn(usize, usize) -> f32,
         B: Fn(usize, usize) -> (u8, u8),
         G: Fn(
@@ -1245,7 +1276,7 @@ impl VcfWriter {
         for m in start..end {
             line_buf.clear();
             let marker_idx = MarkerIdx::new(m as u32);
-            let marker = matrix.marker(marker_idx);
+            let marker = markers.marker(marker_idx);
             let n_alleles = 1 + marker.alt_alleles.len();
 
             // Build INFO field
@@ -1290,7 +1321,7 @@ impl VcfWriter {
             write!(
                 line_buf,
                 "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
-                matrix.markers().chrom_name(marker.chrom).unwrap_or("."),
+                markers.chrom_name(marker.chrom).unwrap_or("."),
                 marker.pos,
                 marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
                 marker.ref_allele,

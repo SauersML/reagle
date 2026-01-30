@@ -304,6 +304,7 @@ struct BufferedMarker {
     gen_pos: f64,
     confidences: Option<Vec<u8>>,
     likelihoods_pl: Option<Vec<Vec<u16>>>,
+    phase_mask: Vec<u8>,
 }
 
 /// Streaming VCF reader that yields windows
@@ -548,6 +549,7 @@ impl StreamingVcfReader {
             let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
             let mut columns = Vec::with_capacity(window_end);
             let mut confidences: Vec<Vec<u8>> = Vec::new();
+            let mut phase_masks: Vec<Vec<u8>> = Vec::new();
             let n_samples = self.samples.len();
             let has_any_likelihoods = self
                 .buffer
@@ -576,6 +578,7 @@ impl StreamingVcfReader {
                         confidences.push(vec![255; self.samples.len()]);
                     }
                 }
+                phase_masks.push(bm.phase_mask.clone());
 
                 if has_any_likelihoods {
                     if let Some(pl_by_sample) = bm.likelihoods_pl.clone() {
@@ -645,6 +648,7 @@ impl StreamingVcfReader {
             } else {
                 GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
             };
+            let genotypes = genotypes.with_phase_mask(Some(phase_masks));
 
             // Peek ahead to find next window start position (if available)
             // window_end is the index of the first marker NOT in the current output+overlap set.
@@ -750,6 +754,7 @@ impl StreamingVcfReader {
         let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         let mut columns = Vec::with_capacity(n_markers);
         let mut confidences: Vec<Vec<u8>> = Vec::new();
+        let mut phase_masks: Vec<Vec<u8>> = Vec::new();
         let n_samples = self.samples.len();
         let has_any_likelihoods = indices.iter().any(|&i| {
             self.buffer
@@ -778,6 +783,7 @@ impl StreamingVcfReader {
                     confidences.push(vec![255; self.samples.len()]);
                 }
             }
+            phase_masks.push(bm.phase_mask.clone());
 
             if has_any_likelihoods {
                 if let Some(pl_by_sample) = bm.likelihoods_pl.clone() {
@@ -837,6 +843,7 @@ impl StreamingVcfReader {
         } else {
             GenotypeMatrix::new_unphased(markers, columns, Arc::clone(&self.samples))
         };
+        let genotypes = genotypes.with_phase_mask(Some(phase_masks));
 
         let window = StreamWindow {
             genotypes,
@@ -965,6 +972,7 @@ impl StreamingVcfReader {
         } else {
             None
         };
+        let mut phase_mask: Vec<u8> = Vec::with_capacity(n_samples);
 
         if self.sample_ploidy.is_none() {
             self.sample_ploidy = Some(vec![true; n_samples]);
@@ -978,6 +986,9 @@ impl StreamingVcfReader {
             }
 
             let (a1, a2) = parse_gt(gt_field);
+            let is_missing = a1 == 255 || a2 == 255;
+            let phased = gt_field.contains('|');
+            phase_mask.push(if phased && !is_missing { 1 } else { 0 });
 
             if a1 == a2 && !gt_field.contains('|') && !gt_field.contains('/') {
                 if let Some(ref mut ploidy) = self.sample_ploidy {
@@ -1036,6 +1047,7 @@ impl StreamingVcfReader {
             gen_pos,
             confidences,
             likelihoods_pl,
+            phase_mask,
         })
     }
 }

@@ -899,6 +899,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     # For switch error rate
     switch_errors = 0
     switch_opportunities = 0
+    switch_errors_input = 0
+    switch_opportunities_input = 0
 
     # SEN (Scaled Euclidean Norm) score
     sen_sum = 0.0
@@ -1022,6 +1024,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
     # Track previous het for switch error calculation per sample
     prev_het = [None] * n_common  # (site, truth_gt, imputed_gt, maf_bin) per sample
+    prev_het_input = [None] * n_common
     common_sites_count = 0
     last_pos = 0
 
@@ -1290,6 +1293,15 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                             maf_bins[maf_bin]["switch_opportunities"] += 1
                         prev_het[sample_idx] = (site, t_gt, i_gt, maf_bin)
                         last_het_pos[sample_idx] = pos
+                        if is_input_site:
+                            if prev_het_input[sample_idx] is not None:
+                                _, prev_t_gt, prev_i_gt, _ = prev_het_input[sample_idx]
+                                t_same_phase = ((t_gt[0] != 0) == (prev_t_gt[0] != 0))
+                                i_same_phase = ((i_gt[0] != 0) == (prev_i_gt[0] != 0))
+                                if t_same_phase != i_same_phase:
+                                    switch_errors_input += 1
+                                switch_opportunities_input += 1
+                            prev_het_input[sample_idx] = (site, t_gt, i_gt, maf_bin)
 
                     # Masked-snp metrics (proxy quality)
                     if is_input_site and mask_pick(t_chrom, t_pos, maf_bin):
@@ -1484,6 +1496,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             metrics["switch_error_rate"] = switch_errors / switch_opportunities
             metrics["switch_errors"] = switch_errors
             metrics["switch_opportunities"] = switch_opportunities
+        if switch_opportunities_input > 0:
+            metrics["switch_error_rate_input_sites"] = switch_errors_input / switch_opportunities_input
+            metrics["switch_errors_input_sites"] = switch_errors_input
+            metrics["switch_opportunities_input_sites"] = switch_opportunities_input
         
         # Confusion matrix
         metrics["confusion_matrix"] = confusion
@@ -1743,6 +1759,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             print(f"\n🔀 PHASING QUALITY")
             print(f"   Switch error rate:    {metrics.get('switch_error_rate'):.4f} ({metrics.get('switch_errors')}/{metrics.get('switch_opportunities')})")
             print(f"   N50 Phase Block:      {metrics.get('n50_phase_block'):.0f} bp")
+            if metrics.get('switch_error_rate_input_sites') is not None:
+                print(f"   Switch error (input): {metrics.get('switch_error_rate_input_sites'):.4f} ({metrics.get('switch_errors_input_sites')}/{metrics.get('switch_opportunities_input_sites')})")
         
         print(f"\n📋 CONFUSION MATRIX (Truth vs Imputed)")
         print(f"   {'':12} {'HomRef':>10} {'Het':>10} {'HomAlt':>10}")
@@ -1858,6 +1876,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             if metrics.get('switch_error_rate') is not None:
                 f.write(f"Switch error rate: {metrics['switch_error_rate']:.6f}\n")
                 f.write(f"N50 Phase Block: {metrics.get('n50_phase_block'):.0f} bp\n")
+            if metrics.get('switch_error_rate_input_sites') is not None:
+                f.write(f"Switch error (input sites): {metrics['switch_error_rate_input_sites']:.6f}\n")
             
             f.write("\nCONFUSION MATRIX\n")
             f.write("-" * 40 + "\n")

@@ -120,6 +120,10 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased, Space = AnyMarkerSpace> 
     /// Layout: `phase_confidence[marker][sample]`
     phase_confidence: Option<Vec<Vec<u8>>>,
 
+    /// Optional per-sample phasedness mask (1 = phased, 0 = unphased or missing).
+    /// Layout: `phase_mask[marker][sample]`
+    phase_mask: Option<Vec<Vec<u8>>>,
+
     likelihoods_pl: Option<Arc<PlMatrix>>,
 
     /// Phantom data to hold the State type parameter (zero-sized)
@@ -135,6 +139,7 @@ impl<State: PhaseState, Space> Clone for GenotypeMatrix<State, Space> {
             is_reversed: self.is_reversed,
             confidence: self.confidence.clone(),
             phase_confidence: self.phase_confidence.clone(),
+            phase_mask: self.phase_mask.clone(),
             likelihoods_pl: self.likelihoods_pl.clone(),
             phantom: PhantomData,
         }
@@ -183,10 +188,6 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         &self.columns[idx.as_usize()]
     }
 
-    pub(crate) fn columns_mut(&mut self) -> &mut Vec<GenotypeColumn> {
-        &mut self.columns
-    }
-
     /// Get allele at (marker, haplotype)
     #[inline]
     pub fn allele(&self, marker: MarkerIdx<Space>, hap: HapIdx) -> u8 {
@@ -206,7 +207,16 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
             .as_ref()
             .map(|c| c.iter().map(|v| v.len()).sum())
             .unwrap_or(0);
-        column_bytes + confidence_bytes + phase_confidence_bytes + std::mem::size_of::<Self>()
+        let phase_mask_bytes: usize = self
+            .phase_mask
+            .as_ref()
+            .map(|c| c.iter().map(|v| v.len()).sum())
+            .unwrap_or(0);
+        column_bytes
+            + confidence_bytes
+            + phase_confidence_bytes
+            + phase_mask_bytes
+            + std::mem::size_of::<Self>()
     }
 
     /// Check if confidence scores are available
@@ -275,6 +285,20 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.phase_confidence.clone()
     }
 
+    pub fn phase_mask(&self) -> Option<&Vec<Vec<u8>>> {
+        self.phase_mask.as_ref()
+    }
+
+
+    pub fn with_phase_mask(mut self, phase_mask: Option<Vec<Vec<u8>>>) -> Self {
+        if let Some(ref mask) = phase_mask {
+            debug_assert_eq!(self.markers.len(), mask.len());
+        }
+        self.phase_mask = phase_mask;
+        self
+    }
+
+
     pub fn likelihoods_pl_arc(&self) -> Option<Arc<PlMatrix>> {
         self.likelihoods_pl.as_ref().map(Arc::clone)
     }
@@ -306,6 +330,7 @@ impl<Space> GenotypeMatrix<Unphased, Space> {
             is_reversed: false,
             confidence: None,
             phase_confidence: None,
+            phase_mask: None,
             likelihoods_pl: None,
             phantom: PhantomData,
         }
@@ -327,6 +352,7 @@ impl<Space> GenotypeMatrix<Unphased, Space> {
             is_reversed: false,
             confidence: Some(confidence),
             phase_confidence: None,
+            phase_mask: None,
             likelihoods_pl: None,
             phantom: PhantomData,
         }
@@ -350,6 +376,7 @@ impl<Space> GenotypeMatrix<Unphased, Space> {
             is_reversed: false,
             confidence,
             phase_confidence: None,
+            phase_mask: None,
             likelihoods_pl: Some(likelihoods_pl),
             phantom: PhantomData,
         }
@@ -367,6 +394,7 @@ impl<Space> GenotypeMatrix<Unphased, Space> {
             is_reversed: self.is_reversed,
             confidence: self.confidence,
             phase_confidence: self.phase_confidence,
+            phase_mask: self.phase_mask,
             likelihoods_pl: self.likelihoods_pl,
             phantom: PhantomData,
         }
@@ -392,6 +420,7 @@ impl<Space> GenotypeMatrix<Phased, Space> {
             is_reversed: false,
             confidence: None,
             phase_confidence: None,
+            phase_mask: None,
             likelihoods_pl: None,
             phantom: PhantomData,
         }
@@ -413,6 +442,7 @@ impl<Space> GenotypeMatrix<Phased, Space> {
             is_reversed: false,
             confidence: Some(confidence),
             phase_confidence: None,
+            phase_mask: None,
             likelihoods_pl: None,
             phantom: PhantomData,
         }
@@ -444,6 +474,7 @@ impl<Space> GenotypeMatrix<Phased, Space> {
             is_reversed: false,
             confidence,
             phase_confidence: None,
+            phase_mask: None,
             likelihoods_pl,
             phantom: PhantomData,
         }

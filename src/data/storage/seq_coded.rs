@@ -130,11 +130,6 @@ impl SeqCodedColumn {
         self.block.alt_count(self.marker_offset)
     }
 
-    /// Whether any sequence maps to a missing allele.
-    pub fn has_missing(&self) -> bool {
-        self.seq_alleles().iter().any(|&a| a == 255)
-    }
-
     /// Memory usage (amortized per marker)
     pub fn size_bytes(&self) -> usize {
         self.block.size_bytes() / self.block.n_markers().max(1)
