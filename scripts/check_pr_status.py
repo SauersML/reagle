@@ -23,7 +23,7 @@ def run_command(command, use_shell=False):
 
 def get_prs():
     # Get number, title, headRefName, and also url for convenience
-    cmd = ["gh", "pr", "list", "--json", "number,title,headRefName,url"]
+    cmd = ["gh", "pr", "list", "--limit", "100", "--json", "number,title,headRefName,url"]
     output = run_command(cmd)
     if output:
         return json.loads(output)

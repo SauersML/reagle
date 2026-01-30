@@ -236,6 +236,18 @@ impl SamplePhase {
             self.phase_confidence[marker] = 1.0;
         }
     }
+
+    /// Get the number of markers that have been successfully phased (locked).
+    #[inline]
+    pub fn phased_count(&self) -> usize {
+        self.status_counts[ClusterStatus::Phased as usize]
+    }
+
+    /// Get the number of markers that are still unphased (pending).
+    #[inline]
+    pub fn unphased_count(&self) -> usize {
+        self.status_counts[ClusterStatus::Unphased as usize]
+    }
 }
 
 #[cfg(test)]
