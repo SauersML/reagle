@@ -183,6 +183,10 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         &self.columns[idx.as_usize()]
     }
 
+    pub(crate) fn columns_mut(&mut self) -> &mut Vec<GenotypeColumn> {
+        &mut self.columns
+    }
+
     /// Get allele at (marker, haplotype)
     #[inline]
     pub fn allele(&self, marker: MarkerIdx<Space>, hap: HapIdx) -> u8 {

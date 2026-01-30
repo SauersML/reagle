@@ -120,6 +120,33 @@ impl DenseColumn {
         }
     }
 
+    /// Whether any haplotype is missing.
+    pub fn has_missing(&self) -> bool {
+        self.missing.iter().any(|b| *b)
+    }
+
+    /// Expose missing mask for fast masking.
+    pub fn missing_bits(&self) -> &BitVec<u64, Lsb0> {
+        &self.missing
+    }
+
+    /// Clone this column and apply missing mask (OR).
+    pub fn with_missing_mask(&self, mask: &BitVec<u64, Lsb0>) -> Self {
+        let mut out = self.clone();
+        if out.missing.len() == mask.len() {
+            for idx in mask.iter_ones() {
+                out.missing.set(idx, true);
+            }
+        } else {
+            for (idx, bit) in mask.iter().enumerate() {
+                if *bit {
+                    out.missing.set(idx, true);
+                }
+            }
+        }
+        out
+    }
+
     /// Iterate all alleles
     pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
         (0..self.n_haplotypes as usize).map(move |i| self.get(HapIdx::new(i as u32)))

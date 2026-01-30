@@ -151,6 +151,16 @@ impl GenotypeColumn {
             ))
         }
     }
+
+    /// Whether this column contains any missing alleles.
+    pub fn has_missing(&self) -> bool {
+        match self {
+            Self::Dense(col) => col.has_missing(),
+            Self::Sparse(_) => false,
+            Self::Dictionary(col, offset) => col.has_missing(*offset),
+            Self::SeqCoded(col) => col.has_missing(),
+        }
+    }
 }
 
 impl Default for GenotypeColumn {

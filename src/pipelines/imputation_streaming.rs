@@ -65,7 +65,7 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
 }
 
 fn mask_phased_with_missing<TargetSpace, OrigPhaseState>(
-    phased: &GenotypeMatrix<Phased, TargetSpace>,
+    mut phased: GenotypeMatrix<Phased, TargetSpace>,
     original: &GenotypeMatrix<OrigPhaseState, TargetSpace>,
 ) -> GenotypeMatrix<Phased, TargetSpace>
 where
@@ -74,52 +74,46 @@ where
     if phased.n_markers() != original.n_markers()
         || phased.n_haplotypes() != original.n_haplotypes()
     {
-        return phased.clone();
+        return phased;
     }
 
     let n_markers = phased.n_markers();
     let n_haps = phased.n_haplotypes();
-    let mut has_missing = false;
-    'scan: for m in 0..n_markers {
-        let m_idx = MarkerIdx::new(m as u32);
-        for h in 0..n_haps {
-            let h_idx = HapIdx::new(h as u32);
-            if original.allele(m_idx, h_idx) == 255 {
-                has_missing = true;
-                break 'scan;
-            }
-        }
-    }
-    if !has_missing {
-        return phased.clone();
-    }
-
-    let markers = phased.markers().clone();
-    let samples = phased.samples_arc();
-    let mut columns: Vec<GenotypeColumn> = Vec::with_capacity(n_markers);
     for m in 0..n_markers {
         let m_idx = MarkerIdx::new(m as u32);
-        let n_alleles = markers.marker(m_idx).n_alleles().max(1);
-        let mut alleles: Vec<u8> = Vec::with_capacity(n_haps);
-        for h in 0..n_haps {
-            let h_idx = HapIdx::new(h as u32);
-            let mut allele = phased.allele(m_idx, h_idx);
-            if original.allele(m_idx, h_idx) == 255 {
-                allele = 255;
-            }
-            alleles.push(allele);
+        let orig_col = original.column(m_idx);
+        if !orig_col.has_missing() {
+            continue;
         }
-        columns.push(GenotypeColumn::from_alleles(&alleles, n_alleles));
+
+        let replace = {
+            let phased_col = phased.column(m_idx);
+            if let (GenotypeColumn::Dense(phased_dense), GenotypeColumn::Dense(orig_dense)) =
+                (phased_col, orig_col)
+            {
+                let masked = phased_dense.with_missing_mask(orig_dense.missing_bits());
+                Some(GenotypeColumn::Dense(masked))
+            } else {
+                let n_alleles = phased.markers().marker(m_idx).n_alleles().max(1);
+                let mut alleles: Vec<u8> = Vec::with_capacity(n_haps);
+                for h in 0..n_haps {
+                    let h_idx = HapIdx::new(h as u32);
+                    let allele = if orig_col.get(h_idx) == 255 {
+                        255
+                    } else {
+                        phased_col.get(h_idx)
+                    };
+                    alleles.push(allele);
+                }
+                Some(GenotypeColumn::from_alleles(&alleles, n_alleles))
+            }
+        };
+        if let Some(col) = replace {
+            phased.columns_mut()[m] = col;
+        }
     }
 
-    GenotypeMatrix::new_phased_with_confidence_and_likelihoods(
-        markers,
-        columns,
-        samples,
-        phased.confidence_clone(),
-        phased.likelihoods_pl_arc(),
-    )
-    .with_phase_confidence(phased.phase_confidence_clone())
+    phased
 }
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -1672,8 +1666,7 @@ impl crate::pipelines::ImputationPipeline {
                 .map(|w| w.genotypes.clone().into_phased());
             if target_was_unphased_for_impute {
                 if let Some(orig_win) = target_window_pl.as_ref() {
-                    phased_target =
-                        mask_phased_with_missing(&phased_target, &orig_win.genotypes);
+                    phased_target = mask_phased_with_missing(phased_target, &orig_win.genotypes);
                 }
             }
             if !header_written {
