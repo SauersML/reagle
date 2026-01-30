@@ -1236,12 +1236,6 @@ fn build_imputation_plan(
                 .copied()
                 .min()
                 .unwrap_or(per_window_cap.max(1));
-            if per_window_cap_min >= n_ref_haps {
-                // Full-panel mode: do not exclude abyss in selection, since we
-                // can afford to keep all haplotypes and avoid false negatives
-                // for rare-variant carriers.
-                abyss.fill(false);
-            }
             plan.abyss_mask[hap_idx] = abyss.clone();
             let (intervals, core) = if per_window_cap_min >= n_ref_haps {
                 // Full panel per window (minus abyss). Store as 1 interval per hap.

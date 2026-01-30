@@ -54,6 +54,16 @@ pub struct Ibs2 {
     sample_segs: Vec<Vec<Ibs2Segment>>,
 }
 
+// We pack 32 markers per u64 block with 2 bits per genotype:
+// - marker i occupies bits [2*i, 2*i+1]
+// - values are 0, 1, or 2 (sum of the two hap alleles for biallelic sites)
+// This layout lets us compare 32 markers at once using XOR + POPCNT.
+const IBS2_BLOCK_MARKERS: usize = 32;
+// Mask that keeps the low bit of each 2-bit lane: binary 0101... across 64 bits.
+// After `diff |= diff >> 1`, any differing 2-bit genotype lane has its LSB set.
+// ANDing with this mask leaves one bit per marker so POPCNT counts mismatches.
+const IBS2_BLOCK_MASK: u64 = 0x5555_5555_5555_5555;
+
 impl Ibs2 {
     /// Build IBS2 segments from genotype data
     pub fn new(gt: &GenotypeMatrix, gen_maps: &GeneticMaps, chrom: ChromIdx, maf: &[f32]) -> Self {
@@ -68,6 +78,7 @@ impl Ibs2 {
         // First pass: find initial IBS2 sets using recursive partitioning
         let ibs2_markers = Ibs2Markers::new(gt, gen_maps, chrom, maf);
         let ibs2_sets = Ibs2Sets::new(gt, &ibs2_markers);
+        let packed = PackedGenotypes::new(gt);
 
         // Build segments for each sample
         let sample_segs: Vec<Vec<Ibs2Segment>> = (0..n_samples)
@@ -79,6 +90,7 @@ impl Ibs2 {
                     chrom,
                     &marker_positions,
                     &ibs2_sets,
+                    &packed,
                     sample,
                 )
             })
@@ -111,6 +123,7 @@ impl Ibs2 {
         chrom: ChromIdx,
         marker_positions: &[u32],
         ibs2_sets: &Ibs2Sets,
+        packed: &PackedGenotypes,
         sample: SampleIdx,
     ) -> Vec<Ibs2Segment> {
         let mut segments = ibs2_sets.segments_for_sample(sample);
@@ -122,7 +135,7 @@ impl Ibs2 {
         segments = Self::merge_segments(segments, gen_maps, chrom, marker_positions);
 
         // Extend segments through homozygous regions
-        segments = Self::extend_segments(gt, sample, segments);
+        segments = Self::extend_segments(gt, sample, segments, packed);
 
         // Merge again after extension
         segments = Self::merge_segments(segments, gen_maps, chrom, marker_positions);
@@ -194,6 +207,7 @@ impl Ibs2 {
         gt: &GenotypeMatrix,
         sample: SampleIdx,
         segments: Vec<Ibs2Segment>,
+        packed: &PackedGenotypes,
     ) -> Vec<Ibs2Segment> {
         let n_markers = gt.n_markers();
 
@@ -205,18 +219,126 @@ impl Ibs2 {
                 let mut end = seg.incl_end;
 
                 // Extend left through compatible markers (IBS2 or homozygous)
-                while start > 0 && Self::is_ibs2_at(gt, start - 1, sample, other) {
-                    start -= 1;
-                }
+                start = Self::extend_left(gt, packed, sample, other, start);
 
                 // Extend right through compatible markers
-                while end < n_markers - 1 && Self::is_ibs2_at(gt, end + 1, sample, other) {
-                    end += 1;
-                }
+                end = Self::extend_right(gt, packed, sample, other, end, n_markers);
 
                 Ibs2Segment::new(other, start, end)
             })
             .collect()
+    }
+
+    fn extend_left(
+        gt: &GenotypeMatrix,
+        packed: &PackedGenotypes,
+        sample: SampleIdx,
+        other: SampleIdx,
+        mut start: usize,
+    ) -> usize {
+        if start == 0 {
+            return start;
+        }
+        let s_idx = sample.0 as usize;
+        let o_idx = other.0 as usize;
+
+        while start > 0 && (start % IBS2_BLOCK_MARKERS) != 0 {
+            let m = start - 1;
+            if !Self::is_ibs2_at_fast(gt, packed, m, sample, other) {
+                return start;
+            }
+            start -= 1;
+        }
+
+        while start >= IBS2_BLOCK_MARKERS {
+            let block = start / IBS2_BLOCK_MARKERS - 1;
+            if !packed.fast_block_all(block) {
+                break;
+            }
+            if packed.block_has_missing(s_idx, o_idx, block) {
+                break;
+            }
+            if packed.block_mismatch_count(s_idx, o_idx, block) != 0 {
+                break;
+            }
+            start -= IBS2_BLOCK_MARKERS;
+        }
+
+        while start > 0 {
+            let m = start - 1;
+            if !Self::is_ibs2_at_fast(gt, packed, m, sample, other) {
+                break;
+            }
+            start -= 1;
+        }
+
+        start
+    }
+
+    fn extend_right(
+        gt: &GenotypeMatrix,
+        packed: &PackedGenotypes,
+        sample: SampleIdx,
+        other: SampleIdx,
+        mut end: usize,
+        n_markers: usize,
+    ) -> usize {
+        if end + 1 >= n_markers {
+            return end;
+        }
+        let s_idx = sample.0 as usize;
+        let o_idx = other.0 as usize;
+
+        while end + 1 < n_markers && ((end + 1) % IBS2_BLOCK_MARKERS) != 0 {
+            let m = end + 1;
+            if !Self::is_ibs2_at_fast(gt, packed, m, sample, other) {
+                return end;
+            }
+            end += 1;
+        }
+
+        while end + IBS2_BLOCK_MARKERS < n_markers {
+            let block = (end + 1) / IBS2_BLOCK_MARKERS;
+            if !packed.fast_block_all(block) {
+                break;
+            }
+            if packed.block_has_missing(s_idx, o_idx, block) {
+                break;
+            }
+            if packed.block_mismatch_count(s_idx, o_idx, block) != 0 {
+                break;
+            }
+            end += IBS2_BLOCK_MARKERS;
+        }
+
+        while end + 1 < n_markers {
+            let m = end + 1;
+            if !Self::is_ibs2_at_fast(gt, packed, m, sample, other) {
+                break;
+            }
+            end += 1;
+        }
+
+        end
+    }
+
+    #[inline]
+    fn is_ibs2_at_fast(
+        gt: &GenotypeMatrix,
+        packed: &PackedGenotypes,
+        marker: usize,
+        s1: SampleIdx,
+        s2: SampleIdx,
+    ) -> bool {
+        if !packed.fast_marker(marker) {
+            return Self::is_ibs2_at(gt, marker, s1, s2);
+        }
+        let s1_idx = s1.0 as usize;
+        let s2_idx = s2.0 as usize;
+        if packed.is_missing(s1_idx, marker) || packed.is_missing(s2_idx, marker) {
+            return Self::is_ibs2_at(gt, marker, s1, s2);
+        }
+        packed.genotype_code(s1_idx, marker) == packed.genotype_code(s2_idx, marker)
     }
 
     fn filter_by_length(
@@ -286,6 +408,138 @@ impl Ibs2 {
             .get(sample.0 as usize)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+}
+
+struct PackedGenotypes {
+    blocks: usize,
+    genotypes: Vec<u64>,
+    missing: Vec<u64>,
+    fast_marker: Vec<bool>,
+    fast_block_all: Vec<bool>,
+}
+
+impl PackedGenotypes {
+    fn new(gt: &GenotypeMatrix) -> Self {
+        let n_markers = gt.n_markers();
+        let n_samples = gt.n_samples();
+        let blocks = (n_markers + IBS2_BLOCK_MARKERS - 1) / IBS2_BLOCK_MARKERS;
+        let mut genotypes = vec![0u64; n_samples * blocks];
+        let mut missing = vec![0u64; n_samples * blocks];
+        let mut fast_marker = vec![false; n_markers];
+
+        for m in 0..n_markers {
+            let m_idx = MarkerIdx::new(m as u32);
+            let is_biallelic = gt.marker(m_idx).alt_alleles.len() == 1;
+            if !is_biallelic {
+                continue;
+            }
+
+            let block = m / IBS2_BLOCK_MARKERS;
+            let bit = (m % IBS2_BLOCK_MARKERS) as u64;
+            let shift = bit * 2;
+            let miss_bit = 1u64 << bit;
+            let mut marker_fast = true;
+
+            for s in 0..n_samples {
+                let sample = SampleIdx::new(s as u32);
+                let a1 = gt.allele(m_idx, sample.hap1());
+                let a2 = gt.allele(m_idx, sample.hap2());
+                let idx = s * blocks + block;
+
+                if a1 == 255 || a2 == 255 {
+                    missing[idx] |= miss_bit;
+                    continue;
+                }
+                if a1 > 1 || a2 > 1 {
+                    marker_fast = false;
+                    continue;
+                }
+                let code = (a1 + a2) as u64;
+                genotypes[idx] |= code << shift;
+            }
+
+            if marker_fast {
+                fast_marker[m] = true;
+            }
+        }
+
+        let mut fast_block_all = vec![false; blocks];
+        for block in 0..blocks {
+            let start = block * IBS2_BLOCK_MARKERS;
+            let end = (start + IBS2_BLOCK_MARKERS).min(n_markers);
+            let mut all_fast = true;
+            for m in start..end {
+                if !fast_marker[m] {
+                    all_fast = false;
+                    break;
+                }
+            }
+            fast_block_all[block] = all_fast;
+        }
+
+        Self {
+            blocks,
+            genotypes,
+            missing,
+            fast_marker,
+            fast_block_all,
+        }
+    }
+
+    #[inline]
+    fn fast_marker(&self, marker: usize) -> bool {
+        self.fast_marker.get(marker).copied().unwrap_or(false)
+    }
+
+    #[inline]
+    fn fast_block_all(&self, block: usize) -> bool {
+        self.fast_block_all.get(block).copied().unwrap_or(false)
+    }
+
+    #[inline]
+    fn block_has_missing(&self, s1: usize, s2: usize, block: usize) -> bool {
+        let idx1 = s1 * self.blocks + block;
+        let idx2 = s2 * self.blocks + block;
+        (self.missing[idx1] | self.missing[idx2]) != 0
+    }
+
+    #[inline]
+    fn block_mismatch_count(&self, s1: usize, s2: usize, block: usize) -> u32 {
+        let idx1 = s1 * self.blocks + block;
+        let idx2 = s2 * self.blocks + block;
+        // XOR exposes per-lane differences across 32 markers (2 bits per marker).
+        // Example for one marker lane:
+        //   00 ^ 00 -> 00 (match)
+        //   01 ^ 01 -> 00 (match)
+        //   10 ^ 10 -> 00 (match)
+        //   01 ^ 10 -> 11 (mismatch)
+        //   00 ^ 01 -> 01 (mismatch)
+        //
+        // `diff |= diff >> 1` collapses any difference in a 2-bit lane to its LSB:
+        //   00 -> 00, 01 -> 01, 10 -> 11, 11 -> 11
+        // AND with 0x5555... keeps only the LSB of each 2-bit lane, yielding
+        // one bit per marker indicating mismatch. POPCNT then counts mismatches.
+        let mut diff = self.genotypes[idx1] ^ self.genotypes[idx2];
+        diff |= diff >> 1;
+        let diff = diff & IBS2_BLOCK_MASK;
+        diff.count_ones()
+    }
+
+    #[inline]
+    fn is_missing(&self, sample: usize, marker: usize) -> bool {
+        let block = marker / IBS2_BLOCK_MARKERS;
+        let bit = (marker % IBS2_BLOCK_MARKERS) as u64;
+        let idx = sample * self.blocks + block;
+        (self.missing[idx] & (1u64 << bit)) != 0
+    }
+
+    #[inline]
+    fn genotype_code(&self, sample: usize, marker: usize) -> u8 {
+        let block = marker / IBS2_BLOCK_MARKERS;
+        let shift = (marker % IBS2_BLOCK_MARKERS) as u64 * 2;
+        let idx = sample * self.blocks + block;
+        ((self.genotypes[idx] >> shift) & 0b11) as u8
     }
 }
 

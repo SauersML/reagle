@@ -185,6 +185,8 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         if self.permuted_bits.len() < n_words {
             self.permuted_bits.resize(n_words, 0);
             self.permuted_missing_bits.resize(n_words, 0);
+        }
+        if self.prefix_ones_words.len() < n_words + 1 {
             self.prefix_ones_words.resize(n_words + 1, 0);
             self.prefix_missing_words.resize(n_words + 1, 0);
         }

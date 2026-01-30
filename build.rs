@@ -907,12 +907,44 @@ impl Sink for ViolationCollector {
             return Ok(true); // Skip this match and continue searching
         }
 
-        // Format the violation string exactly as the `rg -n` command would.
-        self.violations.push(format!("{line_number}:{line_text}"));
+        let mut has_violation = false;
+        let mut token = String::new();
+        for ch in line_text.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                token.push(ch);
+            } else if !token.is_empty() {
+                if is_disallowed_underscore_token(&token) {
+                    has_violation = true;
+                    break;
+                }
+                token.clear();
+            }
+        }
+        if !has_violation && !token.is_empty() && is_disallowed_underscore_token(&token) {
+            has_violation = true;
+        }
+
+        if has_violation {
+            // Format the violation string exactly as the `rg -n` command would.
+            self.violations.push(format!("{line_number}:{line_text}"));
+        }
 
         // Return `Ok(true)` to continue searching for more matches in the same file.
         Ok(true)
     }
+}
+
+fn is_disallowed_underscore_token(token: &str) -> bool {
+    if token == "_" {
+        return false;
+    }
+    if token.starts_with("_mm")
+        || token.starts_with("_MM")
+        || token.starts_with("__m")
+    {
+        return false;
+    }
+    token.starts_with('_')
 }
 
 impl Sink for DisallowedLetCollector {
@@ -2104,7 +2136,9 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
     // Regex pattern to find underscore prefixed variable names.
     // This pattern needs to be more generalized to catch all underscore-prefixed variables,
     // especially in match statements and destructuring patterns
-    let pattern = r"\b(_[a-zA-Z0-9_]+)\b";
+    // Allow SIMD intrinsics like _mm512_* while still flagging underscore-prefixed bindings.
+    // (grep regex doesn't support look-around, so filtering happens in the collector.)
+    let pattern = r"\b_[a-zA-Z0-9_]+\b";
     let mut all_violations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {

@@ -20,29 +20,29 @@
 //! The small wavefront state (~240KB for 10k haplotypes) fits entirely in L2 cache,
 //! making neighbor queries extremely fast compared to random access into a large index.
 
-use crate::model::pbwt::PbwtDivUpdater;
+use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
 
 /// Streaming PBWT state that maintains only the current marker's arrays.
 ///
 /// This replaces `BidirectionalPhaseIbs` for memory-efficient phasing.
 /// Instead of storing arrays for all markers, we maintain a "wavefront"
 /// that advances through the chromosome.
-pub struct PbwtWavefront {
+struct PbwtWavefrontImpl<I: PbwtIndex> {
     /// Current forward prefix array: ppa[i] = haplotype at sorted position i
-    fwd_ppa: Vec<u32>,
+    fwd_ppa: Vec<I>,
     /// Current forward divergence: div[i] = marker where match with predecessor started
     fwd_div: Vec<i32>,
     /// Current backward prefix array
-    bwd_ppa: Vec<u32>,
+    bwd_ppa: Vec<I>,
     /// Current backward divergence: div[i] = marker where match with predecessor ends
     bwd_div: Vec<i32>,
     /// Forward inverse index: fwd_inverse[hap] = position of hap in fwd_ppa
     /// Computed lazily only at sampling points
-    fwd_inverse: Vec<u32>,
+    fwd_inverse: Vec<I>,
     /// Backward inverse index
-    bwd_inverse: Vec<u32>,
+    bwd_inverse: Vec<I>,
     /// Reusable PBWT updater
-    updater: PbwtDivUpdater,
+    updater: PbwtDivUpdater<I>,
     /// Number of haplotypes
     n_haps: usize,
     /// Number of markers in the dataset
@@ -57,7 +57,7 @@ pub struct PbwtWavefront {
     bwd_inverse_valid: bool,
 }
 
-impl PbwtWavefront {
+impl<I: PbwtIndex> PbwtWavefrontImpl<I> {
     #[inline]
     fn finalize_candidates(mut out: Vec<u32>, n_candidates: usize) -> Vec<u32> {
         if out.is_empty() {
@@ -73,7 +73,7 @@ impl PbwtWavefront {
 
     // Linear expansion: check nearest neighbors first.
     fn select_spiral_window(
-        ppa: &[u32],
+        ppa: &[I],
         start: usize,
         end: usize,
         sorted_pos: usize,
@@ -99,8 +99,8 @@ impl PbwtWavefront {
             }
             if offset <= max_left {
                 let hap = ppa[sorted_pos - offset];
-                if hap != target {
-                    out.push(hap);
+                if hap.to_u32() != target {
+                    out.push(hap.to_u32());
                 }
             }
             if out.len() >= n_candidates {
@@ -108,8 +108,8 @@ impl PbwtWavefront {
             }
             if offset <= max_right {
                 let hap = ppa[sorted_pos + offset];
-                if hap != target {
-                    out.push(hap);
+                if hap.to_u32() != target {
+                    out.push(hap.to_u32());
                 }
             }
         };
@@ -218,21 +218,28 @@ impl PbwtWavefront {
                         *d = (*d - shift).max(0);
                     }
                 }
-                (state.ppa.clone(), div)
+                (
+                    state
+                        .ppa
+                        .iter()
+                        .map(|&h| I::from_usize(h as usize))
+                        .collect(),
+                    div,
+                )
             } else {
-                ((0..n_haps as u32).collect(), vec![0; n_haps])
+                ((0..n_haps).map(I::from_usize).collect(), vec![0; n_haps])
             }
         } else {
-            ((0..n_haps as u32).collect(), vec![0; n_haps])
+            ((0..n_haps).map(I::from_usize).collect(), vec![0; n_haps])
         };
 
         Self {
             fwd_ppa,
             fwd_div,
-            bwd_ppa: (0..n_haps as u32).collect(),
+            bwd_ppa: (0..n_haps).map(I::from_usize).collect(),
             bwd_div: vec![n_markers as i32; n_haps],
-            fwd_inverse: vec![0; n_haps],
-            bwd_inverse: vec![0; n_haps],
+            fwd_inverse: vec![I::from_usize(0); n_haps],
+            bwd_inverse: vec![I::from_usize(0); n_haps],
             updater: PbwtDivUpdater::new(n_haps),
             n_haps,
             n_markers,
@@ -246,7 +253,7 @@ impl PbwtWavefront {
     /// Get the current PBWT state (PPA and divergence) for handoff
     pub fn get_state(&self) -> crate::model::pbwt::PbwtState {
         crate::model::pbwt::PbwtState::new(
-            self.fwd_ppa.clone(),
+            self.fwd_ppa.iter().map(|&h| h.to_u32()).collect(),
             self.fwd_div.clone(),
             self.fwd_marker,
         )
@@ -256,7 +263,7 @@ impl PbwtWavefront {
     #[cfg(test)]
     pub fn reset_forward(&mut self) {
         for i in 0..self.n_haps {
-            self.fwd_ppa[i] = i as u32;
+            self.fwd_ppa[i] = I::from_usize(i);
             self.fwd_div[i] = 0;
         }
         self.fwd_marker = 0;
@@ -266,7 +273,7 @@ impl PbwtWavefront {
     /// Reset for a new backward pass (starts at marker n_markers-1)
     pub fn reset_backward(&mut self) {
         for i in 0..self.n_haps {
-            self.bwd_ppa[i] = i as u32;
+            self.bwd_ppa[i] = I::from_usize(i);
             self.bwd_div[i] = self.n_markers as i32;
         }
         self.bwd_marker = self.n_markers;
@@ -311,7 +318,7 @@ impl PbwtWavefront {
     fn ensure_fwd_inverse(&mut self) {
         if !self.fwd_inverse_valid {
             for (pos, &hap) in self.fwd_ppa.iter().enumerate() {
-                self.fwd_inverse[hap as usize] = pos as u32;
+                self.fwd_inverse[hap.to_usize()] = I::from_usize(pos);
             }
             self.fwd_inverse_valid = true;
         }
@@ -321,7 +328,7 @@ impl PbwtWavefront {
     fn ensure_bwd_inverse(&mut self) {
         if !self.bwd_inverse_valid {
             for (pos, &hap) in self.bwd_ppa.iter().enumerate() {
-                self.bwd_inverse[hap as usize] = pos as u32;
+                self.bwd_inverse[hap.to_usize()] = I::from_usize(pos);
             }
             self.bwd_inverse_valid = true;
         }
@@ -340,12 +347,12 @@ impl PbwtWavefront {
             return 0;
         }
         self.ensure_fwd_inverse();
-        let pos = self.fwd_inverse[hap_idx as usize] as usize;
+        let pos = self.fwd_inverse[hap_idx as usize].to_usize();
         let m = self.fwd_marker as i32;
         let mut best = 0i32;
 
         if pos > 0 {
-            let nb = self.fwd_ppa[pos - 1] as usize;
+            let nb = self.fwd_ppa[pos - 1].to_usize();
             if alleles.get(nb).copied().unwrap_or(255) == allele {
                 let len = m - self.fwd_div[pos];
                 if len > best {
@@ -355,7 +362,7 @@ impl PbwtWavefront {
         }
 
         if pos + 1 < self.n_haps {
-            let nb = self.fwd_ppa[pos + 1] as usize;
+            let nb = self.fwd_ppa[pos + 1].to_usize();
             if alleles.get(nb).copied().unwrap_or(255) == allele {
                 let len = m - self.fwd_div[pos + 1];
                 if len > best {
@@ -381,7 +388,7 @@ impl PbwtWavefront {
             return Vec::new();
         }
 
-        let sorted_pos = self.fwd_inverse[hap_idx as usize] as usize;
+        let sorted_pos = self.fwd_inverse[hap_idx as usize].to_usize();
         let marker_i32 = (self.fwd_marker.saturating_sub(1)) as i32;
         let max_span = n_candidates.saturating_mul(8).max(32);
         let (start, end) = self.fwd_window_bounded(sorted_pos, marker_i32, max_span);
@@ -394,11 +401,122 @@ impl PbwtWavefront {
             return Vec::new();
         }
 
-        let sorted_pos = self.bwd_inverse[hap_idx as usize] as usize;
+        let sorted_pos = self.bwd_inverse[hap_idx as usize].to_usize();
         let marker_i32 = self.bwd_marker as i32;
         let max_span = n_candidates.saturating_mul(8).max(32);
         let (start, end) = self.bwd_window_bounded(sorted_pos, marker_i32, max_span);
         Self::select_spiral_window(&self.bwd_ppa, start, end, sorted_pos, hap_idx, n_candidates)
+    }
+}
+
+pub enum PbwtWavefront {
+    U16(PbwtWavefrontImpl<u16>),
+    U32(PbwtWavefrontImpl<u32>),
+}
+
+impl PbwtWavefront {
+    pub fn with_state(
+        n_haps: usize,
+        n_markers: usize,
+        initial_state: Option<&crate::model::pbwt::PbwtState>,
+    ) -> Self {
+        if n_haps <= u16::MAX as usize {
+            Self::U16(PbwtWavefrontImpl::<u16>::with_state(
+                n_haps,
+                n_markers,
+                initial_state,
+            ))
+        } else {
+            Self::U32(PbwtWavefrontImpl::<u32>::with_state(
+                n_haps,
+                n_markers,
+                initial_state,
+            ))
+        }
+    }
+
+    pub fn get_state(&self) -> crate::model::pbwt::PbwtState {
+        match self {
+            Self::U16(inner) => inner.get_state(),
+            Self::U32(inner) => inner.get_state(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn reset_forward(&mut self) {
+        match self {
+            Self::U16(inner) => inner.reset_forward(),
+            Self::U32(inner) => inner.reset_forward(),
+        }
+    }
+
+    pub fn reset_backward(&mut self) {
+        match self {
+            Self::U16(inner) => inner.reset_backward(),
+            Self::U32(inner) => inner.reset_backward(),
+        }
+    }
+
+    pub fn advance_forward(&mut self, alleles: &[u8], n_alleles: usize) {
+        match self {
+            Self::U16(inner) => inner.advance_forward(alleles, n_alleles),
+            Self::U32(inner) => inner.advance_forward(alleles, n_alleles),
+        }
+    }
+
+    pub fn advance_backward(&mut self, alleles: &[u8], n_alleles: usize) {
+        match self {
+            Self::U16(inner) => inner.advance_backward(alleles, n_alleles),
+            Self::U32(inner) => inner.advance_backward(alleles, n_alleles),
+        }
+    }
+
+    pub fn prepare_fwd_queries(&mut self) {
+        match self {
+            Self::U16(inner) => inner.prepare_fwd_queries(),
+            Self::U32(inner) => inner.prepare_fwd_queries(),
+        }
+    }
+
+    pub fn fwd_match_len_with_allele(
+        &mut self,
+        hap_idx: u32,
+        allele: u8,
+        alleles: &[u8],
+    ) -> i32 {
+        match self {
+            Self::U16(inner) => inner.fwd_match_len_with_allele(hap_idx, allele, alleles),
+            Self::U32(inner) => inner.fwd_match_len_with_allele(hap_idx, allele, alleles),
+        }
+    }
+
+    pub fn prepare_bwd_queries(&mut self) {
+        match self {
+            Self::U16(inner) => inner.prepare_bwd_queries(),
+            Self::U32(inner) => inner.prepare_bwd_queries(),
+        }
+    }
+
+    pub fn find_fwd_neighbors_readonly(
+        &self,
+        hap_idx: u32,
+        n_candidates: usize,
+    ) -> Vec<u32> {
+        match self {
+            Self::U16(inner) => inner.find_fwd_neighbors_readonly(hap_idx, n_candidates),
+            Self::U32(inner) => inner.find_fwd_neighbors_readonly(hap_idx, n_candidates),
+        }
+    }
+
+    pub fn find_bwd_neighbors_readonly(
+        &self,
+        hap_idx: u32,
+        n_candidates: usize,
+    ) -> Vec<u32> {
+        match self {
+            Self::U16(inner) => inner.find_bwd_neighbors_readonly(hap_idx, n_candidates),
+            Self::U32(inner) => inner.find_bwd_neighbors_readonly(hap_idx, n_candidates),
+        }
     }
 }
 

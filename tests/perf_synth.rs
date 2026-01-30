@@ -127,7 +127,11 @@ fn synth_impute_runtime_under_2_min() {
         .expect("spawn reagle");
 
     let start = Instant::now();
-    let timeout = Duration::from_secs(120);
+    let timeout_secs = std::env::var("REAGLE_PERF_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120);
+    let timeout = Duration::from_secs(timeout_secs);
     loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
             assert!(status.success(), "reagle exited with {}", status);
@@ -135,7 +139,10 @@ fn synth_impute_runtime_under_2_min() {
         }
         if start.elapsed() > timeout {
             let _ = child.kill();
-            panic!("reagle exceeded 120s on synthetic CI-like workload");
+            panic!(
+                "reagle exceeded {}s on synthetic CI-like workload",
+                timeout_secs
+            );
         }
         sleep(Duration::from_millis(200));
     }

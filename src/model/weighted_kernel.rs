@@ -6,10 +6,118 @@
 
 use wide::f32x8;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use std::arch::x86_64::*;
+
 /// HMM Updater that weights transitions by pattern counts
 pub struct WeightedHmmUpdater;
 
 impl WeightedHmmUpdater {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn fwd_update_weighted_avx512(
+        fwd: &mut [f32],
+        fwd_sum: f32,
+        recomb_rate: f32,
+        n_ref_haps: usize,
+        pattern_counts: &[f32],
+        emissions: &[f32],
+        n_patterns: usize,
+    ) -> f32 {
+        let base_shift = recomb_rate / n_ref_haps as f32;
+        let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
+
+        let base_shift_vec = _mm512_set1_ps(base_shift);
+        let scale_vec = _mm512_set1_ps(scale);
+        let mut sum_vec = _mm512_setzero_ps();
+
+        let mut k = 0;
+        let fwd_ptr = fwd.as_mut_ptr();
+        let count_ptr = pattern_counts.as_ptr();
+        let emit_ptr = emissions.as_ptr();
+        while k + 16 <= n_patterns {
+            let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
+            let count_chunk = _mm512_loadu_ps(count_ptr.add(k));
+            let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+
+            let shift_vec = _mm512_mul_ps(base_shift_vec, count_chunk);
+            let scaled = _mm512_add_ps(_mm512_mul_ps(scale_vec, fwd_chunk), shift_vec);
+            let res = _mm512_mul_ps(emit_vec, scaled);
+
+            _mm512_storeu_ps(fwd_ptr.add(k), res);
+            sum_vec = _mm512_add_ps(sum_vec, res);
+            k += 16;
+        }
+
+        let mut sum_arr = [0.0f32; 16];
+        _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+        let mut new_sum: f32 = sum_arr.iter().sum();
+
+        for i in k..n_patterns {
+            let f = *fwd_ptr.add(i);
+            let c = *count_ptr.add(i);
+            let e = *emit_ptr.add(i);
+            let shift = base_shift * c;
+            let t = scale.mul_add(f, shift);
+            let v = e * t;
+            *fwd_ptr.add(i) = v;
+            new_sum += v;
+        }
+        new_sum
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx512f,fma")]
+    unsafe fn fwd_update_weighted_avx512_fma(
+        fwd: &mut [f32],
+        fwd_sum: f32,
+        recomb_rate: f32,
+        n_ref_haps: usize,
+        pattern_counts: &[f32],
+        emissions: &[f32],
+        n_patterns: usize,
+    ) -> f32 {
+        let base_shift = recomb_rate / n_ref_haps as f32;
+        let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
+
+        let base_shift_vec = _mm512_set1_ps(base_shift);
+        let scale_vec = _mm512_set1_ps(scale);
+        let mut sum_vec = _mm512_setzero_ps();
+
+        let mut k = 0;
+        let fwd_ptr = fwd.as_mut_ptr();
+        let count_ptr = pattern_counts.as_ptr();
+        let emit_ptr = emissions.as_ptr();
+        while k + 16 <= n_patterns {
+            let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
+            let count_chunk = _mm512_loadu_ps(count_ptr.add(k));
+            let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+
+            let shift_vec = _mm512_mul_ps(base_shift_vec, count_chunk);
+            let scaled = _mm512_fmadd_ps(scale_vec, fwd_chunk, shift_vec);
+            let res = _mm512_mul_ps(emit_vec, scaled);
+
+            _mm512_storeu_ps(fwd_ptr.add(k), res);
+            sum_vec = _mm512_add_ps(sum_vec, res);
+            k += 16;
+        }
+
+        let mut sum_arr = [0.0f32; 16];
+        _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+        let mut new_sum: f32 = sum_arr.iter().sum();
+
+        for i in k..n_patterns {
+            let f = *fwd_ptr.add(i);
+            let c = *count_ptr.add(i);
+            let e = *emit_ptr.add(i);
+            let shift = base_shift * c;
+            let t = scale.mul_add(f, shift);
+            let v = e * t;
+            *fwd_ptr.add(i) = v;
+            new_sum += v;
+        }
+        new_sum
+    }
     /// Forward update with weighted transitions
     ///
     /// F_new[i] = (scale * F_old[i] + base_shift * count[i]) * E[i]
@@ -23,6 +131,36 @@ impl WeightedHmmUpdater {
         emissions: &[f32],
         n_patterns: usize,
     ) -> f32 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if n_patterns >= 16 && is_x86_feature_detected!("avx512f") {
+                if is_x86_feature_detected!("fma") {
+                    unsafe {
+                        return Self::fwd_update_weighted_avx512_fma(
+                            fwd,
+                            fwd_sum,
+                            recomb_rate,
+                            n_ref_haps,
+                            pattern_counts,
+                            emissions,
+                            n_patterns,
+                        );
+                    }
+                }
+                unsafe {
+                    return Self::fwd_update_weighted_avx512(
+                        fwd,
+                        fwd_sum,
+                        recomb_rate,
+                        n_ref_haps,
+                        pattern_counts,
+                        emissions,
+                        n_patterns,
+                    );
+                }
+            }
+        }
+
         let base_shift = recomb_rate / n_ref_haps as f32;
         let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
 
@@ -33,15 +171,21 @@ impl WeightedHmmUpdater {
         let mut k = 0;
         while k + 8 <= n_patterns {
             let mut fwd_arr = [0.0f32; 8];
-            fwd_arr.copy_from_slice(&fwd[k..k + 8]);
+            let mut count_arr = [0.0f32; 8];
+            let mut emit_arr = [0.0f32; 8];
+            unsafe {
+                std::ptr::copy_nonoverlapping(fwd.as_ptr().add(k), fwd_arr.as_mut_ptr(), 8);
+                std::ptr::copy_nonoverlapping(
+                    pattern_counts.as_ptr().add(k),
+                    count_arr.as_mut_ptr(),
+                    8,
+                );
+                std::ptr::copy_nonoverlapping(emissions.as_ptr().add(k), emit_arr.as_mut_ptr(), 8);
+            }
             let fwd_chunk = f32x8::from(fwd_arr);
 
-            let mut count_arr = [0.0f32; 8];
-            count_arr.copy_from_slice(&pattern_counts[k..k + 8]);
             let count_chunk = f32x8::from(count_arr);
 
-            let mut emit_arr = [0.0f32; 8];
-            emit_arr.copy_from_slice(&emissions[k..k + 8]);
             let emit_vec = f32x8::from(emit_arr);
 
             // weighted shift = base_shift * count[i]
@@ -51,7 +195,9 @@ impl WeightedHmmUpdater {
             let res = emit_vec * (scale_vec * fwd_chunk + shift_vec);
 
             let res_arr: [f32; 8] = res.into();
-            fwd[k..k + 8].copy_from_slice(&res_arr);
+            unsafe {
+                std::ptr::copy_nonoverlapping(res_arr.as_ptr(), fwd.as_mut_ptr().add(k), 8);
+            }
 
             sum_vec += res;
             k += 8;
@@ -59,9 +205,16 @@ impl WeightedHmmUpdater {
 
         let mut new_sum = sum_vec.reduce_add();
         for i in k..n_patterns {
-            let shift = base_shift * pattern_counts[i];
-            fwd[i] = emissions[i] * (scale * fwd[i] + shift);
-            new_sum += fwd[i];
+            unsafe {
+                let f = *fwd.get_unchecked(i);
+                let c = *pattern_counts.get_unchecked(i);
+                let e = *emissions.get_unchecked(i);
+                let shift = base_shift * c;
+                let t = scale.mul_add(f, shift);
+                let v = e * t;
+                *fwd.get_unchecked_mut(i) = v;
+                new_sum += v;
+            }
         }
         new_sum
     }

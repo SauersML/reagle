@@ -334,29 +334,36 @@ impl MosaicCursor {
     }
 }
 
-/// Scratch buffer for Phase B: allele materialization
-#[derive(Clone, Debug)]
+#[cfg(test)]
+/// Scratch buffer for allele materialization.
+#[derive(Debug, Clone)]
 pub struct AlleleScratch {
-    /// Alleles for each state at current marker
     pub alleles: Vec<u8>,
 }
 
+#[cfg(test)]
 impl AlleleScratch {
-    /// Create scratch buffer for n_states
     pub fn new(n_states: usize) -> Self {
         Self {
-            alleles: vec![0; n_states],
+            alleles: vec![0u8; n_states],
         }
     }
 
-    /// Phase B: Materialize alleles for current marker using cursor
+    fn ensure_len(&mut self, n_states: usize) {
+        if self.alleles.len() != n_states {
+            self.alleles.resize(n_states, 0);
+        }
+    }
+
     #[inline]
-    pub fn materialize<F>(&mut self, cursor: &MosaicCursor, marker: usize, get_allele: F)
+    pub fn materialize<F>(&mut self, cursor: &MosaicCursor, marker: usize, mut allele_of: F)
     where
-        F: Fn(usize, GlobalId) -> u8,
+        F: FnMut(usize, GlobalId) -> u8,
     {
-        for (state, &hap) in cursor.active_haps.iter().enumerate() {
-            self.alleles[state] = get_allele(marker, hap);
+        let active = cursor.active_haps();
+        self.ensure_len(active.len());
+        for (i, &hap) in active.iter().enumerate() {
+            self.alleles[i] = allele_of(marker, hap);
         }
     }
 }
