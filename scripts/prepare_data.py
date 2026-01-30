@@ -3,18 +3,104 @@ import sys
 import subprocess
 import glob
 import shutil
+from pathlib import Path
+PANEL_BCF_URL = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
+
+
+def _repo_root():
+    return Path(__file__).resolve().parent.parent
+
+
+def _panel_cache_vcf():
+    return _repo_root() / "tests" / "data" / "ref.vcf.gz"
+
+
+def _download_file(url, dest):
+    if shutil.which("wget"):
+        subprocess.check_call(["wget", "-q", url, "-O", str(dest)])
+        return
+    if shutil.which("curl"):
+        subprocess.check_call(["curl", "-fsSL", url, "-o", str(dest)])
+        return
+    raise RuntimeError("Neither wget nor curl found; cannot download reference panel.")
+
+
+def _copy_or_link(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _has_vcf_index(vcf_path: Path):
+    return (vcf_path.with_suffix(vcf_path.suffix + ".csi")).exists() or (
+        vcf_path.with_suffix(vcf_path.suffix + ".tbi")
+    ).exists()
 
 
 def _resolve_local_panel_path():
-    candidates = [
-        "ref.vcf.gz",
-        os.path.join("tests", "data", "ref.vcf.gz"),
-    ]
+    candidates = []
+    cwd = Path.cwd()
+    candidates.extend(
+        [
+            cwd / "ref.vcf.gz",
+            cwd / "tests" / "data" / "ref.vcf.gz",
+            cwd / "tests" / "fixtures" / "gnomad_hgdp" / "ref.vcf.gz",
+            cwd / "microarray_profile" / "ref.vcf.gz",
+        ]
+    )
 
-    for p in candidates:
-        if os.path.exists(p):
-            return p
+    root = _repo_root()
+    if root != cwd:
+        candidates.extend(
+            [
+                root / "ref.vcf.gz",
+                root / "tests" / "data" / "ref.vcf.gz",
+                root / "tests" / "fixtures" / "gnomad_hgdp" / "ref.vcf.gz",
+                root / "microarray_profile" / "ref.vcf.gz",
+            ]
+        )
+
+    candidates.append(_panel_cache_vcf())
+
+    for path in candidates:
+        if path and path.exists():
+            return str(path)
     return None
+
+
+def _ensure_reference_panel():
+    panel_path = _resolve_local_panel_path()
+    if panel_path:
+        return panel_path
+
+    if shutil.which("bcftools") is None:
+        raise RuntimeError("bcftools not found on PATH (required to prepare HGDP+1KG panel).")
+
+    cache_vcf = _panel_cache_vcf()
+    cache_vcf.parent.mkdir(parents=True, exist_ok=True)
+    if cache_vcf.exists():
+        if _has_vcf_index(cache_vcf):
+            return str(cache_vcf)
+        subprocess.check_call(["bcftools", "index", "-f", str(cache_vcf)])
+        return str(cache_vcf)
+
+    print("HGDP+1KG panel not found locally; downloading to tests/data/ref.vcf.gz...")
+    raw_bcf = cache_vcf.parent / "hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
+    if not raw_bcf.exists():
+        _download_file(PANEL_BCF_URL, raw_bcf)
+
+    print("Converting cached BCF to VCF.gz...")
+    subprocess.check_call(["bcftools", "view", str(raw_bcf), "-Oz", "-o", str(cache_vcf)])
+    subprocess.check_call(["bcftools", "index", "-f", str(cache_vcf)])
+
+    if raw_bcf.exists():
+        raw_bcf.unlink()
+
+    return str(cache_vcf)
 
 def _clean_output_dir(output_dir):
     os.makedirs(output_dir, exist_ok=True)
@@ -142,25 +228,22 @@ def prepare_input_file(input_path):
 
 def download_reference(output_vcf):
     """Downloads and prepares HGDP+1kG Chr22 reference (hg38)."""
-    if os.path.exists(output_vcf) and os.path.exists(output_vcf + ".csi"):
+    if os.path.exists(output_vcf) and _has_vcf_index(Path(output_vcf)):
         print("Reference already exists.")
         return
 
-    print("Downloading HGDP+1kG reference panel (Chr22, hg38)...")
-    # This URL is for gnomAD HGDP+1kG v3 (hg38)
-    bcf_url = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
-    
-    # Download BCF
-    subprocess.check_call(["wget", "-q", bcf_url, "-O", "ref_raw.bcf"])
-    
-    # Convert BCF -> VCF.gz and Index
-    print("Converting BCF to VCF.gz...")
-    subprocess.check_call(f"bcftools view ref_raw.bcf -Oz -o {output_vcf}", shell=True)
-    subprocess.check_call(["bcftools", "index", "-f", output_vcf])
-    
-    # Cleanup
-    if os.path.exists("ref_raw.bcf"):
-        os.remove("ref_raw.bcf")
+    cached_panel = Path(_ensure_reference_panel())
+    output_path = Path(output_vcf)
+    _copy_or_link(cached_panel, output_path)
+
+    if _has_vcf_index(cached_panel):
+        for suffix in (".csi", ".tbi"):
+            candidate = cached_panel.with_suffix(cached_panel.suffix + suffix)
+            if candidate.exists():
+                _copy_or_link(candidate, output_path.with_suffix(output_path.suffix + suffix))
+    if not _has_vcf_index(output_path):
+        subprocess.check_call(["bcftools", "index", "-f", str(output_path)])
+
     print(f"Reference prepared: {output_vcf}")
 
 def prepare_truth(source, output_vcf):
@@ -217,11 +300,7 @@ def prepare_truth(source, output_vcf):
     print("Indexing Truth VCF...")
     subprocess.check_call(["bcftools", "index", "-t", source_vcf])
 
-    panel_path = _resolve_local_panel_path()
-    if not panel_path:
-        raise RuntimeError(
-            "HGDP+1KG panel VCF not found locally (expected one of: ref.vcf.gz, tests/data/ref.vcf.gz)."
-        )
+    panel_path = _ensure_reference_panel()
 
     install_convert_genome()
 
@@ -287,11 +366,7 @@ def run_conversion(input_path, output_vcf):
     temp_output_dir = "convert_genome_array_out"
     _clean_output_dir(temp_output_dir)
 
-    panel_path = _resolve_local_panel_path()
-    if not panel_path:
-        raise RuntimeError(
-            "HGDP+1KG panel VCF not found locally (expected one of: ref.vcf.gz, tests/data/ref.vcf.gz)."
-        )
+    panel_path = _ensure_reference_panel()
 
     cmd = [
         "convert_genome",
