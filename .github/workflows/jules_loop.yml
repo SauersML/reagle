@@ -56,7 +56,7 @@ jobs:
 
           if [ $CHECK_CODE -eq 0 ]; then
             echo "Cargo check passed. Running tests..."
-            cargo test 2>&1 | tee -a ../build.log
+            cargo test --release 2>&1 | tee -a ../build.log
             TEST_CODE=${PIPESTATUS[0]}
 
             if [ $TEST_CODE -eq 0 ]; then

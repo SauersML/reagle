@@ -69,4 +69,4 @@ jobs:
 
     - name: Run Rust Tests
       run: |
-        cargo test --verbose
+        cargo test --release --verbose
