@@ -1396,29 +1396,29 @@ impl crate::pipelines::ImputationPipeline {
             )));
         }
 
-        let mut phased_target_path = input_target_path.clone();
-        let mut phased_tmp: Option<tempfile::TempDir> = None;
-        // NOTE: imputation uses its own mismatch prior; we do not carry phasing error rates.
-        let mut phased_recomb_intensity: Option<f32> = None;
-        if !is_vcf_fully_phased(&phased_target_path)? {
-            eprintln!("Target is unphased; running phasing before pre-scan...");
-            let tmpdir = tempfile::tempdir()?;
-            let phased_prefix = tmpdir.path().join("phased_target");
-            let mut phase_config = self.config.clone();
-            phase_config.gt = input_target_path.clone();
-            phase_config.r#ref = Some(ref_path.to_path_buf());
-            phase_config.out = phased_prefix.clone();
-            let mut phasing = crate::pipelines::phasing::PhasingPipeline::new(
-                phase_config,
-                self.telemetry.clone(),
-            );
-            phasing.run()?;
-            phased_recomb_intensity = Some(phasing.params().recomb_intensity);
-            phased_target_path = phased_prefix.with_extension("vcf.gz");
-            phased_tmp = Some(tmpdir);
-        } else {
-            eprintln!("Target already phased; skipping phasing before pre-scan.");
-        }
+    let mut phased_target_path = input_target_path.clone();
+    let mut phased_tmp: Option<tempfile::TempDir> = None;
+    // NOTE: imputation uses its own mismatch prior; we do not carry phasing error rates.
+    let mut phased_recomb_intensity: Option<f32> = None;
+    if !is_vcf_fully_phased(&phased_target_path)? {
+        eprintln!("Target is unphased; running phasing before pre-scan...");
+        let tmpdir = tempfile::tempdir()?;
+        let phased_prefix = tmpdir.path().join("phased_target");
+        let mut phase_config = self.config.clone();
+        phase_config.gt = input_target_path.clone();
+        phase_config.r#ref = Some(ref_path.to_path_buf());
+        phase_config.out = phased_prefix.clone();
+        let mut phasing = crate::pipelines::phasing::PhasingPipeline::new(
+            phase_config,
+            self.telemetry.clone(),
+        );
+        phasing.run()?;
+        phased_recomb_intensity = Some(phasing.params().recomb_intensity);
+        phased_target_path = phased_prefix.with_extension("vcf.gz");
+        phased_tmp = Some(tmpdir);
+    } else {
+        eprintln!("Target already phased; skipping phasing before pre-scan.");
+    }
 
         let mut n_threads = self
             .config

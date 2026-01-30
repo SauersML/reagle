@@ -1,0 +1,1444 @@
+diff --git a/.github/workflows/integration.yml b/.github/workflows/integration.yml
+index d3f8ae8..6122f5a 100644
+--- a/.github/workflows/integration.yml
++++ b/.github/workflows/integration.yml
+@@ -328,12 +328,28 @@ jobs:
+         working-directory: .
+         run: python3 tests/integration_test.py metrics
+ 
++      - name: Install plotting dependencies
++        run: python3 -m pip install --quiet matplotlib
++
++      - name: Generate plots
++        working-directory: .
++        run: python3 tests/plot_metrics.py
++
+       - name: Upload metrics
+         uses: actions/upload-artifact@v4
+         if: always()
+         with:
+           name: imputation-metrics
+-          path: tests/data/*_metrics.txt
++          path: |
++            tests/data/*_metrics.txt
++            tests/data/*_metrics.json
++
++      - name: Upload plots
++        uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: imputation-plots
++          path: tests/data/plots/*.png
+           retention-days: 30
+ 
+   # Job 5b: Calculate metrics (5% of chr22)
+diff --git a/src/config.rs b/src/config.rs
+index 3f94643..d934e13 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -113,7 +113,7 @@ pub struct Config {
+ 
+     // ============ General Parameters ============
+     /// Effective population size
+-    #[arg(long, default_value = "100000")]
++    #[arg(long, default_value = "1000000")]
+     pub ne: f32,
+ 
+     /// Allele mismatch probability (auto-calculated if not specified)
+diff --git a/src/model/impute_hmm.rs b/src/model/impute_hmm.rs
+index f4783e5..0372064 100644
+--- a/src/model/impute_hmm.rs
++++ b/src/model/impute_hmm.rs
+@@ -286,7 +286,13 @@ pub fn run_impute_hmm(
+         // Compute posteriors using beta at time t (current ws.bwd), before updating
+         // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
+         let mut allele_probs: Vec<f32> = Vec::new();
+-        let n_alleles = probs.len();
++        let n_alleles = if !probs.is_empty() {
++            probs.len()
++        } else if m_rev < ref_allele_freqs.len() {
++            ref_allele_freqs[m_rev].len()
++        } else {
++            0
++        };
+         if n_alleles > 0 {
+             allele_probs.resize(n_alleles, 0.0f32);
+             let mut total = 0.0f32;
+diff --git a/src/pipelines/imputation_streaming.rs b/src/pipelines/imputation_streaming.rs
+index fe14d67..eca75e2 100644
+--- a/src/pipelines/imputation_streaming.rs
++++ b/src/pipelines/imputation_streaming.rs
+@@ -78,13 +78,25 @@ fn available_memory_bytes() -> Option<u64> {
+     let mut sys = System::new();
+     sys.refresh_memory();
+     // sysinfo reports memory values in bytes.
+-    let avail_bytes = sys.available_memory();
++    let mut avail_bytes = sys.available_memory();
++    let mut total_bytes = sys.total_memory();
++    // Some sysinfo versions report memory in KiB. Detect and normalize.
++    // Heuristic: if total < 1 GiB but total*1024 looks like a plausible RAM size,
++    // treat the values as KiB. This avoids collapsing available memory to ~0.
++    if total_bytes > 0 {
++        let scaled_total = total_bytes.saturating_mul(1024);
++        let looks_like_kib =
++            total_bytes < 1_073_741_824 && scaled_total >= 1_073_741_824 && scaled_total <= (1u64 << 50);
++        if looks_like_kib {
++            avail_bytes = avail_bytes.saturating_mul(1024);
++            total_bytes = scaled_total;
++        }
++    }
+     if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
+         return Some(avail_bytes);
+     }
+     // Fallback: if available memory is unavailable (some CI/containers),
+     // use total memory rather than collapsing to an unusable cap.
+-    let total_bytes = sys.total_memory();
+     if total_bytes > 0 {
+         Some(total_bytes)
+     } else {
+@@ -139,6 +151,71 @@ impl HapIntervals {
+     }
+ }
+ 
++fn log_imputation_plan_summary(plan: &ImputationPlan) {
++    let n_target_haps = plan.core_states.len();
++    if n_target_haps == 0 {
++        eprintln!("Imputation plan: no target haplotypes");
++        return;
++    }
++    let n_windows = plan.per_window_caps.len();
++    let mut core_min = usize::MAX;
++    let mut core_max = 0usize;
++    let mut core_sum = 0usize;
++    let mut dynamic_min = usize::MAX;
++    let mut dynamic_max = 0usize;
++    let mut dynamic_sum = 0usize;
++    let mut abyss_min = usize::MAX;
++    let mut abyss_max = 0usize;
++    let mut abyss_sum = 0usize;
++
++    for hap_idx in 0..n_target_haps {
++        let core = plan.core_states.get(hap_idx).map(|v| v.len()).unwrap_or(0);
++        let intervals = plan
++            .window_intervals
++            .get(hap_idx)
++            .map(|v| v.len())
++            .unwrap_or(0);
++        let dynamic = intervals.saturating_sub(core);
++        let abyss = plan
++            .abyss_mask
++            .get(hap_idx)
++            .map(|v| v.iter().filter(|&&b| b).count())
++            .unwrap_or(0);
++
++        core_min = core_min.min(core);
++        core_max = core_max.max(core);
++        core_sum += core;
++
++        dynamic_min = dynamic_min.min(dynamic);
++        dynamic_max = dynamic_max.max(dynamic);
++        dynamic_sum += dynamic;
++
++        abyss_min = abyss_min.min(abyss);
++        abyss_max = abyss_max.max(abyss);
++        abyss_sum += abyss;
++    }
++
++    let denom = n_target_haps as f64;
++    let core_avg = core_sum as f64 / denom;
++    let dynamic_avg = dynamic_sum as f64 / denom;
++    let abyss_avg = abyss_sum as f64 / denom;
++
++    eprintln!(
++        "Imputation plan hap counts (target_haps={}, windows={}): core_global[min/avg/max]={}/{:.1}/{}, dynamic_window[min/avg/max]={}/{:.1}/{}, abyss[min/avg/max]={}/{:.1}/{}",
++        n_target_haps,
++        n_windows,
++        core_min,
++        core_avg,
++        core_max,
++        dynamic_min,
++        dynamic_avg,
++        dynamic_max,
++        abyss_min,
++        abyss_avg,
++        abyss_max
++    );
++}
++
+ fn estimate_scan_batch_size(
+     available_bytes: u64,
+     n_ref_haps: usize,
+@@ -780,6 +857,11 @@ fn build_imputation_plan(
+                 "Pre-scan produced no windows for allocation".to_string(),
+             ));
+         }
++        eprintln!(
++            "Pre-scan: skipped (full panel global mode); ref_haps={}, windows={}",
++            n_ref_haps,
++            num_windows
++        );
+         plan.per_window_cap = n_ref_haps.max(1);
+         plan.per_window_caps = per_window_caps;
+         for hap_idx in 0..n_target_haps {
+@@ -805,6 +887,13 @@ fn build_imputation_plan(
+         per_window_caps.clear();
+     }
+ 
++    eprintln!(
++        "Pre-scan: enabled (LMS allocation); target_haps={}, ref_haps={}, batch_size={}",
++        n_target_haps,
++        n_ref_haps,
++        batch_size
++    );
++
+     while batch_start < n_target_haps {
+         let batch_end = (batch_start + batch_size).min(n_target_haps);
+         let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
+@@ -1220,6 +1309,8 @@ impl crate::pipelines::ImputationPipeline {
+             phased_p_mismatch = Some(phasing.params().p_mismatch);
+             phased_target_path = phased_prefix.with_extension("vcf.gz");
+             phased_tmp = Some(tmpdir);
++        } else {
++            eprintln!("Target already phased; skipping phasing before pre-scan.");
+         }
+ 
+         let mut n_threads = self
+@@ -1280,6 +1371,7 @@ impl crate::pipelines::ImputationPipeline {
+                 plan.per_window_cap
+             );
+         }
++        log_imputation_plan_summary(&plan);
+ 
+         let mut ref_reader = open_ref_reader(ref_path)?;
+         let target_was_unphased_for_impute = !is_vcf_fully_phased(&input_target_path)?;
+@@ -1290,6 +1382,11 @@ impl crate::pipelines::ImputationPipeline {
+         } else {
+             phased_target_path.clone()
+         };
++        if target_was_unphased_for_impute {
++            eprintln!("Target was unphased at input; using phased target for imputation.");
++        } else {
++            eprintln!("Target already phased; using phased target directly for imputation.");
++        }
+         let mut target_reader = StreamingVcfReader::open(
+             &target_path_for_impute,
+             gen_maps.clone(),
+@@ -1436,7 +1533,7 @@ impl crate::pipelines::ImputationPipeline {
+                 ref_window.global_start,
+                 ref_window.output_start,
+                 ref_window.output_end,
+-                !target_was_unphased_for_impute,
++                true,
+             )?;
+ 
+             total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
+@@ -1572,12 +1669,28 @@ impl crate::pipelines::ImputationPipeline {
+                 .marker(MarkerIdx::new(0))
+                 .chrom;
+             if let Some(gen_map) = gen_maps.get(chrom) {
+-                crate::data::genetic_map::MarkerMap::create(ref_markers, gen_map)
++                // Use cluster cM as a minimum genetic distance between adjacent markers.
++                // This mirrors Beagle-style marker clustering and prevents per-marker
++                // recombination rates from collapsing in very short regions.
++                let min_dist = self.config.cluster.max(1e-8) as f64;
++                crate::data::genetic_map::MarkerMap::from_gen_map_with_min_dist(
++                    ref_markers,
++                    gen_map,
++                    min_dist,
++                )
+             } else {
+                 crate::data::genetic_map::MarkerMap::from_positions(ref_markers)
+             }
+         };
+         let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
++        if let (Some(first), Some(last)) = (gen_positions.first(), gen_positions.last()) {
++            let total_cm = (last - first).abs();
++            eprintln!(
++                "    genetic span: {:.6} cM across {} markers",
++                total_cm,
++                gen_positions.len()
++            );
++        }
+         let mut p_recomb: Vec<f32> = Vec::with_capacity(n_ref_markers);
+         p_recomb.push(0.0f32);
+         for m in 1..n_ref_markers {
+@@ -1585,6 +1698,18 @@ impl crate::pipelines::ImputationPipeline {
+             p_recomb.push(self.params.p_recomb(dist_cm));
+         }
+ 
++        if let Some(min) = p_recomb.iter().copied().reduce(f32::min) {
++            let max = p_recomb
++                .iter()
++                .copied()
++                .fold(f32::NEG_INFINITY, f32::max);
++            let mean = p_recomb.iter().copied().sum::<f32>() / p_recomb.len().max(1) as f32;
++            eprintln!(
++                "    p_recomb stats: min={:.6} mean={:.6} max={:.6}",
++                min, mean, max
++            );
++        }
++
+         if let Some(overlap) = imp_overlap {
+             if let Some(prev_gen_pos) = overlap.prior_stage1_gen_pos() {
+                 if let Some(current_gen_pos) = gen_positions.first().copied() {
+@@ -1616,6 +1741,7 @@ impl crate::pipelines::ImputationPipeline {
+ 
+         let target_samples = target_win.samples_arc();
+         let target_pl_matrix = target_pl.unwrap_or(target_win);
++        let err_rate = self.params.p_mismatch.clamp(1e-6, 0.5);
+         let build_input_probs = |hap_idx: HapIdx, sample_idx: usize| -> TargetAlleleProbs {
+             let mut offsets = Vec::with_capacity(n_ref_markers + 1);
+             let mut probs: Vec<f32> = Vec::new();
+@@ -1628,7 +1754,7 @@ impl crate::pipelines::ImputationPipeline {
+ 
+                 if let Some(target_m_idx) = target_m_idx {
+                     let target_m = target_m_idx.as_usize();
+-                    let conf = target_pl_matrix
++                    let mut conf = target_pl_matrix
+                         .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx);
+                     let allele = target_win.allele(MarkerIdx::new(target_m as u32), hap_idx);
+                     let partner_allele =
+@@ -1659,9 +1785,16 @@ impl crate::pipelines::ImputationPipeline {
+ 
+                     let is_diploid =
+                         target_samples.is_diploid(SampleIdx::new(sample_idx as u32));
+-                    let has_hard = mapped_allele != 255
++                    let mut has_hard = mapped_allele != 255
+                         && (mapped_allele as usize) < n_alleles
+-                        && (!is_diploid || (mapped_partner != 255 && (mapped_partner as usize) < n_alleles));
++                        && (!is_diploid
++                            || (mapped_partner != 255 && (mapped_partner as usize) < n_alleles));
++                    // If the input was unphased, avoid hard-allele emissions unless
++                    // we have PL/GL evidence; otherwise we over-clamp the HMM to a
++                    // potentially incorrect phase assignment.
++                    if !phase_conf_valid {
++                        has_hard = false;
++                    }
+                     let mut pl_probs: Vec<f32> = Vec::new();
+                     let pl = target_pl_matrix.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
+                     if let Some(pl) = pl {
+@@ -1851,6 +1984,11 @@ impl crate::pipelines::ImputationPipeline {
+                     }
+ 
+                     if !use_probs && has_hard {
++                        // If we only have hard GT (no PL/GL evidence), soften confidence
++                        // using the global mismatch rate to avoid over-clamping emissions.
++                        if pl.is_none() || pl.as_ref().map_or(true, |v| v.is_empty()) {
++                            conf = conf.min(1.0 - err_rate);
++                        }
+                         aligned_probs.resize(n_alleles, 0.0);
+                         if is_diploid && mapped_partner != 255 && mapped_partner != mapped_allele {
+                             if phase_conf_valid {
+@@ -2562,13 +2700,13 @@ impl crate::pipelines::ImputationPipeline {
+         // Dosages array is indexed from 0 for markers starting at output_start
+         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
+             let local_m = marker_idx.saturating_sub(output_start);
+-            let dosage = if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+-                dosage_from_gp(n_alleles, &gp)
++            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
++                (a1 + a2) as f32
+             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                 result.dosages.get(local_m).copied().unwrap_or(0.0)
+-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+-                (a1 + a2) as f32
++            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
++                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
++                dosage_from_gp(n_alleles, &gp)
+             } else {
+                 0.0
+             };
+@@ -2583,13 +2721,13 @@ impl crate::pipelines::ImputationPipeline {
+         // Closure to get best genotype
+         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
+             let local_m = marker_idx.saturating_sub(output_start);
+-            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+-                best_gt_from_gp(n_alleles, &gp)
++            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
++                (a1, a2)
+             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
+-            } else if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+-                (a1, a2)
++            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
++                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
++                best_gt_from_gp(n_alleles, &gp)
+             } else {
+                 (0, 0)
+             }
+@@ -2619,21 +2757,23 @@ impl crate::pipelines::ImputationPipeline {
+                 }
+                 if let Some(stats) = quality.get_mut(marker_idx) {
+                     for s in 0..n_samples {
+-                        let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
+-                        if !stats.is_imputed {
++                        let (v1, v2) = get_hap_probs(marker_idx, s);
++                        let (v1, v2) = if !stats.is_imputed {
+                             if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
+-                                v1 = a1 as f32;
+-                                v2 = a2 as f32;
++                                (a1 as f32, a2 as f32)
+                             } else if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                 let n_alleles = ref_markers
+                                     .marker(MarkerIdx::new(marker_idx as u32))
+                                     .n_alleles();
+                                 let dosage = dosage_from_gp(n_alleles, &gp);
+                                 let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+-                                v1 = p_alt;
+-                                v2 = p_alt;
++                                (p_alt, p_alt)
++                            } else {
++                                (v1, v2)
+                             }
+-                        }
++                        } else {
++                            (v1, v2)
++                        };
+                         stats.add_sample_biallelic(v1, v2);
+                     }
+                 }
+@@ -2645,21 +2785,23 @@ impl crate::pipelines::ImputationPipeline {
+                 }
+                 if let Some(stats) = quality.get_mut(marker_idx) {
+                     for s in 0..n_samples {
+-                        let (mut v1, mut v2) = get_hap_probs(marker_idx, s);
+-                        if !stats.is_imputed {
++                        let (v1, v2) = get_hap_probs(marker_idx, s);
++                        let (v1, v2) = if !stats.is_imputed {
+                             if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
+-                                v1 = a1 as f32;
+-                                v2 = a2 as f32;
++                                (a1 as f32, a2 as f32)
+                             } else if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
+                                 let n_alleles = ref_markers
+                                     .marker(MarkerIdx::new(marker_idx as u32))
+                                     .n_alleles();
+                                 let dosage = dosage_from_gp(n_alleles, &gp);
+                                 let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+-                                v1 = p_alt;
+-                                v2 = p_alt;
++                                (p_alt, p_alt)
++                            } else {
++                                (v1, v2)
+                             }
+-                        }
++                        } else {
++                            (v1, v2)
++                        };
+                         stats.add_sample_biallelic(v1, v2);
+                     }
+                 }
+diff --git a/tests/beagle_reference.rs b/tests/beagle_reference.rs
+index 69f0c85..57f03c1 100644
+--- a/tests/beagle_reference.rs
++++ b/tests/beagle_reference.rs
+@@ -1002,6 +1002,151 @@ fn test_imputation_bref3_ref_rust_vs_java() {
+     compare_imputation_results("bref3 Imputation", &gt_path, &java_vcf, &rust_vcf);
+ }
+ 
++#[test]
++#[serial]
++fn test_phasing_multi_window_long_map_vs_java() {
++    let files = setup_test_files();
++    let work_dir = tempfile::tempdir().expect("Create temp dir");
++
++    // Copy target to work dir
++    let gt_path = work_dir.path().join("target.vcf.gz");
++    fs::copy(&files.target_vcf, &gt_path).expect("Copy target VCF");
++
++    // Create a linear genetic map with a large span to force multi-window traversal.
++    let map_path = work_dir.path().join("long_span.map");
++    let _ = write_linear_map_for_span(&gt_path, &map_path, 90.0);
++
++    // Run Java BEAGLE phasing with map
++    let java_out = work_dir.path().join("java_phased_long");
++    let java_output = run_beagle(
++        &files.beagle_jar,
++        &[
++            ("gt", gt_path.to_str().unwrap()),
++            ("map", map_path.to_str().unwrap()),
++            ("out", java_out.to_str().unwrap()),
++            ("seed", "42"),
++        ],
++        work_dir.path(),
++    );
++    assert!(java_output.status.success(), "Java phasing failed");
++
++    let java_vcf = work_dir.path().join("java_phased_long.vcf.gz");
++
++    // Run Rust phasing with the same map and window sizing.
++    let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
++    let rust_out = work_dir.path().join("rust_phased_long");
++    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 30.0, 2.0);
++    assert!(
++        rust_result.is_ok(),
++        "Rust phasing failed: {:?}",
++        rust_result.err()
++    );
++
++    let rust_vcf = work_dir.path().join("rust_phased_long.vcf.gz");
++
++    // Compare outputs
++    let (_, java_records) = parse_vcf(&java_vcf);
++    let (_, rust_records) = parse_vcf(&rust_vcf);
++
++    println!(
++        "[long-map phasing] Java: {} records, Rust: {} records",
++        java_records.len(),
++        rust_records.len()
++    );
++
++    assert_eq!(
++        java_records.len(),
++        rust_records.len(),
++        "Record count mismatch (long-map phasing)"
++    );
++
++    let mut concordant = 0;
++    let mut total = 0;
++    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
++        for (j_gt, r_gt) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()) {
++            total += 1;
++            if normalize_gt_unphased(&j_gt.gt) == normalize_gt_unphased(&r_gt.gt) {
++                concordant += 1;
++            }
++        }
++    }
++
++    let concordance = concordant as f64 / total as f64;
++    println!(
++        "[long-map phasing] Concordance: {:.2}% ({}/{})",
++        concordance * 100.0,
++        concordant,
++        total
++    );
++    assert!(
++        concordance > 0.95,
++        "Long-map phasing concordance too low: {:.2}%",
++        concordance * 100.0
++    );
++}
++
++#[test]
++#[serial]
++fn test_imputation_multi_window_long_map_vs_java() {
++    let files = setup_test_files();
++    let work_dir = tempfile::tempdir().expect("Create temp dir");
++
++    // Copy files to work dir
++    let ref_path = work_dir.path().join("ref.vcf.gz");
++    let gt_path = work_dir.path().join("target_sparse.vcf.gz");
++    fs::copy(&files.ref_vcf, &ref_path).expect("Copy ref VCF");
++    fs::copy(&files.target_sparse_vcf, &gt_path).expect("Copy target VCF");
++
++    // Create a linear genetic map with a large span to force multi-window traversal.
++    let map_path = work_dir.path().join("long_span.map");
++    let _ = write_linear_map_for_span(&ref_path, &map_path, 90.0);
++
++    // Run Java BEAGLE with map
++    let java_out = work_dir.path().join("java_imputed_long");
++    let java_output = run_beagle(
++        &files.beagle_jar,
++        &[
++            ("ref", ref_path.to_str().unwrap()),
++            ("gt", gt_path.to_str().unwrap()),
++            ("map", map_path.to_str().unwrap()),
++            ("out", java_out.to_str().unwrap()),
++            ("seed", "42"),
++            ("gp", "true"),
++        ],
++        work_dir.path(),
++    );
++    assert!(java_output.status.success(), "Java imputation failed");
++
++    let java_vcf = work_dir.path().join("java_imputed_long.vcf.gz");
++
++    // Run Rust with the same map and explicit window sizing.
++    let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
++    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
++    let rust_out = work_dir.path().join("rust_imputed_long");
++    let rust_result = run_rust_imputation_with_map(
++        &gt_vcf,
++        &ref_vcf,
++        &map_path,
++        &rust_out,
++        42,
++        30.0,
++        2.0,
++    );
++    assert!(
++        rust_result.is_ok(),
++        "Rust imputation failed: {:?}",
++        rust_result.err()
++    );
++
++    let rust_vcf = work_dir.path().join("rust_imputed_long.vcf.gz");
++    compare_imputation_results(
++        "long-map multi-window",
++        &gt_path,
++        &java_vcf,
++        &rust_vcf,
++    );
++}
++
+ #[test]
+ #[serial]
+ fn test_full_workflow_rust_vs_java() {
+@@ -2141,6 +2286,63 @@ fn decompress_vcf_for_rust(gz_path: &Path, work_dir: &Path) -> PathBuf {
+     vcf_path
+ }
+ 
++/// Find chrom/min/max positions from a gzipped VCF.
++fn vcf_min_max_pos(vcf_gz: &Path) -> (String, u64, u64) {
++    let output = Command::new("gzip")
++        .args(["-dc", vcf_gz.to_str().unwrap()])
++        .output()
++        .expect("Failed to run gzip");
++
++    assert!(output.status.success(), "gzip decompression failed");
++    let text = String::from_utf8_lossy(&output.stdout);
++    let mut chrom = String::new();
++    let mut min_pos: Option<u64> = None;
++    let mut max_pos: Option<u64> = None;
++    for line in text.lines() {
++        if line.is_empty() || line.starts_with('#') {
++            continue;
++        }
++        let mut parts = line.split('\t');
++        let c = parts.next().unwrap_or("");
++        let pos_str = parts.next().unwrap_or("0");
++        let pos: u64 = pos_str.parse().unwrap_or(0);
++        if chrom.is_empty() {
++            chrom = c.to_string();
++        }
++        min_pos = Some(min_pos.map_or(pos, |p| p.min(pos)));
++        max_pos = Some(max_pos.map_or(pos, |p| p.max(pos)));
++    }
++    let min_pos = min_pos.expect("No VCF records found");
++    let max_pos = max_pos.expect("No VCF records found");
++    (chrom, min_pos, max_pos)
++}
++
++/// Write a simple linear PLINK map with a specified genetic span.
++fn write_linear_map_for_span(
++    vcf_gz: &Path,
++    map_path: &Path,
++    total_cm: f64,
++) -> (String, u64, u64) {
++    let (chrom, min_pos, max_pos) = vcf_min_max_pos(vcf_gz);
++    let span_bp = max_pos.saturating_sub(min_pos).max(1);
++    let span_mb = span_bp as f64 / 1_000_000.0;
++    let rate = if span_mb > 0.0 {
++        total_cm / span_mb
++    } else {
++        1.0
++    };
++    let content = format!(
++        "{chrom}\t{min_pos}\t{rate}\t0.0\n{chrom}\t{max_pos}\t{rate}\t{total_cm}\n",
++        chrom = chrom,
++        min_pos = min_pos,
++        max_pos = max_pos,
++        rate = rate,
++        total_cm = total_cm
++    );
++    fs::write(map_path, content).expect("Write map file");
++    (chrom, min_pos, max_pos)
++}
++
+ /// Helper to run Rust phasing pipeline
+ fn run_rust_phasing(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
+     let config = Config::parse_from([
+@@ -2156,6 +2358,34 @@ fn run_rust_phasing(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Res
+     pipeline.run_auto()
+ }
+ 
++/// Helper to run Rust phasing pipeline with map/window settings
++fn run_rust_phasing_with_map(
++    gt_path: &Path,
++    map_path: &Path,
++    out_prefix: &Path,
++    seed: i64,
++    window_cm: f32,
++    overlap_cm: f32,
++) -> reagle::Result<()> {
++    let config = Config::parse_from([
++        "reagle",
++        "--gt",
++        gt_path.to_str().unwrap(),
++        "--map",
++        map_path.to_str().unwrap(),
++        "--out",
++        out_prefix.to_str().unwrap(),
++        "--seed",
++        &seed.to_string(),
++        "--window",
++        &window_cm.to_string(),
++        "--overlap",
++        &overlap_cm.to_string(),
++    ]);
++    let mut pipeline = PhasingPipeline::new(config, None);
++    pipeline.run_auto()
++}
++
+ /// Helper to run Rust imputation pipeline
+ fn run_rust_imputation(
+     gt_path: &Path,
+@@ -2179,6 +2409,38 @@ fn run_rust_imputation(
+     pipeline.run()
+ }
+ 
++/// Helper to run Rust imputation pipeline with map/window settings.
++fn run_rust_imputation_with_map(
++    gt_path: &Path,
++    ref_path: &Path,
++    map_path: &Path,
++    out_prefix: &Path,
++    seed: i64,
++    window_cm: f32,
++    overlap_cm: f32,
++) -> reagle::Result<()> {
++    let config = Config::parse_from([
++        "reagle",
++        "--gt",
++        gt_path.to_str().unwrap(),
++        "--ref",
++        ref_path.to_str().unwrap(),
++        "--map",
++        map_path.to_str().unwrap(),
++        "--out",
++        out_prefix.to_str().unwrap(),
++        "--seed",
++        &seed.to_string(),
++        "--gp",
++        "--window",
++        &window_cm.to_string(),
++        "--overlap",
++        &overlap_cm.to_string(),
++    ]);
++    let mut pipeline = ImputationPipeline::new(config, None);
++    pipeline.run()
++}
++
+ // =============================================================================
+ // Strict Quality Metrics Comparison Tests
+ // =============================================================================
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index 4b13199..6d6db9f 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -542,8 +542,8 @@ def _stream_vcf_lines(cmd):
+         raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr)
+ 
+ 
+-def _parse_truth_line(line, samples):
+-    """Parse a truth VCF line into (key, sample_data_dict, is_multiallelic)."""
++def _parse_truth_line(line, sample_indices):
++    """Parse a truth VCF line into (key, sample_data_list, is_multiallelic)."""
+     parts = line.split('\t')
+     if len(parts) < 5:
+         return None, None, False
+@@ -552,22 +552,26 @@ def _parse_truth_line(line, samples):
+     key = (chrom, pos, ref, alt)
+     is_multiallelic = ',' in alt
+     gts = parts[4:]
+-    sample_data = {}
+-    for i, gt_str in enumerate(gts):
+-        if i < len(samples):
+-            gt_field = gt_str.split(':')[0]
++    sample_data = []
++    for idx in sample_indices:
++        if idx < len(gts):
++            gt_field = gts[idx].split(':')[0]
+             gt = parse_genotype(gt_field)
+             is_phased = '|' in gt_field
+-            sample_data[samples[i]] = (
+-                gt,
+-                _gt_nonref_dosage(gt) if gt is not None else None,
+-                is_phased,
++            sample_data.append(
++                (
++                    gt,
++                    _gt_nonref_dosage(gt) if gt is not None else None,
++                    is_phased,
++                )
+             )
++        else:
++            sample_data.append((None, None, False))
+     return key, sample_data, is_multiallelic
+ 
+ 
+-def _parse_imputed_line(line, samples):
+-    """Parse an imputed VCF line into (key, sample_data_dict, is_multiallelic)."""
++def _parse_imputed_line(line, sample_indices):
++    """Parse an imputed VCF line into (key, sample_data_list, is_multiallelic)."""
+     parts = line.split('\t')
+     if len(parts) < 5:
+         return None, None, False
+@@ -576,22 +580,23 @@ def _parse_imputed_line(line, samples):
+     key = (chrom, pos, ref, alt)
+     is_multiallelic = ',' in alt
+     sample_data_list = parts[4:]
+-    sample_data = {}
+-    for i, data_str in enumerate(sample_data_list):
+-        if i < len(samples):
++    sample_data = []
++    for idx in sample_indices:
++        if idx < len(sample_data_list):
++            data_str = sample_data_list[idx]
+             fields = data_str.split(':')
+             gt_field = fields[0]
+             gt = parse_genotype(gt_field)
+             is_phased = '|' in gt_field
+-            
++
+             # Expecting GT:DS:GP from bcftools query
+             ds = None
+             gp = None
+-            
++
+             # Parse DS (Estimated Dosage) - may be multiallelic (comma-separated)
+             if len(fields) > 1 and fields[1] != '.':
+                 ds = _parse_ds_field(fields[1])
+-            
++
+             # Parse GP (Genotype Probabilities)
+             if len(fields) > 2 and fields[2] != '.':
+                 try:
+@@ -600,12 +605,14 @@ def _parse_imputed_line(line, samples):
+                         gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
+                 except:
+                     pass
+-            
++
+             # Fallback to hard-call nonref dosage if DS missing
+             if ds is None and gt is not None:
+                 ds = _gt_nonref_dosage(gt)
+ 
+-            sample_data[samples[i]] = (gt, ds, is_phased, gp)
++            sample_data.append((gt, ds, is_phased, gp))
++        else:
++            sample_data.append((None, None, False, None))
+     return key, sample_data, is_multiallelic
+ 
+ 
+@@ -670,6 +677,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+     """
+     import time
+     start_time = time.time()
++    diag_start = start_time
+ 
+     if not imputed_vcf or not os.path.exists(imputed_vcf):
+         print("Imputed VCF not found")
+@@ -691,6 +699,13 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+         return None
+     common_samples_list = [s for s in truth_samples if s in common_samples]
+     print(f"Common samples: {len(common_samples_list)}") 
++
++    # Precompute sample index mappings for faster parsing
++    truth_index = {s: i for i, s in enumerate(truth_samples)}
++    imputed_index = {s: i for i, s in enumerate(imputed_samples)}
++    truth_indices = [truth_index[s] for s in common_samples_list]
++    imputed_indices = [imputed_index[s] for s in common_samples_list]
++    n_common = len(common_samples_list)
+     
+     # ============================================================
+     # DIAGNOSTIC OUTPUT - VCF Analysis
+@@ -778,6 +793,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+     print("\n" + "="*60)
+     print("END DIAGNOSTIC OUTPUT")
+     print("="*60 + "\n")
++    diag_elapsed = time.time() - diag_start
+     
+     input_sites = load_input_sites(input_vcf)
+     if input_sites is not None:
+@@ -825,6 +841,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+     if not reference_vcf or not os.path.exists(reference_vcf):
+         raise RuntimeError("reference_vcf is required for MAF stratification but was not provided or does not exist")
+ 
++    af_start = time.time()
+     try:
+         ref_cmd = (
+             f"bcftools +fill-tags {reference_vcf} -Ou -- -t AF "
+@@ -839,6 +856,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+     except Exception as e:
+         raise RuntimeError(f"Could not initialize reference AF stream from {reference_vcf}: {e}")
+ 
++    af_elapsed = time.time() - af_start
+     # Calculate metrics
+     unphased_concordant = 0  # Genotype match ignoring phase (0|1 == 1|0)
+     total_compared = 0
+@@ -855,13 +873,20 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+     # Classes: 0=HomRef, 1=Het, 2=HomAlt
+     confusion = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+ 
+-    # Per-sample tracking - use online stats instead of storing all dosages
+-    sample_metrics = defaultdict(lambda: {
+-        "concordant": 0, "total": 0,
+-        "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0,
+-        "switch_errors": 0, "switch_opportunities": 0,
+-        "sen_sum": 0.0, "sen_min": 1.0, "sen_max": 0.0, "sen_count": 0
+-    })
++    # Per-sample tracking (arrays aligned to common_samples_list for speed)
++    sample_concordant = [0] * n_common
++    sample_total = [0] * n_common
++    sample_sum_t = [0.0] * n_common
++    sample_sum_i = [0.0] * n_common
++    sample_sum_ti = [0.0] * n_common
++    sample_sum_tt = [0.0] * n_common
++    sample_sum_ii = [0.0] * n_common
++    sample_switch_errors = [0] * n_common
++    sample_switch_opportunities = [0] * n_common
++    sample_sen_sum = [0.0] * n_common
++    sample_sen_min = [1.0] * n_common
++    sample_sen_max = [0.0] * n_common
++    sample_sen_count = [0] * n_common
+ 
+     # For IQS calculation: track per-site concordance and expected concordance
+     site_iqs_sum = 0.0
+@@ -894,10 +919,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+     # For N50 Phasing Block Length
+     # sample -> list of block lengths (in bp)
+     phase_blocks = defaultdict(list)
+-    # sample -> start position of current block
+-    current_block_start = {}
+-    # sample -> last heterozygous position used for switch tracking
+-    last_het_pos = {}
++    # Per-sample phase tracking
++    current_block_start = [-1] * n_common
++    last_het_pos = [-1] * n_common
+ 
+     # MAF bins for stratified analysis - FINER BINS for rare variants
+     def get_maf_bin(maf):
+@@ -981,14 +1005,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+     def get_next_truth():
+         try:
+             line = next(truth_iter)
+-            return _parse_truth_line(line, truth_samples)
++            return _parse_truth_line(line, truth_indices)
+         except StopIteration:
+             return None, None, False
+ 
+     def get_next_imputed():
+         try:
+             line = next(imputed_iter)
+-            return _parse_imputed_line(line, imputed_samples)
++            return _parse_imputed_line(line, imputed_indices)
+         except StopIteration:
+             return None, None, False
+ 
+@@ -997,11 +1021,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+     imp_key, imp_data, imp_multiallelic = get_next_imputed()
+ 
+     # Track previous het for switch error calculation per sample
+-    prev_het = {}  # sample -> (site, truth_gt, imputed_gt, maf_bin)
++    prev_het = [None] * n_common  # (site, truth_gt, imputed_gt, maf_bin) per sample
+     common_sites_count = 0
+     last_pos = 0
+ 
+     print("Streaming and comparing...")
++    loop_start = time.time()
+     
+     # Merge-join loop
+     def gt_class(gt):
+@@ -1099,10 +1124,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+                         f"MAF stratification requires the site to be present in reference_vcf ({reference_vcf})."
+                     )
+ 
+-                ref_ref, ref_alt, ref_af_list = ref_afs
+-                maf = _maf_from_afs(ref_af_list)
+-                if ref_af_list and len(ref_af_list) == 1:
+-                    af = ref_af_list[0]
++    ref_ref, ref_alt, ref_af_list = ref_afs
++    maf = _maf_from_afs(ref_af_list)
++    if ref_af_list and len(ref_af_list) == 1:
++        af = ref_af_list[0]
+ 
+                 if maf is None:
+                     raise RuntimeError(
+@@ -1110,12 +1135,19 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+                     )
+ 
+                 maf_bin = get_maf_bin(maf)
+-                site_concordant = 0
+-                site_total = 0
+-
+-                for sample in common_samples_list:
+-                    t_entry = truth_site.get(sample)
+-                    i_entry = imputed_site.get(sample)
++    site_concordant = 0
++    site_total = 0
++
++    # Dosage calibration bins (predicted dosage -> mean truth dosage)
++    # Bin over [0, 2] since diploid dosage is 0..2.
++    ds_calib_bins = 20
++    ds_calib_sum_pred = [0.0] * ds_calib_bins
++    ds_calib_sum_truth = [0.0] * ds_calib_bins
++    ds_calib_count = [0] * ds_calib_bins
++
++                for sample_idx, _sample in enumerate(common_samples_list):
++                    t_entry = truth_site[sample_idx] if truth_site is not None else None
++                    i_entry = imputed_site[sample_idx] if imputed_site is not None else None
+                     t_gt, t_dos, t_phased = (t_entry if t_entry else (None, None, False))
+                     i_gt, i_dos, i_phased, i_gp = (i_entry if i_entry else (None, None, False, None))
+ 
+@@ -1141,19 +1173,29 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+                     t_class = gt_class(t_gt)
+                     i_class = gt_class(i_gt)
+ 
+-                    if t_class is None or i_dos is None:
+-                        continue
++        if t_class is None or i_dos is None:
++            continue
+ 
+                     if i_class is None and i_gt is not None:
+                         continue
+ 
+-                    # Hellinger score (biallelic only in this harness)
+-                    if i_gp is not None and t_class is not None and len(i_gp) == 3:
+-                        t_gp = (1.0, 0.0, 0.0) if t_class == 0 else ((0.0, 1.0, 0.0) if t_class == 1 else (0.0, 0.0, 1.0))
+-                        bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
+-                        hellinger_dist = math.sqrt(max(0, 1 - bc))
+-                        hellinger_sum += hellinger_dist
+-                        hellinger_count += 1
++        # Hellinger score (biallelic only in this harness)
++        if i_gp is not None and t_class is not None and len(i_gp) == 3:
++            t_gp = (1.0, 0.0, 0.0) if t_class == 0 else ((0.0, 1.0, 0.0) if t_class == 1 else (0.0, 0.0, 1.0))
++            bc = sum(math.sqrt(t * i) for t, i in zip(t_gp, i_gp))
++            hellinger_dist = math.sqrt(max(0, 1 - bc))
++            hellinger_sum += hellinger_dist
++            hellinger_count += 1
++
++        # Dosage calibration bins
++        if i_dos is not None:
++            pred = max(0.0, min(2.0, float(i_dos)))
++            bin_idx = int((pred / 2.0) * ds_calib_bins)
++            if bin_idx >= ds_calib_bins:
++                bin_idx = ds_calib_bins - 1
++            ds_calib_sum_pred[bin_idx] += pred
++            ds_calib_sum_truth[bin_idx] += float(t_dos)
++            ds_calib_count[bin_idx] += 1
+ 
+                     total_compared += 1
+                     site_total += 1
+@@ -1184,18 +1226,18 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+                     maf_bins[maf_bin]["total"] += 1
+ 
+                     # Sample stats
+-                    sample_metrics[sample]["total"] += 1
+-                    sample_metrics[sample]["sum_t"] += t_dos
+-                    sample_metrics[sample]["sum_i"] += i_dos
+-                    sample_metrics[sample]["sum_ti"] += t_dos * i_dos
+-                    sample_metrics[sample]["sum_tt"] += t_dos * t_dos
+-                    sample_metrics[sample]["sum_ii"] += i_dos * i_dos
+-                    sample_metrics[sample]["sen_sum"] += sen
+-                    sample_metrics[sample]["sen_count"] += 1
+-                    if sen < sample_metrics[sample]["sen_min"]:
+-                        sample_metrics[sample]["sen_min"] = sen
+-                    if sen > sample_metrics[sample]["sen_max"]:
+-                        sample_metrics[sample]["sen_max"] = sen
++                    sample_total[sample_idx] += 1
++                    sample_sum_t[sample_idx] += t_dos
++                    sample_sum_i[sample_idx] += i_dos
++                    sample_sum_ti[sample_idx] += t_dos * i_dos
++                    sample_sum_tt[sample_idx] += t_dos * t_dos
++                    sample_sum_ii[sample_idx] += i_dos * i_dos
++                    sample_sen_sum[sample_idx] += sen
++                    sample_sen_count[sample_idx] += 1
++                    if sen < sample_sen_min[sample_idx]:
++                        sample_sen_min[sample_idx] = sen
++                    if sen > sample_sen_max[sample_idx]:
++                        sample_sen_max[sample_idx] = sen
+ 
+                     if i_class is not None:
+                         confusion[t_class][i_class] += 1
+@@ -1209,7 +1251,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+                             unphased_concordant += 1
+                             site_concordant += 1
+                             maf_bins[maf_bin]["unphased_concordant"] += 1
+-                            sample_metrics[sample]["concordant"] += 1
++                            sample_concordant[sample_idx] += 1
+ 
+                     # Non-ref concordance
+                     if t_class > 0 and i_class is not None:
+@@ -1221,29 +1263,30 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+ 
+                     # Switch errors
+                     if t_class == 1 and i_class == 1 and t_phased and i_phased:
++                        sample_name = common_samples_list[sample_idx]
+                         pos = site[1]
+-                        if sample not in current_block_start:
+-                            current_block_start[sample] = pos
++                        if current_block_start[sample_idx] < 0:
++                            current_block_start[sample_idx] = pos
+ 
+-                        if sample in prev_het:
+-                            prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample]
++                        if prev_het[sample_idx] is not None:
++                            prev_site, prev_t_gt, prev_i_gt, prev_maf_bin = prev_het[sample_idx]
+                             t_same_phase = (t_gt[0] == prev_t_gt[0])
+                             i_same_phase = (i_gt[0] == prev_i_gt[0])
+ 
+                             if t_same_phase != i_same_phase:
+-                                block_len = pos - current_block_start[sample]
+-                                phase_blocks[sample].append(block_len)
+-                                current_block_start[sample] = pos
++                                block_len = pos - current_block_start[sample_idx]
++                                phase_blocks[sample_name].append(block_len)
++                                current_block_start[sample_idx] = pos
+ 
+                                 switch_errors += 1
+-                                sample_metrics[sample]["switch_errors"] += 1
++                                sample_switch_errors[sample_idx] += 1
+                                 maf_bins[maf_bin]["switch_errors"] += 1
+ 
+                             switch_opportunities += 1
+-                            sample_metrics[sample]["switch_opportunities"] += 1
++                            sample_switch_opportunities[sample_idx] += 1
+                             maf_bins[maf_bin]["switch_opportunities"] += 1
+-                        prev_het[sample] = (site, t_gt, i_gt, maf_bin)
+-                        last_het_pos[sample] = pos
++                        prev_het[sample_idx] = (site, t_gt, i_gt, maf_bin)
++                        last_het_pos[sample_idx] = pos
+ 
+                     # Masked-snp metrics (proxy quality)
+                     if is_input_site and mask_pick(t_chrom, t_pos, maf_bin):
+@@ -1312,13 +1355,16 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+              imp_key, imp_data, imp_multiallelic = get_next_imputed()
+ 
+     print(f"Common sites: {common_sites_count}")
++    loop_elapsed = time.time() - loop_start
+ 
+     # Close final phase blocks
+-    for sample, start_pos in current_block_start.items():
+-        end_pos = last_het_pos.get(sample)
+-        if end_pos is not None and end_pos >= start_pos:
++    for i, start_pos in enumerate(current_block_start):
++        if start_pos < 0:
++            continue
++        end_pos = last_het_pos[i]
++        if end_pos >= start_pos:
+             block_len = end_pos - start_pos
+-            phase_blocks[sample].append(block_len)
++            phase_blocks[common_samples_list[i]].append(block_len)
+ 
+     # Calculate overall metrics
+     metrics = {}
+@@ -1480,9 +1526,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+             metrics["r_squared"] = None
+ 
+         # Hellinger Score (if GP field was available)
+-        if hellinger_count > 0:
+-            metrics["hellinger_score"] = hellinger_sum / hellinger_count
+-            metrics["hellinger_n"] = hellinger_count
++    if hellinger_count > 0:
++        metrics["hellinger_score"] = hellinger_sum / hellinger_count
++        metrics["hellinger_n"] = hellinger_count
+ 
+         # Calculate Rare Variant R² stats (MAF < 1%) from online stats
+         rare_stats = {
+@@ -1522,23 +1568,23 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+         sample_sen_mins = []
+         sample_sen_maxs = []
+ 
+-        for sample, data in sample_metrics.items():
+-            if data["total"] > 0:
+-                sample_concordances.append(data["concordant"] / data["total"])
+-            n = data["total"]
++        for i in range(n_common):
++            n = sample_total[i]
++            if n > 0:
++                sample_concordances.append(sample_concordant[i] / n)
+             if n > 1:
+-                mean_t = data["sum_t"] / n
+-                mean_i = data["sum_i"] / n
+-                cov = data["sum_ti"] / n - mean_t * mean_i
+-                var_t = data["sum_tt"] / n - mean_t * mean_t
+-                var_i = data["sum_ii"] / n - mean_i * mean_i
++                mean_t = sample_sum_t[i] / n
++                mean_i = sample_sum_i[i] / n
++                cov = sample_sum_ti[i] / n - mean_t * mean_i
++                var_t = sample_sum_tt[i] / n - mean_t * mean_t
++                var_i = sample_sum_ii[i] / n - mean_i * mean_i
+                 if var_t > 0 and var_i > 0:
+                     r = cov / math.sqrt(var_t * var_i)
+                     sample_r2s.append(r ** 2)
+-            if data["sen_count"] > 0:
+-                sample_sen_means.append(data["sen_sum"] / data["sen_count"])
+-                sample_sen_mins.append(data["sen_min"])
+-                sample_sen_maxs.append(data["sen_max"])
++            if sample_sen_count[i] > 0:
++                sample_sen_means.append(sample_sen_sum[i] / sample_sen_count[i])
++                sample_sen_mins.append(sample_sen_min[i])
++                sample_sen_maxs.append(sample_sen_max[i])
+         
+         if sample_concordances:
+             metrics["sample_concordance_mean"] = sum(sample_concordances) / len(sample_concordances)
+@@ -1618,9 +1664,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+         
+         # Per-sample switch error summary
+         sample_switch_rates = []
+-        for sample, data in sample_metrics.items():
+-            if data["switch_opportunities"] > 0:
+-                sample_switch_rates.append(data["switch_errors"] / data["switch_opportunities"])
++        for i in range(n_common):
++            if sample_switch_opportunities[i] > 0:
++                sample_switch_rates.append(
++                    sample_switch_errors[i] / sample_switch_opportunities[i]
++                )
+         if sample_switch_rates:
+             metrics["sample_switch_error_mean"] = sum(sample_switch_rates) / len(sample_switch_rates)
+             metrics["sample_switch_error_max"] = max(sample_switch_rates)
+@@ -1628,6 +1676,31 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+ 
+     elapsed = time.time() - start_time
+     metrics["calculation_time_sec"] = elapsed
++    metrics["diagnostic_time_sec"] = diag_elapsed
++    metrics["af_time_sec"] = af_elapsed
++    metrics["metrics_loop_time_sec"] = loop_elapsed
++
++    # Dosage calibration summary (predicted dosage bins)
++    ds_calibration = []
++    for i in range(ds_calib_bins):
++        count = ds_calib_count[i]
++        if count > 0:
++            mean_pred = ds_calib_sum_pred[i] / count
++            mean_truth = ds_calib_sum_truth[i] / count
++        else:
++            mean_pred = None
++            mean_truth = None
++        bin_lo = (i / ds_calib_bins) * 2.0
++        bin_hi = ((i + 1) / ds_calib_bins) * 2.0
++        ds_calibration.append({
++            "bin": i,
++            "bin_lo": bin_lo,
++            "bin_hi": bin_hi,
++            "mean_pred": mean_pred,
++            "mean_truth": mean_truth,
++            "count": count,
++        })
++    metrics["ds_calibration"] = ds_calibration
+ 
+     # Save metrics to JSON for exact aggregation
+     with open(output_prefix + "_metrics.json", "w") as f:
+@@ -1645,6 +1718,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
+         print(f"   Sites compared: {sites:,}" if sites is not None else "   Sites compared: N/A")
+         print(f"   Genotypes compared: {genotypes:,}" if genotypes is not None else "   Genotypes compared: N/A")
+         print(f"   Calculation time: {metrics.get('calculation_time_sec', 0):.1f}s")
++        if metrics.get("diagnostic_time_sec") is not None:
++            print(f"     Diagnostics:  {metrics.get('diagnostic_time_sec', 0):.1f}s")
++        if metrics.get("af_time_sec") is not None:
++            print(f"     AF extraction:{metrics.get('af_time_sec', 0):.1f}s")
++        if metrics.get("metrics_loop_time_sec") is not None:
++            print(f"     Metrics loop:{metrics.get('metrics_loop_time_sec', 0):.1f}s")
+         
+         print(f"\n🎯 ACCURACY METRICS")
+         print(f"   Unphased concordance: {metrics.get('unphased_concordance', 0):.4f}")
+diff --git a/tests/plot_metrics.py b/tests/plot_metrics.py
+new file mode 100644
+index 0000000..fd91a47
+--- /dev/null
++++ b/tests/plot_metrics.py
+@@ -0,0 +1,202 @@
++#!/usr/bin/env python3
++import json
++import os
++from pathlib import Path
++
++import matplotlib.pyplot as plt
++
++
++def load_metrics(path):
++    if not path or not os.path.exists(path):
++        return None
++    with open(path, "r") as f:
++        return json.load(f)
++
++
++def ensure_dir(path):
++    Path(path).mkdir(parents=True, exist_ok=True)
++
++
++def plot_overall_metrics(beagle, reagle, out_dir):
++    keys = [
++        ("unphased_concordance", "Concordance"),
++        ("r_squared", "R²"),
++        ("iqs", "IQS"),
++        ("nonref_concordance", "Non-ref conc"),
++    ]
++    labels = [k[1] for k in keys]
++    b_vals = [beagle.get(k[0], 0.0) if beagle else 0.0 for k in keys]
++    r_vals = [reagle.get(k[0], 0.0) if reagle else 0.0 for k in keys]
++
++    x = range(len(labels))
++    width = 0.35
++    fig, ax = plt.subplots(figsize=(8, 4))
++    ax.bar([i - width / 2 for i in x], b_vals, width, label="Beagle")
++    ax.bar([i + width / 2 for i in x], r_vals, width, label="Reagle")
++    ax.set_ylabel("Score")
++    ax.set_xticks(list(x))
++    ax.set_xticklabels(labels, rotation=20, ha="right")
++    ax.set_ylim(0, 1.05)
++    ax.set_title("Overall Accuracy Metrics")
++    ax.legend()
++    fig.tight_layout()
++    fig.savefig(os.path.join(out_dir, "overall_metrics.png"), dpi=150)
++    plt.close(fig)
++
++def plot_per_class_accuracy(beagle, reagle, out_dir):
++    keys = [
++        ("homref_accuracy", "HomRef"),
++        ("het_accuracy", "Het"),
++        ("homalt_accuracy", "HomAlt"),
++    ]
++    labels = [k[1] for k in keys]
++    b_vals = [beagle.get(k[0], 0.0) if beagle else 0.0 for k in keys]
++    r_vals = [reagle.get(k[0], 0.0) if reagle else 0.0 for k in keys]
++
++    x = range(len(labels))
++    width = 0.35
++    fig, ax = plt.subplots(figsize=(6, 4))
++    ax.bar([i - width / 2 for i in x], b_vals, width, label="Beagle")
++    ax.bar([i + width / 2 for i in x], r_vals, width, label="Reagle")
++    ax.set_ylabel("Accuracy")
++    ax.set_xticks(list(x))
++    ax.set_xticklabels(labels)
++    ax.set_ylim(0, 1.05)
++    ax.set_title("Per-class Accuracy")
++    ax.legend()
++    fig.tight_layout()
++    fig.savefig(os.path.join(out_dir, "per_class_accuracy.png"), dpi=150)
++    plt.close(fig)
++
++
++def plot_maf_curves(beagle, reagle, out_dir, key, title, filename):
++    if not beagle or not reagle:
++        return
++    b_bins = beagle.get("by_maf", {})
++    r_bins = reagle.get("by_maf", {})
++    bins = list(b_bins.keys())
++    if not bins:
++        return
++
++    b_vals = [b_bins[b].get(key, None) for b in bins]
++    r_vals = [r_bins.get(b, {}).get(key, None) for b in bins]
++
++    fig, ax = plt.subplots(figsize=(8, 4))
++    ax.plot(bins, b_vals, marker="o", label="Beagle")
++    ax.plot(bins, r_vals, marker="o", label="Reagle")
++    ax.set_ylabel(key)
++    ax.set_title(title)
++    ax.set_xticklabels(bins, rotation=25, ha="right")
++    ax.legend()
++    fig.tight_layout()
++    fig.savefig(os.path.join(out_dir, filename), dpi=150)
++    plt.close(fig)
++
++def plot_confusion_matrix(metrics, title, filename, out_dir):
++    if not metrics:
++        return
++    cm = metrics.get("confusion_matrix")
++    if not cm:
++        return
++    fig, ax = plt.subplots(figsize=(5, 4))
++    ax.imshow(cm, cmap="Blues")
++    ax.set_xticks([0, 1, 2])
++    ax.set_yticks([0, 1, 2])
++    ax.set_xticklabels(["HomRef", "Het", "HomAlt"])
++    ax.set_yticklabels(["HomRef", "Het", "HomAlt"])
++    ax.set_xlabel("Imputed")
++    ax.set_ylabel("Truth")
++    ax.set_title(title)
++    for i in range(3):
++        for j in range(3):
++            ax.text(j, i, f"{cm[i][j]:,}", ha="center", va="center", color="black", fontsize=8)
++    fig.tight_layout()
++    fig.savefig(os.path.join(out_dir, filename), dpi=150)
++    plt.close(fig)
++
++def plot_sample_r2_distribution(beagle, reagle, out_dir):
++    if not beagle or not reagle:
++        return
++    b_mean = beagle.get("sample_r2_mean", None)
++    r_mean = reagle.get("sample_r2_mean", None)
++    b_min = beagle.get("sample_r2_min", None)
++    r_min = reagle.get("sample_r2_min", None)
++    if b_mean is None or r_mean is None:
++        return
++    fig, ax = plt.subplots(figsize=(6, 4))
++    ax.bar(["Beagle mean", "Reagle mean"], [b_mean, r_mean], color=["#1f77b4", "#ff7f0e"])
++    ax.set_ylim(0, 1.05)
++    ax.set_ylabel("R²")
++    ax.set_title("Per-sample R² (mean)")
++    ax2 = ax.twinx()
++    if b_min is not None and r_min is not None:
++        ax2.plot([0, 1], [b_min, r_min], marker="o", color="black", linestyle="--")
++        ax2.set_ylabel("R² min")
++    fig.tight_layout()
++    fig.savefig(os.path.join(out_dir, "sample_r2_summary.png"), dpi=150)
++    plt.close(fig)
++
++def plot_ds_calibration(beagle, reagle, out_dir):
++    if not beagle or not reagle:
++        return
++    b_cal = beagle.get("ds_calibration", [])
++    r_cal = reagle.get("ds_calibration", [])
++    if not b_cal or not r_cal:
++        return
++
++    def extract(cal):
++        x = []
++        y = []
++        for row in cal:
++            if row.get("mean_pred") is None or row.get("mean_truth") is None:
++                continue
++            x.append(row["mean_pred"])
++            y.append(row["mean_truth"])
++        return x, y
++
++    b_x, b_y = extract(b_cal)
++    r_x, r_y = extract(r_cal)
++
++    fig, ax = plt.subplots(figsize=(6, 6))
++    ax.plot([0, 2], [0, 2], color="gray", linestyle="--", label="Ideal")
++    ax.plot(b_x, b_y, marker="o", label="Beagle")
++    ax.plot(r_x, r_y, marker="o", label="Reagle")
++    ax.set_xlabel("Mean predicted dosage")
++    ax.set_ylabel("Mean truth dosage")
++    ax.set_title("Dosage Calibration")
++    ax.set_xlim(0, 2)
++    ax.set_ylim(0, 2)
++    ax.legend()
++    fig.tight_layout()
++    fig.savefig(os.path.join(out_dir, "dosage_calibration.png"), dpi=150)
++    plt.close(fig)
++
++
++def main():
++    data_dir = Path("tests/data")
++    beagle = load_metrics(data_dir / "beagle_metrics.json")
++    reagle = load_metrics(data_dir / "reagle_metrics.json")
++    out_dir = data_dir / "plots"
++    ensure_dir(out_dir)
++
++    if not beagle or not reagle:
++        print("Missing metrics JSON; nothing to plot.")
++        return 0
++
++    plot_overall_metrics(beagle, reagle, out_dir)
++    plot_per_class_accuracy(beagle, reagle, out_dir)
++    plot_maf_curves(beagle, reagle, out_dir, "r_squared", "R² by MAF bin", "r2_by_maf.png")
++    plot_maf_curves(beagle, reagle, out_dir, "iqs", "IQS by MAF bin", "iqs_by_maf.png")
++    plot_maf_curves(beagle, reagle, out_dir, "f1_score", "F1 by MAF bin", "f1_by_maf.png")
++    plot_maf_curves(beagle, reagle, out_dir, "nonref_concordance", "Non-ref Concordance by MAF bin", "nonref_conc_by_maf.png")
++    plot_maf_curves(beagle, reagle, out_dir, "switch_error_rate", "Switch Error Rate by MAF bin", "switch_by_maf.png")
++    plot_ds_calibration(beagle, reagle, out_dir)
++    plot_confusion_matrix(beagle, "Beagle Confusion Matrix", "confusion_beagle.png", out_dir)
++    plot_confusion_matrix(reagle, "Reagle Confusion Matrix", "confusion_reagle.png", out_dir)
++    plot_sample_r2_distribution(beagle, reagle, out_dir)
++    print(f"Plots saved to {out_dir}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

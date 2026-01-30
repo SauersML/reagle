@@ -2035,6 +2035,9 @@ fn manual_lint_arguments(build_path: &Path) -> Vec<OsString> {
     vec![
         OsString::from("--edition"),
         OsString::from("2024"),
+        // Lint without linking to avoid toolchain linker/bitcode mismatches.
+        OsString::from("--emit"),
+        OsString::from("metadata"),
         OsString::from("-D"),
         OsString::from("unused_variables"),
         OsString::from("-D"),

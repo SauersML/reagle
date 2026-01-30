@@ -57,6 +57,9 @@ fn run() -> Result<()> {
     // Parse and validate configuration
     let config = Config::parse_and_validate()?;
 
+    #[cfg(feature = "pprof")]
+    let pprof_guard = maybe_start_pprof();
+
     // Initialize profiling if requested
     if config.profile {
         init_profiling();
@@ -103,8 +106,56 @@ fn run() -> Result<()> {
     let elapsed = start.elapsed();
     eprintln!("\nCompleted in {:.2}s", elapsed.as_secs_f64());
 
+    #[cfg(feature = "pprof")]
+    if let Some(guard) = pprof_guard {
+        maybe_write_pprof(guard);
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {}
+
+#[cfg(feature = "pprof")]
+fn maybe_start_pprof() -> Option<pprof::ProfilerGuard<'static>> {
+    if std::env::var("REAGLE_PPROF").is_ok() {
+        match pprof::ProfilerGuard::new(100) {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                eprintln!("pprof: failed to start profiler: {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "pprof")]
+fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
+    let report = match guard.report().build() {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("pprof: failed to build report: {}", err);
+            return;
+        }
+    };
+    let output_path =
+        std::env::var("REAGLE_PPROF_OUTPUT").unwrap_or_else(|_| "reagle.pprof.svg".to_string());
+    match std::fs::File::create(&output_path) {
+        Ok(mut file) => {
+            if let Err(err) = report.flamegraph(&mut file) {
+                eprintln!("pprof: failed to write flamegraph: {}", err);
+            } else {
+                eprintln!("pprof flamegraph written to {}", output_path);
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "pprof: failed to create output file {}: {}",
+                output_path, err
+            );
+        }
+    }
+}

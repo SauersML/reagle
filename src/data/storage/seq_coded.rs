@@ -51,6 +51,16 @@ impl SeqCodedBlock {
         self.n_haps
     }
 
+    /// Haplotype-to-sequence mapping
+    pub fn hap_to_seq(&self) -> &[u16] {
+        self.hap_to_seq.as_slice()
+    }
+
+    /// Sequence-to-allele mapping for a marker offset
+    pub fn seq_alleles(&self, marker_offset: usize) -> &[u8] {
+        &self.seq_to_allele[marker_offset]
+    }
+
     /// Get allele for a haplotype at a marker (by local offset within block)
     #[inline]
     pub fn get(&self, marker_offset: usize, hap: HapIdx) -> u8 {
@@ -98,6 +108,16 @@ impl SeqCodedColumn {
     #[inline]
     pub fn get(&self, hap: HapIdx) -> u8 {
         self.block.get(self.marker_offset, hap)
+    }
+
+    /// Haplotype-to-sequence mapping
+    pub fn hap_to_seq(&self) -> &[u16] {
+        self.block.hap_to_seq()
+    }
+
+    /// Sequence-to-allele mapping for this marker
+    pub fn seq_alleles(&self) -> &[u8] {
+        self.block.seq_alleles(self.marker_offset)
     }
 
     /// Number of haplotypes

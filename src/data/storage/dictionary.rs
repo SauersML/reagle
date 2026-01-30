@@ -115,6 +115,32 @@ impl DictionaryColumn {
         allele
     }
 
+    /// Pattern index for a haplotype
+    #[inline]
+    pub fn hap_pattern_idx(&self, hap: HapIdx) -> usize {
+        self.hap_to_pattern[hap.as_usize()] as usize
+    }
+
+    /// Get allele for a specific pattern at a marker offset
+    #[inline]
+    pub fn pattern_allele(&self, marker_offset: usize, pattern_idx: usize) -> u8 {
+        let pattern = &self.patterns[pattern_idx];
+        let bits_per_marker = self.bits_per_allele as usize + 1;
+        let start = marker_offset * bits_per_marker;
+
+        if pattern[start + bits_per_marker - 1] {
+            return 255;
+        }
+
+        let mut allele = 0u8;
+        for b in 0..self.bits_per_allele as usize {
+            if pattern[start + b] {
+                allele |= 1 << b;
+            }
+        }
+        allele
+    }
+
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.hap_to_pattern.len()

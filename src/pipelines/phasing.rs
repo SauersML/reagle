@@ -1293,6 +1293,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample);
 
         let mut mcmc_paths: Vec<Option<MosaicPaths>> = vec![None; n_samples];
+        let mut stable_main_iters = 0usize;
 
         for it in 0..total_iterations {
             let is_burnin = it < n_burnin;
@@ -1321,7 +1322,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 None
             };
 
-            self.run_phase_baum_iteration_stage1(
+            let (total_switches, total_phased) = self.run_phase_baum_iteration_stage1(
                 &target_gt,
                 &mut geno,
                 &stage1_p_recomb,
@@ -1365,6 +1366,25 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     "  EM update: p_mismatch={:.6}, recomb_intensity={:.4}",
                     self.params.p_mismatch, self.params.recomb_intensity
                 );
+            }
+
+            // Early stop if phase state has stabilized in main iterations.
+            if !is_burnin {
+                let remaining_hets = Self::count_unphased_hets(&sample_phases, &hi_freq_to_orig);
+                let change = total_switches + total_phased;
+                let threshold = (remaining_hets / 100).max(1);
+                if change <= threshold {
+                    stable_main_iters += 1;
+                    if stable_main_iters >= 2 {
+                        eprintln!(
+                            "Phasing converged (changes {} <= threshold {} for 2 main iterations); stopping early.",
+                            change, threshold
+                        );
+                        break;
+                    }
+                } else {
+                    stable_main_iters = 0;
+                }
             }
         }
 
@@ -1826,6 +1846,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         .collect();
                 }
             }
+
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
@@ -2591,10 +2612,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         mcmc_paths: &mut [Option<MosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
-    ) -> Result<()> {
+    ) -> Result<(usize, usize)> {
         let n_stage1_blocks = stage1_blocks.len();
         if n_stage1_blocks == 0 {
-            return Ok(());
+            return Ok((0, 0));
         }
         let n_haps = geno.n_haps();
 
@@ -3000,7 +3021,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             "Applied {} phase switches, {} markers phased (Stage 1 FB)",
             total_switches, total_phased
         );
-        Ok(())
+        Ok((total_switches, total_phased))
     }
 
     /// Build final GenotypeMatrix from mutable genotypes
@@ -3037,6 +3058,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             markers, columns, samples, confidence, pl,
         )
         .with_phase_confidence(Some(phase_confidence))
+    }
+
+    fn count_unphased_hets(sample_phases: &[SamplePhase], hi_freq_to_orig: &[usize]) -> usize {
+        let mut count = 0usize;
+        for sp in sample_phases {
+            for &m in hi_freq_to_orig {
+                let a1 = sp.allele1(m);
+                let a2 = sp.allele2(m);
+                if a1 != 255 && a2 != 255 && a1 != a2 && sp.is_unphased(m) {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     /// Stage 2: Phase rare markers using HMM state probability interpolation
