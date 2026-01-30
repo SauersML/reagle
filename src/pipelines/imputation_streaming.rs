@@ -18,6 +18,7 @@ use crate::data::genetic_map::GeneticMaps;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::storage::phase_state::{Phased, PhaseState};
 use crate::data::{HapIdx, MarkerIdx, SampleIdx};
+use crate::data::marker::{AnyMarkerSpace, RefWindowSpace};
 use crate::error::ReagleError;
 use crate::error::Result;
 use crate::Config;
@@ -78,6 +79,7 @@ const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const STATE_BUDGET_SAFETY: f64 = 0.6;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
+const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
 const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
@@ -995,6 +997,20 @@ fn estimate_ref_window_bytes(ref_window: &RefWindow, packed_cols: &[PackedRefCol
     bytes.saturating_add(marker_overhead)
 }
 
+struct PrescanTargetEntry {
+    phased_target: GenotypeMatrix<Phased, AnyMarkerSpace>,
+    alignment: MarkerAlignment<AnyMarkerSpace, RefWindowSpace>,
+}
+
+fn estimate_target_entry_bytes(entry: &PrescanTargetEntry) -> u64 {
+    let target_bytes = entry.phased_target.size_bytes() as u64;
+    let align_markers =
+        entry.alignment.ref_to_target.len().saturating_add(entry.alignment.target_to_ref.len());
+    let align_bytes = align_markers.saturating_mul(16) as u64
+        + entry.alignment.allele_mappings.len().saturating_mul(32) as u64;
+    target_bytes.saturating_add(align_bytes)
+}
+
 fn compute_per_window_cap(
     n_ref_haps: usize,
     n_ref_markers: usize,
@@ -1310,26 +1326,173 @@ fn build_imputation_plan(
         batch_size
     );
 
+    let target_cache_budget = if avail == 0 {
+        0u64
+    } else {
+        (avail as f64 * TARGET_CACHE_RAM_FRACTION) as u64
+    };
+    let mut target_cache: Option<Vec<Option<PrescanTargetEntry>>> = None;
+    if target_cache_budget > 0 {
+        let mut entries: Vec<Option<PrescanTargetEntry>> = Vec::new();
+        let mut target_bytes = 0u64;
+        let mut cache_ok = true;
+        let mut target_reader =
+            StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
+
+        match ref_data {
+            ReferenceData::InMemory { windows, .. } => {
+                for ref_window in windows.iter() {
+                    let n_ref_markers = ref_window.markers.len();
+                    if n_ref_markers == 0 {
+                        entries.push(None);
+                        continue;
+                    }
+                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                    let ref_chrom = ref_window
+                        .markers
+                        .chrom_name(ref_chrom_idx)
+                        .unwrap_or("UNKNOWN");
+                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                    let end_pos = ref_window
+                        .markers
+                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                        .pos;
+                    let chrom_candidates = chrom_variants(ref_chrom);
+                    let target_window = target_reader.load_window_for_region(
+                        &chrom_candidates,
+                        start_pos,
+                        end_pos,
+                    )?;
+                    if let Some(target_window) = target_window {
+                        let alignment = MarkerAlignment::new_with_ref_markers(
+                            &target_window.genotypes,
+                            &ref_window.markers,
+                        );
+                        let phased_target = target_window.genotypes.clone().into_phased();
+                        let entry = PrescanTargetEntry {
+                            phased_target,
+                            alignment,
+                        };
+                        target_bytes = target_bytes.saturating_add(estimate_target_entry_bytes(&entry));
+                        if target_bytes > target_cache_budget {
+                            cache_ok = false;
+                            break;
+                        }
+                        entries.push(Some(entry));
+                    } else {
+                        entries.push(None);
+                    }
+                }
+            }
+            ReferenceData::OnDisk { cache_meta, .. } => {
+                let mut ref_reader = PrescanCacheReader::open(&cache_meta.path)?;
+                loop {
+                    let ref_window = ref_reader.next_window()?;
+                    let Some(ref_window) = ref_window else { break };
+                    let n_ref_markers = ref_window.markers.len();
+                    if n_ref_markers == 0 {
+                        entries.push(None);
+                        continue;
+                    }
+                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                    let ref_chrom = ref_window
+                        .markers
+                        .chrom_name(ref_chrom_idx)
+                        .unwrap_or("UNKNOWN");
+                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                    let end_pos = ref_window
+                        .markers
+                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                        .pos;
+                    let chrom_candidates = chrom_variants(ref_chrom);
+                    let target_window = target_reader.load_window_for_region(
+                        &chrom_candidates,
+                        start_pos,
+                        end_pos,
+                    )?;
+                    if let Some(target_window) = target_window {
+                        let alignment = MarkerAlignment::new_with_ref_markers(
+                            &target_window.genotypes,
+                            &ref_window.markers,
+                        );
+                        let phased_target = target_window.genotypes.clone().into_phased();
+                        let entry = PrescanTargetEntry {
+                            phased_target,
+                            alignment,
+                        };
+                        target_bytes = target_bytes.saturating_add(estimate_target_entry_bytes(&entry));
+                        if target_bytes > target_cache_budget {
+                            cache_ok = false;
+                            break;
+                        }
+                        entries.push(Some(entry));
+                    } else {
+                        entries.push(None);
+                    }
+                }
+            }
+        }
+
+        if cache_ok && !entries.is_empty() {
+            eprintln!(
+                "Pre-scan: cached target windows (~{} MB)",
+                target_bytes / (1024 * 1024)
+            );
+            target_cache = Some(entries);
+        } else if !entries.is_empty() {
+            eprintln!("Pre-scan: target cache disabled (budget exceeded)");
+        }
+    }
+
+    let mut global_scores: Vec<Vec<f32>> = Vec::new();
+    let mut window_scores: Vec<Vec<f32>> = Vec::new();
+    let mut best_window_scores: Vec<Vec<f32>> = Vec::new();
+    let mut window_rank_hits: Vec<Vec<u32>> = Vec::new();
+    let mut scores_by_window: Vec<Vec<Vec<(usize, f32)>>> = Vec::new();
+
+    let mut on_disk_reader = match ref_data {
+        ReferenceData::OnDisk { cache_meta, .. } => {
+            Some(PrescanCacheReader::open(&cache_meta.path)?)
+        }
+        _ => None,
+    };
+
+    let cache_ready = target_cache
+        .as_ref()
+        .map(|c| c.iter().all(|e| e.is_some()))
+        .unwrap_or(false);
+
     while batch_start < n_target_haps {
         let batch_end = (batch_start + batch_size).min(n_target_haps);
         let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
         let batch_len = batch_haps.len();
 
-        let mut target_reader =
-            StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
+        let mut target_reader: Option<StreamingVcfReader> = if cache_ready {
+            None
+        } else {
+            Some(StreamingVcfReader::open(
+                target_path,
+                gen_maps.clone(),
+                streaming_config.clone(),
+            )?)
+        };
 
-        let mut global_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
-        let mut window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
-        let mut best_window_scores: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
-        let mut window_rank_hits: Vec<Vec<u32>> = Vec::with_capacity(batch_len);
-        let mut scores_by_window: Vec<Vec<Vec<(usize, f32)>>> = Vec::with_capacity(batch_len);
-
-        for _ in 0..batch_len {
+        if global_scores.len() > batch_len {
+            global_scores.truncate(batch_len);
+            window_scores.truncate(batch_len);
+            best_window_scores.truncate(batch_len);
+            window_rank_hits.truncate(batch_len);
+            scores_by_window.truncate(batch_len);
+        }
+        while global_scores.len() < batch_len {
             global_scores.push(Vec::new());
             window_scores.push(Vec::new());
             best_window_scores.push(Vec::new());
             window_rank_hits.push(Vec::new());
             scores_by_window.push(Vec::new());
+        }
+        for list in scores_by_window.iter_mut() {
+            list.clear();
         }
 
         let mut window_idx = 0usize;
@@ -1339,7 +1502,9 @@ fn build_imputation_plan(
                 packed_columns,
                 ..
             } => {
-                for (ref_window, ref_columns) in windows.iter().zip(packed_columns.iter()) {
+                for (idx, (ref_window, ref_columns)) in
+                    windows.iter().zip(packed_columns.iter()).enumerate()
+                {
                     let n_ref_markers = ref_window.markers.len();
                     if n_ref_markers == 0 {
                         continue;
@@ -1351,31 +1516,73 @@ fn build_imputation_plan(
                         .copied()
                         .unwrap_or(per_window_cap.max(1));
 
-                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
-                    let ref_chrom = ref_window
-                        .markers
-                        .chrom_name(ref_chrom_idx)
-                        .unwrap_or("UNKNOWN");
-                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-                    let end_pos = ref_window
-                        .markers
-                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                        .pos;
-
-                    let chrom_candidates = chrom_variants(ref_chrom);
-                    let target_window = target_reader.load_window_for_region(
-                        &chrom_candidates,
-                        start_pos,
-                        end_pos,
-                    )?;
-                    let Some(target_window) = target_window else {
-                        continue;
+                    let (alignment, phased_target) = if let Some(cache) = target_cache.as_ref() {
+                        if let Some(Some(entry)) = cache.get(idx) {
+                            (
+                                entry.alignment.clone(),
+                                entry.phased_target.clone(),
+                            )
+                        } else {
+                            let ref_chrom_idx =
+                                ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                            let ref_chrom = ref_window
+                                .markers
+                                .chrom_name(ref_chrom_idx)
+                                .unwrap_or("UNKNOWN");
+                            let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                            let end_pos = ref_window
+                                .markers
+                                .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                                .pos;
+                            let chrom_candidates = chrom_variants(ref_chrom);
+                            let reader = target_reader.as_mut().ok_or_else(|| {
+                                ReagleError::vcf("Target reader missing in prescan".to_string())
+                            })?;
+                            let target_window = reader.load_window_for_region(
+                                &chrom_candidates,
+                                start_pos,
+                                end_pos,
+                            )?;
+                            let Some(target_window) = target_window else {
+                                continue;
+                            };
+                            let alignment = MarkerAlignment::new_with_ref_markers(
+                                &target_window.genotypes,
+                                &ref_window.markers,
+                            );
+                            let phased_target = target_window.genotypes.clone().into_phased();
+                            (alignment, phased_target)
+                        }
+                    } else {
+                        let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                        let ref_chrom = ref_window
+                            .markers
+                            .chrom_name(ref_chrom_idx)
+                            .unwrap_or("UNKNOWN");
+                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                        let end_pos = ref_window
+                            .markers
+                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                            .pos;
+                        let chrom_candidates = chrom_variants(ref_chrom);
+                        let reader = target_reader.as_mut().ok_or_else(|| {
+                            ReagleError::vcf("Target reader missing in prescan".to_string())
+                        })?;
+                        let target_window = reader.load_window_for_region(
+                            &chrom_candidates,
+                            start_pos,
+                            end_pos,
+                        )?;
+                        let Some(target_window) = target_window else {
+                            continue;
+                        };
+                        let alignment = MarkerAlignment::new_with_ref_markers(
+                            &target_window.genotypes,
+                            &ref_window.markers,
+                        );
+                        let phased_target = target_window.genotypes.clone().into_phased();
+                        (alignment, phased_target)
                     };
-
-                    let alignment = MarkerAlignment::new_with_ref_markers(
-                        &target_window.genotypes,
-                        &ref_window.markers,
-                    );
 
                     for i in 0..batch_len {
                         if global_scores[i].len() != n_ref_haps {
@@ -1396,7 +1603,6 @@ fn build_imputation_plan(
                         .min(PBWT_MAX_PER_HAP)
                         .max(1);
 
-                    let phased_target = target_window.genotypes.clone().into_phased();
                     let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
                     let use_exact = should_use_exact_prescan(
                         n_ref_haps,
@@ -1460,13 +1666,18 @@ fn build_imputation_plan(
                     window_idx += 1;
                 }
             }
-            ReferenceData::OnDisk { cache_meta, .. } => {
-                let mut ref_reader = PrescanCacheReader::open(&cache_meta.path)?;
+            ReferenceData::OnDisk { .. } => {
+                let Some(ref mut ref_reader) = on_disk_reader else {
+                    return Err(ReagleError::vcf(
+                        "Prescan cache reader unavailable".to_string(),
+                    ));
+                };
                 ref_reader.rewind()?;
                 loop {
                     let ref_window = ref_reader.next_window()?;
                     let Some(ref_window) = ref_window else { break };
 
+                    let idx = window_idx;
                     let n_ref_markers = ref_window.markers.len();
                     if n_ref_markers == 0 {
                         continue;
@@ -1478,31 +1689,77 @@ fn build_imputation_plan(
                         .copied()
                         .unwrap_or(per_window_cap.max(1));
 
-                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
-                    let ref_chrom = ref_window
-                        .markers
-                        .chrom_name(ref_chrom_idx)
-                        .unwrap_or("UNKNOWN");
-                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-                    let end_pos = ref_window
-                        .markers
-                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                        .pos;
+                    let (alignment, phased_target) = if let Some(cache) = target_cache.as_ref() {
+                        if let Some(Some(entry)) = cache.get(idx) {
+                            (
+                                entry.alignment.clone(),
+                                entry.phased_target.clone(),
+                            )
+                        } else {
+                            let ref_chrom_idx =
+                                ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                            let ref_chrom = ref_window
+                                .markers
+                                .chrom_name(ref_chrom_idx)
+                                .unwrap_or("UNKNOWN");
+                            let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                            let end_pos = ref_window
+                                .markers
+                                .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                                .pos;
 
-                    let chrom_candidates = chrom_variants(ref_chrom);
-                    let target_window = target_reader.load_window_for_region(
-                        &chrom_candidates,
-                        start_pos,
-                        end_pos,
-                    )?;
-                    let Some(target_window) = target_window else {
-                        continue;
+                            let chrom_candidates = chrom_variants(ref_chrom);
+                            let reader = target_reader.as_mut().ok_or_else(|| {
+                                ReagleError::vcf("Target reader missing in prescan".to_string())
+                            })?;
+                            let target_window = reader.load_window_for_region(
+                                &chrom_candidates,
+                                start_pos,
+                                end_pos,
+                            )?;
+                            let Some(target_window) = target_window else {
+                                continue;
+                            };
+
+                            let alignment = MarkerAlignment::new_with_ref_markers(
+                                &target_window.genotypes,
+                                &ref_window.markers,
+                            );
+                            let phased_target = target_window.genotypes.clone().into_phased();
+                            (alignment, phased_target)
+                        }
+                    } else {
+                        let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                        let ref_chrom = ref_window
+                            .markers
+                            .chrom_name(ref_chrom_idx)
+                            .unwrap_or("UNKNOWN");
+                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                        let end_pos = ref_window
+                            .markers
+                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                            .pos;
+
+                        let chrom_candidates = chrom_variants(ref_chrom);
+                        let reader = target_reader.as_mut().ok_or_else(|| {
+                            ReagleError::vcf("Target reader missing in prescan".to_string())
+                        })?;
+                        let target_window = reader.load_window_for_region(
+                            &chrom_candidates,
+                            start_pos,
+                            end_pos,
+                        )?;
+                        let Some(target_window) = target_window else {
+                            continue;
+                        };
+
+                        let alignment = MarkerAlignment::new_with_ref_markers(
+                            &target_window.genotypes,
+                            &ref_window.markers,
+                        );
+                        let phased_target = target_window.genotypes.clone().into_phased();
+                        (alignment, phased_target)
                     };
-
-                    let alignment = MarkerAlignment::new_with_ref_markers(
-                        &target_window.genotypes,
-                        &ref_window.markers,
-                    );
 
                     for i in 0..batch_len {
                         if global_scores[i].len() != n_ref_haps {
@@ -1523,7 +1780,6 @@ fn build_imputation_plan(
                         .min(PBWT_MAX_PER_HAP)
                         .max(1);
 
-                    let phased_target = target_window.genotypes.clone().into_phased();
                     let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
                     let use_exact = should_use_exact_prescan(
                         n_ref_haps,
