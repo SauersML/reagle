@@ -393,21 +393,22 @@ impl StreamingVcfReader {
                     return Err(anyhow::anyhow!("Expected BGZF file for extension .{}", ext).into());
                 }
                 let reader: Box<dyn BufRead + Send> =
-                    Box::new(BufReader::new(bgzf_io::Reader::new(file)));
+                    Box::new(BufReader::with_capacity(128 * 1024, bgzf_io::Reader::new(file)));
                 Self::from_reader(reader, gen_maps, config)
             }
             "gz" => {
                 let mut file = File::open(path)?;
                 let reader: Box<dyn BufRead + Send> = if detect_bgzf(&mut file)? {
-                    Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+                    Box::new(BufReader::with_capacity(128 * 1024, bgzf_io::Reader::new(file)))
                 } else {
-                    Box::new(BufReader::new(GzDecoder::new(file)))
+                    Box::new(BufReader::with_capacity(128 * 1024, GzDecoder::new(file)))
                 };
                 Self::from_reader(reader, gen_maps, config)
             }
             _ => {
                 let file = File::open(path)?;
-                let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(file));
+                let reader: Box<dyn BufRead + Send> =
+                    Box::new(BufReader::with_capacity(128 * 1024, file));
                 Self::from_reader(reader, gen_maps, config)
             }
         }
@@ -906,7 +907,7 @@ impl StreamingVcfReader {
                 return Ok(None);
             }
 
-            let mut line_buf = std::mem::take(&mut self.line_buf);
+            let line_buf = std::mem::take(&mut self.line_buf);
             let line = trim_line_bytes(&line_buf);
             if line.is_empty() || line[0] == b'#' {
                 self.line_buf = line_buf;

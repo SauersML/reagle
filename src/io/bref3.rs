@@ -404,7 +404,6 @@ fn write_string_array<W: Write>(writer: &mut W, values: &[String]) -> Result<()>
 struct Bref3Writer {
     writer: BufWriter<File>,
     hap_to_seq_bytes: Vec<u8>,
-    n_haps: usize,
 }
 
 impl Bref3Writer {
@@ -419,7 +418,6 @@ impl Bref3Writer {
         Ok(Self {
             writer,
             hap_to_seq_bytes,
-            n_haps,
         })
     }
 
@@ -1094,16 +1092,16 @@ impl StreamingRefVcfReader {
                 if !detect_bgzf(&mut file)? {
                     anyhow::bail!("Expected BGZF file for extension .{}", ext);
                 }
-                Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+                Box::new(BufReader::with_capacity(128 * 1024, bgzf_io::Reader::new(file)))
             }
             "gz" => {
                 if detect_bgzf(&mut file)? {
-                    Box::new(BufReader::new(bgzf_io::Reader::new(file)))
+                    Box::new(BufReader::with_capacity(128 * 1024, bgzf_io::Reader::new(file)))
                 } else {
-                    Box::new(BufReader::new(GzDecoder::new(file)))
+                    Box::new(BufReader::with_capacity(128 * 1024, GzDecoder::new(file)))
                 }
             }
-            _ => Box::new(BufReader::new(file)),
+            _ => Box::new(BufReader::with_capacity(128 * 1024, file)),
         };
         Self::from_reader(reader)
     }
@@ -1300,14 +1298,14 @@ impl StreamingRefVcfReader {
     }
 
     /// Read the next marker without windowing (streaming, raw order).
-    pub fn next_marker(&mut self) -> Result<Option<RefPanelMarker>> {
+    fn next_marker(&mut self) -> Result<Option<RefPanelMarker>> {
         loop {
             self.line_buf.clear();
             if self.reader.read_line(&mut self.line_buf)? == 0 {
                 self.eof = true;
                 return Ok(None);
             }
-            let mut line_buf = std::mem::take(&mut self.line_buf);
+            let line_buf = std::mem::take(&mut self.line_buf);
             let line = line_buf.trim_end();
             if line.is_empty() || line.starts_with('#') {
                 self.line_buf = line_buf;
@@ -1329,7 +1327,7 @@ impl StreamingRefVcfReader {
                 self.eof = true;
                 return Ok(None);
             }
-            let mut line_buf = std::mem::take(&mut self.line_buf);
+            let line_buf = std::mem::take(&mut self.line_buf);
             let line = line_buf.trim_end();
             if line.is_empty() || line.starts_with('#') {
                 self.line_buf = line_buf;

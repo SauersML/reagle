@@ -3,7 +3,7 @@ use crate::data::storage::GenotypeColumn;
 use crate::io::bref3::RefWindow;
 use crate::error::{ReagleError, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const CACHE_MAGIC: &[u8; 8] = b"RGLPRSC1";
@@ -23,13 +23,6 @@ pub enum PackedRefColumn {
 }
 
 impl PackedRefColumn {
-    pub fn n_haplotypes(&self) -> usize {
-        match self {
-            PackedRefColumn::Bits { n_haps, .. } => *n_haps,
-            PackedRefColumn::Bytes { alleles } => alleles.len(),
-        }
-    }
-
     pub fn allele(&self, hap: usize) -> u8 {
         match self {
             PackedRefColumn::Bytes { alleles } => alleles.get(hap).copied().unwrap_or(255),
@@ -156,11 +149,6 @@ impl PackedRefColumn {
 pub struct PackedRefWindow {
     pub markers: Markers<crate::data::marker::RefWindowSpace>,
     pub columns: Vec<PackedRefColumn>,
-    pub global_start: usize,
-    pub global_end: usize,
-    pub output_start: usize,
-    pub output_end: usize,
-    pub n_ref_haps: usize,
 }
 
 pub struct PrescanCacheWriter {
@@ -202,19 +190,14 @@ impl PrescanCacheWriter {
 
     pub fn write_window(&mut self, window: &RefWindow) -> Result<()> {
         if !self.header_written {
-            return Err(ReagleError::internal(
+            return Err(ReagleError::vcf(
                 "prescan cache header not written".to_string(),
             ));
         }
         let n_markers = window.markers.len() as u32;
         write_u32(&mut self.file, n_markers)?;
-        write_u32(&mut self.file, window.output_start as u32)?;
-        write_u32(&mut self.file, window.output_end as u32)?;
-        write_u32(&mut self.file, window.global_start as u32)?;
-        write_u32(&mut self.file, window.global_end as u32)?;
-
         let markers_blob = bincode::serialize(&window.markers)
-            .map_err(|e| ReagleError::internal(format!("marker serialize failed: {}", e)))?;
+            .map_err(|e| ReagleError::vcf(format!("marker serialize failed: {}", e)))?;
         write_u32(&mut self.file, markers_blob.len() as u32)?;
         self.file.write_all(&markers_blob)?;
 
@@ -234,7 +217,7 @@ impl PrescanCacheWriter {
 
 pub struct PrescanCacheReader {
     reader: BufReader<File>,
-    n_ref_haps: usize,
+    data_offset: u64,
     eof: bool,
 }
 
@@ -244,22 +227,25 @@ impl PrescanCacheReader {
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
         if &magic != CACHE_MAGIC {
-            return Err(ReagleError::internal("invalid prescan cache magic".to_string()));
+            return Err(ReagleError::vcf("invalid prescan cache magic".to_string()));
         }
         let version = read_u32(&mut reader)?;
         if version != CACHE_VERSION {
-            return Err(ReagleError::internal("unsupported prescan cache version".to_string()));
+            return Err(ReagleError::vcf("unsupported prescan cache version".to_string()));
         }
-        let n_ref_haps = read_u32(&mut reader)? as usize;
+        let _ = read_u32(&mut reader)? as usize;
+        let data_offset = reader.stream_position()?;
         Ok(Self {
             reader,
-            n_ref_haps,
+            data_offset,
             eof: false,
         })
     }
 
-    pub fn n_ref_haps(&self) -> usize {
-        self.n_ref_haps
+    pub fn rewind(&mut self) -> Result<()> {
+        self.reader.seek(SeekFrom::Start(self.data_offset))?;
+        self.eof = false;
+        Ok(())
     }
 
     pub fn next_window(&mut self) -> Result<Option<PackedRefWindow>> {
@@ -273,21 +259,18 @@ impl PrescanCacheReader {
                 return Ok(None);
             }
         };
-        let output_start = read_u32(&mut self.reader)? as usize;
-        let output_end = read_u32(&mut self.reader)? as usize;
-        let global_start = read_u32(&mut self.reader)? as usize;
-        let global_end = read_u32(&mut self.reader)? as usize;
-
         let markers_len = read_u32(&mut self.reader)? as usize;
         let mut markers_blob = vec![0u8; markers_len];
         self.reader.read_exact(&mut markers_blob)?;
         let markers: Markers<crate::data::marker::RefWindowSpace> =
             bincode::deserialize(&markers_blob)
-                .map_err(|e| ReagleError::internal(format!("marker deserialize failed: {}", e)))?;
+                .map_err(|e| ReagleError::vcf(format!("marker deserialize failed: {}", e)))?;
 
         let n_cols = read_u32(&mut self.reader)? as usize;
         if n_cols != n_markers {
-            return Err(ReagleError::internal("cache window column count mismatch".to_string()));
+            return Err(ReagleError::vcf(
+                "cache window column count mismatch".to_string(),
+            ));
         }
         let mut columns = Vec::with_capacity(n_cols);
         for _ in 0..n_cols {
@@ -297,11 +280,6 @@ impl PrescanCacheReader {
         Ok(Some(PackedRefWindow {
             markers,
             columns,
-            global_start,
-            global_end,
-            output_start,
-            output_end,
-            n_ref_haps: self.n_ref_haps,
         }))
     }
 }
@@ -406,7 +384,7 @@ fn read_packed_column<R: Read>(r: &mut R) -> Result<PackedRefColumn> {
             r.read_exact(&mut alleles)?;
             Ok(PackedRefColumn::Bytes { alleles })
         }
-        _ => Err(ReagleError::internal(
+        _ => Err(ReagleError::vcf(
             "unknown prescan cache column tag".to_string(),
         )),
     }
@@ -512,7 +490,6 @@ mod tests {
         let mut reader = PrescanCacheReader::open(&path).unwrap();
         let got = reader.next_window().unwrap().unwrap();
         assert_eq!(got.markers.len(), 1);
-        assert_eq!(got.n_ref_haps, alleles.len());
         let mut out = vec![0u8; alleles.len()];
         got.columns[0].fill_alleles(&mut out);
         assert_eq!(out, alleles);

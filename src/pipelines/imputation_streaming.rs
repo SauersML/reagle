@@ -425,50 +425,6 @@ fn build_sparse_scores(
     (candidate_haps, scores_by_hap)
 }
 
-fn compute_target_freqs<TargetSpace, RefSpace>(
-    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
-    ref_columns: &[GenotypeColumn],
-    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
-) -> Vec<Vec<f32>> {
-    let n_markers = target_gt.n_markers();
-    let n_ref_haps = ref_columns
-        .first()
-        .map(|c| c.n_haplotypes())
-        .unwrap_or(0);
-    let mut freqs: Vec<Vec<f32>> = Vec::with_capacity(n_markers);
-    for m in 0..n_markers {
-        let n_alleles = target_gt
-            .markers()
-            .marker(MarkerIdx::new(m as u32))
-            .n_alleles();
-        let mut counts = vec![0u32; n_alleles.max(1)];
-        let mut total = 0u32;
-        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-            for rh in 0..n_ref_haps {
-                let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-                let mapped = alignment.reverse_map_allele(m, ref_a);
-                if mapped == 255 {
-                    continue;
-                }
-                let idx = mapped as usize;
-                if idx < counts.len() {
-                    counts[idx] += 1;
-                    total += 1;
-                }
-            }
-        }
-        let mut out = vec![0.0f32; counts.len()];
-        if total > 0 {
-            let inv = 1.0 / total as f32;
-            for (i, c) in counts.into_iter().enumerate() {
-                out[i] = c as f32 * inv;
-            }
-        }
-        freqs.push(out);
-    }
-    freqs
-}
-
 fn compute_target_freqs_packed<TargetSpace, RefSpace>(
     target_gt: &GenotypeMatrix<Phased, TargetSpace>,
     ref_columns: &[PackedRefColumn],
@@ -548,97 +504,6 @@ fn select_top_k_allow_zero(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
 fn should_use_exact_prescan(n_ref_haps: usize, batch_len: usize, n_markers: usize) -> bool {
     let ops = n_ref_haps as u128 * batch_len as u128 * n_markers as u128;
     ops <= EXACT_PRESCAN_MAX_OPS
-}
-
-fn score_window_batch_exact<TargetSpace, RefSpace>(
-    batch_haps: &[usize],
-    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
-    ref_columns: &[GenotypeColumn],
-    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
-    global_scores: &mut [Vec<f32>],
-    window_scores: &mut [Vec<f32>],
-) {
-    let n_markers = target_gt.n_markers();
-    let n_ref_haps = ref_columns
-        .first()
-        .map(|c| c.n_haplotypes())
-        .unwrap_or(0);
-    if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
-        return;
-    }
-
-    let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
-    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
-
-    let mut query_alleles = vec![255u8; batch_haps.len()];
-    let mut ref_bins: Vec<Vec<u32>> = Vec::new();
-
-    for m in 0..n_markers {
-        for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            query_alleles[i] =
-                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-        }
-
-        let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) else {
-            continue;
-        };
-
-        let n_alleles = target_gt
-            .markers()
-            .marker(MarkerIdx::new(m as u32))
-            .n_alleles()
-            .max(1);
-        if ref_bins.len() < n_alleles {
-            ref_bins.resize_with(n_alleles, Vec::new);
-        }
-        for bins in ref_bins.iter_mut().take(n_alleles) {
-            bins.clear();
-        }
-
-        for rh in 0..n_ref_haps {
-            let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-            if ref_a == 255 {
-                continue;
-            }
-            let mapped = alignment.reverse_map_allele(m, ref_a);
-            if mapped == 255 {
-                continue;
-            }
-            let idx = mapped as usize;
-            if idx >= ref_bins.len() {
-                ref_bins.resize_with(idx + 1, Vec::new);
-            }
-            ref_bins[idx].push(rh as u32);
-        }
-
-        for (i, _) in batch_haps.iter().enumerate() {
-            let targ = query_alleles[i];
-            if targ == 255 {
-                continue;
-            }
-            let freq = freqs
-                .get(m)
-                .and_then(|f| f.get(targ as usize))
-                .copied()
-                .unwrap_or(0.0);
-            if freq <= 0.0 {
-                continue;
-            }
-            let weight = -(freq.max(min_freq)).ln();
-            let bins = ref_bins.get(targ as usize);
-            let Some(bins) = bins else { continue };
-            for &rh in bins {
-                let idx = rh as usize;
-                global_scores[i][idx] += weight;
-                let w = &mut window_scores[i][idx];
-                if w.is_finite() {
-                    *w += weight;
-                } else {
-                    *w = weight;
-                }
-            }
-        }
-    }
 }
 
 fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
@@ -724,184 +589,6 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
                     *w += weight;
                 } else {
                     *w = weight;
-                }
-            }
-        }
-    }
-}
-
-fn score_window_batch_pbwt<TargetSpace, RefSpace>(
-    batch_haps: &[usize],
-    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
-    ref_columns: &[GenotypeColumn],
-    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
-    gen_maps: &GeneticMaps,
-    k_per_hap: usize,
-    step_cm: f64,
-    global_scores: &mut [Vec<f32>],
-    window_scores: &mut [Vec<f32>],
-) {
-    let n_markers = target_gt.n_markers();
-    let n_ref_haps = ref_columns
-        .first()
-        .map(|c| c.n_haplotypes())
-        .unwrap_or(0);
-    if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
-        return;
-    }
-
-    let mut gen_positions = Vec::with_capacity(n_markers);
-    for m in 0..n_markers {
-        let marker = target_gt.markers().marker(MarkerIdx::new(m as u32));
-        let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
-        gen_positions.push(gen_pos);
-    }
-    let mut sampling = build_sampling_points(&gen_positions, step_cm);
-    // Always sample genotyped target markers so prescan state selection
-    // captures IBS signal from sparse arrays.
-    for m in 0..n_markers {
-        if alignment.target_to_ref(MarkerIdx::new(m as u32)).is_some() {
-            sampling[m] = true;
-        }
-    }
-    let freqs = compute_target_freqs(target_gt, ref_columns, alignment);
-
-    let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
-    let mut beams_fwd: Vec<RankBeam> = (0..batch_haps.len())
-        .map(|_| RankBeam::full(n_ref_haps as u32))
-        .collect();
-    let mut ref_alleles = vec![0u8; n_ref_haps];
-    let mut query_alleles = vec![0u8; batch_haps.len()];
-
-    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
-
-    for m in 0..n_markers {
-        for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            query_alleles[i] =
-                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-        }
-        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-            for rh in 0..n_ref_haps {
-                let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
-            }
-        } else {
-            ref_alleles.fill(255);
-        }
-
-        let mut is_biallelic = true;
-        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
-            if a >= 2 && a != 255 {
-                is_biallelic = false;
-                break;
-            }
-        }
-        let n_alleles = if is_biallelic { 2 } else { 256 };
-
-        pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
-
-        if sampling[m] {
-            for (i, _) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i];
-                if targ == 255 {
-                    continue;
-                }
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
-                if freq <= 0.0 {
-                    continue;
-                }
-                let weight = -(freq.max(min_freq)).ln();
-                let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
-                for d in donors {
-                    let idx = d as usize;
-                    if idx < n_ref_haps {
-                        let ref_a = ref_alleles[idx];
-                        if ref_a == 255 || ref_a != targ {
-                            continue;
-                        }
-                        global_scores[i][idx] += weight;
-                        let w = &mut window_scores[i][idx];
-                        if w.is_finite() {
-                            *w += weight;
-                        } else {
-                            *w = weight;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
-    let mut beams_bwd: Vec<RankBeam> = (0..batch_haps.len())
-        .map(|_| RankBeam::full(n_ref_haps as u32))
-        .collect();
-    for (rev_step, m) in (0..n_markers).rev().enumerate() {
-        for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            query_alleles[i] =
-                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-        }
-        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-            for rh in 0..n_ref_haps {
-                let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
-            }
-        } else {
-            ref_alleles.fill(255);
-        }
-
-        let mut is_biallelic = true;
-        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
-            if a >= 2 && a != 255 {
-                is_biallelic = false;
-                break;
-            }
-        }
-        let n_alleles = if is_biallelic { 2 } else { 256 };
-
-        pbwt_bwd.advance_with_beams(
-            &ref_alleles,
-            n_alleles,
-            rev_step,
-            &query_alleles,
-            &mut beams_bwd,
-        );
-
-        if sampling[m] {
-            for (i, _) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i];
-                if targ == 255 {
-                    continue;
-                }
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
-                if freq <= 0.0 {
-                    continue;
-                }
-                let weight = -(freq.max(min_freq)).ln();
-                let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
-                for d in donors {
-                    let idx = d as usize;
-                    if idx < n_ref_haps {
-                        let ref_a = ref_alleles[idx];
-                        if ref_a == 255 || ref_a != targ {
-                            continue;
-                        }
-                        global_scores[i][idx] += weight;
-                        let w = &mut window_scores[i][idx];
-                        if w.is_finite() {
-                            *w += weight;
-                        } else {
-                            *w = weight;
-                        }
-                    }
                 }
             }
         }
@@ -1463,8 +1150,8 @@ fn build_imputation_plan(
         ));
     }
     plan.n_ref_haps = n_ref_haps;
-    let mut window_handoff = cache_meta.window_handoff.clone();
-    let mut per_window_caps = cache_meta.per_window_caps.clone();
+    let window_handoff = cache_meta.window_handoff.clone();
+    let per_window_caps = cache_meta.per_window_caps.clone();
     let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
 
@@ -1506,12 +1193,13 @@ fn build_imputation_plan(
         batch_size
     );
 
+    let mut ref_reader = PrescanCacheReader::open(&cache_meta.path)?;
     while batch_start < n_target_haps {
         let batch_end = (batch_start + batch_size).min(n_target_haps);
         let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
         let batch_len = batch_haps.len();
 
-        let mut ref_reader = PrescanCacheReader::open(&cache_meta.path)?;
+        ref_reader.rewind()?;
         let mut target_reader =
             StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
 

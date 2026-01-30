@@ -1028,81 +1028,9 @@ fn parse_allele_bytes(s: &[u8]) -> u8 {
     val as u8
 }
 
-/// Parse a genotype field (e.g., "0|1", "0/1", ".")
-///
-/// This follows the Java VcfRecGTParser behavior:
-/// - If one allele is missing, treat both as missing
-/// - Returns (allele1, allele2, is_phased, is_haploid)
-/// - Missing alleles are represented as 255
-/// - For haploid genotypes, allele2 is set to same as allele1 (for storage compatibility)
-fn parse_genotype(gt: &str) -> Result<(u8, u8, bool, bool)> {
-    // Handle completely missing genotypes
-    if gt == "." || gt == "./." || gt == ".|." {
-        return Ok((255, 255, true, false)); // Missing, treated as phased diploid
-    }
-
-    // Determine if phased (| separator) or unphased (/ separator)
-    let phased = gt.contains('|');
-    let sep = if phased { '|' } else { '/' };
-
-    // Split genotype into alleles without allocation
-    let split = gt.split_once(sep);
-
-    // Handle haploid genotypes (single allele, e.g., "0" or "1")
-    if split.is_none() {
-        let a1 = parse_allele(gt);
-        // Store same allele in both positions for storage compatibility,
-        // but mark as haploid so phasing pipeline knows to skip
-        return Ok((a1, a1, true, true)); // Haploid is always "phased"
-    }
-
-    let (left, right) = split.unwrap();
-    let a1 = parse_allele(left);
-    let a2 = parse_allele(right);
-
-    // Java behavior: if one allele is missing, treat both as missing
-    if a1 == 255 || a2 == 255 {
-        return Ok((255, 255, false, false));
-    }
-
-    Ok((a1, a2, phased, false))
-}
-
 /// Maximum supported allele index (u8 limitation)
 /// Alleles beyond this will be treated as missing with a warning
 pub const MAX_ALLELE_INDEX: u16 = 254;
-
-/// Parse a single allele string to a u8
-/// Returns 255 for missing (.)
-/// Returns 255 with a log warning if allele index exceeds 254 (u8 limitation)
-#[inline]
-fn parse_allele(s: &str) -> u8 {
-    if s == "." || s.is_empty() {
-        return 255;
-    }
-
-    // Fast path for single digit alleles (most common case)
-    if s.len() == 1 {
-        let c = s.as_bytes()[0];
-        if c >= b'0' && c <= b'9' {
-            return c - b'0';
-        }
-    }
-
-    // Multi-digit alleles - check for overflow
-    match s.parse::<u16>() {
-        Ok(val) if val <= MAX_ALLELE_INDEX => val as u8,
-        Ok(val) => {
-            log::warn!(
-                "Allele index {} exceeds maximum supported value {}; treating as missing",
-                val,
-                MAX_ALLELE_INDEX
-            );
-            255
-        }
-        Err(_) => 255,
-    }
-}
 
 /// Compute genotype confidence from GL field.
 ///
@@ -1744,6 +1672,78 @@ impl Drop for VcfWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse a genotype field (e.g., "0|1", "0/1", ".")
+    ///
+    /// This follows the Java VcfRecGTParser behavior:
+    /// - If one allele is missing, treat both as missing
+    /// - Returns (allele1, allele2, is_phased, is_haploid)
+    /// - Missing alleles are represented as 255
+    /// - For haploid genotypes, allele2 is set to same as allele1 (for storage compatibility)
+    fn parse_genotype(gt: &str) -> Result<(u8, u8, bool, bool)> {
+        // Handle completely missing genotypes
+        if gt == "." || gt == "./." || gt == ".|." {
+            return Ok((255, 255, true, false)); // Missing, treated as phased diploid
+        }
+
+        // Determine if phased (| separator) or unphased (/ separator)
+        let phased = gt.contains('|');
+        let sep = if phased { '|' } else { '/' };
+
+        // Split genotype into alleles without allocation
+        let split = gt.split_once(sep);
+
+        // Handle haploid genotypes (single allele, e.g., "0" or "1")
+        if split.is_none() {
+            let a1 = parse_allele(gt);
+            // Store same allele in both positions for storage compatibility,
+            // but mark as haploid so phasing pipeline knows to skip
+            return Ok((a1, a1, true, true)); // Haploid is always "phased"
+        }
+
+        let (left, right) = split.unwrap();
+        let a1 = parse_allele(left);
+        let a2 = parse_allele(right);
+
+        // Java behavior: if one allele is missing, treat both as missing
+        if a1 == 255 || a2 == 255 {
+            return Ok((255, 255, false, false));
+        }
+
+        Ok((a1, a2, phased, false))
+    }
+
+    /// Parse a single allele string to a u8
+    /// Returns 255 for missing (.)
+    /// Returns 255 with a log warning if allele index exceeds 254 (u8 limitation)
+    #[inline]
+    fn parse_allele(s: &str) -> u8 {
+        if s == "." || s.is_empty() {
+            return 255;
+        }
+
+        // Fast path for single digit alleles (most common case)
+        if s.len() == 1 {
+            let c = s.as_bytes()[0];
+            if c >= b'0' && c <= b'9' {
+                return c - b'0';
+            }
+        }
+
+        // Multi-digit alleles - check for overflow
+        match s.parse::<u16>() {
+            Ok(val) if val <= MAX_ALLELE_INDEX => val as u8,
+            Ok(val) => {
+                log::warn!(
+                    "Allele index {} exceeds maximum supported value {}; treating as missing",
+                    val,
+                    MAX_ALLELE_INDEX
+                );
+                255
+            }
+            Err(_) => 255,
+        }
+    }
 
     #[test]
     fn test_parse_genotype() {
