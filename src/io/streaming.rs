@@ -330,7 +330,7 @@ pub struct StreamingVcfReader {
     /// Whether we've reached EOF
     eof: bool,
     /// Current line buffer
-    line_buf: String,
+    line_buf: Vec<u8>,
     /// Whether all genotypes seen so far were phased
     all_phased: bool,
     /// Per-sample ploidy (true=diploid, false=haploid)
@@ -466,7 +466,7 @@ impl StreamingVcfReader {
                 window_num: 0,
                 global_marker_idx: 0,
                 eof: false,
-                line_buf: String::new(),
+                line_buf: Vec::new(),
                 all_phased: true,
                 sample_ploidy: None,
                 has_any_confidence: false,
@@ -900,34 +900,35 @@ impl StreamingVcfReader {
     fn read_next_marker(&mut self) -> Result<Option<BufferedMarker>> {
         loop {
             self.line_buf.clear();
-            let bytes_read = self.reader.read_line(&mut self.line_buf)?;
+            let bytes_read = self.reader.read_until(b'\n', &mut self.line_buf)?;
             if bytes_read == 0 {
                 self.eof = true;
                 return Ok(None);
             }
 
-            let line = self.line_buf.trim().to_string();
-            if line.is_empty() || line.starts_with('#') {
+            let line = trim_line_bytes(&self.line_buf);
+            if line.is_empty() || line[0] == b'#' {
                 continue;
             }
 
             // Parse the VCF line
-            return self.parse_vcf_line(&line).map(Some);
+            return self.parse_vcf_line(line).map(Some);
         }
     }
 
     /// Parse a single VCF line
-    fn parse_vcf_line(&mut self, line: &str) -> Result<BufferedMarker> {
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 10 {
-            return Err(ReagleError::parse(
-                self.global_marker_idx + self.buffer.len(),
-                format!("Expected at least 10 fields, got {}", fields.len()),
-            ));
-        }
+    fn parse_vcf_line(&mut self, line: &[u8]) -> Result<BufferedMarker> {
+        let mut fields = FieldIter::new(line);
+        let line_idx = self.global_marker_idx + self.buffer.len();
+        let mut next_field = || {
+            fields.next().ok_or_else(|| {
+                ReagleError::parse(line_idx, "Expected at least 10 fields, got fewer")
+            })
+        };
 
         // Parse CHROM
-        let chrom_name = fields[0];
+        let chrom_name = std::str::from_utf8(next_field()?)
+            .map_err(|_| ReagleError::parse(line_idx, "Invalid CHROM field"))?;
         let chrom_idx = self.markers_meta.add_chrom(chrom_name);
 
         // Update current chromosome tracking
@@ -937,31 +938,42 @@ impl StreamingVcfReader {
         }
 
         // Parse POS
-        let pos: u32 = fields[1]
-            .parse()
-            .map_err(|_| ReagleError::parse(self.global_marker_idx, "Invalid POS field"))?;
+        let pos: u32 = parse_u32_bytes(next_field()?)
+            .ok_or_else(|| ReagleError::parse(line_idx, "Invalid POS field"))?;
 
         // Parse ID
-        let id = if fields[2] == "." {
+        let id_field = next_field()?;
+        let id = if id_field == b"." {
             None
         } else {
-            Some(fields[2].into())
+            let id_str = std::str::from_utf8(id_field)
+                .map_err(|_| ReagleError::parse(line_idx, "Invalid ID field"))?;
+            Some(id_str.into())
         };
 
         // Parse REF
-        let ref_allele = Allele::from_str(fields[3]);
+        let ref_allele_str = std::str::from_utf8(next_field()?)
+            .map_err(|_| ReagleError::parse(line_idx, "Invalid REF field"))?;
+        let ref_allele = Allele::from_str(ref_allele_str);
 
         // Parse ALT
-        let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
+        let alt_field = next_field()?;
+        let alt_alleles: Vec<Allele> = split_bytes(alt_field, b',')
+            .map(|a| {
+                let s = std::str::from_utf8(a)
+                    .map_err(|_| ReagleError::parse(line_idx, "Invalid ALT field"))?;
+                Ok(Allele::from_str(s))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Skip QUAL and FILTER
+        let _qual = next_field()?;
+        let _filter = next_field()?;
 
         // Parse FORMAT to find GT position
-        let format = fields[8];
-        let gt_idx = format
-            .split(':')
-            .position(|f| f == "GT")
-            .ok_or_else(|| ReagleError::parse(self.global_marker_idx, "No GT field in FORMAT"))?;
-        let gl_idx = format.split(':').position(|f| f == "GL");
-        let pl_idx = format.split(':').position(|f| f == "PL");
+        let format = next_field()?;
+        let (gt_idx, gl_idx, pl_idx) = find_format_indices(format);
+        let gt_idx = gt_idx.ok_or_else(|| ReagleError::parse(line_idx, "No GT field in FORMAT"))?;
 
         // Parse genotypes
         let n_samples = self.samples.len();
@@ -978,19 +990,25 @@ impl StreamingVcfReader {
             self.sample_ploidy = Some(vec![true; n_samples]);
         }
 
-        for (sample_idx, sample_field) in fields[9..].iter().enumerate().take(n_samples) {
-            let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
+        let first_sample = next_field()?;
+        let sample_iter = std::iter::once(first_sample).chain(fields.by_ref());
 
-            if gt_field.contains('/') {
+        for (sample_idx, sample_field) in sample_iter.enumerate().take(n_samples) {
+            let gt_field = nth_colon_field(sample_field, gt_idx).unwrap_or(b"./.");
+
+            if gt_field.iter().any(|&b| b == b'/') {
                 self.all_phased = false;
             }
 
-            let (a1, a2) = parse_gt(gt_field);
+            let (a1, a2) = parse_gt_bytes(gt_field);
             let is_missing = a1 == 255 || a2 == 255;
-            let phased = gt_field.contains('|');
+            let phased = gt_field.iter().any(|&b| b == b'|');
             phase_mask.push(if phased && !is_missing { 1 } else { 0 });
 
-            if a1 == a2 && !gt_field.contains('|') && !gt_field.contains('/') {
+            if a1 == a2
+                && !gt_field.iter().any(|&b| b == b'|')
+                && !gt_field.iter().any(|&b| b == b'/')
+            {
                 if let Some(ref mut ploidy) = self.sample_ploidy {
                     ploidy[sample_idx] = false;
                 }
@@ -1001,15 +1019,13 @@ impl StreamingVcfReader {
 
             if let Some(ref mut pl_out) = likelihoods_pl {
                 let pl_vec = if let Some(pl_i) = pl_idx {
-                    sample_field
-                        .split(':')
-                        .nth(pl_i)
+                    nth_colon_field(sample_field, pl_i)
+                        .and_then(bytes_to_str)
                         .and_then(crate::io::vcf::parse_pl)
                         .unwrap_or_else(Vec::new)
                 } else if let Some(gl_i) = gl_idx {
-                    sample_field
-                        .split(':')
-                        .nth(gl_i)
+                    nth_colon_field(sample_field, gl_i)
+                        .and_then(bytes_to_str)
                         .and_then(crate::io::vcf::gl_to_pl)
                         .unwrap_or_else(Vec::new)
                 } else {
@@ -1020,9 +1036,8 @@ impl StreamingVcfReader {
 
             if let Some(gl_i) = gl_idx {
                 if let Some(conf_vec) = confidences.as_mut() {
-                    let confidence = sample_field
-                        .split(':')
-                        .nth(gl_i)
+                    let confidence = nth_colon_field(sample_field, gl_i)
+                        .and_then(bytes_to_str)
                         .and_then(|gl_str| crate::io::vcf::compute_gl_confidence(gl_str, a1, a2))
                         .unwrap_or(255);
                     conf_vec.push(confidence);
@@ -1034,8 +1049,8 @@ impl StreamingVcfReader {
             self.has_any_confidence = true;
         }
 
-        let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles.clone());
         let n_alleles = 1 + alt_alleles.len();
+        let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles);
         let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
 
         // Calculate genetic position
@@ -1052,26 +1067,154 @@ impl StreamingVcfReader {
     }
 }
 
+fn trim_line_bytes(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && (line[end - 1] == b'\n' || line[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+struct FieldIter<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FieldIter<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for FieldIter<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos > self.buf.len() {
+            return None;
+        }
+        if self.pos == self.buf.len() {
+            self.pos += 1;
+            return Some(&[]);
+        }
+        let start = self.pos;
+        let mut i = start;
+        while i < self.buf.len() && self.buf[i] != b'\t' {
+            i += 1;
+        }
+        self.pos = i + 1;
+        Some(&self.buf[start..i])
+    }
+}
+
+fn split_bytes<'a>(buf: &'a [u8], delim: u8) -> impl Iterator<Item = &'a [u8]> {
+    struct SplitBytes<'a> {
+        buf: &'a [u8],
+        pos: usize,
+        delim: u8,
+    }
+    impl<'a> Iterator for SplitBytes<'a> {
+        type Item = &'a [u8];
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.pos > self.buf.len() {
+                return None;
+            }
+            if self.pos == self.buf.len() {
+                self.pos += 1;
+                return Some(&[]);
+            }
+            let start = self.pos;
+            let mut i = start;
+            while i < self.buf.len() && self.buf[i] != self.delim {
+                i += 1;
+            }
+            self.pos = i + 1;
+            Some(&self.buf[start..i])
+        }
+    }
+    SplitBytes { buf, pos: 0, delim }
+}
+
+fn parse_u32_bytes(buf: &[u8]) -> Option<u32> {
+    if buf.is_empty() {
+        return None;
+    }
+    let mut val: u32 = 0;
+    for &b in buf {
+        if b < b'0' || b > b'9' {
+            return None;
+        }
+        val = val.saturating_mul(10).saturating_add((b - b'0') as u32);
+    }
+    Some(val)
+}
+
+fn bytes_to_str(buf: &[u8]) -> Option<&str> {
+    std::str::from_utf8(buf).ok()
+}
+
+fn find_format_indices(format: &[u8]) -> (Option<usize>, Option<usize>, Option<usize>) {
+    let mut gt_idx = None;
+    let mut gl_idx = None;
+    let mut pl_idx = None;
+    for (i, field) in split_bytes(format, b':').enumerate() {
+        if field == b"GT" {
+            gt_idx = Some(i);
+        } else if field == b"GL" {
+            gl_idx = Some(i);
+        } else if field == b"PL" {
+            pl_idx = Some(i);
+        }
+    }
+    (gt_idx, gl_idx, pl_idx)
+}
+
+fn nth_colon_field<'a>(buf: &'a [u8], idx: usize) -> Option<&'a [u8]> {
+    split_bytes(buf, b':').nth(idx)
+}
+
 /// Parse genotype field to (allele1, allele2)
-fn parse_gt(gt: &str) -> (u8, u8) {
-    if gt == "." || gt == "./." || gt == ".|." {
+fn parse_gt_bytes(gt: &[u8]) -> (u8, u8) {
+    if gt == b"." || gt == b"./." || gt == b".|." {
         return (255, 255);
     }
 
-    let sep = if gt.contains('|') { '|' } else { '/' };
-    let parts: Vec<&str> = gt.split(sep).collect();
-
-    if parts.len() == 1 {
-        let a1 = parse_allele_char(parts[0]);
-        return (a1, a1);
+    let mut sep: Option<u8> = None;
+    for &b in gt {
+        if b == b'|' {
+            sep = Some(b'|');
+            break;
+        } else if b == b'/' {
+            sep = Some(b'/');
+            break;
+        }
     }
 
-    if parts.len() != 2 {
-        return (255, 255);
+    let sep = match sep {
+        Some(s) => s,
+        None => {
+            let a1 = parse_allele_char_bytes(gt);
+            return (a1, a1);
+        }
+    };
+
+    let mut left = None;
+    let mut right = None;
+    for (i, part) in split_bytes(gt, sep).enumerate() {
+        if i == 0 {
+            left = Some(part);
+        } else if i == 1 {
+            right = Some(part);
+            break;
+        }
     }
 
-    let a1 = parse_allele_char(parts[0]);
-    let a2 = parse_allele_char(parts[1]);
+    let (left, right) = match (left, right) {
+        (Some(l), Some(r)) => (l, r),
+        _ => return (255, 255),
+    };
+
+    let a1 = parse_allele_char_bytes(left);
+    let a2 = parse_allele_char_bytes(right);
 
     if a1 == 255 || a2 == 255 {
         (255, 255)
@@ -1080,17 +1223,33 @@ fn parse_gt(gt: &str) -> (u8, u8) {
     }
 }
 
-fn parse_allele_char(s: &str) -> u8 {
-    if s == "." || s.is_empty() {
+fn parse_allele_char_bytes(s: &[u8]) -> u8 {
+    if s.is_empty() || s == b"." {
         return 255;
     }
     if s.len() == 1 {
-        let c = s.as_bytes()[0];
+        let c = s[0];
         if c >= b'0' && c <= b'9' {
             return c - b'0';
         }
     }
-    s.parse().unwrap_or(255)
+    let mut val: u16 = 0;
+    for &b in s {
+        if b < b'0' || b > b'9' {
+            return 255;
+        }
+        val = val.saturating_mul(10).saturating_add((b - b'0') as u16);
+    }
+    if val > crate::io::vcf::MAX_ALLELE_INDEX {
+        255
+    } else {
+        val as u8
+    }
+}
+
+#[cfg(test)]
+fn parse_gt(gt: &str) -> (u8, u8) {
+    parse_gt_bytes(gt.as_bytes())
 }
 
 #[cfg(test)]

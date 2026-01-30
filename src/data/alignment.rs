@@ -18,6 +18,13 @@ pub struct MarkerAlignment<TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpa
     pub allele_mappings: Vec<Option<AlleleMapping>>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AlignmentStats {
+    pub aligned: usize,
+    pub strand_flipped: usize,
+    pub allele_swapped: usize,
+}
+
 impl<TargetSpace, RefSpace> Clone for MarkerAlignment<TargetSpace, RefSpace> {
     fn clone(&self) -> Self {
         Self {
@@ -176,6 +183,67 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
             target_to_ref,
             allele_mappings,
         }
+    }
+
+    /// Build a reference position index for fast streaming alignment.
+    pub fn build_ref_pos_index(ref_markers: &Markers<RefSpace>) -> HashMap<(String, u32), usize> {
+        let mut ref_pos_map: HashMap<(String, u32), usize> = HashMap::new();
+        for m in 0..ref_markers.len() {
+            let marker = ref_markers.marker(MarkerIdx::new(m as u32));
+            let chrom_name = ref_markers.chrom_name(marker.chrom).unwrap_or("");
+            let chrom_norm = normalize_chrom(chrom_name).to_string();
+            ref_pos_map.insert((chrom_norm, marker.pos), m);
+        }
+        ref_pos_map
+    }
+
+    /// Create alignment against a pre-built reference position index.
+    ///
+    /// This avoids scanning all reference markers for each target window. The returned
+    /// alignment is sized to the target markers; `ref_to_target` is left empty because
+    /// streaming phasing only queries target-to-ref mappings.
+    pub fn new_with_ref_index<S: PhaseState>(
+        target_gt: &GenotypeMatrix<S, TargetSpace>,
+        ref_markers: &Markers<RefSpace>,
+        ref_pos_map: &HashMap<(String, u32), usize>,
+    ) -> (Self, AlignmentStats) {
+        use crate::data::marker::compute_allele_mapping;
+
+        let n_target_markers = target_gt.n_markers();
+        let mut target_to_ref = vec![None; n_target_markers];
+        let mut allele_mappings: Vec<Option<AlleleMapping>> = vec![None; n_target_markers];
+        let mut stats = AlignmentStats::default();
+
+        for m in 0..n_target_markers {
+            let target_marker = target_gt.marker(MarkerIdx::new(m as u32));
+            let chrom_name = target_gt.markers().chrom_name(target_marker.chrom).unwrap_or("");
+            let chrom_norm = normalize_chrom(chrom_name).to_string();
+            if let Some(&ref_idx) = ref_pos_map.get(&(chrom_norm, target_marker.pos)) {
+                let ref_marker = ref_markers.marker(MarkerIdx::new(ref_idx as u32));
+                if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
+                    if mapping.is_valid() {
+                        target_to_ref[m] = Some(MarkerIdx::new(ref_idx as u32));
+                        if mapping.strand_flipped {
+                            stats.strand_flipped += 1;
+                        }
+                        if mapping.alleles_swapped {
+                            stats.allele_swapped += 1;
+                        }
+                        allele_mappings[m] = Some(mapping);
+                        stats.aligned += 1;
+                    }
+                }
+            }
+        }
+
+        (
+            Self {
+                ref_to_target: Vec::new(),
+                target_to_ref,
+                allele_mappings,
+            },
+            stats,
+        )
     }
 
     /// Get target marker index for a reference marker (returns None if not genotyped)

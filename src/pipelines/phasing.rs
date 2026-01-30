@@ -56,7 +56,7 @@ impl std::ops::Deref for StreamWindowWithResult {
         &self.window
     }
 }
-use crate::data::alignment::MarkerAlignment;
+use crate::data::alignment::{AlignmentStats, MarkerAlignment};
 use crate::model::allele_lookup::RefAlleleLookup;
 use crate::model::types::GlobalId;
 use crate::model::hmm::MosaicHmm;
@@ -1709,6 +1709,30 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             GeneticMaps::new()
         };
 
+        // Load reference panel if provided (for reference-guided phasing)
+        let mut ref_pos_map: Option<HashMap<(String, u32), usize>> = None;
+        if let Some(ref_path) = &self.config.r#ref {
+            eprintln!("Loading reference panel for streaming phasing...");
+            let ref_gt: GenotypeMatrix<Phased> =
+                if ref_path.extension().map(|e| e == "bref3").unwrap_or(false) {
+                    eprintln!("  Detected BREF3 format");
+                    let reader = Bref3Reader::open(ref_path)?;
+                    reader.read_all()?
+                } else {
+                    eprintln!("  Detected VCF format");
+                    let (mut ref_reader, ref_file) = VcfReader::open(ref_path)?;
+                    ref_reader.read_all(ref_file)?.into_phased()
+                };
+            eprintln!(
+                "  Reference: {} markers, {} haplotypes",
+                ref_gt.n_markers(),
+                ref_gt.n_haplotypes()
+            );
+            ref_pos_map = Some(MarkerAlignment::build_ref_pos_index(ref_gt.markers()));
+            self.reference_gt = Some(Arc::new(ref_gt));
+            self.alignment = None;
+        }
+
         // Open streaming reader
         let mut reader =
             StreamingVcfReader::open(&self.config.gt, gen_maps.clone(), streaming_config)?;
@@ -1734,6 +1758,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let mut window_count = 0;
         let mut total_markers = 0;
         let mut wrote_header = false;
+        let mut align_stats = AlignmentStats::default();
 
         // Track phased overlap from previous window for phase continuity
         // PhasedOverlap contains state probabilities used for PBWT state handoff
@@ -1764,6 +1789,23 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
             // Set the phased overlap from previous window
             window.phased_overlap = phased_overlap.take();
+
+            if let (Some(ref_gt), Some(ref_pos_map)) =
+                (self.reference_gt.as_ref(), ref_pos_map.as_ref())
+            {
+                let (alignment, stats) = MarkerAlignment::new_with_ref_index(
+                    &window.genotypes,
+                    ref_gt.markers(),
+                    ref_pos_map,
+                );
+                align_stats.aligned += stats.aligned;
+                align_stats.strand_flipped += stats.strand_flipped;
+                align_stats.allele_swapped += stats.allele_swapped;
+                self.alignment = Some(alignment);
+            } else {
+                self.alignment = None;
+            }
+
             // Phase this window with overlap constraint
             let (phased, next_overlap_handoff) = self
                 .phase_in_memory_with_overlap(
@@ -1831,6 +1873,13 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             "Streaming phasing complete: {} windows, {} markers",
             window_count, total_markers
         );
+        if align_stats.aligned > 0 && (align_stats.strand_flipped > 0 || align_stats.allele_swapped > 0)
+        {
+            eprintln!(
+                "  Alignment summary (streaming): {} strand-flipped, {} allele-swapped markers",
+                align_stats.strand_flipped, align_stats.allele_swapped
+            );
+        }
         Ok(())
     }
 

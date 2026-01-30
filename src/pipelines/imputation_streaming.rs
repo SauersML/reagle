@@ -21,6 +21,10 @@ use crate::data::{HapIdx, MarkerIdx, SampleIdx};
 use crate::error::ReagleError;
 use crate::error::Result;
 use crate::io::bref3::{RefPanelReader, TargetMarkerIndex};
+use crate::io::prescan_cache::{
+    create_temp_cache_path, PackedRefColumn, PackedRefWindow, PrescanCacheReader,
+    PrescanCacheWriter,
+};
 use crate::io::streaming::{
     GlobalHapId, HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader,
 };

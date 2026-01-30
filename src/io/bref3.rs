@@ -1125,61 +1125,80 @@ impl StreamingRefVcfReader {
                 self.eof = true;
                 return Ok(None);
             }
-            let line = self.line_buf.trim().to_string();
+            let line = self.line_buf.trim_end();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let mut marker = self.parse_vcf_line(&line)?;
+            let mut marker = self.parse_vcf_line(line)?;
             marker.gen_pos = gen_maps.gen_pos(marker.marker.chrom, marker.marker.pos);
             return Ok(Some(marker));
         }
     }
 
     fn parse_vcf_line(&mut self, line: &str) -> Result<RefPanelMarker> {
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 10 {
-            bail!("VCF line has too few fields");
-        }
-
-        // Parse CHROM
-        let chrom_name = fields[0];
+        let mut fields = line.split('\t');
+        let chrom_name = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("VCF line missing CHROM"))?;
         let chrom_idx = self.markers.add_chrom(chrom_name);
 
-        // Parse POS
-        let pos: u32 = fields[1].parse().context("Invalid POS")?;
+        let pos_str = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("VCF line missing POS"))?;
+        let pos: u32 = pos_str.parse().context("Invalid POS")?;
 
-        // Parse ID
+        let _id_field = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("VCF line missing ID"))?;
         let id = None;
 
-        // Parse REF
-        let ref_allele = Allele::from_str(fields[3]);
+        let ref_field = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("VCF line missing REF"))?;
+        let ref_allele = Allele::from_str(ref_field);
 
-        // Parse ALT
-        let alt_alleles: Vec<Allele> = fields[4].split(',').map(|a| Allele::from_str(a)).collect();
+        let alt_field = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("VCF line missing ALT"))?;
+        let alt_alleles: Vec<Allele> =
+            alt_field.split(',').map(|a| Allele::from_str(a)).collect();
 
-        let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles.clone());
-        let n_alleles = 1 + alt_alleles.len();
+        for _ in 0..3 {
+            fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("VCF line missing QUAL/FILTER/INFO"))?;
+        }
+
+        let format = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("VCF line missing FORMAT"))?;
+
+        let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles);
+        let n_alleles = marker.n_alleles();
 
         // Parse genotypes
         let n_samples = self.samples.len();
         let mut alleles = Vec::with_capacity(n_samples * 2);
 
         // Find GT index
-        let format = fields[8];
         let gt_idx = format
             .split(':')
             .position(|f| f == "GT")
             .ok_or_else(|| anyhow::anyhow!("No GT field in FORMAT"))?;
 
-        if fields.len() < 9 + n_samples {
-            bail!("VCF line has fewer samples than header");
-        }
-
-        for sample_field in fields[9..].iter().take(n_samples) {
-            let gt_field = sample_field.split(':').nth(gt_idx).unwrap_or("./.");
+        for (idx, sample_field) in fields.take(n_samples).enumerate() {
+            let gt_field = self
+                .field_at_colon(sample_field, gt_idx)
+                .unwrap_or("./.");
             let (a1, a2) = self.parse_gt_local(gt_field);
             alleles.push(a1);
             alleles.push(a2);
+            if idx + 1 == n_samples {
+                break;
+            }
+        }
+        if alleles.len() < n_samples * 2 {
+            bail!("VCF line has fewer samples than header");
         }
 
         let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
@@ -1195,19 +1214,18 @@ impl StreamingRefVcfReader {
         if gt == "." || gt == "./." || gt == ".|." {
             return (255, 255);
         }
-        let sep = if gt.contains('|') { '|' } else { '/' };
-        let parts: Vec<&str> = gt.split(sep).collect();
-        if parts.len() == 1 {
-            let a = self.parse_allele_local(parts[0]);
-            return (a, a);
+        if let Some(idx) = gt.find('|') {
+            let a1 = self.parse_allele_local(&gt[..idx]);
+            let a2 = self.parse_allele_local(&gt[idx + 1..]);
+            return (a1, a2);
         }
-        if parts.len() != 2 {
-            return (255, 255);
+        if let Some(idx) = gt.find('/') {
+            let a1 = self.parse_allele_local(&gt[..idx]);
+            let a2 = self.parse_allele_local(&gt[idx + 1..]);
+            return (a1, a2);
         }
-        (
-            self.parse_allele_local(parts[0]),
-            self.parse_allele_local(parts[1]),
-        )
+        let a = self.parse_allele_local(gt);
+        (a, a)
     }
 
     fn parse_allele_local(&self, s: &str) -> u8 {
@@ -1221,6 +1239,25 @@ impl StreamingRefVcfReader {
             }
         }
         s.parse().unwrap_or(255)
+    }
+
+    fn field_at_colon<'a>(&self, s: &'a str, idx: usize) -> Option<&'a str> {
+        let bytes = s.as_bytes();
+        let mut start = 0usize;
+        let mut field_idx = 0usize;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b':' {
+                if field_idx == idx {
+                    return Some(&s[start..i]);
+                }
+                field_idx += 1;
+                start = i + 1;
+            }
+        }
+        if field_idx == idx {
+            return Some(&s[start..]);
+        }
+        None
     }
 }
 
