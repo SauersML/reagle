@@ -210,6 +210,18 @@ impl SamplePhase {
         self.status[marker] == ClusterStatus::Missing
     }
 
+    /// Number of markers currently marked as phased.
+    #[inline]
+    pub fn phased_count(&self) -> usize {
+        self.status_counts[ClusterStatus::Phased as usize]
+    }
+
+    /// Number of markers currently marked as unphased.
+    #[inline]
+    pub fn unphased_count(&self) -> usize {
+        self.status_counts[ClusterStatus::Unphased as usize]
+    }
+
     /// Set imputed alleles for a missing marker.
     ///
     /// Sets the alleles and changes status from Missing to Phased.

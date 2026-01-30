@@ -25,6 +25,7 @@ use crate::io::streaming::{
     GlobalHapId, HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader,
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
+use crate::model::parameters::ModelParams;
 use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
@@ -1463,6 +1464,10 @@ impl crate::pipelines::ImputationPipeline {
             self.config.imp_step as f64,
             &self.params,
         )?;
+
+        self.params.recomb_intensity = (0.04 * self.config.ne / plan.n_ref_haps as f32)
+            .min(ModelParams::MAX_RECOMB_INTENSITY);
+
         let full_panel_cap = plan
             .per_window_caps
             .iter()
@@ -1951,6 +1956,29 @@ impl crate::pipelines::ImputationPipeline {
             offsets1.push(0);
             offsets2.push(0);
 
+            let mut dbg_het = 0usize;
+            let mut dbg_het_conf_sum = 0.0f32;
+            let mut dbg_het_conf_low = 0usize;
+            let mut dbg_genotyped = 0usize;
+            let mut dbg_uniform_h1 = 0usize;
+            let mut dbg_uniform_h2 = 0usize;
+            let is_uniform = |vals: &[f32]| -> bool {
+                if vals.len() <= 1 {
+                    return true;
+                }
+                let mut min = vals[0];
+                let mut max = vals[0];
+                for &v in vals.iter().skip(1) {
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                (max - min) <= 1e-6
+            };
+
             for (ref_m, target_m_idx) in alignment.ref_to_target.iter().enumerate() {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles();
                 let mut aligned1: Vec<f32> = Vec::new();
@@ -2224,6 +2252,13 @@ impl crate::pipelines::ImputationPipeline {
                                     .clamp(0.0, 1.0);
                                 aligned1[mapped1 as usize] = phase_conf;
                                 aligned1[mapped2 as usize] = 1.0 - phase_conf;
+                                if sample_idx == 0 {
+                                    dbg_het += 1;
+                                    dbg_het_conf_sum += phase_conf;
+                                    if phase_conf < 0.55 {
+                                        dbg_het_conf_low += 1;
+                                    }
+                                }
                             } else {
                                 aligned1[mapped1 as usize] = 0.5;
                                 aligned1[mapped2 as usize] = 0.5;
@@ -2258,6 +2293,10 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         use2 = true;
                     }
+
+                    if sample_idx == 0 {
+                        dbg_genotyped += 1;
+                    }
                 }
 
                 if !use1 {
@@ -2270,10 +2309,31 @@ impl crate::pipelines::ImputationPipeline {
                 normalize_probs(&mut aligned1);
                 normalize_probs(&mut aligned2);
 
+                if sample_idx == 0 && target_m_idx.is_some() {
+                    if is_uniform(&aligned1) {
+                        dbg_uniform_h1 += 1;
+                    }
+                    if is_uniform(&aligned2) {
+                        dbg_uniform_h2 += 1;
+                    }
+                }
+
                 probs1.extend_from_slice(&aligned1);
                 probs2.extend_from_slice(&aligned2);
                 offsets1.push(probs1.len());
                 offsets2.push(probs2.len());
+            }
+            if sample_idx == 0 && dbg_genotyped > 0 {
+                let mean_conf = dbg_het_conf_sum / dbg_het.max(1) as f32;
+                eprintln!(
+                    "    [debug] genotyped markers={} hets={} mean_phase_conf={:.3} het_conf<0.55={} uniform_h1={} uniform_h2={}",
+                    dbg_genotyped,
+                    dbg_het,
+                    mean_conf,
+                    dbg_het_conf_low,
+                    dbg_uniform_h1,
+                    dbg_uniform_h2
+                );
             }
             (
                 TargetAlleleProbs::new(offsets1, probs1),
@@ -2606,6 +2666,7 @@ impl crate::pipelines::ImputationPipeline {
             &all_results,
             self.config.gp,
             self.config.ap,
+            self.config.err.is_some(),
         )?;
         if let Some(bb) = &self.telemetry {
             let output_markers = output_end.saturating_sub(output_start);
@@ -2647,6 +2708,7 @@ impl crate::pipelines::ImputationPipeline {
     }
 
     /// Write imputed window results to VCF
+    #[allow(clippy::too_many_arguments)]
     fn write_imputed_window_streaming<TargetSpace, RefMarkerSpace, RefPhaseSpace>(
         &self,
         ref_markers: &crate::data::marker::Markers<RefMarkerSpace>,
@@ -2663,6 +2725,7 @@ impl crate::pipelines::ImputationPipeline {
         all_results: &[SampleImputationResult],
         include_gp: bool,
         include_ap: bool,
+        correct_errors: bool,
     ) -> Result<()> {
         let markers_range = output_start..output_end;
         let n_markers = markers_range.len();
@@ -2834,66 +2897,74 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         let error_rate = self.params.p_mismatch;
+        let use_hard_call_fallback = !correct_errors;
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
             let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
-            let pl = target_pl.sample_pl(target_m, sample_idx)?;
-            if !pl.is_empty() {
-                let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len())?;
-                if n_pl_alleles == 0 {
-                    return None;
-                }
-                let n_ref_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                let mapping = alignment
-                    .allele_mappings
-                    .get(target_m.as_usize())
-                    .and_then(|m| m.as_ref());
-                let mut target_gp: Vec<f32> = Vec::new();
-                let n = genotype_probs_from_pl(pl, None, &mut target_gp)?;
-                if n != n_pl_alleles {
-                    return None;
-                }
+            let pl_opt = target_pl.sample_pl(target_m, sample_idx);
 
-                let mut ref_gp = vec![0.0f32; n_ref_alleles * (n_ref_alleles + 1) / 2];
-                let mut idx = 0usize;
-                for j in 0..n_pl_alleles {
-                    for i in 0..=j {
-                        let p = target_gp.get(idx).copied().unwrap_or(0.0);
-                        idx += 1;
-                        let ri: i8 = if let Some(mapping) = mapping {
-                            mapping.targ_to_ref.get(i).copied().unwrap_or(-1)
-                        } else if i <= i8::MAX as usize {
-                            i as i8
-                        } else {
-                            -1
-                        };
-                        let rj: i8 = if let Some(mapping) = mapping {
-                            mapping.targ_to_ref.get(j).copied().unwrap_or(-1)
-                        } else if j <= i8::MAX as usize {
-                            j as i8
-                        } else {
-                            -1
-                        };
-                        if ri < 0 || rj < 0 {
-                            continue;
-                        }
-                        let (ri, rj) = (ri as usize, rj as usize);
-                        if ri >= n_ref_alleles || rj >= n_ref_alleles {
-                            continue;
-                        }
-                        let ref_idx = genotype_index(ri, rj);
-                        if ref_idx < ref_gp.len() {
-                            ref_gp[ref_idx] += p;
+            if let Some(pl) = pl_opt {
+                if !pl.is_empty() {
+                    let n_pl_alleles = infer_n_alleles_from_pl_len(pl.len())?;
+                    if n_pl_alleles == 0 {
+                        return None;
+                    }
+                    let n_ref_alleles = ref_markers
+                        .marker(MarkerIdx::new(marker_idx as u32))
+                        .n_alleles();
+                    let mapping = alignment
+                        .allele_mappings
+                        .get(target_m.as_usize())
+                        .and_then(|m| m.as_ref());
+                    let mut target_gp: Vec<f32> = Vec::new();
+                    let n = genotype_probs_from_pl(pl, None, &mut target_gp)?;
+                    if n != n_pl_alleles {
+                        return None;
+                    }
+
+                    let mut ref_gp = vec![0.0f32; n_ref_alleles * (n_ref_alleles + 1) / 2];
+                    let mut idx = 0usize;
+                    for j in 0..n_pl_alleles {
+                        for i in 0..=j {
+                            let p = target_gp.get(idx).copied().unwrap_or(0.0);
+                            idx += 1;
+                            let ri: i8 = if let Some(mapping) = mapping {
+                                mapping.targ_to_ref.get(i).copied().unwrap_or(-1)
+                            } else if i <= i8::MAX as usize {
+                                i as i8
+                            } else {
+                                -1
+                            };
+                            let rj: i8 = if let Some(mapping) = mapping {
+                                mapping.targ_to_ref.get(j).copied().unwrap_or(-1)
+                            } else if j <= i8::MAX as usize {
+                                j as i8
+                            } else {
+                                -1
+                            };
+                            if ri < 0 || rj < 0 {
+                                continue;
+                            }
+                            let (ri, rj) = (ri as usize, rj as usize);
+                            if ri >= n_ref_alleles || rj >= n_ref_alleles {
+                                continue;
+                            }
+                            let ref_idx = genotype_index(ri, rj);
+                            if ref_idx < ref_gp.len() {
+                                ref_gp[ref_idx] += p;
+                            }
                         }
                     }
+                    if !normalize_probs(&mut ref_gp) {
+                        return None;
+                    }
+                    return Some(ref_gp);
                 }
-                if !normalize_probs(&mut ref_gp) {
-                    return None;
-                }
-                return Some(ref_gp);
             }
             // Soft fallback using hard GT with an error rate: avoids hard-calling
             // genotyped markers when PLs are missing or uninformative.
-            let n_ref_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+            let n_ref_alleles = ref_markers
+                .marker(MarkerIdx::new(marker_idx as u32))
+                .n_alleles();
             if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                 let n_genotypes = n_ref_alleles * (n_ref_alleles + 1) / 2;
                 if n_genotypes == 0 {
@@ -2901,7 +2972,11 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 let mut gp = vec![0.0f32; n_genotypes];
                 let idx = genotype_index(a1 as usize, a2 as usize);
-                let err = error_rate.clamp(1e-6, 0.5);
+                let err = if use_hard_call_fallback {
+                    0.0
+                } else {
+                    error_rate.clamp(1e-6, 0.5)
+                };
                 let main = 1.0 - err;
                 if idx < gp.len() {
                     gp[idx] = main;
@@ -2925,13 +3000,31 @@ impl crate::pipelines::ImputationPipeline {
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let local_m = marker_idx.saturating_sub(output_start);
-            let dosage = if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+            let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
+
+            // If error correction is enabled, prioritize imputed dosages.
+            // Otherwise, prefer hard calls from input when available.
+            let use_hard_call = !correct_errors && hard_call.is_some();
+
+            let dosage = if use_hard_call {
+                let (a1, a2) = hard_call.unwrap();
                 (a1 + a2) as f32
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.dosages.get(local_m).copied().unwrap_or(0.0)
-            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                dosage_from_gp(n_alleles, &gp)
+            } else if !correct_errors {
+                if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles =
+                        ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    dosage_from_gp(n_alleles, &gp)
+                } else if let Some((a1, a2)) = hard_call {
+                    // Fallback to hard call if imputation result is missing
+                    (a1 + a2) as f32
+                } else {
+                    0.0
+                }
+            } else if let Some((a1, a2)) = hard_call {
+                // Fallback to hard call if imputation result is missing
+                (a1 + a2) as f32
             } else {
                 0.0
             };
@@ -2946,13 +3039,26 @@ impl crate::pipelines::ImputationPipeline {
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let local_m = marker_idx.saturating_sub(output_start);
-            if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                (a1, a2)
+            let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
+
+            let use_hard_call = !correct_errors && hard_call.is_some();
+
+            if use_hard_call {
+                hard_call.unwrap()
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 result.best_gt.get(local_m).copied().unwrap_or((0, 0))
-            } else if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                let n_alleles = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
-                best_gt_from_gp(n_alleles, &gp)
+            } else if !correct_errors {
+                if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles =
+                        ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    best_gt_from_gp(n_alleles, &gp)
+                } else if let Some(gt) = hard_call {
+                    gt
+                } else {
+                    (0, 0)
+                }
+            } else if let Some(gt) = hard_call {
+                gt
             } else {
                 (0, 0)
             }
@@ -3052,8 +3158,11 @@ impl crate::pipelines::ImputationPipeline {
             &marker_matrix
         };
 
-        let get_genotype_posteriors_for_writer =
-            if include_gp { Some(|m, s| get_genotype_posteriors(m, s)) } else { None };
+        let get_genotype_posteriors_for_writer = if include_gp && !correct_errors {
+            Some(|m, s| get_genotype_posteriors(m, s))
+        } else {
+            None
+        };
 
         writer.write_imputed_streaming(
             marker_matrix_ref,
@@ -3205,6 +3314,7 @@ mod tests {
             output_end,
             output_start,
             &all_results,
+            false,
             false,
             false,
         );

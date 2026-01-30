@@ -1111,6 +1111,7 @@ fn test_imputation_multi_window_long_map_vs_java() {
             ("gt", gt_path.to_str().unwrap()),
             ("map", map_path.to_str().unwrap()),
             ("window", "2.0"),
+            ("overlap", "1.0"),
             ("out", java_out.to_str().unwrap()),
             ("seed", "42"),
             ("gp", "true"),
@@ -1132,7 +1133,7 @@ fn test_imputation_multi_window_long_map_vs_java() {
         &rust_out,
         42,
         2.0,
-        2.0,
+        1.0,
     );
     assert!(
         rust_result.is_ok(),
