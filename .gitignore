@@ -1,7 +1,11 @@
 debug
 target
 **/*.rs.bk
+*.rmeta
 **/mutants.out*/
+# Markdown files except README
+*.md
+!README*.md
 jules.patch
 build.log
 **/build
@@ -28,6 +32,8 @@ __pycache__/
 *_raw.vcf.gz
 *_metrics.json
 *_report.json
+*.svg
+*.positions
 
 # Codex/AI session files
 codex_session_*.jsonl
