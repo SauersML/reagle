@@ -3,13 +3,33 @@ import sys
 import subprocess
 import glob
 import shutil
+import shlex
 from pathlib import Path
+
 PANEL_BCF_URL = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
 
 
 def _repo_root():
     return Path(__file__).resolve().parent.parent
 
+
+def _bump_nofile_limit(min_soft: int = 4096):
+    try:
+        import resource
+    except Exception:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:
+        return
+    target = max(soft, min_soft)
+    if hard != resource.RLIM_INFINITY:
+        target = min(target, hard)
+    if target > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except Exception:
+            pass
 
 def _panel_cache_vcf():
     return _repo_root() / "tests" / "data" / "ref.vcf.gz"
@@ -255,6 +275,9 @@ def prepare_truth(source, output_vcf):
     
     Source can be dir or person name.
     """
+    if os.path.exists(output_vcf) and _has_vcf_index(Path(output_vcf)) and os.path.getsize(output_vcf) > 0:
+        print(f"Truth already exists: {output_vcf}")
+        return
     if source.lower() == "kat":
         input_dir = "data/kat_suricata"
     elif source.lower() == "christopher":
@@ -301,8 +324,10 @@ def prepare_truth(source, output_vcf):
     subprocess.check_call(["bcftools", "index", "-t", source_vcf])
 
     panel_path = _ensure_reference_panel()
+    _bump_nofile_limit()
 
     install_convert_genome()
+    _bump_nofile_limit()
 
     ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
     truth_output_dir = "convert_genome_truth_out"
@@ -321,7 +346,8 @@ def prepare_truth(source, output_vcf):
     ]
 
     print(f"Running: {' '.join(cmd)}")
-    subprocess.check_call(cmd)
+    cmd_str = " ".join(shlex.quote(part) for part in cmd)
+    subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
 
     truth_raw_vcf = _find_genotypes_vcf(truth_output_dir)
     if not truth_raw_vcf:
@@ -380,7 +406,8 @@ def run_conversion(input_path, output_vcf):
     ]
 
     print(f"Running: {' '.join(cmd)}")
-    subprocess.check_call(cmd)
+    cmd_str = " ".join(shlex.quote(part) for part in cmd)
+    subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
 
     temp_hg38_vcf = _find_genotypes_vcf(temp_output_dir)
     if not temp_hg38_vcf:

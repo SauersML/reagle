@@ -42,7 +42,6 @@
 //! absolute best haplotypes matching on both sides, which is crucial for accurate
 //! phasing and imputation.
 
-pub mod allele_lookup;
 pub mod hmm;
 pub mod ibs2;
 pub mod parameters;

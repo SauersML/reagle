@@ -143,6 +143,7 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     ref_out = args.out_dir / "ref.vcf.gz"
+    ref_for_impute = ref_out
     target_dense = args.out_dir / "target_dense.vcf.gz"
     target_sparse = args.out_dir / "target_sparse.vcf.gz"
     positions = args.out_dir / "target_sparse.positions"
@@ -162,39 +163,22 @@ def main():
 
         prepare = repo_root / "scripts" / "prepare_data.py"
         run(["python3", str(prepare), "reference", str(ref_out)])
-        ref_backup = args.out_dir / "ref_wgs.vcf.gz"
-        shutil.copy2(ref_out, ref_backup)
-        ref_index = ref_out.with_suffix(ref_out.suffix + ".csi")
-        if ref_index.exists():
-            shutil.copy2(ref_index, ref_backup.with_suffix(ref_backup.suffix + ".csi"))
         # Microarray sites come from the array conversion (sparse target).
         run(["python3", str(prepare), "array", str(array_file), str(target_sparse)])
-        # Restore WGS-density reference in case the array conversion padded the panel.
-        shutil.copy2(ref_backup, ref_out)
-        ref_backup_index = ref_backup.with_suffix(ref_backup.suffix + ".csi")
-        if ref_backup_index.exists():
-            shutil.copy2(ref_backup_index, ref_out.with_suffix(ref_out.suffix + ".csi"))
-        else:
-            run(["bcftools", "index", "-f", str(ref_out)])
         # Dense target represents WGS-like density for the same person.
         if person is None:
             raise SystemExit("Unable to infer person for WGS truth; pass --array-file under data/<person>.")
         truth_source = person_data_dir(repo_root, person)
-        if truth_source.exists():
-            try:
-                run(["python3", str(prepare), "truth", str(truth_source), str(target_dense)])
-            except subprocess.CalledProcessError:
-                print("WGS truth missing; falling back to reference panel as dense target.")
-                shutil.copy2(ref_out, target_dense)
-                ref_index = ref_out.with_suffix(ref_out.suffix + ".csi")
-                if ref_index.exists():
-                    shutil.copy2(ref_index, target_dense.with_suffix(target_dense.suffix + ".csi"))
+        run(["python3", str(prepare), "truth", str(truth_source), str(target_dense)])
+        # Use WGS-density truth as the reference for imputation in real-data mode.
+        ref_wgs = args.out_dir / "ref_wgs.vcf.gz"
+        shutil.copy2(target_dense, ref_wgs)
+        truth_index = target_dense.with_suffix(target_dense.suffix + ".csi")
+        if truth_index.exists():
+            shutil.copy2(truth_index, ref_wgs.with_suffix(ref_wgs.suffix + ".csi"))
         else:
-            print("WGS truth directory missing; falling back to reference panel as dense target.")
-            shutil.copy2(ref_out, target_dense)
-            ref_index = ref_out.with_suffix(ref_out.suffix + ".csi")
-            if ref_index.exists():
-                shutil.copy2(ref_index, target_dense.with_suffix(target_dense.suffix + ".csi"))
+            run(["bcftools", "index", "-f", str(ref_wgs)])
+        ref_for_impute = ref_wgs
     else:
         if not ref_vcf or not target_vcf or not ref_vcf.exists() or not target_vcf.exists():
             raise SystemExit(
@@ -251,7 +235,7 @@ def main():
 
     cmd = [
         str(reagle_bin),
-        "--ref", str(ref_out),
+        "--ref", str(ref_for_impute),
         "--gt", str(target_sparse),
         "--out", str(args.out_dir / "reagle_microarray"),
         "--gp",
@@ -266,7 +250,7 @@ def main():
     print("\nDone.")
     print(f"Flamegraph: {env['REAGLE_PPROF_OUTPUT']}")
     print(f"Sparse target: {target_sparse}")
-    print(f"Reference: {ref_out}")
+    print(f"Reference: {ref_for_impute}")
 
 
 if __name__ == "__main__":

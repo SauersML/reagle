@@ -13,8 +13,6 @@ pub struct ThreadWorkspace {
     pub fwd: AVec<f32, ConstAlign<32>>,
     /// Backward probabilities: bwd[m * n_states + k] = P(state k at marker m)
     pub bwd: AVec<f32, ConstAlign<32>>,
-    /// Pre-computed alleles: alleles[m * n_states + k] = allele for state k at marker m
-    pub lookup: AVec<u8, ConstAlign<32>>,
     /// Forward prior buffer (same length as fwd)
     pub fwd_prior: AVec<f32, ConstAlign<32>>,
     /// Per-marker ref alleles buffer (n_states)
@@ -76,7 +74,6 @@ impl ThreadWorkspace {
         Self {
             fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
             bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
-            lookup: AVec::from_iter(32, std::iter::repeat(0).take(size)),
             fwd_prior: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
             ref_alleles: Vec::new(),
             weights: Vec::new(),
@@ -129,7 +126,6 @@ impl ThreadWorkspace {
 
             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
             self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
-            self.lookup = AVec::from_iter(32, std::iter::repeat(0).take(new_size));
             self.fwd_prior = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
             self.n_states = n_states;
         }

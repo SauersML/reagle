@@ -23,7 +23,7 @@ use tracing::{info_span, instrument};
 use crate::config::Config;
 use crate::data::genetic_map::{GeneticMaps, MarkerMap};
 use crate::data::haplotype::{HapIdx, SampleIdx};
-use crate::data::marker::MarkerIdx;
+use crate::data::marker::{AnyMarkerSpace, MarkerIdx};
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes};
@@ -57,8 +57,8 @@ impl std::ops::Deref for StreamWindowWithResult {
     }
 }
 use crate::data::alignment::{AlignmentStats, MarkerAlignment};
-use crate::model::allele_lookup::RefAlleleLookup;
 use crate::model::types::GlobalId;
+use crate::model::states::ThreadedHaps;
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
@@ -77,6 +77,37 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
+
+struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
+    ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
+    threaded_haps: &'a ThreadedHaps,
+    state_buf: Vec<GlobalId>,
+}
+
+impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
+    fn new(ref_gt: GenotypeView<'a, TargetSpace, RefSpace>, threaded_haps: &'a ThreadedHaps) -> Self {
+        let n_states = threaded_haps.n_states();
+        Self {
+            ref_gt,
+            threaded_haps,
+            state_buf: vec![GlobalId::from(0u32); n_states],
+        }
+    }
+
+    #[inline]
+    fn fill_ref_alleles(&mut self, marker: usize, out: &mut [u8]) {
+        let n_states = self.threaded_haps.n_states().min(out.len());
+        if self.state_buf.len() < n_states {
+            self.state_buf.resize(n_states, GlobalId::from(0u32));
+        }
+        self.threaded_haps.materialize_at(marker, &mut self.state_buf);
+        let marker_idx = MarkerIdx::new(marker as u32);
+        for i in 0..n_states {
+            let hap = HapIdx::new(self.state_buf[i].as_u32());
+            out[i] = self.ref_gt.allele(marker_idx, hap);
+        }
+    }
+}
 
 fn partition_markers_by_cm(gen_positions: &[f64], block_cm: f64) -> Vec<(usize, usize)> {
     if gen_positions.is_empty() {
@@ -821,7 +852,7 @@ fn global_to_local_paths(
     Some(MosaicPaths { path1, path2 })
 }
 
-struct MosaicChain<'a> {
+struct MosaicChain<'a, RefSpace = crate::data::AnyMarkerSpace> {
     rng: rand::rngs::SmallRng,
     n_markers: usize,
     n_states: usize,
@@ -829,7 +860,7 @@ struct MosaicChain<'a> {
     seq1: &'a [u8],
     seq2: &'a [u8],
     conf: &'a [f32],
-    lookup: &'a RefAlleleLookup,
+    ref_provider: RefAlleleProvider<'a, AnyMarkerSpace, RefSpace>,
     combined_checkpoints: &'a FwdCheckpoints,
     fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
@@ -854,7 +885,7 @@ struct MosaicChain<'a> {
     pl_provider: Option<PlProvider<'a>>,
 }
 
-impl<'a> MosaicChain<'a> {
+impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
     fn new_with_buffers(
         seed: u64,
         n_markers: usize,
@@ -863,7 +894,7 @@ impl<'a> MosaicChain<'a> {
         seq1: &'a [u8],
         seq2: &'a [u8],
         conf: &'a [f32],
-        lookup: &'a RefAlleleLookup,
+        ref_provider: RefAlleleProvider<'a, AnyMarkerSpace, RefSpace>,
         combined_checkpoints: &'a FwdCheckpoints,
         buffers: MosaicBuffers,
         p_no_err: f32,
@@ -878,7 +909,7 @@ impl<'a> MosaicChain<'a> {
             seq1,
             seq2,
             conf,
-            lookup,
+            ref_provider,
             combined_checkpoints,
             fwd: buffers.fwd,
             fwd_prior: buffers.fwd_prior,
@@ -907,10 +938,6 @@ impl<'a> MosaicChain<'a> {
             pl_provider,
         };
         out
-    }
-
-    fn paths(&self) -> (&[u32], &[u32]) {
-        (&self.path1, &self.path2)
     }
 
     fn into_buffers(self) -> MosaicBuffers {
@@ -974,7 +1001,9 @@ impl<'a> MosaicChain<'a> {
         for m in 0..self.n_markers {
             let a1 = self.seq1[m];
             let a2 = self.seq2[m];
-            let ref_al = self.lookup.allele(m, self.path1[m] as usize);
+            self.ref_provider
+                .fill_ref_alleles(m, &mut self.ref_alleles);
+            let ref_al = self.ref_alleles[self.path1[m] as usize];
             // Partner allele is always the other haplotype's current reference allele.
             self.hap2_partner_allele[m] = ref_al;
             if a1 == 255 && a2 == 255 {
@@ -1007,7 +1036,9 @@ impl<'a> MosaicChain<'a> {
         for m in 0..self.n_markers {
             let a1 = self.seq1[m];
             let a2 = self.seq2[m];
-            let ref_al = self.lookup.allele(m, self.path2[m] as usize);
+            self.ref_provider
+                .fill_ref_alleles(m, &mut self.ref_alleles);
+            let ref_al = self.ref_alleles[self.path2[m] as usize];
             // Partner allele is always the other haplotype's current reference allele.
             self.hap1_partner_allele[m] = ref_al;
             if a1 == 255 && a2 == 255 {
@@ -1039,7 +1070,7 @@ impl<'a> MosaicChain<'a> {
     }
 }
 
-impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
+impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
     fn step(&mut self) -> &MosaicTrace {
         // Proper Gibbs sampling: H1 and H2 must each condition on the other.
         //
@@ -1069,7 +1100,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                     partner_allele: &dummy_partner,
                     use_combined: &dummy_combined,
                 },
-                self.lookup,
+                &mut self.ref_provider,
                 self.pl_provider.as_ref(),
                 self.p_no_err,
                 self.p_err,
@@ -1101,7 +1132,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                     partner_allele: &self.hap1_partner_allele,
                     use_combined: &self.hap1_use_combined,
                 },
-                self.lookup,
+                &mut self.ref_provider,
                 self.pl_provider.as_ref(),
                 &mut self.allele_probs,
                 fwd,
@@ -1125,7 +1156,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                     partner_allele: &self.hap1_partner_allele,
                     use_combined: &self.hap1_use_combined,
                 },
-                self.lookup,
+                &mut self.ref_provider,
                 self.pl_provider.as_ref(),
                 self.p_no_err,
                 self.p_err,
@@ -1156,7 +1187,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                 partner_allele: &self.hap2_partner_allele,
                 use_combined: &self.hap2_use_combined,
             },
-            self.lookup,
+            &mut self.ref_provider,
             self.pl_provider.as_ref(),
             &mut self.allele_probs,
             fwd,
@@ -1180,7 +1211,7 @@ impl MarkovChain<MosaicTrace> for MosaicChain<'_> {
                 partner_allele: &self.hap2_partner_allele,
                 use_combined: &self.hap2_use_combined,
             },
-            self.lookup,
+            &mut self.ref_provider,
             self.pl_provider.as_ref(),
             self.p_no_err,
             self.p_err,
@@ -2803,24 +2834,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let mut fwd2 = Vec::new();
                                 let mut bwd2 = Vec::new();
 
-                                let lookup_full = RefAlleleLookup::new_from_threaded_with_buffer(
-                                    &threaded_haps_full,
-                                    n_markers,
-                                    n_states_full,
-                                    n_haps,
-                                    ref_geno,
-                                    self.reference_gt.as_deref(),
-                                    self.alignment.as_ref(),
-                                    None,
-                                    aligned_vec::AVec::new(32),
-                                );
-
                                 let plp = PlProvider {
                                     gt: target_gt,
                                     sample: s,
                                     subset_to_orig: None,
                                 };
-                                hmm_full.conditioned_forward_backward_with_lookup(
+                                hmm_full.conditioned_forward_backward(
                                     &seq1,
                                     &seq2,
                                     &seq2,
@@ -2828,11 +2847,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     Some(&plp),
                                     None,
                                     None,
-                                    &lookup_full,
+                                    &threaded_haps_full,
                                     &mut fwd1,
                                     &mut bwd1,
                                 );
-                                hmm_full.conditioned_forward_backward_with_lookup(
+                                hmm_full.conditioned_forward_backward(
                                     &seq2,
                                     &seq1,
                                     &seq1,
@@ -2840,7 +2859,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     Some(&plp),
                                     None,
                                     None,
-                                    &lookup_full,
+                                    &threaded_haps_full,
                                     &mut fwd2,
                                     &mut bwd2,
                                 );
@@ -2898,20 +2917,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     }
                                     let ws = workspace.as_mut().unwrap();
                                     ws.clear(); // Explicit reset between samples to prevent state contamination
-                                    let lookup = RefAlleleLookup::new_from_threaded_with_buffer(
-                                        &threaded_haps,
-                                        n_markers,
-                                        n_states,
-                                        n_haps,
-                                        ref_geno,
-                                        self.reference_gt.as_deref(),
-                                        self.alignment.as_ref(),
-                                        None,
-                                        std::mem::replace(
-                                            &mut ws.lookup,
-                                            aligned_vec::AVec::new(32),
-                                        ),
-                                    );
+                                    let ref_provider =
+                                        RefAlleleProvider::new(ref_view, &threaded_haps);
 
                                     let donor_blocks =
                                         partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
@@ -2926,7 +2933,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         &seq1,
                                         &seq2,
                                         &sample_conf,
-                                        &lookup,
+                                        ref_provider,
                                         Some(PlProvider {
                                             gt: target_gt,
                                             sample: s,
@@ -2946,7 +2953,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         p_err,
                                         ws,
                                     );
-                                    ws.lookup = lookup.into_buffer();
                                     result
                                 });
                             if new_paths.path1.is_empty() {
@@ -3236,35 +3242,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             (swap_bits, swap_lr, swap_probs, Some(global_paths))
                         } else {
                             // Classic Beagle-style: static state space MCMC with thread-local workspace
-                            let lookup = if self.config.profile {
-                                info_span!("prep_allele_lookup", sample = s).in_scope(|| {
-                                    RefAlleleLookup::new_from_threaded_with_buffer(
-                                        &threaded_haps,
-                                        n_hi_freq,
-                                        n_states,
-                                        n_haps,
-                                        ref_geno,
-                                        self.reference_gt.as_deref(),
-                                        self.alignment.as_ref(),
-                                        Some(hi_freq_to_orig),
-                                        std::mem::replace(
-                                            &mut ws.lookup,
-                                            aligned_vec::AVec::new(32),
-                                        ),
-                                    )
+                            let ref_provider = if self.config.profile {
+                                info_span!("prep_allele_provider", sample = s).in_scope(|| {
+                                    RefAlleleProvider::new(subset_view, &threaded_haps)
                                 })
                             } else {
-                                RefAlleleLookup::new_from_threaded_with_buffer(
-                                    &threaded_haps,
-                                    n_hi_freq,
-                                    n_states,
-                                    n_haps,
-                                    ref_geno,
-                                    self.reference_gt.as_deref(),
-                                    self.alignment.as_ref(),
-                                    Some(hi_freq_to_orig),
-                                    std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
-                                )
+                                RefAlleleProvider::new(subset_view, &threaded_haps)
                             };
 
                             let local_prior = prior_paths[s]
@@ -3281,7 +3264,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         &seq1,
                                         &seq2,
                                         &sample_conf,
-                                        &lookup,
+                                        ref_provider,
                                         Some(PlProvider {
                                             gt: target_gt,
                                             sample: s,
@@ -3306,7 +3289,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     &seq1,
                                     &seq2,
                                     &sample_conf,
-                                    &lookup,
+                                    ref_provider,
                                     Some(PlProvider {
                                         gt: target_gt,
                                         sample: s,
@@ -3323,7 +3306,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     ws,
                                 )
                             };
-                            ws.lookup = lookup.into_buffer();
                             let global_paths =
                                 local_to_global_paths(&result.3, &threaded_haps, n_hi_freq);
                             (result.0, result.1, result.2, Some(global_paths))
@@ -3834,95 +3816,35 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     };
                     let init_prior1: Option<&[f32]> = init_prior1_storage.as_deref();
                     let init_prior2: Option<&[f32]> = init_prior2_storage.as_deref();
-                    let use_lookup = self.reference_gt.is_some() && self.alignment.is_some();
-                    let mut lookup = None;
-                    if use_lookup {
-                        lookup = Some(THREAD_WORKSPACE.with(|ws| {
-                            let mut workspace = ws.borrow_mut();
-                            if workspace.is_none() {
-                                *workspace =
-                                    Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
-                            }
-                            let ws = workspace.as_mut().unwrap();
-                            RefAlleleLookup::new_from_threaded_with_buffer(
-                                &threaded_haps,
-                                n_stage1,
-                                n_states,
-                                n_haps,
-                                ref_geno,
-                                self.reference_gt.as_deref(),
-                                self.alignment.as_ref(),
-                                Some(hi_freq_markers),
-                                std::mem::replace(&mut ws.lookup, aligned_vec::AVec::new(32)),
-                            )
-                        }));
-                    }
                     let allele_freqs_stage1: Vec<f32> =
                         hi_freq_markers.iter().map(|&m| alt_freqs[m]).collect();
-                    if let Some(ref lookup) = lookup {
-                        hmm.conditioned_forward_backward_with_lookup(
-                            &seq1,
-                            &seq2,
-                            &seq2,
-                            Some(&seq_conf),
-                            Some(&plp),
-                            Some(&allele_freqs_stage1),
-                            init_prior1,
-                            lookup,
-                            &mut fwd1,
-                            &mut bwd1,
-                        );
-                    } else {
-                        hmm.conditioned_forward_backward(
-                            &seq1,
-                            &seq2,
-                            &seq2,
-                            Some(&seq_conf),
-                            Some(&plp),
-                            Some(&allele_freqs_stage1),
-                            init_prior1,
-                            &threaded_haps,
-                            &mut fwd1,
-                            &mut bwd1,
-                        );
-                    }
+                    hmm.conditioned_forward_backward(
+                        &seq1,
+                        &seq2,
+                        &seq2,
+                        Some(&seq_conf),
+                        Some(&plp),
+                        Some(&allele_freqs_stage1),
+                        init_prior1,
+                        &threaded_haps,
+                        &mut fwd1,
+                        &mut bwd1,
+                    );
 
                     let mut fwd2 = Vec::new();
                     let mut bwd2 = Vec::new();
-                    if let Some(ref lookup) = lookup {
-                        hmm.conditioned_forward_backward_with_lookup(
-                            &seq1,
-                            &seq2,
-                            &seq1,
-                            Some(&seq_conf),
-                            Some(&plp),
-                            Some(&allele_freqs_stage1),
-                            init_prior2,
-                            lookup,
-                            &mut fwd2,
-                            &mut bwd2,
-                        );
-                    } else {
-                        hmm.conditioned_forward_backward(
-                            &seq1,
-                            &seq2,
-                            &seq1,
-                            Some(&seq_conf),
-                            Some(&plp),
-                            Some(&allele_freqs_stage1),
-                            init_prior2,
-                            &threaded_haps,
-                            &mut fwd2,
-                            &mut bwd2,
-                        );
-                    }
-                    if let Some(lookup) = lookup {
-                        THREAD_WORKSPACE.with(|ws| {
-                            if let Some(ws) = ws.borrow_mut().as_mut() {
-                                ws.lookup = lookup.into_buffer();
-                            }
-                        });
-                    }
+                    hmm.conditioned_forward_backward(
+                        &seq1,
+                        &seq2,
+                        &seq1,
+                        Some(&seq_conf),
+                        Some(&plp),
+                        Some(&allele_freqs_stage1),
+                        init_prior2,
+                        &threaded_haps,
+                        &mut fwd2,
+                        &mut bwd2,
+                    );
 
                     // Compute posterior state probabilities at each Stage 1 marker
                     let probs1 = compute_state_posteriors(&fwd1, &bwd1, n_stage1, n_states);
@@ -4700,7 +4622,7 @@ fn refresh_path_ref_from_states(path_ref: &mut [u32], path_idx: &[u32], neighbor
     }
 }
 
-fn build_fwd_checkpoints(
+fn build_fwd_checkpoints<RefSpace>(
     checkpoints: &mut FwdCheckpoints,
     n_markers: usize,
     n_states: usize,
@@ -4709,7 +4631,7 @@ fn build_fwd_checkpoints(
     seq2: &[u8],
     conf: &[f32],
     inputs: HapEmissionInputs<'_>,
-    lookup: &RefAlleleLookup,
+    ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     pl_provider: Option<&PlProvider>,
     allele_probs: &mut Vec<f32>,
     fwd: &mut [f32],
@@ -4769,9 +4691,7 @@ fn build_fwd_checkpoints(
         let conf_m = conf[m].clamp(0.0, 1.0);
 
         // Batch lookup: get all ref alleles for this marker at once
-        for k in 0..n_states {
-            ref_alleles[k] = lookup.allele(m, k);
-        }
+        ref_provider.fill_ref_alleles(m, ref_alleles);
 
         let use_combined = matches!(mode, EmissionMode::Combined) || inputs.use_combined[m];
 
@@ -5006,7 +4926,7 @@ fn sample_from_weights(weights: &[f32], rng: &mut rand::rngs::SmallRng) -> usize
     weights.len().saturating_sub(1)
 }
 
-fn sample_path_from_checkpoints(
+fn sample_path_from_checkpoints<RefSpace>(
     path: &mut [u32],
     checkpoints: &FwdCheckpoints,
     n_markers: usize,
@@ -5016,7 +4936,7 @@ fn sample_path_from_checkpoints(
     seq2: &[u8],
     conf: &[f32],
     inputs: HapEmissionInputs<'_>,
-    lookup: &RefAlleleLookup,
+    ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     pl_provider: Option<&PlProvider>,
     p_no_err: f32,
     p_err: f32,
@@ -5073,9 +4993,7 @@ fn sample_path_from_checkpoints(
             let prev_row = &prev_part[row_idx - row_stride..];
 
             // Batch lookup ref alleles
-            for k in 0..n_states {
-                ref_alleles[k] = lookup.allele(m, k);
-            }
+            ref_provider.fill_ref_alleles(m, ref_alleles);
 
             // SIMD-optimized forward update
             let shift_vec = f32x8::splat(shift);
@@ -6042,12 +5960,12 @@ fn sample_dynamic_mcmc(
 /// This breaks the symmetry of the Combined HMM initialization (which cannot distinguish
 /// between phasing configurations at 0/1 sites) and helps the Gibbs sampler escape
 /// "Mosaic Traps" where H1 and H2 lock each other into high-switching local optima.
-fn find_best_constant_pair_with_buffer(
+fn find_best_constant_pair_with_buffer<RefSpace>(
     n_markers: usize,
     n_states: usize,
     seq1: &[u8],
     seq2: &[u8],
-    lookup: &RefAlleleLookup,
+    ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
 ) -> Option<MosaicPaths> {
     if n_states < 2 {
@@ -6061,6 +5979,7 @@ fn find_best_constant_pair_with_buffer(
         scores[..need].fill(0.0);
     }
 
+    let mut ref_alleles = vec![255u8; n_states];
     for m in 0..n_markers {
         let a1 = seq1[m];
         let a2 = seq2[m];
@@ -6070,8 +5989,9 @@ fn find_best_constant_pair_with_buffer(
 
         let is_het = a1 != a2 && a1 != 255 && a2 != 255;
 
+        ref_provider.fill_ref_alleles(m, &mut ref_alleles);
         for i in 0..n_states {
-            let r1 = lookup.allele(m, i);
+            let r1 = ref_alleles[i];
             if r1 == 255 {
                 continue;
             }
@@ -6079,7 +5999,7 @@ fn find_best_constant_pair_with_buffer(
             // Symmetric scan: only check j < i (lower triangle)
             // We can infer upper triangle or just pick best from lower.
             for j in 0..i {
-                let r2 = lookup.allele(m, j);
+                let r2 = ref_alleles[j];
                 if r2 == 255 {
                     continue;
                 }
@@ -6144,14 +6064,14 @@ fn find_best_constant_pair_with_buffer(
 /// 2. Run burn-in steps to let the chain mix via Gibbs sampling
 /// 3. Take samples from the posterior
 /// 4. Return swap decisions based on average posterior
-fn sample_swap_bits_mosaic(
+fn sample_swap_bits_mosaic<RefSpace>(
     n_markers: usize,
     n_states: usize,
     p_recomb: &[f32],
     seq1: &[u8],
     seq2: &[u8],
     conf: &[f32],
-    lookup: &RefAlleleLookup,
+    mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     pl_provider: Option<PlProvider>,
     block_starts: Arc<[usize]>,
     het_positions: &[usize],
@@ -6179,7 +6099,6 @@ fn sample_swap_bits_mosaic(
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
     workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
-
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     // Attempt pairwise initialization if no initial paths provided
     let heuristic_paths = if initial_paths.is_none() {
@@ -6188,7 +6107,7 @@ fn sample_swap_bits_mosaic(
             n_states,
             seq1,
             seq2,
-            lookup,
+            &mut ref_provider,
             &mut workspace.scores,
         )
     } else {
@@ -6230,7 +6149,7 @@ fn sample_swap_bits_mosaic(
                 partner_allele: &dummy_partner,
                 use_combined: &dummy_combined,
             },
-            lookup,
+            &mut ref_provider,
             pl_provider.as_ref(),
             &mut workspace.allele_probs,
             fwd,
@@ -6281,7 +6200,7 @@ fn sample_swap_bits_mosaic(
         seq1,
         seq2,
         conf,
-        lookup,
+        ref_provider,
         combined_checkpoints_ref,
         buffers,
         p_no_err,
@@ -6328,7 +6247,6 @@ fn sample_swap_bits_mosaic(
 
     for sample_idx in 0..lr_samples {
         chain.step();
-        let (path1, path2) = chain.paths();
         let is_last = sample_idx + 1 == lr_samples;
 
         for (i, &m) in het_positions.iter().enumerate() {
@@ -6341,8 +6259,11 @@ fn sample_swap_bits_mosaic(
                 continue;
             }
 
-            let ref1 = lookup.allele(m, path1[m] as usize);
-            let ref2 = lookup.allele(m, path2[m] as usize);
+            let p1 = chain.path1[m] as usize;
+            let p2 = chain.path2[m] as usize;
+            chain.ref_provider.fill_ref_alleles(m, &mut chain.ref_alleles);
+            let ref1 = chain.ref_alleles[p1];
+            let ref2 = chain.ref_alleles[p2];
 
             let orient = if ref1 == a1 && ref2 == a2 {
                 Some(0u8)
@@ -6373,8 +6294,8 @@ fn sample_swap_bits_mosaic(
 
         if is_last {
             new_paths = MosaicPaths {
-                path1: path1.to_vec(),
-                path2: path2.to_vec(),
+                path1: chain.path1.clone(),
+                path2: chain.path2.clone(),
             };
         }
     }
@@ -7317,7 +7238,8 @@ mod tests {
 
     #[test]
     fn test_find_best_constant_pair() {
-        use crate::model::allele_lookup::RefAlleleLookup;
+        use crate::data::storage::MutableGenotypes;
+        use crate::model::states::ThreadedHaps;
 
         let n_markers = 3;
         let n_states = 4;
@@ -7341,7 +7263,15 @@ mod tests {
         // M2
         data.extend_from_slice(&[0, 1, 0, 1]);
 
-        let lookup = RefAlleleLookup::new_raw(data, n_states);
+        let geno = MutableGenotypes::from_fn(n_markers, n_states, |m, h| {
+            data[m * n_states + h]
+        });
+        let mut threaded = ThreadedHaps::new(n_states, n_states, n_markers);
+        for h in 0..n_states {
+            threaded.push_new(GlobalId::new(h as u32));
+        }
+        let mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, AnyMarkerSpace> =
+            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded);
 
         let seq1 = vec![0, 0, 0];
         let seq2 = vec![1, 1, 1];
@@ -7352,7 +7282,7 @@ mod tests {
             n_states,
             &seq1,
             &seq2,
-            &lookup,
+            &mut ref_provider,
             &mut scores,
         )
         .unwrap();

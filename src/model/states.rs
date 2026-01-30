@@ -139,54 +139,6 @@ impl ThreadedHaps {
         }
     }
 
-    /// Fill allele array with marker-major iteration order.
-    ///
-    /// This variant processes markers in the outer loop, allowing the caller
-    /// to hoist per-marker computations (like alignment lookups) outside
-    /// the state loop for better performance.
-    ///
-    /// # Arguments
-    /// * `out` - Output allele array of size n_markers * n_states
-    /// * `per_marker` - Called once per marker, returns a closure that maps hap_idx -> allele
-    #[inline]
-    pub fn fill_alleles_marker_major<F, G>(&self, out: &mut [u8], mut per_marker: F)
-    where
-        F: FnMut(usize) -> G,
-        G: Fn(GlobalId) -> u8,
-    {
-        let n_states = self.state_heads.len();
-        let n_markers = self.n_markers;
-
-        // Initialize cursors for all states
-        let mut cursors: Vec<usize> = (0..n_states)
-            .map(|s| self.state_heads[s] as usize)
-            .collect();
-        let mut seg_ends: Vec<usize> = cursors
-            .iter()
-            .map(|&c| self.segments_end[c] as usize)
-            .collect();
-        let mut haps: Vec<GlobalId> = cursors.iter().map(|&c| self.segments_hap[c]).collect();
-
-        for m in 0..n_markers {
-            // Get the hap-to-allele function for this marker (allows hoisting per-marker work)
-            let to_allele = per_marker(m);
-
-            let base = m * n_states;
-            for state_idx in 0..n_states {
-                // Advance cursor if needed
-                while m >= seg_ends[state_idx] {
-                    let next = self.segments_next[cursors[state_idx]];
-                    if next == Self::NIL {
-                        break;
-                    }
-                    cursors[state_idx] = next as usize;
-                    seg_ends[state_idx] = self.segments_end[cursors[state_idx]] as usize;
-                    haps[state_idx] = self.segments_hap[cursors[state_idx]];
-                }
-                out[base + state_idx] = to_allele(haps[state_idx]);
-            }
-        }
-    }
 }
 
 // ============================================================================
