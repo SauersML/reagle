@@ -150,6 +150,11 @@ fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
             format!("{}.txt", output_path)
         }
     });
+    let folded_output_path = if let Some(stem) = text_output_path.strip_suffix(".txt") {
+        format!("{}.folded.txt", stem)
+    } else {
+        format!("{}.folded.txt", text_output_path)
+    };
     match std::fs::File::create(&output_path) {
         Ok(mut file) => {
             if let Err(err) = report.flamegraph(&mut file) {
@@ -168,6 +173,67 @@ fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
 
     match std::fs::File::create(&text_output_path) {
         Ok(mut file) => {
+            use std::collections::HashMap;
+            use std::io::Write as _;
+
+            let mut total_samples: i64 = 0;
+            let mut per_thread: HashMap<String, i64> = HashMap::new();
+            let mut per_symbol: HashMap<String, i64> = HashMap::new();
+
+            for (key, value) in report.data.iter() {
+                let count = *value as i64;
+                total_samples += count;
+                *per_thread.entry(key.thread_name_or_id()).or_insert(0) += count;
+
+                for frame in key.frames.iter() {
+                    for symbol in frame.iter() {
+                        let name = format!("{}", symbol);
+                        *per_symbol.entry(name).or_insert(0) += count;
+                    }
+                }
+            }
+
+            writeln!(file, "Reagle pprof summary").ok();
+            writeln!(file, "Total samples: {}", total_samples).ok();
+            writeln!(file).ok();
+
+            let mut threads: Vec<(String, i64)> = per_thread.into_iter().collect();
+            threads.sort_by(|a, b| b.1.cmp(&a.1));
+            writeln!(file, "Top threads:").ok();
+            for (name, count) in threads.iter().take(10) {
+                let pct = if total_samples > 0 {
+                    (count * 100) as f64 / total_samples as f64
+                } else {
+                    0.0
+                };
+                writeln!(file, "  {:>6.2}%  {:>8}  {}", pct, count, name).ok();
+            }
+            writeln!(file).ok();
+
+            let mut symbols: Vec<(String, i64)> = per_symbol.into_iter().collect();
+            symbols.sort_by(|a, b| b.1.cmp(&a.1));
+            writeln!(file, "Top functions (inclusive samples):").ok();
+            for (name, count) in symbols.iter().take(50) {
+                let pct = if total_samples > 0 {
+                    (count * 100) as f64 / total_samples as f64
+                } else {
+                    0.0
+                };
+                writeln!(file, "  {:>6.2}%  {:>8}  {}", pct, count, name).ok();
+            }
+
+            eprintln!("pprof summary written to {}", text_output_path);
+        }
+        Err(err) => {
+            eprintln!(
+                "pprof: failed to create output file {}: {}",
+                text_output_path, err
+            );
+        }
+    }
+
+    match std::fs::File::create(&folded_output_path) {
+        Ok(mut file) => {
             use std::fmt::Write as _;
             use std::io::Write as _;
             for (key, value) in report.data.iter() {
@@ -182,12 +248,12 @@ fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
                 let _ = write!(&mut line, " {}", value);
                 let _ = writeln!(file, "{}", line);
             }
-            eprintln!("pprof folded stacks written to {}", text_output_path);
+            eprintln!("pprof folded stacks written to {}", folded_output_path);
         }
         Err(err) => {
             eprintln!(
                 "pprof: failed to create output file {}: {}",
-                text_output_path, err
+                folded_output_path, err
             );
         }
     }
