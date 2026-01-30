@@ -934,14 +934,17 @@ impl Sink for ViolationCollector {
     }
 }
 
+const SIMD_ALLOWLIST: &[&str] = &["_mm_prefetch", "_MM_HINT_T0"];
+
+fn is_allowed_simd_token(token: &str) -> bool {
+    SIMD_ALLOWLIST.contains(&token) || token.starts_with("__m")
+}
+
 fn is_disallowed_underscore_token(token: &str) -> bool {
     if token == "_" {
         return false;
     }
-    if token.starts_with("_mm")
-        || token.starts_with("_MM")
-        || token.starts_with("__m")
-    {
+    if is_allowed_simd_token(token) {
         return false;
     }
     token.starts_with('_')
