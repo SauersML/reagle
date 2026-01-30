@@ -24,46 +24,50 @@ impl WeightedHmmUpdater {
         emissions: &[f32],
         n_patterns: usize,
     ) -> f32 {
-        let base_shift = recomb_rate / n_ref_haps as f32;
-        let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
+        // Safety: caller guarantees slices have at least `n_patterns` elements and are valid
+        // for AVX-512 loads/stores (unaligned is permitted by loadu/storeu).
+        unsafe {
+            let base_shift = recomb_rate / n_ref_haps as f32;
+            let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
 
-        let base_shift_vec = _mm512_set1_ps(base_shift);
-        let scale_vec = _mm512_set1_ps(scale);
-        let mut sum_vec = _mm512_setzero_ps();
+            let base_shift_vec = _mm512_set1_ps(base_shift);
+            let scale_vec = _mm512_set1_ps(scale);
+            let mut sum_vec = _mm512_setzero_ps();
 
-        let mut k = 0;
-        let fwd_ptr = fwd.as_mut_ptr();
-        let count_ptr = pattern_counts.as_ptr();
-        let emit_ptr = emissions.as_ptr();
-        while k + 16 <= n_patterns {
-            let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
-            let count_chunk = _mm512_loadu_ps(count_ptr.add(k));
-            let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+            let mut k = 0;
+            let fwd_ptr = fwd.as_mut_ptr();
+            let count_ptr = pattern_counts.as_ptr();
+            let emit_ptr = emissions.as_ptr();
+            while k + 16 <= n_patterns {
+                let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
+                let count_chunk = _mm512_loadu_ps(count_ptr.add(k));
+                let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
 
-            let shift_vec = _mm512_mul_ps(base_shift_vec, count_chunk);
-            let scaled = _mm512_add_ps(_mm512_mul_ps(scale_vec, fwd_chunk), shift_vec);
-            let res = _mm512_mul_ps(emit_vec, scaled);
+                let shift_vec = _mm512_mul_ps(base_shift_vec, count_chunk);
+                let scaled = _mm512_add_ps(_mm512_mul_ps(scale_vec, fwd_chunk), shift_vec);
+                let res = _mm512_mul_ps(emit_vec, scaled);
 
-            _mm512_storeu_ps(fwd_ptr.add(k), res);
-            sum_vec = _mm512_add_ps(sum_vec, res);
-            k += 16;
+                _mm512_storeu_ps(fwd_ptr.add(k), res);
+                sum_vec = _mm512_add_ps(sum_vec, res);
+                k += 16;
+            }
+
+            let mut sum_arr = [0.0f32; 16];
+            _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let mut new_sum: f32 = sum_arr.iter().sum();
+
+            for i in k..n_patterns {
+                let f = *fwd_ptr.add(i);
+                let c = *count_ptr.add(i);
+                let e = *emit_ptr.add(i);
+                let shift = base_shift * c;
+                let t = scale.mul_add(f, shift);
+                let v = e * t;
+                *fwd_ptr.add(i) = v;
+                new_sum += v;
+            }
+            new_sum
         }
-
-        let mut sum_arr = [0.0f32; 16];
-        _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
-        let mut new_sum: f32 = sum_arr.iter().sum();
-
-        for i in k..n_patterns {
-            let f = *fwd_ptr.add(i);
-            let c = *count_ptr.add(i);
-            let e = *emit_ptr.add(i);
-            let shift = base_shift * c;
-            let t = scale.mul_add(f, shift);
-            let v = e * t;
-            *fwd_ptr.add(i) = v;
-            new_sum += v;
-        }
-        new_sum
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -77,46 +81,50 @@ impl WeightedHmmUpdater {
         emissions: &[f32],
         n_patterns: usize,
     ) -> f32 {
-        let base_shift = recomb_rate / n_ref_haps as f32;
-        let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
+        // Safety: caller guarantees slices have at least `n_patterns` elements and are valid
+        // for AVX-512 loads/stores (unaligned is permitted by loadu/storeu).
+        unsafe {
+            let base_shift = recomb_rate / n_ref_haps as f32;
+            let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
 
-        let base_shift_vec = _mm512_set1_ps(base_shift);
-        let scale_vec = _mm512_set1_ps(scale);
-        let mut sum_vec = _mm512_setzero_ps();
+            let base_shift_vec = _mm512_set1_ps(base_shift);
+            let scale_vec = _mm512_set1_ps(scale);
+            let mut sum_vec = _mm512_setzero_ps();
 
-        let mut k = 0;
-        let fwd_ptr = fwd.as_mut_ptr();
-        let count_ptr = pattern_counts.as_ptr();
-        let emit_ptr = emissions.as_ptr();
-        while k + 16 <= n_patterns {
-            let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
-            let count_chunk = _mm512_loadu_ps(count_ptr.add(k));
-            let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+            let mut k = 0;
+            let fwd_ptr = fwd.as_mut_ptr();
+            let count_ptr = pattern_counts.as_ptr();
+            let emit_ptr = emissions.as_ptr();
+            while k + 16 <= n_patterns {
+                let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
+                let count_chunk = _mm512_loadu_ps(count_ptr.add(k));
+                let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
 
-            let shift_vec = _mm512_mul_ps(base_shift_vec, count_chunk);
-            let scaled = _mm512_fmadd_ps(scale_vec, fwd_chunk, shift_vec);
-            let res = _mm512_mul_ps(emit_vec, scaled);
+                let shift_vec = _mm512_mul_ps(base_shift_vec, count_chunk);
+                let scaled = _mm512_fmadd_ps(scale_vec, fwd_chunk, shift_vec);
+                let res = _mm512_mul_ps(emit_vec, scaled);
 
-            _mm512_storeu_ps(fwd_ptr.add(k), res);
-            sum_vec = _mm512_add_ps(sum_vec, res);
-            k += 16;
+                _mm512_storeu_ps(fwd_ptr.add(k), res);
+                sum_vec = _mm512_add_ps(sum_vec, res);
+                k += 16;
+            }
+
+            let mut sum_arr = [0.0f32; 16];
+            _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let mut new_sum: f32 = sum_arr.iter().sum();
+
+            for i in k..n_patterns {
+                let f = *fwd_ptr.add(i);
+                let c = *count_ptr.add(i);
+                let e = *emit_ptr.add(i);
+                let shift = base_shift * c;
+                let t = scale.mul_add(f, shift);
+                let v = e * t;
+                *fwd_ptr.add(i) = v;
+                new_sum += v;
+            }
+            new_sum
         }
-
-        let mut sum_arr = [0.0f32; 16];
-        _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
-        let mut new_sum: f32 = sum_arr.iter().sum();
-
-        for i in k..n_patterns {
-            let f = *fwd_ptr.add(i);
-            let c = *count_ptr.add(i);
-            let e = *emit_ptr.add(i);
-            let shift = base_shift * c;
-            let t = scale.mul_add(f, shift);
-            let v = e * t;
-            *fwd_ptr.add(i) = v;
-            new_sum += v;
-        }
-        new_sum
     }
     /// Forward update with weighted transitions
     ///

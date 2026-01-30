@@ -33,39 +33,43 @@ impl HmmUpdater {
         emissions: &[f32],
         n_states: usize,
     ) -> f32 {
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
+        // Safety: caller guarantees `fwd` and `emissions` have at least `n_states` elements
+        // and point to valid, properly aligned memory for AVX-512 loads/stores.
+        unsafe {
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
 
-        let shift_vec = _mm512_set1_ps(shift);
-        let scale_vec = _mm512_set1_ps(scale);
-        let mut sum_vec = _mm512_setzero_ps();
+            let shift_vec = _mm512_set1_ps(shift);
+            let scale_vec = _mm512_set1_ps(scale);
+            let mut sum_vec = _mm512_setzero_ps();
 
-        let mut k = 0;
-        let fwd_ptr = fwd.as_mut_ptr();
-        let emit_ptr = emissions.as_ptr();
-        while k + 16 <= n_states {
-            let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
-            let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
-            let scaled = _mm512_add_ps(_mm512_mul_ps(scale_vec, fwd_chunk), shift_vec);
-            let res = _mm512_mul_ps(emit_vec, scaled);
-            _mm512_storeu_ps(fwd_ptr.add(k), res);
-            sum_vec = _mm512_add_ps(sum_vec, res);
-            k += 16;
+            let mut k = 0;
+            let fwd_ptr = fwd.as_mut_ptr();
+            let emit_ptr = emissions.as_ptr();
+            while k + 16 <= n_states {
+                let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
+                let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+                let scaled = _mm512_add_ps(_mm512_mul_ps(scale_vec, fwd_chunk), shift_vec);
+                let res = _mm512_mul_ps(emit_vec, scaled);
+                _mm512_storeu_ps(fwd_ptr.add(k), res);
+                sum_vec = _mm512_add_ps(sum_vec, res);
+                k += 16;
+            }
+
+            let mut sum_arr = [0.0f32; 16];
+            _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let mut new_sum: f32 = sum_arr.iter().sum();
+
+            for i in k..n_states {
+                let f = *fwd_ptr.add(i);
+                let e = *emit_ptr.add(i);
+                let t = scale.mul_add(f, shift);
+                let v = e * t;
+                *fwd_ptr.add(i) = v;
+                new_sum += v;
+            }
+            new_sum
         }
-
-        let mut sum_arr = [0.0f32; 16];
-        _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
-        let mut new_sum: f32 = sum_arr.iter().sum();
-
-        for i in k..n_states {
-            let f = *fwd_ptr.add(i);
-            let e = *emit_ptr.add(i);
-            let t = scale.mul_add(f, shift);
-            let v = e * t;
-            *fwd_ptr.add(i) = v;
-            new_sum += v;
-        }
-        new_sum
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -77,39 +81,43 @@ impl HmmUpdater {
         emissions: &[f32],
         n_states: usize,
     ) -> f32 {
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
+        // Safety: caller guarantees `fwd` and `emissions` have at least `n_states` elements
+        // and point to valid, properly aligned memory for AVX-512 loads/stores.
+        unsafe {
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
 
-        let shift_vec = _mm512_set1_ps(shift);
-        let scale_vec = _mm512_set1_ps(scale);
-        let mut sum_vec = _mm512_setzero_ps();
+            let shift_vec = _mm512_set1_ps(shift);
+            let scale_vec = _mm512_set1_ps(scale);
+            let mut sum_vec = _mm512_setzero_ps();
 
-        let mut k = 0;
-        let fwd_ptr = fwd.as_mut_ptr();
-        let emit_ptr = emissions.as_ptr();
-        while k + 16 <= n_states {
-            let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
-            let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
-            let scaled = _mm512_fmadd_ps(scale_vec, fwd_chunk, shift_vec);
-            let res = _mm512_mul_ps(emit_vec, scaled);
-            _mm512_storeu_ps(fwd_ptr.add(k), res);
-            sum_vec = _mm512_add_ps(sum_vec, res);
-            k += 16;
+            let mut k = 0;
+            let fwd_ptr = fwd.as_mut_ptr();
+            let emit_ptr = emissions.as_ptr();
+            while k + 16 <= n_states {
+                let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
+                let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+                let scaled = _mm512_fmadd_ps(scale_vec, fwd_chunk, shift_vec);
+                let res = _mm512_mul_ps(emit_vec, scaled);
+                _mm512_storeu_ps(fwd_ptr.add(k), res);
+                sum_vec = _mm512_add_ps(sum_vec, res);
+                k += 16;
+            }
+
+            let mut sum_arr = [0.0f32; 16];
+            _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let mut new_sum: f32 = sum_arr.iter().sum();
+
+            for i in k..n_states {
+                let f = *fwd_ptr.add(i);
+                let e = *emit_ptr.add(i);
+                let t = scale.mul_add(f, shift);
+                let v = e * t;
+                *fwd_ptr.add(i) = v;
+                new_sum += v;
+            }
+            new_sum
         }
-
-        let mut sum_arr = [0.0f32; 16];
-        _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
-        let mut new_sum: f32 = sum_arr.iter().sum();
-
-        for i in k..n_states {
-            let f = *fwd_ptr.add(i);
-            let e = *emit_ptr.add(i);
-            let t = scale.mul_add(f, shift);
-            let v = e * t;
-            *fwd_ptr.add(i) = v;
-            new_sum += v;
-        }
-        new_sum
     }
 
     /// Forward update using precomputed per-state emission probabilities.
@@ -368,56 +376,60 @@ impl HmmUpdater {
         mismatches: &[u8],
         n_states: usize,
     ) {
-        let p0 = emit_probs[0];
-        let p1 = emit_probs[1];
-        let diff = p1 - p0;
+        // Safety: caller guarantees `bwd` and `mismatches` have at least `n_states` elements
+        // and point to valid, properly aligned memory for AVX-512 loads/stores.
+        unsafe {
+            let p0 = emit_probs[0];
+            let p1 = emit_probs[1];
+            let diff = p1 - p0;
 
-        let p0_vec = _mm512_set1_ps(p0);
-        let diff_vec = _mm512_set1_ps(diff);
-        let mut sum_vec = _mm512_setzero_ps();
+            let p0_vec = _mm512_set1_ps(p0);
+            let diff_vec = _mm512_set1_ps(diff);
+            let mut sum_vec = _mm512_setzero_ps();
 
-        let mut k = 0;
-        let bwd_ptr = bwd.as_mut_ptr();
-        let mismatch_ptr = mismatches.as_ptr();
-        while k + 16 <= n_states {
-            let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
-            let m_u8 = _mm_loadu_si128(mismatch_ptr.add(k) as *const __m128i);
-            let m_i32 = _mm512_cvtepu8_epi32(m_u8);
-            let m_f32 = _mm512_cvtepi32_ps(m_i32);
-            let emit_vec = _mm512_add_ps(_mm512_mul_ps(m_f32, diff_vec), p0_vec);
-            let res = _mm512_mul_ps(bwd_chunk, emit_vec);
-            _mm512_storeu_ps(bwd_ptr.add(k), res);
-            sum_vec = _mm512_add_ps(sum_vec, res);
-            k += 16;
-        }
+            let mut k = 0;
+            let bwd_ptr = bwd.as_mut_ptr();
+            let mismatch_ptr = mismatches.as_ptr();
+            while k + 16 <= n_states {
+                let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
+                let m_u8 = _mm_loadu_si128(mismatch_ptr.add(k) as *const __m128i);
+                let m_i32 = _mm512_cvtepu8_epi32(m_u8);
+                let m_f32 = _mm512_cvtepi32_ps(m_i32);
+                let emit_vec = _mm512_add_ps(_mm512_mul_ps(m_f32, diff_vec), p0_vec);
+                let res = _mm512_mul_ps(bwd_chunk, emit_vec);
+                _mm512_storeu_ps(bwd_ptr.add(k), res);
+                sum_vec = _mm512_add_ps(sum_vec, res);
+                k += 16;
+            }
 
-        let mut sum_arr = [0.0f32; 16];
-        _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
-        let mut sum: f32 = sum_arr.iter().sum();
+            let mut sum_arr = [0.0f32; 16];
+            _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let mut sum: f32 = sum_arr.iter().sum();
 
-        for i in k..n_states {
-            let em = emit_probs[*mismatches.get_unchecked(i) as usize];
-            let v = *bwd_ptr.add(i) * em;
-            *bwd_ptr.add(i) = v;
-            sum += v;
-        }
+            for i in k..n_states {
+                let em = emit_probs[*mismatches.get_unchecked(i) as usize];
+                let v = *bwd_ptr.add(i) * em;
+                *bwd_ptr.add(i) = v;
+                sum += v;
+            }
 
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / sum.max(1e-30);
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) / sum.max(1e-30);
 
-        let shift_vec = _mm512_set1_ps(shift);
-        let scale_vec = _mm512_set1_ps(scale);
+            let shift_vec = _mm512_set1_ps(shift);
+            let scale_vec = _mm512_set1_ps(scale);
 
-        k = 0;
-        while k + 16 <= n_states {
-            let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
-            let res = _mm512_add_ps(_mm512_mul_ps(scale_vec, bwd_chunk), shift_vec);
-            _mm512_storeu_ps(bwd_ptr.add(k), res);
-            k += 16;
-        }
+            k = 0;
+            while k + 16 <= n_states {
+                let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
+                let res = _mm512_add_ps(_mm512_mul_ps(scale_vec, bwd_chunk), shift_vec);
+                _mm512_storeu_ps(bwd_ptr.add(k), res);
+                k += 16;
+            }
 
-        for i in k..n_states {
-            *bwd_ptr.add(i) = scale * *bwd_ptr.add(i) + shift;
+            for i in k..n_states {
+                *bwd_ptr.add(i) = scale * *bwd_ptr.add(i) + shift;
+            }
         }
     }
 
@@ -430,56 +442,60 @@ impl HmmUpdater {
         mismatches: &[u8],
         n_states: usize,
     ) {
-        let p0 = emit_probs[0];
-        let p1 = emit_probs[1];
-        let diff = p1 - p0;
+        // Safety: caller guarantees `bwd` and `mismatches` have at least `n_states` elements
+        // and point to valid, properly aligned memory for AVX-512 loads/stores.
+        unsafe {
+            let p0 = emit_probs[0];
+            let p1 = emit_probs[1];
+            let diff = p1 - p0;
 
-        let p0_vec = _mm512_set1_ps(p0);
-        let diff_vec = _mm512_set1_ps(diff);
-        let mut sum_vec = _mm512_setzero_ps();
+            let p0_vec = _mm512_set1_ps(p0);
+            let diff_vec = _mm512_set1_ps(diff);
+            let mut sum_vec = _mm512_setzero_ps();
 
-        let mut k = 0;
-        let bwd_ptr = bwd.as_mut_ptr();
-        let mismatch_ptr = mismatches.as_ptr();
-        while k + 16 <= n_states {
-            let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
-            let m_u8 = _mm_loadu_si128(mismatch_ptr.add(k) as *const __m128i);
-            let m_i32 = _mm512_cvtepu8_epi32(m_u8);
-            let m_f32 = _mm512_cvtepi32_ps(m_i32);
-            let emit_vec = _mm512_fmadd_ps(m_f32, diff_vec, p0_vec);
-            let res = _mm512_mul_ps(bwd_chunk, emit_vec);
-            _mm512_storeu_ps(bwd_ptr.add(k), res);
-            sum_vec = _mm512_add_ps(sum_vec, res);
-            k += 16;
-        }
+            let mut k = 0;
+            let bwd_ptr = bwd.as_mut_ptr();
+            let mismatch_ptr = mismatches.as_ptr();
+            while k + 16 <= n_states {
+                let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
+                let m_u8 = _mm_loadu_si128(mismatch_ptr.add(k) as *const __m128i);
+                let m_i32 = _mm512_cvtepu8_epi32(m_u8);
+                let m_f32 = _mm512_cvtepi32_ps(m_i32);
+                let emit_vec = _mm512_fmadd_ps(m_f32, diff_vec, p0_vec);
+                let res = _mm512_mul_ps(bwd_chunk, emit_vec);
+                _mm512_storeu_ps(bwd_ptr.add(k), res);
+                sum_vec = _mm512_add_ps(sum_vec, res);
+                k += 16;
+            }
 
-        let mut sum_arr = [0.0f32; 16];
-        _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
-        let mut sum: f32 = sum_arr.iter().sum();
+            let mut sum_arr = [0.0f32; 16];
+            _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let mut sum: f32 = sum_arr.iter().sum();
 
-        for i in k..n_states {
-            let em = emit_probs[*mismatches.get_unchecked(i) as usize];
-            let v = *bwd_ptr.add(i) * em;
-            *bwd_ptr.add(i) = v;
-            sum += v;
-        }
+            for i in k..n_states {
+                let em = emit_probs[*mismatches.get_unchecked(i) as usize];
+                let v = *bwd_ptr.add(i) * em;
+                *bwd_ptr.add(i) = v;
+                sum += v;
+            }
 
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / sum.max(1e-30);
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) / sum.max(1e-30);
 
-        let shift_vec = _mm512_set1_ps(shift);
-        let scale_vec = _mm512_set1_ps(scale);
+            let shift_vec = _mm512_set1_ps(shift);
+            let scale_vec = _mm512_set1_ps(scale);
 
-        k = 0;
-        while k + 16 <= n_states {
-            let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
-            let res = _mm512_fmadd_ps(scale_vec, bwd_chunk, shift_vec);
-            _mm512_storeu_ps(bwd_ptr.add(k), res);
-            k += 16;
-        }
+            k = 0;
+            while k + 16 <= n_states {
+                let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
+                let res = _mm512_fmadd_ps(scale_vec, bwd_chunk, shift_vec);
+                _mm512_storeu_ps(bwd_ptr.add(k), res);
+                k += 16;
+            }
 
-        for i in k..n_states {
-            *bwd_ptr.add(i) = scale * *bwd_ptr.add(i) + shift;
+            for i in k..n_states {
+                *bwd_ptr.add(i) = scale * *bwd_ptr.add(i) + shift;
+            }
         }
     }
 
@@ -492,27 +508,31 @@ impl HmmUpdater {
         constant_term: f32,
         n_states: usize,
     ) {
-        let inv_c = 1.0 / constant_term.max(1e-30);
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) * inv_c;
+        // Safety: caller guarantees `bwd` and `emissions` have at least `n_states` elements
+        // and point to valid, properly aligned memory for AVX-512 loads/stores.
+        unsafe {
+            let inv_c = 1.0 / constant_term.max(1e-30);
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) * inv_c;
 
-        let shift_vec = _mm512_set1_ps(shift);
-        let scale_vec = _mm512_set1_ps(scale);
+            let shift_vec = _mm512_set1_ps(shift);
+            let scale_vec = _mm512_set1_ps(scale);
 
-        let mut k = 0;
-        let bwd_ptr = bwd.as_mut_ptr();
-        let emit_ptr = emissions.as_ptr();
-        while k + 16 <= n_states {
-            let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
-            let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
-            let scaled = _mm512_mul_ps(scale_vec, _mm512_mul_ps(emit_vec, bwd_chunk));
-            let res = _mm512_add_ps(scaled, shift_vec);
-            _mm512_storeu_ps(bwd_ptr.add(k), res);
-            k += 16;
-        }
+            let mut k = 0;
+            let bwd_ptr = bwd.as_mut_ptr();
+            let emit_ptr = emissions.as_ptr();
+            while k + 16 <= n_states {
+                let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
+                let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+                let scaled = _mm512_mul_ps(scale_vec, _mm512_mul_ps(emit_vec, bwd_chunk));
+                let res = _mm512_add_ps(scaled, shift_vec);
+                _mm512_storeu_ps(bwd_ptr.add(k), res);
+                k += 16;
+            }
 
-        for i in k..n_states {
-            *bwd_ptr.add(i) = scale * *emit_ptr.add(i) * *bwd_ptr.add(i) + shift;
+            for i in k..n_states {
+                *bwd_ptr.add(i) = scale * *emit_ptr.add(i) * *bwd_ptr.add(i) + shift;
+            }
         }
     }
 
@@ -525,27 +545,31 @@ impl HmmUpdater {
         constant_term: f32,
         n_states: usize,
     ) {
-        let inv_c = 1.0 / constant_term.max(1e-30);
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) * inv_c;
+        // Safety: caller guarantees `bwd` and `emissions` have at least `n_states` elements
+        // and point to valid, properly aligned memory for AVX-512 loads/stores.
+        unsafe {
+            let inv_c = 1.0 / constant_term.max(1e-30);
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) * inv_c;
 
-        let shift_vec = _mm512_set1_ps(shift);
-        let scale_vec = _mm512_set1_ps(scale);
+            let shift_vec = _mm512_set1_ps(shift);
+            let scale_vec = _mm512_set1_ps(scale);
 
-        let mut k = 0;
-        let bwd_ptr = bwd.as_mut_ptr();
-        let emit_ptr = emissions.as_ptr();
-        while k + 16 <= n_states {
-            let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
-            let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
-            let scaled = _mm512_mul_ps(emit_vec, bwd_chunk);
-            let res = _mm512_fmadd_ps(scale_vec, scaled, shift_vec);
-            _mm512_storeu_ps(bwd_ptr.add(k), res);
-            k += 16;
-        }
+            let mut k = 0;
+            let bwd_ptr = bwd.as_mut_ptr();
+            let emit_ptr = emissions.as_ptr();
+            while k + 16 <= n_states {
+                let bwd_chunk = _mm512_loadu_ps(bwd_ptr.add(k));
+                let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+                let scaled = _mm512_mul_ps(emit_vec, bwd_chunk);
+                let res = _mm512_fmadd_ps(scale_vec, scaled, shift_vec);
+                _mm512_storeu_ps(bwd_ptr.add(k), res);
+                k += 16;
+            }
 
-        for i in k..n_states {
-            *bwd_ptr.add(i) = scale * *emit_ptr.add(i) * *bwd_ptr.add(i) + shift;
+            for i in k..n_states {
+                *bwd_ptr.add(i) = scale * *emit_ptr.add(i) * *bwd_ptr.add(i) + shift;
+            }
         }
     }
 }
