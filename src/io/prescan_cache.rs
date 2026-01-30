@@ -1,10 +1,9 @@
 use crate::data::marker::{bits_per_allele, MarkerIdx, Markers};
 use crate::data::storage::GenotypeColumn;
 use crate::io::bref3::RefWindow;
-use crate::utils::errors::{ReagleError, Result};
-use serde::{Deserialize, Serialize};
+use crate::error::{ReagleError, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const CACHE_MAGIC: &[u8; 8] = b"RGLPRSC1";
@@ -110,7 +109,11 @@ impl PackedRefColumn {
         }
     }
 
-    pub fn pack_from_column(marker_idx: MarkerIdx, markers: &Markers, col: &GenotypeColumn) -> Self {
+    pub fn pack_from_column<Space>(
+        marker_idx: MarkerIdx<Space>,
+        markers: &Markers<Space>,
+        col: &GenotypeColumn,
+    ) -> Self {
         let marker = markers.marker(marker_idx);
         let n_alleles = marker.n_alleles();
         let bits = bits_per_allele(n_alleles);
@@ -454,4 +457,64 @@ fn is_missing_bit(bits: &[u64], idx: usize) -> bool {
         return false;
     }
     ((bits[word] >> bit) & 1) == 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::marker::{Allele, Marker, RefWindowSpace};
+    use crate::data::storage::GenotypeColumn;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_pack_unpack_biallelic() {
+        let mut markers = Markers::<RefWindowSpace>::new();
+        let chrom = markers.add_chrom("1");
+        let marker = Marker::new(chrom, 100, None, Allele::from_str("A"), vec![Allele::from_str("G")]);
+        markers.push(marker);
+
+        let alleles = vec![0u8, 1, 0, 1, 255];
+        let col = GenotypeColumn::from_alleles(&alleles, 2);
+        let packed = PackedRefColumn::pack_from_column(MarkerIdx::new(0), &markers, &col);
+
+        let mut out = vec![0u8; alleles.len()];
+        packed.fill_alleles(&mut out);
+        assert_eq!(out, alleles);
+    }
+
+    #[test]
+    fn test_cache_roundtrip() {
+        let mut markers = Markers::<RefWindowSpace>::new();
+        let chrom = markers.add_chrom("1");
+        let marker = Marker::new(chrom, 200, None, Allele::from_str("C"), vec![Allele::from_str("T")]);
+        markers.push(marker);
+
+        let alleles = vec![0u8, 1, 1, 0];
+        let col = GenotypeColumn::from_alleles(&alleles, 2);
+        let window = RefWindow {
+            markers: markers.clone(),
+            ref_columns: vec![col],
+            ref_genotypes: None,
+            global_start: 0,
+            global_end: 1,
+            output_start: 0,
+            output_end: 1,
+        };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.bin");
+        let mut writer = PrescanCacheWriter::create(&path).unwrap();
+        writer.set_n_ref_haps(alleles.len());
+        writer.write_header().unwrap();
+        writer.write_window(&window).unwrap();
+        writer.finish().unwrap();
+
+        let mut reader = PrescanCacheReader::open(&path).unwrap();
+        let got = reader.next_window().unwrap().unwrap();
+        assert_eq!(got.markers.len(), 1);
+        assert_eq!(got.n_ref_haps, alleles.len());
+        let mut out = vec![0u8; alleles.len()];
+        got.columns[0].fill_alleles(&mut out);
+        assert_eq!(out, alleles);
+    }
 }

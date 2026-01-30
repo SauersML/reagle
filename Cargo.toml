@@ -48,6 +48,7 @@ aligned-vec = "0.6.4"
 flate2 = "1.0"
 sysinfo = "0.33"
 tempfile = "3.24.0"
+lexical-core = "1.0.6"
 pprof = { version = "0.13", features = ["flamegraph"], optional = true }
 
 [features]

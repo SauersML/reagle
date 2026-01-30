@@ -906,13 +906,16 @@ impl StreamingVcfReader {
                 return Ok(None);
             }
 
-            let line = trim_line_bytes(&self.line_buf);
+            let mut line_buf = std::mem::take(&mut self.line_buf);
+            let line = trim_line_bytes(&line_buf);
             if line.is_empty() || line[0] == b'#' {
+                self.line_buf = line_buf;
                 continue;
             }
 
-            // Parse the VCF line
-            return self.parse_vcf_line(line).map(Some);
+            let parsed = self.parse_vcf_line(line).map(Some);
+            self.line_buf = line_buf;
+            return parsed;
         }
     }
 
@@ -967,8 +970,8 @@ impl StreamingVcfReader {
             .collect::<Result<Vec<_>>>()?;
 
         // Skip QUAL and FILTER
-        let _qual = next_field()?;
-        let _filter = next_field()?;
+        let _ = next_field()?;
+        let _ = next_field()?;
 
         // Parse FORMAT to find GT position
         let format = next_field()?;

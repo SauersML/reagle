@@ -29,7 +29,7 @@ pub(crate) fn parse_pl(pl_str: &str) -> Option<Vec<u16>> {
         if s.is_empty() || s == "." {
             return None;
         }
-        let v = s.parse::<u32>().ok()?;
+        let v = lexical_core::parse::<u32>(s.as_bytes()).ok()?;
         out.push(v.min(u16::MAX as u32) as u16);
     }
     if out.is_empty() { None } else { Some(out) }
@@ -44,7 +44,7 @@ pub(crate) fn gl_to_pl(gl_str: &str) -> Option<Vec<u16>> {
         if s.is_empty() || s == "." {
             return None;
         }
-        let v = s.parse::<f64>().ok()?;
+        let v = lexical_core::parse::<f64>(s.as_bytes()).ok()?;
         if !v.is_finite() {
             return None;
         }
@@ -718,8 +718,8 @@ impl VcfReader {
             .collect::<Result<Vec<_>>>()?;
 
         // Skip QUAL and FILTER
-        let _qual = next_field()?;
-        let _filter = next_field()?;
+        let _ = next_field()?;
+        let _ = next_field()?;
 
         // Parse INFO field for END tag (field[7])
         // This is important for structural variants and gVCF blocks
@@ -1127,7 +1127,7 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
         if s.is_empty() || s == "." {
             return None;
         }
-        let v = s.parse::<f64>().ok()?;
+        let v = lexical_core::parse::<f64>(s.as_bytes()).ok()?;
         if !v.is_finite() {
             return None;
         }

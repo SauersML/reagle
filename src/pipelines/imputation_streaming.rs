@@ -5,7 +5,7 @@
 //! directly to imputation in-memory.
 
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::collections::HashMap;
 
@@ -20,10 +20,10 @@ use crate::data::storage::phase_state::{Phased, PhaseState};
 use crate::data::{HapIdx, MarkerIdx, SampleIdx};
 use crate::error::ReagleError;
 use crate::error::Result;
-use crate::io::bref3::{RefPanelReader, TargetMarkerIndex};
+use crate::Config;
+use crate::io::bref3::{RefPanelReader, TargetMarkerIndex, convert_ref_vcf_to_bref3};
 use crate::io::prescan_cache::{
-    create_temp_cache_path, PackedRefColumn, PackedRefWindow, PrescanCacheReader,
-    PrescanCacheWriter,
+    create_temp_cache_path, PackedRefColumn, PrescanCacheReader, PrescanCacheWriter,
 };
 use crate::io::streaming::{
     GlobalHapId, HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader,
@@ -469,6 +469,48 @@ fn compute_target_freqs<TargetSpace, RefSpace>(
     freqs
 }
 
+fn compute_target_freqs_packed<TargetSpace, RefSpace>(
+    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+    ref_columns: &[PackedRefColumn],
+    n_ref_haps: usize,
+    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+) -> Vec<Vec<f32>> {
+    let n_markers = target_gt.n_markers();
+    let mut freqs: Vec<Vec<f32>> = Vec::with_capacity(n_markers);
+    for m in 0..n_markers {
+        let n_alleles = target_gt
+            .markers()
+            .marker(MarkerIdx::new(m as u32))
+            .n_alleles();
+        let mut counts = vec![0u32; n_alleles.max(1)];
+        let mut total = 0u32;
+        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+            let col = &ref_columns[ref_m.as_usize()];
+            for rh in 0..n_ref_haps {
+                let ref_a = col.allele(rh);
+                let mapped = alignment.reverse_map_allele(m, ref_a);
+                if mapped == 255 {
+                    continue;
+                }
+                let idx = mapped as usize;
+                if idx < counts.len() {
+                    counts[idx] += 1;
+                    total += 1;
+                }
+            }
+        }
+        let mut out = vec![0.0f32; counts.len()];
+        if total > 0 {
+            let inv = 1.0 / total as f32;
+            for (i, c) in counts.into_iter().enumerate() {
+                out[i] = c as f32 * inv;
+            }
+        }
+        freqs.push(out);
+    }
+    freqs
+}
+
 fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
@@ -555,6 +597,95 @@ fn score_window_batch_exact<TargetSpace, RefSpace>(
 
         for rh in 0..n_ref_haps {
             let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+            if ref_a == 255 {
+                continue;
+            }
+            let mapped = alignment.reverse_map_allele(m, ref_a);
+            if mapped == 255 {
+                continue;
+            }
+            let idx = mapped as usize;
+            if idx >= ref_bins.len() {
+                ref_bins.resize_with(idx + 1, Vec::new);
+            }
+            ref_bins[idx].push(rh as u32);
+        }
+
+        for (i, _) in batch_haps.iter().enumerate() {
+            let targ = query_alleles[i];
+            if targ == 255 {
+                continue;
+            }
+            let freq = freqs
+                .get(m)
+                .and_then(|f| f.get(targ as usize))
+                .copied()
+                .unwrap_or(0.0);
+            if freq <= 0.0 {
+                continue;
+            }
+            let weight = -(freq.max(min_freq)).ln();
+            let bins = ref_bins.get(targ as usize);
+            let Some(bins) = bins else { continue };
+            for &rh in bins {
+                let idx = rh as usize;
+                global_scores[i][idx] += weight;
+                let w = &mut window_scores[i][idx];
+                if w.is_finite() {
+                    *w += weight;
+                } else {
+                    *w = weight;
+                }
+            }
+        }
+    }
+}
+
+fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
+    batch_haps: &[usize],
+    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+    ref_columns: &[PackedRefColumn],
+    n_ref_haps: usize,
+    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+    global_scores: &mut [Vec<f32>],
+    window_scores: &mut [Vec<f32>],
+) {
+    let n_markers = target_gt.n_markers();
+    if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
+        return;
+    }
+
+    let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
+    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+
+    let mut query_alleles = vec![255u8; batch_haps.len()];
+    let mut ref_bins: Vec<Vec<u32>> = Vec::new();
+
+    for m in 0..n_markers {
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            query_alleles[i] =
+                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+        }
+
+        let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) else {
+            continue;
+        };
+
+        let n_alleles = target_gt
+            .markers()
+            .marker(MarkerIdx::new(m as u32))
+            .n_alleles()
+            .max(1);
+        if ref_bins.len() < n_alleles {
+            ref_bins.resize_with(n_alleles, Vec::new);
+        }
+        for bins in ref_bins.iter_mut().take(n_alleles) {
+            bins.clear();
+        }
+
+        let col = &ref_columns[ref_m.as_usize()];
+        for rh in 0..n_ref_haps {
+            let ref_a = col.allele(rh);
             if ref_a == 255 {
                 continue;
             }
@@ -777,6 +908,183 @@ fn score_window_batch_pbwt<TargetSpace, RefSpace>(
     }
 }
 
+fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
+    batch_haps: &[usize],
+    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+    ref_columns: &[PackedRefColumn],
+    n_ref_haps: usize,
+    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+    gen_maps: &GeneticMaps,
+    k_per_hap: usize,
+    step_cm: f64,
+    global_scores: &mut [Vec<f32>],
+    window_scores: &mut [Vec<f32>],
+) {
+    let n_markers = target_gt.n_markers();
+    if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
+        return;
+    }
+
+    let mut gen_positions = Vec::with_capacity(n_markers);
+    for m in 0..n_markers {
+        let marker = target_gt.markers().marker(MarkerIdx::new(m as u32));
+        let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
+        gen_positions.push(gen_pos);
+    }
+    let mut sampling = build_sampling_points(&gen_positions, step_cm);
+    for m in 0..n_markers {
+        if alignment.target_to_ref(MarkerIdx::new(m as u32)).is_some() {
+            sampling[m] = true;
+        }
+    }
+    let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
+
+    let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
+    let mut beams_fwd: Vec<RankBeam> = (0..batch_haps.len())
+        .map(|_| RankBeam::full(n_ref_haps as u32))
+        .collect();
+    let mut ref_alleles = vec![0u8; n_ref_haps];
+    let mut query_alleles = vec![0u8; batch_haps.len()];
+
+    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+
+    for m in 0..n_markers {
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            query_alleles[i] =
+                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+        }
+        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+            let col = &ref_columns[ref_m.as_usize()];
+            col.fill_alleles(&mut ref_alleles);
+            for rh in 0..n_ref_haps {
+                let ref_a = ref_alleles[rh];
+                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
+            }
+        } else {
+            ref_alleles.fill(255);
+        }
+
+        let mut is_biallelic = true;
+        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+            if a >= 2 && a != 255 {
+                is_biallelic = false;
+                break;
+            }
+        }
+        let n_alleles = if is_biallelic { 2 } else { 256 };
+
+        pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
+
+        if sampling[m] {
+            for (i, _) in batch_haps.iter().enumerate() {
+                let targ = query_alleles[i];
+                if targ == 255 {
+                    continue;
+                }
+                let freq = freqs
+                    .get(m)
+                    .and_then(|f| f.get(targ as usize))
+                    .copied()
+                    .unwrap_or(0.0);
+                if freq <= 0.0 {
+                    continue;
+                }
+                let weight = -(freq.max(min_freq)).ln();
+                let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
+                for d in donors {
+                    let idx = d as usize;
+                    if idx < n_ref_haps {
+                        let ref_a = ref_alleles[idx];
+                        if ref_a == 255 || ref_a != targ {
+                            continue;
+                        }
+                        global_scores[i][idx] += weight;
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pbwt_bwd = ReferencePbwt::new(n_ref_haps);
+    let mut beams_bwd: Vec<RankBeam> = (0..batch_haps.len())
+        .map(|_| RankBeam::full(n_ref_haps as u32))
+        .collect();
+    for (rev_step, m) in (0..n_markers).rev().enumerate() {
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            query_alleles[i] =
+                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+        }
+        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+            let col = &ref_columns[ref_m.as_usize()];
+            col.fill_alleles(&mut ref_alleles);
+            for rh in 0..n_ref_haps {
+                let ref_a = ref_alleles[rh];
+                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
+            }
+        } else {
+            ref_alleles.fill(255);
+        }
+
+        let mut is_biallelic = true;
+        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+            if a >= 2 && a != 255 {
+                is_biallelic = false;
+                break;
+            }
+        }
+        let n_alleles = if is_biallelic { 2 } else { 256 };
+
+        pbwt_bwd.advance_with_beams(
+            &ref_alleles,
+            n_alleles,
+            rev_step,
+            &query_alleles,
+            &mut beams_bwd,
+        );
+
+        if sampling[m] {
+            for (i, _) in batch_haps.iter().enumerate() {
+                let targ = query_alleles[i];
+                if targ == 255 {
+                    continue;
+                }
+                let freq = freqs
+                    .get(m)
+                    .and_then(|f| f.get(targ as usize))
+                    .copied()
+                    .unwrap_or(0.0);
+                if freq <= 0.0 {
+                    continue;
+                }
+                let weight = -(freq.max(min_freq)).ln();
+                let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
+                for d in donors {
+                    let idx = d as usize;
+                    if idx < n_ref_haps {
+                        let ref_a = ref_alleles[idx];
+                        if ref_a == 255 || ref_a != targ {
+                            continue;
+                        }
+                        global_scores[i][idx] += weight;
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn normalize_chrom_local(name: &str) -> &str {
     if name.len() >= 3 && name[..3].eq_ignore_ascii_case("chr") {
         &name[3..]
@@ -835,6 +1143,211 @@ fn open_ref_reader(path: &Path) -> Result<RefPanelReader> {
         let reader = crate::io::bref3::StreamingRefVcfReader::open(path)?;
         Ok(RefPanelReader::StreamingVcf(reader))
     }
+}
+
+const BREF3_CONVERT_MIN_BYTES: u64 = 500 * 1024 * 1024;
+
+fn should_convert_ref_to_bref3(config: &Config, ref_path: &Path) -> bool {
+    if ref_path.extension().and_then(|e| e.to_str()) == Some("bref3") {
+        return false;
+    }
+    if let Some(region) = config.chrom.as_deref() {
+        if region.contains(':') && region.contains('-') {
+            return false;
+        }
+    }
+    let Ok(meta) = std::fs::metadata(ref_path) else {
+        return false;
+    };
+    meta.len() >= BREF3_CONVERT_MIN_BYTES
+}
+
+fn cache_is_fresh(cache_path: &Path, ref_path: &Path) -> bool {
+    let Ok(cache_meta) = std::fs::metadata(cache_path) else {
+        return false;
+    };
+    if cache_meta.len() == 0 {
+        return false;
+    }
+    let Ok(ref_meta) = std::fs::metadata(ref_path) else {
+        return false;
+    };
+    match (cache_meta.modified(), ref_meta.modified()) {
+        (Ok(cache_time), Ok(ref_time)) => cache_time >= ref_time,
+        _ => true,
+    }
+}
+
+fn ensure_binary_reference(ref_path: &Path, config: &Config) -> Result<PathBuf> {
+    if ref_path.extension().and_then(|e| e.to_str()) == Some("bref3") {
+        return Ok(ref_path.to_path_buf());
+    }
+    if !should_convert_ref_to_bref3(config, ref_path) {
+        return Ok(ref_path.to_path_buf());
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(ref_path.with_extension("bref3"));
+    candidates.push(config.out.with_extension("ref.bref3"));
+    let stem = ref_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("reference");
+    candidates.push(std::env::temp_dir().join(format!(
+        "reagle_ref_cache_{}.bref3",
+        stem
+    )));
+
+    for path in candidates {
+        if path.exists() && cache_is_fresh(&path, ref_path) {
+            eprintln!("Using cached BREF3 reference at {:?}", path);
+            return Ok(path);
+        }
+        let tmp_path = path.with_extension("bref3.tmp");
+        match convert_ref_vcf_to_bref3(ref_path, &tmp_path) {
+            Ok(()) => {
+                if let Err(err) = std::fs::rename(&tmp_path, &path) {
+                    eprintln!(
+                        "Reference conversion rename failed at {:?}: {}. Trying next location...",
+                        path, err
+                    );
+                    let _ = std::fs::remove_file(&tmp_path);
+                    continue;
+                }
+                eprintln!("Converted reference VCF to BREF3 at {:?}", path);
+                return Ok(path);
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                eprintln!(
+                    "Reference conversion failed at {:?}: {}. Trying next location...",
+                    path, err
+                );
+            }
+        }
+    }
+
+    Ok(ref_path.to_path_buf())
+}
+
+#[derive(Debug)]
+struct PrescanCacheMeta {
+    path: PathBuf,
+    n_ref_haps: usize,
+    per_window_caps: Vec<usize>,
+    window_handoff: Vec<(f64, f64)>,
+}
+
+struct PrescanCacheGuard {
+    path: PathBuf,
+}
+
+impl Drop for PrescanCacheGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn build_prescan_cache(
+    ref_path: &Path,
+    streaming_config: &StreamingConfig,
+    gen_maps: &GeneticMaps,
+    target_positions: &TargetMarkerIndex,
+    available_bytes: u64,
+    n_threads: usize,
+    safe_bytes_per_thread: u64,
+    force_full_panel: bool,
+) -> Result<(PrescanCacheMeta, PrescanCacheGuard)> {
+    let cache_path = create_temp_cache_path();
+    let mut writer = PrescanCacheWriter::create(&cache_path)?;
+
+    let mut ref_reader = open_ref_reader(ref_path)?;
+    let mut n_ref_haps = 0usize;
+    let mut per_window_caps: Vec<usize> = Vec::new();
+    let mut window_handoff: Vec<(f64, f64)> = Vec::new();
+    let mut header_written = false;
+
+    loop {
+        let ref_window = ref_reader.next_window(streaming_config, gen_maps, Some(target_positions))?;
+        let Some(ref_window) = ref_window else { break };
+        let n_ref_markers = ref_window.markers.len();
+        if n_ref_markers == 0 {
+            continue;
+        }
+
+        if n_ref_haps == 0 {
+            n_ref_haps = ref_window
+                .ref_columns
+                .first()
+                .map(|c| c.n_haplotypes())
+                .unwrap_or(0);
+            if n_ref_haps == 0 {
+                continue;
+            }
+            writer.set_n_ref_haps(n_ref_haps);
+            writer.write_header()?;
+            header_written = true;
+        }
+
+        let mut per_window_cap_window = if force_full_panel {
+            n_ref_haps.max(1)
+        } else {
+            let per_state_bytes = 4usize.saturating_mul(4 + n_ref_markers);
+            let mut cap = if per_state_bytes == 0 {
+                0
+            } else {
+                let full_panel_bytes = per_state_bytes
+                    .saturating_mul(n_ref_haps)
+                    .saturating_mul(n_threads.max(1));
+                let can_fit_full_panel = available_bytes > 0
+                    && full_panel_bytes as f64 <= (available_bytes as f64 * FULL_PANEL_RAM_FRACTION);
+                if can_fit_full_panel {
+                    n_ref_haps
+                } else {
+                    (safe_bytes_per_thread as usize) / per_state_bytes
+                }
+            };
+            if cap == 0 {
+                cap = 1;
+            }
+            cap
+        };
+        let cap = n_ref_haps.max(1);
+        per_window_cap_window = per_window_cap_window.min(cap).max(1);
+        per_window_caps.push(per_window_cap_window);
+
+        let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
+        let output_end = ref_window.output_end.min(n_ref_markers).max(1);
+        let left_idx = output_end.saturating_sub(1);
+        let right_idx = output_start.min(n_ref_markers.saturating_sub(1));
+        let left_marker = ref_window.markers.marker(MarkerIdx::new(left_idx as u32));
+        let right_marker = ref_window.markers.marker(MarkerIdx::new(right_idx as u32));
+        let left_gen = gen_maps.gen_pos(left_marker.chrom, left_marker.pos);
+        let right_gen = gen_maps.gen_pos(right_marker.chrom, right_marker.pos);
+        window_handoff.push((left_gen, right_gen));
+
+        if header_written {
+            writer.write_window(&ref_window)?;
+        }
+    }
+
+    if n_ref_haps == 0 || !header_written {
+        return Err(ReagleError::vcf(
+            "Reference window scanning found no haplotypes".to_string(),
+        ));
+    }
+
+    let _ = writer.finish()?;
+    let meta = PrescanCacheMeta {
+        path: cache_path.clone(),
+        n_ref_haps,
+        per_window_caps,
+        window_handoff,
+    };
+    let guard = PrescanCacheGuard {
+        path: cache_path,
+    };
+    Ok((meta, guard))
 }
 
 fn is_vcf_fully_phased(path: &Path) -> Result<bool> {
@@ -932,92 +1445,28 @@ fn build_imputation_plan(
         (per_thread as f64 * STATE_BUDGET_SAFETY) as u64
     };
     let force_full_panel = available_bytes < MIN_AVAIL_BYTES_FOR_PLANNING;
-    let mut ref_reader = open_ref_reader(ref_path)?;
-    let mut n_ref_haps = 0usize;
-    loop {
-        let ref_window = ref_reader.next_window(
-            streaming_config,
-            gen_maps,
-            Some(target_positions),
-        )?;
-        let Some(ref_window) = ref_window else { break };
-        n_ref_haps = ref_window
-            .ref_columns
-            .first()
-            .map(|c| c.n_haplotypes())
-            .unwrap_or(0);
-        if n_ref_haps > 0 {
-            break;
-        }
-    }
+    let (cache_meta, cache_guard) = build_prescan_cache(
+        ref_path,
+        streaming_config,
+        gen_maps,
+        target_positions,
+        available_bytes,
+        n_threads,
+        safe_bytes_per_thread,
+        force_full_panel,
+    )?;
+    let _ = &cache_guard;
+    let n_ref_haps = cache_meta.n_ref_haps;
     if n_ref_haps == 0 {
         return Err(ReagleError::vcf(
             "Reference window scanning found no haplotypes".to_string(),
         ));
     }
     plan.n_ref_haps = n_ref_haps;
+    let mut window_handoff = cache_meta.window_handoff.clone();
+    let mut per_window_caps = cache_meta.per_window_caps.clone();
     let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
-
-    // Handoff anchor: (prev_output_end_gen_pos, next_output_start_gen_pos)
-    let mut window_handoff: Vec<(f64, f64)> = Vec::new();
-    let mut per_window_caps: Vec<usize> = Vec::new();
-
-    // Fast path: if every window can hold the full panel, skip prescan and
-    // select all haplotypes globally. If memory is unknown (available_bytes=0),
-    // default to full-panel for small/CI runs to avoid degrading accuracy.
-    {
-        let mut ref_reader = open_ref_reader(ref_path)?;
-        loop {
-            let ref_window = ref_reader.next_window(
-                streaming_config,
-                gen_maps,
-                Some(target_positions),
-            )?;
-            let Some(ref_window) = ref_window else { break };
-            let n_ref_markers = ref_window.markers.len();
-            if n_ref_markers == 0 {
-                continue;
-            }
-            let mut per_window_cap_window = if force_full_panel {
-                n_ref_haps.max(1)
-            } else {
-                let per_state_bytes = 4usize.saturating_mul(4 + n_ref_markers);
-                let mut per_window_cap_window = if per_state_bytes == 0 {
-                    0
-                } else {
-                    let full_panel_bytes = per_state_bytes
-                        .saturating_mul(n_ref_haps)
-                        .saturating_mul(n_threads.max(1));
-                    let can_fit_full_panel = available_bytes > 0
-                        && full_panel_bytes as f64
-                            <= (available_bytes as f64 * FULL_PANEL_RAM_FRACTION);
-                    if can_fit_full_panel {
-                        n_ref_haps
-                    } else {
-                        (safe_bytes_per_thread as usize) / per_state_bytes
-                    }
-                };
-                if per_window_cap_window == 0 {
-                    per_window_cap_window = 1;
-                }
-                per_window_cap_window
-            };
-            let cap = n_ref_haps.max(1);
-            per_window_cap_window = per_window_cap_window.min(cap).max(1);
-            per_window_caps.push(per_window_cap_window);
-
-            let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
-            let output_end = ref_window.output_end.min(n_ref_markers).max(1);
-            let left_idx = output_end.saturating_sub(1);
-            let right_idx = output_start.min(n_ref_markers.saturating_sub(1));
-            let left_marker = ref_window.markers.marker(MarkerIdx::new(left_idx as u32));
-            let right_marker = ref_window.markers.marker(MarkerIdx::new(right_idx as u32));
-            let left_gen = gen_maps.gen_pos(left_marker.chrom, left_marker.pos);
-            let right_gen = gen_maps.gen_pos(right_marker.chrom, right_marker.pos);
-            window_handoff.push((left_gen, right_gen));
-        }
-    }
 
     let can_full_panel =
         !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps);
@@ -1040,11 +1489,15 @@ fn build_imputation_plan(
             plan.stats.update(n_ref_haps, 0, 0);
         }
         return Ok(plan);
-    } else {
-        // Reset for prescan path (we rebuilt these in the fast-path probe).
-        window_handoff.clear();
-        per_window_caps.clear();
     }
+
+    if window_handoff.is_empty() || per_window_caps.is_empty() {
+        return Err(ReagleError::vcf(
+            "Pre-scan produced no windows for LMS allocation".to_string(),
+        ));
+    }
+
+    plan.per_window_caps = per_window_caps.clone();
 
     eprintln!(
         "Pre-scan: enabled (LMS allocation); target_haps={}, ref_haps={}, batch_size={}",
@@ -1058,7 +1511,7 @@ fn build_imputation_plan(
         let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
         let batch_len = batch_haps.len();
 
-        let mut ref_reader = open_ref_reader(ref_path)?;
+        let mut ref_reader = PrescanCacheReader::open(&cache_meta.path)?;
         let mut target_reader =
             StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
 
@@ -1078,11 +1531,7 @@ fn build_imputation_plan(
 
         let mut window_idx = 0usize;
         loop {
-            let ref_window = ref_reader.next_window(
-                streaming_config,
-                gen_maps,
-                Some(target_positions),
-            )?;
+            let ref_window = ref_reader.next_window()?;
             let Some(ref_window) = ref_window else { break };
 
             let n_ref_markers = ref_window.markers.len();
@@ -1091,20 +1540,10 @@ fn build_imputation_plan(
             }
             // Derive per-window cap from the observed marker count to match
             // the real workspace footprint (fwd/bwd/history scale with markers).
-            let per_state_bytes = 4usize.saturating_mul(4 + n_ref_markers);
-            let mut per_window_cap_window = if per_state_bytes == 0 {
-                0
-            } else {
-                (safe_bytes_per_thread as usize) / per_state_bytes
-            };
-            if per_window_cap_window == 0 {
-                per_window_cap_window = 1;
-            }
-            let cap = n_ref_haps.max(1);
-            per_window_cap_window = per_window_cap_window.min(cap).max(1);
-            if batch_start == 0 {
-                per_window_caps.push(per_window_cap_window);
-            }
+            let per_window_cap_window = per_window_caps
+                .get(window_idx)
+                .copied()
+                .unwrap_or(per_window_cap.max(1));
 
             let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
             let ref_chrom = ref_window
@@ -1159,19 +1598,21 @@ fn build_imputation_plan(
                 phased_target.n_markers(),
             );
             if use_exact {
-                score_window_batch_exact(
+                score_window_batch_exact_packed(
                     &batch_haps,
                     &phased_target,
-                    &ref_window.ref_columns,
+                    &ref_window.columns,
+                    n_ref_haps,
                     &alignment,
                     &mut global_scores,
                     &mut window_scores,
                 );
             } else {
-                score_window_batch_pbwt(
+                score_window_batch_pbwt_packed(
                     &batch_haps,
                     &phased_target,
-                    &ref_window.ref_columns,
+                    &ref_window.columns,
+                    n_ref_haps,
                     &alignment,
                     gen_maps,
                     k_per_hap,
@@ -1210,20 +1651,6 @@ fn build_imputation_plan(
                 scores_by_window[i].push(top);
             }
 
-            // Record handoff anchor points once (batch 0), reuse for all batches.
-            if batch_start == 0 {
-                let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
-                let output_end = ref_window.output_end.min(n_ref_markers).max(1);
-                let left_idx = output_end.saturating_sub(1);
-                let right_idx = output_start.min(n_ref_markers.saturating_sub(1));
-                let left_marker = ref_window.markers.marker(MarkerIdx::new(left_idx as u32));
-                let right_marker = ref_window.markers.marker(MarkerIdx::new(right_idx as u32));
-                let left_gen = gen_maps.gen_pos(left_marker.chrom, left_marker.pos);
-                let right_gen = gen_maps.gen_pos(right_marker.chrom, right_marker.pos);
-                if window_handoff.len() == window_idx {
-                    window_handoff.push((left_gen, right_gen));
-                }
-            }
             window_idx += 1;
 
         }
@@ -1232,11 +1659,6 @@ fn build_imputation_plan(
             .max(imp_step_cm)
             .max(1e-6);
         let boundary_cm = window_boundaries_from_handoff(&window_handoff, min_step_cm);
-        if window_handoff.is_empty() {
-            return Err(ReagleError::vcf(
-                "Pre-scan produced no windows for LMS allocation".to_string(),
-            ));
-        }
         if !per_window_caps.is_empty() && per_window_caps.len() != window_handoff.len() {
             return Err(ReagleError::vcf(format!(
                 "Per-window cap length mismatch (caps={}, bounds={})",
@@ -1244,8 +1666,12 @@ fn build_imputation_plan(
                 window_handoff.len()
             )));
         }
-        if batch_start == 0 {
-            plan.per_window_caps = per_window_caps.clone();
+        if window_idx != window_handoff.len() {
+            return Err(ReagleError::vcf(format!(
+                "Prescan window count mismatch (seen={}, bounds={})",
+                window_idx,
+                window_handoff.len()
+            )));
         }
 
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
@@ -1448,6 +1874,7 @@ impl crate::pipelines::ImputationPipeline {
             .r#ref
             .as_ref()
             .ok_or_else(|| ReagleError::config("Reference panel required for imputation"))?;
+        let ref_path = ensure_binary_reference(ref_path, &self.config)?;
 
         let mut input_target_path = self.config.gt.clone();
         let mut input_tmp: Option<tempfile::TempDir> = None;
@@ -1530,7 +1957,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let plan = build_imputation_plan(
             &phased_target_path,
-            ref_path,
+            &ref_path,
             &streaming_config,
             &gen_maps,
             &target_positions_map,
@@ -1566,7 +1993,7 @@ impl crate::pipelines::ImputationPipeline {
             bb.set_current_window(0);
         }
 
-        let mut ref_reader = open_ref_reader(ref_path)?;
+        let mut ref_reader = open_ref_reader(&ref_path)?;
         let target_was_unphased_for_impute = !is_vcf_fully_phased(&input_target_path)?;
         // Always use phased target haplotypes for emissions to preserve LD signal.
         // If the input was unphased, we will still treat phase as uncertain in

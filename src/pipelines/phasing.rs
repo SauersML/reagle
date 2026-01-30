@@ -1728,7 +1728,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 ref_gt.n_markers(),
                 ref_gt.n_haplotypes()
             );
-            ref_pos_map = Some(MarkerAlignment::build_ref_pos_index(ref_gt.markers()));
+            ref_pos_map = Some(MarkerAlignment::<crate::data::AnyMarkerSpace, _>::build_ref_pos_index(ref_gt.markers()));
             self.reference_gt = Some(Arc::new(ref_gt));
             self.alignment = None;
         }

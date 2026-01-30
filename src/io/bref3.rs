@@ -21,11 +21,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use flate2::read::GzDecoder;
+use lexical_core::parse as lexical_parse;
 use noodles::bgzf::io as bgzf_io;
 use tracing::info_span;
 
@@ -53,6 +54,9 @@ const SEQ_CODED: u8 = 0;
 
 /// Allele-coded record flag
 const ALLELE_CODED: u8 = 1;
+
+const BREF3_BLOCK_TARGET_BYTES: usize = 32 * 1024 * 1024;
+const BREF3_BLOCK_MAX_RECORDS: usize = 10_000;
 
 /// All 24 permutations of SNV bases (A, C, G, T) for allele code decoding
 static SNV_PERMS: [[&str; 4]; 24] = [
@@ -322,6 +326,11 @@ fn read_be_i32<R: Read>(reader: &mut R) -> Result<i32> {
     Ok(i32::from_be_bytes(buf))
 }
 
+fn write_be_i32<W: Write>(writer: &mut W, value: i32) -> Result<()> {
+    writer.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+
 /// Read a big-endian u16
 fn read_be_u16<R: Read>(reader: &mut R) -> Result<u16> {
     let mut buf = [0u8; 2];
@@ -329,11 +338,21 @@ fn read_be_u16<R: Read>(reader: &mut R) -> Result<u16> {
     Ok(u16::from_be_bytes(buf))
 }
 
+fn write_be_u16<W: Write>(writer: &mut W, value: u16) -> Result<()> {
+    writer.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+
 /// Read a single byte
 fn read_byte<R: Read>(reader: &mut R) -> Result<u8> {
     let mut buf = [0u8; 1];
     reader.read_exact(&mut buf)?;
     Ok(buf[0])
+}
+
+fn write_byte<W: Write>(writer: &mut W, value: u8) -> Result<()> {
+    writer.write_all(&[value])?;
+    Ok(())
 }
 
 /// Read a Java modified UTF-8 string
@@ -349,6 +368,15 @@ fn read_utf8_string<R: Read>(reader: &mut R) -> Result<String> {
     String::from_utf8(buf).context("Invalid UTF-8 in BREF3 string")
 }
 
+fn write_utf8_string<W: Write>(writer: &mut W, value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    let len = u16::try_from(bytes.len())
+        .map_err(|_| anyhow::anyhow!("String too long for BREF3 UTF-8 encoding"))?;
+    write_be_u16(writer, len)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
 /// Read a string array (length-prefixed)
 fn read_string_array<R: Read>(reader: &mut R) -> Result<Vec<String>> {
     let len = read_be_i32(reader)?;
@@ -361,6 +389,158 @@ fn read_string_array<R: Read>(reader: &mut R) -> Result<Vec<String>> {
         result.push(read_utf8_string(reader)?);
     }
     Ok(result)
+}
+
+fn write_string_array<W: Write>(writer: &mut W, values: &[String]) -> Result<()> {
+    let len = i32::try_from(values.len())
+        .map_err(|_| anyhow::anyhow!("String array too long for BREF3 encoding"))?;
+    write_be_i32(writer, len)?;
+    for value in values {
+        write_utf8_string(writer, value)?;
+    }
+    Ok(())
+}
+
+struct Bref3Writer {
+    writer: BufWriter<File>,
+    hap_to_seq_bytes: Vec<u8>,
+    n_haps: usize,
+}
+
+impl Bref3Writer {
+    fn create(path: &Path, sample_ids: &[String]) -> Result<Self> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        write_be_i32(&mut writer, BREF3_MAGIC)?;
+        write_utf8_string(&mut writer, "reagle")?;
+        write_string_array(&mut writer, sample_ids)?;
+        let n_haps = sample_ids.len() * 2;
+        let hap_to_seq_bytes = vec![0u8; n_haps * 2];
+        Ok(Self {
+            writer,
+            hap_to_seq_bytes,
+            n_haps,
+        })
+    }
+
+    fn write_block(&mut self, chrom: &str, n_recs: usize, record_bytes: &[u8]) -> Result<()> {
+        let n_recs = i32::try_from(n_recs)
+            .map_err(|_| anyhow::anyhow!("Too many records in BREF3 block"))?;
+        write_be_i32(&mut self.writer, n_recs)?;
+        write_utf8_string(&mut self.writer, chrom)?;
+        write_be_u16(&mut self.writer, 1)?;
+        self.writer.write_all(&self.hap_to_seq_bytes)?;
+        self.writer.write_all(record_bytes)?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        write_be_i32(&mut self.writer, END_OF_DATA)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+}
+
+fn encode_bref3_marker_record(
+    buf: &mut Vec<u8>,
+    marker: &Marker,
+    column: &GenotypeColumn,
+) -> Result<()> {
+    let pos = marker.pos as i32;
+    buf.extend_from_slice(&pos.to_be_bytes());
+    write_byte(buf, 0)?;
+    write_byte(buf, 255)?;
+    let mut alleles: Vec<String> = Vec::with_capacity(1 + marker.alt_alleles.len());
+    alleles.push(marker.ref_allele.to_string());
+    for alt in &marker.alt_alleles {
+        alleles.push(alt.to_string());
+    }
+    write_string_array(buf, &alleles)?;
+    let end_pos = marker.end.map(|v| v as i32).unwrap_or(-1);
+    write_be_i32(buf, end_pos)?;
+    write_byte(buf, ALLELE_CODED)?;
+
+    let n_alleles = marker.n_alleles();
+    let mut allele_haps: Vec<Vec<i32>> = vec![Vec::new(); n_alleles];
+    for hap in 0..column.n_haplotypes() {
+        let allele = column.get(crate::data::HapIdx::new(hap as u32));
+        if allele == 255 {
+            bail!("Missing alleles are not supported in BREF3 conversion");
+        }
+        let idx = allele as usize;
+        if idx >= n_alleles {
+            bail!("Allele index out of range during BREF3 conversion");
+        }
+        if idx > 0 {
+            allele_haps[idx].push(hap as i32);
+        }
+    }
+
+    write_be_i32(buf, -1)?;
+    for idx in 1..n_alleles {
+        let haps = &allele_haps[idx];
+        write_be_i32(buf, haps.len() as i32)?;
+        for &hap_idx in haps {
+            write_be_i32(buf, hap_idx)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn convert_ref_vcf_to_bref3(input: &Path, output: &Path) -> Result<()> {
+    let mut reader = StreamingRefVcfReader::open(input)?;
+    let sample_ids: Vec<String> = reader
+        .samples_arc()
+        .ids()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut writer = Bref3Writer::create(output, &sample_ids)?;
+
+    let mut current_chrom: Option<String> = None;
+    let mut record_count = 0usize;
+    let mut record_bytes: Vec<u8> = Vec::new();
+
+    loop {
+        let next_marker = reader.next_marker()?;
+        let Some(marker) = next_marker else { break };
+        let chrom_name = reader
+            .markers
+            .chrom_name(marker.marker.chrom)
+            .unwrap_or("UNKNOWN");
+        let chrom_changed = current_chrom.as_deref() != Some(chrom_name);
+        if chrom_changed && record_count > 0 {
+            if let Some(chrom) = current_chrom.as_deref() {
+                writer.write_block(chrom, record_count, &record_bytes)?;
+            }
+            record_bytes.clear();
+            record_count = 0;
+        }
+        if chrom_changed {
+            current_chrom = Some(chrom_name.to_string());
+        }
+
+        encode_bref3_marker_record(&mut record_bytes, &marker.marker, &marker.column)?;
+        record_count += 1;
+
+        if record_bytes.len() >= BREF3_BLOCK_TARGET_BYTES || record_count >= BREF3_BLOCK_MAX_RECORDS
+        {
+            if let Some(chrom) = current_chrom.as_deref() {
+                writer.write_block(chrom, record_count, &record_bytes)?;
+            }
+            record_bytes.clear();
+            record_count = 0;
+        }
+    }
+
+    if record_count > 0 {
+        if let Some(chrom) = current_chrom.as_deref() {
+            writer.write_block(chrom, record_count, &record_bytes)?;
+        }
+    }
+
+    writer.finish()
 }
 
 /// A single block of reference data from streaming BREF3 reading
@@ -974,6 +1154,10 @@ impl StreamingRefVcfReader {
         })
     }
 
+    pub fn samples_arc(&self) -> Arc<Samples> {
+        Arc::clone(&self.samples)
+    }
+
     /// Read the next reference-driven window (streaming).
     pub fn next_window(
         &mut self,
@@ -1115,6 +1299,26 @@ impl StreamingRefVcfReader {
         }))
     }
 
+    /// Read the next marker without windowing (streaming, raw order).
+    pub fn next_marker(&mut self) -> Result<Option<RefPanelMarker>> {
+        loop {
+            self.line_buf.clear();
+            if self.reader.read_line(&mut self.line_buf)? == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
+            let mut line_buf = std::mem::take(&mut self.line_buf);
+            let line = line_buf.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                self.line_buf = line_buf;
+                continue;
+            }
+            let marker = self.parse_vcf_line(line)?;
+            self.line_buf = line_buf;
+            return Ok(Some(marker));
+        }
+    }
+
     fn read_next_marker_with_gen(
         &mut self,
         gen_maps: &GeneticMaps,
@@ -1125,12 +1329,15 @@ impl StreamingRefVcfReader {
                 self.eof = true;
                 return Ok(None);
             }
-            let line = self.line_buf.trim_end();
+            let mut line_buf = std::mem::take(&mut self.line_buf);
+            let line = line_buf.trim_end();
             if line.is_empty() || line.starts_with('#') {
+                self.line_buf = line_buf;
                 continue;
             }
             let mut marker = self.parse_vcf_line(line)?;
             marker.gen_pos = gen_maps.gen_pos(marker.marker.chrom, marker.marker.pos);
+            self.line_buf = line_buf;
             return Ok(Some(marker));
         }
     }
@@ -1145,9 +1352,9 @@ impl StreamingRefVcfReader {
         let pos_str = fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("VCF line missing POS"))?;
-        let pos: u32 = pos_str.parse().context("Invalid POS")?;
+        let pos: u32 = lexical_parse(pos_str.as_bytes()).context("Invalid POS")?;
 
-        let _id_field = fields
+        let _ = fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("VCF line missing ID"))?;
         let id = None;
@@ -1238,7 +1445,7 @@ impl StreamingRefVcfReader {
                 return c - b'0';
             }
         }
-        s.parse().unwrap_or(255)
+        lexical_parse::<u8>(s.as_bytes()).unwrap_or(255)
     }
 
     fn field_at_colon<'a>(&self, s: &'a str, idx: usize) -> Option<&'a str> {
