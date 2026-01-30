@@ -24,6 +24,7 @@ Rust/clippy_output.txt
 # Python cache
 __pycache__/
 *.pyc
+*.txt
 
 # Data files - do not commit
 *.vcf.gz
@@ -38,3 +39,7 @@ __pycache__/
 # Codex/AI session files
 codex_session_*.jsonl
 .DS_Store
+
+# Microarray profiling artifacts
+microarray_profile/
+scripts/microarray_profile/

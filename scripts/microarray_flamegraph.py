@@ -58,6 +58,17 @@ def find_real_array_file(repo_root: Path):
     candidates.sort(key=lambda x: ("23andme" not in x[1].name.lower(), x[1].name))
     return candidates[0]
 
+def infer_person_from_path(path: Path):
+    parts = path.parts
+    for name in ("kat_suricata", "christopher_smith"):
+        if name in parts:
+            return name
+    return None
+
+
+def person_data_dir(repo_root: Path, person: str) -> Path:
+    return repo_root / "data" / person
+
 
 def open_vcf(path: Path):
     if str(path).endswith(".gz"):
@@ -138,8 +149,11 @@ def main():
 
     if use_real_data:
         array_file = args.array_file
+        person = None
         if array_file is None:
-            _, array_file = find_real_array_file(repo_root)
+            person, array_file = find_real_array_file(repo_root)
+        else:
+            person = infer_person_from_path(array_file)
         if array_file is None or not array_file.exists():
             raise SystemExit(
                 "No microarray file found. Provide --array-file or add a 23andme/ancestry "
@@ -148,10 +162,35 @@ def main():
 
         prepare = repo_root / "scripts" / "prepare_data.py"
         run(["python3", str(prepare), "reference", str(ref_out)])
-        # Microarray sites come from the array conversion.
+        ref_backup = args.out_dir / "ref_wgs.vcf.gz"
+        shutil.copy2(ref_out, ref_backup)
+        ref_index = ref_out.with_suffix(ref_out.suffix + ".csi")
+        if ref_index.exists():
+            shutil.copy2(ref_index, ref_backup.with_suffix(ref_backup.suffix + ".csi"))
+        # Microarray sites come from the array conversion (sparse target).
         run(["python3", str(prepare), "array", str(array_file), str(target_sparse)])
-        # Dense target represents WGS-like density, sourced from the reference panel.
-        if target_dense != ref_out:
+        # Restore WGS-density reference in case the array conversion padded the panel.
+        shutil.copy2(ref_backup, ref_out)
+        ref_backup_index = ref_backup.with_suffix(ref_backup.suffix + ".csi")
+        if ref_backup_index.exists():
+            shutil.copy2(ref_backup_index, ref_out.with_suffix(ref_out.suffix + ".csi"))
+        else:
+            run(["bcftools", "index", "-f", str(ref_out)])
+        # Dense target represents WGS-like density for the same person.
+        if person is None:
+            raise SystemExit("Unable to infer person for WGS truth; pass --array-file under data/<person>.")
+        truth_source = person_data_dir(repo_root, person)
+        if truth_source.exists():
+            try:
+                run(["python3", str(prepare), "truth", str(truth_source), str(target_dense)])
+            except subprocess.CalledProcessError:
+                print("WGS truth missing; falling back to reference panel as dense target.")
+                shutil.copy2(ref_out, target_dense)
+                ref_index = ref_out.with_suffix(ref_out.suffix + ".csi")
+                if ref_index.exists():
+                    shutil.copy2(ref_index, target_dense.with_suffix(target_dense.suffix + ".csi"))
+        else:
+            print("WGS truth directory missing; falling back to reference panel as dense target.")
             shutil.copy2(ref_out, target_dense)
             ref_index = ref_out.with_suffix(ref_out.suffix + ".csi")
             if ref_index.exists():
@@ -192,7 +231,12 @@ def main():
             raise SystemExit("Sampling kept 0 markers; increase --keep-prob.")
         print(f"Sparse positions: kept {kept}/{total} markers ({kept/total:.2%})")
 
-        run(["bcftools", "view", "-R", str(positions), str(sample_source), "-Oz", "-o", str(target_sparse)])
+        out_path = target_sparse
+        if sample_source == target_sparse:
+            out_path = target_sparse.with_suffix(".tmp.vcf.gz")
+        run(["bcftools", "view", "-R", str(positions), str(sample_source), "-Oz", "-o", str(out_path)])
+        if out_path != target_sparse:
+            shutil.move(out_path, target_sparse)
         run(["bcftools", "index", "-f", str(target_sparse)])
 
     run(["cargo", "build", "--release", "--features", "pprof"], env=os.environ.copy())
