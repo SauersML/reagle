@@ -2142,26 +2142,40 @@ def stage_prepare_profile(keep_phased=False):
     if not gsa_sites:
         raise RuntimeError("No GSA sites found for chr22")
 
-    # Load GSA sites for chr22
-    gsa_positions = sorted([pos for chrom, pos in gsa_sites])
+    # Find chromosome label from VCF
+    chrom_label = find_chrom_label(paths['chr22_vcf'], "22") or "chr22"
 
-    if not gsa_positions:
-        raise RuntimeError("No GSA sites found for chr22")
+    # Compute region based on MIDDLE 5% of TARGET markers (GSA sites present in the VCF)
+    gsa_present_positions = []
+    with _open_maybe_gzip(paths['chr22_vcf']) as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            if (fields[0], pos) in gsa_sites or (chrom_label, pos) in gsa_sites:
+                gsa_present_positions.append(pos)
 
-    # Compute region based on MIDDLE 5% of TARGET (GSA) markers
-    total_markers = len(gsa_positions)
+    gsa_present_positions = sorted(set(gsa_present_positions))
+    if not gsa_present_positions:
+        raise RuntimeError("No GSA sites found in chr22 VCF")
+
+    total_markers = len(gsa_present_positions)
     window_size = max(1, int(total_markers * 0.05))
     start_idx = (total_markers - window_size) // 2
     end_idx = start_idx + window_size
 
-    min_pos = gsa_positions[start_idx]
-    end_pos = gsa_positions[end_idx - 1]
+    min_pos = gsa_present_positions[start_idx]
+    end_pos = gsa_present_positions[end_idx - 1]
 
-    # Find chromosome label from VCF
-    chrom_label = find_chrom_label(paths['chr22_vcf'], "22") or "chr22"
     region = f"{chrom_label}:{min_pos}-{end_pos}"
 
-    print(f"Profiling region based on middle 5% of {total_markers} GSA markers:")
+    print(f"Profiling region based on middle 5% of {total_markers} target markers:")
     print(f"  Region: {region} (positions {min_pos}..{end_pos})")
     print(f"  Target markers in region: {window_size} (indices {start_idx}-{end_idx-1})")
 
