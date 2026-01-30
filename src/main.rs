@@ -143,6 +143,13 @@ fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
     };
     let output_path =
         std::env::var("REAGLE_PPROF_OUTPUT").unwrap_or_else(|_| "reagle.pprof.svg".to_string());
+    let text_output_path = std::env::var("REAGLE_PPROF_TEXT").unwrap_or_else(|_| {
+        if let Some(stem) = output_path.strip_suffix(".svg") {
+            format!("{}.txt", stem)
+        } else {
+            format!("{}.txt", output_path)
+        }
+    });
     match std::fs::File::create(&output_path) {
         Ok(mut file) => {
             if let Err(err) = report.flamegraph(&mut file) {
@@ -155,6 +162,32 @@ fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
             eprintln!(
                 "pprof: failed to create output file {}: {}",
                 output_path, err
+            );
+        }
+    }
+
+    match std::fs::File::create(&text_output_path) {
+        Ok(mut file) => {
+            use std::fmt::Write as _;
+            use std::io::Write as _;
+            for (key, value) in report.data.iter() {
+                let mut line = key.thread_name_or_id();
+                line.push(';');
+                for frame in key.frames.iter().rev() {
+                    for symbol in frame.iter().rev() {
+                        let _ = write!(&mut line, "{};", symbol);
+                    }
+                }
+                line.pop();
+                let _ = write!(&mut line, " {}", value);
+                let _ = writeln!(file, "{}", line);
+            }
+            eprintln!("pprof folded stacks written to {}", text_output_path);
+        }
+        Err(err) => {
+            eprintln!(
+                "pprof: failed to create output file {}: {}",
+                text_output_path, err
             );
         }
     }
