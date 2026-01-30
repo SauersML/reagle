@@ -446,16 +446,34 @@ fn compute_target_freqs_packed<TargetSpace, RefSpace>(
         let mut total = 0u32;
         if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
             let col = &ref_columns[ref_m.as_usize()];
-            for rh in 0..n_ref_haps {
-                let ref_a = col.allele(rh);
-                let mapped = alignment.reverse_map_allele(m, ref_a);
-                if mapped == 255 {
-                    continue;
+            if let Some((zeros, ones, missing)) = col.counts_biallelic() {
+                let map0 = alignment.reverse_map_allele(m, 0);
+                let map1 = alignment.reverse_map_allele(m, 1);
+                if map0 != 255 {
+                    let idx = map0 as usize;
+                    if idx < counts.len() {
+                        counts[idx] += zeros as u32;
+                    }
                 }
-                let idx = mapped as usize;
-                if idx < counts.len() {
-                    counts[idx] += 1;
-                    total += 1;
+                if map1 != 255 {
+                    let idx = map1 as usize;
+                    if idx < counts.len() {
+                        counts[idx] += ones as u32;
+                    }
+                }
+                total = (n_ref_haps.saturating_sub(missing)) as u32;
+            } else {
+                for rh in 0..n_ref_haps {
+                    let ref_a = col.allele(rh);
+                    let mapped = alignment.reverse_map_allele(m, ref_a);
+                    if mapped == 255 {
+                        continue;
+                    }
+                    let idx = mapped as usize;
+                    if idx < counts.len() {
+                        counts[idx] += 1;
+                        total += 1;
+                    }
                 }
             }
         }
@@ -1064,7 +1082,43 @@ fn prepare_reference_data(
     };
     let mut use_in_memory = memory_budget > 0;
 
-    let mut ref_reader = open_ref_reader(ref_path)?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Option<RefWindow>>>(2);
+    let ref_path = ref_path.to_path_buf();
+    let streaming_config = streaming_config.clone();
+    let gen_maps_thread = gen_maps.clone();
+    let target_positions = target_positions.clone();
+    let reader_handle = std::thread::spawn(move || {
+        let mut ref_reader = match open_ref_reader(&ref_path) {
+            Ok(reader) => reader,
+            Err(err) => {
+                let _ = tx.send(Err(err.into()));
+                return Ok(());
+            }
+        };
+        loop {
+            let result = ref_reader.next_window(
+                &streaming_config,
+                &gen_maps_thread,
+                Some(&target_positions),
+            );
+            match result {
+                Ok(Some(window)) => {
+                    if tx.send(Ok(Some(window))).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Ok(None));
+                    break;
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err.into()));
+                    break;
+                }
+            }
+        }
+        Ok::<(), ReagleError>(())
+    });
     let mut n_ref_haps = 0usize;
     let mut per_window_caps: Vec<usize> = Vec::new();
     let mut window_handoff: Vec<(f64, f64)> = Vec::new();
@@ -1075,80 +1129,91 @@ fn prepare_reference_data(
     let mut cache_path: Option<PathBuf> = None;
     let mut cache_writer: Option<PrescanCacheWriter> = None;
 
-    loop {
-        let ref_window = ref_reader.next_window(streaming_config, gen_maps, Some(target_positions))?;
-        let Some(ref_window) = ref_window else { break };
-        let n_ref_markers = ref_window.markers.len();
-        if n_ref_markers == 0 {
-            continue;
-        }
+    let read_result: Result<()> = (|| {
+        for msg in rx {
+            let ref_window = match msg? {
+                Some(window) => window,
+                None => break,
+            };
+            let n_ref_markers = ref_window.markers.len();
+            if n_ref_markers == 0 {
+                continue;
+            }
 
-        if n_ref_haps == 0 {
-            n_ref_haps = ref_window
-                .ref_columns
-                .first()
-                .map(|c| c.n_haplotypes())
-                .unwrap_or(0);
             if n_ref_haps == 0 {
-                continue;
-            }
-        }
-
-        let per_window_cap_window = compute_per_window_cap(
-            n_ref_haps,
-            n_ref_markers,
-            available_bytes,
-            n_threads,
-            safe_bytes_per_thread,
-            force_full_panel,
-        );
-        per_window_caps.push(per_window_cap_window);
-
-        let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
-        let output_end = ref_window.output_end.min(n_ref_markers).max(1);
-        let left_idx = output_end.saturating_sub(1);
-        let right_idx = output_start.min(n_ref_markers.saturating_sub(1));
-        let left_marker = ref_window.markers.marker(MarkerIdx::new(left_idx as u32));
-        let right_marker = ref_window.markers.marker(MarkerIdx::new(right_idx as u32));
-        let left_gen = gen_maps.gen_pos(left_marker.chrom, left_marker.pos);
-        let right_gen = gen_maps.gen_pos(right_marker.chrom, right_marker.pos);
-        window_handoff.push((left_gen, right_gen));
-
-        if use_in_memory {
-            let packed = pack_ref_columns(&ref_window.markers, &ref_window.ref_columns);
-            total_bytes = total_bytes.saturating_add(estimate_ref_window_bytes(&ref_window, &packed));
-            if total_bytes <= memory_budget {
-                packed_columns.push(packed);
-                windows.push(ref_window);
-                continue;
+                n_ref_haps = ref_window
+                    .ref_columns
+                    .first()
+                    .map(|c| c.n_haplotypes())
+                    .unwrap_or(0);
+                if n_ref_haps == 0 {
+                    continue;
+                }
             }
 
-            use_in_memory = false;
-            let path = create_temp_cache_path();
-            let mut writer = PrescanCacheWriter::create(&path)?;
-            writer.set_n_ref_haps(n_ref_haps);
-            writer.write_header()?;
-            for win in windows.iter() {
-                writer.write_window(win)?;
-            }
-            writer.write_window(&ref_window)?;
-            windows.clear();
-            packed_columns.clear();
-            cache_path = Some(path);
-            cache_writer = Some(writer);
-        } else {
-            if cache_writer.is_none() {
-                let path = cache_path.get_or_insert_with(create_temp_cache_path);
-                let mut writer = PrescanCacheWriter::create(path)?;
+            let per_window_cap_window = compute_per_window_cap(
+                n_ref_haps,
+                n_ref_markers,
+                available_bytes,
+                n_threads,
+                safe_bytes_per_thread,
+                force_full_panel,
+            );
+            per_window_caps.push(per_window_cap_window);
+
+            let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
+            let output_end = ref_window.output_end.min(n_ref_markers).max(1);
+            let left_idx = output_end.saturating_sub(1);
+            let right_idx = output_start.min(n_ref_markers.saturating_sub(1));
+            let left_marker = ref_window.markers.marker(MarkerIdx::new(left_idx as u32));
+            let right_marker = ref_window.markers.marker(MarkerIdx::new(right_idx as u32));
+            let left_gen = gen_maps.gen_pos(left_marker.chrom, left_marker.pos);
+            let right_gen = gen_maps.gen_pos(right_marker.chrom, right_marker.pos);
+            window_handoff.push((left_gen, right_gen));
+
+            if use_in_memory {
+                let packed = pack_ref_columns(&ref_window.markers, &ref_window.ref_columns);
+                total_bytes =
+                    total_bytes.saturating_add(estimate_ref_window_bytes(&ref_window, &packed));
+                if total_bytes <= memory_budget {
+                    packed_columns.push(packed);
+                    windows.push(ref_window);
+                    continue;
+                }
+
+                use_in_memory = false;
+                let path = create_temp_cache_path();
+                let mut writer = PrescanCacheWriter::create(&path)?;
                 writer.set_n_ref_haps(n_ref_haps);
                 writer.write_header()?;
-                cache_writer = Some(writer);
-            }
-            if let Some(writer) = cache_writer.as_mut() {
+                for win in windows.iter() {
+                    writer.write_window(win)?;
+                }
                 writer.write_window(&ref_window)?;
+                windows.clear();
+                packed_columns.clear();
+                cache_path = Some(path);
+                cache_writer = Some(writer);
+            } else {
+                if cache_writer.is_none() {
+                    let path = cache_path.get_or_insert_with(create_temp_cache_path);
+                    let mut writer = PrescanCacheWriter::create(path)?;
+                    writer.set_n_ref_haps(n_ref_haps);
+                    writer.write_header()?;
+                    cache_writer = Some(writer);
+                }
+                if let Some(writer) = cache_writer.as_mut() {
+                    writer.write_window(&ref_window)?;
+                }
             }
         }
-    }
+        Ok(())
+    })();
+
+    let _ = reader_handle
+        .join()
+        .map_err(|_| ReagleError::vcf("Reference reader thread panicked".to_string()))??;
+    read_result?;
 
     if n_ref_haps == 0 {
         return Err(ReagleError::vcf(

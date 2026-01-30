@@ -59,7 +59,7 @@ impl std::ops::Deref for StreamWindowWithResult {
 use crate::data::alignment::{AlignmentStats, MarkerAlignment};
 use crate::model::types::GlobalId;
 use crate::model::states::ThreadedHaps;
-use crate::model::hmm::MosaicHmm;
+use crate::model::hmm::{MosaicHmm, RefColumnProvider};
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
@@ -2763,6 +2763,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     } else {
                         GenotypeView::Mutable(ref_geno)
                     };
+                let ref_provider_base = if let (Some(ref_gt), Some(alignment)) =
+                    (&self.reference_gt, &self.alignment)
+                {
+                    Some(RefColumnProvider::new(
+                        ref_gt.columns(),
+                        Some(alignment),
+                        None,
+                        None,
+                    ))
+                } else {
+                    None
+                };
 
                 let prior_paths = &mcmc_paths[..];
                 let mut swap_results: Vec<(
@@ -2847,6 +2859,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     Some(&plp),
                                     None,
                                     None,
+                                    ref_provider_base.as_ref(),
                                     &threaded_haps_full,
                                     &mut fwd1,
                                     &mut bwd1,
@@ -2859,6 +2872,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     Some(&plp),
                                     None,
                                     None,
+                                    ref_provider_base.as_ref(),
                                     &threaded_haps_full,
                                     &mut fwd2,
                                     &mut bwd2,
@@ -3722,6 +3736,19 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 carrier_haps[m] = carriers;
             }
 
+            let ref_provider_base = if let (Some(ref_gt), Some(alignment)) =
+                (&self.reference_gt, &self.alignment)
+            {
+                Some(RefColumnProvider::new(
+                    ref_gt.columns(),
+                    Some(alignment),
+                    Some(hi_freq_markers),
+                    None,
+                ))
+            } else {
+                None
+            };
+
             // Process samples in parallel - collect results: Stage2Decision
             // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
             sample_phases
@@ -3826,6 +3853,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         Some(&plp),
                         Some(&allele_freqs_stage1),
                         init_prior1,
+                        ref_provider_base.as_ref(),
                         &threaded_haps,
                         &mut fwd1,
                         &mut bwd1,
@@ -3841,6 +3869,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         Some(&plp),
                         Some(&allele_freqs_stage1),
                         init_prior2,
+                        ref_provider_base.as_ref(),
                         &threaded_haps,
                         &mut fwd2,
                         &mut bwd2,

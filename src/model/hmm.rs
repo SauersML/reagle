@@ -582,6 +582,9 @@ use crate::model::pl_emission::{
     PlProvider, allele_probs_cond_from_pl, allele_probs_uncond_from_pl, emit_from_allele_probs,
 };
 use crate::model::states::{MosaicCursor, StateSwitch, ThreadedHaps};
+use crate::data::alignment::MarkerAlignment;
+use crate::data::marker::AnyMarkerSpace;
+use crate::data::storage::GenotypeColumn;
 
 /// High-performance Li-Stephens HMM using mosaic states with A-B-C loop pattern.
 ///
@@ -603,6 +606,53 @@ pub struct MosaicHmm<'a, TargetSpace = crate::data::AnyMarkerSpace, RefSpace = c
     n_states: usize,
     /// Recombination probabilities between consecutive markers
     p_recomb: Vec<f32>,
+}
+
+/// Optional reference column provider for block-aware emissions.
+pub struct RefColumnProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
+    ref_columns: &'a [GenotypeColumn],
+    alignment: Option<&'a MarkerAlignment<TargetSpace, RefSpace>>,
+    marker_map: Option<&'a [usize]>,
+    ref_index_map: Option<&'a [usize]>,
+}
+
+impl<'a, TargetSpace, RefSpace> RefColumnProvider<'a, TargetSpace, RefSpace> {
+    pub fn new(
+        ref_columns: &'a [GenotypeColumn],
+        alignment: Option<&'a MarkerAlignment<TargetSpace, RefSpace>>,
+        marker_map: Option<&'a [usize]>,
+        ref_index_map: Option<&'a [usize]>,
+    ) -> Self {
+        Self {
+            ref_columns,
+            alignment,
+            marker_map,
+            ref_index_map,
+        }
+    }
+
+    #[inline]
+    fn column_for_marker(&self, marker_idx: usize) -> Option<&'a GenotypeColumn> {
+        let orig_m = self
+            .marker_map
+            .and_then(|map| map.get(marker_idx).copied())
+            .unwrap_or(marker_idx);
+        let ref_m = if let Some(alignment) = self.alignment {
+            alignment.target_to_ref(MarkerIdx::new(orig_m as u32))?
+        } else {
+            MarkerIdx::new(orig_m as u32)
+        };
+        let col_idx = if let Some(map) = self.ref_index_map {
+            let idx = *map.get(ref_m.as_usize())?;
+            if idx == usize::MAX {
+                return None;
+            }
+            idx
+        } else {
+            ref_m.as_usize()
+        };
+        self.ref_columns.get(col_idx)
+    }
 }
 
 impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
@@ -639,6 +689,7 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
         pl_provider: Option<&PlProvider>,
         allele_freqs: Option<&[f32]>,
         init_prior: Option<&[f32]>,
+        ref_provider: Option<&RefColumnProvider<'_, TargetSpace, RefSpace>>,
         threaded_haps: &ThreadedHaps,
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
@@ -666,8 +717,9 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
 
         let mut ref_alleles = vec![255u8; n_states];
         let mut state_buf = vec![GlobalId::from(0u32); n_states];
-        let mut fill_ref_alleles = |m: usize, ref_alleles: &mut [u8]| {
-            threaded_haps.materialize_at(m, &mut state_buf);
+        let mut state_patterns: Vec<u32> = vec![0u32; n_states];
+        let mut pattern_emissions: Vec<f32> = Vec::new();
+        let fill_ref_alleles = |m: usize, ref_alleles: &mut [u8], state_buf: &[GlobalId]| {
             let marker = MarkerIdx::new(m as u32);
             for k in 0..n_states {
                 let hap = HapIdx::new(state_buf[k].as_u32());
@@ -714,11 +766,105 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
                 }
             };
 
+        let mut try_fill_pattern_emissions =
+            |m: usize,
+             partner: u8,
+             allele_probs_opt: Option<&[f32]>,
+             emissions: &mut [f32],
+             state_buf: &[GlobalId]| {
+                let Some(provider) = ref_provider else {
+                    return false;
+                };
+                let Some(col) = provider.column_for_marker(m) else {
+                    return false;
+                };
+                match col {
+                    GenotypeColumn::SeqCoded(c) => {
+                        let hap_to_seq = c.hap_to_seq();
+                        for k in 0..n_states {
+                            state_patterns[k] = hap_to_seq[state_buf[k].as_usize()] as u32;
+                        }
+                        let seq_alleles = c.seq_alleles();
+                        pattern_emissions.resize(seq_alleles.len(), 1.0);
+                        if let Some(allele_probs) = allele_probs_opt {
+                            let n_alleles = allele_probs.len();
+                            let p_no_err = p_no_err_base;
+                            let p_err_other = if n_alleles > 1 {
+                                p_err_base / (n_alleles as f32 - 1.0)
+                            } else {
+                                0.0
+                            };
+                            for (pid, &allele) in seq_alleles.iter().enumerate() {
+                                pattern_emissions[pid] = emit_from_allele_probs(
+                                    allele,
+                                    allele_probs,
+                                    p_no_err,
+                                    p_err_other,
+                                );
+                            }
+                        } else if let Some(req) = required_allele(m, partner) {
+                            let conf = conf_at(m);
+                            let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+                            let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+                            for (pid, &allele) in seq_alleles.iter().enumerate() {
+                                pattern_emissions[pid] = if allele == req { p_no_err } else { p_err };
+                            }
+                        } else {
+                            pattern_emissions.fill(1.0);
+                        }
+                        for k in 0..n_states {
+                            let pid = state_patterns[k] as usize;
+                            emissions[k] = pattern_emissions.get(pid).copied().unwrap_or(1.0);
+                        }
+                        true
+                    }
+                    GenotypeColumn::Dictionary(dict, offset) => {
+                        let n_patterns = dict.n_patterns();
+                        pattern_emissions.resize(n_patterns, 1.0);
+                        if let Some(allele_probs) = allele_probs_opt {
+                            let n_alleles = allele_probs.len();
+                            let p_no_err = p_no_err_base;
+                            let p_err_other = if n_alleles > 1 {
+                                p_err_base / (n_alleles as f32 - 1.0)
+                            } else {
+                                0.0
+                            };
+                            for pid in 0..n_patterns {
+                                let allele = dict.pattern_allele(*offset, pid);
+                                pattern_emissions[pid] = emit_from_allele_probs(
+                                    allele,
+                                    allele_probs,
+                                    p_no_err,
+                                    p_err_other,
+                                );
+                            }
+                        } else if let Some(req) = required_allele(m, partner) {
+                            let conf = conf_at(m);
+                            let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
+                            let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
+                            for pid in 0..n_patterns {
+                                let allele = dict.pattern_allele(*offset, pid);
+                                pattern_emissions[pid] = if allele == req { p_no_err } else { p_err };
+                            }
+                        } else {
+                            pattern_emissions.fill(1.0);
+                        }
+                        for k in 0..n_states {
+                            let hap = HapIdx::new(state_buf[k].as_u32());
+                            state_patterns[k] = dict.hap_pattern_idx(hap) as u32;
+                            let pid = state_patterns[k] as usize;
+                            emissions[k] = pattern_emissions.get(pid).copied().unwrap_or(1.0);
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            };
+
         let mut process_marker = |m: usize| {
             let row_offset = m * n_states;
             let p_recomb_m = self.p_recomb.get(m).copied().unwrap_or(0.0);
-            fill_ref_alleles(m, &mut ref_alleles);
-            let ref_row = &ref_alleles[..n_states];
+            threaded_haps.materialize_at(m, &mut state_buf);
 
             if let Some(plp) = pl_provider {
                 let partner = partner_alleles.get(m).copied().unwrap_or(255);
@@ -760,23 +906,52 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
                         } else {
                             0.0
                         };
-                        for k in 0..n_states {
-                            emissions[k] = emit_from_allele_probs(
-                                ref_row[k],
-                                &allele_probs,
-                                p_no_err,
-                                p_err_other,
-                            );
+                        let used_pattern = try_fill_pattern_emissions(
+                            m,
+                            partner,
+                            Some(&allele_probs),
+                            &mut emissions,
+                            &state_buf,
+                        );
+                        if !used_pattern {
+                            fill_ref_alleles(m, &mut ref_alleles, &state_buf);
+                            let ref_row = &ref_alleles[..n_states];
+                            for k in 0..n_states {
+                                emissions[k] = emit_from_allele_probs(
+                                    ref_row[k],
+                                    &allele_probs,
+                                    p_no_err,
+                                    p_err_other,
+                                );
+                            }
                         }
                     } else {
-                        fill_conf_emissions(m, partner, &mut emissions, ref_row);
+                        let used_pattern =
+                            try_fill_pattern_emissions(m, partner, None, &mut emissions, &state_buf);
+                        if !used_pattern {
+                            fill_ref_alleles(m, &mut ref_alleles, &state_buf);
+                            let ref_row = &ref_alleles[..n_states];
+                            fill_conf_emissions(m, partner, &mut emissions, ref_row);
+                        }
                     }
                 } else {
-                    fill_conf_emissions(m, partner, &mut emissions, ref_row);
+                    let used_pattern =
+                        try_fill_pattern_emissions(m, partner, None, &mut emissions, &state_buf);
+                    if !used_pattern {
+                        fill_ref_alleles(m, &mut ref_alleles, &state_buf);
+                        let ref_row = &ref_alleles[..n_states];
+                        fill_conf_emissions(m, partner, &mut emissions, ref_row);
+                    }
                 }
             } else {
                 let partner = partner_alleles.get(m).copied().unwrap_or(255);
-                fill_conf_emissions(m, partner, &mut emissions, ref_row);
+                let used_pattern =
+                    try_fill_pattern_emissions(m, partner, None, &mut emissions, &state_buf);
+                if !used_pattern {
+                    fill_ref_alleles(m, &mut ref_alleles, &state_buf);
+                    let ref_row = &ref_alleles[..n_states];
+                    fill_conf_emissions(m, partner, &mut emissions, ref_row);
+                }
             }
 
             if m == 0 {
@@ -819,17 +994,23 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
             }
         };
 
-        let mut m = 0usize;
-        while m + 4 <= n_markers {
-            process_marker(m);
-            process_marker(m + 1);
-            process_marker(m + 2);
-            process_marker(m + 3);
-            m += 4;
-        }
-        while m < n_markers {
-            process_marker(m);
-            m += 1;
+        const TILE_SIZE: usize = 256;
+        let mut tile_start = 0usize;
+        while tile_start < n_markers {
+            let tile_end = (tile_start + TILE_SIZE).min(n_markers);
+            let mut m = tile_start;
+            while m + 4 <= tile_end {
+                process_marker(m);
+                process_marker(m + 1);
+                process_marker(m + 2);
+                process_marker(m + 3);
+                m += 4;
+            }
+            while m < tile_end {
+                process_marker(m);
+                m += 1;
+            }
+            tile_start = tile_end;
         }
 
         let last_row = (n_markers - 1) * n_states;
@@ -838,11 +1019,13 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
             bwd[last_row + k] = init_bwd;
         }
 
-        for m in (0..n_markers - 1).rev() {
-            let m_next = m + 1;
+        let mut tile_end = n_markers;
+        while tile_end > 1 {
+            let tile_start = tile_end.saturating_sub(TILE_SIZE).max(1);
+            for m in (tile_start - 1..tile_end - 1).rev() {
+                let m_next = m + 1;
             let p_recomb_next = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
-            fill_ref_alleles(m_next, &mut ref_alleles);
-            let ref_row = &ref_alleles[..n_states];
+            threaded_haps.materialize_at(m_next, &mut state_buf);
 
             if let Some(plp) = pl_provider {
                 let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
@@ -885,23 +1068,52 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
                         } else {
                             0.0
                         };
-                        for k in 0..n_states {
-                            emissions[k] = emit_from_allele_probs(
-                                ref_row[k],
-                                &allele_probs,
-                                p_no_err,
-                                p_err_other,
-                            );
+                        let used_pattern = try_fill_pattern_emissions(
+                            m_next,
+                            partner,
+                            Some(&allele_probs),
+                            &mut emissions,
+                            &state_buf,
+                        );
+                        if !used_pattern {
+                            fill_ref_alleles(m_next, &mut ref_alleles, &state_buf);
+                            let ref_row = &ref_alleles[..n_states];
+                            for k in 0..n_states {
+                                emissions[k] = emit_from_allele_probs(
+                                    ref_row[k],
+                                    &allele_probs,
+                                    p_no_err,
+                                    p_err_other,
+                                );
+                            }
                         }
                     } else {
-                        fill_conf_emissions(m_next, partner, &mut emissions, ref_row);
+                        let used_pattern =
+                            try_fill_pattern_emissions(m_next, partner, None, &mut emissions, &state_buf);
+                        if !used_pattern {
+                            fill_ref_alleles(m_next, &mut ref_alleles, &state_buf);
+                            let ref_row = &ref_alleles[..n_states];
+                            fill_conf_emissions(m_next, partner, &mut emissions, ref_row);
+                        }
                     }
                 } else {
-                    fill_conf_emissions(m_next, partner, &mut emissions, ref_row);
+                    let used_pattern =
+                        try_fill_pattern_emissions(m_next, partner, None, &mut emissions, &state_buf);
+                    if !used_pattern {
+                        fill_ref_alleles(m_next, &mut ref_alleles, &state_buf);
+                        let ref_row = &ref_alleles[..n_states];
+                        fill_conf_emissions(m_next, partner, &mut emissions, ref_row);
+                    }
                 }
             } else {
                 let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
-                fill_conf_emissions(m_next, partner, &mut emissions, ref_row);
+                let used_pattern =
+                    try_fill_pattern_emissions(m_next, partner, None, &mut emissions, &state_buf);
+                if !used_pattern {
+                    fill_ref_alleles(m_next, &mut ref_alleles, &state_buf);
+                    let ref_row = &ref_alleles[..n_states];
+                    fill_conf_emissions(m_next, partner, &mut emissions, ref_row);
+                }
             }
 
             let next_row = m_next * n_states;
@@ -917,13 +1129,15 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
                 constant_term += current_bwd[k] * emissions[k];
             }
 
-            HmmUpdater::bwd_update_constant(
-                &mut bwd[curr_row..curr_row + n_states],
-                p_recomb_next,
-                &emissions,
-                constant_term,
-                n_states,
-            );
+                HmmUpdater::bwd_update_constant(
+                    &mut bwd[curr_row..curr_row + n_states],
+                    p_recomb_next,
+                    &emissions,
+                    constant_term,
+                    n_states,
+                );
+            }
+            tile_end = tile_start;
         }
 
         log_likelihood
@@ -1241,6 +1455,7 @@ mod tests {
             &target_alleles,
             &target_alleles,
             &target_alleles,
+            None,
             None,
             None,
             None,

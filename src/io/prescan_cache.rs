@@ -102,6 +102,32 @@ impl PackedRefColumn {
         }
     }
 
+    pub fn counts_biallelic(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            PackedRefColumn::Bits {
+                bits,
+                n_haps,
+                words,
+                missing,
+            } => {
+                if *bits != 1 {
+                    return None;
+                }
+                let mut ones = 0usize;
+                let mut missing_count = 0usize;
+                for (i, word) in words.iter().enumerate() {
+                    let miss = missing.get(i).copied().unwrap_or(0);
+                    ones += (word & !miss).count_ones() as usize;
+                    missing_count += miss.count_ones() as usize;
+                }
+                let total = *n_haps;
+                let zeros = total.saturating_sub(ones + missing_count);
+                Some((zeros, ones, missing_count))
+            }
+            _ => None,
+        }
+    }
+
     pub fn pack_from_column<Space>(
         marker_idx: MarkerIdx<Space>,
         markers: &Markers<Space>,
