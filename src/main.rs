@@ -222,6 +222,35 @@ fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
                 writeln!(file, "  {:>6.2}%  {:>8}  {}", pct, count, name).ok();
             }
 
+            let mut stacks: Vec<(String, i64)> = Vec::new();
+            for (key, value) in report.data.iter() {
+                let mut stack = String::new();
+                stack.push_str(&key.thread_name_or_id());
+                stack.push_str(" :: ");
+                let mut first = true;
+                for frame in key.frames.iter().rev() {
+                    for symbol in frame.iter().rev() {
+                        if !first {
+                            stack.push_str(" <- ");
+                        }
+                        first = false;
+                        stack.push_str(&format!("{}", symbol));
+                    }
+                }
+                stacks.push((stack, *value as i64));
+            }
+            stacks.sort_by(|a, b| b.1.cmp(&a.1));
+            writeln!(file).ok();
+            writeln!(file, "Top stacks (thread :: root <- leaf):").ok();
+            for (stack, count) in stacks.iter().take(50) {
+                let pct = if total_samples > 0 {
+                    (count * 100) as f64 / total_samples as f64
+                } else {
+                    0.0
+                };
+                writeln!(file, "  {:>6.2}%  {:>8}  {}", pct, count, stack).ok();
+            }
+
             eprintln!("pprof summary written to {}", text_output_path);
         }
         Err(err) => {
