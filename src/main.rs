@@ -199,16 +199,6 @@ fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
 
             let mut threads: Vec<(String, i64)> = per_thread.into_iter().collect();
             threads.sort_by(|a, b| b.1.cmp(&a.1));
-            writeln!(file, "Top threads:").ok();
-            for (name, count) in threads.iter().take(10) {
-                let pct = if total_samples > 0 {
-                    (count * 100) as f64 / total_samples as f64
-                } else {
-                    0.0
-                };
-                writeln!(file, "  {:>6.2}%  {:>8}  {}", pct, count, name).ok();
-            }
-            writeln!(file).ok();
 
             let mut symbols: Vec<(String, i64)> = per_symbol.into_iter().collect();
             symbols.sort_by(|a, b| b.1.cmp(&a.1));
