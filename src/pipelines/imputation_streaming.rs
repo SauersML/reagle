@@ -1588,8 +1588,19 @@ impl crate::pipelines::ImputationPipeline {
     let mut phased_recomb_intensity: Option<f32> = None;
     if !is_vcf_fully_phased(&phased_target_path)? {
         eprintln!("Target is unphased; running phasing before pre-scan...");
-        let tmpdir = tempfile::tempdir()?;
-        let phased_prefix = tmpdir.path().join("phased_target");
+        let phased_prefix = if self.config.out.as_os_str() != "-" {
+            let out = &self.config.out;
+            let parent = out.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let stem = out
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("reagle_out"));
+            parent.join(format!("{}_phased_target", stem.to_string_lossy()))
+        } else {
+            let tmpdir = tempfile::tempdir()?;
+            let prefix = tmpdir.path().join("phased_target");
+            phased_tmp = Some(tmpdir);
+            prefix
+        };
         let mut phase_config = self.config.clone();
         phase_config.gt = input_target_path.clone();
         phase_config.r#ref = Some(ref_path.to_path_buf());
@@ -1601,7 +1612,9 @@ impl crate::pipelines::ImputationPipeline {
         phasing.run()?;
         phased_recomb_intensity = Some(phasing.params().recomb_intensity);
         phased_target_path = phased_prefix.with_extension("vcf.gz");
-        phased_tmp = Some(tmpdir);
+        if phased_tmp.is_none() {
+            eprintln!("Phased target saved at {:?}", phased_target_path);
+        }
     } else {
         eprintln!("Target already phased; skipping phasing before pre-scan.");
     }
