@@ -1798,6 +1798,46 @@ fn calculate_brier_score(gp: [f64; 3], truth_gt: &str) -> f64 {
     (gp[0] - truth_vec[0]).powi(2) + (gp[1] - truth_vec[1]).powi(2) + (gp[2] - truth_vec[2]).powi(2)
 }
 
+fn summarize_gp(
+    imputed_records: &[ParsedRecord],
+    truth_map: &HashMap<(String, u64, usize), String>,
+) -> (usize, f64, f64) {
+    let mut count = 0usize;
+    let mut max_sum = 0.0f64;
+    let mut truth_sum = 0.0f64;
+
+    for record in imputed_records {
+        for (sample_idx, gt) in record.genotypes.iter().enumerate() {
+            let key = (record.chrom.clone(), record.pos, sample_idx);
+            if truth_map.get(&key).is_none() {
+                continue;
+            }
+            let Some(gp) = gt.gp else {
+                continue;
+            };
+            count += 1;
+            max_sum += gp.iter().cloned().fold(0.0, f64::max);
+            let truth_prob = match normalize_gt_unphased(truth_map.get(&key).unwrap()).as_str()
+            {
+                "0/0" => gp[0],
+                "0/1" | "1/0" => gp[1],
+                "1/1" => gp[2],
+                _ => 0.0,
+            };
+            truth_sum += truth_prob;
+        }
+    }
+
+    if count == 0 {
+        return (0, 0.0, 0.0);
+    }
+    (
+        count,
+        max_sum / count as f64,
+        truth_sum / count as f64,
+    )
+}
+
 /// Calculate imputation accuracy comparing imputed VCF against truth
 fn evaluate_imputation(
     imputed_records: &[ParsedRecord],
@@ -1966,6 +2006,8 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
     // Evaluate both against ground truth
     let java_acc = evaluate_imputation(&java_records, &truth_map, &target_records);
     let rust_acc = evaluate_imputation(&rust_records, &truth_map, &target_records);
+    let (java_gp_n, java_gp_max, java_gp_truth) = summarize_gp(&java_records, &truth_map);
+    let (rust_gp_n, rust_gp_max, rust_gp_truth) = summarize_gp(&rust_records, &truth_map);
 
     // Print results side-by-side
     println!("\n=== [{}] Mask-and-Recover: Rust vs Java ===", source.name);
@@ -1982,6 +2024,24 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
         "Brier Score",
         java_acc.brier_score(),
         rust_acc.brier_score()
+    );
+    println!(
+        "{:<25} {:>12.4} {:>12.4}",
+        "Mean max GP",
+        java_gp_max,
+        rust_gp_max
+    );
+    println!(
+        "{:<25} {:>12} {:>12}",
+        "GP samples",
+        java_gp_n,
+        rust_gp_n
+    );
+    println!(
+        "{:<25} {:>12.4} {:>12.4}",
+        "Mean truth GP",
+        java_gp_truth,
+        rust_gp_truth
     );
     println!(
         "{:<25} {:>12.3} {:>12.3}",
@@ -3093,6 +3153,8 @@ fn test_diverse_mask_scenarios() {
 
         let java_acc = evaluate_imputation(&java_records, &truth_map, &target_records);
         let rust_acc = evaluate_imputation(&rust_records, &truth_map, &target_records);
+        let (java_gp_n, java_gp_max, java_gp_truth) = summarize_gp(&java_records, &truth_map);
+        let (rust_gp_n, rust_gp_max, rust_gp_truth) = summarize_gp(&rust_records, &truth_map);
 
         // Print results
         println!("\n{:<25} {:>12} {:>12}", "Metric", "Java", "Rust");
@@ -3108,6 +3170,88 @@ fn test_diverse_mask_scenarios() {
             "Brier Score",
             java_acc.brier_score(),
             rust_acc.brier_score()
+        );
+        println!(
+            "{:<25} {:>12.4} {:>12.4}",
+            "Mean max GP",
+            java_gp_max,
+            rust_gp_max
+        );
+        println!(
+            "{:<25} {:>12} {:>12}",
+            "GP samples",
+            java_gp_n,
+            rust_gp_n
+        );
+        println!(
+            "{:<25} {:>12.4} {:>12.4}",
+            "Mean truth GP",
+            java_gp_truth,
+            rust_gp_truth
+        );
+        let mut keys: Vec<(String, u64, usize)> = truth_map.keys().cloned().collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        println!("Sample GP comparisons (first 5 masked sites):");
+        for key in keys.into_iter().take(5) {
+            let truth_gt = truth_map.get(&key).cloned().unwrap_or_default();
+            let java_gp = java_records
+                .iter()
+                .find(|r| r.chrom == key.0 && r.pos == key.1)
+                .and_then(|r| r.genotypes.get(key.2))
+                .and_then(|g| g.gp);
+            let rust_gp = rust_records
+                .iter()
+                .find(|r| r.chrom == key.0 && r.pos == key.1)
+                .and_then(|r| r.genotypes.get(key.2))
+                .and_then(|g| g.gp);
+            println!(
+                "  {}:{} sample {} truth={} java_gp={:?} rust_gp={:?}",
+                key.0, key.1, key.2, truth_gt, java_gp, rust_gp
+            );
+        }
+
+        let mut java_ok_rust_bad = Vec::new();
+        for (key, truth_gt) in truth_map.iter() {
+            let truth_norm = normalize_gt_unphased(truth_gt);
+            let java_gt = java_records
+                .iter()
+                .find(|r| r.chrom == key.0 && r.pos == key.1)
+                .and_then(|r| r.genotypes.get(key.2))
+                .map(|g| normalize_gt_unphased(&g.gt));
+            let rust_gt = rust_records
+                .iter()
+                .find(|r| r.chrom == key.0 && r.pos == key.1)
+                .and_then(|r| r.genotypes.get(key.2))
+                .map(|g| normalize_gt_unphased(&g.gt));
+            let java_ok = java_gt.as_deref() == Some(truth_norm.as_str());
+            let rust_ok = rust_gt.as_deref() == Some(truth_norm.as_str());
+            if java_ok && !rust_ok {
+                java_ok_rust_bad.push((key.clone(), truth_norm, java_gt, rust_gt));
+            }
+        }
+        if !java_ok_rust_bad.is_empty() {
+            println!(
+                "Java-correct/Rust-wrong examples (first 5 of {}):",
+                java_ok_rust_bad.len()
+            );
+            for (key, truth_norm, java_gt, rust_gt) in java_ok_rust_bad.into_iter().take(5) {
+                println!(
+                    "  {}:{} sample {} truth={} java_gt={:?} rust_gt={:?}",
+                    key.0, key.1, key.2, truth_norm, java_gt, rust_gt
+                );
+            }
+        }
+        println!(
+            "{:<25} {:>12.4} {:>12.4}",
+            "Mean max GP",
+            java_gp_max,
+            rust_gp_max
+        );
+        println!(
+            "{:<25} {:>12.4} {:>12.4}",
+            "Mean truth GP",
+            java_gp_truth,
+            rust_gp_truth
         );
 
         // Strict assertions (zero tolerance)

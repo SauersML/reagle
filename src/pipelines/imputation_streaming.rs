@@ -16,7 +16,7 @@ use tracing::{info_span, instrument, warn};
 use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
-use crate::data::storage::phase_state::Phased;
+use crate::data::storage::phase_state::{Phased, PhaseState};
 use crate::data::{HapIdx, MarkerIdx, SampleIdx};
 use crate::error::ReagleError;
 use crate::error::Result;
@@ -62,6 +62,64 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
         push_unique(&mut candidates, format!("CHR{}", chrom));
     }
     candidates
+}
+
+fn mask_phased_with_missing<TargetSpace, OrigPhaseState>(
+    phased: &GenotypeMatrix<Phased, TargetSpace>,
+    original: &GenotypeMatrix<OrigPhaseState, TargetSpace>,
+) -> GenotypeMatrix<Phased, TargetSpace>
+where
+    OrigPhaseState: PhaseState,
+{
+    if phased.n_markers() != original.n_markers()
+        || phased.n_haplotypes() != original.n_haplotypes()
+    {
+        return phased.clone();
+    }
+
+    let n_markers = phased.n_markers();
+    let n_haps = phased.n_haplotypes();
+    let mut has_missing = false;
+    'scan: for m in 0..n_markers {
+        let m_idx = MarkerIdx::new(m as u32);
+        for h in 0..n_haps {
+            let h_idx = HapIdx::new(h as u32);
+            if original.allele(m_idx, h_idx) == 255 {
+                has_missing = true;
+                break 'scan;
+            }
+        }
+    }
+    if !has_missing {
+        return phased.clone();
+    }
+
+    let markers = phased.markers().clone();
+    let samples = phased.samples_arc();
+    let mut columns: Vec<GenotypeColumn> = Vec::with_capacity(n_markers);
+    for m in 0..n_markers {
+        let m_idx = MarkerIdx::new(m as u32);
+        let n_alleles = markers.marker(m_idx).n_alleles().max(1);
+        let mut alleles: Vec<u8> = Vec::with_capacity(n_haps);
+        for h in 0..n_haps {
+            let h_idx = HapIdx::new(h as u32);
+            let mut allele = phased.allele(m_idx, h_idx);
+            if original.allele(m_idx, h_idx) == 255 {
+                allele = 255;
+            }
+            alleles.push(allele);
+        }
+        columns.push(GenotypeColumn::from_alleles(&alleles, n_alleles));
+    }
+
+    GenotypeMatrix::new_phased_with_confidence_and_likelihoods(
+        markers,
+        columns,
+        samples,
+        phased.confidence_clone(),
+        phased.likelihoods_pl_arc(),
+    )
+    .with_phase_confidence(phased.phase_confidence_clone())
 }
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -1608,11 +1666,16 @@ impl crate::pipelines::ImputationPipeline {
                 &ref_window.markers,
             );
 
-            let phased_target = target_window.genotypes.clone().into_phased();
+            let mut phased_target = target_window.genotypes.clone().into_phased();
             let phased_target_pl = target_window_pl
                 .as_ref()
                 .map(|w| w.genotypes.clone().into_phased());
-
+            if target_was_unphased_for_impute {
+                if let Some(orig_win) = target_window_pl.as_ref() {
+                    phased_target =
+                        mask_phased_with_missing(&phased_target, &orig_win.genotypes);
+                }
+            }
             if !header_written {
                 writer.write_header_extended(&ref_window.markers, true, self.config.gp, self.config.ap)?;
                 header_written = true;
@@ -1955,13 +2018,10 @@ impl crate::pipelines::ImputationPipeline {
             let mut probs2: Vec<f32> = Vec::new();
             offsets1.push(0);
             offsets2.push(0);
-
-            let mut dbg_het = 0usize;
-            let mut dbg_het_conf_sum = 0.0f32;
-            let mut dbg_het_conf_low = 0usize;
             let mut dbg_genotyped = 0usize;
-            let mut dbg_uniform_h1 = 0usize;
-            let mut dbg_uniform_h2 = 0usize;
+            let mut dbg_hard_used = 0usize;
+            let mut dbg_pl_present_with_hard = 0usize;
+            let mut dbg_pl_uniform_with_hard = 0usize;
             let is_uniform = |vals: &[f32]| -> bool {
                 if vals.len() <= 1 {
                     return true;
@@ -2023,6 +2083,7 @@ impl crate::pipelines::ImputationPipeline {
                         && (mapped1 as usize) < n_alleles
                         && (!is_diploid
                             || (mapped2 != 255 && (mapped2 as usize) < n_alleles));
+
                     // If phase confidence is unavailable (unphased input), we still
                     // use hard genotype information but avoid committing to a phase:
                     // heterozygotes are represented as 0.5/0.5 per haplotype.
@@ -2234,8 +2295,10 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     };
 
-                    compute_from_pl(allele2, &mut aligned1, &mut use1);
-                    compute_from_pl(allele1, &mut aligned2, &mut use2);
+                    if !has_hard {
+                        compute_from_pl(allele2, &mut aligned1, &mut use1);
+                        compute_from_pl(allele1, &mut aligned2, &mut use2);
+                    }
 
                     if !use1 && has_hard {
                         if pl.is_none() || pl.as_ref().map_or(true, |v| v.is_empty()) {
@@ -2252,13 +2315,6 @@ impl crate::pipelines::ImputationPipeline {
                                     .clamp(0.0, 1.0);
                                 aligned1[mapped1 as usize] = phase_conf;
                                 aligned1[mapped2 as usize] = 1.0 - phase_conf;
-                                if sample_idx == 0 {
-                                    dbg_het += 1;
-                                    dbg_het_conf_sum += phase_conf;
-                                    if phase_conf < 0.55 {
-                                        dbg_het_conf_low += 1;
-                                    }
-                                }
                             } else {
                                 aligned1[mapped1 as usize] = 0.5;
                                 aligned1[mapped2 as usize] = 0.5;
@@ -2296,6 +2352,23 @@ impl crate::pipelines::ImputationPipeline {
 
                     if sample_idx == 0 {
                         dbg_genotyped += 1;
+                        if has_hard && use1 && use2 {
+                            dbg_hard_used += 1;
+                        }
+                        if has_hard {
+                            if let Some(pl_vals) = pl {
+                                if !pl_vals.is_empty() {
+                                    dbg_pl_present_with_hard += 1;
+                                    let mut pl_probs: Vec<f32> = Vec::new();
+                                    if allele_probs_uncond_from_pl(pl_vals, None, &mut pl_probs)
+                                        .is_some()
+                                        && is_uniform(&pl_probs)
+                                    {
+                                        dbg_pl_uniform_with_hard += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -2309,30 +2382,18 @@ impl crate::pipelines::ImputationPipeline {
                 normalize_probs(&mut aligned1);
                 normalize_probs(&mut aligned2);
 
-                if sample_idx == 0 && target_m_idx.is_some() {
-                    if is_uniform(&aligned1) {
-                        dbg_uniform_h1 += 1;
-                    }
-                    if is_uniform(&aligned2) {
-                        dbg_uniform_h2 += 1;
-                    }
-                }
-
                 probs1.extend_from_slice(&aligned1);
                 probs2.extend_from_slice(&aligned2);
                 offsets1.push(probs1.len());
                 offsets2.push(probs2.len());
             }
             if sample_idx == 0 && dbg_genotyped > 0 {
-                let mean_conf = dbg_het_conf_sum / dbg_het.max(1) as f32;
                 eprintln!(
-                    "    [debug] genotyped markers={} hets={} mean_phase_conf={:.3} het_conf<0.55={} uniform_h1={} uniform_h2={}",
+                    "    [debug] genotyped markers={} hard_used={} pl_present_with_hard={} pl_uniform_with_hard={}",
                     dbg_genotyped,
-                    dbg_het,
-                    mean_conf,
-                    dbg_het_conf_low,
-                    dbg_uniform_h1,
-                    dbg_uniform_h2
+                    dbg_hard_used,
+                    dbg_pl_present_with_hard,
+                    dbg_pl_uniform_with_hard
                 );
             }
             (
@@ -2900,6 +2961,11 @@ impl crate::pipelines::ImputationPipeline {
         let use_hard_call_fallback = !correct_errors;
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
             let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
+            // If the target genotype is missing at this marker, defer to imputation
+            // posteriors instead of GL/PL-derived genotype probabilities.
+            if get_genotyped_alleles(marker_idx, sample_idx).is_none() {
+                return None;
+            }
             let pl_opt = target_pl.sample_pl(target_m, sample_idx);
 
             if let Some(pl) = pl_opt {
