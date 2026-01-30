@@ -1,4 +1,4 @@
-use crate::model::pbwt::PbwtDivUpdater;
+use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
 
 const MAX_RANK_INTERVALS: usize = 8;
 
@@ -65,23 +65,31 @@ impl RankBeam {
     }
 }
 
-pub struct ReferencePbwt {
-    updater: PbwtDivUpdater,
-    ppa: Vec<u32>,
+pub struct ReferencePbwtImpl<I: PbwtIndex> {
+    updater: PbwtDivUpdater<I>,
+    ppa: Vec<I>,
     div: Vec<i32>,
     permuted_ref: Vec<u8>,
+    permuted_bits: Vec<u64>,
+    permuted_missing_bits: Vec<u64>,
+    prefix_ones_words: Vec<u32>,
+    prefix_missing_words: Vec<u32>,
     prefix_counts: Vec<u32>,
     counts: Vec<u32>,
     offsets: Vec<u32>,
 }
 
-impl ReferencePbwt {
+impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     pub fn new(n_ref_haps: usize) -> Self {
         Self {
             updater: PbwtDivUpdater::new(n_ref_haps),
-            ppa: (0..n_ref_haps as u32).collect(),
+            ppa: (0..n_ref_haps).map(I::from_usize).collect(),
             div: vec![0; n_ref_haps],
             permuted_ref: vec![0; n_ref_haps],
+            permuted_bits: Vec::new(),
+            permuted_missing_bits: Vec::new(),
+            prefix_ones_words: Vec::new(),
+            prefix_missing_words: Vec::new(),
             prefix_counts: Vec::new(),
             counts: Vec::new(),
             offsets: Vec::new(),
@@ -115,13 +123,13 @@ impl ReferencePbwt {
             while out.len() < k && (left > l || right < r) {
                 if left > l {
                     left -= 1;
-                    out.push(self.ppa[left]);
+                    out.push(self.ppa[left].to_u32());
                     if out.len() >= k {
                         break;
                     }
                 }
                 if right < r {
-                    out.push(self.ppa[right]);
+                    out.push(self.ppa[right].to_u32());
                     right += 1;
                 }
             }
@@ -167,11 +175,48 @@ impl ReferencePbwt {
         }
     }
 
+    fn ensure_bit_buffers(&mut self) {
+        let n_ref = self.ppa.len();
+        let n_words = (n_ref + 63) / 64;
+        if self.permuted_bits.len() < n_words {
+            self.permuted_bits.resize(n_words, 0);
+            self.permuted_missing_bits.resize(n_words, 0);
+            self.prefix_ones_words.resize(n_words + 1, 0);
+            self.prefix_missing_words.resize(n_words + 1, 0);
+        }
+    }
+
     fn prefix_idx(bin: usize, pos: usize, n_ref: usize) -> usize {
         bin * (n_ref + 1) + pos
     }
 
-    fn rank(&self, bin: usize, pos: u32, n_ref: usize) -> u32 {
+    fn rank(&self, bin: usize, pos: u32, n_ref: usize, n_alleles: usize) -> u32 {
+        if n_alleles == 2 {
+            let p = pos.min(n_ref as u32) as usize;
+            let n_words = self.permuted_bits.len();
+            let word = p / 64;
+            let bit = p % 64;
+            let mask = if bit == 0 { 0 } else { (1u64 << bit) - 1 };
+            let base_word = word.min(n_words.saturating_sub(1));
+            let ones_base = self.prefix_ones_words[word.min(n_words)];
+            let missing_base = self.prefix_missing_words[word.min(n_words)];
+            let ones = if word >= n_words {
+                ones_base
+            } else {
+                ones_base + (self.permuted_bits[base_word] & mask).count_ones()
+            };
+            let missing = if word >= n_words {
+                missing_base
+            } else {
+                missing_base + (self.permuted_missing_bits[base_word] & mask).count_ones()
+            };
+            let zeros = p as u32 - ones - missing;
+            return match bin {
+                0 => zeros,
+                1 => missing,
+                _ => ones,
+            };
+        }
         let p = pos.min(n_ref as u32) as usize;
         self.prefix_counts[Self::prefix_idx(bin, p, n_ref)]
     }
@@ -212,37 +257,87 @@ impl ReferencePbwt {
     pub fn prepare_step(&mut self, ref_alleles: &[u8], n_alleles: usize) {
         let n_ref = self.ppa.len();
         let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
-        self.ensure_buffers(n_bins);
+        if n_alleles == 2 {
+            self.ensure_bit_buffers();
+            let n_words = (n_ref + 63) / 64;
+            let mut count1 = 0u32;
+            let mut count_miss = 0u32;
+            let mut idx = 0usize;
 
-        for i in 0..n_ref {
-            self.permuted_ref[i] = ref_alleles[self.ppa[i] as usize];
-        }
-
-        self.counts[..n_bins].fill(0);
-        for &a in &self.permuted_ref {
-            let b = Self::bin_for_allele(a, n_alleles);
-            if b < n_bins {
-                self.counts[b] += 1;
-            }
-        }
-
-        let mut running = 0u32;
-        for b in 0..n_bins {
-            self.offsets[b] = running;
-            running += self.counts[b];
-        }
-
-        for b in 0..n_bins {
-            let mut c = 0u32;
-            let base = b * (n_ref + 1);
-            self.prefix_counts[base] = 0;
-            for i in 0..n_ref {
-                let a = self.permuted_ref[i];
-                let bin = Self::bin_for_allele(a, n_alleles);
-                if bin == b {
-                    c += 1;
+            for w in 0..n_words {
+                let mut bits = 0u64;
+                let mut miss = 0u64;
+                let block_end = (idx + 64).min(n_ref);
+                let mut bit = 0u64;
+                while idx < block_end {
+                    let allele = ref_alleles[self.ppa[idx].to_usize()];
+                    if allele == 1 {
+                        bits |= 1u64 << bit;
+                    } else if allele > 1 {
+                        miss |= 1u64 << bit;
+                    }
+                    idx += 1;
+                    bit += 1;
                 }
-                self.prefix_counts[base + i + 1] = c;
+                self.permuted_bits[w] = bits;
+                self.permuted_missing_bits[w] = miss;
+                count1 += bits.count_ones();
+                count_miss += miss.count_ones();
+            }
+
+            self.counts[..n_bins].fill(0);
+            let count0 = n_ref as u32 - count1 - count_miss;
+            self.counts[0] = count0;
+            self.counts[1] = count_miss;
+            self.counts[2] = count1;
+
+            let mut running = 0u32;
+            for b in 0..n_bins {
+                self.offsets[b] = running;
+                running += self.counts[b];
+            }
+
+            self.prefix_ones_words[0] = 0;
+            self.prefix_missing_words[0] = 0;
+            for w in 0..n_words {
+                self.prefix_ones_words[w + 1] =
+                    self.prefix_ones_words[w] + self.permuted_bits[w].count_ones();
+                self.prefix_missing_words[w + 1] =
+                    self.prefix_missing_words[w] + self.permuted_missing_bits[w].count_ones();
+            }
+        } else {
+            self.ensure_buffers(n_bins);
+
+            for i in 0..n_ref {
+                self.permuted_ref[i] = ref_alleles[self.ppa[i].to_usize()];
+            }
+
+            self.counts[..n_bins].fill(0);
+            for &a in &self.permuted_ref {
+                let b = Self::bin_for_allele(a, n_alleles);
+                if b < n_bins {
+                    self.counts[b] += 1;
+                }
+            }
+
+            let mut running = 0u32;
+            for b in 0..n_bins {
+                self.offsets[b] = running;
+                running += self.counts[b];
+            }
+
+            for b in 0..n_bins {
+                let mut c = 0u32;
+                let base = b * (n_ref + 1);
+                self.prefix_counts[base] = 0;
+                for i in 0..n_ref {
+                    let a = self.permuted_ref[i];
+                    let bin = Self::bin_for_allele(a, n_alleles);
+                    if bin == b {
+                        c += 1;
+                    }
+                    self.prefix_counts[base + i + 1] = c;
+                }
             }
         }
     }
@@ -275,8 +370,8 @@ impl ReferencePbwt {
                 scratch.clear();
                 for &(l, r) in old.intervals() {
                     for b in 0..n_bins {
-                        let nl = self.offsets[b] + self.rank(b, l, n_ref);
-                        let nr = self.offsets[b] + self.rank(b, r, n_ref);
+                        let nl = self.offsets[b] + self.rank(b, l, n_ref, n_alleles);
+                        let nr = self.offsets[b] + self.rank(b, r, n_ref, n_alleles);
                         if nl < nr {
                             let len = nr - nl;
                             let score = len.saturating_mul(self.counts[b]);
@@ -295,8 +390,8 @@ impl ReferencePbwt {
                 let b = Self::bin_for_allele(qa, n_alleles);
                 if b < n_bins {
                     for &(l, r) in old.intervals() {
-                        let nl = self.offsets[b] + self.rank(b, l, n_ref);
-                        let nr = self.offsets[b] + self.rank(b, r, n_ref);
+                        let nl = self.offsets[b] + self.rank(b, l, n_ref, n_alleles);
+                        let nr = self.offsets[b] + self.rank(b, r, n_ref, n_alleles);
                         next.push_interval(nl, nr);
                     }
                 } else {
@@ -307,8 +402,8 @@ impl ReferencePbwt {
                     scratch.clear();
                     for &(l, r) in old.intervals() {
                         for b in 0..n_bins {
-                            let nl = self.offsets[b] + self.rank(b, l, n_ref);
-                            let nr = self.offsets[b] + self.rank(b, r, n_ref);
+                        let nl = self.offsets[b] + self.rank(b, l, n_ref, n_alleles);
+                        let nr = self.offsets[b] + self.rank(b, r, n_ref, n_alleles);
                             if nl < nr {
                                 let len = nr - nl;
                                 let score = len.saturating_mul(self.counts[b]);
@@ -334,6 +429,55 @@ impl ReferencePbwt {
     pub fn finalize_step(&mut self, ref_alleles: &[u8], n_alleles: usize, marker: usize) {
         self.updater
             .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
+    }
+
+}
+
+pub enum ReferencePbwt {
+    U16(ReferencePbwtImpl<u16>),
+    U32(ReferencePbwtImpl<u32>),
+}
+
+impl ReferencePbwt {
+    pub fn new(n_ref_haps: usize) -> Self {
+        if n_ref_haps <= u16::MAX as usize {
+            Self::U16(ReferencePbwtImpl::<u16>::new(n_ref_haps))
+        } else {
+            Self::U32(ReferencePbwtImpl::<u32>::new(n_ref_haps))
+        }
+    }
+
+    pub fn select_donors(&self, beam: &RankBeam, k: usize) -> Vec<u32> {
+        match self {
+            Self::U16(inner) => inner.select_donors(beam, k),
+            Self::U32(inner) => inner.select_donors(beam, k),
+        }
+    }
+
+    pub fn advance_with_beams(
+        &mut self,
+        ref_alleles: &[u8],
+        n_alleles: usize,
+        marker: usize,
+        query_alleles: &[u8],
+        beams: &mut [RankBeam],
+    ) {
+        match self {
+            Self::U16(inner) => inner.advance_with_beams(
+                ref_alleles,
+                n_alleles,
+                marker,
+                query_alleles,
+                beams,
+            ),
+            Self::U32(inner) => inner.advance_with_beams(
+                ref_alleles,
+                n_alleles,
+                marker,
+                query_alleles,
+                beams,
+            ),
+        }
     }
 
 }

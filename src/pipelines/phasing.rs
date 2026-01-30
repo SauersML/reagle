@@ -272,25 +272,38 @@ fn compute_ref_freqs<TargetSpace, RefSpace>(
     target_gt: &GenotypeMatrix<impl crate::data::storage::phase_state::PhaseState, TargetSpace>,
     ref_columns: &[GenotypeColumn],
     alignment: Option<&MarkerAlignment<TargetSpace, RefSpace>>,
+    marker_map: Option<&[usize]>,
+    ref_index_map: Option<&[usize]>,
+    n_markers: usize,
 ) -> Vec<Vec<f32>> {
-    let n_markers = target_gt.n_markers();
     let n_ref_haps = ref_columns
         .first()
         .map(|c| c.n_haplotypes())
         .unwrap_or(0);
     let mut freqs: Vec<Vec<f32>> = Vec::with_capacity(n_markers);
     for m in 0..n_markers {
+        let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
         let n_alleles = target_gt
             .markers()
-            .marker(MarkerIdx::new(m as u32))
+            .marker(MarkerIdx::new(orig_m as u32))
             .n_alleles();
         let mut counts = vec![0u32; n_alleles.max(1)];
         let mut total = 0u32;
         if let Some(alignment) = alignment {
-            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
+            if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                let ref_idx = if let Some(map) = ref_index_map {
+                    let idx = map[ref_m.as_usize()];
+                    if idx == usize::MAX {
+                        freqs.push(vec![0.0f32; counts.len()]);
+                        continue;
+                    }
+                    idx
+                } else {
+                    ref_m.as_usize()
+                };
                 for rh in 0..n_ref_haps {
-                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
-                    let mapped = alignment.reverse_map_allele(m, ref_a);
+                    let ref_a = ref_columns[ref_idx].get(HapIdx::new(rh as u32));
+                    let mapped = alignment.reverse_map_allele(orig_m, ref_a);
                     if mapped == 255 {
                         continue;
                     }
@@ -301,9 +314,27 @@ fn compute_ref_freqs<TargetSpace, RefSpace>(
                     }
                 }
             }
-        } else if m < ref_columns.len() {
+        } else {
+            let ref_idx = if let Some(map) = ref_index_map {
+                if orig_m >= map.len() {
+                    freqs.push(vec![0.0f32; counts.len()]);
+                    continue;
+                }
+                let idx = map[orig_m];
+                if idx == usize::MAX {
+                    freqs.push(vec![0.0f32; counts.len()]);
+                    continue;
+                }
+                idx
+            } else {
+                if orig_m >= ref_columns.len() {
+                    freqs.push(vec![0.0f32; counts.len()]);
+                    continue;
+                }
+                orig_m
+            };
             for rh in 0..n_ref_haps {
-                let ref_a = ref_columns[m].get(HapIdx::new(rh as u32));
+                let ref_a = ref_columns[ref_idx].get(HapIdx::new(rh as u32));
                 if ref_a == 255 {
                     continue;
                 }
@@ -338,6 +369,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
     window_scores: &mut [Vec<f32>],
     exclude_self: bool,
     marker_map: Option<&[usize]>,
+    ref_index_map: Option<&[usize]>,
 ) {
     let n_ref_haps = ref_columns
         .first()
@@ -371,19 +403,45 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
 
         if let Some(alignment) = alignment {
             if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                let ref_idx = if let Some(map) = ref_index_map {
+                    let idx = map[ref_m.as_usize()];
+                    if idx == usize::MAX {
+                        ref_alleles.fill(255);
+                        continue;
+                    }
+                    idx
+                } else {
+                    ref_m.as_usize()
+                };
                 for rh in 0..n_ref_haps {
-                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                    let ref_a = ref_columns[ref_idx].get(HapIdx::new(rh as u32));
                     ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
                 }
             } else {
                 ref_alleles.fill(255);
             }
-        } else if orig_m < ref_columns.len() {
-            for rh in 0..n_ref_haps {
-                ref_alleles[rh] = ref_columns[orig_m].get(HapIdx::new(rh as u32));
-            }
         } else {
-            ref_alleles.fill(255);
+            let ref_idx = if let Some(map) = ref_index_map {
+                if orig_m >= map.len() {
+                    ref_alleles.fill(255);
+                    continue;
+                }
+                let idx = map[orig_m];
+                if idx == usize::MAX {
+                    ref_alleles.fill(255);
+                    continue;
+                }
+                idx
+            } else {
+                if orig_m >= ref_columns.len() {
+                    ref_alleles.fill(255);
+                    continue;
+                }
+                orig_m
+            };
+            for rh in 0..n_ref_haps {
+                ref_alleles[rh] = ref_columns[ref_idx].get(HapIdx::new(rh as u32));
+            }
         }
 
         let mut is_biallelic = true;
@@ -404,7 +462,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     continue;
                 }
                 let freq = freqs
-                    .get(orig_m)
+                    .get(m)
                     .and_then(|f| f.get(targ as usize))
                     .copied()
                     .unwrap_or(0.0);
@@ -451,19 +509,45 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
 
         if let Some(alignment) = alignment {
             if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                let ref_idx = if let Some(map) = ref_index_map {
+                    let idx = map[ref_m.as_usize()];
+                    if idx == usize::MAX {
+                        ref_alleles.fill(255);
+                        continue;
+                    }
+                    idx
+                } else {
+                    ref_m.as_usize()
+                };
                 for rh in 0..n_ref_haps {
-                    let ref_a = ref_columns[ref_m.as_usize()].get(HapIdx::new(rh as u32));
+                    let ref_a = ref_columns[ref_idx].get(HapIdx::new(rh as u32));
                     ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
                 }
             } else {
                 ref_alleles.fill(255);
             }
-        } else if orig_m < ref_columns.len() {
-            for rh in 0..n_ref_haps {
-                ref_alleles[rh] = ref_columns[orig_m].get(HapIdx::new(rh as u32));
-            }
         } else {
-            ref_alleles.fill(255);
+            let ref_idx = if let Some(map) = ref_index_map {
+                if orig_m >= map.len() {
+                    ref_alleles.fill(255);
+                    continue;
+                }
+                let idx = map[orig_m];
+                if idx == usize::MAX {
+                    ref_alleles.fill(255);
+                    continue;
+                }
+                idx
+            } else {
+                if orig_m >= ref_columns.len() {
+                    ref_alleles.fill(255);
+                    continue;
+                }
+                orig_m
+            };
+            for rh in 0..n_ref_haps {
+                ref_alleles[rh] = ref_columns[ref_idx].get(HapIdx::new(rh as u32));
+            }
         }
 
         let mut is_biallelic = true;
@@ -490,7 +574,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     continue;
                 }
                 let freq = freqs
-                    .get(orig_m)
+                    .get(m)
                     .and_then(|f| f.get(targ as usize))
                     .copied()
                     .unwrap_or(0.0);
@@ -1293,6 +1377,36 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample);
 
         let mut mcmc_paths: Vec<Option<MosaicPaths>> = vec![None; n_samples];
+        let ref_gt = self.reference_gt.as_ref().map(|v| v.as_ref());
+        let threaded_haps_vec = if self.config.profile {
+            info_span!("phase_prescan_build", markers = n_hi_freq, samples = n_samples).in_scope(
+                || {
+                    self.build_phasing_prescan_states(
+                        &target_gt,
+                        &geno,
+                        ref_gt,
+                        self.alignment.as_ref(),
+                        n_hi_freq,
+                        n_samples,
+                        &hi_freq_gen_positions,
+                        self.config.imp_step,
+                        Some(&hi_freq_to_orig),
+                    )
+                },
+            )?
+        } else {
+            self.build_phasing_prescan_states(
+                &target_gt,
+                &geno,
+                ref_gt,
+                self.alignment.as_ref(),
+                n_hi_freq,
+                n_samples,
+                &hi_freq_gen_positions,
+                self.config.imp_step,
+                Some(&hi_freq_to_orig),
+            )?
+        };
         let mut stable_main_iters = 0usize;
 
         for it in 0..total_iterations {
@@ -1325,10 +1439,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             let (total_switches, total_phased) = self.run_phase_baum_iteration_stage1(
                 &target_gt,
                 &mut geno,
+                &threaded_haps_vec,
                 &stage1_p_recomb,
                 &stage1_gen_dists,
                 &hi_freq_to_orig,
-                &hi_freq_gen_positions,
                 &stage1_blocks,
                 &ibs2,
                 &mut sample_phases,
@@ -2128,25 +2242,58 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         let n_full_markers = target_gt.n_markers();
-        let ref_columns: Vec<GenotypeColumn> = if let Some(ref_gt) = ref_gt {
-            (0..ref_gt.n_markers())
-                .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
-                .collect()
-        } else {
-            (0..n_full_markers)
-                .map(|m| {
-                    let alleles = target_geno.marker_alleles(m);
+        let (ref_columns, ref_index_map): (Vec<GenotypeColumn>, Option<Vec<usize>>) =
+            if let Some(ref_gt) = ref_gt {
+                let n_ref_markers = ref_gt.n_markers();
+                let mut ref_indices: Vec<usize> = Vec::with_capacity(n_markers);
+                for m in 0..n_markers {
+                    let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
+                    if let Some(alignment) = alignment {
+                        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                            ref_indices.push(ref_m.as_usize());
+                        }
+                    } else if orig_m < n_ref_markers {
+                        ref_indices.push(orig_m);
+                    }
+                }
+                ref_indices.sort_unstable();
+                ref_indices.dedup();
+
+                let mut map = vec![usize::MAX; n_ref_markers];
+                let mut cols: Vec<GenotypeColumn> = Vec::with_capacity(ref_indices.len());
+                for (i, ref_m) in ref_indices.iter().enumerate() {
+                    map[*ref_m] = i;
+                    cols.push(ref_gt.column(MarkerIdx::new(*ref_m as u32)).clone());
+                }
+                (cols, Some(map))
+            } else {
+                let mut map = vec![usize::MAX; n_full_markers];
+                let mut cols: Vec<GenotypeColumn> = Vec::with_capacity(n_markers);
+                for m in 0..n_markers {
+                    let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
+                    if orig_m >= n_full_markers {
+                        continue;
+                    }
+                    let alleles = target_geno.marker_alleles(orig_m);
                     let n_alleles = target_gt
                         .markers()
-                        .marker(MarkerIdx::new(m as u32))
+                        .marker(MarkerIdx::new(orig_m as u32))
                         .n_alleles()
                         .max(1);
-                    GenotypeColumn::from_alleles(&alleles, n_alleles)
-                })
-                .collect()
-        };
+                    map[orig_m] = cols.len();
+                    cols.push(GenotypeColumn::from_alleles(&alleles, n_alleles));
+                }
+                (cols, Some(map))
+            };
 
-        let freqs = compute_ref_freqs(target_gt, &ref_columns, alignment);
+        let freqs = compute_ref_freqs(
+            target_gt,
+            &ref_columns,
+            alignment,
+            marker_map,
+            ref_index_map.as_deref(),
+            n_markers,
+        );
         let avail = available_memory_bytes().unwrap_or(0);
         let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_haps).max(1);
 
@@ -2181,6 +2328,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     &mut window_scores,
                     ref_gt.is_none(),
                     marker_map,
+                    ref_index_map.as_deref(),
                 );
 
                 let top_m = per_window_cap
@@ -2602,10 +2750,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
+        threaded_haps_vec: &[crate::model::states::ThreadedHaps],
         stage1_p_recomb: &[f32],
         stage1_gen_dists: &[f64],
         hi_freq_to_orig: &[usize],
-        hi_freq_gen_positions: &[f64],
         stage1_blocks: &[(usize, usize)],
         ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
@@ -2622,36 +2770,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let n_samples = sample_phases.len();
         let n_hi_freq = hi_freq_to_orig.len();
 
-        let ref_gt = self.reference_gt.as_ref().map(|v| v.as_ref());
-        let threaded_haps_vec = if self.config.profile {
-            info_span!("phase_prescan_build", markers = n_hi_freq, samples = n_samples).in_scope(
-                || {
-                    self.build_phasing_prescan_states(
-                        target_gt,
-                        geno,
-                        ref_gt,
-                        self.alignment.as_ref(),
-                        n_hi_freq,
-                        n_samples,
-                        hi_freq_gen_positions,
-                        self.config.imp_step,
-                        Some(hi_freq_to_orig),
-                    )
-                },
-            )?
-        } else {
-            self.build_phasing_prescan_states(
-                target_gt,
-                geno,
-                ref_gt,
-                self.alignment.as_ref(),
-                n_hi_freq,
-                n_samples,
-                hi_freq_gen_positions,
-                self.config.imp_step,
-                Some(hi_freq_to_orig),
-            )?
-        };
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
         // We use a scoped immutable borrow that ends before the apply phase.
@@ -6699,7 +6817,13 @@ mod tests {
                 haps
             })
             .collect();
-        let phase_ibs = BidirectionalPhaseIbs::build(alleles, n_total_haps, n_markers);
+        let subset_to_global: Vec<usize> = (0..n_markers).collect();
+        let phase_ibs = BidirectionalPhaseIbs::build_for_subset(
+            alleles,
+            n_total_haps,
+            n_markers,
+            &subset_to_global,
+        );
 
         // Empty IBS2 - need at least 1 sample for the structure
         let ibs2 = Ibs2::empty(1);
@@ -6779,7 +6903,13 @@ mod tests {
                 haps
             })
             .collect();
-        let phase_ibs = BidirectionalPhaseIbs::build(alleles, n_total_haps, n_markers);
+        let subset_to_global: Vec<usize> = (0..n_markers).collect();
+        let phase_ibs = BidirectionalPhaseIbs::build_for_subset(
+            alleles,
+            n_total_haps,
+            n_markers,
+            &subset_to_global,
+        );
 
         let ibs2 = Ibs2::empty(1);
 

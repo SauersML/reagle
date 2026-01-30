@@ -26,7 +26,20 @@
 
 use crate::data::haplotype::SampleIdx;
 use crate::model::ibs2::Ibs2;
-use crate::model::pbwt::PbwtDivUpdater;
+use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
+
+pub trait PbwtStateCache<I: PbwtIndex> {
+    fn with_fwd_state<R>(
+        this: &BidirectionalPhaseIbsImpl<I>,
+        marker_idx: usize,
+        f: impl FnOnce(&[I], &[i32]) -> R,
+    ) -> R;
+    fn with_bwd_state<R>(
+        this: &BidirectionalPhaseIbsImpl<I>,
+        marker_idx: usize,
+        f: impl FnOnce(&[I], &[i32]) -> R,
+    ) -> R;
+}
 
 /// Checkpoint interval for sparse PBWT storage.
 /// PPA/div/pos arrays are only stored at every CHECKPOINT_INTERVAL markers.
@@ -46,7 +59,7 @@ const PBWT_CHECKPOINT_INTERVAL: usize = 64;
 /// the PBWT operates in subset index space (0..n_subset), but IBS2 segments
 /// use global marker indices. The `subset_to_global` mapping handles this
 /// coordinate space conversion automatically in `find_neighbors`.
-pub struct BidirectionalPhaseIbs {
+pub struct BidirectionalPhaseIbsImpl<I: crate::model::pbwt::PbwtIndex> {
     /// Forward divergence at checkpoints: `fwd_div[checkpoint_idx]` = divergence array after
     /// processing markers 0..=checkpoint_marker. For position i in the sorted order, `div[i]` is
     /// the marker where the match with the haplotype at position i-1 started.
@@ -54,13 +67,13 @@ pub struct BidirectionalPhaseIbs {
     fwd_div: Vec<Vec<i32>>,
     /// Forward prefix array at checkpoints: `fwd_ppa[checkpoint_idx][i]` = haplotype index at
     /// sorted position i after processing markers 0..=checkpoint_marker
-    fwd_ppa: Vec<Vec<u32>>,
+    fwd_ppa: Vec<Vec<I>>,
     /// Backward divergence at checkpoints: `bwd_div[checkpoint_idx]` = divergence array after
     /// processing markers checkpoint_marker..n_markers (in reverse). For position i, `div[i]` is
     /// the marker where the match with the haplotype at position i-1 ends.
     bwd_div: Vec<Vec<i32>>,
     /// Backward prefix array at checkpoints
-    bwd_ppa: Vec<Vec<u32>>,
+    bwd_ppa: Vec<Vec<I>>,
     /// Marker indices for each checkpoint (sorted ascending)
     checkpoint_markers: Vec<usize>,
     /// Total number of haplotypes in the PBWT
@@ -83,7 +96,10 @@ pub struct BidirectionalPhaseIbs {
     reference_start_hap: Option<u32>,
 }
 
-impl BidirectionalPhaseIbs {
+impl<I: crate::model::pbwt::PbwtIndex> BidirectionalPhaseIbsImpl<I>
+where
+    BidirectionalPhaseIbsImpl<I>: PbwtStateCache<I>,
+{
     /// Build bidirectional PBWT from genotype data
     ///
     /// Uses sparse storage: PPA/div/pos arrays are only stored at checkpoint intervals
@@ -113,7 +129,7 @@ impl BidirectionalPhaseIbs {
 
         let mut updater = PbwtDivUpdater::new(n_haps);
 
-        let mut ppa: Vec<u32> = (0..n_haps as u32).collect();
+        let mut ppa: Vec<I> = (0..n_haps).map(I::from_usize).collect();
         let mut div: Vec<i32> = vec![0; n_haps + 1];
 
         let mut next_checkpoint = 0usize;
@@ -129,7 +145,7 @@ impl BidirectionalPhaseIbs {
             }
         }
 
-        ppa = (0..n_haps as u32).collect();
+        ppa = (0..n_haps).map(I::from_usize).collect();
         div = vec![n_markers as i32; n_haps + 1];
 
         let mut next_checkpoint = n_checkpoints;
@@ -165,101 +181,17 @@ impl BidirectionalPhaseIbs {
         self.n_haps
     }
 
-    fn with_fwd_state<R>(&self, marker_idx: usize, f: impl FnOnce(&[u32], &[i32]) -> R) -> R {
-        let checkpoint_idx = self.marker_to_checkpoint_floor(marker_idx);
-        let checkpoint_marker = self.checkpoint_markers[checkpoint_idx];
-        if marker_idx == checkpoint_marker {
-            return f(&self.fwd_ppa[checkpoint_idx], &self.fwd_div[checkpoint_idx]);
-        }
-
-        thread_local! {
-            static FWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u32>, Vec<i32>)> =
-                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
-            static FWD_UPDATER: std::cell::RefCell<PbwtDivUpdater> =
-                std::cell::RefCell::new(PbwtDivUpdater::new(0));
-        }
-
-        FWD_STATE_CACHE.with(|state_cell| {
-            FWD_UPDATER.with(|upd_cell| {
-                let mut state = state_cell.borrow_mut();
-                if state.0 != checkpoint_idx
-                    || state.1 != marker_idx
-                    || state.2.len() != self.n_haps
-                {
-                    state.0 = checkpoint_idx;
-                    state.1 = marker_idx;
-                    state.2 = self.fwd_ppa[checkpoint_idx].clone();
-                    state.3 = self.fwd_div[checkpoint_idx].clone();
-
-                    let mut updater = upd_cell.borrow_mut();
-                    if updater.n_haps() != self.n_haps {
-                        *updater = PbwtDivUpdater::new(self.n_haps);
-                    }
-                    let mut ppa = std::mem::take(&mut state.2);
-                    let mut div = std::mem::take(&mut state.3);
-                    for m in (checkpoint_marker + 1)..=marker_idx {
-                        let n_alleles = self.n_alleles_by_marker[m];
-                        updater.fwd_update(&self.alleles[m], n_alleles, m, &mut ppa, &mut div);
-                    }
-                    state.2 = ppa;
-                    state.3 = div;
-                }
-                f(&state.2, &state.3)
-            })
-        })
-    }
-
-    fn with_bwd_state<R>(&self, marker_idx: usize, f: impl FnOnce(&[u32], &[i32]) -> R) -> R {
-        let checkpoint_idx = self.marker_to_checkpoint_ceil(marker_idx);
-        let checkpoint_marker = self.checkpoint_markers[checkpoint_idx];
-        if marker_idx == checkpoint_marker {
-            return f(&self.bwd_ppa[checkpoint_idx], &self.bwd_div[checkpoint_idx]);
-        }
-
-        thread_local! {
-            static BWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u32>, Vec<i32>)> =
-                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
-            static BWD_UPDATER: std::cell::RefCell<PbwtDivUpdater> =
-                std::cell::RefCell::new(PbwtDivUpdater::new(0));
-        }
-
-        BWD_STATE_CACHE.with(|state_cell| {
-            BWD_UPDATER.with(|upd_cell| {
-                let mut state = state_cell.borrow_mut();
-                if state.0 != checkpoint_idx
-                    || state.1 != marker_idx
-                    || state.2.len() != self.n_haps
-                {
-                    state.0 = checkpoint_idx;
-                    state.1 = marker_idx;
-                    state.2 = self.bwd_ppa[checkpoint_idx].clone();
-                    state.3 = self.bwd_div[checkpoint_idx].clone();
-
-                    let mut updater = upd_cell.borrow_mut();
-                    if updater.n_haps() != self.n_haps {
-                        *updater = PbwtDivUpdater::new(self.n_haps);
-                    }
-                    let mut ppa = std::mem::take(&mut state.2);
-                    let mut div = std::mem::take(&mut state.3);
-                    for m in (marker_idx..checkpoint_marker).rev() {
-                        let n_alleles = self.n_alleles_by_marker[m];
-                        updater.bwd_update(&self.alleles[m], n_alleles, m, &mut ppa, &mut div);
-                    }
-                    state.2 = ppa;
-                    state.3 = div;
-                }
-                f(&state.2, &state.3)
-            })
-        })
-    }
 
     fn with_fwd_pos_at_marker<R>(
         &self,
         marker_idx: usize,
         hap_idx: u32,
-        f: impl FnOnce(&[u32], &[i32], usize) -> R,
+        f: impl FnOnce(&[I], &[i32], usize) -> R,
     ) -> R {
-        self.with_fwd_state(marker_idx, |ppa, div| {
+        <BidirectionalPhaseIbsImpl<I> as PbwtStateCache<I>>::with_fwd_state(
+            self,
+            marker_idx,
+            |ppa, div| {
             thread_local! {
                 static FWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
                     std::cell::RefCell::new((usize::MAX, Vec::new()));
@@ -270,23 +202,27 @@ impl BidirectionalPhaseIbs {
                     cache.1.clear();
                     cache.1.resize(ppa.len(), 0u32);
                     for (i, &h) in ppa.iter().enumerate() {
-                        cache.1[h as usize] = i as u32;
+                        cache.1[h.to_usize()] = i as u32;
                     }
                     cache.0 = marker_idx;
                 }
                 let pos = cache.1[hap_idx as usize] as usize;
                 f(ppa, div, pos)
             })
-        })
+        },
+        )
     }
 
     fn with_bwd_pos_at_marker<R>(
         &self,
         marker_idx: usize,
         hap_idx: u32,
-        f: impl FnOnce(&[u32], &[i32], usize) -> R,
+        f: impl FnOnce(&[I], &[i32], usize) -> R,
     ) -> R {
-        self.with_bwd_state(marker_idx, |ppa, div| {
+        <BidirectionalPhaseIbsImpl<I> as PbwtStateCache<I>>::with_bwd_state(
+            self,
+            marker_idx,
+            |ppa, div| {
             thread_local! {
                 static BWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
                     std::cell::RefCell::new((usize::MAX, Vec::new()));
@@ -297,14 +233,15 @@ impl BidirectionalPhaseIbs {
                     cache.1.clear();
                     cache.1.resize(ppa.len(), 0u32);
                     for (i, &h) in ppa.iter().enumerate() {
-                        cache.1[h as usize] = i as u32;
+                        cache.1[h.to_usize()] = i as u32;
                     }
                     cache.0 = marker_idx;
                 }
                 let pos = cache.1[hap_idx as usize] as usize;
                 f(ppa, div, pos)
             })
-        })
+        },
+        )
     }
 
     /// Build bidirectional PBWT for a marker subset with global index mapping.
@@ -536,13 +473,13 @@ impl BidirectionalPhaseIbs {
                 if go_up {
                     max_div_up = max_div_up.max(div_up);
                     u -= 1;
-                    let h = ppa[u];
+                    let h = ppa[u].to_u32();
                     if h != hap_idx {
                         result.push(h);
                     }
                 } else {
                     max_div_down = max_div_down.max(div_down);
-                    let h = ppa[v];
+                    let h = ppa[v].to_u32();
                     if h != hap_idx {
                         result.push(h);
                     }
@@ -552,13 +489,13 @@ impl BidirectionalPhaseIbs {
 
             while result.len() < n_candidates && u > 0 {
                 u -= 1;
-                let h = ppa[u];
+                let h = ppa[u].to_u32();
                 if h != hap_idx {
                     result.push(h);
                 }
             }
             while result.len() < n_candidates && v < self.n_haps {
-                let h = ppa[v];
+                let h = ppa[v].to_u32();
                 if h != hap_idx {
                     result.push(h);
                 }
@@ -607,13 +544,13 @@ impl BidirectionalPhaseIbs {
                 if go_up {
                     min_div_up = min_div_up.min(div_up);
                     u -= 1;
-                    let h = ppa[u];
+                    let h = ppa[u].to_u32();
                     if h != hap_idx {
                         result.push(h);
                     }
                 } else {
                     min_div_down = min_div_down.min(div_down);
-                    let h = ppa[v];
+                    let h = ppa[v].to_u32();
                     if h != hap_idx {
                         result.push(h);
                     }
@@ -623,13 +560,13 @@ impl BidirectionalPhaseIbs {
 
             while result.len() < n_candidates && u > 0 {
                 u -= 1;
-                let h = ppa[u];
+                let h = ppa[u].to_u32();
                 if h != hap_idx {
                     result.push(h);
                 }
             }
             while result.len() < n_candidates && v < self.n_haps {
-                let h = ppa[v];
+                let h = ppa[v].to_u32();
                 if h != hap_idx {
                     result.push(h);
                 }
@@ -718,7 +655,7 @@ impl BidirectionalPhaseIbs {
                 if prefer_u && can_go_u {
                     max_div_u = max_div_u.max(div.get(u).copied().unwrap_or(i32::MAX));
                     u -= 1;
-                    let h = ppa[u];
+                    let h = ppa[u].to_u32();
                     if (!exclude_sample || (h != hap1 && h != hap2)) && h != ref_state {
                         if ref_start.map_or(true, |start| h >= start) {
                             neighbors.push(h);
@@ -726,7 +663,7 @@ impl BidirectionalPhaseIbs {
                     }
                 } else if can_go_v {
                     max_div_v = max_div_v.max(div.get(v).copied().unwrap_or(i32::MAX));
-                    let h = ppa[v];
+                    let h = ppa[v].to_u32();
                     if (!exclude_sample || (h != hap1 && h != hap2)) && h != ref_state {
                         if ref_start.map_or(true, |start| h >= start) {
                             neighbors.push(h);
@@ -748,6 +685,284 @@ impl BidirectionalPhaseIbs {
             }
             neighbors
         })
+    }
+}
+
+impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
+    fn with_fwd_state<R>(
+        this: &BidirectionalPhaseIbsImpl<u16>,
+        marker_idx: usize,
+        f: impl FnOnce(&[u16], &[i32]) -> R,
+    ) -> R {
+        let checkpoint_idx = this.marker_to_checkpoint_floor(marker_idx);
+        let checkpoint_marker = this.checkpoint_markers[checkpoint_idx];
+        if marker_idx == checkpoint_marker {
+            return f(&this.fwd_ppa[checkpoint_idx], &this.fwd_div[checkpoint_idx]);
+        }
+
+        thread_local! {
+            static FWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u16>, Vec<i32>)> =
+                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static FWD_UPDATER: std::cell::RefCell<PbwtDivUpdater<u16>> =
+                std::cell::RefCell::new(PbwtDivUpdater::new(0));
+        }
+
+        FWD_STATE_CACHE.with(|state_cell| {
+            FWD_UPDATER.with(|upd_cell| {
+                let mut state = state_cell.borrow_mut();
+                if state.0 != checkpoint_idx
+                    || state.1 != marker_idx
+                    || state.2.len() != this.n_haps
+                {
+                    state.0 = checkpoint_idx;
+                    state.1 = marker_idx;
+                    state.2 = this.fwd_ppa[checkpoint_idx].clone();
+                    state.3 = this.fwd_div[checkpoint_idx].clone();
+
+                    let mut updater = upd_cell.borrow_mut();
+                    if updater.n_haps() != this.n_haps {
+                        *updater = PbwtDivUpdater::new(this.n_haps);
+                    }
+                    let mut ppa = std::mem::take(&mut state.2);
+                    let mut div = std::mem::take(&mut state.3);
+                    for m in (checkpoint_marker + 1)..=marker_idx {
+                        let n_alleles = this.n_alleles_by_marker[m];
+                        updater.fwd_update(&this.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                    }
+                    state.2 = ppa;
+                    state.3 = div;
+                }
+                f(&state.2, &state.3)
+            })
+        })
+    }
+
+    fn with_bwd_state<R>(
+        this: &BidirectionalPhaseIbsImpl<u16>,
+        marker_idx: usize,
+        f: impl FnOnce(&[u16], &[i32]) -> R,
+    ) -> R {
+        let checkpoint_idx = this.marker_to_checkpoint_ceil(marker_idx);
+        let checkpoint_marker = this.checkpoint_markers[checkpoint_idx];
+        if marker_idx == checkpoint_marker {
+            return f(&this.bwd_ppa[checkpoint_idx], &this.bwd_div[checkpoint_idx]);
+        }
+
+        thread_local! {
+            static BWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u16>, Vec<i32>)> =
+                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static BWD_UPDATER: std::cell::RefCell<PbwtDivUpdater<u16>> =
+                std::cell::RefCell::new(PbwtDivUpdater::new(0));
+        }
+
+        BWD_STATE_CACHE.with(|state_cell| {
+            BWD_UPDATER.with(|upd_cell| {
+                let mut state = state_cell.borrow_mut();
+                if state.0 != checkpoint_idx
+                    || state.1 != marker_idx
+                    || state.2.len() != this.n_haps
+                {
+                    state.0 = checkpoint_idx;
+                    state.1 = marker_idx;
+                    state.2 = this.bwd_ppa[checkpoint_idx].clone();
+                    state.3 = this.bwd_div[checkpoint_idx].clone();
+
+                    let mut updater = upd_cell.borrow_mut();
+                    if updater.n_haps() != this.n_haps {
+                        *updater = PbwtDivUpdater::new(this.n_haps);
+                    }
+                    let mut ppa = std::mem::take(&mut state.2);
+                    let mut div = std::mem::take(&mut state.3);
+                    for m in (marker_idx..checkpoint_marker).rev() {
+                        let n_alleles = this.n_alleles_by_marker[m];
+                        updater.bwd_update(&this.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                    }
+                    state.2 = ppa;
+                    state.3 = div;
+                }
+                f(&state.2, &state.3)
+            })
+        })
+    }
+}
+
+impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
+    fn with_fwd_state<R>(
+        this: &BidirectionalPhaseIbsImpl<u32>,
+        marker_idx: usize,
+        f: impl FnOnce(&[u32], &[i32]) -> R,
+    ) -> R {
+        let checkpoint_idx = this.marker_to_checkpoint_floor(marker_idx);
+        let checkpoint_marker = this.checkpoint_markers[checkpoint_idx];
+        if marker_idx == checkpoint_marker {
+            return f(&this.fwd_ppa[checkpoint_idx], &this.fwd_div[checkpoint_idx]);
+        }
+
+        thread_local! {
+            static FWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u32>, Vec<i32>)> =
+                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static FWD_UPDATER: std::cell::RefCell<PbwtDivUpdater<u32>> =
+                std::cell::RefCell::new(PbwtDivUpdater::new(0));
+        }
+
+        FWD_STATE_CACHE.with(|state_cell| {
+            FWD_UPDATER.with(|upd_cell| {
+                let mut state = state_cell.borrow_mut();
+                if state.0 != checkpoint_idx
+                    || state.1 != marker_idx
+                    || state.2.len() != this.n_haps
+                {
+                    state.0 = checkpoint_idx;
+                    state.1 = marker_idx;
+                    state.2 = this.fwd_ppa[checkpoint_idx].clone();
+                    state.3 = this.fwd_div[checkpoint_idx].clone();
+
+                    let mut updater = upd_cell.borrow_mut();
+                    if updater.n_haps() != this.n_haps {
+                        *updater = PbwtDivUpdater::new(this.n_haps);
+                    }
+                    let mut ppa = std::mem::take(&mut state.2);
+                    let mut div = std::mem::take(&mut state.3);
+                    for m in (checkpoint_marker + 1)..=marker_idx {
+                        let n_alleles = this.n_alleles_by_marker[m];
+                        updater.fwd_update(&this.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                    }
+                    state.2 = ppa;
+                    state.3 = div;
+                }
+                f(&state.2, &state.3)
+            })
+        })
+    }
+
+    fn with_bwd_state<R>(
+        this: &BidirectionalPhaseIbsImpl<u32>,
+        marker_idx: usize,
+        f: impl FnOnce(&[u32], &[i32]) -> R,
+    ) -> R {
+        let checkpoint_idx = this.marker_to_checkpoint_ceil(marker_idx);
+        let checkpoint_marker = this.checkpoint_markers[checkpoint_idx];
+        if marker_idx == checkpoint_marker {
+            return f(&this.bwd_ppa[checkpoint_idx], &this.bwd_div[checkpoint_idx]);
+        }
+
+        thread_local! {
+            static BWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u32>, Vec<i32>)> =
+                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static BWD_UPDATER: std::cell::RefCell<PbwtDivUpdater<u32>> =
+                std::cell::RefCell::new(PbwtDivUpdater::new(0));
+        }
+
+        BWD_STATE_CACHE.with(|state_cell| {
+            BWD_UPDATER.with(|upd_cell| {
+                let mut state = state_cell.borrow_mut();
+                if state.0 != checkpoint_idx
+                    || state.1 != marker_idx
+                    || state.2.len() != this.n_haps
+                {
+                    state.0 = checkpoint_idx;
+                    state.1 = marker_idx;
+                    state.2 = this.bwd_ppa[checkpoint_idx].clone();
+                    state.3 = this.bwd_div[checkpoint_idx].clone();
+
+                    let mut updater = upd_cell.borrow_mut();
+                    if updater.n_haps() != this.n_haps {
+                        *updater = PbwtDivUpdater::new(this.n_haps);
+                    }
+                    let mut ppa = std::mem::take(&mut state.2);
+                    let mut div = std::mem::take(&mut state.3);
+                    for m in (marker_idx..checkpoint_marker).rev() {
+                        let n_alleles = this.n_alleles_by_marker[m];
+                        updater.bwd_update(&this.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                    }
+                    state.2 = ppa;
+                    state.3 = div;
+                }
+                f(&state.2, &state.3)
+            })
+        })
+    }
+}
+
+pub enum BidirectionalPhaseIbs {
+    U16(BidirectionalPhaseIbsImpl<u16>),
+    U32(BidirectionalPhaseIbsImpl<u32>),
+}
+
+impl BidirectionalPhaseIbs {
+    pub fn build_for_subset(
+        alleles: Vec<Vec<u8>>,
+        n_haps: usize,
+        n_markers: usize,
+        subset_to_global: &[usize],
+    ) -> Self {
+        if n_haps <= u16::MAX as usize {
+            Self::U16(BidirectionalPhaseIbsImpl::<u16>::build_for_subset(
+                alleles,
+                n_haps,
+                n_markers,
+                subset_to_global,
+            ))
+        } else {
+            Self::U32(BidirectionalPhaseIbsImpl::<u32>::build_for_subset(
+                alleles,
+                n_haps,
+                n_markers,
+                subset_to_global,
+            ))
+        }
+    }
+
+    pub fn n_haps(&self) -> usize {
+        match self {
+            Self::U16(inner) => inner.n_haps(),
+            Self::U32(inner) => inner.n_haps(),
+        }
+    }
+
+    pub fn find_neighbors(
+        &self,
+        hap_idx: u32,
+        marker_idx: usize,
+        ibs2: &Ibs2,
+        n_candidates: usize,
+    ) -> Vec<u32> {
+        match self {
+            Self::U16(inner) => inner.find_neighbors(hap_idx, marker_idx, ibs2, n_candidates),
+            Self::U32(inner) => inner.find_neighbors(hap_idx, marker_idx, ibs2, n_candidates),
+        }
+    }
+
+    pub fn best_match_span(&self, hap_idx: u32, marker_idx: usize) -> usize {
+        match self {
+            Self::U16(inner) => inner.best_match_span(hap_idx, marker_idx),
+            Self::U32(inner) => inner.best_match_span(hap_idx, marker_idx),
+        }
+    }
+
+    #[inline]
+    pub fn allele(&self, marker: usize, hap: u32) -> u8 {
+        match self {
+            Self::U16(inner) => inner.allele(marker, hap),
+            Self::U32(inner) => inner.allele(marker, hap),
+        }
+    }
+
+    pub fn find_neighbors_of_state(
+        &self,
+        ref_state: u32,
+        marker_idx: usize,
+        sample_idx: u32,
+        n_candidates: usize,
+    ) -> Vec<u32> {
+        match self {
+            Self::U16(inner) => {
+                inner.find_neighbors_of_state(ref_state, marker_idx, sample_idx, n_candidates)
+            }
+            Self::U32(inner) => {
+                inner.find_neighbors_of_state(ref_state, marker_idx, sample_idx, n_candidates)
+            }
+        }
     }
 }
 

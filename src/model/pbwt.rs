@@ -17,25 +17,88 @@
 
 use tracing::info_span;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+
+#[inline(always)]
+fn prefetch_read<T>(ptr: *const T) {
+    std::hint::black_box(ptr);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+    }
+}
+
+pub trait PbwtIndex: Copy + Default {
+    fn from_usize(v: usize) -> Self;
+    fn to_usize(self) -> usize;
+    fn to_u32(self) -> u32;
+}
+
+impl PbwtIndex for u32 {
+    #[inline]
+    fn from_usize(v: usize) -> Self {
+        v as u32
+    }
+
+    #[inline]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+
+    #[inline]
+    fn to_u32(self) -> u32 {
+        self
+    }
+}
+
+impl PbwtIndex for u16 {
+    #[inline]
+    fn from_usize(v: usize) -> Self {
+        assert!(v <= u16::MAX as usize, "PBWT index overflow: {}", v);
+        v as u16
+    }
+
+    #[inline]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+
+    #[inline]
+    fn to_u32(self) -> u32 {
+        self as u32
+    }
+}
+
 /// PBWT updater with divergence array tracking
 ///
 /// This optimized implementation uses flat arrays and Counting Sort
 /// to avoid heap allocations during updates.
 #[derive(Debug)]
-pub struct PbwtDivUpdater {
+pub struct PbwtDivUpdater<I: PbwtIndex = u32> {
     /// Number of haplotypes
     n_haps: usize,
     /// Current prefix array (flat)
-    a: Vec<u32>,
+    a: Vec<I>,
     /// Current divergence array (flat)
     d: Vec<i32>,
     /// Scratch prefix array for double buffering
-    scratch_a: Vec<u32>,
+    scratch_a: Vec<I>,
     /// Scratch divergence array for double buffering
     scratch_d: Vec<i32>,
     /// Pre-permuted alleles: permuted_alleles[i] = alleles[prefix[i]]
     /// Converts random-access gather to sequential access for counting and scatter
     permuted_alleles: Vec<u8>,
+    /// Bit-packed permuted alleles for biallelic fast path (1 = ALT)
+    permuted_bits: Vec<u64>,
+    /// Bit-packed permuted missing mask for biallelic fast path (1 = missing)
+    permuted_missing_bits: Vec<u64>,
+    /// Word-level base offsets for biallelic scatter (prefix order -> bin order)
+    word_base0: Vec<usize>,
+    /// Word-level base offsets for allele-1 bin
+    word_base1: Vec<usize>,
+    /// Word-level base offsets for missing bin
+    word_base_miss: Vec<usize>,
     /// Propagation array for tracking max/min divergence across alleles
     p: Vec<i32>,
     /// Helper for counting sort: counts per allele
@@ -44,7 +107,7 @@ pub struct PbwtDivUpdater {
     offsets: Vec<usize>,
 }
 
-impl PbwtDivUpdater {
+impl<I: PbwtIndex> PbwtDivUpdater<I> {
     /// Create a new PBWT divergence updater
     pub fn new(n_haps: usize) -> Self {
         let max_alleles = 256; // Max u8 alleles
@@ -55,6 +118,11 @@ impl PbwtDivUpdater {
             scratch_a: Vec::new(),
             scratch_d: Vec::new(),
             permuted_alleles: Vec::new(),
+            permuted_bits: Vec::new(),
+            permuted_missing_bits: Vec::new(),
+            word_base0: Vec::new(),
+            word_base1: Vec::new(),
+            word_base_miss: Vec::new(),
             p: vec![0; max_alleles],
             counts: vec![0; max_alleles],
             offsets: vec![0; max_alleles + 1],
@@ -73,14 +141,99 @@ impl PbwtDivUpdater {
         }
 
         if self.scratch_a.len() < self.n_haps {
-            self.scratch_a.resize(self.n_haps, 0);
+            self.scratch_a
+                .resize(self.n_haps, I::from_usize(0));
             self.scratch_d.resize(self.n_haps, 0);
             self.permuted_alleles.resize(self.n_haps, 0);
+            let n_words = (self.n_haps + 63) / 64;
+            self.permuted_bits.resize(n_words, 0);
+            self.permuted_missing_bits.resize(n_words, 0);
+            self.word_base0.resize(n_words, 0);
+            self.word_base1.resize(n_words, 0);
+            self.word_base_miss.resize(n_words, 0);
             // Also initialize 'a' and 'd' if empty (lazy init)
             if self.a.is_empty() {
-                self.a.resize(self.n_haps, 0);
+                self.a.resize(self.n_haps, I::from_usize(0));
                 self.d.resize(self.n_haps, 0);
             }
+        }
+    }
+
+    #[inline]
+    fn pack_biallelic_bits(&mut self, alleles: &[u8], prefix: &[I]) -> (usize, usize) {
+        let n_words = (self.n_haps + 63) / 64;
+        if self.permuted_bits.len() < n_words {
+            self.permuted_bits.resize(n_words, 0);
+            self.permuted_missing_bits.resize(n_words, 0);
+            self.word_base0.resize(n_words, 0);
+            self.word_base1.resize(n_words, 0);
+            self.word_base_miss.resize(n_words, 0);
+        }
+
+        let mut count1 = 0usize;
+        let mut count_miss = 0usize;
+        let mut idx = 0usize;
+
+        for w in 0..n_words {
+            let mut bits = 0u64;
+            let mut miss = 0u64;
+            let block_end = (idx + 64).min(self.n_haps);
+            let mut bit = 0u64;
+            while idx < block_end {
+                let allele = alleles[prefix[idx].to_usize()];
+                if allele == 1 {
+                    bits |= 1u64 << bit;
+                } else if allele > 1 {
+                    miss |= 1u64 << bit;
+                }
+                idx += 1;
+                bit += 1;
+            }
+
+            self.permuted_bits[w] = bits;
+            self.permuted_missing_bits[w] = miss;
+            count1 += bits.count_ones() as usize;
+            count_miss += miss.count_ones() as usize;
+        }
+
+        (count1, count_miss)
+    }
+
+    #[inline]
+    fn compute_biallelic_word_bases(&mut self, has_missing: bool) {
+        let n_words = (self.n_haps + 63) / 64;
+        if self.word_base0.len() < n_words {
+            self.word_base0.resize(n_words, 0);
+            self.word_base1.resize(n_words, 0);
+            self.word_base_miss.resize(n_words, 0);
+        }
+
+        let mut base0 = self.offsets[0];
+        let mut base1 = self.offsets[2];
+        let mut base_miss = self.offsets[1];
+        let mut idx = 0usize;
+
+        for w in 0..n_words {
+            let block_end = (idx + 64).min(self.n_haps);
+            let block_len = block_end - idx;
+            let count1 = self.permuted_bits[w].count_ones() as usize;
+            let count_m = if has_missing {
+                self.permuted_missing_bits[w].count_ones() as usize
+            } else {
+                0
+            };
+            let count0 = block_len.saturating_sub(count1 + count_m);
+
+            self.word_base0[w] = base0;
+            self.word_base1[w] = base1;
+            if has_missing {
+                self.word_base_miss[w] = base_miss;
+                base_miss += count_m;
+            }
+
+            base0 += count0;
+            base1 += count1;
+            idx = block_end;
         }
     }
 
@@ -117,7 +270,7 @@ impl PbwtDivUpdater {
         alleles: &[u8],
         n_alleles: usize,
         marker: usize,
-        prefix: &mut [u32],
+        prefix: &mut [I],
         divergence: &mut [i32],
     ) {
         info_span!(
@@ -134,74 +287,23 @@ impl PbwtDivUpdater {
             let n_bins = n_alleles + 1;
             self.ensure_capacity(n_bins);
 
-            // 0. Pre-permute alleles: gather alleles[prefix[i]] into contiguous buffer.
-            // This converts subsequent random-access patterns to sequential access.
-            // Single gather pass here enables two sequential passes below.
-            for i in 0..self.n_haps {
-                self.permuted_alleles[i] = alleles[prefix[i] as usize];
-            }
-
             // 1. Count frequencies of each allele (Counting Sort Phase 1) - now sequential access
             self.counts[..n_bins].fill(0);
 
             if n_alleles == 2 {
-                // Fast path for biallelic sites - single pass counting
-                // Computes sum of bytes AND detects non-0/1 values simultaneously
-                let data = &self.permuted_alleles[..self.n_haps];
-
-                // Single-pass: sum all bytes and OR-reduce to detect values > 1
-                // For pure 0/1 data, sum = count of 1s, and any_high will be 0 or 1
-                // For data with missing (>1), any_high will have bits 1-7 set
-                let mut sum = 0usize;
-                let mut any_high = 0u8;
-
-                // Process in chunks for autovectorization
-                let chunks = data.chunks_exact(32);
-                let remainder = chunks.remainder();
-
-                for chunk in chunks {
-                    for &b in chunk {
-                        sum += b as usize;
-                        any_high |= b;
-                    }
-                }
-                for &b in remainder {
-                    sum += b as usize;
-                    any_high |= b;
-                }
-
-                // any_high > 1 means some byte had value > 1 (missing data)
-                if any_high <= 1 {
-                    // Pure 0/1 data - sum equals count of 1s
-                    self.counts[0] = self.n_haps - sum;
-                    self.counts[1] = 0; // Bin 1: Missing (empty)
-                    self.counts[2] = sum; // Bin 2: Allele 1
-                } else {
-                    // Has missing data - need detailed count
-                    // This path is rare (<1% of markers) so extra scan is acceptable
-                    let mut count1 = 0usize;
-                    let mut count_miss = 0usize;
-
-                    let chunks = data.chunks_exact(32);
-                    let remainder = chunks.remainder();
-
-                    for chunk in chunks {
-                        for &b in chunk {
-                            count1 += (b == 1) as usize;
-                            count_miss += (b > 1) as usize;
-                        }
-                    }
-                    for &b in remainder {
-                        count1 += (b == 1) as usize;
-                        count_miss += (b > 1) as usize;
-                    }
-
-                    self.counts[0] = self.n_haps - count1 - count_miss;
-                    self.counts[1] = count_miss; // Bin 1: Missing
-                    self.counts[2] = count1; // Bin 2: Allele 1
-                }
+                let (count1, count_miss) = self.pack_biallelic_bits(alleles, prefix);
+                self.counts[0] = self.n_haps - count1 - count_miss;
+                self.counts[1] = count_miss; // Bin 1: Missing
+                self.counts[2] = count1; // Bin 2: Allele 1
             } else {
                 // General path for multiallelic
+                // 0. Pre-permute alleles: gather alleles[prefix[i]] into contiguous buffer.
+                // This converts subsequent random-access patterns to sequential access.
+                // Single gather pass here enables two sequential passes below.
+                for i in 0..self.n_haps {
+                    self.permuted_alleles[i] = alleles[prefix[i].to_usize()];
+                }
+
                 for i in 0..self.n_haps {
                     let allele = self.permuted_alleles[i] as usize;
                     // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
@@ -228,6 +330,7 @@ impl PbwtDivUpdater {
             // This lets us use a faster 2-bin path when there's no missing data
             // Missing data is now in Bin 1
             let has_missing = self.counts[1] > 0;
+            self.compute_biallelic_word_bases(has_missing);
 
             // 4. Initialize p array and reset counts for scatter pass
             let init_value = (marker + 1) as i32;
@@ -241,36 +344,40 @@ impl PbwtDivUpdater {
                 // This is the common case and avoids the 3rd comparison per haplotype
                 let mut p0 = init_value;
                 let mut p1 = init_value;
-                let base0 = self.offsets[0];
-                let base1 = self.offsets[2]; // Allele 1 is now in Bin 2
-                let mut count0 = 0usize;
-                let mut count1 = 0usize;
 
-                for i in 0..self.n_haps {
-                    let hap = prefix[i];
-                    let div = divergence[i];
-                    let allele = self.permuted_alleles[i]; // Sequential access
+                let mut idx = 0usize;
+                let n_words = (self.n_haps + 63) / 64;
+                for w in 0..n_words {
+                    let mut bits = self.permuted_bits[w];
+                    let mut pos0 = self.word_base0[w];
+                    let mut pos1 = self.word_base1[w];
+                    let block_end = (idx + 64).min(self.n_haps);
+                    while idx < block_end {
+                        let hap = prefix[idx];
+                        let div = divergence[idx];
 
-                    // Propagate max to both bins
-                    if div > p0 {
-                        p0 = div;
-                    }
-                    if div > p1 {
-                        p1 = div;
-                    }
+                        // Propagate max to both bins
+                        if div > p0 {
+                            p0 = div;
+                        }
+                        if div > p1 {
+                            p1 = div;
+                        }
 
-                    if allele == 0 {
-                        let pos = base0 + count0;
-                        self.scratch_a[pos] = hap;
-                        self.scratch_d[pos] = p0;
-                        p0 = i32::MIN;
-                        count0 += 1;
-                    } else {
-                        let pos = base1 + count1;
-                        self.scratch_a[pos] = hap;
-                        self.scratch_d[pos] = p1;
-                        p1 = i32::MIN;
-                        count1 += 1;
+                        if (bits & 1) == 0 {
+                            self.scratch_a[pos0] = hap;
+                            self.scratch_d[pos0] = p0;
+                            p0 = i32::MIN;
+                            pos0 += 1;
+                        } else {
+                            self.scratch_a[pos1] = hap;
+                            self.scratch_d[pos1] = p1;
+                            p1 = i32::MIN;
+                            pos1 += 1;
+                        }
+
+                        bits >>= 1;
+                        idx += 1;
                     }
                 }
             } else if n_alleles == 2 {
@@ -278,58 +385,66 @@ impl PbwtDivUpdater {
                 let mut p0 = init_value;
                 let mut p1 = init_value;
                 let mut p_miss = init_value;
-                let base0 = self.offsets[0];
-                let base_miss = self.offsets[1]; // Missing is now in Bin 1
-                let base1 = self.offsets[2]; // Allele 1 is now in Bin 2
-                let mut count0 = 0usize;
-                let mut count1 = 0usize;
-                let mut count_miss = 0usize;
 
-                for i in 0..self.n_haps {
-                    let hap = prefix[i];
-                    let div = divergence[i];
-                    let allele = self.permuted_alleles[i]; // Sequential access
+                let mut idx = 0usize;
+                let n_words = (self.n_haps + 63) / 64;
+                for w in 0..n_words {
+                    let mut bits = self.permuted_bits[w];
+                    let mut miss = self.permuted_missing_bits[w];
+                    let mut pos0 = self.word_base0[w];
+                    let mut pos1 = self.word_base1[w];
+                    let mut pos_miss = self.word_base_miss[w];
+                    let block_end = (idx + 64).min(self.n_haps);
+                    while idx < block_end {
+                        let hap = prefix[idx];
+                        let div = divergence[idx];
 
-                    // Propagate max to all bins - this is essential for correctness
-                    // The divergence must propagate through all allele bins
-                    if div > p0 {
-                        p0 = div;
-                    }
-                    if div > p1 {
-                        p1 = div;
-                    }
-                    if div > p_miss {
-                        p_miss = div;
-                    }
-
-                    match allele {
-                        0 => {
-                            let pos = base0 + count0;
-                            self.scratch_a[pos] = hap;
-                            self.scratch_d[pos] = p0;
-                            p0 = i32::MIN;
-                            count0 += 1;
+                        // Propagate max to all bins - this is essential for correctness
+                        // The divergence must propagate through all allele bins
+                        if div > p0 {
+                            p0 = div;
                         }
-                        1 => {
-                            let pos = base1 + count1;
-                            self.scratch_a[pos] = hap;
-                            self.scratch_d[pos] = p1;
-                            p1 = i32::MIN;
-                            count1 += 1;
+                        if div > p1 {
+                            p1 = div;
                         }
-                        _ => {
+                        if div > p_miss {
+                            p_miss = div;
+                        }
+
+                        if (miss & 1) != 0 {
                             // Missing or invalid allele
-                            let pos = base_miss + count_miss;
-                            self.scratch_a[pos] = hap;
-                            self.scratch_d[pos] = p_miss;
+                            self.scratch_a[pos_miss] = hap;
+                            self.scratch_d[pos_miss] = p_miss;
                             p_miss = i32::MIN;
-                            count_miss += 1;
+                            pos_miss += 1;
+                        } else if (bits & 1) == 0 {
+                            self.scratch_a[pos0] = hap;
+                            self.scratch_d[pos0] = p0;
+                            p0 = i32::MIN;
+                            pos0 += 1;
+                        } else {
+                            self.scratch_a[pos1] = hap;
+                            self.scratch_d[pos1] = p1;
+                            p1 = i32::MIN;
+                            pos1 += 1;
                         }
+
+                        bits >>= 1;
+                        miss >>= 1;
+                        idx += 1;
                     }
                 }
             } else {
                 // General multiallelic path
+                let prefetch_stride = 64usize;
                 for i in 0..self.n_haps {
+                    if i + prefetch_stride < self.n_haps {
+                        unsafe {
+                            prefetch_read(self.permuted_alleles.as_ptr().add(i + prefetch_stride));
+                            prefetch_read(prefix.as_ptr().add(i + prefetch_stride));
+                            prefetch_read(divergence.as_ptr().add(i + prefetch_stride));
+                        }
+                    }
                     let hap = prefix[i];
                     let div = divergence[i];
                     let allele = self.permuted_alleles[i] as usize; // Sequential access
@@ -398,7 +513,7 @@ impl PbwtDivUpdater {
         alleles: &[u8],
         n_alleles: usize,
         marker: usize,
-        prefix: &mut [u32],
+        prefix: &mut [I],
         divergence: &mut [i32],
     ) {
         assert_eq!(alleles.len(), self.n_haps);
@@ -409,12 +524,6 @@ impl PbwtDivUpdater {
         let n_bins = n_alleles + 1;
         self.ensure_capacity(n_bins);
 
-        // 0. Pre-permute alleles: gather alleles[prefix[i]] into contiguous buffer.
-        // This converts subsequent random-access patterns to sequential access.
-        for i in 0..self.n_haps {
-            self.permuted_alleles[i] = alleles[prefix[i] as usize];
-        }
-
         // 1. Initialize p array for backward PBWT
         //
         // Java uses marker-1 for initialization. This correctly handles allele boundaries:
@@ -423,61 +532,22 @@ impl PbwtDivUpdater {
         // suggest they match indefinitely.
         let init_value = (marker as i32) - 1;
 
-        // 2. Count frequencies - now sequential access via permuted_alleles
+        // 2. Count frequencies
         self.counts[..n_bins].fill(0);
 
         if n_alleles == 2 {
-            // Fast path for biallelic sites - single pass counting
-            let data = &self.permuted_alleles[..self.n_haps];
-
-            // Single-pass: sum all bytes and OR-reduce to detect values > 1
-            let mut sum = 0usize;
-            let mut any_high = 0u8;
-
-            let chunks = data.chunks_exact(32);
-            let remainder = chunks.remainder();
-
-            for chunk in chunks {
-                for &b in chunk {
-                    sum += b as usize;
-                    any_high |= b;
-                }
-            }
-            for &b in remainder {
-                sum += b as usize;
-                any_high |= b;
-            }
-
-            if any_high <= 1 {
-                // Pure 0/1 data - sum equals count of 1s
-                self.counts[0] = self.n_haps - sum;
-                self.counts[1] = 0; // Bin 1: Missing (empty)
-                self.counts[2] = sum; // Bin 2: Allele 1
-            } else {
-                // Has missing data - need detailed count
-                let mut count1 = 0usize;
-                let mut count_miss = 0usize;
-
-                let chunks = data.chunks_exact(32);
-                let remainder = chunks.remainder();
-
-                for chunk in chunks {
-                    for &b in chunk {
-                        count1 += (b == 1) as usize;
-                        count_miss += (b > 1) as usize;
-                    }
-                }
-                for &b in remainder {
-                    count1 += (b == 1) as usize;
-                    count_miss += (b > 1) as usize;
-                }
-
-                self.counts[0] = self.n_haps - count1 - count_miss;
-                self.counts[1] = count_miss; // Bin 1: Missing
-                self.counts[2] = count1; // Bin 2: Allele 1
-            }
+            let (count1, count_miss) = self.pack_biallelic_bits(alleles, prefix);
+            self.counts[0] = self.n_haps - count1 - count_miss;
+            self.counts[1] = count_miss; // Bin 1: Missing
+            self.counts[2] = count1; // Bin 2: Allele 1
         } else {
             // General path for multiallelic
+            // 0. Pre-permute alleles: gather alleles[prefix[i]] into contiguous buffer.
+            // This converts subsequent random-access patterns to sequential access.
+            for i in 0..self.n_haps {
+                self.permuted_alleles[i] = alleles[prefix[i].to_usize()];
+            }
+
             for i in 0..self.n_haps {
                 let allele = self.permuted_alleles[i] as usize;
                 // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
@@ -502,6 +572,7 @@ impl PbwtDivUpdater {
 
         // 4. Check if there's any missing data (before resetting counts)
         let has_missing = self.counts[1] > 0;
+        self.compute_biallelic_word_bases(has_missing);
 
         // 5. Scatter with MIN propagation for backward PBWT
         // p[j] tracks the minimum divergence seen since last output for allele j
@@ -513,36 +584,40 @@ impl PbwtDivUpdater {
             // Fast biallelic path when no missing data - only 2 bins needed
             let mut p0 = init_value;
             let mut p1 = init_value;
-            let base0 = self.offsets[0];
-            let base1 = self.offsets[2]; // Allele 1 is now in Bin 2
-            let mut count0 = 0usize;
-            let mut count1 = 0usize;
 
-            for i in 0..self.n_haps {
-                let hap = prefix[i];
-                let div = divergence[i];
-                let allele = self.permuted_alleles[i]; // Sequential access
+            let mut idx = 0usize;
+            let n_words = (self.n_haps + 63) / 64;
+            for w in 0..n_words {
+                let mut bits = self.permuted_bits[w];
+                let mut pos0 = self.word_base0[w];
+                let mut pos1 = self.word_base1[w];
+                let block_end = (idx + 64).min(self.n_haps);
+                while idx < block_end {
+                    let hap = prefix[idx];
+                    let div = divergence[idx];
 
-                // Propagate min to both bins (backward PBWT)
-                if div < p0 {
-                    p0 = div;
-                }
-                if div < p1 {
-                    p1 = div;
-                }
+                    // Propagate min to both bins (backward PBWT)
+                    if div < p0 {
+                        p0 = div;
+                    }
+                    if div < p1 {
+                        p1 = div;
+                    }
 
-                if allele == 0 {
-                    let pos = base0 + count0;
-                    self.scratch_a[pos] = hap;
-                    self.scratch_d[pos] = p0;
-                    p0 = i32::MAX;
-                    count0 += 1;
-                } else {
-                    let pos = base1 + count1;
-                    self.scratch_a[pos] = hap;
-                    self.scratch_d[pos] = p1;
-                    p1 = i32::MAX;
-                    count1 += 1;
+                    if (bits & 1) == 0 {
+                        self.scratch_a[pos0] = hap;
+                        self.scratch_d[pos0] = p0;
+                        p0 = i32::MAX;
+                        pos0 += 1;
+                    } else {
+                        self.scratch_a[pos1] = hap;
+                        self.scratch_d[pos1] = p1;
+                        p1 = i32::MAX;
+                        pos1 += 1;
+                    }
+
+                    bits >>= 1;
+                    idx += 1;
                 }
             }
         } else if n_alleles == 2 {
@@ -550,57 +625,65 @@ impl PbwtDivUpdater {
             let mut p0 = init_value;
             let mut p1 = init_value;
             let mut p_miss = init_value;
-            let base0 = self.offsets[0];
-            let base_miss = self.offsets[1]; // Missing is now in Bin 1
-            let base1 = self.offsets[2]; // Allele 1 is now in Bin 2
-            let mut count0 = 0usize;
-            let mut count1 = 0usize;
-            let mut count_miss = 0usize;
 
-            for i in 0..self.n_haps {
-                let hap = prefix[i];
-                let div = divergence[i];
-                let allele = self.permuted_alleles[i]; // Sequential access
+            let mut idx = 0usize;
+            let n_words = (self.n_haps + 63) / 64;
+            for w in 0..n_words {
+                let mut bits = self.permuted_bits[w];
+                let mut miss = self.permuted_missing_bits[w];
+                let mut pos0 = self.word_base0[w];
+                let mut pos1 = self.word_base1[w];
+                let mut pos_miss = self.word_base_miss[w];
+                let block_end = (idx + 64).min(self.n_haps);
+                while idx < block_end {
+                    let hap = prefix[idx];
+                    let div = divergence[idx];
 
-                // Propagate min to all bins (backward PBWT)
-                if div < p0 {
-                    p0 = div;
-                }
-                if div < p1 {
-                    p1 = div;
-                }
-                if div < p_miss {
-                    p_miss = div;
-                }
-
-                match allele {
-                    0 => {
-                        let pos = base0 + count0;
-                        self.scratch_a[pos] = hap;
-                        self.scratch_d[pos] = p0;
-                        p0 = i32::MAX;
-                        count0 += 1;
+                    // Propagate min to all bins (backward PBWT)
+                    if div < p0 {
+                        p0 = div;
                     }
-                    1 => {
-                        let pos = base1 + count1;
-                        self.scratch_a[pos] = hap;
-                        self.scratch_d[pos] = p1;
-                        p1 = i32::MAX;
-                        count1 += 1;
+                    if div < p1 {
+                        p1 = div;
                     }
-                    _ => {
+                    if div < p_miss {
+                        p_miss = div;
+                    }
+
+                    if (miss & 1) != 0 {
                         // Missing or invalid allele
-                        let pos = base_miss + count_miss;
-                        self.scratch_a[pos] = hap;
-                        self.scratch_d[pos] = p_miss;
+                        self.scratch_a[pos_miss] = hap;
+                        self.scratch_d[pos_miss] = p_miss;
                         p_miss = i32::MAX;
-                        count_miss += 1;
+                        pos_miss += 1;
+                    } else if (bits & 1) == 0 {
+                        self.scratch_a[pos0] = hap;
+                        self.scratch_d[pos0] = p0;
+                        p0 = i32::MAX;
+                        pos0 += 1;
+                    } else {
+                        self.scratch_a[pos1] = hap;
+                        self.scratch_d[pos1] = p1;
+                        p1 = i32::MAX;
+                        pos1 += 1;
                     }
+
+                    bits >>= 1;
+                    miss >>= 1;
+                    idx += 1;
                 }
             }
         } else {
             // General multiallelic path
+            let prefetch_stride = 64usize;
             for i in 0..self.n_haps {
+                if i + prefetch_stride < self.n_haps {
+                    unsafe {
+                        prefetch_read(self.permuted_alleles.as_ptr().add(i + prefetch_stride));
+                        prefetch_read(prefix.as_ptr().add(i + prefetch_stride));
+                        prefetch_read(divergence.as_ptr().add(i + prefetch_stride));
+                    }
+                }
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = self.permuted_alleles[i] as usize; // Sequential access
