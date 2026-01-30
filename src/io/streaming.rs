@@ -974,6 +974,9 @@ impl StreamingVcfReader {
         let _ = next_field()?;
         let _ = next_field()?;
 
+        // Skip INFO
+        let _ = next_field()?;
+
         // Parse FORMAT to find GT position
         let format = next_field()?;
         let (gt_idx, gl_idx, pl_idx) = find_format_indices(format);
