@@ -155,12 +155,11 @@ impl ModelParams {
     ///
     /// From Java `PhaseData.updateRecombIntensity`:
     /// Only update if new value is present, valid and positive
-    pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
-        if let Some(r) = new_intensity {
-            if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
-            }
-        }
+    pub fn update_recomb_intensity(&mut self, _: Option<f32>) {
+        // Parameter locking:
+        // Disable EM updates for recombination intensity to prevent
+        // underestimation in sparse/small datasets.
+        // We rely on the initial Ne-derived intensity.
     }
 
     /// Set number of states
