@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use reagle::data::alignment::MarkerAlignment;
 use reagle::data::marker::{AnyMarkerSpace, Nucleotide};
-use reagle::model::block_hash::types::GlobalId;
+use reagle::model::types::GlobalId;
 use reagle::model::hmm::HmmUpdater;
 use std::hint::black_box;
 

@@ -74,6 +74,8 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     permuted_missing_bits: Vec<u64>,
     prefix_ones_words: Vec<u32>,
     prefix_missing_words: Vec<u32>,
+    binary_counts: [u32; 3],
+    binary_offsets: [u32; 3],
     prefix_counts: Vec<u32>,
     counts: Vec<u32>,
     offsets: Vec<u32>,
@@ -90,6 +92,8 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             permuted_missing_bits: Vec::new(),
             prefix_ones_words: Vec::new(),
             prefix_missing_words: Vec::new(),
+            binary_counts: [0; 3],
+            binary_offsets: [0; 3],
             prefix_counts: Vec::new(),
             counts: Vec::new(),
             offsets: Vec::new(),
@@ -183,6 +187,22 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             self.permuted_missing_bits.resize(n_words, 0);
             self.prefix_ones_words.resize(n_words + 1, 0);
             self.prefix_missing_words.resize(n_words + 1, 0);
+        }
+    }
+
+    fn offset_for(&self, bin: usize, n_alleles: usize) -> u32 {
+        if n_alleles == 2 {
+            self.binary_offsets[bin]
+        } else {
+            self.offsets[bin]
+        }
+    }
+
+    fn count_for(&self, bin: usize, n_alleles: usize) -> u32 {
+        if n_alleles == 2 {
+            self.binary_counts[bin]
+        } else {
+            self.counts[bin]
         }
     }
 
@@ -285,16 +305,15 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 count_miss += miss.count_ones();
             }
 
-            self.counts[..n_bins].fill(0);
             let count0 = n_ref as u32 - count1 - count_miss;
-            self.counts[0] = count0;
-            self.counts[1] = count_miss;
-            self.counts[2] = count1;
+            self.binary_counts[0] = count0;
+            self.binary_counts[1] = count_miss;
+            self.binary_counts[2] = count1;
 
             let mut running = 0u32;
             for b in 0..n_bins {
-                self.offsets[b] = running;
-                running += self.counts[b];
+                self.binary_offsets[b] = running;
+                running += self.binary_counts[b];
             }
 
             self.prefix_ones_words[0] = 0;
@@ -370,11 +389,11 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 scratch.clear();
                 for &(l, r) in old.intervals() {
                     for b in 0..n_bins {
-                        let nl = self.offsets[b] + self.rank(b, l, n_ref, n_alleles);
-                        let nr = self.offsets[b] + self.rank(b, r, n_ref, n_alleles);
+                        let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                        let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                         if nl < nr {
                             let len = nr - nl;
-                            let score = len.saturating_mul(self.counts[b]);
+                            let score = len.saturating_mul(self.count_for(b, n_alleles));
                             scratch.push((nl, nr, score));
                         }
                     }
@@ -390,8 +409,8 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 let b = Self::bin_for_allele(qa, n_alleles);
                 if b < n_bins {
                     for &(l, r) in old.intervals() {
-                        let nl = self.offsets[b] + self.rank(b, l, n_ref, n_alleles);
-                        let nr = self.offsets[b] + self.rank(b, r, n_ref, n_alleles);
+                        let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                        let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                         next.push_interval(nl, nr);
                     }
                 } else {
@@ -402,11 +421,13 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     scratch.clear();
                     for &(l, r) in old.intervals() {
                         for b in 0..n_bins {
-                        let nl = self.offsets[b] + self.rank(b, l, n_ref, n_alleles);
-                        let nr = self.offsets[b] + self.rank(b, r, n_ref, n_alleles);
+                            let nl =
+                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                            let nr =
+                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                             if nl < nr {
                                 let len = nr - nl;
-                                let score = len.saturating_mul(self.counts[b]);
+                                let score = len.saturating_mul(self.count_for(b, n_alleles));
                                 scratch.push((nl, nr, score));
                             }
                         }
