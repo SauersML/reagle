@@ -1,4 +1,4 @@
-use crate::data::marker::{bits_per_allele, MarkerIdx, Markers};
+use crate::data::marker::{bits_per_allele, MarkerIdx, Markers, RefWindowSpace};
 use crate::data::storage::GenotypeColumn;
 use crate::io::bref3::RefWindow;
 use crate::error::{ReagleError, Result};
@@ -151,6 +151,21 @@ pub struct PackedRefWindow {
     pub columns: Vec<PackedRefColumn>,
 }
 
+pub fn pack_ref_columns(
+    markers: &Markers<RefWindowSpace>,
+    ref_columns: &[GenotypeColumn],
+) -> Vec<PackedRefColumn> {
+    let mut packed = Vec::with_capacity(ref_columns.len());
+    for (m, col) in ref_columns.iter().enumerate() {
+        packed.push(PackedRefColumn::pack_from_column(
+            MarkerIdx::new(m as u32),
+            markers,
+            col,
+        ));
+    }
+    packed
+}
+
 pub struct PrescanCacheWriter {
     file: BufWriter<File>,
     path: PathBuf,
@@ -202,8 +217,8 @@ impl PrescanCacheWriter {
         self.file.write_all(&markers_blob)?;
 
         write_u32(&mut self.file, window.ref_columns.len() as u32)?;
-        for (m, col) in window.ref_columns.iter().enumerate() {
-            let packed = PackedRefColumn::pack_from_column(MarkerIdx::new(m as u32), &window.markers, col);
+        let packed_cols = pack_ref_columns(&window.markers, &window.ref_columns);
+        for packed in packed_cols {
             write_packed_column(&mut self.file, &packed)?;
         }
         Ok(())

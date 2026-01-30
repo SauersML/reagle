@@ -21,9 +21,10 @@ use crate::data::{HapIdx, MarkerIdx, SampleIdx};
 use crate::error::ReagleError;
 use crate::error::Result;
 use crate::Config;
-use crate::io::bref3::{RefPanelReader, TargetMarkerIndex, convert_ref_vcf_to_bref3};
+use crate::io::bref3::{RefPanelReader, RefWindow, TargetMarkerIndex, convert_ref_vcf_to_bref3};
 use crate::io::prescan_cache::{
-    create_temp_cache_path, PackedRefColumn, PrescanCacheReader, PrescanCacheWriter,
+    create_temp_cache_path, pack_ref_columns, PackedRefColumn, PrescanCacheReader,
+    PrescanCacheWriter,
 };
 use crate::io::streaming::{
     GlobalHapId, HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader,
@@ -77,6 +78,7 @@ const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const STATE_BUDGET_SAFETY: f64 = 0.6;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
+const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 
@@ -935,7 +937,101 @@ impl Drop for PrescanCacheGuard {
     }
 }
 
-fn build_prescan_cache(
+enum ReferenceData {
+    InMemory {
+        windows: Vec<RefWindow>,
+        packed_columns: Vec<Vec<PackedRefColumn>>,
+        n_ref_haps: usize,
+        per_window_caps: Vec<usize>,
+        window_handoff: Vec<(f64, f64)>,
+    },
+    OnDisk {
+        cache_meta: PrescanCacheMeta,
+        guard: PrescanCacheGuard,
+    },
+}
+
+impl ReferenceData {
+    fn n_ref_haps(&self) -> usize {
+        match self {
+            Self::InMemory { n_ref_haps, .. } => *n_ref_haps,
+            Self::OnDisk { cache_meta, .. } => cache_meta.n_ref_haps,
+        }
+    }
+
+    fn per_window_caps(&self) -> &[usize] {
+        match self {
+            Self::InMemory { per_window_caps, .. } => per_window_caps.as_slice(),
+            Self::OnDisk { cache_meta, .. } => cache_meta.per_window_caps.as_slice(),
+        }
+    }
+
+    fn window_handoff(&self) -> &[(f64, f64)] {
+        match self {
+            Self::InMemory { window_handoff, .. } => window_handoff.as_slice(),
+            Self::OnDisk { cache_meta, .. } => cache_meta.window_handoff.as_slice(),
+        }
+    }
+}
+
+fn packed_column_size_bytes(col: &PackedRefColumn) -> u64 {
+    match col {
+        PackedRefColumn::Bits { words, missing, .. } => {
+            (words.len() as u64 * 8) + (missing.len() as u64 * 8)
+        }
+        PackedRefColumn::Bytes { alleles } => alleles.len() as u64,
+    }
+}
+
+fn estimate_ref_window_bytes(ref_window: &RefWindow, packed_cols: &[PackedRefColumn]) -> u64 {
+    let mut bytes = 0u64;
+    for col in ref_window.ref_columns.iter() {
+        bytes = bytes.saturating_add(col.size_bytes() as u64);
+    }
+    for col in packed_cols.iter() {
+        bytes = bytes.saturating_add(packed_column_size_bytes(col));
+    }
+    let marker_overhead = ref_window.markers.len().saturating_mul(64) as u64;
+    bytes.saturating_add(marker_overhead)
+}
+
+fn compute_per_window_cap(
+    n_ref_haps: usize,
+    n_ref_markers: usize,
+    available_bytes: u64,
+    n_threads: usize,
+    safe_bytes_per_thread: u64,
+    force_full_panel: bool,
+) -> usize {
+    let mut per_window_cap_window = if force_full_panel {
+        n_ref_haps.max(1)
+    } else {
+        let per_state_bytes = 4usize.saturating_mul(4 + n_ref_markers);
+        let mut cap = if per_state_bytes == 0 {
+            0
+        } else {
+            let full_panel_bytes = per_state_bytes
+                .saturating_mul(n_ref_haps)
+                .saturating_mul(n_threads.max(1));
+            let can_fit_full_panel = available_bytes > 0
+                && full_panel_bytes as f64 <= (available_bytes as f64 * FULL_PANEL_RAM_FRACTION);
+            if can_fit_full_panel {
+                n_ref_haps
+            } else {
+                (safe_bytes_per_thread as usize) / per_state_bytes
+            }
+        };
+        if cap == 0 {
+            cap = 1;
+        }
+        cap
+    };
+    let cap = n_ref_haps.max(1);
+    per_window_cap_window = per_window_cap_window.min(cap).max(1);
+    per_window_cap_window
+}
+
+fn prepare_reference_data(
     ref_path: &Path,
     streaming_config: &StreamingConfig,
     gen_maps: &GeneticMaps,
@@ -944,15 +1040,24 @@ fn build_prescan_cache(
     n_threads: usize,
     safe_bytes_per_thread: u64,
     force_full_panel: bool,
-) -> Result<(PrescanCacheMeta, PrescanCacheGuard)> {
-    let cache_path = create_temp_cache_path();
-    let mut writer = PrescanCacheWriter::create(&cache_path)?;
+) -> Result<ReferenceData> {
+    let memory_budget = if available_bytes == 0 {
+        0u64
+    } else {
+        (available_bytes as f64 * REF_PANEL_RAM_FRACTION) as u64
+    };
+    let mut use_in_memory = memory_budget > 0;
 
     let mut ref_reader = open_ref_reader(ref_path)?;
     let mut n_ref_haps = 0usize;
     let mut per_window_caps: Vec<usize> = Vec::new();
     let mut window_handoff: Vec<(f64, f64)> = Vec::new();
-    let mut header_written = false;
+    let mut windows: Vec<RefWindow> = Vec::new();
+    let mut packed_columns: Vec<Vec<PackedRefColumn>> = Vec::new();
+    let mut total_bytes: u64 = 0;
+
+    let mut cache_path: Option<PathBuf> = None;
+    let mut cache_writer: Option<PrescanCacheWriter> = None;
 
     loop {
         let ref_window = ref_reader.next_window(streaming_config, gen_maps, Some(target_positions))?;
@@ -971,36 +1076,16 @@ fn build_prescan_cache(
             if n_ref_haps == 0 {
                 continue;
             }
-            writer.set_n_ref_haps(n_ref_haps);
-            writer.write_header()?;
-            header_written = true;
         }
 
-        let mut per_window_cap_window = if force_full_panel {
-            n_ref_haps.max(1)
-        } else {
-            let per_state_bytes = 4usize.saturating_mul(4 + n_ref_markers);
-            let mut cap = if per_state_bytes == 0 {
-                0
-            } else {
-                let full_panel_bytes = per_state_bytes
-                    .saturating_mul(n_ref_haps)
-                    .saturating_mul(n_threads.max(1));
-                let can_fit_full_panel = available_bytes > 0
-                    && full_panel_bytes as f64 <= (available_bytes as f64 * FULL_PANEL_RAM_FRACTION);
-                if can_fit_full_panel {
-                    n_ref_haps
-                } else {
-                    (safe_bytes_per_thread as usize) / per_state_bytes
-                }
-            };
-            if cap == 0 {
-                cap = 1;
-            }
-            cap
-        };
-        let cap = n_ref_haps.max(1);
-        per_window_cap_window = per_window_cap_window.min(cap).max(1);
+        let per_window_cap_window = compute_per_window_cap(
+            n_ref_haps,
+            n_ref_markers,
+            available_bytes,
+            n_threads,
+            safe_bytes_per_thread,
+            force_full_panel,
+        );
         per_window_caps.push(per_window_cap_window);
 
         let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
@@ -1013,28 +1098,81 @@ fn build_prescan_cache(
         let right_gen = gen_maps.gen_pos(right_marker.chrom, right_marker.pos);
         window_handoff.push((left_gen, right_gen));
 
-        if header_written {
+        if use_in_memory {
+            let packed = pack_ref_columns(&ref_window.markers, &ref_window.ref_columns);
+            total_bytes = total_bytes.saturating_add(estimate_ref_window_bytes(&ref_window, &packed));
+            if total_bytes <= memory_budget {
+                packed_columns.push(packed);
+                windows.push(ref_window);
+                continue;
+            }
+
+            use_in_memory = false;
+            let path = create_temp_cache_path();
+            let mut writer = PrescanCacheWriter::create(&path)?;
+            writer.set_n_ref_haps(n_ref_haps);
+            writer.write_header()?;
+            for win in windows.iter() {
+                writer.write_window(win)?;
+            }
             writer.write_window(&ref_window)?;
+            windows.clear();
+            packed_columns.clear();
+            cache_path = Some(path);
+            cache_writer = Some(writer);
+        } else {
+            if cache_writer.is_none() {
+                let path = cache_path.get_or_insert_with(create_temp_cache_path);
+                let mut writer = PrescanCacheWriter::create(path)?;
+                writer.set_n_ref_haps(n_ref_haps);
+                writer.write_header()?;
+                cache_writer = Some(writer);
+            }
+            if let Some(writer) = cache_writer.as_mut() {
+                writer.write_window(&ref_window)?;
+            }
         }
     }
 
-    if n_ref_haps == 0 || !header_written {
+    if n_ref_haps == 0 {
         return Err(ReagleError::vcf(
             "Reference window scanning found no haplotypes".to_string(),
         ));
     }
 
-    let _ = writer.finish()?;
-    let meta = PrescanCacheMeta {
-        path: cache_path.clone(),
-        n_ref_haps,
-        per_window_caps,
-        window_handoff,
-    };
-    let guard = PrescanCacheGuard {
-        path: cache_path,
-    };
-    Ok((meta, guard))
+    if use_in_memory {
+        if windows.is_empty() {
+            return Err(ReagleError::vcf(
+                "Reference window scanning found no haplotypes".to_string(),
+            ));
+        }
+        Ok(ReferenceData::InMemory {
+            windows,
+            packed_columns,
+            n_ref_haps,
+            per_window_caps,
+            window_handoff,
+        })
+    } else {
+        let path = cache_path.ok_or_else(|| {
+            ReagleError::vcf("Prescan cache path missing after scan".to_string())
+        })?;
+        let writer = cache_writer.ok_or_else(|| {
+            ReagleError::vcf("Prescan cache writer missing after scan".to_string())
+        })?;
+        let _ = writer.finish()?;
+        let meta = PrescanCacheMeta {
+            path: path.clone(),
+            n_ref_haps,
+            per_window_caps,
+            window_handoff,
+        };
+        let guard = PrescanCacheGuard { path };
+        Ok(ReferenceData::OnDisk {
+            cache_meta: meta,
+            guard,
+        })
+    }
 }
 
 fn is_vcf_fully_phased(path: &Path) -> Result<bool> {
@@ -1095,15 +1233,13 @@ fn is_vcf_fully_phased(path: &Path) -> Result<bool> {
 
 fn build_imputation_plan(
     target_path: &Path,
-    ref_path: &Path,
     streaming_config: &StreamingConfig,
     gen_maps: &GeneticMaps,
-    target_positions: &TargetMarkerIndex,
     per_window_cap: usize,
     available_bytes: u64,
-    n_threads: usize,
     imp_step_cm: f64,
     params: &crate::model::parameters::ModelParams,
+    ref_data: &ReferenceData,
 ) -> Result<ImputationPlan> {
     let target_reader =
         StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
@@ -1124,34 +1260,15 @@ fn build_imputation_plan(
     };
 
     let avail = available_bytes;
-    let safe_bytes_per_thread = if n_threads == 0 {
-        0u64
-    } else {
-        let budget = (avail as f64 * IMPUTE_RAM_FRACTION) as u64;
-        let per_thread = budget / n_threads as u64;
-        (per_thread as f64 * STATE_BUDGET_SAFETY) as u64
-    };
-    let force_full_panel = available_bytes < MIN_AVAIL_BYTES_FOR_PLANNING;
-    let (cache_meta, cache_guard) = build_prescan_cache(
-        ref_path,
-        streaming_config,
-        gen_maps,
-        target_positions,
-        available_bytes,
-        n_threads,
-        safe_bytes_per_thread,
-        force_full_panel,
-    )?;
-    let _ = &cache_guard;
-    let n_ref_haps = cache_meta.n_ref_haps;
+    let n_ref_haps = ref_data.n_ref_haps();
     if n_ref_haps == 0 {
         return Err(ReagleError::vcf(
             "Reference window scanning found no haplotypes".to_string(),
         ));
     }
     plan.n_ref_haps = n_ref_haps;
-    let window_handoff = cache_meta.window_handoff.clone();
-    let per_window_caps = cache_meta.per_window_caps.clone();
+    let window_handoff = ref_data.window_handoff().to_vec();
+    let per_window_caps = ref_data.per_window_caps().to_vec();
     let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
 
@@ -1193,13 +1310,11 @@ fn build_imputation_plan(
         batch_size
     );
 
-    let mut ref_reader = PrescanCacheReader::open(&cache_meta.path)?;
     while batch_start < n_target_haps {
         let batch_end = (batch_start + batch_size).min(n_target_haps);
         let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
         let batch_len = batch_haps.len();
 
-        ref_reader.rewind()?;
         let mut target_reader =
             StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
 
@@ -1218,129 +1333,260 @@ fn build_imputation_plan(
         }
 
         let mut window_idx = 0usize;
-        loop {
-            let ref_window = ref_reader.next_window()?;
-            let Some(ref_window) = ref_window else { break };
-
-            let n_ref_markers = ref_window.markers.len();
-            if n_ref_markers == 0 {
-                continue;
-            }
-            // Derive per-window cap from the observed marker count to match
-            // the real workspace footprint (fwd/bwd/history scale with markers).
-            let per_window_cap_window = per_window_caps
-                .get(window_idx)
-                .copied()
-                .unwrap_or(per_window_cap.max(1));
-
-            let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
-            let ref_chrom = ref_window
-                .markers
-                .chrom_name(ref_chrom_idx)
-                .unwrap_or("UNKNOWN");
-            let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-            let end_pos = ref_window
-                .markers
-                .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                .pos;
-
-            let chrom_candidates = chrom_variants(ref_chrom);
-            let target_window = target_reader.load_window_for_region(
-                &chrom_candidates,
-                start_pos,
-                end_pos,
-            )?;
-            let Some(target_window) = target_window else {
-                continue;
-            };
-
-            let alignment = MarkerAlignment::new_with_ref_markers(
-                &target_window.genotypes,
-                &ref_window.markers,
-            );
-
-            for i in 0..batch_len {
-                if global_scores[i].len() != n_ref_haps {
-                    global_scores[i] = vec![0.0f32; n_ref_haps];
-                    window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
-                    best_window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
-                    window_rank_hits[i] = vec![0u32; n_ref_haps];
-                }
-            }
-
-            for w in window_scores.iter_mut() {
-                w.fill(f32::NEG_INFINITY);
-            }
-
-            let k_per_hap = per_window_cap_window
-                .saturating_mul(PBWT_PER_WINDOW_MULT)
-                .max(PBWT_MIN_PER_HAP)
-                .min(PBWT_MAX_PER_HAP)
-                .max(1);
-
-            let phased_target = target_window.genotypes.clone().into_phased();
-            let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
-            let use_exact = should_use_exact_prescan(
-                n_ref_haps,
-                batch_haps.len(),
-                phased_target.n_markers(),
-            );
-            if use_exact {
-                score_window_batch_exact_packed(
-                    &batch_haps,
-                    &phased_target,
-                    &ref_window.columns,
-                    n_ref_haps,
-                    &alignment,
-                    &mut global_scores,
-                    &mut window_scores,
-                );
-            } else {
-                score_window_batch_pbwt_packed(
-                    &batch_haps,
-                    &phased_target,
-                    &ref_window.columns,
-                    n_ref_haps,
-                    &alignment,
-                    gen_maps,
-                    k_per_hap,
-                    step_cm,
-                    &mut global_scores,
-                    &mut window_scores,
-                );
-            }
-
-            let abyss_rank_cutoff = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
-                .min(n_ref_haps)
-                .max(1);
-            for (i, _) in batch_haps.iter().enumerate() {
-                for (h, score) in window_scores[i].iter().copied().enumerate() {
-                    if score > best_window_scores[i][h] {
-                        best_window_scores[i][h] = score;
+        match ref_data {
+            ReferenceData::InMemory {
+                windows,
+                packed_columns,
+                ..
+            } => {
+                for (ref_window, ref_columns) in windows.iter().zip(packed_columns.iter()) {
+                    let n_ref_markers = ref_window.markers.len();
+                    if n_ref_markers == 0 {
+                        continue;
                     }
-                }
+                    // Derive per-window cap from the observed marker count to match
+                    // the real workspace footprint (fwd/bwd/history scale with markers).
+                    let per_window_cap_window = per_window_caps
+                        .get(window_idx)
+                        .copied()
+                        .unwrap_or(per_window_cap.max(1));
 
-                let abyss_top = select_top_k(&window_scores[i], abyss_rank_cutoff);
-                for (ref_idx, _) in abyss_top {
-                    if ref_idx < window_rank_hits[i].len() {
-                        window_rank_hits[i][ref_idx] =
-                            window_rank_hits[i][ref_idx].saturating_add(1);
+                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                    let ref_chrom = ref_window
+                        .markers
+                        .chrom_name(ref_chrom_idx)
+                        .unwrap_or("UNKNOWN");
+                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                    let end_pos = ref_window
+                        .markers
+                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                        .pos;
+
+                    let chrom_candidates = chrom_variants(ref_chrom);
+                    let target_window = target_reader.load_window_for_region(
+                        &chrom_candidates,
+                        start_pos,
+                        end_pos,
+                    )?;
+                    let Some(target_window) = target_window else {
+                        continue;
+                    };
+
+                    let alignment = MarkerAlignment::new_with_ref_markers(
+                        &target_window.genotypes,
+                        &ref_window.markers,
+                    );
+
+                    for i in 0..batch_len {
+                        if global_scores[i].len() != n_ref_haps {
+                            global_scores[i] = vec![0.0f32; n_ref_haps];
+                            window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                            best_window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                            window_rank_hits[i] = vec![0u32; n_ref_haps];
+                        }
                     }
+
+                    for w in window_scores.iter_mut() {
+                        w.fill(f32::NEG_INFINITY);
+                    }
+
+                    let k_per_hap = per_window_cap_window
+                        .saturating_mul(PBWT_PER_WINDOW_MULT)
+                        .max(PBWT_MIN_PER_HAP)
+                        .min(PBWT_MAX_PER_HAP)
+                        .max(1);
+
+                    let phased_target = target_window.genotypes.clone().into_phased();
+                    let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
+                    let use_exact = should_use_exact_prescan(
+                        n_ref_haps,
+                        batch_haps.len(),
+                        phased_target.n_markers(),
+                    );
+                    if use_exact {
+                        score_window_batch_exact_packed(
+                            &batch_haps,
+                            &phased_target,
+                            ref_columns,
+                            n_ref_haps,
+                            &alignment,
+                            &mut global_scores,
+                            &mut window_scores,
+                        );
+                    } else {
+                        score_window_batch_pbwt_packed(
+                            &batch_haps,
+                            &phased_target,
+                            ref_columns,
+                            n_ref_haps,
+                            &alignment,
+                            gen_maps,
+                            k_per_hap,
+                            step_cm,
+                            &mut global_scores,
+                            &mut window_scores,
+                        );
+                    }
+
+                    let abyss_rank_cutoff = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
+                        .min(n_ref_haps)
+                        .max(1);
+                    for (i, _) in batch_haps.iter().enumerate() {
+                        for (h, score) in window_scores[i].iter().copied().enumerate() {
+                            if score > best_window_scores[i][h] {
+                                best_window_scores[i][h] = score;
+                            }
+                        }
+
+                        let abyss_top = select_top_k(&window_scores[i], abyss_rank_cutoff);
+                        for (ref_idx, _) in abyss_top {
+                            if ref_idx < window_rank_hits[i].len() {
+                                window_rank_hits[i][ref_idx] =
+                                    window_rank_hits[i][ref_idx].saturating_add(1);
+                            }
+                        }
+                    }
+
+                    // Persist per-window sparse scores for LMS allocator (top-M per window).
+                    for i in 0..batch_len {
+                        let top_m = per_window_cap_window
+                            .saturating_mul(PBWT_PER_WINDOW_MULT)
+                            .max(per_window_cap_window)
+                            .min(n_ref_haps.max(1));
+                        let top = select_top_k(&window_scores[i], top_m);
+                        scores_by_window[i].push(top);
+                    }
+
+                    window_idx += 1;
                 }
             }
+            ReferenceData::OnDisk { cache_meta, .. } => {
+                let mut ref_reader = PrescanCacheReader::open(&cache_meta.path)?;
+                ref_reader.rewind()?;
+                loop {
+                    let ref_window = ref_reader.next_window()?;
+                    let Some(ref_window) = ref_window else { break };
 
-            // Persist per-window sparse scores for LMS allocator (top-M per window).
-            for i in 0..batch_len {
-                let top_m = per_window_cap_window
-                    .saturating_mul(PBWT_PER_WINDOW_MULT)
-                    .max(per_window_cap_window)
-                    .min(n_ref_haps.max(1));
-                let top = select_top_k(&window_scores[i], top_m);
-                scores_by_window[i].push(top);
+                    let n_ref_markers = ref_window.markers.len();
+                    if n_ref_markers == 0 {
+                        continue;
+                    }
+                    // Derive per-window cap from the observed marker count to match
+                    // the real workspace footprint (fwd/bwd/history scale with markers).
+                    let per_window_cap_window = per_window_caps
+                        .get(window_idx)
+                        .copied()
+                        .unwrap_or(per_window_cap.max(1));
+
+                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                    let ref_chrom = ref_window
+                        .markers
+                        .chrom_name(ref_chrom_idx)
+                        .unwrap_or("UNKNOWN");
+                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                    let end_pos = ref_window
+                        .markers
+                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                        .pos;
+
+                    let chrom_candidates = chrom_variants(ref_chrom);
+                    let target_window = target_reader.load_window_for_region(
+                        &chrom_candidates,
+                        start_pos,
+                        end_pos,
+                    )?;
+                    let Some(target_window) = target_window else {
+                        continue;
+                    };
+
+                    let alignment = MarkerAlignment::new_with_ref_markers(
+                        &target_window.genotypes,
+                        &ref_window.markers,
+                    );
+
+                    for i in 0..batch_len {
+                        if global_scores[i].len() != n_ref_haps {
+                            global_scores[i] = vec![0.0f32; n_ref_haps];
+                            window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                            best_window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                            window_rank_hits[i] = vec![0u32; n_ref_haps];
+                        }
+                    }
+
+                    for w in window_scores.iter_mut() {
+                        w.fill(f32::NEG_INFINITY);
+                    }
+
+                    let k_per_hap = per_window_cap_window
+                        .saturating_mul(PBWT_PER_WINDOW_MULT)
+                        .max(PBWT_MIN_PER_HAP)
+                        .min(PBWT_MAX_PER_HAP)
+                        .max(1);
+
+                    let phased_target = target_window.genotypes.clone().into_phased();
+                    let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
+                    let use_exact = should_use_exact_prescan(
+                        n_ref_haps,
+                        batch_haps.len(),
+                        phased_target.n_markers(),
+                    );
+                    if use_exact {
+                        score_window_batch_exact_packed(
+                            &batch_haps,
+                            &phased_target,
+                            &ref_window.columns,
+                            n_ref_haps,
+                            &alignment,
+                            &mut global_scores,
+                            &mut window_scores,
+                        );
+                    } else {
+                        score_window_batch_pbwt_packed(
+                            &batch_haps,
+                            &phased_target,
+                            &ref_window.columns,
+                            n_ref_haps,
+                            &alignment,
+                            gen_maps,
+                            k_per_hap,
+                            step_cm,
+                            &mut global_scores,
+                            &mut window_scores,
+                        );
+                    }
+
+                    let abyss_rank_cutoff = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
+                        .min(n_ref_haps)
+                        .max(1);
+                    for (i, _) in batch_haps.iter().enumerate() {
+                        for (h, score) in window_scores[i].iter().copied().enumerate() {
+                            if score > best_window_scores[i][h] {
+                                best_window_scores[i][h] = score;
+                            }
+                        }
+
+                        let abyss_top = select_top_k(&window_scores[i], abyss_rank_cutoff);
+                        for (ref_idx, _) in abyss_top {
+                            if ref_idx < window_rank_hits[i].len() {
+                                window_rank_hits[i][ref_idx] =
+                                    window_rank_hits[i][ref_idx].saturating_add(1);
+                            }
+                        }
+                    }
+
+                    // Persist per-window sparse scores for LMS allocator (top-M per window).
+                    for i in 0..batch_len {
+                        let top_m = per_window_cap_window
+                            .saturating_mul(PBWT_PER_WINDOW_MULT)
+                            .max(per_window_cap_window)
+                            .min(n_ref_haps.max(1));
+                        let top = select_top_k(&window_scores[i], top_m);
+                        scores_by_window[i].push(top);
+                    }
+
+                    window_idx += 1;
+                }
             }
-
-            window_idx += 1;
-
         }
 
         let min_step_cm = (streaming_config.overlap_cm as f64)
@@ -1656,17 +1902,44 @@ impl crate::pipelines::ImputationPipeline {
             avail_bytes / (1024 * 1024)
         );
 
-        let plan = build_imputation_plan(
-            &phased_target_path,
+        let safe_bytes_per_thread = if n_threads == 0 {
+            0u64
+        } else {
+            let budget = (avail_bytes as f64 * IMPUTE_RAM_FRACTION) as u64;
+            let per_thread = budget / n_threads as u64;
+            (per_thread as f64 * STATE_BUDGET_SAFETY) as u64
+        };
+        let prescan_force_full_panel = avail_bytes < MIN_AVAIL_BYTES_FOR_PLANNING;
+        let ref_data = prepare_reference_data(
             &ref_path,
             &streaming_config,
             &gen_maps,
             &target_positions_map,
-            per_window_cap,
             if force_full_panel { 0 } else { avail_bytes },
             n_threads,
+            safe_bytes_per_thread,
+            prescan_force_full_panel,
+        )?;
+
+        match &ref_data {
+            ReferenceData::InMemory { .. } => {
+                eprintln!("Reference mode: in-memory (single-pass)");
+            }
+            ReferenceData::OnDisk { guard, .. } => {
+                eprintln!("Reference mode: prescan cache (double-pass)");
+                let _ = guard;
+            }
+        }
+
+        let plan = build_imputation_plan(
+            &phased_target_path,
+            &streaming_config,
+            &gen_maps,
+            per_window_cap,
+            if force_full_panel { 0 } else { avail_bytes },
             self.config.imp_step as f64,
             &self.params,
+            &ref_data,
         )?;
 
         self.params.recomb_intensity = (0.04 * self.config.ne / plan.n_ref_haps as f32)
@@ -1694,7 +1967,7 @@ impl crate::pipelines::ImputationPipeline {
             bb.set_current_window(0);
         }
 
-        let mut ref_reader = open_ref_reader(&ref_path)?;
+        let mut ref_data = ref_data;
         let target_was_unphased_for_impute = !is_vcf_fully_phased(&input_target_path)?;
         // Always use phased target haplotypes for emissions to preserve LD signal.
         // If the input was unphased, we will still treat phase as uncertain in
@@ -1758,205 +2031,416 @@ impl crate::pipelines::ImputationPipeline {
         let mut total_markers = 0usize;
         let mut window_idx = 0usize;
 
-        loop {
-            if let Some(bb) = &self.telemetry {
-                bb.set_producer_stage(crate::utils::telemetry::Stage::LoadingData);
-                bb.set_producer_op(&format!("Loading ref window {}", window_idx + 1));
-                bb.set_op(&format!("Loading ref window {}", window_idx + 1));
-                bb.set_current_window((window_idx + 1) as u64);
-            }
-            let ref_window = ref_reader.next_window(
-                &streaming_config,
-                &gen_maps,
-                Some(&target_positions_map),
-            )?;
-            let Some(mut ref_window) = ref_window else { break };
+        match &mut ref_data {
+            ReferenceData::InMemory { windows, .. } => {
+                for ref_window in windows.iter_mut() {
+                    if let Some(bb) = &self.telemetry {
+                        bb.set_producer_stage(crate::utils::telemetry::Stage::LoadingData);
+                        bb.set_producer_op(&format!("Loading ref window {}", window_idx + 1));
+                        bb.set_op(&format!("Loading ref window {}", window_idx + 1));
+                        bb.set_current_window((window_idx + 1) as u64);
+                    }
 
-            let n_ref_markers = ref_window.markers.len();
-            if n_ref_markers == 0 {
-                window_idx += 1;
-                continue;
-            }
+                    let n_ref_markers = ref_window.markers.len();
+                    if n_ref_markers == 0 {
+                        window_idx += 1;
+                        continue;
+                    }
 
-            let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
-            let ref_chrom = ref_window
-                .markers
-                .chrom_name(ref_chrom_idx)
-                .unwrap_or("UNKNOWN");
-            let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-            let end_pos = ref_window
-                .markers
-                .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                .pos;
+                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                    let ref_chrom = ref_window
+                        .markers
+                        .chrom_name(ref_chrom_idx)
+                        .unwrap_or("UNKNOWN");
+                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                    let end_pos = ref_window
+                        .markers
+                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                        .pos;
 
-            let chrom_candidates = chrom_variants(ref_chrom);
-            let target_window = target_reader.load_window_for_region(
-                &chrom_candidates,
-                start_pos,
-                end_pos,
-            )?;
-            let Some(target_window) = target_window else {
-                window_idx += 1;
-                continue;
-            };
-            let target_window_pl = if let Some(reader_pl) = target_reader_pl.as_mut() {
-                reader_pl.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
-            } else {
-                None
-            };
+                    let chrom_candidates = chrom_variants(ref_chrom);
+                    let target_window = target_reader.load_window_for_region(
+                        &chrom_candidates,
+                        start_pos,
+                        end_pos,
+                    )?;
+                    let Some(target_window) = target_window else {
+                        window_idx += 1;
+                        continue;
+                    };
+                    let target_window_pl = if let Some(reader_pl) = target_reader_pl.as_mut() {
+                        reader_pl.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                    } else {
+                        None
+                    };
 
-            // Align using the phased target markers; PL/GL lookups share the same
-            // marker set, so indices should remain consistent.
-            let alignment = MarkerAlignment::new_with_ref_markers(
-                &target_window.genotypes,
-                &ref_window.markers,
-            );
+                    // Align using the phased target markers; PL/GL lookups share the same
+                    // marker set, so indices should remain consistent.
+                    let alignment = MarkerAlignment::new_with_ref_markers(
+                        &target_window.genotypes,
+                        &ref_window.markers,
+                    );
 
-            let phased_target = target_window.genotypes.clone().into_phased();
-            let phased_target_pl = target_window_pl
-                .as_ref()
-                .map(|w| w.genotypes.clone().into_phased());
-            let target_missing = if target_was_unphased_for_impute {
-                target_window_pl.as_ref().map(|w| &w.genotypes)
-            } else {
-                None
-            };
-            if !header_written {
-                writer.write_header_extended(&ref_window.markers, true, self.config.gp, self.config.ap)?;
-                header_written = true;
-            }
+                    let phased_target = target_window.genotypes.clone().into_phased();
+                    let phased_target_pl = target_window_pl
+                        .as_ref()
+                        .map(|w| w.genotypes.clone().into_phased());
+                    let target_missing = if target_was_unphased_for_impute {
+                        target_window_pl.as_ref().map(|w| &w.genotypes)
+                    } else {
+                        None
+                    };
+                    if !header_written {
+                        writer.write_header_extended(
+                            &ref_window.markers,
+                            true,
+                            self.config.gp,
+                            self.config.ap,
+                        )?;
+                        header_written = true;
+                    }
 
-            let should_log = phased_target.n_markers() >= 100 || window_idx % 1000 == 0;
-            if should_log {
-                eprintln!(
-                    "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
-                    window_idx,
-                    phased_target.n_markers(),
-                    ref_window.global_start,
-                    ref_window.global_end,
-                    ref_window.output_start,
-                    ref_window.output_end
-                );
-            }
+                    let should_log = phased_target.n_markers() >= 100 || window_idx % 1000 == 0;
+                    if should_log {
+                        eprintln!(
+                            "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
+                            window_idx,
+                            phased_target.n_markers(),
+                            ref_window.global_start,
+                            ref_window.global_end,
+                            ref_window.output_start,
+                            ref_window.output_end
+                        );
+                    }
 
-            let n_alleles_per_marker: Vec<usize> = (0..ref_window.markers.len())
-                .map(|m| {
-                    let marker = ref_window.markers.marker(MarkerIdx::new(m as u32));
-                    1 + marker.alt_alleles.len()
-                })
-                .collect();
-            let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-            for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                window_quality.set_imputed(ref_m, target_idx.is_none());
-            }
+                    let n_alleles_per_marker: Vec<usize> = (0..ref_window.markers.len())
+                        .map(|m| {
+                            let marker = ref_window.markers.marker(MarkerIdx::new(m as u32));
+                            1 + marker.alt_alleles.len()
+                        })
+                        .collect();
+                    let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
+                    for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
+                        window_quality.set_imputed(ref_m, target_idx.is_none());
+                    }
 
-            let window_results = self.run_imputation_window_streaming(
-                &phased_target,
-                phased_target_pl.as_ref(),
-                target_missing,
-                &ref_window.markers,
-                &ref_window.ref_columns,
-                &alignment,
-                &gen_maps,
-                imp_overlap.as_ref(),
-                &plan,
-                window_idx,
-                ref_window.global_start,
-                ref_window.output_start,
-                ref_window.output_end,
-                // Use phase confidence from the phased target haplotypes. If the
-                // input was unphased, the phasing pipeline provides calibrated
-                // phase confidence for heterozygotes, which we should leverage
-                // to preserve LD signal in imputation emissions.
-                true,
-            )?;
+                    let window_results = self.run_imputation_window_streaming(
+                        &phased_target,
+                        phased_target_pl.as_ref(),
+                        target_missing,
+                        &ref_window.markers,
+                        &ref_window.ref_columns,
+                        &alignment,
+                        &gen_maps,
+                        imp_overlap.as_ref(),
+                        &plan,
+                        window_idx,
+                        ref_window.global_start,
+                        ref_window.output_start,
+                        ref_window.output_end,
+                        // Use phase confidence from the phased target haplotypes. If the
+                        // input was unphased, the phasing pipeline provides calibrated
+                        // phase confidence for heterozygotes, which we should leverage
+                        // to preserve LD signal in imputation emissions.
+                        true,
+                    )?;
 
-            let mut next_handoff = None;
-            if let Some(window_results) = window_results {
-                let ImputationWindowResults {
-                    all_results,
-                    ref_is_biallelic,
-                    handoff,
-                } = window_results;
-                next_handoff = handoff;
-                // Drop heavy reference data before writing to reduce peak RSS.
-                // Drop reference genotypes/columns to free large buffers before write.
-                let _ = std::mem::take(&mut ref_window.ref_columns);
-                ref_window.ref_genotypes = None;
+                    let mut next_handoff = None;
+                    if let Some(window_results) = window_results {
+                        let ImputationWindowResults {
+                            all_results,
+                            ref_is_biallelic,
+                            handoff,
+                        } = window_results;
+                        next_handoff = handoff;
+                        // Drop heavy reference data before writing to reduce peak RSS.
+                        // Drop reference genotypes/columns to free large buffers before write.
+                        let _ = std::mem::take(&mut ref_window.ref_columns);
+                        ref_window.ref_genotypes = None;
 
-                if let Some(bb) = &self.telemetry {
-                    let output_markers =
-                        ref_window.output_end.saturating_sub(ref_window.output_start);
-                    bb.set_stage(crate::utils::telemetry::Stage::WritingOutput);
-                    bb.set_consumer_stage(crate::utils::telemetry::Stage::WritingOutput);
-                    bb.set_total_markers(output_markers as u64);
-                    bb.set_markers_processed(0);
-                    bb.set_total_samples(phased_target.n_samples() as u64);
-                    bb.set_samples_processed(0);
-                    bb.set_op(&format!(
-                        "Writing window {} ({} markers)",
-                        window_idx, output_markers
-                    ));
-                    bb.set_consumer_op(&format!(
-                        "Writing window {} ({} markers)",
-                        window_idx, output_markers
-                    ));
+                        if let Some(bb) = &self.telemetry {
+                            let output_markers =
+                                ref_window.output_end.saturating_sub(ref_window.output_start);
+                            bb.set_stage(crate::utils::telemetry::Stage::WritingOutput);
+                            bb.set_consumer_stage(crate::utils::telemetry::Stage::WritingOutput);
+                            bb.set_total_markers(output_markers as u64);
+                            bb.set_markers_processed(0);
+                            bb.set_total_samples(phased_target.n_samples() as u64);
+                            bb.set_samples_processed(0);
+                            bb.set_op(&format!(
+                                "Writing window {} ({} markers)",
+                                window_idx, output_markers
+                            ));
+                            bb.set_consumer_op(&format!(
+                                "Writing window {} ({} markers)",
+                                window_idx, output_markers
+                            ));
+                        }
+
+                        self.write_imputed_window_streaming(
+                            &ref_window.markers,
+                            &phased_target,
+                            phased_target_pl.as_ref(),
+                            &alignment,
+                            &mut writer,
+                            &mut window_quality,
+                            &ref_is_biallelic,
+                            ref_window.output_start,
+                            ref_window.output_end,
+                            ref_window.output_start,
+                            &all_results,
+                            self.config.gp,
+                            self.config.ap,
+                            self.config.err.is_some(),
+                        )?;
+
+                        if let Some(bb) = &self.telemetry {
+                            let output_markers =
+                                ref_window.output_end.saturating_sub(ref_window.output_start);
+                            bb.set_markers_processed(output_markers as u64);
+                            bb.set_samples_processed(phased_target.n_samples() as u64);
+                            bb.set_stage(crate::utils::telemetry::Stage::Imputation);
+                            bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
+                        }
+
+                    }
+
+                    total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
+
+                    let mut next_overlap = self.extract_imputed_overlap_streaming(
+                        &phased_target,
+                        &ref_window.markers,
+                        &alignment,
+                        ref_window.output_end,
+                    );
+                    if let Some(handoff) = next_handoff {
+                        next_overlap.set_hap_priors(handoff.priors);
+                        if let Some(idx) = handoff.prior_global_idx {
+                            next_overlap.set_prior_stage1_global_marker(idx);
+                        }
+                        if let Some(gen_pos) = handoff.prior_gen_pos {
+                            next_overlap.set_prior_stage1_gen_pos(gen_pos);
+                        }
+                    } else if !warned_no_overlap {
+                        warn!(
+                            "No overlap handoff for window {} (empty/short window or region boundary)",
+                            window_idx
+                        );
+                        warned_no_overlap = true;
+                    }
+                    imp_overlap = Some(next_overlap);
+
+                    window_idx += 1;
                 }
-
-                self.write_imputed_window_streaming(
-                    &ref_window.markers,
-                    &phased_target,
-                    phased_target_pl.as_ref(),
-                    &alignment,
-                    &mut writer,
-                    &mut window_quality,
-                    &ref_is_biallelic,
-                    ref_window.output_start,
-                    ref_window.output_end,
-                    ref_window.output_start,
-                    &all_results,
-                    self.config.gp,
-                    self.config.ap,
-                    self.config.err.is_some(),
-                )?;
-
-                if let Some(bb) = &self.telemetry {
-                    let output_markers =
-                        ref_window.output_end.saturating_sub(ref_window.output_start);
-                    bb.set_markers_processed(output_markers as u64);
-                    bb.set_samples_processed(phased_target.n_samples() as u64);
-                    bb.set_stage(crate::utils::telemetry::Stage::Imputation);
-                    bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
-                }
-
             }
+            ReferenceData::OnDisk { .. } => {
+                let mut ref_reader = open_ref_reader(&ref_path)?;
+                loop {
+                    if let Some(bb) = &self.telemetry {
+                        bb.set_producer_stage(crate::utils::telemetry::Stage::LoadingData);
+                        bb.set_producer_op(&format!("Loading ref window {}", window_idx + 1));
+                        bb.set_op(&format!("Loading ref window {}", window_idx + 1));
+                        bb.set_current_window((window_idx + 1) as u64);
+                    }
+                    let ref_window = ref_reader.next_window(
+                        &streaming_config,
+                        &gen_maps,
+                        Some(&target_positions_map),
+                    )?;
+                    let Some(mut ref_window) = ref_window else { break };
 
-            total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
+                    let n_ref_markers = ref_window.markers.len();
+                    if n_ref_markers == 0 {
+                        window_idx += 1;
+                        continue;
+                    }
 
-            let mut next_overlap = self.extract_imputed_overlap_streaming(
-                &phased_target,
-                &ref_window.markers,
-                &alignment,
-                ref_window.output_end,
-            );
-            if let Some(handoff) = next_handoff {
-                next_overlap.set_hap_priors(handoff.priors);
-                if let Some(idx) = handoff.prior_global_idx {
-                    next_overlap.set_prior_stage1_global_marker(idx);
+                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                    let ref_chrom = ref_window
+                        .markers
+                        .chrom_name(ref_chrom_idx)
+                        .unwrap_or("UNKNOWN");
+                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                    let end_pos = ref_window
+                        .markers
+                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                        .pos;
+
+                    let chrom_candidates = chrom_variants(ref_chrom);
+                    let target_window = target_reader.load_window_for_region(
+                        &chrom_candidates,
+                        start_pos,
+                        end_pos,
+                    )?;
+                    let Some(target_window) = target_window else {
+                        window_idx += 1;
+                        continue;
+                    };
+                    let target_window_pl = if let Some(reader_pl) = target_reader_pl.as_mut() {
+                        reader_pl.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                    } else {
+                        None
+                    };
+
+                    // Align using the phased target markers; PL/GL lookups share the same
+                    // marker set, so indices should remain consistent.
+                    let alignment = MarkerAlignment::new_with_ref_markers(
+                        &target_window.genotypes,
+                        &ref_window.markers,
+                    );
+
+                    let phased_target = target_window.genotypes.clone().into_phased();
+                    let phased_target_pl = target_window_pl
+                        .as_ref()
+                        .map(|w| w.genotypes.clone().into_phased());
+                    let target_missing = if target_was_unphased_for_impute {
+                        target_window_pl.as_ref().map(|w| &w.genotypes)
+                    } else {
+                        None
+                    };
+                    if !header_written {
+                        writer.write_header_extended(
+                            &ref_window.markers,
+                            true,
+                            self.config.gp,
+                            self.config.ap,
+                        )?;
+                        header_written = true;
+                    }
+
+                    let should_log = phased_target.n_markers() >= 100 || window_idx % 1000 == 0;
+                    if should_log {
+                        eprintln!(
+                            "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
+                            window_idx,
+                            phased_target.n_markers(),
+                            ref_window.global_start,
+                            ref_window.global_end,
+                            ref_window.output_start,
+                            ref_window.output_end
+                        );
+                    }
+
+                    let n_alleles_per_marker: Vec<usize> = (0..ref_window.markers.len())
+                        .map(|m| {
+                            let marker = ref_window.markers.marker(MarkerIdx::new(m as u32));
+                            1 + marker.alt_alleles.len()
+                        })
+                        .collect();
+                    let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
+                    for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
+                        window_quality.set_imputed(ref_m, target_idx.is_none());
+                    }
+
+                    let window_results = self.run_imputation_window_streaming(
+                        &phased_target,
+                        phased_target_pl.as_ref(),
+                        target_missing,
+                        &ref_window.markers,
+                        &ref_window.ref_columns,
+                        &alignment,
+                        &gen_maps,
+                        imp_overlap.as_ref(),
+                        &plan,
+                        window_idx,
+                        ref_window.global_start,
+                        ref_window.output_start,
+                        ref_window.output_end,
+                        // Use phase confidence from the phased target haplotypes. If the
+                        // input was unphased, the phasing pipeline provides calibrated
+                        // phase confidence for heterozygotes, which we should leverage
+                        // to preserve LD signal in imputation emissions.
+                        true,
+                    )?;
+
+                    let mut next_handoff = None;
+                    if let Some(window_results) = window_results {
+                        let ImputationWindowResults {
+                            all_results,
+                            ref_is_biallelic,
+                            handoff,
+                        } = window_results;
+                        next_handoff = handoff;
+                        // Drop heavy reference data before writing to reduce peak RSS.
+                        // Drop reference genotypes/columns to free large buffers before write.
+                        let _ = std::mem::take(&mut ref_window.ref_columns);
+                        ref_window.ref_genotypes = None;
+
+                        if let Some(bb) = &self.telemetry {
+                            let output_markers =
+                                ref_window.output_end.saturating_sub(ref_window.output_start);
+                            bb.set_stage(crate::utils::telemetry::Stage::WritingOutput);
+                            bb.set_consumer_stage(crate::utils::telemetry::Stage::WritingOutput);
+                            bb.set_total_markers(output_markers as u64);
+                            bb.set_markers_processed(0);
+                            bb.set_total_samples(phased_target.n_samples() as u64);
+                            bb.set_samples_processed(0);
+                            bb.set_op(&format!(
+                                "Writing window {} ({} markers)",
+                                window_idx, output_markers
+                            ));
+                            bb.set_consumer_op(&format!(
+                                "Writing window {} ({} markers)",
+                                window_idx, output_markers
+                            ));
+                        }
+
+                        self.write_imputed_window_streaming(
+                            &ref_window.markers,
+                            &phased_target,
+                            phased_target_pl.as_ref(),
+                            &alignment,
+                            &mut writer,
+                            &mut window_quality,
+                            &ref_is_biallelic,
+                            ref_window.output_start,
+                            ref_window.output_end,
+                            ref_window.output_start,
+                            &all_results,
+                            self.config.gp,
+                            self.config.ap,
+                            self.config.err.is_some(),
+                        )?;
+
+                        if let Some(bb) = &self.telemetry {
+                            let output_markers =
+                                ref_window.output_end.saturating_sub(ref_window.output_start);
+                            bb.set_markers_processed(output_markers as u64);
+                            bb.set_samples_processed(phased_target.n_samples() as u64);
+                            bb.set_stage(crate::utils::telemetry::Stage::Imputation);
+                            bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
+                        }
+
+                    }
+
+                    total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
+
+                    let mut next_overlap = self.extract_imputed_overlap_streaming(
+                        &phased_target,
+                        &ref_window.markers,
+                        &alignment,
+                        ref_window.output_end,
+                    );
+                    if let Some(handoff) = next_handoff {
+                        next_overlap.set_hap_priors(handoff.priors);
+                        if let Some(idx) = handoff.prior_global_idx {
+                            next_overlap.set_prior_stage1_global_marker(idx);
+                        }
+                        if let Some(gen_pos) = handoff.prior_gen_pos {
+                            next_overlap.set_prior_stage1_gen_pos(gen_pos);
+                        }
+                    } else if !warned_no_overlap {
+                        warn!(
+                            "No overlap handoff for window {} (empty/short window or region boundary)",
+                            window_idx
+                        );
+                        warned_no_overlap = true;
+                    }
+                    imp_overlap = Some(next_overlap);
+
+                    window_idx += 1;
                 }
-                if let Some(gen_pos) = handoff.prior_gen_pos {
-                    next_overlap.set_prior_stage1_gen_pos(gen_pos);
-                }
-            } else if !warned_no_overlap {
-                warn!(
-                    "No overlap handoff for window {} (empty/short window or region boundary)",
-                    window_idx
-                );
-                warned_no_overlap = true;
             }
-            imp_overlap = Some(next_overlap);
-
-            window_idx += 1;
         }
 
         if let Some(tmpdir) = input_tmp.as_ref() {

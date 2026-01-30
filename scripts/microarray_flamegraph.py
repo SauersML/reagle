@@ -88,7 +88,12 @@ def main():
     parser.add_argument("--ref", type=Path, default=None, help="Input reference VCF.gz")
     parser.add_argument("--target", type=Path, default=None, help="Input target VCF.gz")
     parser.add_argument("--out-dir", type=Path, default=Path("microarray_profile"), help="Output directory")
-    parser.add_argument("--keep-prob", type=float, default=0.01, help="Fraction of markers to keep (microarray)")
+    parser.add_argument(
+        "--keep-prob",
+        type=float,
+        default=1.0,
+        help="Fraction of markers to keep (default keeps all microarray markers)",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for marker sampling")
     parser.add_argument("--chrom", type=str, default=None, help="Optional chrom/region for bcftools -r")
     parser.add_argument("--threads", type=int, default=0, help="Threads for Reagle (0=all)")
@@ -143,7 +148,14 @@ def main():
 
         prepare = repo_root / "scripts" / "prepare_data.py"
         run(["python3", str(prepare), "reference", str(ref_out)])
-        run(["python3", str(prepare), "array", str(array_file), str(target_dense)])
+        # Microarray sites come from the array conversion.
+        run(["python3", str(prepare), "array", str(array_file), str(target_sparse)])
+        # Dense target represents WGS-like density, sourced from the reference panel.
+        if target_dense != ref_out:
+            shutil.copy2(ref_out, target_dense)
+            ref_index = ref_out.with_suffix(ref_out.suffix + ".csi")
+            if ref_index.exists():
+                shutil.copy2(ref_index, target_dense.with_suffix(target_dense.suffix + ".csi"))
     else:
         if not ref_vcf or not target_vcf or not ref_vcf.exists() or not target_vcf.exists():
             raise SystemExit(
@@ -162,13 +174,26 @@ def main():
             if target_dense != target_vcf:
                 shutil.copy2(target_vcf, target_dense)
 
-    total, kept = build_sparse_positions(target_dense, positions, args.keep_prob, args.seed)
-    if kept == 0:
-        raise SystemExit("Sampling kept 0 markers; increase --keep-prob.")
-    print(f"Sparse positions: kept {kept}/{total} markers ({kept/total:.2%})")
+    if args.keep_prob >= 1.0:
+        if not use_real_data and target_sparse != target_dense:
+            shutil.copy2(target_dense, target_sparse)
+            dense_index = target_dense.with_suffix(target_dense.suffix + ".csi")
+            if dense_index.exists():
+                shutil.copy2(dense_index, target_sparse.with_suffix(target_sparse.suffix + ".csi"))
+            else:
+                run(["bcftools", "index", "-f", str(target_sparse)])
+        if positions.exists():
+            positions.unlink()
+        print("Sparse positions: kept 100% of microarray markers (no subsampling).")
+    else:
+        sample_source = target_sparse if use_real_data else target_dense
+        total, kept = build_sparse_positions(sample_source, positions, args.keep_prob, args.seed)
+        if kept == 0:
+            raise SystemExit("Sampling kept 0 markers; increase --keep-prob.")
+        print(f"Sparse positions: kept {kept}/{total} markers ({kept/total:.2%})")
 
-    run(["bcftools", "view", "-R", str(positions), str(target_dense), "-Oz", "-o", str(target_sparse)])
-    run(["bcftools", "index", "-f", str(target_sparse)])
+        run(["bcftools", "view", "-R", str(positions), str(sample_source), "-Oz", "-o", str(target_sparse)])
+        run(["bcftools", "index", "-f", str(target_sparse)])
 
     run(["cargo", "build", "--release", "--features", "pprof"], env=os.environ.copy())
 
