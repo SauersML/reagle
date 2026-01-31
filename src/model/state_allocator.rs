@@ -56,6 +56,8 @@
 //! monotonicity under the greedy outer loop.
 
 use crate::model::parameters::ModelParams;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 const NEG_INF: f32 = -1.0e30;
 
@@ -69,7 +71,11 @@ fn logaddexp(a: f32, b: f32) -> f32 {
     }
     let m = a.max(b);
     let d = (a - b).abs();
-    m + (-(d)).exp().ln_1p()
+    if d > 12.0 {
+        m
+    } else {
+        m + (-(d)).exp().ln_1p()
+    }
 }
 
 /// Allocation result for a single target haplotype:
@@ -348,61 +354,100 @@ pub fn allocate_lms_sparse(
     }
     let mu = mu_best;
 
-    // Main coordinate-ascent allocation using tuned mu.
-    while remaining > 0 {
-        let mut best_gain = 0.0f32;
-        let mut best_h = None;
-        let mut best_active: Vec<bool> = Vec::new();
-        let mut best_len = 0usize;
+    #[derive(Clone)]
+    struct HeapEntry {
+        gain: f32,
+        idx: usize,
+        active: Vec<bool>,
+        len: usize,
+    }
+
+    impl Eq for HeapEntry {}
+
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.gain == other.gain && self.idx == other.idx
+        }
+    }
+
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        }
+    }
+
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.gain
+                .partial_cmp(&other.gain)
+                .or_else(|| Some(self.idx.cmp(&other.idx)))
+        }
+    }
+
+    // Lazy-greedy allocation using tuned mu.
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+    {
         let blocked: Vec<bool> = counts
             .iter()
             .enumerate()
             .map(|(w_i, &c)| c >= per_window_caps[w_i])
             .collect();
-
         for h in 0..n {
-            if selected[h] {
-                continue;
-            }
             let scores = &scores_by_hap[h];
             let (gain, active) =
                 dp_intervals_sparse(scores, &z_w, mu, &blocked, &t11, &t10, &t01);
-            if gain > best_gain {
-                let len = active.iter().filter(|v| **v).count();
-                if len == 0 || len > remaining {
-                    continue;
+            let len = active.iter().filter(|v| **v).count();
+            if gain > 0.0 && len > 0 && len <= remaining {
+                heap.push(HeapEntry {
+                    gain,
+                    idx: h,
+                    active,
+                    len,
+                });
+            }
+        }
+    }
+
+    while remaining > 0 {
+        let Some(mut entry) = heap.pop() else { break };
+        if selected[entry.idx] {
+            continue;
+        }
+        let blocked: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
+        let (gain, active) =
+            dp_intervals_sparse(&scores_by_hap[entry.idx], &z_w, mu, &blocked, &t11, &t10, &t01);
+        let len = active.iter().filter(|v| **v).count();
+        if gain <= 0.0 || len == 0 || len > remaining {
+            continue;
+        }
+        let next_gain = heap.peek().map(|e| e.gain).unwrap_or(NEG_INF);
+        if gain >= next_gain {
+            selected[entry.idx] = true;
+            for win in 0..w {
+                if active[win] && counts[win] < per_window_caps[win] {
+                    counts[win] += 1;
                 }
-                best_gain = gain;
-                best_h = Some(h);
-                best_active = active;
-                best_len = len;
             }
-        }
-
-        if best_gain <= 0.0 {
-            break;
-        }
-        let Some(h) = best_h else { break };
-        selected[h] = true;
-
-        for win in 0..w {
-            if best_active[win] && counts[win] < per_window_caps[win] {
-                counts[win] += 1;
+            for &(win, score) in scores_by_hap[entry.idx].iter() {
+                if win < w && active[win] && score.is_finite() {
+                    z_w[win] = logaddexp(z_w[win], score);
+                }
             }
-        }
-        for &(win, score) in scores_by_hap[h].iter() {
-            if win < w && best_active[win] && score.is_finite() {
-                z_w[win] = logaddexp(z_w[win], score);
+            let intervals = active_to_intervals(&active);
+            if !intervals.is_empty() {
+                intervals_by_hap.push((candidate_haps[entry.idx], intervals));
             }
+            remaining = remaining.saturating_sub(len);
+        } else {
+            entry.gain = gain;
+            entry.active = active;
+            entry.len = len;
+            heap.push(entry);
         }
-        let intervals = active_to_intervals(&best_active);
-        if !intervals.is_empty() {
-            intervals_by_hap.push((candidate_haps[h], intervals));
-        }
-        if best_len > remaining {
-            break;
-        }
-        remaining -= best_len;
     }
 
     WindowAllocation {
@@ -433,52 +478,89 @@ fn simulate_allocation(
     let mut total_gain = 0.0f32;
     let mut selected = vec![false; n];
 
-    loop {
-        let mut best_gain = 0.0f32;
-        let mut best_h = None;
-        let mut best_active: Vec<bool> = Vec::new();
-        let mut best_len = 0usize;
+    #[derive(Clone)]
+    struct HeapEntry {
+        gain: f32,
+        idx: usize,
+        active: Vec<bool>,
+        len: usize,
+    }
+
+    impl Eq for HeapEntry {}
+
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.gain == other.gain && self.idx == other.idx
+        }
+    }
+
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        }
+    }
+
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.gain
+                .partial_cmp(&other.gain)
+                .or_else(|| Some(self.idx.cmp(&other.idx)))
+        }
+    }
+
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+    {
         let blocked: Vec<bool> = counts
             .iter()
             .enumerate()
             .map(|(w_i, &c)| c >= per_window_caps[w_i])
             .collect();
-
         for h in 0..n {
-            if selected[h] {
-                continue;
-            }
             let scores = &scores_by_hap[h];
-            let (gain, active) =
-                dp_intervals_sparse(scores, &z_w, mu, &blocked, t11, t10, t01);
-            if gain > best_gain {
-                let len = active.iter().filter(|v| **v).count();
-                if len == 0 {
-                    continue;
-                }
-                best_gain = gain;
-                best_h = Some(h);
-                best_active = active;
-                best_len = len;
+            let (gain, active) = dp_intervals_sparse(scores, &z_w, mu, &blocked, t11, t10, t01);
+            let len = active.iter().filter(|v| **v).count();
+            if gain > 0.0 && len > 0 {
+                heap.push(HeapEntry { gain, idx: h, active, len });
             }
         }
+    }
 
-        if best_gain <= 0.0 {
-            break;
+    loop {
+        let Some(mut entry) = heap.pop() else { break };
+        if selected[entry.idx] {
+            continue;
         }
-        let Some(h) = best_h else { break };
-        selected[h] = true;
-        total_gain += best_gain;
-        used += best_len;
-        for win in 0..w {
-            if best_active[win] && counts[win] < per_window_caps[win] {
-                counts[win] += 1;
-            }
+        let blocked: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
+        let (gain, active) =
+            dp_intervals_sparse(&scores_by_hap[entry.idx], &z_w, mu, &blocked, t11, t10, t01);
+        let len = active.iter().filter(|v| **v).count();
+        if gain <= 0.0 || len == 0 {
+            continue;
         }
-        for &(win, score) in scores_by_hap[h].iter() {
-            if win < w && best_active[win] && score.is_finite() {
-                z_w[win] = logaddexp(z_w[win], score);
+        let next_gain = heap.peek().map(|e| e.gain).unwrap_or(NEG_INF);
+        if gain >= next_gain {
+            selected[entry.idx] = true;
+            total_gain += gain;
+            used += len;
+            for win in 0..w {
+                if active[win] && counts[win] < per_window_caps[win] {
+                    counts[win] += 1;
+                }
             }
+            for &(win, score) in scores_by_hap[entry.idx].iter() {
+                if win < w && active[win] && score.is_finite() {
+                    z_w[win] = logaddexp(z_w[win], score);
+                }
+            }
+        } else {
+            entry.gain = gain;
+            entry.active = active;
+            entry.len = len;
+            heap.push(entry);
         }
     }
 

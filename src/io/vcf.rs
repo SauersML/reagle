@@ -5,6 +5,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use rayon::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1319,16 +1320,16 @@ impl VcfWriter {
         telemetry: Option<&Arc<TelemetryBlackboard>>,
     ) -> Result<()>
     where
-        F: Fn(usize, usize) -> f32,
-        B: Fn(usize, usize) -> (u8, u8),
+        F: Fn(usize, usize) -> f32 + Sync,
+        B: Fn(usize, usize) -> (u8, u8) + Sync,
         G: Fn(
             usize,
             usize,
         ) -> (
             crate::pipelines::imputation::AllelePosteriors,
             crate::pipelines::imputation::AllelePosteriors,
-        ),
-        H: Fn(usize, usize) -> Option<Vec<f32>>,
+        ) + Sync,
+        H: Fn(usize, usize) -> Option<Vec<f32>> + Sync,
     {
         let n_samples = self.samples.len();
 
@@ -1344,11 +1345,6 @@ impl VcfWriter {
             }
             parts.join(":")
         };
-
-        // Pre-allocate line buffer (estimate ~50 bytes per sample)
-        let mut line_buf = String::with_capacity(n_samples * 50 + 200);
-        // Buffer for ryu float formatting
-        let mut ryu_buf = ryu::Buffer::new();
 
         // Helper to format float with 4 decimal places using ryu when possible.
         // Falls back to fixed-format for scientific notation to avoid exponent truncation.
@@ -1391,13 +1387,18 @@ impl VcfWriter {
             best
         }
 
-        for m in start..end {
-            line_buf.clear();
+        let get_posteriors_ref = get_posteriors.as_ref();
+        let get_genotype_posteriors_ref = get_genotype_posteriors.as_ref();
+        let n_markers = end.saturating_sub(start);
+        let mut lines: Vec<String> = vec![String::new(); n_markers];
+        lines.par_iter_mut().enumerate().for_each(|(idx, line)| {
+            let m = start + idx;
             let marker_idx = MarkerIdx::new(m as u32);
             let marker = markers.marker(marker_idx);
             let n_alleles = 1 + marker.alt_alleles.len();
+            let mut line_buf = String::with_capacity(n_samples * 50 + 200);
+            let mut ryu_buf = ryu::Buffer::new();
 
-            // Build INFO field
             let stats = quality.get(m);
             let info_field = if let Some(stats) = stats {
                 let mut info_str = String::with_capacity(64);
@@ -1434,7 +1435,6 @@ impl VcfWriter {
                 ".".to_string()
             };
 
-            // Write fixed fields using line buffer
             use std::fmt::Write;
             write!(
                 line_buf,
@@ -1456,9 +1456,8 @@ impl VcfWriter {
 
             for s in 0..n_samples {
                 let ds = get_dosage(m, s);
-                let posteriors = get_posteriors.as_ref().map(|f| f(m, s));
-                let gp_override = get_genotype_posteriors
-                    .as_ref()
+                let posteriors = get_posteriors_ref.map(|f| f(m, s));
+                let gp_override = get_genotype_posteriors_ref
                     .and_then(|f| f(m, s))
                     .and_then(|gp| {
                         let expected = n_alleles * (n_alleles + 1) / 2;
@@ -1527,10 +1526,7 @@ impl VcfWriter {
                     get_best_gt(m, s)
                 };
 
-                // Format: \t{a1}|{a2}:{ds}
                 line_buf.push('\t');
-
-                // Handle allele 1
                 if a1 == 255 {
                     line_buf.push('.');
                 } else if a1 < 10 {
@@ -1539,10 +1535,7 @@ impl VcfWriter {
                     let mut buffer = itoa::Buffer::new();
                     line_buf.push_str(buffer.format(a1));
                 }
-
                 line_buf.push('|');
-
-                // Handle allele 2
                 if a2 == 255 {
                     line_buf.push('.');
                 } else if a2 < 10 {
@@ -1551,7 +1544,6 @@ impl VcfWriter {
                     let mut buffer = itoa::Buffer::new();
                     line_buf.push_str(buffer.format(a2));
                 }
-
                 line_buf.push(':');
                 let v = format_f32_4dp(ds, &mut ryu_buf);
                 line_buf.push_str(&v);
@@ -1586,7 +1578,6 @@ impl VcfWriter {
                             }
                         }
                     } else {
-                        // n_alleles * (n_alleles + 1) / 2 zeros
                         let n_gp = n_alleles * (n_alleles + 1) / 2;
                         for i in 0..n_gp {
                             if i > 0 {
@@ -1641,11 +1632,11 @@ impl VcfWriter {
                 }
             }
             line_buf.push('\n');
+            *line = line_buf;
+        });
 
-            // Single write for entire line
-            self.writer.write_all(line_buf.as_bytes())?;
-
-            // Update progress after each marker
+        for line in lines.into_iter() {
+            self.writer.write_all(line.as_bytes())?;
             if let Some(bb) = telemetry {
                 bb.add_markers(1);
             }

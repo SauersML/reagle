@@ -686,7 +686,10 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let mut current_error = error_rate;
 
-    for pass in 0..2 {
+    let update_error = false;
+    let final_pass = 0usize;
+    for pass in 0..1 {
+        let is_final = pass == final_pass;
         let mut fwd_sum: f32;
         if let Some(priors) = state_priors {
             let len = priors.len().min(active_states);
@@ -783,7 +786,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
-        if pass == 1 {
+        if is_final {
             posteriors.reserve(n_markers);
             posteriors.resize_with(n_markers, || AllelePosteriors::Biallelic(0.0));
         }
@@ -814,7 +817,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                 );
             }
 
-            if pass == 1 {
+            if is_final {
                 // Compute posteriors using beta at time t (current ws.bwd), before updating
                 // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
                 ws.allele_probs.clear();
@@ -899,7 +902,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
 
             // Expected mismatch accumulation for MAP update.
             // Only use informative markers (non-empty allele probs and >1 allele).
-            if pass == 0 && !uniform && !probs.is_empty() && probs.len() > 1 {
+            if update_error && pass == 0 && !uniform && !probs.is_empty() && probs.len() > 1 {
                 fill_emissions(
                     ref_slice,
                     probs,
@@ -973,7 +976,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
             tile_end = tile_start;
         }
 
-        if pass == 0 {
+        if update_error && pass == 0 {
             // MAP update (minimal Beta prior) and run one more pass.
             if mismatch_markers > 0.0 {
                 let numerator = mismatch_sum + (prior_alpha - 1.0) as f64;
@@ -981,7 +984,8 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                 let e_map = (numerator / denom).clamp(1e-8, 0.5 - 1e-8) as f32;
                 current_error = e_map;
             }
-        } else {
+        }
+        if is_final {
             final_posteriors = posteriors;
             final_prior_state_post = prior_state_post;
         }
@@ -1026,7 +1030,10 @@ fn run_impute_hmm_seqcoded<Space>(
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let mut current_error = error_rate;
 
-    for pass in 0..2 {
+    let update_error = false;
+    let final_pass = 0usize;
+    for pass in 0..1 {
+        let is_final = pass == final_pass;
         let mut fwd_sum: f32;
         if let Some(priors) = state_priors {
             let len = priors.len().min(active_states);
@@ -1132,7 +1139,7 @@ fn run_impute_hmm_seqcoded<Space>(
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
-        if pass == 1 {
+        if is_final {
             posteriors.reserve(n_markers);
             posteriors.resize_with(n_markers, || AllelePosteriors::Biallelic(0.0));
         }
@@ -1168,7 +1175,7 @@ fn run_impute_hmm_seqcoded<Space>(
                 let start = m_rev * active_states;
                 let fwd_slice = &ws.fwd_history[start..start + active_states];
 
-            if pass == 1 {
+            if is_final {
                 ws.allele_probs.clear();
                 let n_alleles = if !probs.is_empty() {
                     probs.len()
@@ -1250,7 +1257,7 @@ fn run_impute_hmm_seqcoded<Space>(
                 }
             }
 
-            if pass == 0 && !uniform && !probs.is_empty() && probs.len() > 1 {
+            if update_error && pass == 0 && !uniform && !probs.is_empty() && probs.len() > 1 {
                 let mismatch_prob = fill_pattern_emissions(
                     seq_alleles,
                     probs,
@@ -1322,14 +1329,15 @@ fn run_impute_hmm_seqcoded<Space>(
             tile_end = tile_start;
         }
 
-        if pass == 0 {
+        if update_error && pass == 0 {
             if mismatch_markers > 0.0 {
                 let numerator = mismatch_sum + (prior_alpha - 1.0) as f64;
                 let denom = mismatch_markers + prior_denom as f64;
                 let e_map = (numerator / denom).clamp(1e-8, 0.5 - 1e-8) as f32;
                 current_error = e_map;
             }
-        } else {
+        }
+        if is_final {
             final_posteriors = posteriors;
             final_prior_state_post = prior_state_post;
         }
@@ -1374,7 +1382,10 @@ fn run_impute_hmm_dict<Space>(
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let mut current_error = error_rate;
 
-    for pass in 0..2 {
+    let update_error = false;
+    let final_pass = 0usize;
+    for pass in 0..1 {
+        let is_final = pass == final_pass;
         let mut fwd_sum: f32;
         if let Some(priors) = state_priors {
             let len = priors.len().min(active_states);
@@ -1483,7 +1494,7 @@ fn run_impute_hmm_dict<Space>(
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
-        if pass == 1 {
+        if is_final {
             posteriors.reserve(n_markers);
             posteriors.resize_with(n_markers, || AllelePosteriors::Biallelic(0.0));
         }
@@ -1521,7 +1532,7 @@ fn run_impute_hmm_dict<Space>(
                 let start = m_rev * active_states;
                 let fwd_slice = &ws.fwd_history[start..start + active_states];
 
-                if pass == 1 {
+            if is_final {
                     ws.allele_probs.clear();
                     let n_alleles = if !probs.is_empty() {
                         probs.len()
@@ -1604,7 +1615,7 @@ fn run_impute_hmm_dict<Space>(
                     }
                 }
 
-                if pass == 0 && !uniform && !probs.is_empty() && probs.len() > 1 {
+            if update_error && pass == 0 && !uniform && !probs.is_empty() && probs.len() > 1 {
                     let mismatch_prob = fill_pattern_emissions(
                         &ws.dict_pattern_alleles[..n_patterns],
                         probs,
@@ -1676,14 +1687,15 @@ fn run_impute_hmm_dict<Space>(
             tile_end = tile_start;
         }
 
-        if pass == 0 {
+        if update_error && pass == 0 {
             if mismatch_markers > 0.0 {
                 let numerator = mismatch_sum + (prior_alpha - 1.0) as f64;
                 let denom = mismatch_markers + prior_denom as f64;
                 let e_map = (numerator / denom).clamp(1e-8, 0.5 - 1e-8) as f32;
                 current_error = e_map;
             }
-        } else {
+        }
+        if is_final {
             final_posteriors = posteriors;
             final_prior_state_post = prior_state_post;
         }
