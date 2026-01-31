@@ -20,13 +20,33 @@ import gzip
 import os
 import random
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 
-def run(cmd, *, env=None):
+def run(cmd, *, env=None, timeout=None):
     print(f"CMD: {' '.join(cmd)}")
-    subprocess.check_call(cmd, env=env)
+    if timeout is None or timeout <= 0:
+        subprocess.check_call(cmd, env=env)
+        return False
+    proc = subprocess.Popen(cmd, env=env)
+    try:
+        proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"TIMEOUT: {timeout}s reached, sending SIGINT...")
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            print("SIGINT did not stop process; killing.")
+            proc.kill()
+            proc.communicate()
+        return True
 
 
 def find_default_inputs(repo_root: Path):
@@ -118,6 +138,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for marker sampling")
     parser.add_argument("--chrom", type=str, default=None, help="Optional chrom/region for bcftools -r")
     parser.add_argument("--threads", type=int, default=0, help="Threads for Reagle (0=all)")
+    parser.add_argument(
+        "--time-limit",
+        type=int,
+        default=0,
+        help="Time limit in seconds for the Reagle run (0 = no limit)",
+    )
     parser.add_argument(
         "--use-real-data",
         action="store_true",
@@ -255,9 +281,11 @@ def main():
     if args.chrom:
         cmd.extend(["--chrom", args.chrom])
 
-    run(cmd, env=env)
+    timed_out = run(cmd, env=env, timeout=args.time_limit)
 
     print("\nDone.")
+    if timed_out:
+        print("Reagle run timed out; outputs may be partial.")
     print(f"Flamegraph: {env['REAGLE_PPROF_OUTPUT']}")
     txt_path = args.out_dir / "reagle_microarray.txt"
     folded_path = args.out_dir / "reagle_microarray.folded.txt"

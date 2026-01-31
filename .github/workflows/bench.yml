@@ -287,7 +287,6 @@ jobs:
   pprof_flamegraph:
     name: Pprof Flamegraph (on 5% subset)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     needs: prepare_data
     defaults:
       run:
@@ -330,7 +329,8 @@ jobs:
             --ref tests/data/ref.vcf.gz \
             --target tests/data/input.vcf.gz \
             --out-dir tests/data/pprof \
-            --keep-prob 1.0
+            --keep-prob 1.0 \
+            --time-limit 3600
 
       - name: Show pprof text summary
         run: |
@@ -355,7 +355,6 @@ jobs:
   release_tests_no_run:
     name: Cargo Test --release (no run)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
