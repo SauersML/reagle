@@ -1631,7 +1631,7 @@ fn build_imputation_plan(
                             ref_window.markers.marker(MarkerIdx::new(0)).chrom,
                             end_pos,
                         );
-                        window_span_bp = Some(span_bp);
+                        window_span_bp = Some(span_bp.into());
                         window_span_cm = Some((end_cm - start_cm).abs());
                     }
                     // Derive per-window cap from the observed marker count to match
@@ -1826,7 +1826,7 @@ fn build_imputation_plan(
                             ref_window.markers.marker(MarkerIdx::new(0)).chrom,
                             end_pos,
                         );
-                        window_span_bp = Some(span_bp);
+                        window_span_bp = Some(span_bp.into());
                         window_span_cm = Some((end_cm - start_cm).abs());
                     }
                     // Derive per-window cap from the observed marker count to match
@@ -2469,6 +2469,7 @@ impl crate::pipelines::ImputationPipeline {
         let mut header_written = false;
         let mut total_markers = 0usize;
         let mut window_idx = 0usize;
+        let mut sample_error_rates = vec![self.params.p_mismatch.clamp(1e-6, 0.5); n_target_samples];
 
         match &mut ref_data {
             ReferenceData::InMemory { windows, .. } => {
@@ -2582,6 +2583,7 @@ impl crate::pipelines::ImputationPipeline {
                         // phase confidence for heterozygotes, which we should leverage
                         // to preserve LD signal in imputation emissions.
                         true,
+                        &mut sample_error_rates,
                     )?;
 
                     let mut next_handoff = None;
@@ -2790,6 +2792,7 @@ impl crate::pipelines::ImputationPipeline {
                         // phase confidence for heterozygotes, which we should leverage
                         // to preserve LD signal in imputation emissions.
                         true,
+                        &mut sample_error_rates,
                     )?;
 
                     let mut next_handoff = None;
@@ -2918,6 +2921,7 @@ impl crate::pipelines::ImputationPipeline {
         output_start: usize,
         output_end: usize,
         phase_conf_valid: bool,
+        sample_error_rates: &mut [f32],
     ) -> Result<Option<ImputationWindowResults>> {
         let window_span = if self.config.profile {
             Some(
@@ -3572,6 +3576,13 @@ impl crate::pipelines::ImputationPipeline {
         };
         let prior_global_idx = prior_marker_idx.map(|idx| idx + global_start);
         let prior_gen_pos = prior_marker_idx.and_then(|idx| gen_positions.get(idx).copied());
+        let min_informative_sites =
+            (output_markers as f64 * 0.05).clamp(20.0, 150.0);
+        let ratio_low = 0.6f32;
+        let ratio_high = 1.7f32;
+        let ratio_floor = 1e-4f32;
+        let ema_fast = 0.2f32;
+        let ema_slow = 0.1f32;
 
         struct ImputeResult {
             result: SampleImputationResult,
@@ -3579,9 +3590,10 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let telemetry = self.telemetry.clone();
-        let sample_results: Vec<ImputeResult> = (0..n_target_samples)
-            .into_par_iter()
-            .map(|s| {
+        let sample_results: Vec<ImputeResult> = sample_error_rates
+            .par_iter_mut()
+            .enumerate()
+            .map(|(s, prior_error_rate)| {
                 let h1_idx = HapIdx::new((s * 2) as u32);
                 let h2_idx = HapIdx::new((s * 2 + 1) as u32);
 
@@ -3597,8 +3609,9 @@ impl crate::pipelines::ImputationPipeline {
                 let (input_probs_h1, input_probs_h2) = build_input_probs_pair(h1_idx, h2_idx, s);
                 let mut process_haplotype = |hap_idx: HapIdx,
                                          priors: Option<&HaplotypePriors>,
-                                         input_probs: &TargetAlleleProbs|
-                 -> (Vec<AllelePosteriors>, HaplotypePriors) {
+                                         input_probs: &TargetAlleleProbs,
+                                         error_rate: f32|
+                 -> (Vec<AllelePosteriors>, HaplotypePriors, crate::model::impute_hmm::EmStats) {
                     let plan_idx = hap_idx.as_usize();
                     let state_haps = if let Some(full) = full_states.as_ref() {
                         full.as_slice()
@@ -3646,7 +3659,7 @@ impl crate::pipelines::ImputationPipeline {
                         Some(mapped)
                     });
 
-                    let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
+                    let (posteriors, state_post, stats) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
@@ -3657,7 +3670,7 @@ impl crate::pipelines::ImputationPipeline {
                             ref_columns,
                             input_probs,
                             &p_recomb,
-                            self.params.p_mismatch,
+                            error_rate,
                             prior_marker_idx,
                             state_priors.as_deref(),
                             plan.n_ref_haps,
@@ -3678,11 +3691,44 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
-                    (posteriors, next_priors)
+                    (posteriors, next_priors, stats)
                 };
 
-                let (post1_full, p1_out) = process_haplotype(h1_idx, priors_h1, &input_probs_h1);
-                let (post2_full, p2_out) = process_haplotype(h2_idx, priors_h2, &input_probs_h2);
+                let prior_error = (*prior_error_rate).clamp(1e-6, 0.5);
+                let (mut post1_full, mut p1_out, stats1) =
+                    process_haplotype(h1_idx, priors_h1, &input_probs_h1, prior_error);
+                let (mut post2_full, mut p2_out, stats2) =
+                    process_haplotype(h2_idx, priors_h2, &input_probs_h2, prior_error);
+
+                let total_sites = stats1.informative_sites + stats2.informative_sites;
+                let total_mismatch = stats1.expected_mismatches + stats2.expected_mismatches;
+                let posterior_rate = if total_sites > 0.0 {
+                    (total_mismatch / total_sites).clamp(1e-6, 0.5) as f32
+                } else {
+                    prior_error
+                };
+
+                let mut next_error = prior_error;
+                if total_sites >= min_informative_sites {
+                    let baseline = prior_error.max(ratio_floor);
+                    let ratio = posterior_rate / baseline;
+                    let divergent = ratio < ratio_low || ratio > ratio_high;
+                    if divergent {
+                        let local_rate = posterior_rate.clamp(1e-6, 0.5);
+                        let (post1_rerun, p1_rerun, _) =
+                            process_haplotype(h1_idx, priors_h1, &input_probs_h1, local_rate);
+                        let (post2_rerun, p2_rerun, _) =
+                            process_haplotype(h2_idx, priors_h2, &input_probs_h2, local_rate);
+                        post1_full = post1_rerun;
+                        post2_full = post2_rerun;
+                        p1_out = p1_rerun;
+                        p2_out = p2_rerun;
+                        next_error = (1.0 - ema_fast) * prior_error + ema_fast * local_rate;
+                    } else {
+                        next_error = (1.0 - ema_slow) * prior_error + ema_slow * posterior_rate;
+                    }
+                }
+                *prior_error_rate = next_error;
 
                 let output_len = output_end.saturating_sub(output_start);
                 let include_posteriors = self.config.gp || self.config.ap;
@@ -3835,7 +3881,7 @@ impl crate::pipelines::ImputationPipeline {
 
     /// Write imputed window results to VCF
     #[allow(clippy::too_many_arguments)]
-    fn write_imputed_window_streaming<TargetSpace, RefMarkerSpace>(
+    fn write_imputed_window_streaming<TargetSpace: Sync, RefMarkerSpace: Sync>(
         &self,
         ref_markers: &crate::data::marker::Markers<RefMarkerSpace>,
         target_win: &GenotypeMatrix<Phased, TargetSpace>,

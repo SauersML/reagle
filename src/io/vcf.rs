@@ -1320,6 +1320,7 @@ impl VcfWriter {
         telemetry: Option<&Arc<TelemetryBlackboard>>,
     ) -> Result<()>
     where
+        Space: Sync,
         F: Fn(usize, usize) -> f32 + Sync,
         B: Fn(usize, usize) -> (u8, u8) + Sync,
         G: Fn(

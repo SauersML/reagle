@@ -9,15 +9,22 @@ This test:
 4. Runs both Java Beagle and Reagle for imputation
 5. Calculates imputation accuracy metrics (R², concordance, etc.)
 
+IMPORTANT: Two dataset sizes available:
+- prepare:         FULL chr22 (~830K markers) - integration testing
+- prepare-profile: 5% of chr22 (~41K markers) - profiling/benchmarking
+
+The 5% subset allows profiling to complete in ~4 hours.
+The full dataset may cause single-threaded state allocation to stall (6+ hours).
+
 Requirements:
 - bcftools, tabix
 - Java 11+ (for Beagle)
 - Reagle binary (cargo build --release)
 
 Usage:
-  python integration_test.py              # Run all stages
-  python integration_test.py prepare      # Download data and prepare VCFs
-  python integration_test.py prepare-profile  # Prepare middle 5% of chr22 for profiling
+  python integration_test.py              # Run all stages (FULL dataset)
+  python integration_test.py prepare      # Download and prepare FULL chr22 VCFs
+  python integration_test.py prepare-profile  # Prepare 5% subset for profiling
   python integration_test.py beagle       # Run Beagle imputation only
   python integration_test.py reagle       # Run Reagle imputation only
   python integration_test.py metrics      # Calculate metrics only
@@ -1959,9 +1966,23 @@ def has_phased_genotypes(vcf_path, max_records=200):
 
 
 def stage_prepare(keep_phased=False):
-    """Download data and prepare reference/truth/input VCFs."""
+    """
+    Download data and prepare reference/truth/input VCFs.
+
+    This creates the FULL chr22 dataset (~830K markers) for integration testing.
+
+    Dataset comparison:
+    - stage_prepare():         100% of chr22 (~830K markers) - FULL integration test
+    - stage_prepare_profile():   5% of chr22 (~41K markers)  - PROFILING subset
+
+    The full dataset is used for production integration tests comparing against Beagle.
+    WARNING: The full dataset may cause single-threaded state allocation to stall.
+
+    Used by: .github/workflows/integration.yml (integration test jobs)
+    NOT used by: .github/workflows/bench.yml (uses stage_prepare_profile instead)
+    """
     print("=" * 60)
-    print("STAGE: PREPARE - Download and prepare data")
+    print("STAGE: PREPARE - Download and prepare data (FULL chr22)")
     print("=" * 60)
 
     paths = get_paths()
@@ -2101,7 +2122,21 @@ def stage_prepare(keep_phased=False):
 
 
 def stage_prepare_profile(keep_phased=False):
-    """Prepare reduced data (middle 5% of chr22 target markers) for profiling runs."""
+    """
+    Prepare reduced data (middle 5% of chr22 target markers) for profiling runs.
+
+    This creates a SMALLER dataset (~41K markers) for fast profiling/benchmarking.
+
+    Dataset comparison:
+    - stage_prepare():         100% of chr22 (~830K markers) - FULL integration test
+    - stage_prepare_profile():   5% of chr22 (~41K markers)  - PROFILING subset
+
+    The 5% subset allows profiling runs to complete in ~4 hours on CI.
+    The full 100% dataset causes single-threaded state allocation to stall for 6+ hours.
+
+    Used by: .github/workflows/bench.yml (profiling jobs)
+    NOT used by: .github/workflows/integration.yml (uses stage_prepare instead)
+    """
     print("=" * 60)
     print("STAGE: PREPARE PROFILE - Middle 5% of chr22 (target markers)")
     print("=" * 60)

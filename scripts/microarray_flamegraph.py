@@ -2,6 +2,16 @@
 """
 Generate microarray-style target/ref VCFs and run a pprof flamegraph.
 
+IMPORTANT: This script does NOT perform dataset size reduction.
+It works on whatever input VCFs you provide via --ref and --target.
+
+In the benchmark workflow (.github/workflows/bench.yml):
+- The prepare_data job creates a 5% subset of chr22 (~41K markers)
+- This script receives those pre-reduced VCFs as input
+- The --keep-prob parameter controls additional subsampling (1.0 = no subsampling)
+
+For full-size datasets, use integration_test.py prepare instead of prepare-profile.
+
 Defaults to local fixtures to avoid large downloads.
 """
 
