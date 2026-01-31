@@ -330,7 +330,7 @@ jobs:
             --target tests/data/input.vcf.gz \
             --out-dir tests/data/pprof \
             --keep-prob 1.0 \
-            --time-limit 3600
+            --time-limit 19800
 
       - name: Show pprof text summary
         run: |

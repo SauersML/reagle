@@ -286,6 +286,7 @@ def main():
     print("\nDone.")
     if timed_out:
         print("Reagle run timed out; outputs may be partial.")
+        raise SystemExit(2)
     print(f"Flamegraph: {env['REAGLE_PPROF_OUTPUT']}")
     txt_path = args.out_dir / "reagle_microarray.txt"
     folded_path = args.out_dir / "reagle_microarray.folded.txt"
