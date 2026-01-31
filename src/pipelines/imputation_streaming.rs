@@ -43,6 +43,7 @@ use crate::model::impute_hmm::{
 };
 use crate::model::transition_matrix::TransitionMatrix;
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::utils::telemetry::TelemetryBlackboard;
 
 
 fn push_unique(dst: &mut Vec<String>, value: String) {
@@ -1322,6 +1323,7 @@ fn build_imputation_plan(
     imp_step_cm: f64,
     params: &crate::model::parameters::ModelParams,
     ref_data: &ReferenceData,
+    telemetry: Option<&Arc<TelemetryBlackboard>>,
 ) -> Result<ImputationPlan> {
     let target_reader =
         StreamingVcfReader::open(target_path, gen_maps.clone(), streaming_config.clone())?;
@@ -1353,6 +1355,7 @@ fn build_imputation_plan(
     let per_window_caps = ref_data.per_window_caps().to_vec();
     let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
+    let batches_total = (n_target_haps + batch_size - 1) / batch_size;
 
     let can_full_panel =
         !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps);
@@ -1368,6 +1371,11 @@ fn build_imputation_plan(
             n_ref_haps,
             num_windows
         );
+        if let Some(bb) = telemetry {
+            bb.set_stage(crate::utils::telemetry::Stage::ImputationPlanning);
+            bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPlanning);
+            bb.set_op("Imputation prescan: skipped (full panel)");
+        }
         plan.per_window_cap = n_ref_haps.max(1);
         plan.per_window_caps = per_window_caps;
         plan.full_panel = true;
@@ -1391,6 +1399,17 @@ fn build_imputation_plan(
         n_ref_haps,
         batch_size
     );
+    if let Some(bb) = telemetry {
+        let num_windows = window_handoff.len().max(1);
+        let total_batches = batches_total.saturating_mul(num_windows).max(1);
+        bb.set_stage(crate::utils::telemetry::Stage::ImputationPrescan);
+        bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPrescan);
+        bb.set_op("Imputation prescan: PBWT scoring");
+        bb.set_total_windows(num_windows as u64);
+        bb.set_current_window(0);
+        bb.set_total_markers(total_batches as u64);
+        bb.set_markers_processed(0);
+    }
 
     let target_cache_budget = if avail == 0 {
         0u64
@@ -1528,10 +1547,19 @@ fn build_imputation_plan(
         .map(|c| c.iter().all(|e| e.is_some()))
         .unwrap_or(false);
 
+    let mut batch_idx = 0usize;
     while batch_start < n_target_haps {
+        batch_idx += 1;
         let batch_end = (batch_start + batch_size).min(n_target_haps);
         let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
         let batch_len = batch_haps.len();
+        if let Some(bb) = telemetry {
+            bb.set_op(&format!(
+                "Imputation prescan: scoring batch {}/{}",
+                batch_idx,
+                batches_total.max(1)
+            ));
+        }
 
         let mut target_reader: Option<StreamingVcfReader> = if cache_ready {
             None
@@ -1730,6 +1758,10 @@ fn build_imputation_plan(
                     }
 
                     window_idx += 1;
+                    if let Some(bb) = telemetry {
+                        bb.set_current_window(window_idx as u64);
+                        bb.add_markers(1);
+                    }
                 }
             }
             ReferenceData::OnDisk { .. } => {
@@ -1907,6 +1939,10 @@ fn build_imputation_plan(
                     }
 
                     window_idx += 1;
+                    if let Some(bb) = telemetry {
+                        bb.set_current_window(window_idx as u64);
+                        bb.add_markers(1);
+                    }
                 }
             }
         }
@@ -2272,6 +2308,7 @@ impl crate::pipelines::ImputationPipeline {
             self.config.imp_step as f64,
             &self.params,
             &ref_data,
+            self.telemetry.as_ref(),
         )?;
 
         self.params.recomb_intensity = (0.04 * self.config.ne / plan.n_ref_haps as f32)
