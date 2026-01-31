@@ -5,7 +5,7 @@
 //! comparing our Rust implementation against.
 //!
 //! Tests run on multiple data sources:
-//! - BEAGLE test data (1000 Genomes subset)
+//! - Test data (1000 Genomes subset)
 //! - gnomAD HGDP+1KG (if bcftools available)
 
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ struct GnomadTestFiles {
 }
 
 /// Get gnomAD test data directory (downloads if needed)
-fn gnomad_data_dir() -> PathBuf {
+fn gnomad_test_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("data")
@@ -45,7 +45,7 @@ fn gnomad_data_dir() -> PathBuf {
 
 /// Setup gnomAD test files (panics if not available)
 fn setup_gnomad_files() -> GnomadTestFiles {
-    let dir = gnomad_data_dir();
+    let dir = gnomad_test_dir();
     let ref_vcf = dir.join("ref.vcf.gz");
     let target_vcf = dir.join("target.vcf.gz");
     let target_sparse_vcf = dir.join("target_sparse.vcf.gz");
@@ -94,12 +94,12 @@ fn get_all_data_sources() -> Vec<TestDataSource> {
     ]
 }
 
-/// Directory for BEAGLE test data (downloaded on demand)
-fn beagle_data_dir() -> PathBuf {
+/// Directory for Test data (downloaded on demand)
+fn test_data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("data")
-        .join("beagle_reference")
+        .join("reference_comparison")
 }
 
 const BEAGLE_JAR_URL: &str = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
@@ -129,7 +129,7 @@ fn download_if_missing(url: &str, dest: &Path) -> bool {
 
 /// Get BEAGLE test files (downloads JARs if needed, panics if VCF data unavailable)
 fn setup_test_files() -> TestFiles {
-    let dir = beagle_data_dir();
+    let dir = test_data_dir();
     let _ = fs::create_dir_all(&dir);
 
     let beagle_jar = dir.join("beagle.27Feb25.75f.jar");
@@ -146,7 +146,7 @@ fn setup_test_files() -> TestFiles {
 
     // VCF test data must be provided
     if !ref_vcf.exists() || !target_vcf.exists() {
-        panic!("BEAGLE VCF test data not found at {:?}", dir);
+        panic!("Test VCF data not found at {:?}", dir);
     }
 
     TestFiles {
