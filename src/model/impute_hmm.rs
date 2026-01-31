@@ -296,6 +296,9 @@ impl RefColumnLike for DenseColumn {
             let n_haps = self.n_haplotypes();
             let bits = self.bits_raw();
             let missing = self.missing_raw();
+            let mut cached_word_idx = usize::MAX;
+            let mut cached_bits_word = 0u64;
+            let mut cached_missing_word = 0u64;
             for (i, hap) in state_haps.iter().enumerate() {
                 let idx = hap.as_usize();
                 if idx >= n_haps {
@@ -304,18 +307,16 @@ impl RefColumnLike for DenseColumn {
                 }
                 let word_idx = idx >> 6;
                 let bit_idx = idx & 63;
-                if word_idx < missing.len()
-                    && ((missing[word_idx] >> bit_idx) & 1) != 0
-                {
+                if word_idx != cached_word_idx {
+                    cached_word_idx = word_idx;
+                    cached_bits_word = if word_idx < bits.len() { bits[word_idx] } else { 0 };
+                    cached_missing_word = if word_idx < missing.len() { missing[word_idx] } else { 0 };
+                }
+                if ((cached_missing_word >> bit_idx) & 1) != 0 {
                     out[i] = 255;
                     continue;
                 }
-                let bit = if word_idx < bits.len() {
-                    (bits[word_idx] >> bit_idx) & 1
-                } else {
-                    0
-                };
-                out[i] = bit as u8;
+                out[i] = ((cached_bits_word >> bit_idx) & 1) as u8;
             }
         } else {
             for (i, hap) in state_haps.iter().enumerate() {
