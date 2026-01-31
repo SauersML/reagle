@@ -41,3 +41,6 @@ codex_session_*.jsonl
 # Microarray profiling artifacts
 microarray_profile/
 scripts/microarray_profile/
+
+# Test data cache (downloaded on demand)
+tests/data/

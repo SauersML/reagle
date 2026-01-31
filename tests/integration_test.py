@@ -723,7 +723,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     
     # Check VCF headers for build/format information
     print("\n📋 VCF Header Information:")
-    for vcf_path, label in [(truth_vcf, "TRUTH"), (imputed_vcf, "IMPUTED")]:
+    diag_vcfs = [(truth_vcf, "TRUTH"), (imputed_vcf, "IMPUTED")]
+    if reference_vcf:
+        diag_vcfs.append((reference_vcf, "REFERENCE"))
+    for vcf_path, label in diag_vcfs:
         try:
             header_result = subprocess.run(
                 f"bcftools view -h {vcf_path} | head -30",
@@ -749,6 +752,76 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             print(f"    Has GT: {has_gt}, DS: {has_ds}, GP: {has_gp}")
         except Exception as e:
             print(f"  {label}: Error reading header - {e}")
+
+    # File-level diagnostics
+    print("\n📦 VCF File Summary:")
+    for vcf_path, label in diag_vcfs:
+        try:
+            size_bytes = os.path.getsize(vcf_path)
+        except Exception:
+            size_bytes = -1
+        size_mb = (size_bytes / (1024 * 1024)) if size_bytes >= 0 else None
+        size_str = f"{size_mb:.2f} MB" if size_mb is not None else "unknown"
+        print(f"\n  {label}:")
+        print(f"    Path: {vcf_path}")
+        print(f"    Size: {size_str}")
+        try:
+            sample_result = subprocess.run(
+                f"bcftools query -l {vcf_path}",
+                shell=True, capture_output=True, text=True
+            )
+            samples = [s for s in sample_result.stdout.strip().split("\n") if s.strip()]
+            print(f"    Samples: {len(samples)} {samples[:3] if samples else ''}")
+        except Exception as e:
+            print(f"    Samples: Error - {e}")
+        try:
+            count_result = subprocess.run(
+                f"bcftools index -n {vcf_path}",
+                shell=True, capture_output=True, text=True
+            )
+            count = count_result.stdout.strip()
+            print(f"    Records: {count if count else 'unknown'}")
+        except Exception as e:
+            print(f"    Records: Error - {e}")
+        try:
+            first_result = subprocess.run(
+                f"bcftools view -H {vcf_path} | head -1",
+                shell=True, capture_output=True, text=True
+            )
+            last_result = subprocess.run(
+                f"bcftools view -H {vcf_path} | tail -1",
+                shell=True, capture_output=True, text=True
+            )
+            first_line = first_result.stdout.strip()
+            last_line = last_result.stdout.strip()
+            if first_line:
+                f_parts = first_line.split("\t")
+                if len(f_parts) >= 5:
+                    print(f"    First: {f_parts[0]}:{f_parts[1]} {f_parts[3]}>{f_parts[4]}")
+            if last_line:
+                l_parts = last_line.split("\t")
+                if len(l_parts) >= 5:
+                    print(f"    Last:  {l_parts[0]}:{l_parts[1]} {l_parts[3]}>{l_parts[4]}")
+        except Exception as e:
+            print(f"    Range: Error - {e}")
+
+    # Print example lines (raw records) from each file
+    print("\n🧾 Example Records (first 3 lines):")
+    for vcf_path, label in diag_vcfs:
+        try:
+            ex_result = subprocess.run(
+                f"bcftools view -H {vcf_path} | head -3",
+                shell=True, capture_output=True, text=True
+            )
+            lines = [l for l in ex_result.stdout.strip().split("\n") if l]
+            print(f"\n  {label}:")
+            if not lines:
+                print("    (no records)")
+            else:
+                for line in lines:
+                    print(f"    {line}")
+        except Exception as e:
+            print(f"  {label}: Error - {e}")
     
     # Sample first 10 sites from each VCF
     print("\n📍 Sample Sites (first 10):")
@@ -794,6 +867,44 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             print(f"\n  Sample imputed sites:")
             for site in list(imputed_sites_sample)[:3]:
                 print(f"    {site}")
+
+        # Coordinate-only overlap (ignores REF/ALT) for multiple pairs
+        def _pos_set(vcf_path, limit):
+            cmd = f"bcftools query -f '%CHROM\\t%POS\\n' {vcf_path} | head -{limit}"
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            return set([l for l in res.stdout.strip().split("\n") if l])
+
+        pos_limit = 5000
+        truth_pos = _pos_set(truth_vcf, pos_limit)
+        imputed_pos = _pos_set(imputed_vcf, pos_limit)
+        pos_overlap = truth_pos & imputed_pos
+        print(f"  First {pos_limit} positions - Truth: {len(truth_pos)}, Imputed: {len(imputed_pos)}, Overlap: {len(pos_overlap)}")
+        if reference_vcf:
+            ref_pos = _pos_set(reference_vcf, pos_limit)
+            print(f"  First {pos_limit} positions - Truth: {len(truth_pos)}, Ref: {len(ref_pos)}, Overlap: {len(truth_pos & ref_pos)}")
+            print(f"  First {pos_limit} positions - Imputed: {len(imputed_pos)}, Ref: {len(ref_pos)}, Overlap: {len(imputed_pos & ref_pos)}")
+
+        # Quick REF/ALT mismatch sample at shared positions
+        if pos_overlap:
+            truth_map = {}
+            for line in truth_sites_sample:
+                parts = line.split("\t")
+                if len(parts) >= 4:
+                    truth_map[f"{parts[0]}\t{parts[1]}"] = (parts[2], parts[3])
+            imputed_map = {}
+            for line in imputed_sites_sample:
+                parts = line.split("\t")
+                if len(parts) >= 4:
+                    imputed_map[f"{parts[0]}\t{parts[1]}"] = (parts[2], parts[3])
+            mismatch_examples = 0
+            for key in list(pos_overlap)[:10]:
+                t_vals = truth_map.get(key)
+                i_vals = imputed_map.get(key)
+                if t_vals and i_vals and t_vals != i_vals:
+                    mismatch_examples += 1
+                    print(f"  REF/ALT diff at {key}: truth {t_vals[0]}>{t_vals[1]} imputed {i_vals[0]}>{i_vals[1]}")
+            if mismatch_examples == 0:
+                print("  No REF/ALT diffs found in sampled shared positions")
     except Exception as e:
         print(f"  Error: {e}")
     
@@ -985,10 +1096,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     # Check VCF header for DS/GP fields before querying
     # This handles both Beagle (with gp=true) and Reagle (which may not have DS/GP)
     imputed_cmd_full = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf}"
+    imputed_cmd_ds = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS]\\n' {imputed_vcf}"
     imputed_cmd_gt = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
     
     # Check if DS and GP fields exist in VCF header
-    has_ds_gp = False
+    has_ds = False
+    has_gp = False
     try:
         header_result = subprocess.run(
             ["bcftools", "view", "-h", imputed_vcf],
@@ -997,13 +1110,17 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         if header_result.returncode == 0:
             header = header_result.stdout
             # Check for FORMAT=<ID=DS and FORMAT=<ID=GP in header
-            has_ds_gp = "ID=DS" in header and "ID=GP" in header
+            has_ds = "ID=DS" in header
+            has_gp = "ID=GP" in header
     except Exception as e:
         print(f"Warning: Could not check VCF header: {e}")
     
-    if has_ds_gp:
+    if has_ds and has_gp:
         imputed_cmd = imputed_cmd_full
         print(f"Using GT:DS:GP format for {imputed_vcf}")
+    elif has_ds:
+        imputed_cmd = imputed_cmd_ds
+        print(f"Using GT:DS format for {imputed_vcf}")
     else:
         imputed_cmd = imputed_cmd_gt
         print(f"Using GT-only format for {imputed_vcf} (DS/GP not in header)")
@@ -1781,11 +1898,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         print(f"\n⚠️  DIAGNOSTIC WARNINGS")
         homref_count = confusion_matrix[0][0] + confusion_matrix[0][1] + confusion_matrix[0][2]
         if homref_count == 0:
-            print(f"   CRITICAL: Truth has ZERO HomRef genotypes!")
-            print(f"   → This indicates truth VCF is variant-only (no 0/0 calls)")
+            print(f"   NOTE: Truth has ZERO HomRef genotypes (expected for variant-only VCFs)")
             print(f"   → Metrics are calculated ONLY at variant sites")
-            print(f"   → This makes concordance metrics unreliable")
-            print(f"   → Solution: Use array input sites as comparison set, not WGS variants")
+            print(f"   → Concordance may be inflated/deflated vs array-site evaluation")
         
         missing_truth = metrics.get('missing_truth', 0)
         missing_imputed = metrics.get('missing_imputed', 0)

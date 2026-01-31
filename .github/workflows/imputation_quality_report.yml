@@ -62,6 +62,8 @@ jobs:
   impute-and-measure:
     needs: prepare-shared
     runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +113,34 @@ jobs:
 
       - name: Run Quality Assessment
         run: python3 scripts/quality_assessment.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}" --format "${{ matrix.format }}"
+
+      - name: Diagnostics (post-run)
+        if: always()
+        run: |
+          set +e
+          echo "=== Workspace Files ==="
+          ls -lh
+          echo "=== Data Files ==="
+          ls -lh tests/data || true
+          echo "=== Tool Versions ==="
+          bcftools --version | head -1 || true
+          tabix --version | head -1 || true
+          java -version 2>&1 | head -1 || true
+          echo "=== VCF Record Counts ==="
+          for f in ref.vcf.gz target.vcf.gz truth.vcf.gz tests/data/reagle_imputed.vcf.gz tests/data/beagle_imputed.vcf.gz; do
+            if [ -f "$f" ]; then
+              echo "$f"
+              bcftools index -n "$f" || true
+            fi
+          done
+          echo "=== VCF Headers (first 5 lines) ==="
+          for f in tests/data/reagle_imputed.vcf.gz tests/data/beagle_imputed.vcf.gz tests/data/truth.vcf.gz; do
+            if [ -f "$f" ]; then
+              echo "--- $f ---"
+              bcftools view -h "$f" | head -5 || true
+            fi
+          done
+          set -e
 
       - name: Upload Metrics
         uses: actions/upload-artifact@v4

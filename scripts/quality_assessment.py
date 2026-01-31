@@ -29,7 +29,75 @@ def ensure_beagle():
         raise RuntimeError("Neither wget nor curl found")
     return BEAGLE_JAR
 
+
+def print_tool_versions():
+    print("\n=== Tool Versions ===")
+    for cmd in [
+        "bcftools --version | head -1",
+        "tabix --version | head -1",
+        "java -version 2>&1 | head -1",
+        "python3 --version",
+    ]:
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            line = result.stdout.strip() or result.stderr.strip()
+            print(f"{cmd.split()[0]}: {line if line else 'unknown'}")
+        except Exception as e:
+            print(f"{cmd.split()[0]}: Error - {e}")
+
+
+def print_vcf_diagnostics(vcf_path, label):
+    print(f"\n=== VCF Diagnostics: {label} ===")
+    if not os.path.exists(vcf_path):
+        print(f"Missing: {vcf_path}")
+        return
+    try:
+        size_bytes = os.path.getsize(vcf_path)
+        print(f"Path: {vcf_path}")
+        print(f"Size: {size_bytes / (1024 * 1024):.2f} MB")
+    except Exception as e:
+        print(f"Size: Error - {e}")
+    try:
+        rec = subprocess.run(
+            f"bcftools index -n {vcf_path}",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        print(f"Records: {rec if rec else 'unknown'}")
+    except Exception as e:
+        print(f"Records: Error - {e}")
+    try:
+        hdr = subprocess.run(
+            f"bcftools view -h {vcf_path} | head -20",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip().split("\n")
+        contigs = [l for l in hdr if l.startswith("##contig")]
+        formats = [l for l in hdr if l.startswith("##FORMAT")]
+        print(f"Contigs: {len(contigs)}")
+        print(f"FORMAT fields: {len(formats)}")
+    except Exception as e:
+        print(f"Header: Error - {e}")
+    try:
+        first = subprocess.run(
+            f"bcftools view -H {vcf_path} | head -1",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        last = subprocess.run(
+            f"bcftools view -H {vcf_path} | tail -1",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        if first:
+            f_parts = first.split("\t")
+            if len(f_parts) >= 5:
+                print(f"First: {f_parts[0]}:{f_parts[1]} {f_parts[3]}>{f_parts[4]}")
+        if last:
+            l_parts = last.split("\t")
+            if len(l_parts) >= 5:
+                print(f"Last:  {l_parts[0]}:{l_parts[1]} {l_parts[3]}>{l_parts[4]}")
+    except Exception as e:
+        print(f"Range: Error - {e}")
+
 def run_benchmark(person, file_path, format):
+    print_tool_versions()
     # 1. Prepare Data
     print(f"=== Preparing data for {person} ({file_path}) ===")
     run_cmd(["python3", "scripts/prepare_data.py", "reference", "ref.vcf.gz"])
@@ -37,6 +105,9 @@ def run_benchmark(person, file_path, format):
 
     truth_dir = "data/kat_suricata" if person == "Kat" else "data/christopher_smith"
     run_cmd(["python3", "scripts/prepare_data.py", "truth", truth_dir, "truth.vcf.gz", "ref.vcf.gz"])
+    print_vcf_diagnostics("ref.vcf.gz", "Reference Panel")
+    print_vcf_diagnostics("target.vcf.gz", "Target Array")
+    print_vcf_diagnostics("truth.vcf.gz", "Truth WGS")
 
     # 2. Run Reagle
     print("=== Running Reagle ===")
@@ -44,7 +115,7 @@ def run_benchmark(person, file_path, format):
         print("ERROR: target.vcf.gz missing after prep!")
         run_cmd(["ls", "-l"])
     
-    run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--gt", "target.vcf.gz", "--out", "reagle_out", "--chrom", "chr22"])
+    run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--gt", "target.vcf.gz", "--out", "reagle_out", "--chrom", "chr22", "--gp"])
 
     # 3. Run Beagle
     print("=== Running Beagle ===")
@@ -53,8 +124,27 @@ def run_benchmark(person, file_path, format):
     # The original ref.vcf.gz is preserved for Reagle to ensure no loss of data in the primary pipeline.
     # NOTE: +setGT must run BEFORE filtering missing data to handle sparse panels correctly.
     # We first fill missing values with Reference (0) to ensure the panel is dense, then force phasing.
-    run_cmd("bcftools +setGT ref.vcf.gz -Ou -- -t . -n 0 | bcftools +setGT - -Ou -- -t a -n p | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
+    print("Preparing Beagle reference panel (bcftools +setGT)...")
+    # Capture stderr so bcftools messages don't look like Reagle output.
+    prep_log = "ref_beagle_prep.log"
+    prep_cmd = (
+        "bcftools +setGT ref.vcf.gz -Ou -- -t . -n 0 "
+        "| bcftools +setGT - -Ou -- -t a -n p "
+        "| bcftools view -Oz -o ref_beagle.vcf.gz"
+    )
+    run_cmd(f"{prep_cmd} 2> {prep_log}", shell=True)
+    if os.path.exists(prep_log):
+        print("Beagle ref prep logs (bcftools):")
+        with open(prep_log, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    print(f"  [bcftools] {line}")
+                    if line.startswith("Filled"):
+                        print("  [bcftools] Note: count is per marker×sample entries in ref panel, not target alleles")
+        os.remove(prep_log)
     run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
+    print_vcf_diagnostics("ref_beagle.vcf.gz", "Reference Panel (Beagle)")
 
     beagle_jar = ensure_beagle()
     run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref_beagle.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=chr22", "nthreads=4", "gp=true"])
@@ -99,6 +189,9 @@ def run_benchmark(person, file_path, format):
             run_cmd(["bcftools", "index", "-f", vcf])
     
     os.remove("sample_name.txt")
+
+    print_vcf_diagnostics("tests/data/reagle_imputed.vcf.gz", "Reagle Imputed")
+    print_vcf_diagnostics("tests/data/beagle_imputed.vcf.gz", "Beagle Imputed")
     
     # Run metrics via integration test (it now auto-detects DS/GP vs GT-only format)
     run_cmd(["python3", "tests/integration_test.py", "metrics"])

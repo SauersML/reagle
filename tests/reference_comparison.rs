@@ -1,15 +1,11 @@
-//! Integration tests that run Java BEAGLE as a reference implementation.
+//! Integration tests comparing Reagle against Java BEAGLE reference.
 //!
-//! These tests download the official BEAGLE JAR and test data, run the Java
-//! implementation, and verify the outputs. This establishes a baseline for
-//! comparing our Rust implementation against.
-//!
-//! Tests run on multiple data sources:
-//! - Test data (1000 Genomes subset)
-//! - gnomAD HGDP+1KG (if bcftools available)
+//! Test data is generated dynamically from HGDP+1KG panel:
+//! - Reference panel (subset of samples)
+//! - Target samples (held out from ref)
+//! - Sparse target (filtered to GSA microarray sites)
 
 use std::collections::HashMap;
-use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,48 +20,39 @@ use reagle::{Config, ImputationPipeline, PhasingPipeline};
 // Serialize tests to prevent OOM from parallel execution
 use serial_test::serial;
 
+// Shared test utilities
+mod common;
+use common::{cache_dir, download_if_missing, generate_test_data, TestData};
+
 // =============================================================================
-// gnomAD Test Data Source
+// Test Data Setup
 // =============================================================================
 
-/// gnomAD test files (same structure as BEAGLE test files)
-struct GnomadTestFiles {
-    ref_vcf: PathBuf,
-    target_vcf: PathBuf,
-    target_sparse_vcf: PathBuf,
+const BEAGLE_JAR_URL: &str = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
+const BREF3_JAR_URL: &str = "https://faculty.washington.edu/browning/beagle/bref3.27Feb25.75f.jar";
+
+/// Test configuration for data generation
+struct TestConfig {
+    /// Number of samples for reference panel
+    ref_samples: usize,
+    /// Number of samples held out as target
+    target_samples: usize,
+    /// Genomic region to extract (e.g., "chr22:16000000-17000000")
+    region: &'static str,
 }
 
-/// Get gnomAD test data directory (downloads if needed)
-fn gnomad_test_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("data")
-        .join("gnomad_hgdp")
-}
-
-/// Setup gnomAD test files (panics if not available)
-fn setup_gnomad_files() -> GnomadTestFiles {
-    let dir = gnomad_test_dir();
-    let ref_vcf = dir.join("ref.vcf.gz");
-    let target_vcf = dir.join("target.vcf.gz");
-    let target_sparse_vcf = dir.join("target_sparse.vcf.gz");
-
-    if !ref_vcf.exists() || !target_vcf.exists() || !target_sparse_vcf.exists() {
-        panic!("gnomAD test data not found at {:?}", dir);
-    }
-
-    GnomadTestFiles {
-        ref_vcf,
-        target_vcf,
-        target_sparse_vcf,
+impl Default for TestConfig {
+    fn default() -> Self {
+        Self {
+            // Use 100 ref samples and 5 targets from a 1MB region
+            ref_samples: 100,
+            target_samples: 5,
+            region: "chr22:16000000-17000000",
+        }
     }
 }
 
-// =============================================================================
-// Common Data Source Abstraction
-// =============================================================================
-
-/// Common interface for test data sources
+/// Common interface for test data sources (now unified - single source from HGDP+1KG)
 struct TestDataSource {
     name: &'static str,
     ref_vcf: PathBuf,
@@ -73,70 +60,47 @@ struct TestDataSource {
     target_sparse_vcf: PathBuf,
 }
 
-/// Get all available test data sources
-fn get_all_data_sources() -> Vec<TestDataSource> {
-    let beagle = setup_test_files();
-    let gnomad = setup_gnomad_files();
-
-    vec![
-        TestDataSource {
-            name: "BEAGLE",
-            ref_vcf: beagle.ref_vcf,
-            target_vcf: beagle.target_vcf,
-            target_sparse_vcf: beagle.target_sparse_vcf,
-        },
-        TestDataSource {
-            name: "gnomAD",
-            ref_vcf: gnomad.ref_vcf,
-            target_vcf: gnomad.target_vcf,
-            target_sparse_vcf: gnomad.target_sparse_vcf,
-        },
-    ]
+/// Get all available test data sources (single unified source from HGDP+1KG)
+/// Returns (sources, files) - caller must keep `files` alive to prevent temp dir cleanup
+fn get_all_data_sources() -> (Vec<TestDataSource>, TestFiles) {
+    let files = setup_test_files();
+    let sources = vec![TestDataSource {
+        name: "HGDP_1KG",
+        ref_vcf: files.ref_vcf.clone(),
+        target_vcf: files.target_vcf.clone(),
+        target_sparse_vcf: files.target_sparse_vcf.clone(),
+    }];
+    (sources, files)
 }
 
-/// Directory for Test data (downloaded on demand)
-fn test_data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("data")
-        .join("reference_comparison")
+/// Files needed for running tests
+struct TestFiles {
+    beagle_jar: PathBuf,
+    bref3_jar: PathBuf,
+    ref_vcf: PathBuf,
+    target_vcf: PathBuf,
+    target_sparse_vcf: PathBuf,
+    /// Holds temp dir to keep files alive (accessed via Debug print in tests)
+    test_data: TestData,
 }
 
-const BEAGLE_JAR_URL: &str = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
-const BREF3_JAR_URL: &str = "https://faculty.washington.edu/browning/beagle/bref3.27Feb25.75f.jar";
-
-/// Download a file if it doesn't exist
-fn download_if_missing(url: &str, dest: &Path) -> bool {
-    if dest.exists() {
-        return true;
-    }
-    if let Some(parent) = dest.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    eprintln!("Downloading {} to {:?}...", url, dest);
-    let status = Command::new("curl")
-        .args(["-fsSL", url, "-o"])
-        .arg(dest)
-        .status();
-    match status {
-        Ok(s) if s.success() => true,
-        _ => {
-            eprintln!("Failed to download {}", url);
-            false
-        }
+impl std::fmt::Debug for TestFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Access test_data to prevent "unused field" - shows temp dir path
+        write!(f, "TestFiles {{ work_dir: {:?} }}", self.test_data.work_dir.path())
     }
 }
 
-/// Get BEAGLE test files (downloads JARs if needed, panics if VCF data unavailable)
+/// Setup test files - downloads JARs and generates VCF data from HGDP+1KG
 fn setup_test_files() -> TestFiles {
-    let dir = test_data_dir();
-    let _ = fs::create_dir_all(&dir);
+    setup_test_files_with_config(TestConfig::default())
+}
 
-    let beagle_jar = dir.join("beagle.27Feb25.75f.jar");
-    let bref3_jar = dir.join("bref3.27Feb25.75f.jar");
-    let ref_vcf = dir.join("ref.27Feb25.75f.vcf.gz");
-    let target_vcf = dir.join("target.27Feb25.75f.vcf.gz");
-    let target_sparse_vcf = dir.join("target_sparse.27Feb25.75f.vcf.gz");
+fn setup_test_files_with_config(config: TestConfig) -> TestFiles {
+    let jar_dir = cache_dir();
+
+    let beagle_jar = jar_dir.join("beagle.27Feb25.75f.jar");
+    let bref3_jar = jar_dir.join("bref3.27Feb25.75f.jar");
 
     // Download JARs if missing
     if !download_if_missing(BEAGLE_JAR_URL, &beagle_jar) {
@@ -144,27 +108,17 @@ fn setup_test_files() -> TestFiles {
     }
     let _ = download_if_missing(BREF3_JAR_URL, &bref3_jar);
 
-    // VCF test data must be provided
-    if !ref_vcf.exists() || !target_vcf.exists() {
-        panic!("Test VCF data not found at {:?}", dir);
-    }
+    // Generate test data from HGDP+1KG
+    let data = generate_test_data(config.ref_samples, config.target_samples, config.region);
 
     TestFiles {
         beagle_jar,
         bref3_jar,
-        ref_vcf,
-        target_vcf,
-        target_sparse_vcf,
+        ref_vcf: data.ref_vcf.clone(),
+        target_vcf: data.target_vcf.clone(),
+        target_sparse_vcf: data.target_sparse_vcf.clone(),
+        test_data: data,
     }
-}
-
-struct TestFiles {
-    beagle_jar: PathBuf,
-    bref3_jar: PathBuf,
-    ref_vcf: PathBuf,
-    target_vcf: PathBuf,
-    /// Sparse target with ~10% of markers for true imputation testing
-    target_sparse_vcf: PathBuf,
 }
 
 // =============================================================================
@@ -732,7 +686,9 @@ fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::proces
 #[serial]
 fn test_phasing_rust_vs_java() {
     // Run on all available data sources
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(60));
         println!("=== Phasing Test: {} data ===", source.name);
         println!("{}", "=".repeat(60));
@@ -833,7 +789,9 @@ fn run_phasing_comparison(source: &TestDataSource) {
 #[serial]
 fn test_imputation_vcf_ref_rust_vs_java() {
     // Run on all available data sources
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(60));
         println!("=== Imputation Test: {} data ===", source.name);
         println!("{}", "=".repeat(60));
@@ -1151,7 +1109,9 @@ fn test_imputation_multi_window_long_map_vs_java() {
 #[serial]
 fn test_full_workflow_rust_vs_java() {
     // Run full workflow on all data sources
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(60));
         println!("=== Full Workflow Test: {} data ===", source.name);
         println!("{}", "=".repeat(60));
@@ -1314,7 +1274,9 @@ fn run_bref3_java_only_test() {
 #[serial]
 fn test_output_structure_rust_vs_java() {
     // Run on all available data sources
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(60));
         println!("=== Output Structure Test: {} data ===", source.name);
         println!("{}", "=".repeat(60));
@@ -1922,7 +1884,9 @@ fn evaluate_imputation(
 #[serial]
 fn test_mask_and_recover_rust_vs_java() {
     // Run on all available data sources
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(60));
         println!("=== Mask-and-Recover Test: {} data ===", source.name);
         println!("{}", "=".repeat(60));
@@ -2270,15 +2234,20 @@ fn compare_against_beagle(
 #[serial]
 fn test_comparison_framework_self_check() {
     // Sanity check: BEAGLE compared against itself should pass trivially
+    // Uses target_vcf (different samples from ref) to ensure proper imputation with GP output
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
 
     let ref_path = work_dir.path().join("ref.vcf.gz");
     fs::copy(&files.ref_vcf, &ref_path).expect("Copy ref VCF");
 
-    // Create masked version
+    // Use target_vcf (separate samples) for masking - this ensures BEAGLE does real imputation
+    let target_path = work_dir.path().join("target.vcf.gz");
+    fs::copy(&files.target_vcf, &target_path).expect("Copy target VCF");
+
+    // Create masked version from target (not ref)
     let masked_path = work_dir.path().join("masked.vcf");
-    let truth_map = create_masked_vcf(&ref_path, &masked_path, 0.05, 99);
+    let truth_map = create_masked_vcf(&target_path, &masked_path, 0.05, 99);
 
     // Compress
     let masked_gz = work_dir.path().join("masked.vcf.gz");
@@ -2290,11 +2259,12 @@ fn test_comparison_framework_self_check() {
         .expect("gzip");
     assert!(status.success());
 
-    // Run BEAGLE
+    // Run BEAGLE imputation - target samples not in ref, so BEAGLE outputs GP
     let out_prefix = work_dir.path().join("imputed");
     let output = run_beagle(
         &files.beagle_jar,
         &[
+            ("ref", ref_path.to_str().unwrap()),
             ("gt", masked_gz.to_str().unwrap()),
             ("out", out_prefix.to_str().unwrap()),
             ("seed", "99"),
@@ -2307,6 +2277,15 @@ fn test_comparison_framework_self_check() {
     let (_, ref_records) = parse_vcf(&ref_path);
     let imputed_vcf = work_dir.path().join("imputed.vcf.gz");
     let (_, imputed_records) = parse_vcf(&imputed_vcf);
+
+    // Check GP count - BEAGLE must output GP for metrics calculation
+    let gp_count = imputed_records.iter()
+        .flat_map(|r| r.genotypes.iter())
+        .filter(|g| g.gp.is_some())
+        .count();
+    assert!(gp_count > 0, "BEAGLE must output GP values for Brier score calculation. \
+        Check that gt samples are not in ref panel and gp=true is set.");
+
     let accuracy = evaluate_imputation(&imputed_records, &truth_map, &ref_records);
 
     // Create baseline from the same run
@@ -2937,7 +2916,9 @@ fn compare_genotyped_dosages_to_truth(
 fn test_genotyped_dosage_correlation_with_truth() {
     // Test that genotyped markers (non-imputed) have near-perfect correlation
     // between Rust output dosage and ground truth dosage
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         let files = setup_test_files();
         println!("\n{}", "=".repeat(70));
         println!(
@@ -3005,7 +2986,9 @@ fn test_genotyped_dosage_correlation_with_truth() {
 #[serial]
 fn test_strict_dr2_and_dosage_comparison() {
     // Comprehensive quality metrics comparison between Rust and Java
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(70));
         println!("=== Strict Quality Metrics Test: {} ===", source.name);
         println!("{}", "=".repeat(70));
@@ -3071,7 +3054,8 @@ fn test_strict_dr2_and_dosage_comparison() {
 #[serial]
 fn test_diverse_mask_scenarios() {
     // Test imputation with different masking fractions
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
 
     // Test multiple masking scenarios
@@ -3279,7 +3263,8 @@ fn test_diverse_mask_scenarios() {
 fn test_multiple_seeds_consistency() {
     // Verify that different seeds don't cause catastrophic failures
     // and results remain consistent with Java
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
 
     let seeds = [1, 42, 123, 999, 12345];
@@ -3416,7 +3401,8 @@ fn test_multiple_seeds_consistency() {
 #[test]
 #[serial]
 fn test_per_sample_imputation_accuracy() {
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
 
     println!("\n{}", "=".repeat(60));
@@ -3626,7 +3612,8 @@ fn test_per_sample_imputation_accuracy() {
 #[test]
 #[serial]
 fn test_dr2_genotyped_vs_imputed() {
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
 
     println!("\n{}", "=".repeat(70));
@@ -3871,7 +3858,8 @@ fn test_dr2_genotyped_vs_imputed() {
 #[test]
 #[serial]
 fn test_dosage_by_distance_from_genotyped() {
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
 
     println!("\n{}", "=".repeat(70));
@@ -4090,7 +4078,8 @@ fn test_dosage_by_distance_from_genotyped() {
 #[test]
 #[serial]
 fn test_posterior_probability_calibration() {
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
 
     println!("\n{}", "=".repeat(70));
@@ -4292,7 +4281,8 @@ fn test_posterior_probability_calibration() {
 #[test]
 #[serial]
 fn test_genotyped_dosage_matches_hard_call() {
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
 
     println!("\n{}", "=".repeat(70));
@@ -4471,7 +4461,9 @@ fn test_genotyped_dosage_matches_hard_call() {
 #[test]
 #[serial]
 fn test_phasing_sanity_checks() {
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(70));
         println!("=== Phasing Sanity Checks: {} ===", source.name);
         println!("{}", "=".repeat(70));
@@ -4648,7 +4640,9 @@ fn test_phasing_sanity_checks() {
 #[test]
 #[serial]
 fn test_phasing_switch_error_rate() {
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(70));
         println!("=== Strict Phasing Switch Error Rate: {} ===", source.name);
         println!("{}", "=".repeat(70));
@@ -4813,7 +4807,8 @@ fn test_phasing_switch_error_rate() {
 #[test]
 #[serial]
 fn test_phasing_determinism() {
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
 
     println!("\n{}", "=".repeat(70));
     println!("=== Phasing Determinism Test ===");
@@ -4875,7 +4870,8 @@ fn test_phasing_determinism() {
 #[test]
 #[serial]
 fn test_phasing_heterozygote_stress() {
-    let sources = get_all_data_sources(); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
 
     println!("\n{}", "=".repeat(70));
     println!("=== Phasing Heterozygote Stress Test ===");
@@ -5384,7 +5380,9 @@ fn test_dr2_zero_variance_genotyped_marker() {
 #[test]
 #[serial]
 fn test_imputation_vs_ground_truth() {
-    for source in get_all_data_sources() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files);
+    for source in sources {
         println!("\n{}", "=".repeat(60));
         println!("=== Imputation Accuracy Test: {} data ===", source.name);
         println!("{}", "=".repeat(60));
