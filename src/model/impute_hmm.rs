@@ -292,8 +292,35 @@ impl RefColumnLike for DenseColumn {
         dict_pattern_alleles: &mut Vec<u8>,
     ) {
         std::hint::black_box(dict_pattern_alleles.len());
-        for (i, hap) in state_haps.iter().enumerate() {
-            out[i] = self.get(*hap);
+        if self.bits_per_allele() == 1 {
+            let n_haps = self.n_haplotypes();
+            let bits = self.bits_raw();
+            let missing = self.missing_raw();
+            for (i, hap) in state_haps.iter().enumerate() {
+                let idx = hap.as_usize();
+                if idx >= n_haps {
+                    out[i] = 0;
+                    continue;
+                }
+                let word_idx = idx >> 6;
+                let bit_idx = idx & 63;
+                if word_idx < missing.len()
+                    && ((missing[word_idx] >> bit_idx) & 1) != 0
+                {
+                    out[i] = 255;
+                    continue;
+                }
+                let bit = if word_idx < bits.len() {
+                    (bits[word_idx] >> bit_idx) & 1
+                } else {
+                    0
+                };
+                out[i] = bit as u8;
+            }
+        } else {
+            for (i, hap) in state_haps.iter().enumerate() {
+                out[i] = self.get(*hap);
+            }
         }
     }
 }

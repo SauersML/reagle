@@ -2015,115 +2015,122 @@ fn build_imputation_plan(
             )));
         }
 
-        for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            let mut abyss = vec![false; n_ref_haps];
-            let mut abyss_count = 0usize;
-            for h in 0..n_ref_haps {
-                let score = best_window_scores[i][h];
-                if window_rank_hits[i][h] == 0 || !score.is_finite() || score <= 0.0 {
-                    abyss[h] = true;
-                    abyss_count += 1;
-                }
-            }
-            if abyss_count == n_ref_haps {
-                let keep = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
-                    .min(n_ref_haps)
-                    .max(1);
-                let top = select_top_k_allow_zero(&global_scores[i], keep);
-                if top.is_empty() {
-                    for h in 0..keep {
-                        abyss[h] = false;
+        let num_windows = window_handoff.len();
+        let use_plan_caps = !plan.per_window_caps.is_empty() && plan.per_window_caps.len() == num_windows;
+        let fallback_caps = if use_plan_caps {
+            None
+        } else {
+            Some(vec![per_window_cap.max(1); num_windows])
+        };
+        let plan_caps = plan.per_window_caps.clone();
+        let batch_results: Vec<_> = batch_haps
+            .par_iter()
+            .enumerate()
+            .map(|(i, &hap_idx)| {
+                let mut abyss = vec![false; n_ref_haps];
+                let mut abyss_count = 0usize;
+                for h in 0..n_ref_haps {
+                    let score = best_window_scores[i][h];
+                    if window_rank_hits[i][h] == 0 || !score.is_finite() || score <= 0.0 {
+                        abyss[h] = true;
+                        abyss_count += 1;
                     }
-                    abyss_count = n_ref_haps.saturating_sub(keep);
-                } else {
-                    for (h, _) in top {
-                        if abyss[h] {
+                }
+                if abyss_count == n_ref_haps {
+                    let keep = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
+                        .min(n_ref_haps)
+                        .max(1);
+                    let top = select_top_k_allow_zero(&global_scores[i], keep);
+                    if top.is_empty() {
+                        for h in 0..keep {
                             abyss[h] = false;
-                            abyss_count = abyss_count.saturating_sub(1);
+                        }
+                        abyss_count = n_ref_haps.saturating_sub(keep);
+                    } else {
+                        for (h, _) in top {
+                            if abyss[h] {
+                                abyss[h] = false;
+                                abyss_count = abyss_count.saturating_sub(1);
+                            }
                         }
                     }
                 }
-            }
-            // Run LMS allocator for this target haplotype.
-            let window_scores_matrix = &scores_by_window[i];
-            if window_scores_matrix.len() != window_handoff.len() {
-                return Err(ReagleError::vcf(format!(
-                    "Pre-scan window count mismatch for hap {} (scores={}, bounds={})",
-                    hap_idx,
-                    window_scores_matrix.len(),
-                    window_handoff.len()
-                )));
-            }
-            // LMS allocation: select a per-window active set that maximizes a
-            // Li–Stephens-aligned surrogate objective under a slot budget.
-            // This is a prescan-only selection layer; the actual HMM still uses
-            // explicit GlobalId states and identity-preserving transitions.
-            let num_windows = window_scores_matrix.len();
-            let per_window_caps_used = if !plan.per_window_caps.is_empty()
-                && plan.per_window_caps.len() == num_windows
-            {
-                plan.per_window_caps.clone()
-            } else {
-                vec![per_window_cap.max(1); num_windows]
-            };
-            let per_window_cap_min = per_window_caps_used
-                .iter()
-                .copied()
-                .min()
-                .unwrap_or(per_window_cap.max(1));
-            plan.abyss_mask[hap_idx] = abyss.clone();
-            let (intervals, core) = if per_window_cap_min >= n_ref_haps {
-                // Full panel per window (minus abyss). Store as 1 interval per hap.
-                let mut intervals = Vec::new();
-                let mut core = Vec::new();
-                let end = num_windows.saturating_sub(1) as u32;
-                for h in 0..n_ref_haps {
-                    if abyss[h] {
-                        continue;
+                let window_scores_matrix = &scores_by_window[i];
+                if window_scores_matrix.len() != window_handoff.len() {
+                    return Err(ReagleError::vcf(format!(
+                        "Pre-scan window count mismatch for hap {} (scores={}, bounds={})",
+                        hap_idx,
+                        window_scores_matrix.len(),
+                        window_handoff.len()
+                    )));
+                }
+                let per_window_caps_used = if use_plan_caps {
+                    plan_caps.as_slice()
+                } else {
+                    fallback_caps.as_ref().unwrap().as_slice()
+                };
+                let per_window_cap_min = per_window_caps_used
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap_or(per_window_cap.max(1));
+                let (intervals, core) = if per_window_cap_min >= n_ref_haps {
+                    let mut intervals = Vec::new();
+                    let mut core = Vec::new();
+                    let end = num_windows.saturating_sub(1) as u32;
+                    for h in 0..n_ref_haps {
+                        if abyss[h] {
+                            continue;
+                        }
+                        let hap = GlobalId::new(h as u32);
+                        intervals.push(HapIntervals {
+                            hap,
+                            intervals: vec![(0, end)],
+                        });
+                        core.push(hap);
                     }
-                    let hap = GlobalId::new(h as u32);
-                    intervals.push(HapIntervals {
-                        hap,
-                        intervals: vec![(0, end)],
-                    });
-                    core.push(hap);
-                }
-                (intervals, core)
-            } else {
-                let (candidate_haps, scores_by_hap) =
-                    build_sparse_scores(window_scores_matrix, &abyss);
-                let global_slot_budget =
-                    per_window_caps_used.iter().copied().sum::<usize>().max(1);
-                let allocation = crate::model::state_allocator::allocate_lms_sparse(
-                    &scores_by_hap,
-                    &candidate_haps,
-                    num_windows,
-                    &boundary_cm,
-                    params,
-                    n_ref_haps,
-                    global_slot_budget,
-                    &per_window_caps_used,
-                );
-                let mut intervals = Vec::new();
-                for (hap, spans) in allocation.intervals_by_hap.into_iter() {
-                    intervals.push(HapIntervals {
-                        hap: GlobalId::new(hap as u32),
-                        intervals: spans,
-                    });
-                }
-                let mut core = Vec::new();
-                let need_end = window_scores_matrix.len().saturating_sub(1) as u32;
-                for hi in intervals.iter() {
-                    if hi.intervals.len() == 1 && hi.intervals[0] == (0, need_end) {
-                        core.push(hi.hap);
+                    (intervals, core)
+                } else {
+                    let (candidate_haps, scores_by_hap) =
+                        build_sparse_scores(window_scores_matrix, &abyss);
+                    let global_slot_budget =
+                        per_window_caps_used.iter().copied().sum::<usize>().max(1);
+                    let allocation = crate::model::state_allocator::allocate_lms_sparse(
+                        &scores_by_hap,
+                        &candidate_haps,
+                        num_windows,
+                        &boundary_cm,
+                        params,
+                        n_ref_haps,
+                        global_slot_budget,
+                        per_window_caps_used,
+                    );
+                    let mut intervals = Vec::new();
+                    for (hap, spans) in allocation.intervals_by_hap.into_iter() {
+                        intervals.push(HapIntervals {
+                            hap: GlobalId::new(hap as u32),
+                            intervals: spans,
+                        });
                     }
-                }
-                (intervals, core)
-            };
+                    let mut core = Vec::new();
+                    let need_end = window_scores_matrix.len().saturating_sub(1) as u32;
+                    for hi in intervals.iter() {
+                        if hi.intervals.len() == 1 && hi.intervals[0] == (0, need_end) {
+                            core.push(hi.hap);
+                        }
+                    }
+                    (intervals, core)
+                };
+                let core_len = core.len();
+                let intervals_len = intervals.len();
+                Ok((hap_idx, abyss, intervals, core, core_len, intervals_len, abyss_count))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (hap_idx, abyss, intervals, core, core_len, intervals_len, abyss_count) in batch_results {
+            plan.abyss_mask[hap_idx] = abyss;
             plan.window_intervals[hap_idx] = intervals;
             plan.core_states[hap_idx] = core;
-            let core_len = plan.core_states[hap_idx].len();
-            let intervals_len = plan.window_intervals[hap_idx].len();
             plan
                 .stats
                 .update(core_len, intervals_len.saturating_sub(core_len), abyss_count);

@@ -108,6 +108,21 @@ impl DenseColumn {
         self.n_haplotypes as usize
     }
 
+    #[inline]
+    pub fn bits_per_allele(&self) -> u8 {
+        self.bits_per_allele
+    }
+
+    #[inline]
+    pub fn bits_raw(&self) -> &[u64] {
+        self.bits.as_raw_slice()
+    }
+
+    #[inline]
+    pub fn missing_raw(&self) -> &[u64] {
+        self.missing.as_raw_slice()
+    }
+
     /// Count of ALT alleles (for biallelic)
     pub fn alt_count(&self) -> usize {
         if self.bits_per_allele == 1 {
