@@ -2,6 +2,11 @@ import os
 import sys
 import subprocess
 import argparse
+import shutil
+
+BEAGLE_URL = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar"
+BEAGLE_JAR = "beagle.jar"
+
 
 def run_cmd(cmd, shell=False):
     print(f"Running: {cmd}")
@@ -10,14 +15,28 @@ def run_cmd(cmd, shell=False):
     else:
         subprocess.check_call(cmd)
 
+
+def ensure_beagle():
+    """Download Beagle JAR if not present."""
+    if os.path.exists(BEAGLE_JAR):
+        return BEAGLE_JAR
+    print(f"Downloading Beagle from {BEAGLE_URL}...")
+    if shutil.which("wget"):
+        subprocess.check_call(["wget", "-q", BEAGLE_URL, "-O", BEAGLE_JAR])
+    elif shutil.which("curl"):
+        subprocess.check_call(["curl", "-fsSL", BEAGLE_URL, "-o", BEAGLE_JAR])
+    else:
+        raise RuntimeError("Neither wget nor curl found")
+    return BEAGLE_JAR
+
 def run_benchmark(person, file_path, format):
     # 1. Prepare Data
     print(f"=== Preparing data for {person} ({file_path}) ===")
     run_cmd(["python3", "scripts/prepare_data.py", "reference", "ref.vcf.gz"])
-    run_cmd(["python3", "scripts/prepare_data.py", "array", file_path, "target.vcf.gz"])
-    
+    run_cmd(["python3", "scripts/prepare_data.py", "array", file_path, "target.vcf.gz", "ref.vcf.gz"])
+
     truth_dir = "data/kat_suricata" if person == "Kat" else "data/christopher_smith"
-    run_cmd(["python3", "scripts/prepare_data.py", "truth", truth_dir, "truth.vcf.gz"])
+    run_cmd(["python3", "scripts/prepare_data.py", "truth", truth_dir, "truth.vcf.gz", "ref.vcf.gz"])
 
     # 2. Run Reagle
     print("=== Running Reagle ===")
@@ -37,14 +56,13 @@ def run_benchmark(person, file_path, format):
     run_cmd("bcftools +setGT ref.vcf.gz -Ou -- -t . -n 0 | bcftools +setGT - -Ou -- -t a -n p | bcftools view -Oz -o ref_beagle.vcf.gz", shell=True)
     run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
 
-    beagle_jar = "tests/fixtures/beagle_reference/beagle.27Feb25.75f.jar"
+    beagle_jar = ensure_beagle()
     run_cmd(["java", "-Xmx6g", "-jar", beagle_jar, "ref=ref_beagle.vcf.gz", "gt=target.vcf.gz", "out=beagle_out", "chrom=chr22", "nthreads=4", "gp=true"])
     
     # 4. Run Metrics using the Python integration test
     print("=== Calculating Metrics ===")
     
     # Move outputs to expected locations for integration test
-    import shutil
     os.makedirs("tests/data", exist_ok=True)
     shutil.copy("truth.vcf.gz", "tests/data/truth.vcf.gz")
     shutil.copy("reagle_out.vcf.gz", "tests/data/reagle_imputed.vcf.gz")

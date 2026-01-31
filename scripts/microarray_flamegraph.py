@@ -11,8 +11,6 @@ In the benchmark workflow (.github/workflows/bench.yml):
 - The --keep-prob parameter controls additional subsampling (1.0 = no subsampling)
 
 For full-size datasets, use integration_test.py prepare instead of prepare-profile.
-
-Defaults to local fixtures to avoid large downloads.
 """
 
 import argparse
@@ -54,11 +52,6 @@ def find_default_inputs(repo_root: Path):
     root_target = repo_root / "target.vcf.gz"
     if root_ref.exists() and root_target.exists():
         return root_ref, root_target
-
-    fixture_ref = repo_root / "tests" / "fixtures" / "gnomad_hgdp" / "ref.vcf.gz"
-    fixture_target = repo_root / "tests" / "fixtures" / "gnomad_hgdp" / "target.vcf.gz"
-    if fixture_ref.exists() and fixture_target.exists():
-        return fixture_ref, fixture_target
 
     return None, None
 
