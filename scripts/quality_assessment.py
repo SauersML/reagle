@@ -96,7 +96,7 @@ def print_vcf_diagnostics(vcf_path, label):
     except Exception as e:
         print(f"Range: Error - {e}")
 
-def run_benchmark(person, file_path, format):
+def run_benchmark(person, file_path):
     print_tool_versions()
     # 1. Prepare Data
     print(f"=== Preparing data for {person} ({file_path}) ===")
@@ -200,7 +200,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--person", required=True)
     parser.add_argument("--file", required=True)
-    parser.add_argument("--format", required=True)
+    # NOTE: --format removed; convert_genome auto-detects input format.
     args = parser.parse_args()
     
-    run_benchmark(args.person, args.file, args.format)
+    run_benchmark(args.person, args.file)

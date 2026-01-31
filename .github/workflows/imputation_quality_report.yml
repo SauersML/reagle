@@ -70,16 +70,12 @@ jobs:
         include:
           - person: "Kat"
             file_path: "data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt"
-            format: "23andme"
           - person: "Kat"
             file_path: "data/kat_suricata/ancestrydna.txt"
-            format: "ancestry"
           - person: "Christopher"
             file_path: "data/christopher_smith/dna-data-2023-09-26.zip"
-            format: "23andme"
           - person: "Christopher"
             file_path: "data/christopher_smith/genome_Christopher_Smith_v5_Full_20230926164611.zip"
-            format: "23andme"
 
     steps:
       - uses: actions/checkout@v4
@@ -112,7 +108,7 @@ jobs:
         run: cargo build --release
 
       - name: Run Quality Assessment
-        run: python3 scripts/quality_assessment.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}" --format "${{ matrix.format }}"
+        run: python3 scripts/quality_assessment.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}"
 
       - name: Diagnostics (post-run)
         if: always()
@@ -145,7 +141,7 @@ jobs:
       - name: Upload Metrics
         uses: actions/upload-artifact@v4
         with:
-          name: metrics-${{ matrix.person }}-${{ matrix.format }}-${{ hashFiles(matrix.file_path) }}
+          name: metrics-${{ matrix.person }}-${{ hashFiles(matrix.file_path) }}
           path: |
             tests/data/reagle_metrics.json
             tests/data/beagle_metrics.json
