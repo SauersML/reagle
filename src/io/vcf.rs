@@ -1305,7 +1305,7 @@ impl VcfWriter {
     ///
     /// Eliminates O(n_markers * n_samples) flat_dosages allocation by using
     /// closures to access sample-major data directly during write.
-    pub fn write_imputed_streaming<Space, F, B, G, H>(
+    pub fn write_imputed_streaming<Space: Sync, F, B, G, H>(
         &mut self,
         markers: &Markers<Space>,
         get_dosage: F,
