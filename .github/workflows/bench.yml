@@ -287,6 +287,7 @@ jobs:
   pprof_flamegraph:
     name: Pprof Flamegraph (on 5% subset)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: prepare_data
     defaults:
       run:
@@ -331,6 +332,14 @@ jobs:
             --out-dir tests/data/pprof \
             --keep-prob 1.0
 
+      - name: Show pprof text summary
+        run: |
+          echo "== pprof text head =="
+          sed -n '1,120p' tests/data/pprof/reagle_microarray.txt
+          echo ""
+          echo "== pprof text tail =="
+          tail -n 120 tests/data/pprof/reagle_microarray.txt
+
       - name: Upload flamegraph
         uses: actions/upload-artifact@v4
         with:
@@ -342,3 +351,27 @@ jobs:
             tests/data/pprof/target_sparse.vcf.gz
             tests/data/pprof/ref.vcf.gz
           retention-days: 7
+
+  release_tests_no_run:
+    name: Cargo Test --release (no run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-test-
+
+      - name: Build tests (release, no run)
+        run: cargo test --release --no-run

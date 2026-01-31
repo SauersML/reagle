@@ -259,6 +259,16 @@ def main():
 
     print("\nDone.")
     print(f"Flamegraph: {env['REAGLE_PPROF_OUTPUT']}")
+    txt_path = args.out_dir / "reagle_microarray.txt"
+    folded_path = args.out_dir / "reagle_microarray.folded.txt"
+    if txt_path.exists():
+        print(f"Text profile: {txt_path}")
+    else:
+        print("Text profile: (missing)")
+    if folded_path.exists():
+        print(f"Folded profile: {folded_path}")
+    else:
+        print("Folded profile: (missing)")
     print(f"Sparse target: {target_sparse}")
     print(f"Reference: {ref_for_impute}")
 
