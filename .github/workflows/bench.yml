@@ -312,6 +312,8 @@ jobs:
           name: pprof-flamegraph
           path: |
             tests/data/pprof/reagle_microarray.svg
+            tests/data/pprof/reagle_microarray.txt
+            tests/data/pprof/reagle_microarray.folded.txt
             tests/data/pprof/target_sparse.vcf.gz
             tests/data/pprof/ref.vcf.gz
           retention-days: 7

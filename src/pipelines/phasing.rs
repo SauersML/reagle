@@ -420,6 +420,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
         .collect();
     let mut ref_alleles = vec![0u8; n_ref_haps];
     let mut query_alleles = vec![0u8; batch_haps.len()];
+    let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
 
@@ -501,8 +502,8 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = -(freq.max(min_freq)).ln();
-                let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
-                for d in donors {
+                pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
+                for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
                         continue;
@@ -613,8 +614,8 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = -(freq.max(min_freq)).ln();
-                let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
-                for d in donors {
+                pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
+                for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
                         continue;
@@ -2594,14 +2595,30 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .min(n_ref_haps.max(1));
 
             let mut batch_start = 0usize;
+            let mut batch_haps_buf: Vec<usize> = Vec::with_capacity(batch_size);
+            let mut window_scores_buf: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
             while batch_start < n_haps {
                 let batch_end = (batch_start + batch_size).min(n_haps);
-                let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
-                let mut window_scores: Vec<Vec<f32>> =
-                    vec![vec![f32::NEG_INFINITY; n_ref_haps]; batch_haps.len()];
+                batch_haps_buf.clear();
+                batch_haps_buf.extend(batch_start..batch_end);
+                let batch_len = batch_haps_buf.len();
+
+                if window_scores_buf.len() < batch_len {
+                    let needed = batch_len - window_scores_buf.len();
+                    window_scores_buf.extend(
+                        (0..needed).map(|_| vec![f32::NEG_INFINITY; n_ref_haps]),
+                    );
+                }
+                for row in window_scores_buf.iter_mut().take(batch_len) {
+                    if row.len() != n_ref_haps {
+                        row.resize(n_ref_haps, f32::NEG_INFINITY);
+                    } else {
+                        row.fill(f32::NEG_INFINITY);
+                    }
+                }
 
                 score_window_batch_pbwt_segment(
-                    &batch_haps,
+                    &batch_haps_buf,
                     target_geno,
                     &ref_columns,
                     alignment,
@@ -2609,7 +2626,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     (start, end),
                     k_per_hap,
                     &sampling,
-                    &mut window_scores,
+                    &mut window_scores_buf[..batch_len],
                     ref_gt.is_none(),
                     marker_map,
                     ref_index_map.as_deref(),
@@ -2619,8 +2636,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .saturating_mul(PBWT_PER_WINDOW_MULT)
                     .max(per_window_cap)
                     .min(n_ref_haps.max(1));
-                for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                    let top = select_top_k(&window_scores[i], top_m);
+                for (i, &hap_idx) in batch_haps_buf.iter().enumerate() {
+                    let top = select_top_k(&window_scores_buf[i], top_m);
                     scores_by_window_by_hap[hap_idx].push(top);
                 }
 
@@ -2634,34 +2651,51 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let per_window_caps = vec![per_window_cap; num_windows];
         let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
         let mut out: Vec<crate::model::states::ThreadedHaps> = Vec::with_capacity(n_samples);
+        let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
+        let mut touched_indices: Vec<usize> =
+            Vec::with_capacity(per_window_cap.saturating_mul(PBWT_PER_WINDOW_MULT).max(1));
 
         for s in 0..n_samples {
             let hap1 = s * 2;
             let hap2 = s * 2 + 1;
             let mut window_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_windows);
             for w in 0..num_windows {
-                let mut merged: HashMap<usize, f32> = HashMap::new();
+                for &idx in &touched_indices {
+                    dense_merge_buffer[idx] = f32::NEG_INFINITY;
+                }
+                touched_indices.clear();
+
                 for &(h, score) in scores_by_window_by_hap[hap1][w]
                     .iter()
                     .chain(scores_by_window_by_hap[hap2][w].iter())
                 {
-                    merged
-                        .entry(h)
-                        .and_modify(|v| {
-                            if score > *v {
-                                *v = score;
-                            }
-                        })
-                        .or_insert(score);
+                    if h >= dense_merge_buffer.len() {
+                        continue;
+                    }
+                    let current = &mut dense_merge_buffer[h];
+                    if current.is_finite() {
+                        if score > *current {
+                            *current = score;
+                        }
+                    } else {
+                        *current = score;
+                        touched_indices.push(h);
+                    }
                 }
-                let mut list: Vec<(usize, f32)> = merged.into_iter().collect();
-                list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                touched_indices.sort_by(|&a, &b| {
+                    dense_merge_buffer[b]
+                        .partial_cmp(&dense_merge_buffer[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let cap = per_window_cap
                     .saturating_mul(PBWT_PER_WINDOW_MULT)
                     .max(per_window_cap)
                     .min(n_ref_haps.max(1));
-                if list.len() > cap {
-                    list.truncate(cap);
+                let take = cap.min(touched_indices.len());
+                let mut list: Vec<(usize, f32)> = Vec::with_capacity(take);
+                for &h in touched_indices.iter().take(take) {
+                    list.push((h, dense_merge_buffer[h]));
                 }
                 window_scores.push(list);
             }

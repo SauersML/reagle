@@ -79,6 +79,7 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     prefix_counts: Vec<u32>,
     counts: Vec<u32>,
     offsets: Vec<u32>,
+    intervals_buf: Vec<(usize, usize)>,
 }
 
 impl<I: PbwtIndex> ReferencePbwtImpl<I> {
@@ -97,42 +98,48 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             prefix_counts: Vec::new(),
             counts: Vec::new(),
             offsets: Vec::new(),
+            intervals_buf: Vec::new(),
         }
     }
 
-    pub fn select_donors(&self, beam: &RankBeam, k: usize) -> Vec<u32> {
+    pub fn select_donors(&mut self, beam: &RankBeam, k: usize) -> Vec<u32> {
+        let mut out = Vec::with_capacity(k);
+        self.select_donors_into(beam, k, &mut out);
+        out
+    }
+
+    pub fn select_donors_into(&mut self, beam: &RankBeam, k: usize, out: &mut Vec<u32>) {
+        out.clear();
         if k == 0 {
-            return Vec::new();
+            return;
         }
         let n_ref = self.ppa.len();
         if n_ref == 0 {
-            return Vec::new();
+            return;
         }
-
-        let mut out = Vec::with_capacity(k);
 
         // Uniform spaced sampling from all intervals to ensure coverage of the
         // entire PBWT space, avoiding bias towards the center or beginning.
         // We treat the intervals as a single contiguous range and sample uniformly.
-        let intervals: Vec<(usize, usize)> = beam
-            .intervals()
-            .iter()
-            .map(|&(l, r)| {
-                let l = l.min(n_ref as u32) as usize;
-                let r = r.min(n_ref as u32) as usize;
-                (l, r)
-            })
-            .filter(|&(l, r)| l < r)
-            .collect();
-
-        if intervals.is_empty() {
-            return Vec::new();
+        self.intervals_buf.clear();
+        self.intervals_buf.reserve(beam.intervals().len());
+        for &(l, r) in beam.intervals() {
+            let l = l.min(n_ref as u32) as usize;
+            let r = r.min(n_ref as u32) as usize;
+            if l < r {
+                self.intervals_buf.push((l, r));
+            }
         }
 
-        let total_len: usize = intervals.iter().map(|&(l, r)| r - l).sum();
+        if self.intervals_buf.is_empty() {
+            return;
+        }
+
+        let total_len: usize = self.intervals_buf.iter().map(|&(l, r)| r - l).sum();
 
         if total_len <= k {
-            for &(l, r) in &intervals {
+            out.reserve(total_len);
+            for &(l, r) in &self.intervals_buf {
                 for i in l..r {
                     out.push(self.ppa[i].to_u32());
                 }
@@ -143,12 +150,13 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             let mut current_interval_idx = 0;
             let mut current_interval_start_offset = 0;
 
+            out.reserve(k);
             for i in 0..k {
                 let target = (2 * i + 1) * total_len / (2 * k);
 
                 // Advance to interval containing target
-                while current_interval_idx < intervals.len() {
-                    let (l, r) = intervals[current_interval_idx];
+                while current_interval_idx < self.intervals_buf.len() {
+                    let (l, r) = self.intervals_buf[current_interval_idx];
                     let len = r - l;
                     if target < current_interval_start_offset + len {
                         let offset_in_interval = target - current_interval_start_offset;
@@ -160,8 +168,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
             }
         }
-
-        out
     }
 
     fn bin_for_allele(a: u8, n_alleles: usize) -> usize {
@@ -487,10 +493,17 @@ impl ReferencePbwt {
         }
     }
 
-    pub fn select_donors(&self, beam: &RankBeam, k: usize) -> Vec<u32> {
+    pub fn select_donors(&mut self, beam: &RankBeam, k: usize) -> Vec<u32> {
         match self {
             Self::U16(inner) => inner.select_donors(beam, k),
             Self::U32(inner) => inner.select_donors(beam, k),
+        }
+    }
+
+    pub fn select_donors_into(&mut self, beam: &RankBeam, k: usize, out: &mut Vec<u32>) {
+        match self {
+            Self::U16(inner) => inner.select_donors_into(beam, k, out),
+            Self::U32(inner) => inner.select_donors_into(beam, k, out),
         }
     }
 

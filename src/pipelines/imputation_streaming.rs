@@ -654,6 +654,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         .collect();
     let mut ref_alleles = vec![0u8; n_ref_haps];
     let mut query_alleles = vec![0u8; batch_haps.len()];
+    let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
 
@@ -699,8 +700,8 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = -(freq.max(min_freq)).ln();
-                let donors = pbwt_fwd.select_donors(&beams_fwd[i], k_per_hap);
-                for d in donors {
+                pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
+                for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx < n_ref_haps {
                         let ref_a = ref_alleles[idx];
@@ -772,8 +773,8 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = -(freq.max(min_freq)).ln();
-                let donors = pbwt_bwd.select_donors(&beams_bwd[i], k_per_hap);
-                for d in donors {
+                pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
+                for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx < n_ref_haps {
                         let ref_a = ref_alleles[idx];
