@@ -873,6 +873,24 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             for site in list(imputed_sites_sample)[:3]:
                 print(f"    {site}")
 
+        # Full overlap across all sites (exact CHROM/POS/REF/ALT)
+        def _site_set_all(vcf_path):
+            sites = set()
+            cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\n' {vcf_path}"
+            for line in _stream_vcf_lines(cmd):
+                parts = line.split('\t')
+                if len(parts) >= 4:
+                    chrom, pos, ref, alt = parts[0], int(parts[1]), parts[2], parts[3]
+                    sites.add((chrom, pos, ref, alt))
+            return sites
+
+        truth_all = _site_set_all(truth_vcf)
+        imputed_all = _site_set_all(imputed_vcf)
+        overlap_all = truth_all & imputed_all
+        print(f"  Full overlap (exact CHROM/POS/REF/ALT): Truth={len(truth_all)}, Imputed={len(imputed_all)}, Overlap={len(overlap_all)}")
+        if not overlap_all:
+            print("  ⚠️  NO OVERLAP across all sites (exact match)")
+
         # Coordinate-only overlap (ignores REF/ALT) for multiple pairs
         def _pos_set(vcf_path, limit):
             cmd = f"bcftools query -f '%CHROM\\t%POS\\n' {vcf_path} | head -{limit}"
