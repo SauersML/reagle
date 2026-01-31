@@ -400,10 +400,10 @@ mod tests {
     fn create_test_map_file() -> tempfile::NamedTempFile {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-        // PLINK format: chrom rsid cM bp
-        writeln!(file, "chr1 rs1 0.0 1000000").unwrap();
-        writeln!(file, "chr1 rs2 1.0 2000000").unwrap();
-        writeln!(file, "chr1 rs3 2.5 3000000").unwrap();
+        // PLINK format: chrom position_bp rate_cM_per_Mb position_cM
+        writeln!(file, "chr1 1000000 1.0 0.0").unwrap();
+        writeln!(file, "chr1 2000000 1.0 1.0").unwrap();
+        writeln!(file, "chr1 3000000 1.5 2.5").unwrap();
         file.flush().unwrap();
         file
     }
