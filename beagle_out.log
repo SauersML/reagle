@@ -1,0 +1,55 @@
+beagle.27Feb25.75f.jar (version 5.5)
+Copyright (C) 2014-2024 Brian L. Browning
+Enter "java -jar beagle.27Feb25.75f.jar" to list command line argument
+Start time: 04:34 PM CST on 31 Jan 2026
+
+Command line: java -Xmx6144m -jar beagle.27Feb25.75f.jar
+  ref=ref_beagle.vcf.gz
+  gt=target.vcf.gz
+  out=beagle_out
+  chrom=chr22
+  nthreads=4
+  gp=true
+
+No genetic map is specified: using 1 cM = 1 Mb
+
+Reference samples:                4,091
+Study     samples:                    1
+
+Window 1 [chr22:15382411-50776368]
+Reference markers:                6,857
+Study     markers:                5,930
+
+Burnin  iteration 1:           0 seconds
+Burnin  iteration 2:           0 seconds
+Burnin  iteration 3:           0 seconds
+
+Estimated ne:                  97619
+Estimated err:                 2.1e-02
+
+Phasing iteration 1:           0 seconds
+Phasing iteration 2:           0 seconds
+Phasing iteration 3:           0 seconds
+Phasing iteration 4:           0 seconds
+Phasing iteration 5:           0 seconds
+Phasing iteration 6:           0 seconds
+Phasing iteration 7:           0 seconds
+Phasing iteration 8:           0 seconds
+Phasing iteration 9:           0 seconds
+Phasing iteration 10:          0 seconds
+Phasing iteration 11:          0 seconds
+Phasing iteration 12:          0 seconds
+
+Imputation time:               0 seconds
+
+Cumulative Statistics:
+
+Reference markers:                6,857
+Study     markers:                5,930
+
+Haplotype phasing time:        2 seconds
+Imputation time:               0 seconds
+Total time:                    3 seconds
+
+End time: 04:34 PM CST on 31 Jan 2026
+beagle.27Feb25.75f.jar finished

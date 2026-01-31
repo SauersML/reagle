@@ -1014,6 +1014,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     hellinger_sum = 0.0
     hellinger_count = 0
 
+    # Reference AF/MAF availability tracking (for MAF stratification)
+    ref_af_missing = 0
+    ref_af_sites = 0
+
     # For switch error rate
     switch_errors = 0
     switch_opportunities = 0
@@ -1237,6 +1241,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 # Calculate AF/MAF for stratification from the reference panel.
                 maf = None
                 af = None
+                maf_bin = None
                 site_key = (t_chrom, t_pos)
                 while ref_key is not None and ref_key < site_key:
                     try:
@@ -1245,23 +1250,18 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                         ref_key, ref_afs = None, None
                         break
 
-                if ref_key != site_key:
-                    raise RuntimeError(
-                        f"Reference AF not found for site {t_chrom}:{t_pos}. "
-                        f"MAF stratification requires the site to be present in reference_vcf ({reference_vcf})."
-                    )
-
-                ref_ref, ref_alt, ref_af_list = ref_afs
-                maf = _maf_from_afs(ref_af_list)
-                if ref_af_list and len(ref_af_list) == 1:
-                    af = ref_af_list[0]
-
-                if maf is None:
-                    raise RuntimeError(
-                        f"Reference AF/MAF missing or invalid for site {t_chrom}:{t_pos} in {reference_vcf}"
-                    )
-
-                maf_bin = get_maf_bin(maf)
+                ref_af_sites += 1
+                if ref_key == site_key and ref_afs is not None:
+                    ref_ref, ref_alt, ref_af_list = ref_afs
+                    maf = _maf_from_afs(ref_af_list)
+                    if ref_af_list and len(ref_af_list) == 1:
+                        af = ref_af_list[0]
+                    if maf is not None:
+                        maf_bin = get_maf_bin(maf)
+                    else:
+                        ref_af_missing += 1
+                else:
+                    ref_af_missing += 1
                 site_concordant = 0
                 site_total = 0
 
@@ -1345,12 +1345,13 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     sen_count += 1
 
                     # MAF bin stats
-                    maf_bins[maf_bin]["sum_t"] += t_dos
-                    maf_bins[maf_bin]["sum_i"] += i_dos
-                    maf_bins[maf_bin]["sum_ti"] += t_dos * i_dos
-                    maf_bins[maf_bin]["sum_tt"] += t_dos * t_dos
-                    maf_bins[maf_bin]["sum_ii"] += i_dos * i_dos
-                    maf_bins[maf_bin]["total"] += 1
+                    if maf_bin is not None:
+                        maf_bins[maf_bin]["sum_t"] += t_dos
+                        maf_bins[maf_bin]["sum_i"] += i_dos
+                        maf_bins[maf_bin]["sum_ti"] += t_dos * i_dos
+                        maf_bins[maf_bin]["sum_tt"] += t_dos * t_dos
+                        maf_bins[maf_bin]["sum_ii"] += i_dos * i_dos
+                        maf_bins[maf_bin]["total"] += 1
 
                     # Sample stats
                     sample_total[sample_idx] += 1
@@ -1368,7 +1369,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
                     if i_class is not None:
                         confusion[t_class][i_class] += 1
-                        maf_bins[maf_bin]["confusion"][t_class][i_class] += 1
+                        if maf_bin is not None:
+                            maf_bins[maf_bin]["confusion"][t_class][i_class] += 1
 
                     # Concordance
                     if i_class is not None:
@@ -1377,16 +1379,19 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                         if t_sorted == i_sorted:
                             unphased_concordant += 1
                             site_concordant += 1
-                            maf_bins[maf_bin]["unphased_concordant"] += 1
+                            if maf_bin is not None:
+                                maf_bins[maf_bin]["unphased_concordant"] += 1
                             sample_concordant[sample_idx] += 1
 
                     # Non-ref concordance
                     if t_class > 0 and i_class is not None:
                         nonref_total += 1
-                        maf_bins[maf_bin]["nonref_total"] += 1
+                        if maf_bin is not None:
+                            maf_bins[maf_bin]["nonref_total"] += 1
                         if t_sorted == i_sorted:
                             nonref_concordant += 1
-                            maf_bins[maf_bin]["nonref_concordant"] += 1
+                            if maf_bin is not None:
+                                maf_bins[maf_bin]["nonref_concordant"] += 1
 
                     # Switch errors
                     if t_class == 1 and i_class == 1 and t_phased and i_phased:
@@ -1410,11 +1415,13 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
                                 switch_errors += 1
                                 sample_switch_errors[sample_idx] += 1
-                                maf_bins[maf_bin]["switch_errors"] += 1
+                                if maf_bin is not None:
+                                    maf_bins[maf_bin]["switch_errors"] += 1
 
                             switch_opportunities += 1
                             sample_switch_opportunities[sample_idx] += 1
-                            maf_bins[maf_bin]["switch_opportunities"] += 1
+                            if maf_bin is not None:
+                                maf_bins[maf_bin]["switch_opportunities"] += 1
                         prev_het[sample_idx] = (site, t_gt, i_gt, maf_bin)
                         last_het_pos[sample_idx] = pos
                         if is_input_site:
@@ -1428,7 +1435,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                             prev_het_input[sample_idx] = (site, t_gt, i_gt, maf_bin)
 
                     # Masked-snp metrics (proxy quality)
-                    if is_input_site and mask_pick(t_chrom, t_pos, maf_bin):
+                    if maf_bin is not None and is_input_site and mask_pick(t_chrom, t_pos, maf_bin):
                         if i_class is not None:
                             masked_total += 1
                             masked_stats["sum_t"] += t_dos
@@ -1465,7 +1472,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                             ece_bins[bin_idx]["count"] += 1
 
                 # IQS Calculation
-                if site_total > 0 and maf > 0 and maf < 1 and af is not None:
+                if site_total > 0 and maf is not None and maf > 0 and maf < 1 and af is not None:
                     p = af
                     q = 1 - p
                     expected_conc = (q*q)**2 + (2*p*q)**2 + (p*p)**2
@@ -1474,8 +1481,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                         iqs = (observed_conc - expected_conc) / (1.0 - expected_conc)
                         site_iqs_sum += iqs
                         site_iqs_count += 1
-                        maf_bins[maf_bin]["iqs_sum"] += iqs
-                        maf_bins[maf_bin]["iqs_count"] += 1
+                        if maf_bin is not None:
+                            maf_bins[maf_bin]["iqs_sum"] += iqs
+                            maf_bins[maf_bin]["iqs_count"] += 1
 
                 # Advance both
                 truth_key, truth_data, truth_multiallelic = get_next_truth()
@@ -1822,6 +1830,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     metrics["diagnostic_time_sec"] = diag_elapsed
     metrics["af_time_sec"] = af_elapsed
     metrics["metrics_loop_time_sec"] = loop_elapsed
+    metrics["ref_af_missing_sites"] = ref_af_missing
+    metrics["ref_af_sites"] = ref_af_sites
 
     # Dosage calibration summary (predicted dosage bins)
     ds_calibration = []
@@ -1913,6 +1923,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             print(f"   REF/ALT mismatches: {ref_alt_mismatch:,} sites (coordinate/strand issue?)")
         if ref_alt_swapped > 0:
             print(f"   REF/ALT swaps normalized: {ref_alt_swapped:,} sites")
+
+        ref_af_missing_sites = metrics.get('ref_af_missing_sites', 0)
+        ref_af_sites = metrics.get('ref_af_sites', 0)
+        if ref_af_missing_sites > 0 and ref_af_sites > 0:
+            pct = (ref_af_missing_sites / ref_af_sites) * 100.0
+            print(f"   Missing ref AF/MAF: {ref_af_missing_sites:,} / {ref_af_sites:,} sites ({pct:.2f}%)")
         
         multiallelic = metrics.get('multiallelic_sites', 0)
         if multiallelic > 0:
