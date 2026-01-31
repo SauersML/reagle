@@ -150,6 +150,35 @@ def _update_panel_if_present(output_dir, panel_path):
     subprocess.check_call(["bcftools", "index", "-f", panel_path])
     return True
 
+def _get_vcf_chrom_name(vcf_path):
+    """Returns the first chromosome name from a VCF/BCF file."""
+    try:
+        # Check first record's chromosome
+        result = subprocess.run(
+            ["bcftools", "query", "-f", "%CHROM\\n", vcf_path],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().split('\n')[0]
+
+        # Fallback: check header (contig lines) if empty or query failed
+        result = subprocess.run(
+            ["bcftools", "view", "-h", vcf_path],
+            capture_output=True, text=True
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("##contig=<ID="):
+                # Parse ID from ##contig=<ID=chr22,length=...>
+                start = line.find("ID=") + 3
+                end = line.find(",", start)
+                if end == -1: end = line.find(">", start)
+                if start > 2 and end > start:
+                    return line[start:end]
+        return None
+    except Exception as e:
+        print(f"Warning: Failed to detect chromosome name from {vcf_path}: {e}")
+        return None
+
 def _clear_convert_genome_cache():
     """Removes any existing convert_genome binary and caches to force a fresh install."""
     # Remove known binary locations if present.
@@ -357,12 +386,18 @@ def prepare_truth(source, output_vcf):
     subprocess.check_call(["bcftools", "index", "-f", truth_hg38_vcf])
     _update_panel_if_present(truth_output_dir, panel_path)
 
-    # Rename chroms (22 -> chr22) to match reference panel which uses chr22 notation
-    with open("chr_map.txt", "w") as f:
-        f.write("22\tchr22\n")
+    # Detect reference panel chromosome style
+    ref_chrom = _get_vcf_chrom_name(panel_path) or "chr22"
+    print(f"Detected reference panel chromosome: {ref_chrom}")
 
-    print("Filtering Truth to Chr22...")
-    # Filter FIRST using index (regions 22 or chr22), then rename to chr22
+    # Rename chroms to match reference panel
+    # We map BOTH '22' and 'chr22' to the target style to be safe
+    with open("chr_map.txt", "w") as f:
+        f.write(f"22\t{ref_chrom}\n")
+        f.write(f"chr22\t{ref_chrom}\n")
+
+    print(f"Filtering Truth to {ref_chrom}...")
+    # Filter FIRST using index (regions 22 or chr22), then rename to match ref
     cmd = (
         f"bcftools view {truth_hg38_vcf} --regions 22,chr22 -Ou | "
         f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
@@ -416,10 +451,15 @@ def run_conversion(input_path, output_vcf):
     print("Finalizing GRCh38 output...")
     print("Filtering invalid records (missing ALT but non-ref GT) and normalizing chromosomes...")
 
-    # Ensure chr22 naming convention for Beagle compatibility
+    # Detect reference panel chromosome style
+    ref_chrom = _get_vcf_chrom_name(panel_path) or "chr22"
+    print(f"Detected reference panel chromosome: {ref_chrom}")
+
+    # Ensure chromosome naming convention matches reference for Beagle compatibility
     chr_map_path = "chr_map.txt"
     with open(chr_map_path, "w") as f:
-        f.write("22\tchr22\n")
+        f.write(f"22\t{ref_chrom}\n")
+        f.write(f"chr22\t{ref_chrom}\n")
 
     filter_cmd = (
         f"bcftools view {temp_hg38_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Ou | "
