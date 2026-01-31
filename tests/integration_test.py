@@ -578,16 +578,17 @@ def _parse_truth_line(line, sample_indices):
 
 
 def _parse_imputed_line(line, sample_indices):
-    """Parse an imputed VCF line into (key, sample_data_list, is_multiallelic)."""
+    """Parse an imputed VCF line into (key, sample_data_list, is_multiallelic, missing_required)."""
     parts = line.split('\t')
     if len(parts) < 5:
-        return None, None, False
+        return None, None, False, False
     chrom, pos = parts[0], int(parts[1])
     ref, alt = parts[2], parts[3]
     key = (chrom, pos, ref, alt)
     is_multiallelic = ',' in alt
     sample_data_list = parts[4:]
     sample_data = []
+    missing_required = False
     for idx in sample_indices:
         if idx < len(sample_data_list):
             data_str = sample_data_list[idx]
@@ -613,14 +614,13 @@ def _parse_imputed_line(line, sample_indices):
                 except:
                     pass
 
-            # Fallback to hard-call nonref dosage if DS missing
-            if ds is None and gt is not None:
-                ds = _gt_nonref_dosage(gt)
+            if ds is None or gp is None:
+                missing_required = True
 
             sample_data.append((gt, ds, is_phased, gp))
         else:
             sample_data.append((None, None, False, None))
-    return key, sample_data, is_multiallelic
+    return key, sample_data, is_multiallelic, missing_required
 
 
 def load_input_sites(input_vcf):
@@ -1091,6 +1091,23 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
     # === STREAMING SETUP ===
     print("Initializing streams...")
+
+    def _vcf_site_count(path):
+        try:
+            res = subprocess.run(
+                f"bcftools index -n {path}",
+                shell=True, capture_output=True, text=True
+            )
+            if res.returncode == 0:
+                return int(res.stdout.strip())
+        except Exception:
+            pass
+        return None
+
+    total_truth_sites = _vcf_site_count(truth_vcf)
+    total_imputed_sites = _vcf_site_count(imputed_vcf)
+    truth_only_sites = 0
+    imputed_only_sites = 0
     
     # 1. Truth Stream
     truth_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {truth_vcf}"
@@ -1100,8 +1117,6 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     # Check VCF header for DS/GP fields before querying
     # This handles both Beagle (with gp=true) and Reagle (which may not have DS/GP)
     imputed_cmd_full = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf}"
-    imputed_cmd_ds = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS]\\n' {imputed_vcf}"
-    imputed_cmd_gt = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
     
     # Check if DS and GP fields exist in VCF header
     has_ds = False
@@ -1122,12 +1137,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     if has_ds and has_gp:
         imputed_cmd = imputed_cmd_full
         print(f"Using GT:DS:GP format for {imputed_vcf}")
-    elif has_ds:
-        imputed_cmd = imputed_cmd_ds
-        print(f"Using GT:DS format for {imputed_vcf}")
     else:
-        imputed_cmd = imputed_cmd_gt
-        print(f"Using GT-only format for {imputed_vcf} (DS/GP not in header)")
+        raise RuntimeError("Imputed VCF must include GT:DS:GP in header (no fallbacks).")
     
     imputed_iter = _stream_vcf_lines(imputed_cmd)
 
@@ -1144,16 +1155,17 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             line = next(imputed_iter)
             return _parse_imputed_line(line, imputed_indices)
         except StopIteration:
-            return None, None, False
+            return None, None, False, False
 
     # Initial fetch
     truth_key, truth_data, truth_multiallelic = get_next_truth()
-    imp_key, imp_data, imp_multiallelic = get_next_imputed()
+    imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
 
     # Track previous het for switch error calculation per sample
     prev_het = [None] * n_common  # (site, truth_gt, imputed_gt, maf_bin) per sample
     prev_het_input = [None] * n_common
     common_sites_count = 0
+    skipped_missing_required = 0
     last_pos = 0
 
     print("Streaming and comparing...")
@@ -1186,6 +1198,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         if t_chrom == i_chrom:
             if t_pos == i_pos:
                 # MATCH! Process site
+                if imp_missing_required:
+                    skipped_missing_required += 1
+                    truth_key, truth_data, truth_multiallelic = get_next_truth()
+                    imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
+                    continue
                 site = truth_key
                 last_pos = site[1]
                 truth_site = truth_data
@@ -1219,7 +1236,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                                         f"[MULTIALLELIC MISMATCH] {t_chrom}:{t_pos} truth {t_ref}>{t_alt} imputed {i_ref}>{i_alt}"
                                     )
                                 truth_key, truth_data, truth_multiallelic = get_next_truth()
-                                imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                                imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
                                 continue
                         else:
                             ref_alt_mismatch += 1
@@ -1229,7 +1246,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                                     f"[ALLELE MISMATCH] {t_chrom}:{t_pos} truth {t_ref}>{t_alt} imputed {i_ref}>{i_alt}"
                                 )
                             truth_key, truth_data, truth_multiallelic = get_next_truth()
-                            imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                            imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
                             continue
                 if truth_multiallelic or imp_multiallelic:
                     multiallelic_sites += 1
@@ -1487,21 +1504,32 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
                 # Advance both
                 truth_key, truth_data, truth_multiallelic = get_next_truth()
-                imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
             
             elif t_pos < i_pos:
                 # Truth is behind, means site missing in imputation (or extra site in Truth)
+                truth_only_sites += 1
                 truth_key, truth_data, truth_multiallelic = get_next_truth()
             else:
                 # Imputed is behind, means extra site in Imputation
-                imp_key, imp_data, imp_multiallelic = get_next_imputed()
+                if imp_missing_required:
+                    skipped_missing_required += 1
+                else:
+                    imputed_only_sites += 1
+                imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
         
         elif t_chrom < i_chrom:
+             truth_only_sites += 1
              truth_key, truth_data, truth_multiallelic = get_next_truth()
         else:
-             imp_key, imp_data, imp_multiallelic = get_next_imputed()
+             if imp_missing_required:
+                 skipped_missing_required += 1
+             else:
+                 imputed_only_sites += 1
+             imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
 
     print(f"Common sites: {common_sites_count}")
+    print(f"Skipped sites (missing DS/GP): {skipped_missing_required}")
     loop_elapsed = time.time() - loop_start
 
     # Close final phase blocks
@@ -1830,6 +1858,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     metrics["diagnostic_time_sec"] = diag_elapsed
     metrics["af_time_sec"] = af_elapsed
     metrics["metrics_loop_time_sec"] = loop_elapsed
+    metrics["sites_truth_total"] = total_truth_sites
+    metrics["sites_imputed_total"] = total_imputed_sites
+    metrics["sites_truth_only"] = truth_only_sites
+    metrics["sites_imputed_only"] = imputed_only_sites
+    metrics["sites_common"] = common_sites_count
+    metrics["sites_skipped_missing_required"] = skipped_missing_required
     metrics["ref_af_missing_sites"] = ref_af_missing
     metrics["ref_af_sites"] = ref_af_sites
 
@@ -1916,6 +1950,20 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         missing_imputed = metrics.get('missing_imputed', 0)
         if missing_truth > 0 or missing_imputed > 0:
             print(f"   Missing genotypes: Truth={missing_truth:,}, Imputed={missing_imputed:,}")
+
+        total_truth_sites = metrics.get('sites_truth_total')
+        total_imputed_sites = metrics.get('sites_imputed_total')
+        common_sites = metrics.get('sites_common', 0)
+        if total_truth_sites:
+            pct = (common_sites / total_truth_sites) * 100.0
+            print(f"   Site overlap: {common_sites:,}/{total_truth_sites:,} truth sites ({pct:.2f}%)")
+        if total_imputed_sites:
+            pct = (common_sites / total_imputed_sites) * 100.0
+            print(f"   Site overlap: {common_sites:,}/{total_imputed_sites:,} imputed sites ({pct:.2f}%)")
+        
+        skipped_missing_required = metrics.get('sites_skipped_missing_required', 0)
+        if skipped_missing_required > 0:
+            print(f"   Skipped sites (missing DS/GP): {skipped_missing_required:,}")
         
         ref_alt_mismatch = metrics.get('ref_alt_mismatch', 0)
         ref_alt_swapped = metrics.get('ref_alt_swapped', 0)
