@@ -2231,6 +2231,11 @@ impl crate::pipelines::ImputationPipeline {
             (per_thread as f64 * STATE_BUDGET_SAFETY) as u64
         };
         let prescan_force_full_panel = avail_bytes < MIN_AVAIL_BYTES_FOR_PLANNING;
+        if let Some(bb) = &self.telemetry {
+            bb.set_stage(crate::utils::telemetry::Stage::ImputationPrescan);
+            bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPrescan);
+            bb.set_op("Imputation prescan: reference prep");
+        }
         let ref_data = prepare_reference_data(
             &ref_path,
             &streaming_config,
@@ -2252,6 +2257,11 @@ impl crate::pipelines::ImputationPipeline {
             }
         }
 
+        if let Some(bb) = &self.telemetry {
+            bb.set_stage(crate::utils::telemetry::Stage::ImputationPlanning);
+            bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPlanning);
+            bb.set_op("Imputation planning: window caps");
+        }
         let plan = build_imputation_plan(
             &phased_target_path,
             &streaming_config,

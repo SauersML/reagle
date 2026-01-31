@@ -1479,6 +1479,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         };
 
         // Build IBS2 segments for phase consistency (uses PositionMap fallback if no --map)
+        if let Some(bb) = &self.telemetry {
+            bb.set_stage(Stage::PhasingPrescan);
+            bb.set_producer_stage(Stage::PhasingPrescan);
+            bb.set_op("Phasing prescan: IBS2 segments");
+        }
         eprintln!("Building IBS2 segments...");
         let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
         let n_with_ibs2 = (0..n_samples)
@@ -2476,6 +2481,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         step_cm: f32,
         marker_map: Option<&[usize]>,
     ) -> Result<Vec<crate::model::states::ThreadedHaps>> {
+        let telemetry_snapshot = self.telemetry.as_ref().map(|bb| bb.snapshot());
         let n_haps = target_geno.n_haps();
         let n_ref_haps = ref_gt.map(|r| r.n_haplotypes()).unwrap_or(n_haps).max(1);
         let per_window_cap = self.config.phase_states.min(n_ref_haps).max(1);
@@ -2554,11 +2560,31 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         );
         let avail = available_memory_bytes().unwrap_or(0);
         let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_haps).max(1);
+        let batches_per_window = (n_haps + batch_size - 1) / batch_size;
+        let total_batches = num_windows.saturating_mul(batches_per_window).max(1);
+
+        if let Some(bb) = &self.telemetry {
+            bb.set_stage(Stage::PhasingPrescan);
+            bb.set_producer_stage(Stage::PhasingPrescan);
+            bb.set_op("Phasing prescan: PBWT scoring");
+            bb.set_total_windows(num_windows as u64);
+            bb.set_current_window(0);
+            bb.set_total_markers(total_batches as u64);
+            bb.set_markers_processed(0);
+        }
 
         let mut scores_by_window_by_hap: Vec<Vec<Vec<(usize, f32)>>> =
             vec![Vec::with_capacity(num_windows); n_haps];
 
-        for &(start, end) in &window_blocks {
+        for (window_idx, &(start, end)) in window_blocks.iter().enumerate() {
+            if let Some(bb) = &self.telemetry {
+                bb.set_current_window((window_idx + 1) as u64);
+                bb.set_op(&format!(
+                    "Phasing prescan: PBWT scoring (window {}/{})",
+                    window_idx + 1,
+                    num_windows
+                ));
+            }
             let sampling = build_sampling_points(&gen_positions[start..end], step_cm);
             let k_per_hap = per_window_cap
                 .saturating_mul(PBWT_PER_WINDOW_MULT)
@@ -2599,6 +2625,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
 
                 batch_start = batch_end;
+                if let Some(bb) = &self.telemetry {
+                    bb.add_markers(1);
+                }
             }
         }
 
@@ -2678,6 +2707,25 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 th.push_new(GlobalId::new(h as u32));
             }
             out.push(th);
+        }
+
+        if let Some(bb) = &self.telemetry {
+            if let Some(prev) = telemetry_snapshot {
+                bb.set_stage(prev.stage);
+                bb.set_producer_stage(prev.producer_stage);
+                bb.set_consumer_stage(prev.consumer_stage);
+                bb.set_current_window(prev.current_window);
+                bb.set_total_windows(prev.total_windows);
+                bb.set_current_iteration(prev.current_iteration);
+                bb.set_total_iterations(prev.total_iterations);
+                bb.set_samples_processed(prev.samples_processed);
+                bb.set_total_samples(prev.total_samples);
+                bb.set_markers_processed(prev.markers_processed);
+                bb.set_total_markers(prev.total_markers);
+                bb.set_op(&prev.current_op);
+                bb.set_producer_op(&prev.producer_op);
+                bb.set_consumer_op(&prev.consumer_op);
+            }
         }
 
         Ok(out)

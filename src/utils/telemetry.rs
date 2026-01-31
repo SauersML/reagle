@@ -25,6 +25,9 @@ pub enum Stage {
     Imputation = 5,
     WritingOutput = 6,
     Complete = 7,
+    PhasingPrescan = 8,
+    ImputationPrescan = 9,
+    ImputationPlanning = 10,
 }
 
 impl Stage {
@@ -32,9 +35,12 @@ impl Stage {
         match self {
             Stage::Initializing => "Initializing",
             Stage::LoadingData => "Loading Data",
+            Stage::PhasingPrescan => "Phasing Prescan",
             Stage::PhasingBurnin => "Phasing (burn-in)",
             Stage::PhasingMain => "Phasing (main)",
             Stage::PhasingStage2 => "Phasing Stage 2",
+            Stage::ImputationPrescan => "Imputation Prescan",
+            Stage::ImputationPlanning => "Imputation Planning",
             Stage::Imputation => "Imputation",
             Stage::WritingOutput => "Writing Output",
             Stage::Complete => "Complete",
@@ -50,6 +56,10 @@ impl Stage {
             4 => Stage::PhasingStage2,
             5 => Stage::Imputation,
             6 => Stage::WritingOutput,
+            7 => Stage::Complete,
+            8 => Stage::PhasingPrescan,
+            9 => Stage::ImputationPrescan,
+            10 => Stage::ImputationPlanning,
             _ => Stage::Complete,
         }
     }
@@ -233,7 +243,7 @@ impl TelemetryBlackboard {
 
     // === Snapshot for Heartbeat ===
 
-    fn snapshot(&self) -> TelemetrySnapshot {
+    pub(crate) fn snapshot(&self) -> TelemetrySnapshot {
         TelemetrySnapshot {
             stage: self.stage(),
             producer_stage: Stage::from_u64(self.producer_stage.load(Ordering::Relaxed)),
@@ -306,26 +316,26 @@ impl Default for TelemetryBlackboard {
 }
 
 /// Snapshot of telemetry state at a point in time
-struct TelemetrySnapshot {
-    stage: Stage,
-    producer_stage: Stage,
-    consumer_stage: Stage,
-    current_window: u64,
-    total_windows: u64,
-    current_iteration: u64,
-    total_iterations: u64,
-    samples_processed: u64,
-    total_samples: u64,
-    markers_processed: u64,
-    total_markers: u64,
-    elapsed_secs: f64,
-    last_progress_nanos: u64,
-    current_nanos: u64,
-    current_op: String,
-    producer_op: String,
-    consumer_op: String,
-    channel_depth: u64,
-    channel_capacity: u64,
+pub(crate) struct TelemetrySnapshot {
+    pub(crate) stage: Stage,
+    pub(crate) producer_stage: Stage,
+    pub(crate) consumer_stage: Stage,
+    pub(crate) current_window: u64,
+    pub(crate) total_windows: u64,
+    pub(crate) current_iteration: u64,
+    pub(crate) total_iterations: u64,
+    pub(crate) samples_processed: u64,
+    pub(crate) total_samples: u64,
+    pub(crate) markers_processed: u64,
+    pub(crate) total_markers: u64,
+    pub(crate) elapsed_secs: f64,
+    pub(crate) last_progress_nanos: u64,
+    pub(crate) current_nanos: u64,
+    pub(crate) current_op: String,
+    pub(crate) producer_op: String,
+    pub(crate) consumer_op: String,
+    pub(crate) channel_depth: u64,
+    pub(crate) channel_capacity: u64,
 }
 
 /// Heartbeat output configuration
@@ -472,6 +482,7 @@ enum ProgressMetric {
     Samples,
     Markers,
     Windows,
+    Batches,
     None,
 }
 
@@ -483,7 +494,14 @@ struct ProgressSnapshot {
 }
 
 fn select_progress_metric(snap: &TelemetrySnapshot) -> ProgressSnapshot {
-    if matches!(
+    if snap.stage == Stage::PhasingPrescan && snap.total_markers > 0 {
+        ProgressSnapshot {
+            metric: ProgressMetric::Batches,
+            done: snap.markers_processed,
+            total: snap.total_markers,
+            unit: "batch",
+        }
+    } else if matches!(
         snap.stage,
         Stage::PhasingBurnin | Stage::PhasingMain | Stage::PhasingStage2
     ) && snap.total_samples > 0
@@ -697,6 +715,8 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
             }
             print_log_progress(
                 &snap,
+                progress.done,
+                progress.total,
                 progress.unit,
                 &eta_str,
                 rss_mb,
@@ -830,6 +850,8 @@ fn print_tty_progress(
 /// Print progress for non-TTY (structured log line)
 fn print_log_progress(
     snap: &TelemetrySnapshot,
+    progress_done: u64,
+    progress_total: u64,
     velocity_unit: &str,
     eta: &str,
     rss_mb: Option<u64>,
@@ -840,6 +862,11 @@ fn print_log_progress(
     is_stalled: bool,
     show_extra: bool,
 ) {
+    let progress_pct = if progress_total > 0 {
+        (progress_done as f64 / progress_total as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
     let iter_str = if snap.total_iterations > 0 {
         format!(" iter={}/{}", snap.current_iteration, snap.total_iterations)
     } else {
@@ -860,7 +887,8 @@ fn print_log_progress(
         };
         eprintln!(
             "[HEARTBEAT] stage=\"{}\" window={}/{}{} samples={}/{} markers={}/{} \
-             velocity={:.0}/s velocity_unit={} elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} \
+             progress={}/{} progress_unit={} progress_pct={:.1} velocity={:.0}/s velocity_unit={} \
+             elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} \
              cpu_pct={} op=\"{}\" producer_stage=\"{}\" consumer_stage=\"{}\" producer_op=\"{}\" \
              consumer_op=\"{}\" channel={}/{} stalled={}",
             snap.stage.as_str(),
@@ -871,6 +899,10 @@ fn print_log_progress(
             snap.total_samples,
             snap.markers_processed,
             snap.total_markers,
+            progress_done,
+            progress_total,
+            velocity_unit,
+            progress_pct,
             velocity,
             velocity_unit,
             snap.elapsed_secs,
@@ -911,7 +943,8 @@ fn print_log_progress(
         };
         eprintln!(
             "[HEARTBEAT] stage=\"{}\" window={}/{}{} samples={}/{} markers={}/{} \
-             velocity={:.0}/s velocity_unit={} elapsed={:.0}s eta={} rss_mb={} \
+             progress={}/{} progress_unit={} progress_pct={:.1} velocity={:.0}/s velocity_unit={} \
+             elapsed={:.0}s eta={} rss_mb={} \
              producer_stage=\"{}\" consumer_stage=\"{}\" producer_op=\"{}\" consumer_op=\"{}\" \
              stalled={}",
             snap.stage.as_str(),
@@ -922,6 +955,10 @@ fn print_log_progress(
             snap.total_samples,
             snap.markers_processed,
             snap.total_markers,
+            progress_done,
+            progress_total,
+            velocity_unit,
+            progress_pct,
             velocity,
             velocity_unit,
             snap.elapsed_secs,
@@ -947,9 +984,12 @@ mod tests {
         for stage in [
             Stage::Initializing,
             Stage::LoadingData,
+            Stage::PhasingPrescan,
             Stage::PhasingBurnin,
             Stage::PhasingMain,
             Stage::PhasingStage2,
+            Stage::ImputationPrescan,
+            Stage::ImputationPlanning,
             Stage::Imputation,
             Stage::WritingOutput,
             Stage::Complete,
