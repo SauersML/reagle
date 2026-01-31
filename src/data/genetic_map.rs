@@ -514,9 +514,9 @@ mod tests {
 
     #[test]
     fn test_genetic_maps_collection() {
-        // Test the GeneticMaps collection with from_plink_file
+        let map_file = create_test_map_file();
         let chrom_names = ["chr1"];
-        let maps = GeneticMaps::from_plink_file(fixture_map_path().as_path(), &chrom_names)
+        let maps = GeneticMaps::from_plink_file(map_file.path(), &chrom_names)
             .expect("Failed to load maps");
 
         // Should have loaded chr1
