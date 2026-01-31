@@ -805,6 +805,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         except Exception as e:
             print(f"    Range: Error - {e}")
 
+    def _truncate_line(line, limit=2000):
+        if len(line) <= limit:
+            return line
+        return line[:limit] + "...[truncated]"
+
     # Print example lines (raw records) from each file
     print("\n🧾 Example Records (first 3 lines):")
     for vcf_path, label in diag_vcfs:
@@ -819,7 +824,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 print("    (no records)")
             else:
                 for line in lines:
-                    print(f"    {line}")
+                    print(f"    {_truncate_line(line)}")
         except Exception as e:
             print(f"  {label}: Error - {e}")
     
