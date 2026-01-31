@@ -1356,6 +1356,7 @@ fn build_imputation_plan(
     let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
     let batches_total = (n_target_haps + batch_size - 1) / batch_size;
+    let prescan_start = std::time::Instant::now();
 
     let can_full_panel =
         !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps);
@@ -1366,6 +1367,7 @@ fn build_imputation_plan(
                 "Pre-scan produced no windows for allocation".to_string(),
             ));
         }
+        let plan_start = std::time::Instant::now();
         eprintln!(
             "Pre-scan: skipped (full panel global mode); ref_haps={}, windows={}",
             n_ref_haps,
@@ -1382,6 +1384,10 @@ fn build_imputation_plan(
         for _ in 0..n_target_haps {
             plan.stats.update(n_ref_haps, 0, 0);
         }
+        eprintln!(
+            "Pre-scan summary: skipped full panel in {:.1}s",
+            plan_start.elapsed().as_secs_f32()
+        );
         return Ok(plan);
     }
 
@@ -1548,17 +1554,24 @@ fn build_imputation_plan(
         .unwrap_or(false);
 
     let mut batch_idx = 0usize;
+    let mut window_span_cm: Option<f64> = None;
+    let mut window_span_bp: Option<u64> = None;
     while batch_start < n_target_haps {
         batch_idx += 1;
         let batch_end = (batch_start + batch_size).min(n_target_haps);
         let batch_haps: Vec<usize> = (batch_start..batch_end).collect();
         let batch_len = batch_haps.len();
         if let Some(bb) = telemetry {
-            bb.set_op(&format!(
-                "Imputation prescan: scoring batch {}/{}",
+            let mut op = format!(
+                "Imputation prescan: scoring batch {}/{} (batch_size={})",
                 batch_idx,
-                batches_total.max(1)
-            ));
+                batches_total.max(1),
+                batch_len
+            );
+            if let (Some(cm), Some(bp)) = (window_span_cm, window_span_bp) {
+                op.push_str(&format!(", span_cm={:.3}, span_bp={}", cm, bp));
+            }
+            bb.set_op(&op);
         }
 
         let mut target_reader: Option<StreamingVcfReader> = if cache_ready {
@@ -1602,6 +1615,24 @@ fn build_imputation_plan(
                     let n_ref_markers = ref_window.markers.len();
                     if n_ref_markers == 0 {
                         continue;
+                    }
+                    if window_span_cm.is_none() || window_span_bp.is_none() {
+                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                        let end_pos = ref_window
+                            .markers
+                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                            .pos;
+                        let span_bp = end_pos.saturating_sub(start_pos);
+                        let start_cm = gen_maps.gen_pos(
+                            ref_window.markers.marker(MarkerIdx::new(0)).chrom,
+                            start_pos,
+                        );
+                        let end_cm = gen_maps.gen_pos(
+                            ref_window.markers.marker(MarkerIdx::new(0)).chrom,
+                            end_pos,
+                        );
+                        window_span_bp = Some(span_bp);
+                        window_span_cm = Some((end_cm - start_cm).abs());
                     }
                     // Derive per-window cap from the observed marker count to match
                     // the real workspace footprint (fwd/bwd/history scale with markers).
@@ -1779,6 +1810,24 @@ fn build_imputation_plan(
                     let n_ref_markers = ref_window.markers.len();
                     if n_ref_markers == 0 {
                         continue;
+                    }
+                    if window_span_cm.is_none() || window_span_bp.is_none() {
+                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                        let end_pos = ref_window
+                            .markers
+                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                            .pos;
+                        let span_bp = end_pos.saturating_sub(start_pos);
+                        let start_cm = gen_maps.gen_pos(
+                            ref_window.markers.marker(MarkerIdx::new(0)).chrom,
+                            start_pos,
+                        );
+                        let end_cm = gen_maps.gen_pos(
+                            ref_window.markers.marker(MarkerIdx::new(0)).chrom,
+                            end_pos,
+                        );
+                        window_span_bp = Some(span_bp);
+                        window_span_cm = Some((end_cm - start_cm).abs());
                     }
                     // Derive per-window cap from the observed marker count to match
                     // the real workspace footprint (fwd/bwd/history scale with markers).
@@ -2082,6 +2131,20 @@ fn build_imputation_plan(
 
         batch_start = batch_end;
     }
+    let elapsed = prescan_start.elapsed().as_secs_f32();
+    let cache_hit = target_cache
+        .as_ref()
+        .map(|c| c.iter().filter(|e| e.is_some()).count())
+        .unwrap_or(0);
+    let cache_total = target_cache.as_ref().map(|c| c.len()).unwrap_or(0);
+    eprintln!(
+        "Pre-scan summary: batches={} windows={} cache_hits={}/{} elapsed={:.1}s",
+        batches_total.max(1),
+        window_handoff.len(),
+        cache_hit,
+        cache_total,
+        elapsed
+    );
 
     Ok(plan)
 }

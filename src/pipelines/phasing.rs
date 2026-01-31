@@ -2587,11 +2587,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 } else {
                     0.0
                 };
+                let span_markers = end.saturating_sub(start);
                 bb.set_op(&format!(
-                    "Phasing prescan: PBWT scoring (window {}/{}, span_cm={:.3})",
+                    "Phasing prescan: PBWT scoring (window {}/{}, span_cm={:.3}, markers={})",
                     window_idx + 1,
                     num_windows,
-                    span_cm
+                    span_cm,
+                    span_markers
                 ));
             }
             let sampling = build_sampling_points(&gen_positions[start..end], step_cm);
