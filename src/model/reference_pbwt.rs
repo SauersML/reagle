@@ -102,12 +102,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         }
     }
 
-    pub fn select_donors(&mut self, beam: &RankBeam, k: usize) -> Vec<u32> {
-        let mut out = Vec::with_capacity(k);
-        self.select_donors_into(beam, k, &mut out);
-        out
-    }
-
     pub fn select_donors_into(&mut self, beam: &RankBeam, k: usize, out: &mut Vec<u32>) {
         out.clear();
         if k == 0 {
@@ -490,13 +484,6 @@ impl ReferencePbwt {
             Self::U16(ReferencePbwtImpl::<u16>::new(n_ref_haps))
         } else {
             Self::U32(ReferencePbwtImpl::<u32>::new(n_ref_haps))
-        }
-    }
-
-    pub fn select_donors(&mut self, beam: &RankBeam, k: usize) -> Vec<u32> {
-        match self {
-            Self::U16(inner) => inner.select_donors(beam, k),
-            Self::U32(inner) => inner.select_donors(beam, k),
         }
     }
 

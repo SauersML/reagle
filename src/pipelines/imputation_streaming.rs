@@ -1631,7 +1631,7 @@ fn build_imputation_plan(
                             ref_window.markers.marker(MarkerIdx::new(0)).chrom,
                             end_pos,
                         );
-                        window_span_bp = Some(span_bp);
+                        window_span_bp = Some(span_bp.into());
                         window_span_cm = Some((end_cm - start_cm).abs());
                     }
                     // Derive per-window cap from the observed marker count to match
@@ -1826,7 +1826,7 @@ fn build_imputation_plan(
                             ref_window.markers.marker(MarkerIdx::new(0)).chrom,
                             end_pos,
                         );
-                        window_span_bp = Some(span_bp);
+                        window_span_bp = Some(span_bp.into());
                         window_span_cm = Some((end_cm - start_cm).abs());
                     }
                     // Derive per-window cap from the observed marker count to match
@@ -3835,7 +3835,7 @@ impl crate::pipelines::ImputationPipeline {
 
     /// Write imputed window results to VCF
     #[allow(clippy::too_many_arguments)]
-    fn write_imputed_window_streaming<TargetSpace, RefMarkerSpace>(
+    fn write_imputed_window_streaming<TargetSpace: Sync, RefMarkerSpace: Sync>(
         &self,
         ref_markers: &crate::data::marker::Markers<RefMarkerSpace>,
         target_win: &GenotypeMatrix<Phased, TargetSpace>,
