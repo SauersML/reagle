@@ -414,10 +414,22 @@ def run_conversion(input_path, output_vcf):
         raise RuntimeError("convert_genome failed to produce genotypes.vcf")
 
     print("Finalizing GRCh38 output...")
-    print("Filtering invalid records (missing ALT but non-ref GT)...")
-    filter_cmd = f"bcftools view {temp_hg38_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Oz -o {output_vcf}"
+    print("Filtering invalid records (missing ALT but non-ref GT) and renaming chromosomes...")
+
+    # Rename chroms (22 -> chr22) to match reference panel which uses chr22 notation
+    with open("chr_map.txt", "w") as f:
+        f.write("22\tchr22\n")
+
+    filter_cmd = (
+        f"bcftools view {temp_hg38_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Ou | "
+        f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
+    )
     subprocess.check_call(filter_cmd, shell=True)
     subprocess.check_call(["bcftools", "index", "-f", output_vcf])
+
+    if os.path.exists("chr_map.txt"):
+        os.remove("chr_map.txt")
+
     print("Conversion complete.")
     _update_panel_if_present(temp_output_dir, panel_path)
 
