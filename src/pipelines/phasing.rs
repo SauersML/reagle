@@ -1670,6 +1670,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             if let Some(bb) = &self.telemetry {
                 bb.set_stage(Stage::PhasingStage2);
                 bb.set_producer_stage(Stage::PhasingStage2);
+                bb.set_op("Phasing stage2: HMM interpolation");
                 bb.set_total_iterations(0);
                 bb.set_current_iteration(0);
                 bb.set_total_markers(rare_markers.len() as u64);
@@ -2268,6 +2269,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             );
             if let Some(bb) = &self.telemetry {
                 bb.set_stage(Stage::PhasingStage2);
+                bb.set_op("Phasing stage2: HMM interpolation");
                 bb.set_total_iterations(0);
                 bb.set_current_iteration(0);
                 bb.set_total_markers(rare_markers.len() as u64);
@@ -2580,10 +2582,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         for (window_idx, &(start, end)) in window_blocks.iter().enumerate() {
             if let Some(bb) = &self.telemetry {
                 bb.set_current_window((window_idx + 1) as u64);
+                let span_cm = if end > start && end <= gen_positions.len() {
+                    (gen_positions[end - 1] - gen_positions[start]).abs()
+                } else {
+                    0.0
+                };
                 bb.set_op(&format!(
-                    "Phasing prescan: PBWT scoring (window {}/{})",
+                    "Phasing prescan: PBWT scoring (window {}/{}, span_cm={:.3})",
                     window_idx + 1,
-                    num_windows
+                    num_windows,
+                    span_cm
                 ));
             }
             let sampling = build_sampling_points(&gen_positions[start..end], step_cm);
