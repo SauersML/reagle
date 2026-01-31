@@ -2660,14 +2660,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         let per_window_caps = vec![per_window_cap; num_windows];
         let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
-        let mut out: Vec<crate::model::states::ThreadedHaps> = Vec::with_capacity(n_samples);
-        let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
-        let mut touched_indices: Vec<usize> =
-            Vec::with_capacity(per_window_cap.saturating_mul(PBWT_PER_WINDOW_MULT).max(1));
-
-        for s in 0..n_samples {
+        let exclude_self = ref_gt.is_none();
+        let out: Vec<crate::model::states::ThreadedHaps> = (0..n_samples)
+            .into_par_iter()
+            .map(|s| {
             let hap1 = s * 2;
             let hap2 = s * 2 + 1;
+            let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
+            let mut touched_indices: Vec<usize> =
+                Vec::with_capacity(per_window_cap.saturating_mul(PBWT_PER_WINDOW_MULT).max(1));
             let mut window_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_windows);
             for w in 0..num_windows {
                 for &idx in &touched_indices {
@@ -2727,13 +2728,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 allocation.intervals_by_hap.into_iter().map(|(h, _)| h).collect();
             selected.sort_unstable();
             selected.dedup();
-            if ref_gt.is_none() {
+            if exclude_self {
                 selected.retain(|h| h / 2 != s);
             }
             if selected.is_empty() {
                 let fallback_cap = per_window_cap.min(n_ref_haps.max(1)).max(1);
                 let mut fallback: Vec<usize> = (0..fallback_cap).collect();
-                if ref_gt.is_none() {
+                if exclude_self {
                     fallback.retain(|h| h / 2 != s);
                 }
                 if fallback.is_empty() {
@@ -2750,8 +2751,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             for h in selected {
                 th.push_new(GlobalId::new(h as u32));
             }
-            out.push(th);
-        }
+            th
+        })
+        .collect();
 
         if let Some(bb) = &self.telemetry {
             if let Some(prev) = telemetry_snapshot {
