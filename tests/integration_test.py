@@ -1166,6 +1166,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     prev_het_input = [None] * n_common
     common_sites_count = 0
     skipped_missing_required = 0
+    skipped_missing_required_matched = 0
+    skipped_missing_required_imputed_only = 0
     last_pos = 0
 
     print("Streaming and comparing...")
@@ -1200,6 +1202,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 # MATCH! Process site
                 if imp_missing_required:
                     skipped_missing_required += 1
+                    skipped_missing_required_matched += 1
                     truth_key, truth_data, truth_multiallelic = get_next_truth()
                     imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
                     continue
@@ -1514,6 +1517,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 # Imputed is behind, means extra site in Imputation
                 if imp_missing_required:
                     skipped_missing_required += 1
+                    skipped_missing_required_imputed_only += 1
                 else:
                     imputed_only_sites += 1
                 imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
@@ -1524,12 +1528,15 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         else:
              if imp_missing_required:
                  skipped_missing_required += 1
+                 skipped_missing_required_imputed_only += 1
              else:
                  imputed_only_sites += 1
              imp_key, imp_data, imp_multiallelic, imp_missing_required = get_next_imputed()
 
     print(f"Common sites: {common_sites_count}")
     print(f"Skipped sites (missing DS/GP): {skipped_missing_required}")
+    print(f"  - Matched sites skipped: {skipped_missing_required_matched}")
+    print(f"  - Imputed-only sites skipped: {skipped_missing_required_imputed_only}")
     loop_elapsed = time.time() - loop_start
 
     # Close final phase blocks
@@ -1864,6 +1871,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     metrics["sites_imputed_only"] = imputed_only_sites
     metrics["sites_common"] = common_sites_count
     metrics["sites_skipped_missing_required"] = skipped_missing_required
+    metrics["sites_skipped_missing_required_matched"] = skipped_missing_required_matched
+    metrics["sites_skipped_missing_required_imputed_only"] = skipped_missing_required_imputed_only
     metrics["ref_af_missing_sites"] = ref_af_missing
     metrics["ref_af_sites"] = ref_af_sites
 
@@ -1964,6 +1973,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         skipped_missing_required = metrics.get('sites_skipped_missing_required', 0)
         if skipped_missing_required > 0:
             print(f"   Skipped sites (missing DS/GP): {skipped_missing_required:,}")
+            skipped_matched = metrics.get('sites_skipped_missing_required_matched', 0)
+            skipped_imputed_only = metrics.get('sites_skipped_missing_required_imputed_only', 0)
+            print(f"     - Matched sites skipped: {skipped_matched:,}")
+            print(f"     - Imputed-only sites skipped: {skipped_imputed_only:,}")
         
         ref_alt_mismatch = metrics.get('ref_alt_mismatch', 0)
         ref_alt_swapped = metrics.get('ref_alt_swapped', 0)
