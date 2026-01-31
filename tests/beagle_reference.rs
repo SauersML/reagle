@@ -3080,7 +3080,7 @@ fn test_strict_dr2_and_dosage_comparison() {
 #[serial]
 fn test_diverse_mask_scenarios() {
     // Test imputation with different masking fractions
-    let source = &get_all_data_sources()[0]; // Use first data source
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
     let Some(files) = setup_test_files() else { return; };
 
     // Test multiple masking scenarios
@@ -3288,7 +3288,7 @@ fn test_diverse_mask_scenarios() {
 fn test_multiple_seeds_consistency() {
     // Verify that different seeds don't cause catastrophic failures
     // and results remain consistent with Java
-    let source = &get_all_data_sources()[0];
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
     let Some(files) = setup_test_files() else { return; };
 
     let seeds = [1, 42, 123, 999, 12345];
@@ -3425,7 +3425,7 @@ fn test_multiple_seeds_consistency() {
 #[test]
 #[serial]
 fn test_per_sample_imputation_accuracy() {
-    let source = &get_all_data_sources()[0];
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
     let Some(files) = setup_test_files() else { return; };
 
     println!("\n{}", "=".repeat(60));
@@ -3635,7 +3635,7 @@ fn test_per_sample_imputation_accuracy() {
 #[test]
 #[serial]
 fn test_dr2_genotyped_vs_imputed() {
-    let source = &get_all_data_sources()[0];
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
     let Some(files) = setup_test_files() else { return; };
 
     println!("\n{}", "=".repeat(70));
@@ -3880,7 +3880,7 @@ fn test_dr2_genotyped_vs_imputed() {
 #[test]
 #[serial]
 fn test_dosage_by_distance_from_genotyped() {
-    let source = &get_all_data_sources()[0];
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
     let Some(files) = setup_test_files() else { return; };
 
     println!("\n{}", "=".repeat(70));
@@ -4099,7 +4099,7 @@ fn test_dosage_by_distance_from_genotyped() {
 #[test]
 #[serial]
 fn test_posterior_probability_calibration() {
-    let source = &get_all_data_sources()[0];
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
     let Some(files) = setup_test_files() else { return; };
 
     println!("\n{}", "=".repeat(70));
@@ -4301,7 +4301,7 @@ fn test_posterior_probability_calibration() {
 #[test]
 #[serial]
 fn test_genotyped_dosage_matches_hard_call() {
-    let source = &get_all_data_sources()[0];
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
     let Some(files) = setup_test_files() else { return; };
 
     println!("\n{}", "=".repeat(70));
@@ -4822,7 +4822,7 @@ fn test_phasing_switch_error_rate() {
 #[test]
 #[serial]
 fn test_phasing_determinism() {
-    let source = &get_all_data_sources()[0]; // Use first source
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
 
     println!("\n{}", "=".repeat(70));
     println!("=== Phasing Determinism Test ===");
@@ -4884,7 +4884,7 @@ fn test_phasing_determinism() {
 #[test]
 #[serial]
 fn test_phasing_heterozygote_stress() {
-    let source = &get_all_data_sources()[0];
+    let sources = get_all_data_sources(); if sources.is_empty() { return; } let source = &sources[0];
 
     println!("\n{}", "=".repeat(70));
     println!("=== Phasing Heterozygote Stress Test ===");
