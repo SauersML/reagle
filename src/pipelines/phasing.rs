@@ -5135,7 +5135,12 @@ fn emit_prob_hard(ref_al: u8, targ_al: u8, conf: f32, p_no_err: f32, p_err: f32,
         if targ_al == INVALID_ALLELE {
             return 0.0;
         }
-        return if ref_al == targ_al { p_no_err } else { 0.0 };
+        // Treat missing reference allele (255) as a match
+        return if ref_al == targ_al || ref_al == 255 {
+            p_no_err
+        } else {
+            0.0
+        };
     }
     emit_prob(ref_al, targ_al, conf, p_no_err, p_err)
 }
@@ -5270,7 +5275,8 @@ fn emit_haploid_constrained(
     };
 
     // Emission: does ref_al match the required allele?
-    let matches = (ref_al == required_allele) as u8 as f32;
+    // Treat missing reference allele (255) as a match (neutral)
+    let matches = ((ref_al == required_allele) || (ref_al == 255)) as u8 as f32;
     let raw_emit = matches * p_no_err + (1.0 - matches) * p_err;
 
     // Blend with uniform based on confidence
@@ -8331,6 +8337,45 @@ mod tests {
                 || (paths.path1[0] == 0 && paths.path2[0] == 1)
                 || (paths.path1[0] == 3 && paths.path2[0] == 2)
                 || (paths.path1[0] == 2 && paths.path2[0] == 3)
+        );
+    }
+
+    #[test]
+    fn test_emit_haploid_constrained_missing_ref() {
+        // If reference allele is missing (255), it should be neutral/match, not penalized.
+        let p_no_err = 0.999;
+        let p_err = 0.001;
+        let conf = 1.0;
+
+        // Het site (0, 1), fixed H2=0 => H1 must be 1.
+        // Reference has 255 (missing).
+        // Should return high probability (neutral/match), not p_err.
+        let emit = emit_haploid_constrained(255, 0, 1, 0, conf, p_no_err, p_err);
+
+        // Currently this fails (returns p_err ~0.001). We want it to be > 0.9.
+        assert!(
+            emit > 0.9,
+            "Expected high emission for missing reference allele, got {}",
+            emit
+        );
+    }
+
+    #[test]
+    fn test_emit_prob_hard_missing_ref() {
+        // Hard emission with missing reference should be match/neutral.
+        let p_no_err = 0.999;
+        let p_err = 0.001;
+        let conf = 1.0;
+
+        // Target allele 0. Reference missing (255).
+        // Should return p_no_err, not 0.0.
+        let emit = emit_prob_hard(255, 0, conf, p_no_err, p_err, true);
+
+        // Currently this fails (returns 0.0). We want it to be p_no_err.
+        assert!(
+            emit > 0.9,
+            "Expected high emission for missing reference allele in hard mode, got {}",
+            emit
         );
     }
 }
