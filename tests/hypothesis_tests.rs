@@ -107,7 +107,7 @@ fn run_rust_phasing(
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.err = Some(0.001);
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run()?;
@@ -131,7 +131,7 @@ fn run_rust_phasing_with_seed(
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.err = Some(0.001);
     config.seed = seed;
     let mut pipeline = PhasingPipeline::new(config, None);
