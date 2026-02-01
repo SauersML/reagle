@@ -477,7 +477,10 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 if a1 != 255 && a1 == a2 {
                     query_alleles[i] = a1;
                 } else {
-                    query_alleles[i] = 255;
+                    // For unphased hets, use the allele assigned to this specific haplotype
+                    // (which is arbitrary but complementary between hap1/hap2).
+                    // This ensures we search for neighbors of BOTH alleles, maximizing diversity.
+                    query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
                 }
             } else {
                 query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
@@ -605,7 +608,8 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 if a1 != 255 && a1 == a2 {
                     query_alleles[i] = a1;
                 } else {
-                    query_alleles[i] = 255;
+                    // For unphased hets, use the allele assigned to this specific haplotype
+                    query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
                 }
             } else {
                 query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
