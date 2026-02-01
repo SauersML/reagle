@@ -3219,6 +3219,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     eprintln!("[prescan] watch_hap={} present={}", h, found);
                 }
             }
+            let mut forced_anchor_haps = Vec::new();
             if ref_has_panel && PBWT_ANCHOR_TOP_HAPS > 0 {
                 let hap1 = s * 2;
                 let hap2 = s * 2 + 1;
@@ -3270,6 +3271,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
                     let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
                     for &h in idxs.iter().take(take) {
+                        forced_anchor_haps.push(h);
                         if !candidate_haps.contains(&h) {
                             candidate_haps.push(h);
                             scores_by_hap.push(Vec::new());
@@ -3320,6 +3322,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 });
                 let take = PBWT_FORCE_TOP_HAPS.min(touched_indices.len());
                 for &h in touched_indices.iter().take(take) {
+                    if !selected.contains(&h) {
+                        selected.push(h);
+                    }
+                }
+            }
+            if !forced_anchor_haps.is_empty() {
+                for h in forced_anchor_haps {
                     if !selected.contains(&h) {
                         selected.push(h);
                     }
