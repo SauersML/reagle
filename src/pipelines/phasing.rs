@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -78,8 +78,8 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_FORCE_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -6690,6 +6690,91 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    // Initialize path with starting states from standard neighbor finding
+    // This gives the first iteration something to work with
+    let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
+    if initial_neighbors.is_empty() {
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MosaicPaths {
+                path1: Vec::new(),
+                path2: Vec::new(),
+            },
+        );
+    }
+
+    if initial_paths.is_none() && n_markers <= 500 {
+        let mut informative_markers = 0usize;
+        for m in 0..n_markers {
+            if seq1[m] != 255 && seq2[m] != 255 {
+                informative_markers += 1;
+            }
+        }
+
+        if informative_markers > 0 {
+            let needed_score = (informative_markers as f32 * 0.9).ceil() as usize;
+            let mut best_score = 0usize;
+            let mut best_pair = None;
+
+            for (i, &h1) in initial_neighbors.iter().enumerate() {
+                for &h2 in initial_neighbors.iter().take(i) {
+                    let mut score = 0usize;
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 || a2 == 255 {
+                            continue;
+                        }
+                        let ref1 = phase_ibs.allele(m, h1);
+                        let ref2 = phase_ibs.allele(m, h2);
+                        if ref1 == 255 || ref2 == 255 {
+                            continue;
+                        }
+
+                        if a1 == a2 {
+                            if ref1 == a1 && ref2 == a2 {
+                                score += 1;
+                            }
+                        } else {
+                            if (ref1 == a1 && ref2 == a2) || (ref1 == a2 && ref2 == a1) {
+                                score += 1;
+                            }
+                        }
+                    }
+                    if score > best_score {
+                        best_score = score;
+                        best_pair = Some((h1, h2));
+                    }
+                }
+            }
+
+            if best_score >= needed_score {
+                if let Some((h1, h2)) = best_pair {
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 || a2 == 255 {
+                            continue;
+                        }
+                        if a1 != a2 {
+                            let ref1 = phase_ibs.allele(m, h1);
+                            let ref2 = phase_ibs.allele(m, h2);
+                            if ref1 == a1 && ref2 == a2 {
+                                h1_alleles[m] = a1;
+                                h2_alleles[m] = a2;
+                            } else if ref1 == a2 && ref2 == a1 {
+                                h1_alleles[m] = a2;
+                                h2_alleles[m] = a1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Seed alleles from initial paths if available (from heuristic)
     // This ensures MCMC starts in a high-probability region rather than drifting
     // from a random start.
@@ -6722,21 +6807,6 @@ fn sample_dynamic_mcmc(
                 }
             }
         }
-    }
-
-    // Initialize path with starting states from standard neighbor finding
-    // This gives the first iteration something to work with
-    let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
-    if initial_neighbors.is_empty() {
-        return (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            MosaicPaths {
-                path1: Vec::new(),
-                path2: Vec::new(),
-            },
-        );
     }
 
     // Separate paths for H1 and H2 to avoid cross-talk in Gibbs sampling
@@ -7666,8 +7736,29 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
+        let mut dot_prod = 0.0f32;
         for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
+            if obs_counts[i] > 0 && obs_counts2[i] > 0 {
+                let mean1 = swap_counts[i] as f32 - (obs_counts[i] as f32 * 0.5);
+                let mean2 = swap_counts2[i] as f32 - (obs_counts2[i] as f32 * 0.5);
+                dot_prod += mean1 * mean2;
+            }
+        }
+
+        let flip_second_chain = dot_prod < 0.0;
+        if flip_second_chain {
+            eprintln!(
+                "[mosaic] chains anti-aligned (dot={:.2}), flipping chain 2",
+                dot_prod
+            );
+        }
+
+        for i in 0..het_positions.len() {
+            let mut c2 = swap_counts2[i];
+            if flip_second_chain && obs_counts2[i] > 0 {
+                c2 = obs_counts2[i].saturating_sub(c2);
+            }
+            swap_counts[i] = swap_counts[i].saturating_add(c2);
             obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
         }
     }
