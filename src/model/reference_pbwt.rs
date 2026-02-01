@@ -1,6 +1,6 @@
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
 
-const MAX_RANK_INTERVALS: usize = 512;
+const MAX_RANK_INTERVALS: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RankBeam {

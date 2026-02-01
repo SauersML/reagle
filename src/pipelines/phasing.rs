@@ -3451,7 +3451,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
 
                     for (m, p_orient) in het_phase_values {
-                        sp.set_phase_confidence(m, p_orient);
+                        sp.set_phase_confidence(m, p_orient.max(1.0 - p_orient));
                     }
 
                     let lr_threshold = self.params.lr_threshold;
@@ -4027,7 +4027,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             for (hi_freq_idx, p_orient) in het_phase_values {
                 let m = hi_freq_to_orig[hi_freq_idx];
-                sp.set_phase_confidence(m, p_orient);
+                sp.set_phase_confidence(m, p_orient.max(1.0 - p_orient));
             }
 
             if let Some(paths) = new_paths {
@@ -5035,7 +5035,20 @@ fn select_top_k_by_mass_two(
         }
     }
     let mut idx: Vec<usize> = (0..n_states).collect();
-    idx.sort_by(|&a, &b| mass[b].partial_cmp(&mass[a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| {
+        mass[b]
+            .partial_cmp(&mass[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                // Break ties deterministically but pseudo-randomly using a hash of the index.
+                // This ensures that when masses are uniform (e.g. unphased hets vs all states),
+                // we don't just pick the first K states (which might all be from one hap group).
+                // Mixing the bits ensures we sample a diverse set of states.
+                let ha = (a as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                let hb = (b as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                ha.cmp(&hb)
+            })
+    });
     idx.truncate(k.min(n_states));
     idx
 }
@@ -7271,8 +7284,26 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
+        // Compute alignment between chains to handle symmetric modes.
+        // If the two chains converged to opposite phases (e.g. A|B vs B|A),
+        // we flip the second chain's votes to match the first before averaging.
+        let mut dot_prod = 0.0f32;
         for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
+            if obs_counts[i] > 0 && obs_counts2[i] > 0 {
+                let c1 = swap_counts[i] as f32 - (obs_counts[i] as f32 * 0.5);
+                let c2 = swap_counts2[i] as f32 - (obs_counts2[i] as f32 * 0.5);
+                dot_prod += c1 * c2;
+            }
+        }
+
+        let flip_chain2 = dot_prod < 0.0;
+
+        for i in 0..het_positions.len() {
+            let mut s2 = swap_counts2[i];
+            if flip_chain2 {
+                s2 = obs_counts2[i].saturating_sub(s2);
+            }
+            swap_counts[i] = swap_counts[i].saturating_add(s2);
             obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
         }
     }
