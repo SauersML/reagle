@@ -249,6 +249,15 @@ fn build_sampling_points(gen_positions: &[f64], step_cm: f64) -> Vec<bool> {
         }
     }
     sampling[n - 1] = true;
+    let count = sampling.iter().filter(|&&b| b).count();
+    eprintln!(
+        "[pbwt sampling] markers={} step_cm={:.6} sampled={} first_cm={:.6} last_cm={:.6}",
+        n,
+        step,
+        count,
+        gen_positions.first().copied().unwrap_or(0.0),
+        gen_positions.last().copied().unwrap_or(0.0)
+    );
     sampling
 }
 
@@ -2661,6 +2670,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let per_window_caps = vec![per_window_cap; num_windows];
         let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
         let exclude_self = ref_gt.is_none();
+        let debug_watch = vec![198usize, 199usize];
         let out: Vec<crate::model::states::ThreadedHaps> = (0..n_samples)
             .into_par_iter()
             .map(|s| {
@@ -2713,6 +2723,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             let abyss = vec![false; n_ref_haps];
             let (candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
+            if s == 0 {
+                eprintln!(
+                    "[prescan] sample={} candidate_haps={} windows={}",
+                    s,
+                    candidate_haps.len(),
+                    num_windows
+                );
+                for &h in &debug_watch {
+                    let found = candidate_haps.iter().any(|&c| c == h);
+                    eprintln!("[prescan] watch_hap={} present={}", h, found);
+                }
+            }
             let allocation = allocate_lms_sparse(
                 &scores_by_hap,
                 &candidate_haps,
@@ -3422,6 +3444,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let mut swap_mask = vec![false; n_hi_freq];
                         let mut current_phase = 0u8;
                         let mut phase_idx = 0usize;
+                        let mut anchor_resets = 0usize;
                         for i in 0..n_hi_freq {
                             let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
@@ -3434,6 +3457,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             if is_phased_het {
                                 swap_mask[i] = false;
                                 current_phase = 0;
+                                anchor_resets += 1;
                                 continue;
                             }
 
@@ -3443,6 +3467,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
                             swap_mask[i] = current_phase == 1;
                         }
+
+                        eprintln!(
+                            "[phase anchors] sample={} anchors={} hets={}",
+                            s,
+                            anchor_resets,
+                            het_positions.len()
+                        );
 
                         let het_lr_values: Vec<(usize, f32)> = het_positions
                             .iter()
@@ -3459,6 +3490,26 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         ws.seq2 = seq2;
                         ws.sample_conf = sample_conf;
                         ws.het_positions = het_positions;
+
+                        if let Some(ref paths) = new_paths {
+                            let mut p1_switches = 0usize;
+                            let mut p2_switches = 0usize;
+                            for i in 1..paths.path1.len() {
+                                if paths.path1[i] != paths.path1[i - 1] {
+                                    p1_switches += 1;
+                                }
+                                if paths.path2[i] != paths.path2[i - 1] {
+                                    p2_switches += 1;
+                                }
+                            }
+                            eprintln!(
+                                "[mosaic paths] sample={} path1_switches={} path2_switches={} markers={}",
+                                s,
+                                p1_switches,
+                                p2_switches,
+                                paths.path1.len()
+                            );
+                        }
 
                         if let Some(bb) = telemetry.as_ref() {
                             bb.add_samples(1);
@@ -7357,6 +7408,88 @@ mod tests {
         // Verify LR values exist
         assert_eq!(swap_lr.len(), het_positions.len());
         assert!(swap_probs.len() <= het_positions.len());
+    }
+
+    #[test]
+    fn test_dynamic_mcmc_symmetric_all0_all1_should_not_switch() {
+        // Correctness expectation:
+        // With symmetric evidence (hero all-0, anti all-1) and a perfect match,
+        // the sampler should maintain a stable path rather than introducing switches.
+        use crate::model::ibs2::Ibs2;
+        use crate::model::phase_ibs::BidirectionalPhaseIbs;
+
+        let n_markers = 50;
+        let n_target_haps = 2;
+        let n_ref_haps = 2;
+        let n_total_haps = n_target_haps + n_ref_haps;
+
+        let alleles: Vec<Vec<u8>> = (0..n_markers)
+            .map(|_| {
+                let mut haps = vec![255u8; n_total_haps];
+                haps[2] = 0; // hero
+                haps[3] = 1; // anti-hero
+                haps
+            })
+            .collect();
+        let subset_to_global: Vec<usize> = (0..n_markers).collect();
+        let phase_ibs = BidirectionalPhaseIbs::build_for_subset(
+            alleles,
+            n_total_haps,
+            n_markers,
+            &subset_to_global,
+        );
+
+        let ibs2 = Ibs2::empty(1);
+        let seq1 = vec![0u8; n_markers];
+        let seq2 = vec![1u8; n_markers];
+        let conf = vec![1.0f32; n_markers];
+        let p_recomb = vec![0.02f32; n_markers];
+        let het_positions: Vec<usize> = (0..n_markers).collect();
+
+        let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
+        let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
+            n_markers,
+            n_total_haps,
+            &p_recomb,
+            &seq1,
+            &seq2,
+            &conf,
+            &phase_ibs,
+            &ibs2,
+            0,
+            &het_positions,
+            424242,
+            5,
+            0.999,
+            0.001,
+            None,
+            &mut workspace,
+        );
+        assert_eq!(swap_bits.len(), het_positions.len());
+        assert_eq!(swap_lr.len(), het_positions.len());
+        assert!(swap_probs.len() <= het_positions.len());
+
+        let mut path1_switches = 0usize;
+        let mut path2_switches = 0usize;
+        for i in 1..n_markers {
+            if paths.path1[i] != paths.path1[i - 1] {
+                path1_switches += 1;
+            }
+            if paths.path2[i] != paths.path2[i - 1] {
+                path2_switches += 1;
+            }
+        }
+
+        println!(
+            "[symmetric mcmc] path1_switches={} path2_switches={}",
+            path1_switches, path2_switches
+        );
+
+        assert_eq!(
+            path1_switches + path2_switches,
+            0,
+            "Unexpected path switching under symmetric evidence"
+        );
     }
 
     #[test]
