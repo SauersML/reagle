@@ -3451,7 +3451,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
 
                     for (m, p_orient) in het_phase_values {
-                        sp.set_phase_confidence(m, p_orient);
+                        // The HMM returns probability of SWAP.
+                        // Phase confidence is max(p, 1-p).
+                        // If p=0 (confident no swap), conf=1.0.
+                        // If p=1 (confident swap), conf=1.0.
+                        // If p=0.5 (uncertain), conf=0.5.
+                        let conf = p_orient.max(1.0 - p_orient);
+                        sp.set_phase_confidence(m, conf);
                     }
 
                     let lr_threshold = self.params.lr_threshold;
