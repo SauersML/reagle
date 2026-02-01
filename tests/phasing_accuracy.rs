@@ -1,7 +1,12 @@
 use reagle::config::Config;
+use reagle::data::alignment::MarkerAlignment;
+use reagle::data::genetic_map::GeneticMaps;
+use reagle::data::marker::MarkerIdx;
+use reagle::io::vcf::VcfReader;
 use reagle::pipelines::phasing::PhasingPipeline;
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 
 // Helper to write a simplified VCF
@@ -56,32 +61,22 @@ fn write_target_vcf(path: &std::path::Path, marker_pos: &[u32]) {
     writeln!(file, "\tTarget").unwrap();
 
     for &pos in marker_pos.iter() {
-        // Hero allele is (m % 2).
-        // Target is homozygous for Hero allele.
-        // Hero: 0, 1, 0, 1...
-        // Target: 0/0, 1/1, 0/0, 1/1...
-        // This is effectively PHASED but we write it as unphased 0/0 or 1/1.
-        // Wait, if it is homozygous, phasing is trivial.
-        // Let's make it Heterozygous to force phasing.
-        // IF we make it heterozygous (0/1), it needs to decide phase.
-        // H1 should be Hero (0, 1, 0, 1).
-        // H2 should be Anti-Hero (1, 0, 1, 0).
-        // If we provide Hero in ref, H1 should latch to Hero.
-
-        // Let's stick to the User's plan "Target: Unphased, matches Hero Hap".
-        // If target is unphased, we usually write 0/1.
-        // But if matches Hero perfectly, does it mean H1 matches Hero?
-        // Let's try homozygous target as initially planned to test CONFIDENCE drop.
-
-        // Target must be Heterozygous (0/1) to be processed as high-freq marker.
-        // If it's homozygous, MAF=0 and it gets skipped.
+        // Target is heterozygous at every marker to force phasing.
+        // The reference panel defines the hero/anti patterns.
         write!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t0/1", pos).unwrap();
         writeln!(file).unwrap();
     }
 }
 
+fn hero_pattern_from_ref_hap(ref_haps: &[Vec<u8>], hero_hap_idx: usize) -> Vec<u8> {
+    ref_haps
+        .get(hero_hap_idx)
+        .cloned()
+        .unwrap_or_default()
+}
+
 #[test]
-fn test_stability_trap_file_based() {
+fn test_ser_switching_all0_all1_reference() {
     let n_markers = 50;
     let n_ref_haps = 100;
     let hero_idx = 99;
@@ -109,16 +104,16 @@ fn test_stability_trap_file_based() {
         }
     }
 
-    // Set Hero Hap (Index 99 * 2 = 198) with pattern 0,1,0,1,...
+    // Set Hero Hap (Index 99 * 2 = 198) with the test-specific hero pattern
     let hero_hap_idx = hero_idx * 2;
     for m in 0..n_markers {
-        ref_haps[hero_hap_idx][m] = (m % 2) as u8;
+        ref_haps[hero_hap_idx][m] = 0;
     }
 
-    // Set Anti-Hero Hap (Index 99 * 2 + 1 = 199) with pattern 1,0,1,0,...
+    // Set Anti-Hero Hap (Index 99 * 2 + 1 = 199) as the complementary pattern
     let anti_hero_hap_idx = hero_idx * 2 + 1;
     for m in 0..n_markers {
-        ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
+        ref_haps[anti_hero_hap_idx][m] = 1;
     }
 
     let marker_pos: Vec<u32> = (0..n_markers).map(|i| (i * 1000 + 100) as u32).collect();
@@ -207,26 +202,17 @@ fn test_stability_trap_file_based() {
         "Parsed wrong number of markers"
     );
 
-    // Calculate Switch Error Rate relative to Hero Hap
-    // Hero Alleles: (m % 2)
-    // At m=0 (Hero=0): Target is 0/1. If Hap1=Hero, GT=0|1.
-    // At m=1 (Hero=1): Target is 0/1. If Hap1=Hero, GT=1|0.
-    // At m=2 (Hero=0): Target is 0/1. If Hap1=Hero, GT=0|1.
+    // Calculate Switch Error Rate relative to the hero hap from the reference.
+    // This is invariant to global hap1/hap2 label swaps.
 
-    // Pattern A (Hap1 tracks Hero): 0|1, 1|0, 0|1, 1|0...
-    // Pattern B (Hap2 tracks Hero): 1|0, 0|1, 1|0, 0|1...
+    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
 
     // Standard Switch Error Calculation
     // Iterate and compare phase of (m-1, m)
     let mut switch_errors = 0;
     for m in 1..n_markers {
-        let hero_prev = ((m - 1) % 2) as u8;
-        let hero_curr = (m % 2) as u8;
-
-        // Use m in a dummy way if not used otherwise, but here we use it for hero_curr calculation
-        // and accessing phased_haps[m]!
-        // The compiler complaint about 'm' unused at line 37 was for the WRITING loop.
-        // I need to fix THAT loop too.
+        let hero_prev = hero_pattern[m - 1];
+        let hero_curr = hero_pattern[m];
 
         let (h1_prev, _) = phased_haps[m - 1];
         let (h1_curr, _) = phased_haps[m];
@@ -256,7 +242,7 @@ fn test_stability_trap_file_based() {
 }
 
 #[test]
-fn test_hypothesis_max_states_fixes_stability_trap() {
+fn test_ser_not_fixed_by_high_state_count_all0_all1() {
     let n_markers = 50;
     let n_ref_haps = 100;
     let hero_idx = 99;
@@ -283,12 +269,12 @@ fn test_hypothesis_max_states_fixes_stability_trap() {
 
     let hero_hap_idx = hero_idx * 2;
     for m in 0..n_markers {
-        ref_haps[hero_hap_idx][m] = (m % 2) as u8;
+        ref_haps[hero_hap_idx][m] = 0;
     }
 
     let anti_hero_hap_idx = hero_idx * 2 + 1;
     for m in 0..n_markers {
-        ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
+        ref_haps[anti_hero_hap_idx][m] = 1;
     }
 
     let marker_pos: Vec<u32> = (0..n_markers).map(|i| (i * 1000 + 100) as u32).collect();
@@ -348,10 +334,12 @@ fn test_hypothesis_max_states_fixes_stability_trap() {
 
     assert_eq!(phased_haps.len(), n_markers);
 
+    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
+
     let mut switch_errors = 0;
     for m in 1..n_markers {
-        let hero_prev = ((m - 1) % 2) as u8;
-        let hero_curr = (m % 2) as u8;
+        let hero_prev = hero_pattern[m - 1];
+        let hero_curr = hero_pattern[m];
         let (h1_prev, _) = phased_haps[m - 1];
         let (h1_curr, _) = phased_haps[m];
 
@@ -369,7 +357,7 @@ fn test_hypothesis_max_states_fixes_stability_trap() {
 }
 
 #[test]
-fn test_hypothesis_initial_phasing_causes_beam_exclusion() {
+fn test_sparse_phased_anchors_do_not_cause_switching() {
     let n_markers = 50;
     let n_ref_haps = 100;
     let hero_idx = 99;
@@ -399,7 +387,7 @@ fn test_hypothesis_initial_phasing_causes_beam_exclusion() {
         ref_haps[hero_hap_idx][m] = (m % 2) as u8;
     }
 
-    // Set Anti-Hero Hap (Index 99 * 2 + 1 = 199) with pattern 1,0,1,0,...
+    // Set Anti-Hero Hap (Index 99 * 2 + 1 = 199) as the complementary pattern
     let anti_hero_hap_idx = hero_idx * 2 + 1;
     for m in 0..n_markers {
         ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
@@ -424,15 +412,20 @@ fn test_hypothesis_initial_phasing_causes_beam_exclusion() {
     )
     .unwrap();
 
+    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
     for (m, &pos) in marker_pos.iter().enumerate() {
-        let hero_allele = (m % 2) as u8;
+        let hero_allele = hero_pattern[m];
         let anti_hero = 1 - hero_allele;
-        write!(
-            file,
-            "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
-            pos, hero_allele, anti_hero
-        )
-        .unwrap();
+        if m % 10 == 0 {
+            write!(
+                file,
+                "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
+                pos, hero_allele, anti_hero
+            )
+            .unwrap();
+        } else {
+            write!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t0/1", pos).unwrap();
+        }
         writeln!(file).unwrap();
     }
 
@@ -482,10 +475,12 @@ fn test_hypothesis_initial_phasing_causes_beam_exclusion() {
         }
     }
 
+    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
+
     let mut switch_errors = 0;
     for m in 1..n_markers {
-        let hero_prev = ((m - 1) % 2) as u8;
-        let hero_curr = (m % 2) as u8;
+        let hero_prev = hero_pattern[m - 1];
+        let hero_curr = hero_pattern[m];
         let (h1_prev, _) = phased_haps[m - 1];
         let (h1_curr, _) = phased_haps[m];
         let prev_match = h1_prev == hero_prev;
@@ -505,7 +500,7 @@ fn test_hypothesis_initial_phasing_causes_beam_exclusion() {
 }
 
 #[test]
-fn test_small_panel_perfect_match() {
+fn test_small_panel_all0_all1_perfect_match_ser() {
     let n_markers = 10; // Small for readability
     let n_ref_haps = 20; // Small panel
     let hero_idx = 10;
@@ -532,12 +527,12 @@ fn test_small_panel_perfect_match() {
 
     let hero_hap_idx = hero_idx * 2;
     for m in 0..n_markers {
-        ref_haps[hero_hap_idx][m] = (m % 2) as u8;
+        ref_haps[hero_hap_idx][m] = 0;
     }
 
     let anti_hero_hap_idx = hero_idx * 2 + 1;
     for m in 0..n_markers {
-        ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
+        ref_haps[anti_hero_hap_idx][m] = 1;
     }
 
     let marker_pos: Vec<u32> = (0..n_markers).map(|i| (i * 1000 + 100) as u32).collect();
@@ -592,10 +587,12 @@ fn test_small_panel_perfect_match() {
         }
     }
 
+    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
+
     let mut switch_errors = 0;
     for m in 1..n_markers {
-        let hero_prev = ((m - 1) % 2) as u8;
-        let hero_curr = (m % 2) as u8;
+        let hero_prev = hero_pattern[m - 1];
+        let hero_curr = hero_pattern[m];
         let (h1_prev, _) = phased_haps[m - 1];
         let (h1_curr, _) = phased_haps[m];
         let prev_match = h1_prev == hero_prev;
@@ -611,135 +608,7 @@ fn test_small_panel_perfect_match() {
 }
 
 #[test]
-fn test_homozygous_anchors_vs_all_heterozygous() {
-    let n_markers = 20;
-    let n_ref_haps = 20;
-    let hero_idx = 10;
-
-    let ref_file = NamedTempFile::new().unwrap();
-    let ref_path = ref_file.path().to_path_buf();
-
-    let mut ref_samples = Vec::new();
-    let mut ref_haps = Vec::new();
-
-    for i in 0..n_ref_haps {
-        ref_samples.push(format!("R{}", i));
-        ref_haps.push(vec![0u8; n_markers]);
-        ref_haps.push(vec![0u8; n_markers]);
-    }
-
-    use rand::{Rng, SeedableRng};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    for h in 0..ref_haps.len() {
-        for m in 0..n_markers {
-            ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
-        }
-    }
-
-    let hero_hap_idx = hero_idx * 2;
-    let anti_hero_hap_idx = hero_idx * 2 + 1;
-    for m in 0..n_markers {
-        ref_haps[hero_hap_idx][m] = (m % 2) as u8;
-        ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
-    }
-
-    let marker_pos: Vec<u32> = (0..n_markers).map(|i| (i * 1000 + 100) as u32).collect();
-    write_vcf(&ref_path, &ref_samples, &ref_haps, &marker_pos);
-
-    let target_file = NamedTempFile::new().unwrap();
-    let target_path = target_file.path().to_path_buf();
-
-    let mut file = File::create(&target_path).unwrap();
-    writeln!(file, "##fileformat=VCFv4.2").unwrap();
-    writeln!(
-        file,
-        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
-    )
-    .unwrap();
-    writeln!(
-        file,
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget"
-    )
-    .unwrap();
-
-    for (m, &pos) in marker_pos.iter().enumerate() {
-        let hero_allele = (m % 2) as u8;
-        if m < 10 && m % 2 == 0 {
-            write!(
-                file,
-                "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
-                pos, hero_allele, hero_allele
-            )
-            .unwrap();
-        } else {
-            write!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t0/1", pos).unwrap();
-        }
-        writeln!(file).unwrap();
-    }
-
-    let out_file = NamedTempFile::new().unwrap();
-    let out_path = out_file.path().to_path_buf();
-
-    let mut config = Config::default();
-    config.gt = target_path.clone();
-    config.r#ref = Some(ref_path.clone());
-    config.out = out_path.clone();
-    config.phase_states = 30;
-    config.burnin = 0;
-    config.iterations = 2;
-    config.nthreads = Some(1);
-    config.ne = 10000.0;
-    config.err = Some(0.0001);
-
-    let mut pipeline = PhasingPipeline::new(config, None);
-    pipeline.run().expect("Pipeline run failed");
-
-    let expected_out_path = out_path.with_extension("vcf.gz");
-    use flate2::read::MultiGzDecoder;
-    use std::io::BufRead;
-    use std::io::BufReader;
-
-    let file = File::open(&expected_out_path).unwrap();
-    let decoder = MultiGzDecoder::new(file);
-    let reader = BufReader::new(decoder);
-
-    let mut phased_haps: Vec<(u8, u8)> = Vec::new();
-    for line in reader.lines() {
-        let line = line.unwrap();
-        if line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('\t').collect();
-        let sample_field = parts[9];
-        let gt_str = sample_field.split(':').next().unwrap();
-        let alleles: Vec<u8> = gt_str
-            .split(['|', '/'])
-            .map(|s| s.parse().unwrap_or(0))
-            .collect();
-        if alleles.len() >= 2 {
-            phased_haps.push((alleles[0], alleles[1]));
-        }
-    }
-
-    let mut switch_errors = 0;
-    for m in 1..20 {
-        let hero_prev = ((m - 1) % 2) as u8;
-        let hero_curr = (m % 2) as u8;
-        let (h1_prev, _) = phased_haps[m - 1];
-        let (h1_curr, _) = phased_haps[m];
-        let prev_match = h1_prev == hero_prev;
-        let curr_match = h1_curr == hero_curr;
-        if prev_match != curr_match {
-            switch_errors += 1;
-        }
-    }
-    let overall_ser = switch_errors as f32 / 19.0;
-
-    assert!(overall_ser < 0.1, "SER too high: {:.4}", overall_ser);
-}
-
-#[test]
-fn test_burnin_zero_forces_combined_initialization() {
+fn test_burnin_zero_all0_all1_ser() {
     let n_markers = 30;
     let n_ref_haps = 20;
     let hero_idx = 10;
@@ -822,10 +691,12 @@ fn test_burnin_zero_forces_combined_initialization() {
         }
     }
 
+    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
+
     let mut switch_errors = 0;
     for m in 1..n_markers {
-        let hero_prev = ((m - 1) % 2) as u8;
-        let hero_curr = (m % 2) as u8;
+        let hero_prev = hero_pattern[m - 1];
+        let hero_curr = hero_pattern[m];
         let (h1_prev, _) = phased_haps[m - 1];
         let (h1_curr, _) = phased_haps[m];
         let prev_match = h1_prev == hero_prev;
@@ -838,4 +709,100 @@ fn test_burnin_zero_forces_combined_initialization() {
     let ser = switch_errors as f32 / (n_markers - 1) as f32;
 
     assert!(ser < 0.1, "SER too high with burnin=0: {:.4}", ser);
+}
+
+#[test]
+fn test_symmetric_evidence_phase_confidence_low() {
+    let n_markers = 40;
+    let n_ref_haps = 100;
+    let hero_idx = 99;
+
+    let ref_file = NamedTempFile::new().unwrap();
+    let ref_path = ref_file.path().to_path_buf();
+
+    let mut ref_samples = Vec::new();
+    let mut ref_haps = Vec::new();
+
+    for i in 0..n_ref_haps {
+        ref_samples.push(format!("R{}", i));
+        ref_haps.push(vec![0u8; n_markers]);
+        ref_haps.push(vec![0u8; n_markers]);
+    }
+
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    for h in 0..ref_haps.len() {
+        for m in 0..n_markers {
+            ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
+        }
+    }
+
+    let hero_hap_idx = hero_idx * 2;
+    let anti_hero_hap_idx = hero_idx * 2 + 1;
+    for m in 0..n_markers {
+        ref_haps[hero_hap_idx][m] = (m % 2) as u8;
+        ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
+    }
+
+    let marker_pos: Vec<u32> = (0..n_markers).map(|i| (i * 1000 + 100) as u32).collect();
+    write_vcf(&ref_path, &ref_samples, &ref_haps, &marker_pos);
+
+    let target_file = NamedTempFile::new().unwrap();
+    let target_path = target_file.path().to_path_buf();
+    write_target_vcf(&target_path, &marker_pos);
+
+    let (mut target_reader, target_file) = VcfReader::open(&target_path).unwrap();
+    let target_gt = target_reader.read_all(target_file).unwrap();
+    let (mut ref_reader, ref_file) = VcfReader::open(&ref_path).unwrap();
+    let ref_gt = ref_reader.read_all(ref_file).unwrap();
+    let ref_gt = ref_gt.into_phased();
+
+    let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+
+    let mut config = Config::default();
+    config.phase_states = 20;
+    config.burnin = 0;
+    config.iterations = 2;
+    config.nthreads = Some(1);
+    config.ne = 10000.0;
+    config.err = Some(0.0001);
+
+    let mut pipeline = PhasingPipeline::new(config, None);
+    pipeline.set_reference(Arc::new(ref_gt), alignment);
+
+    let gen_maps = GeneticMaps::new();
+    let (phased, _) = pipeline
+        .phase_in_memory_with_overlap(&target_gt, &gen_maps, None, None)
+        .expect("phase_in_memory_with_overlap");
+
+    assert!(
+        phased.phase_confidence_clone().is_some(),
+        "Expected phase confidence to be populated"
+    );
+
+    let mut sum = 0.0f32;
+    let mut max = 0.0f32;
+    for m in 0..n_markers {
+        let conf = phased.sample_phase_confidence_f32(MarkerIdx::new(m as u32), 0);
+        sum += conf;
+        if conf > max {
+            max = conf;
+        }
+    }
+    let mean = sum / n_markers as f32;
+    println!(
+        "[uninformative phase confidence] mean={:.3} max={:.3}",
+        mean, max
+    );
+
+    assert!(
+        mean < 0.6,
+        "Expected low mean phase confidence under symmetric evidence; mean={:.3}",
+        mean
+    );
+    assert!(
+        max < 0.9,
+        "Expected no highly confident markers under symmetric evidence; max={:.3}",
+        max
+    );
 }
