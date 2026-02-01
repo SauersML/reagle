@@ -3449,6 +3449,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                                 p_no_err,
                                                 p_err,
                                                 prior_local_dyn.as_ref(),
+                                                None,
+                                                None,
                                                 ws,
                                             )
                                         })
@@ -3469,6 +3471,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                             p_no_err,
                                             p_err,
                                             prior_local_dyn.as_ref(),
+                                            None,
+                                            None,
                                             ws,
                                         )
                                     }
@@ -3879,6 +3883,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             atomic.add_estimation_data(&local_est);
                         }
 
+                        let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
+                        let has_anchors = anchor_h1_full.iter().any(|&a| a != 255)
+                            || anchor_h2_full.iter().any(|&a| a != 255);
+                        let mut anchor_h1 = Vec::with_capacity(n_hi_freq);
+                        let mut anchor_h2 = Vec::with_capacity(n_hi_freq);
+                        for &m in hi_freq_to_orig {
+                            anchor_h1.push(anchor_h1_full[m]);
+                            anchor_h2.push(anchor_h2_full[m]);
+                        }
+                        let anchor_opt1 = if has_anchors { Some(anchor_h1.as_slice()) } else { None };
+                        let anchor_opt2 = if has_anchors { Some(anchor_h2.as_slice()) } else { None };
+
                         let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
@@ -3904,6 +3920,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         p_no_err,
                                         p_err,
                                         prior_local.as_ref(),
+                                        anchor_opt1,
+                                        anchor_opt2,
                                         ws,
                                     )
                                 })
@@ -3924,6 +3942,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     p_no_err,
                                     p_err,
                                     prior_local.as_ref(),
+                                    anchor_opt1,
+                                    anchor_opt2,
                                     ws,
                                 )
                             };
@@ -3945,9 +3965,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let local_prior_raw = prior_paths[s]
                                 .as_ref()
                                 .and_then(|gp| global_to_local_paths(gp, &threaded_haps, n_hi_freq));
-                            let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
-                            let has_anchors = anchor_h1_full.iter().any(|&a| a != 255)
-                                || anchor_h2_full.iter().any(|&a| a != 255);
+                            // Anchors extracted above
                             let local_prior = if has_anchors {
                                 None
                             } else {
@@ -6516,6 +6534,8 @@ fn sample_dynamic_mcmc(
     p_no_err: f32,
     p_err: f32,
     initial_paths: Option<&MosaicPaths>,
+    anchor_hap1: Option<&[u8]>,
+    anchor_hap2: Option<&[u8]>,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
@@ -6540,7 +6560,7 @@ fn sample_dynamic_mcmc(
     let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
 
     // Calculate heuristic paths early so they can seed both the reference paths AND the initial alleles.
-    let heuristic_paths = if initial_paths.is_none() {
+    let mut heuristic_paths = if initial_paths.is_none() {
         find_best_constant_pair_pbwt(
             n_markers,
             seq1,
@@ -6552,9 +6572,49 @@ fn sample_dynamic_mcmc(
     } else {
         None
     };
+
+    let anchor_h1 = anchor_hap1.unwrap_or(&[]);
+    let anchor_h2 = anchor_hap2.unwrap_or(&[]);
+    let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
+
+    // Align heuristic orientation to anchors when present
+    if has_anchor {
+        if let Some(paths) = heuristic_paths.as_mut() {
+            let mut score_direct: i32 = 0;
+            let mut score_flip: i32 = 0;
+            for m in 0..n_markers {
+                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
+                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
+                if a1 == 255 && a2 == 255 {
+                    continue;
+                }
+
+                let p1 = paths.path1[m] as usize;
+                let p2 = paths.path2[m] as usize;
+                if p1 >= phase_ibs.n_haps() || p2 >= phase_ibs.n_haps() {
+                    continue;
+                }
+                let r1 = phase_ibs.allele(m, p1 as u32);
+                let r2 = phase_ibs.allele(m, p2 as u32);
+
+                if a1 != 255 {
+                    if r1 == a1 { score_direct += 1; } else { score_direct -= 1; }
+                    if r2 == a1 { score_flip += 1; } else { score_flip -= 1; }
+                }
+                if a2 != 255 {
+                    if r2 == a2 { score_direct += 1; } else { score_direct -= 1; }
+                    if r1 == a2 { score_flip += 1; } else { score_flip -= 1; }
+                }
+            }
+            if score_flip > score_direct {
+                std::mem::swap(&mut paths.path1, &mut paths.path2);
+            }
+        }
+    }
+
     let start_paths = initial_paths.or(heuristic_paths.as_ref());
 
-    // Initialize H1, H2 alleles from genotype (random phase at hets)
+    // Initialize H1, H2 alleles from genotype (random phase at hets, or anchored)
     let mut h1_alleles = vec![0u8; n_markers];
     let mut h2_alleles = vec![0u8; n_markers];
     for m in 0..n_markers {
@@ -6567,13 +6627,25 @@ fn sample_dynamic_mcmc(
             h1_alleles[m] = a1;
             h2_alleles[m] = a1;
         } else {
-            // Het: random initial phase
-            if rng.random::<bool>() {
-                h1_alleles[m] = a1;
-                h2_alleles[m] = a2;
+            // Het: check anchors first
+            let anc1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let anc2 = anchor_h2.get(m).copied().unwrap_or(255);
+
+            if anc1 != 255 && (anc1 == a1 || anc1 == a2) {
+                 h1_alleles[m] = anc1;
+                 h2_alleles[m] = if anc1 == a1 { a2 } else { a1 };
+            } else if anc2 != 255 && (anc2 == a1 || anc2 == a2) {
+                 h2_alleles[m] = anc2;
+                 h1_alleles[m] = if anc2 == a1 { a2 } else { a1 };
             } else {
-                h1_alleles[m] = a2;
-                h2_alleles[m] = a1;
+                // Random initial phase
+                if rng.random::<bool>() {
+                    h1_alleles[m] = a1;
+                    h2_alleles[m] = a2;
+                } else {
+                    h1_alleles[m] = a2;
+                    h2_alleles[m] = a1;
+                }
             }
         }
     }
@@ -8402,6 +8474,8 @@ mod tests {
             0.999,
             0.001,
             None,
+            None,
+            None,
             &mut workspace,
         );
         assert_eq!(paths.path1.len(), n_markers);
@@ -8483,6 +8557,8 @@ mod tests {
             0.999,
             0.001,
             None,
+            None,
+            None,
             &mut workspace,
         );
         assert_eq!(paths.path1.len(), n_markers);
@@ -8557,6 +8633,8 @@ mod tests {
             5,
             0.999,
             0.001,
+            None,
+            None,
             None,
             &mut workspace,
         );
