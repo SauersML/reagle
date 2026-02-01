@@ -3733,6 +3733,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
+                            let mut ref_provider = if self.config.profile {
+                                info_span!("prep_allele_provider", sample = s).in_scope(|| {
+                                    RefAlleleProvider::new(subset_view, &threaded_haps)
+                                })
+                            } else {
+                                RefAlleleProvider::new(subset_view, &threaded_haps)
+                            };
+
                             let prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
                                 path2: gp.path2.iter().map(|id| id.as_u32()).collect(),
@@ -3757,6 +3765,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         p_err,
                                         prior_local.as_ref(),
                                         ws,
+                                        &mut ref_provider,
                                     )
                                 })
                             } else {
@@ -3777,6 +3786,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     p_err,
                                     prior_local.as_ref(),
                                     ws,
+                                    &mut ref_provider,
                                 )
                             };
                             let global_paths = GlobalMosaicPaths {
@@ -6262,7 +6272,7 @@ fn ffbs_haploid_constrained(
 /// haplotypes that match the current phase estimate via the "Latent State" approach:
 /// neighbors are found by looking up the position of the PREVIOUSLY SAMPLED reference
 /// state in the PBWT, giving O(1) lookup and preserving phase inertia.
-fn sample_dynamic_mcmc(
+fn sample_dynamic_mcmc<RefSpace>(
     n_markers: usize,
     n_states: usize,
     p_recomb: &[f32],
@@ -6279,6 +6289,7 @@ fn sample_dynamic_mcmc(
     p_err: f32,
     initial_paths: Option<&MosaicPaths>,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
+    ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
 
@@ -6321,10 +6332,28 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    // Attempt pairwise initialization if no initial paths provided.
+    // This is crucial for symmetry breaking (e.g. 0/1 hets vs 0/0 and 1/1 refs).
+    // The "heuristic paths" provide a much better starting point than random phase.
+    let heuristic_paths = if initial_paths.is_none() && n_markers <= 500 {
+        find_best_constant_pair_with_buffer(
+            n_markers,
+            n_states,
+            seq1,
+            seq2,
+            ref_provider,
+            &mut workspace.scores,
+        )
+    } else {
+        None
+    };
+
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
     // Seed alleles from initial paths if available (from heuristic)
     // This ensures MCMC starts in a high-probability region rather than drifting
     // from a random start.
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             for m in 0..n_markers {
                 let a1 = seq1[m];
@@ -6382,7 +6411,7 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
@@ -8111,7 +8140,7 @@ mod tests {
             .collect();
         let subset_to_global: Vec<usize> = (0..n_markers).collect();
         let phase_ibs = BidirectionalPhaseIbs::build_for_subset(
-            alleles,
+            alleles.clone(),
             n_total_haps,
             n_markers,
             &subset_to_global,
@@ -8129,6 +8158,20 @@ mod tests {
         let p_recomb = vec![0.01f32; n_markers];
 
         let het_positions: Vec<usize> = (0..n_markers).collect();
+
+        let geno = MutableGenotypes::from_fn(n_markers, n_total_haps, |m, h| {
+            alleles[m][h]
+        });
+        let mut threaded = ThreadedHaps::new(n_total_haps, n_total_haps, n_markers);
+        for h in 0..n_total_haps {
+            threaded.push_new(GlobalId::new(h as u32));
+        }
+        let mut ref_provider = RefAlleleProvider::new(
+            GenotypeView::<crate::data::AnyMarkerSpace, crate::data::AnyMarkerSpace>::Mutable(
+                &geno,
+            ),
+            &threaded,
+        );
 
         // Sample 0: haplotypes 0 and 1
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
@@ -8149,6 +8192,7 @@ mod tests {
             0.001,
             None,
             &mut workspace,
+            &mut ref_provider,
         );
         assert_eq!(paths.path1.len(), n_markers);
         assert_eq!(paths.path2.len(), n_markers);
@@ -8197,7 +8241,7 @@ mod tests {
             .collect();
         let subset_to_global: Vec<usize> = (0..n_markers).collect();
         let phase_ibs = BidirectionalPhaseIbs::build_for_subset(
-            alleles,
+            alleles.clone(),
             n_total_haps,
             n_markers,
             &subset_to_global,
@@ -8211,6 +8255,20 @@ mod tests {
         let conf = vec![1.0f32; n_markers];
         let p_recomb = vec![0.01f32; n_markers];
         let het_positions: Vec<usize> = (0..n_markers).collect();
+
+        let geno = MutableGenotypes::from_fn(n_markers, n_total_haps, |m, h| {
+            alleles[m][h]
+        });
+        let mut threaded = ThreadedHaps::new(n_total_haps, n_total_haps, n_markers);
+        for h in 0..n_total_haps {
+            threaded.push_new(GlobalId::new(h as u32));
+        }
+        let mut ref_provider = RefAlleleProvider::new(
+            GenotypeView::<crate::data::AnyMarkerSpace, crate::data::AnyMarkerSpace>::Mutable(
+                &geno,
+            ),
+            &threaded,
+        );
 
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
         let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
@@ -8230,6 +8288,7 @@ mod tests {
             0.001,
             None,
             &mut workspace,
+            &mut ref_provider,
         );
         assert_eq!(paths.path1.len(), n_markers);
         assert_eq!(paths.path2.len(), n_markers);
@@ -8274,7 +8333,7 @@ mod tests {
             .collect();
         let subset_to_global: Vec<usize> = (0..n_markers).collect();
         let phase_ibs = BidirectionalPhaseIbs::build_for_subset(
-            alleles,
+            alleles.clone(),
             n_total_haps,
             n_markers,
             &subset_to_global,
@@ -8286,6 +8345,20 @@ mod tests {
         let conf = vec![1.0f32; n_markers];
         let p_recomb = vec![0.02f32; n_markers];
         let het_positions: Vec<usize> = (0..n_markers).collect();
+
+        let geno = MutableGenotypes::from_fn(n_markers, n_total_haps, |m, h| {
+            alleles[m][h]
+        });
+        let mut threaded = ThreadedHaps::new(n_total_haps, n_total_haps, n_markers);
+        for h in 0..n_total_haps {
+            threaded.push_new(GlobalId::new(h as u32));
+        }
+        let mut ref_provider = RefAlleleProvider::new(
+            GenotypeView::<crate::data::AnyMarkerSpace, crate::data::AnyMarkerSpace>::Mutable(
+                &geno,
+            ),
+            &threaded,
+        );
 
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
         let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
@@ -8305,6 +8378,7 @@ mod tests {
             0.001,
             None,
             &mut workspace,
+            &mut ref_provider,
         );
         assert_eq!(swap_bits.len(), het_positions.len());
         assert_eq!(swap_lr.len(), het_positions.len());
