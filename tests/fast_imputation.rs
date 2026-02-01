@@ -92,7 +92,7 @@ impl SyntheticVcfBuilder {
             } else {
                 m * 1000 + 1
             };
-            write!(file, "chr1\t{}\trs{}\tA\tT\t.\tPASS\t.\tGT", pos, m).unwrap();
+            write!(file, "chr1\t{}\trs{}\tA\tC\t.\tPASS\t.\tGT", pos, m).unwrap();
 
             for s in 0..self.n_samples {
                 let mut alleles = Vec::new();
@@ -1648,37 +1648,46 @@ fn test_microarray_vs_wgs_imputation() {
     // Dense WGS reference panel: 500 markers, 50 samples (100 haplotypes)
     let n_ref_markers = 500;
     let n_ref_samples = 50;
-    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 1000 + 1).collect();
+    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 100 + 1).collect();
 
     // Create structured haplotype patterns with strong LD blocks.
-    // Each block shares the same allele per haplotype group, and typed markers
-    // land at block boundaries to make haplotype groups identifiable.
+    // All markers within a block share the same allele per haplotype.
+    // Typed markers at block boundaries fully determine the block allele.
     const BLOCK_SIZE: usize = 10;
-    const GROUPS: usize = 10;
-    fn allele_for(m: usize, h: usize) -> u8 {
-        let block = m / BLOCK_SIZE;
-        let hap_group = h % GROUPS; // 10 haplotype groups
-        let seed = (block as u64)
-            .wrapping_mul(1_315_423_911)
-            .wrapping_add(hap_group as u64 * 2_654_435_761);
-        let bit = (seed ^ (seed >> 13) ^ (seed >> 7)) & 1;
-        bit as u8
+    let n_blocks = (n_ref_markers + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let mut hap_block_alleles = vec![vec![0u8; n_blocks]; n_ref_samples * 2];
+    for h in 0..(n_ref_samples * 2) {
+        let hap_pair = h / 2;
+        for b in 0..n_blocks {
+            hap_block_alleles[h][b] = ((hap_pair + b * 7) % 2) as u8;
+        }
     }
+    let hap_block_alleles = std::sync::Arc::new(hap_block_alleles);
 
     let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
         .positions(positions.clone())
-        .allele_generator(allele_for)
+        .allele_generator({
+            let hap_block_alleles = std::sync::Arc::clone(&hap_block_alleles);
+            move |m, h| {
+                let block = m / BLOCK_SIZE;
+                hap_block_alleles[h][block]
+            }
+        })
         .build();
 
     // Create masked target (microarray-style - only every 10th marker)
     let masked_target_file = SyntheticVcfBuilder::new(n_ref_markers, 5)
         .positions(positions.clone())
-        .allele_generator(|m, h| {
-            if m % 10 == 0 {
-                // Genotyped marker - same pattern as full target
-                allele_for(m, h)
-            } else {
-                255 // Missing - to be imputed
+        .allele_generator({
+            let hap_block_alleles = std::sync::Arc::clone(&hap_block_alleles);
+            move |m, h| {
+                if m % 10 == 0 {
+                    // Genotyped marker - same pattern as full target
+                    let block = m / BLOCK_SIZE;
+                    hap_block_alleles[h][block]
+                } else {
+                    255 // Missing - to be imputed
+                }
             }
         })
         .build();
@@ -1706,8 +1715,9 @@ fn test_microarray_vs_wgs_imputation() {
                 .map(|s| {
                     let h0 = s * 2;
                     let h1 = s * 2 + 1;
-                    let allele0 = allele_for(m, h0) as f32;
-                    let allele1 = allele_for(m, h1) as f32;
+                    let block = m / BLOCK_SIZE;
+                    let allele0 = hap_block_alleles[h0][block] as f32;
+                    let allele1 = hap_block_alleles[h1][block] as f32;
                     allele0 + allele1
                 })
                 .collect()
@@ -1750,6 +1760,46 @@ fn test_microarray_vs_wgs_imputation() {
     }
     let concordance = correct as f64 / total as f64;
     println!("Microarray vs WGS Concordance: {:.2}%", concordance * 100.0);
+
+    let mut sum0 = 0.0f64;
+    let mut sum2 = 0.0f64;
+    let mut count0 = 0usize;
+    let mut count2 = 0usize;
+    for (&est, &truth) in imputed_est.iter().zip(imputed_true.iter()) {
+        if truth < 0.5 {
+            sum0 += est as f64;
+            count0 += 1;
+        } else if truth > 1.5 {
+            sum2 += est as f64;
+            count2 += 1;
+        }
+    }
+    if count0 > 0 && count2 > 0 {
+        println!(
+            "Microarray vs WGS mean est: truth0={:.3} truth2={:.3}",
+            sum0 / count0 as f64,
+            sum2 / count2 as f64
+        );
+    }
+    // Sanity check on genotyped markers (should match hard calls).
+    let mut geno_mismatch = 0usize;
+    let mut geno_total = 0usize;
+    for m in (0..n_ref_markers).step_by(10) {
+        for s in 0..5 {
+            let est = imputed_dosages[m][s];
+            let truth = true_dosages[m][s];
+            if (est - truth).abs() > 0.01 {
+                geno_mismatch += 1;
+            }
+            geno_total += 1;
+        }
+    }
+    if geno_total > 0 {
+        println!(
+            "Microarray genotyped marker mismatches: {} / {}",
+            geno_mismatch, geno_total
+        );
+    }
 
     // R² should be reasonably high for well-imputed data
     assert!(
@@ -1796,6 +1846,128 @@ fn test_microarray_vs_wgs_imputation() {
         "Mean DR2 ({:.4}) too low for microarray test with R²={:.4}",
         mean_dr2,
         r_squared
+    );
+}
+
+/// Detect reversed polarity: imputed dosages should increase with true ALT dosage.
+#[test]
+#[serial]
+fn test_imputation_polarity_consistency() {
+    let n_ref_markers = 100;
+    let n_ref_samples = 20;
+    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 1000 + 1).collect();
+
+    const BLOCK_SIZE: usize = 10;
+    let n_blocks = (n_ref_markers + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let mut hap_block_alleles = vec![vec![0u8; n_blocks]; n_ref_samples * 2];
+    for h in 0..(n_ref_samples * 2) {
+        let hap_pair = h / 2;
+        for b in 0..n_blocks {
+            hap_block_alleles[h][b] = ((hap_pair + b * 7) % 2) as u8;
+        }
+    }
+    let hap_block_alleles = std::sync::Arc::new(hap_block_alleles);
+
+    let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
+        .positions(positions.clone())
+        .allele_generator({
+            let hap_block_alleles = std::sync::Arc::clone(&hap_block_alleles);
+            move |m, h| {
+                let block = m / BLOCK_SIZE;
+                hap_block_alleles[h][block]
+            }
+        })
+        .build();
+
+    let masked_target_file = SyntheticVcfBuilder::new(n_ref_markers, 3)
+        .positions(positions.clone())
+        .allele_generator({
+            let hap_block_alleles = std::sync::Arc::clone(&hap_block_alleles);
+            move |m, h| {
+                if m % 10 == 0 {
+                    let block = m / BLOCK_SIZE;
+                    hap_block_alleles[h][block]
+                } else {
+                    255
+                }
+            }
+        })
+        .build();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_prefix = temp_dir.path().join("output_polarity");
+
+    let mut config = default_test_config();
+    config.gt = masked_target_file.path().to_path_buf();
+    config.r#ref = Some(ref_file.path().to_path_buf());
+    config.out = out_prefix.clone();
+    config.imp_states = 80;
+    config.nthreads = Some(1);
+
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run().expect("Pipeline run success");
+
+    let out_vcf = temp_dir.path().join("output_polarity.vcf.gz");
+    let imputed_dosages = inspect_dosages(&out_vcf, 3);
+
+    let true_dosages: Vec<Vec<f32>> = (0..n_ref_markers)
+        .map(|m| {
+            (0..3)
+                .map(|s| {
+                    let h0 = s * 2;
+                    let h1 = s * 2 + 1;
+                    let block = m / BLOCK_SIZE;
+                    let allele0 = hap_block_alleles[h0][block] as f32;
+                    let allele1 = hap_block_alleles[h1][block] as f32;
+                    allele0 + allele1
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut sum0 = 0.0f64;
+    let mut sum2 = 0.0f64;
+    let mut count0 = 0usize;
+    let mut count2 = 0usize;
+    let mut reversed = 0usize;
+    let mut total = 0usize;
+
+    for m in 0..n_ref_markers {
+        if m % 10 == 0 {
+            continue;
+        }
+        for s in 0..3 {
+            let est = imputed_dosages[m][s] as f64;
+            let truth = true_dosages[m][s] as f64;
+            if truth < 0.5 {
+                sum0 += est;
+                count0 += 1;
+                if est > 1.5 {
+                    reversed += 1;
+                }
+            } else if truth > 1.5 {
+                sum2 += est;
+                count2 += 1;
+                if est < 0.5 {
+                    reversed += 1;
+                }
+            }
+            total += 1;
+        }
+    }
+
+    let mean0 = if count0 > 0 { sum0 / count0 as f64 } else { 0.0 };
+    let mean2 = if count2 > 0 { sum2 / count2 as f64 } else { 0.0 };
+    println!(
+        "Polarity check: mean est truth0={:.3} truth2={:.3}, reversed {}/{}",
+        mean0, mean2, reversed, total
+    );
+
+    assert!(
+        mean0 < mean2,
+        "Polarity reversed: mean est truth0={:.3} >= truth2={:.3}",
+        mean0,
+        mean2
     );
 }
 

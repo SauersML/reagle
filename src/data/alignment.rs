@@ -92,6 +92,22 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                         }
                         if mapping.alleles_swapped {
                             n_allele_swapped += 1;
+                            eprintln!(
+                                "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
+                                target_marker.pos,
+                                target_marker.ref_allele,
+                                target_marker
+                                    .alt_alleles
+                                    .get(0)
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                ref_marker.ref_allele,
+                                ref_marker
+                                    .alt_alleles
+                                    .get(0)
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                            );
                         }
 
                         allele_mappings[target_idx] = Some(mapping);
@@ -163,6 +179,22 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                         }
                         if mapping.alleles_swapped {
                             n_allele_swapped += 1;
+                            eprintln!(
+                                "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
+                                target_marker.pos,
+                                target_marker.ref_allele,
+                                target_marker
+                                    .alt_alleles
+                                    .get(0)
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                ref_marker.ref_allele,
+                                ref_marker
+                                    .alt_alleles
+                                    .get(0)
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                            );
                         }
 
                         allele_mappings[target_idx] = Some(mapping);
@@ -228,6 +260,22 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                         }
                         if mapping.alleles_swapped {
                             stats.allele_swapped += 1;
+                            eprintln!(
+                                "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
+                                target_marker.pos,
+                                target_marker.ref_allele,
+                                target_marker
+                                    .alt_alleles
+                                    .get(0)
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                ref_marker.ref_allele,
+                                ref_marker
+                                    .alt_alleles
+                                    .get(0)
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                            );
                         }
                         allele_mappings[m] = Some(mapping);
                         stats.aligned += 1;

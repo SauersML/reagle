@@ -806,13 +806,12 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
             let start = m_rev * active_states;
             let ref_slice = &mut ws.state_alleles[..active_states];
             let fwd_slice = &ws.fwd_history[start..start + active_states];
-            if !(pass == 0 && uniform) {
-                ref_columns[m_rev].fill_ref_alleles(
-                    &state_hap_idx,
-                    ref_slice,
-                    &mut ws.dict_pattern_alleles,
-                );
-            }
+            // Always refresh ref alleles for posterior calculation, even if emissions are uniform.
+            ref_columns[m_rev].fill_ref_alleles(
+                &state_hap_idx,
+                ref_slice,
+                &mut ws.dict_pattern_alleles,
+            );
 
             if is_final {
                 // Compute posteriors using beta at time t (current ws.bwd), before updating
