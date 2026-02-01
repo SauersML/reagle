@@ -6751,7 +6751,123 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    // Heuristic: if no initial paths, try to find a consistent pair in neighbors
+    // to break symmetry and avoid "Mosaic Traps".
+    let mut heuristic_paths: Option<MosaicPaths> = None;
+    if initial_paths.is_none() && n_markers <= 500 {
+        let mut best_score = -1.0;
+        let mut best_pair = None;
+        let informative_threshold = 0.9;
+
+        let mut informative = 0;
+        for m in 0..n_markers {
+            if seq1[m] != 255 || seq2[m] != 255 {
+                informative += 1;
+            }
+        }
+        let threshold = informative as f32 * informative_threshold;
+
+        if informative > 0 {
+            // Check top K neighbors (e.g. top 16 to keep it fast O(K^2))
+            let k = neighbors.len().min(16);
+            for i in 0..k {
+                let h1 = neighbors[i];
+                for j in 0..i {
+                    // strictly lower triangle
+                    let h2 = neighbors[j];
+
+                    let mut score = 0.0;
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 && a2 == 255 {
+                            continue;
+                        }
+
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+
+                        let match_direct = (r1 == a1 && r2 == a2)
+                            || (r1 == a1 && a2 == 255)
+                            || (r1 == 255 && r2 == a2);
+                        let match_flip = (r1 == a2 && r2 == a1)
+                            || (r1 == a2 && a1 == 255)
+                            || (r1 == 255 && r2 == a1);
+
+                        // For hets, we need one of the two phases to match
+                        if a1 != a2 && a1 != 255 && a2 != 255 {
+                            if match_direct || match_flip {
+                                score += 1.0;
+                            } else {
+                                score -= 1.0;
+                            }
+                        } else {
+                            // Hom or missing
+                            if match_direct {
+                                score += 1.0;
+                            } else {
+                                score -= 1.0;
+                            }
+                        }
+                    }
+
+                    if score > best_score {
+                        best_score = score;
+                        best_pair = Some((h1, h2));
+                    }
+                }
+            }
+        }
+
+        if best_score >= threshold {
+            if let Some((h1, h2)) = best_pair {
+                heuristic_paths = Some(MosaicPaths {
+                    path1: vec![h1; n_markers],
+                    path2: vec![h2; n_markers],
+                });
+                // Also update h1_alleles and h2_alleles
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 && a2 == 255 {
+                        continue;
+                    }
+                    if a1 == a2 {
+                        continue;
+                    }
+
+                    let r1 = phase_ibs.allele(m, h1);
+                    let r2 = phase_ibs.allele(m, h2);
+
+                    // If matches orientation 1: r1==a1, r2==a2
+                    let matches_orient1 = (r1 == a1 && r2 == a2)
+                        || (r1 == a1 && a2 == 255)
+                        || (r1 == 255 && r2 == a2);
+                    // If matches orientation 2: r1==a2, r2==a1
+                    let matches_orient2 = (r1 == a2 && r2 == a1)
+                        || (r1 == a2 && a1 == 255)
+                        || (r1 == 255 && r2 == a1);
+
+                    if matches_orient1 && !matches_orient2 {
+                        h1_alleles[m] = a1;
+                        h2_alleles[m] = a2;
+                    } else if matches_orient2 && !matches_orient1 {
+                        h1_alleles[m] = a2;
+                        h2_alleles[m] = a1;
+                    }
+                }
+                // Ensure neighbors used for first step include the best pair
+                if !neighbors.contains(&h1) {
+                    neighbors.push(h1);
+                }
+                if !neighbors.contains(&h2) {
+                    neighbors.push(h2);
+                }
+            }
+        }
+    }
+
+    if let Some(paths) = initial_paths.or(heuristic_paths.as_ref()) {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
