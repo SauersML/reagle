@@ -138,7 +138,7 @@ fn test_ser_switching_all0_all1_reference() {
     config.gt = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone(); // Reagle will likely append .vcf.gz
-    config.phase_states = 20; // Small state budget; ambiguity in the setup is the primary driver.
+    config.phase_states = 0; // Auto state budget.
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
@@ -296,7 +296,7 @@ fn test_ser_switching_all0_all1_reference_dense_map() {
     config.gt = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone();
-    config.phase_states = 20;
+    config.phase_states = 0;
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
@@ -405,7 +405,7 @@ fn test_ser_not_fixed_by_high_state_count_all0_all1() {
     config.gt = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone();
-    config.phase_states = 200;
+    config.phase_states = 0;
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
@@ -548,7 +548,7 @@ fn test_sparse_phased_anchors_dense_map_still_switches() {
     config.gt = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone();
-    config.phase_states = 20;
+    config.phase_states = 0;
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
@@ -691,7 +691,7 @@ fn test_sparse_phased_anchors_do_not_cause_switching() {
     config.gt = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone();
-    config.phase_states = 20; // Same low value as original failing test
+    config.phase_states = 0;
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
@@ -804,7 +804,7 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
     config.gt = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone();
-    config.phase_states = 30;
+    config.phase_states = 0;
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
@@ -911,7 +911,7 @@ fn test_symmetric_evidence_phase_confidence_low() {
     let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
 
     let mut config = Config::default();
-    config.phase_states = 20;
+    config.phase_states = 0;
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);

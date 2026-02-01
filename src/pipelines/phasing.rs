@@ -81,6 +81,8 @@ const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 8;
 const PBWT_ANCHOR_TOP_HAPS: usize = 32;
 const SCAN_RAM_FRACTION: f64 = 0.10;
+const PHASE_RAM_FRACTION: f64 = 0.15;
+const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
 
@@ -228,6 +230,24 @@ fn available_memory_bytes() -> Option<u64> {
     } else {
         None
     }
+}
+
+fn estimate_phase_state_budget(
+    available_bytes: u64,
+    n_threads: usize,
+    window_markers: usize,
+) -> usize {
+    if available_bytes == 0 || n_threads == 0 || window_markers == 0 {
+        return 0;
+    }
+    let per_state_bytes = 16usize.saturating_add(window_markers.saturating_mul(5));
+    if per_state_bytes == 0 {
+        return 0;
+    }
+    let budget = (available_bytes as f64 * PHASE_RAM_FRACTION) as u64;
+    let per_thread = budget / n_threads.max(1) as u64;
+    let safe_bytes = (per_thread as f64 * PHASE_STATE_BUDGET_SAFETY) as u64;
+    (safe_bytes as usize) / per_state_bytes
 }
 
 fn estimate_scan_batch_size(available_bytes: u64, n_ref_haps: usize, n_target_haps: usize) -> usize {
@@ -2732,7 +2752,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let telemetry_snapshot = self.telemetry.as_ref().map(|bb| bb.snapshot());
         let n_haps = target_geno.n_haps();
         let n_ref_haps = ref_gt.map(|r| r.n_haplotypes()).unwrap_or(n_haps).max(1);
-        let per_window_cap = self.config.phase_states.min(n_ref_haps).max(1);
         let step_cm = PBWT_SELECT_BLOCK_CM.max(step_cm as f64);
 
         let window_blocks = partition_markers_by_cm(gen_positions, stage1_block_cm(gen_positions));
@@ -2740,6 +2759,45 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             return Err(crate::error::ReagleError::vcf(
                 "Pre-scan produced no windows for phasing".to_string(),
             ));
+        }
+        let window_markers_est = window_blocks
+            .iter()
+            .map(|(s, e)| e.saturating_sub(*s))
+            .max()
+            .unwrap_or(STAGE1_BLOCK_MIN_MARKERS)
+            .max(1);
+        let mut n_threads = self
+            .config
+            .nthreads
+            .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+            .unwrap_or(1);
+        let mut avail_bytes = available_memory_bytes().unwrap_or(0);
+        if avail_bytes < MIN_AVAIL_BYTES_FOR_PLANNING {
+            avail_bytes = 0;
+        }
+        let mut auto_budget = estimate_phase_state_budget(avail_bytes, n_threads, window_markers_est);
+        while auto_budget < 64 && n_threads > 1 {
+            n_threads = (n_threads / 2).max(1);
+            auto_budget = estimate_phase_state_budget(avail_bytes, n_threads, window_markers_est);
+        }
+        let mut per_window_cap = if self.config.phase_states == 0 {
+            if avail_bytes == 0 || auto_budget == 0 {
+                n_ref_haps
+            } else {
+                auto_budget.max(1)
+            }
+        } else {
+            self.config.phase_states
+        };
+        per_window_cap = per_window_cap.min(n_ref_haps).max(1);
+        if self.config.phase_states == 0 {
+            eprintln!(
+                "Phasing prescan: per_window_cap={} threads={} available_mb={} window_markers={}",
+                per_window_cap,
+                n_threads,
+                avail_bytes / (1024 * 1024),
+                window_markers_est
+            );
         }
         let num_windows = window_blocks.len();
 

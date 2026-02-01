@@ -70,8 +70,8 @@ pub struct Config {
     #[arg(long = "mcmc-lr-samples", default_value = "32")]
     pub mcmc_lr_samples: usize,
 
-    /// Model states for phasing (more states = better accuracy)
-    #[arg(long = "phase-states", default_value = "400")]
+    /// Model states for phasing (0 = auto by memory budget)
+    #[arg(long = "phase-states", default_value = "0")]
     pub phase_states: usize,
 
     /// Rare variant frequency threshold
@@ -169,7 +169,7 @@ impl Default for Config {
             dynamic_mcmc: false,
             mcmc_steps: 3,
             mcmc_lr_samples: 32,
-            phase_states: 400,
+            phase_states: 0,
             rare: 0.002,
             impute: true,
             imp_states: 1600,
