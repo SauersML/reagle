@@ -79,7 +79,7 @@ const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
@@ -3119,6 +3119,55 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     eprintln!("[prescan] watch_hap={} present={}", h, found);
                 }
             }
+            let allocation = allocate_lms_sparse(
+                &scores_by_hap,
+                &candidate_haps,
+                num_windows,
+                &boundary_cm,
+                &self.params,
+                n_ref_haps,
+                global_slot_budget,
+                &per_window_caps,
+            );
+
+            let mut selected: Vec<usize> =
+                allocation.intervals_by_hap.into_iter().map(|(h, _)| h).collect();
+            selected.sort_unstable();
+            selected.dedup();
+            if PBWT_FORCE_TOP_HAPS > 0 && !window_scores.is_empty() {
+                for &idx in &touched_indices {
+                    dense_merge_buffer[idx] = f32::NEG_INFINITY;
+                }
+                touched_indices.clear();
+                for list in &window_scores {
+                    for &(h, score) in list {
+                        if h >= dense_merge_buffer.len() {
+                            continue;
+                        }
+                        let current = &mut dense_merge_buffer[h];
+                        if current.is_finite() {
+                            if score > *current {
+                                *current = score;
+                            }
+                        } else {
+                            *current = score;
+                            touched_indices.push(h);
+                        }
+                    }
+                }
+                touched_indices.sort_by(|&a, &b| {
+                    dense_merge_buffer[b]
+                        .partial_cmp(&dense_merge_buffer[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let take = PBWT_FORCE_TOP_HAPS.min(touched_indices.len());
+                for &h in touched_indices.iter().take(take) {
+                    if !selected.contains(&h) {
+                        selected.push(h);
+                    }
+                }
+            }
+
             if ref_has_panel && PBWT_ANCHOR_TOP_HAPS > 0 {
                 let hap1 = s * 2;
                 let hap2 = s * 2 + 1;
@@ -3170,58 +3219,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
                     let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
                     for &h in idxs.iter().take(take) {
-                        if !candidate_haps.contains(&h) {
-                            candidate_haps.push(h);
-                            scores_by_hap.push(Vec::new());
+                        if !selected.contains(&h) {
+                            selected.push(h);
                         }
-                    }
-                }
-            }
-            let allocation = allocate_lms_sparse(
-                &scores_by_hap,
-                &candidate_haps,
-                num_windows,
-                &boundary_cm,
-                &self.params,
-                n_ref_haps,
-                global_slot_budget,
-                &per_window_caps,
-            );
-
-            let mut selected: Vec<usize> =
-                allocation.intervals_by_hap.into_iter().map(|(h, _)| h).collect();
-            selected.sort_unstable();
-            selected.dedup();
-            if PBWT_FORCE_TOP_HAPS > 0 && !window_scores.is_empty() {
-                for &idx in &touched_indices {
-                    dense_merge_buffer[idx] = f32::NEG_INFINITY;
-                }
-                touched_indices.clear();
-                for list in &window_scores {
-                    for &(h, score) in list {
-                        if h >= dense_merge_buffer.len() {
-                            continue;
-                        }
-                        let current = &mut dense_merge_buffer[h];
-                        if current.is_finite() {
-                            if score > *current {
-                                *current = score;
-                            }
-                        } else {
-                            *current = score;
-                            touched_indices.push(h);
-                        }
-                    }
-                }
-                touched_indices.sort_by(|&a, &b| {
-                    dense_merge_buffer[b]
-                        .partial_cmp(&dense_merge_buffer[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let take = PBWT_FORCE_TOP_HAPS.min(touched_indices.len());
-                for &h in touched_indices.iter().take(take) {
-                    if !selected.contains(&h) {
-                        selected.push(h);
                     }
                 }
             }
