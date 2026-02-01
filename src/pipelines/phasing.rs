@@ -4224,6 +4224,30 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 }
                             }
                         }
+                        if s == 0 && n_hi_freq <= 12 {
+                            let mut rows = Vec::with_capacity(n_hi_freq);
+                            for i in 0..n_hi_freq {
+                                let a1 = seq1[i];
+                                let a2 = seq2[i];
+                                let (ref1, ref2) = if let Some(ref paths) = new_paths {
+                                    if paths.path1.len() == n_hi_freq && paths.path2.len() == n_hi_freq
+                                    {
+                                        let h1 = paths.path1[i].as_u32();
+                                        let h2 = paths.path2[i].as_u32();
+                                        (
+                                            subset_view.allele(MarkerIdx::new(i as u32), HapIdx::new(h1)),
+                                            subset_view.allele(MarkerIdx::new(i as u32), HapIdx::new(h2)),
+                                        )
+                                    } else {
+                                        (255, 255)
+                                    }
+                                } else {
+                                    (255, 255)
+                                };
+                                rows.push((i, a1, a2, ref1, ref2, swap_mask[i]));
+                            }
+                            eprintln!("[swap debug] i a1 a2 ref1 ref2 swap={:?}", rows);
+                        }
 
                         let het_lr_values: Vec<(usize, f32)> = het_positions
                             .iter()

@@ -857,7 +857,23 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
         }
     }
 
+    if n_markers <= 20 {
+        println!("[small_panel_ser] hero_pattern={:?}", hero_pattern);
+        println!("[small_panel_ser] phased_haps={:?}", phased_haps);
+        let mut match_trace = Vec::with_capacity(n_markers);
+        for m in 0..n_markers {
+            let (h1, h2) = phased_haps[m];
+            match_trace.push((m, h1, h2, hero_pattern[m]));
+        }
+        println!("[small_panel_ser] match_trace={:?}", match_trace);
+    }
+
     let ser = switch_errors as f32 / (n_markers - 1) as f32;
+
+    println!(
+        "[small_panel_ser] markers={} switch_errors={} ser={:.4}",
+        n_markers, switch_errors, ser
+    );
 
     assert!(ser < 0.15, "SER too high in small panel: {:.4}", ser);
 }
