@@ -3451,13 +3451,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
 
                     for (m, p_orient) in het_phase_values {
-                        // The HMM returns probability of SWAP.
-                        // Phase confidence is max(p, 1-p).
-                        // If p=0 (confident no swap), conf=1.0.
-                        // If p=1 (confident swap), conf=1.0.
-                        // If p=0.5 (uncertain), conf=0.5.
-                        let conf = p_orient.max(1.0 - p_orient);
-                        sp.set_phase_confidence(m, conf);
+                        sp.set_phase_confidence(m, p_orient);
                     }
 
                     let lr_threshold = self.params.lr_threshold;
@@ -7249,7 +7243,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
 
-    if !has_anchor {
+    // Only run the secondary "twin" chain if we lack both anchors AND a starting path.
+    // If we have a start path (e.g. from heuristic), it has already broken symmetry,
+    // so running the twin chain would just restore symmetry and degrade confidence to 0.5.
+    if !has_anchor && start_paths.is_none() {
         let flipped_paths =
             if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
                 Some(MosaicPaths {
