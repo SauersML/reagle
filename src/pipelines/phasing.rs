@@ -6754,8 +6754,10 @@ fn sample_dynamic_mcmc(
             let mut best_score = f32::NEG_INFINITY;
             let mut best_pair = None;
 
-            // Scan all pairs of initial neighbors
-            for (i, &h1) in initial_neighbors.iter().enumerate() {
+            // Scan all pairs of initial neighbors (limit to top 16 for stability and speed)
+            // Limiting to 16 ensures that varying phase_states (e.g. 20 vs 200) doesn't
+            // change the heuristic outcome, provided phase_states >= 16.
+            for (i, &h1) in initial_neighbors.iter().enumerate().take(16) {
                 for &h2 in initial_neighbors.iter().take(i) {
                     let mut score = 0.0;
                     for m in 0..n_markers {
@@ -7720,7 +7722,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Skip the secondary (flipped) chain if we have an anchor OR if we started with
     // a high-quality heuristic path (start_paths is Some).
     // Averaging symmetric modes degrades confidence if we already have a good guess.
-    if !has_anchor && start_paths.is_none() {
+    if !has_anchor {
         let flipped_paths =
             if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
                 Some(MosaicPaths {
