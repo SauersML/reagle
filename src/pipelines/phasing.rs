@@ -79,6 +79,7 @@ const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 8;
+const PBWT_ANCHOR_TOP_HAPS: usize = 32;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
@@ -2642,6 +2643,51 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             ref_index_map.as_deref(),
             n_markers,
         );
+        let phase_mask = target_gt.phase_mask();
+        let mut anchors_by_hap: Vec<Vec<(usize, u8, u8)>> = vec![Vec::new(); n_haps];
+        let mut ref_col_for_marker = vec![usize::MAX; n_markers];
+        if ref_gt.is_some() {
+            if let Some(ref_gt) = ref_gt {
+                let n_ref_markers = ref_gt.n_markers();
+                for m in 0..n_markers {
+                    let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
+                    if let Some(alignment) = alignment {
+                        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                            if let Some(map) = &ref_index_map {
+                                let idx = map.get(ref_m.as_usize()).copied().unwrap_or(usize::MAX);
+                                ref_col_for_marker[m] = idx;
+                            }
+                        }
+                    } else if orig_m < n_ref_markers {
+                        if let Some(map) = &ref_index_map {
+                            let idx = map.get(orig_m).copied().unwrap_or(usize::MAX);
+                            ref_col_for_marker[m] = idx;
+                        }
+                    }
+                }
+            }
+            for s in 0..(n_haps / 2) {
+                let hap1 = s * 2;
+                let hap2 = s * 2 + 1;
+                for m in 0..n_markers {
+                    let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
+                    let phased = phase_mask
+                        .and_then(|mask| mask.get(orig_m).and_then(|row| row.get(s)))
+                        .copied()
+                        .unwrap_or(0);
+                    if phased == 0 {
+                        continue;
+                    }
+                    let a1 = target_geno.get(orig_m, HapIdx::new(hap1 as u32));
+                    let a2 = target_geno.get(orig_m, HapIdx::new(hap2 as u32));
+                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                        continue;
+                    }
+                    anchors_by_hap[hap1].push((m, a1, a2));
+                    anchors_by_hap[hap2].push((m, a2, a1));
+                }
+            }
+        }
         let avail = available_memory_bytes().unwrap_or(0);
         let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_haps).max(1);
         let batches_per_window = (n_haps + batch_size - 1) / batch_size;
@@ -2796,7 +2842,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
 
             let abyss = vec![false; n_ref_haps];
-            let (candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
+            let (mut candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
             if s == 0 {
                 eprintln!(
                     "[prescan] sample={} candidate_haps={} windows={}",
@@ -2807,6 +2853,63 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 for &h in &debug_watch {
                     let found = candidate_haps.iter().any(|&c| c == h);
                     eprintln!("[prescan] watch_hap={} present={}", h, found);
+                }
+            }
+            if ref_has_panel && PBWT_ANCHOR_TOP_HAPS > 0 {
+                let hap1 = s * 2;
+                let hap2 = s * 2 + 1;
+                let mut anchor_scores = vec![0i32; n_ref_haps];
+                for &(start, end) in &window_blocks {
+                    let mut window_anchors: Vec<(usize, u8, u8)> = Vec::new();
+                    if let Some(list) = anchors_by_hap.get(hap1) {
+                        for &(m, a1, a2) in list {
+                            if m >= start && m < end {
+                                window_anchors.push((m, a1, a2));
+                            }
+                        }
+                    }
+                    if let Some(list) = anchors_by_hap.get(hap2) {
+                        for &(m, a1, a2) in list {
+                            if m >= start && m < end {
+                                window_anchors.push((m, a1, a2));
+                            }
+                        }
+                    }
+                    if window_anchors.is_empty() {
+                        continue;
+                    }
+                    anchor_scores.fill(0);
+                    for h in 0..n_ref_haps {
+                        let hap_idx = HapIdx::new(h as u32);
+                        let mut score = 0i32;
+                        for (m, a1, _) in &window_anchors {
+                            let ref_col_idx = ref_col_for_marker[*m];
+                            if ref_col_idx == usize::MAX {
+                                continue;
+                            }
+                            let ref_al = ref_columns
+                                .get(ref_col_idx)
+                                .map(|c| c.get(hap_idx))
+                                .unwrap_or(255);
+                            if ref_al == 255 {
+                                continue;
+                            }
+                            if ref_al == *a1 {
+                                score += 1;
+                            } else {
+                                score -= 1;
+                            }
+                        }
+                        anchor_scores[h] = score;
+                    }
+                    let mut idxs: Vec<usize> = (0..n_ref_haps).collect();
+                    idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
+                    let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
+                    for &h in idxs.iter().take(take) {
+                        if !candidate_haps.contains(&h) {
+                            candidate_haps.push(h);
+                        }
+                    }
                 }
             }
             let allocation = allocate_lms_sparse(
@@ -3720,38 +3823,91 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let mut swap_mask = vec![false; n_hi_freq];
-                        let mut current_phase = 0u8;
-                        let mut phase_idx = 0usize;
                         let mut anchor_resets = 0usize;
+                        let mut p_swap = vec![0.5f32; n_hi_freq];
+                        for (idx, &pos) in het_positions.iter().enumerate() {
+                            let p_orient = swap_probs.get(idx).copied().unwrap_or(0.5);
+                            let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
+                            let p = if swap_bit == 1 { p_orient } else { 1.0 - p_orient };
+                            p_swap[pos] = p.clamp(0.0, 1.0);
+                        }
+                        let mut forced_orient: Vec<Option<u8>> = vec![None; n_hi_freq];
                         for i in 0..n_hi_freq {
                             let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
                             let a2 = seq2[i];
                             let is_het = a1 != 255 && a2 != 255 && a1 != a2;
                             let is_phased_het = is_het && !sp.is_unphased(m);
-
-                            // Phased heterozygotes are anchors: do not swap them and
-                            // do not propagate swap state across them.
                             if is_phased_het {
                                 let a1_anchor = sp.allele1(m);
                                 let a2_anchor = sp.allele2(m);
-                                current_phase = if a1 == a1_anchor && a2 == a2_anchor {
+                                let orient = if a1 == a1_anchor && a2 == a2_anchor {
                                     0
                                 } else if a1 == a2_anchor && a2 == a1_anchor {
                                     1
                                 } else {
                                     0
                                 };
-                                swap_mask[i] = current_phase == 1;
+                                forced_orient[i] = Some(orient);
                                 anchor_resets += 1;
-                                continue;
                             }
+                        }
+                        // Viterbi over orientation with anchor constraints.
+                        if n_hi_freq > 0 {
+                            let mut dp0 = vec![0.0f32; n_hi_freq];
+                            let mut dp1 = vec![0.0f32; n_hi_freq];
+                            let mut prev0 = vec![0u8; n_hi_freq];
+                            let mut prev1 = vec![0u8; n_hi_freq];
 
-                            if phase_idx < het_positions.len() && het_positions[phase_idx] == i {
-                                current_phase = swap_bits.get(phase_idx).copied().unwrap_or(0);
-                                phase_idx += 1;
+                            let emit0 = (1.0 - p_swap[0]).clamp(1e-6, 1.0);
+                            let emit1 = p_swap[0].clamp(1e-6, 1.0);
+                            let (e0, e1) = match forced_orient[0] {
+                                Some(0) => (emit0, 1e-12),
+                                Some(1) => (1e-12, emit1),
+                                _ => (emit0, emit1),
+                            };
+                            dp0[0] = e0.ln();
+                            dp1[0] = e1.ln();
+
+                            for i in 1..n_hi_freq {
+                                let r = stage1_p_recomb.get(i).copied().unwrap_or(0.0).clamp(1e-6, 1.0);
+                                let stay = (1.0 - r).clamp(1e-6, 1.0);
+                                let switch = r;
+                                let emit0 = (1.0 - p_swap[i]).clamp(1e-6, 1.0);
+                                let emit1 = p_swap[i].clamp(1e-6, 1.0);
+                                let (e0, e1) = match forced_orient[i] {
+                                    Some(0) => (emit0, 1e-12),
+                                    Some(1) => (1e-12, emit1),
+                                    _ => (emit0, emit1),
+                                };
+                                let stay0 = dp0[i - 1] + stay.ln();
+                                let sw0 = dp1[i - 1] + switch.ln();
+                                if stay0 >= sw0 {
+                                    dp0[i] = stay0 + e0.ln();
+                                    prev0[i] = 0;
+                                } else {
+                                    dp0[i] = sw0 + e0.ln();
+                                    prev0[i] = 1;
+                                }
+                                let stay1 = dp1[i - 1] + stay.ln();
+                                let sw1 = dp0[i - 1] + switch.ln();
+                                if stay1 >= sw1 {
+                                    dp1[i] = stay1 + e1.ln();
+                                    prev1[i] = 1;
+                                } else {
+                                    dp1[i] = sw1 + e1.ln();
+                                    prev1[i] = 0;
+                                }
                             }
-                            swap_mask[i] = current_phase == 1;
+                            let mut state = if dp1[n_hi_freq - 1] > dp0[n_hi_freq - 1] {
+                                1u8
+                            } else {
+                                0u8
+                            };
+                            for i in (0..n_hi_freq).rev() {
+                                swap_mask[i] = state == 1;
+                                state = if state == 0 { prev0[i] } else { prev1[i] };
+                            }
                         }
 
                         eprintln!(
@@ -6908,6 +7064,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
     let mut swap_probs = Vec::with_capacity(het_positions.len());
+    let mut obs_zero = 0usize;
+    let mut p_min = 1.0f32;
+    let mut p_max = 0.0f32;
+    let mut p_sum = 0.0f32;
     for (i, &m) in het_positions.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
@@ -6915,6 +7075,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
             swap_bits.push(0);
             swap_lr.push(1.0);
             swap_probs.push(0.5);
+            if obs_counts[i] == 0 {
+                obs_zero += 1;
+            }
             continue;
         }
 
@@ -6935,6 +7098,36 @@ fn sample_swap_bits_mosaic<RefSpace>(
         swap_lr.push(lr);
         let p_orient = if chosen_swap { p_swap } else { p_keep };
         swap_probs.push(p_orient.clamp(0.0, 1.0));
+        let p = p_orient.clamp(0.0, 1.0);
+        p_min = p_min.min(p);
+        p_max = p_max.max(p);
+        p_sum += p;
+    }
+    if !het_positions.is_empty() {
+        let denom = (het_positions.len().saturating_sub(obs_zero)).max(1) as f32;
+        let mean = p_sum / denom;
+        eprintln!(
+            "[swap stats] hets={} obs0={} p_min={:.3} p_mean={:.3} p_max={:.3} anchors={}",
+            het_positions.len(),
+            obs_zero,
+            p_min,
+            mean,
+            p_max,
+            chain_anchor_hap1.iter().filter(|&&a| a != 255).count()
+        );
+        if n_markers <= 60 {
+            let limit = het_positions.len().min(12);
+            for i in 0..limit {
+                let m = het_positions[i];
+                eprintln!(
+                    "[swap stats] m={} obs={} swap_ct={} p={:.3}",
+                    m,
+                    obs_counts[i],
+                    swap_counts[i],
+                    swap_probs[i]
+                );
+            }
+        }
     }
 
     // Return buffers to workspace for reuse
