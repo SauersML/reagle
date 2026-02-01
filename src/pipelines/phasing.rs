@@ -6387,9 +6387,99 @@ fn sample_dynamic_mcmc(
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
         }
-    } else if let Some(&seed_hap) = neighbors.first() {
-        path1_ref.fill(seed_hap);
-        path2_ref.fill(seed_hap);
+    } else {
+        // Attempt to find a constant pair among initial_neighbors that explains the data
+        // This heuristic breaks symmetry in perfect-match scenarios (e.g. 0|0 vs 1|1)
+        let n_neigh = neighbors.len();
+        let mut found_heuristic = false;
+
+        if n_neigh >= 2 {
+            let mut best_score = -1.0f32;
+            let mut best_pair = (0, 1);
+            let mut informative = 0;
+
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 != 255 && a2 != 255 {
+                    informative += 1;
+                }
+            }
+
+            if informative > 0 {
+                for i in 0..n_neigh {
+                    let h1 = neighbors[i];
+                    for j in 0..i {
+                        let h2 = neighbors[j];
+                        let mut score = 0.0;
+                        for m in 0..n_markers {
+                            let a1 = seq1[m];
+                            let a2 = seq2[m];
+                            if a1 == 255 && a2 == 255 {
+                                continue;
+                            }
+                            let r1 = phase_ibs.allele(m, h1);
+                            let r2 = phase_ibs.allele(m, h2);
+
+                            if r1 == 255 || r2 == 255 {
+                                continue;
+                            }
+
+                            // Compatible if (r1,r2) matches (a1,a2) or (a2,a1)
+                            // Note: if a1==a2, then r1==a1 and r2==a1 is required.
+                            let match1 = r1 == a1 && r2 == a2;
+                            let match2 = r1 == a2 && r2 == a1;
+
+                            if match1 || match2 {
+                                score += 1.0;
+                            } else {
+                                score -= 1.0;
+                            }
+                        }
+                        if score > best_score {
+                            best_score = score;
+                            best_pair = (i, j);
+                        }
+                    }
+                }
+
+                let threshold = 0.9 * (informative as f32);
+                if best_score >= threshold && n_markers <= 500 {
+                    let h1 = neighbors[best_pair.0];
+                    let h2 = neighbors[best_pair.1];
+
+                    path1_ref.fill(h1);
+                    path2_ref.fill(h2);
+                    found_heuristic = true;
+
+                    // Apply phase constraints from heuristic
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                            continue;
+                        }
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+
+                        if r1 == a1 && r2 == a2 {
+                            h1_alleles[m] = a1;
+                            h2_alleles[m] = a2;
+                        } else if r1 == a2 && r2 == a1 {
+                            h1_alleles[m] = a2;
+                            h2_alleles[m] = a1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found_heuristic {
+            if let Some(&seed_hap) = neighbors.first() {
+                path1_ref.fill(seed_hap);
+                path2_ref.fill(seed_hap);
+            }
+        }
     }
 
     fn mix_neighbors(
