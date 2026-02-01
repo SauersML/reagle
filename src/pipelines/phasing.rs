@@ -2244,6 +2244,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .collect()
             };
 
+        let ibs2 = if self.config.dynamic_mcmc {
+            Some(Ibs2::new(target_gt, gen_maps, chrom, &maf))
+        } else {
+            None
+        };
+
         let n_burnin = self.config.burnin.min(3);
         let n_iterations = self.config.iterations.min(6);
         let total_iterations = n_burnin + n_iterations;
@@ -2309,6 +2315,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &mut mcmc_paths,
                 atomic_estimates.as_ref(),
                 &confidence_by_sample,
+                ibs2.as_ref(),
             )?;
             if let Some(bb) = &self.telemetry {
                 bb.set_samples_processed(n_samples as u64);
@@ -2586,18 +2593,50 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         &self,
         geno: &MutableGenotypes,
         marker_indices: &[usize],
-        n_haps: usize,
+        n_target_haps: usize,
     ) -> BidirectionalPhaseIbs {
         let n_subset = marker_indices.len();
+        let n_ref_haps = self
+            .reference_gt
+            .as_ref()
+            .map(|r| r.n_haplotypes())
+            .unwrap_or(0);
+        let n_total_haps = n_target_haps + n_ref_haps;
+
         // Use bulk slice access instead of per-haplotype get() calls
         let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
 
         for &orig_m in marker_indices {
+            let mut alleles = Vec::with_capacity(n_total_haps);
+
+            // 1. Target alleles
             let marker_slice = geno.marker_alleles(orig_m);
-            alleles_by_marker.push(marker_slice[..n_haps].to_vec());
+            alleles.extend_from_slice(&marker_slice[..n_target_haps]);
+
+            // 2. Reference alleles (if any)
+            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                    let ref_col = ref_gt.column(ref_m);
+                    for rh in 0..n_ref_haps {
+                        let ref_a = ref_col.get(HapIdx::new(rh as u32));
+                        let mapped = alignment.reverse_map_allele(orig_m, ref_a);
+                        alleles.push(mapped);
+                    }
+                } else {
+                    // Marker not in reference: fill with missing/neutral
+                    alleles.resize(n_total_haps, 255);
+                }
+            }
+
+            alleles_by_marker.push(alleles);
         }
 
-        BidirectionalPhaseIbs::build_for_subset(alleles_by_marker, n_haps, n_subset, marker_indices)
+        BidirectionalPhaseIbs::build_for_subset(
+            alleles_by_marker,
+            n_total_haps,
+            n_subset,
+            marker_indices,
+        )
     }
 
     fn build_phasing_prescan_states<RefPanelSpace>(
@@ -3078,6 +3117,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         mcmc_paths: &mut [Option<GlobalMosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
+        ibs2: Option<&Ibs2>,
     ) -> Result<()> {
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
@@ -3171,6 +3211,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     );
                     n_samples
                 ];
+
+                let use_dynamic_mcmc = self.config.dynamic_mcmc && ibs2.is_some();
+                let phase_ibs = if use_dynamic_mcmc {
+                    let all_markers: Vec<usize> = (0..n_markers).collect();
+                    Some(self.build_bidirectional_pbwt_subset(ref_geno, &all_markers, n_haps))
+                } else {
+                    None
+                };
 
                 tracing::info_span!("hmm_samples").in_scope(|| {
                     swap_results
@@ -3317,15 +3365,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 atomic.add_estimation_data(&local_est);
                             }
 
-                            // 3-Track HMM with Prior-First Approach
-                            //
-                            // This implementation avoids the numerically unstable division workaround.
-                            // Instead, we:
-                            // 1. Run sparse backward passes, storing only at het positions
-                            // 2. Run forward with prior-first: compute transition before emission
-                            // 3. At hets: use prior (no emission) to evaluate both hypotheses
-                            // 4. Apply combined emission after decision for numerical stability
-
                             // Identify heterozygote positions first
                             let het_positions: Vec<usize> = (0..n_markers)
                                 .filter(|&m| {
@@ -3351,47 +3390,69 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     }
                                     let ws = workspace.as_mut().unwrap();
                                     ws.clear(); // Explicit reset between samples to prevent state contamination
-                                    let ref_provider =
+                                    let mut ref_provider =
                                         RefAlleleProvider::new(ref_view, &threaded_haps);
-                                    let (anchor_h1, anchor_h2) =
-                                        build_anchor_constraints(&sample_phase_view[s]);
 
-                                    let donor_blocks =
-                                        partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
-                                    let block_starts: Arc<[usize]> =
-                                        blocks_to_starts(&donor_blocks, n_markers)
-                                            .into_boxed_slice()
-                                            .into();
-                                    let result = sample_swap_bits_mosaic(
-                                        n_markers,
-                                        n_states,
-                                        p_recomb,
-                                        &seq1,
-                                        &seq2,
-                                        &sample_conf,
-                                        ref_provider,
-                                        Some(PlProvider {
-                                            gt: target_gt,
-                                            sample: s,
-                                            subset_to_orig: None,
-                                        }),
-                                        block_starts,
-                                        &het_positions,
-                                        if selection_applied {
-                                            None
-                                        } else {
-                                            local_prior.as_ref()
-                                        },
-                                        Some(&anchor_h1),
-                                        Some(&anchor_h2),
-                                        sample_seed,
-                                        self.config.mcmc_burnin,
-                                        self.config.mcmc_lr_samples,
-                                        p_no_err,
-                                        p_err,
-                                        ws,
-                                    );
-                                    result
+                                    if let (Some(ibs2), Some(phase_ibs)) = (ibs2, phase_ibs.as_ref()) {
+                                        sample_dynamic_mcmc(
+                                            n_markers,
+                                            n_states,
+                                            p_recomb,
+                                            &seq1,
+                                            &seq2,
+                                            &sample_conf,
+                                            phase_ibs,
+                                            ibs2,
+                                            s as u32,
+                                            &het_positions,
+                                            sample_seed,
+                                            self.config.mcmc_steps,
+                                            p_no_err,
+                                            p_err,
+                                            local_prior.as_ref(),
+                                            ws,
+                                            &mut ref_provider,
+                                        )
+                                    } else {
+                                        let (anchor_h1, anchor_h2) =
+                                            build_anchor_constraints(&sample_phase_view[s]);
+
+                                        let donor_blocks =
+                                            partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
+                                        let block_starts: Arc<[usize]> =
+                                            blocks_to_starts(&donor_blocks, n_markers)
+                                                .into_boxed_slice()
+                                                .into();
+                                        sample_swap_bits_mosaic(
+                                            n_markers,
+                                            n_states,
+                                            p_recomb,
+                                            &seq1,
+                                            &seq2,
+                                            &sample_conf,
+                                            ref_provider,
+                                            Some(PlProvider {
+                                                gt: target_gt,
+                                                sample: s,
+                                                subset_to_orig: None,
+                                            }),
+                                            block_starts,
+                                            &het_positions,
+                                            if selection_applied {
+                                                None
+                                            } else {
+                                                local_prior.as_ref()
+                                            },
+                                            Some(&anchor_h1),
+                                            Some(&anchor_h2),
+                                            sample_seed,
+                                            self.config.mcmc_burnin,
+                                            self.config.mcmc_lr_samples,
+                                            p_no_err,
+                                            p_err,
+                                            ws,
+                                        )
+                                    }
                                 });
                             if new_paths.path1.is_empty() {
                                 *paths_out = None;
@@ -3531,7 +3592,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 };
 
             // 2. Build bidirectional PBWT on high-frequency markers only
-            let use_dynamic_mcmc = self.config.dynamic_mcmc && self.reference_gt.is_none();
+            // Dynamic MCMC should be used if enabled, regardless of reference panel presence.
+            // The reference panel is now integrated into build_bidirectional_pbwt_subset.
+            let use_dynamic_mcmc = self.config.dynamic_mcmc;
             let phase_ibs = if use_dynamic_mcmc {
                 Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
             } else {
@@ -6350,10 +6413,33 @@ fn sample_dynamic_mcmc<RefSpace>(
 
     let start_paths = initial_paths.or(heuristic_paths.as_ref());
 
+    // Convert start paths from local state indices to global haplotype indices
+    let mut global_start_paths = None;
+    if let Some(paths) = start_paths {
+        if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
+            let mut p1 = vec![0u32; n_markers];
+            let mut p2 = vec![0u32; n_markers];
+            let mut state_buf = vec![GlobalId::from(0u32); n_states];
+
+            for m in 0..n_markers {
+                ref_provider.threaded_haps.materialize_at(m, &mut state_buf);
+                let s1 = paths.path1[m] as usize;
+                let s2 = paths.path2[m] as usize;
+                if s1 < n_states {
+                    p1[m] = state_buf[s1].as_u32();
+                }
+                if s2 < n_states {
+                    p2[m] = state_buf[s2].as_u32();
+                }
+            }
+            global_start_paths = Some(MosaicPaths { path1: p1, path2: p2 });
+        }
+    }
+
     // Seed alleles from initial paths if available (from heuristic)
     // This ensures MCMC starts in a high-probability region rather than drifting
     // from a random start.
-    if let Some(paths) = start_paths {
+    if let Some(paths) = global_start_paths.as_ref() {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             for m in 0..n_markers {
                 let a1 = seq1[m];
@@ -6411,7 +6497,7 @@ fn sample_dynamic_mcmc<RefSpace>(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = start_paths {
+    if let Some(paths) = global_start_paths.as_ref() {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
