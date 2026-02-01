@@ -3389,6 +3389,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 .iter()
                                 .copied()
                                 .zip(swap_probs.into_iter())
+                                .map(|(m, p)| (m, p.max(1.0 - p)))
                                 .collect();
                             assert!(swap_lr.len() <= n_markers);
                             assert!(het_phase_out.len() <= het_positions.len());
@@ -4840,7 +4841,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
                         }
 
-                        sp.set_phase_confidence(m, lr / (1.0 + lr));
+                        let final_conf = lr / (1.0 + lr);
+                        sp.set_phase_confidence(m, final_conf);
 
                         // Only mark as phased if likelihood ratio exceeds threshold
                         // (Stage 2 runs after iterations, so threshold is typically 1.0)
@@ -6303,7 +6305,7 @@ fn find_best_constant_pair_pbwt(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
+    let threshold = 0.9 * (informative as f32);
     if best_score < threshold || n_markers > HEURISTIC_MAX_MARKERS {
         return None;
     }
@@ -6789,7 +6791,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
 ) -> Option<MosaicPaths> {
-    if n_states < 2 {
+    if n_states < 2 || n_markers > HEURISTIC_MAX_MARKERS {
         return None;
     }
 
@@ -6866,8 +6868,8 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
-    if best_score < threshold || n_markers > HEURISTIC_MAX_MARKERS {
+    let threshold = 0.9 * (informative as f32);
+    if best_score < threshold {
         return None;
     }
 
@@ -6927,12 +6929,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
     workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
-    let anchor_h1 = anchor_hap1.unwrap_or(&[]);
-    let anchor_h2 = anchor_hap2.unwrap_or(&[]);
-    let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
-    // Attempt pairwise initialization if no initial paths provided
-    let mut heuristic_paths = if initial_paths.is_none() {
+    let start_paths = initial_paths;
+
+    // Attempt heuristic initialization if no start path
+    let heuristic_paths = if start_paths.is_none() {
         find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
@@ -6944,127 +6945,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     } else {
         None
     };
-
-    // Align heuristic orientation to anchors when present.
-    if has_anchor {
-        if let Some(paths) = heuristic_paths.as_mut() {
-            let mut score_direct: i32 = 0;
-            let mut score_flip: i32 = 0;
-            let ref_alleles = &mut workspace.ref_alleles;
-            for m in 0..n_markers {
-                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1 == 255 && a2 == 255 {
-                    continue;
-                }
-                ref_provider.fill_ref_alleles(m, ref_alleles);
-                let p1 = paths.path1[m] as usize;
-                let p2 = paths.path2[m] as usize;
-                if p1 >= n_states || p2 >= n_states {
-                    continue;
-                }
-                let r1 = ref_alleles[p1];
-                let r2 = ref_alleles[p2];
-                if a1 != 255 {
-                    if r1 == a1 {
-                        score_direct += 1;
-                    } else {
-                        score_direct -= 1;
-                    }
-                    if r2 == a1 {
-                        score_flip += 1;
-                    } else {
-                        score_flip -= 1;
-                    }
-                }
-                if a2 != 255 {
-                    if r2 == a2 {
-                        score_direct += 1;
-                    } else {
-                        score_direct -= 1;
-                    }
-                    if r1 == a2 {
-                        score_flip += 1;
-                    } else {
-                        score_flip -= 1;
-                    }
-                }
-            }
-            if score_flip > score_direct {
-                std::mem::swap(&mut paths.path1, &mut paths.path2);
-                eprintln!(
-                    "[anchor init] flipped heuristic paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
-            } else {
-                eprintln!(
-                    "[anchor init] kept heuristic paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
-            }
-        }
-    }
-
-    let mut start_paths = initial_paths.or(heuristic_paths.as_ref());
-    let mut start_paths_owned: Option<MosaicPaths> = None;
-    if has_anchor {
-        if let Some(paths) = start_paths {
-            let mut score_direct: i32 = 0;
-            let mut score_flip: i32 = 0;
-            let ref_alleles = &mut workspace.ref_alleles;
-            for m in 0..n_markers {
-                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1 == 255 && a2 == 255 {
-                    continue;
-                }
-                ref_provider.fill_ref_alleles(m, ref_alleles);
-                let p1 = paths.path1[m] as usize;
-                let p2 = paths.path2[m] as usize;
-                if p1 >= n_states || p2 >= n_states {
-                    continue;
-                }
-                let r1 = ref_alleles[p1];
-                let r2 = ref_alleles[p2];
-                if a1 != 255 {
-                    if r1 == a1 {
-                        score_direct += 1;
-                    } else {
-                        score_direct -= 1;
-                    }
-                    if r2 == a1 {
-                        score_flip += 1;
-                    } else {
-                        score_flip -= 1;
-                    }
-                }
-                if a2 != 255 {
-                    if r2 == a2 {
-                        score_direct += 1;
-                    } else {
-                        score_direct -= 1;
-                    }
-                    if r1 == a2 {
-                        score_flip += 1;
-                    } else {
-                        score_flip -= 1;
-                    }
-                }
-            }
-            if score_flip > score_direct {
-                let mut owned = paths.clone();
-                std::mem::swap(&mut owned.path1, &mut owned.path2);
-                start_paths_owned = Some(owned);
-                eprintln!(
-                    "[anchor init] flipped start paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
-            }
-        }
-    }
-    if start_paths_owned.is_some() {
-        start_paths = start_paths_owned.as_ref();
-    }
+    let start_paths = start_paths.or(heuristic_paths.as_ref());
 
     // Only build combined checkpoints if we don't have a start path
     // This optimization avoids the expensive Combined HMM step when we have a good guess
@@ -7283,9 +7164,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         (swap_counts, obs_counts, new_paths, returned)
     };
 
-    let ref_view = ref_provider.ref_gt;
-    let threaded_haps = ref_provider.threaded_haps;
-
     let buffers = MosaicBuffers {
         fwd: std::mem::replace(&mut workspace.fwd, aligned_vec::AVec::new(32)),
         fwd_prior: std::mem::replace(&mut workspace.fwd_prior, aligned_vec::AVec::new(32)),
@@ -7316,45 +7194,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
     };
 
     let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
-    let (swap_counts1, obs_counts1, new_paths, mut buffers) =
+    let (swap_counts, obs_counts, new_paths, buffers) =
         run_chain(chain_seed, start_paths, buffers, ref_provider);
-
-    let mut swap_counts = swap_counts1;
-    let mut obs_counts = obs_counts1;
-
-    if !has_anchor {
-        let flipped_paths =
-            if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
-                Some(MosaicPaths {
-                    path1: new_paths.path2.clone(),
-                    path2: new_paths.path1.clone(),
-                })
-            } else {
-                None
-            };
-
-        let chain_seed_2 = seed.wrapping_add(0xBAD_CAFE_F00Du64);
-        let ref_provider_2 = RefAlleleProvider::new(ref_view, threaded_haps);
-        let (swap_counts2, obs_counts2, paths2, buffers2) = run_chain(
-            chain_seed_2,
-            flipped_paths.as_ref(),
-            buffers,
-            ref_provider_2,
-        );
-        buffers = buffers2;
-        if paths2.path1.len() != n_markers || paths2.path2.len() != n_markers {
-            eprintln!(
-                "[mosaic paths] secondary chain path lengths: path1={} path2={}",
-                paths2.path1.len(),
-                paths2.path2.len()
-            );
-        }
-
-        for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
-            obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
-        }
-    }
 
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
