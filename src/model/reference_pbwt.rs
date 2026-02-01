@@ -82,6 +82,58 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     intervals_buf: Vec<(usize, usize)>,
 }
 
+#[repr(transparent)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct PbwtQueryAllele(u8);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct PbwtStrictAllele(u8);
+
+impl PbwtQueryAllele {
+    pub const WILDCARD_VALUE: u8 = 128;
+
+    pub fn allele(a: u8) -> Option<Self> {
+        if a <= 1 {
+            Some(Self(a))
+        } else {
+            None
+        }
+    }
+
+    pub fn missing() -> Self {
+        Self(255)
+    }
+
+    pub fn wildcard() -> Self {
+        Self(Self::WILDCARD_VALUE)
+    }
+
+    #[inline]
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+impl PbwtStrictAllele {
+    pub fn allele(a: u8) -> Option<Self> {
+        if a <= 1 {
+            Some(Self(a))
+        } else {
+            None
+        }
+    }
+
+    pub fn missing() -> Self {
+        Self(255)
+    }
+
+    #[inline]
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
 impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     pub fn new(n_ref_haps: usize) -> Self {
         Self {
@@ -260,16 +312,16 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         self.prefix_counts[Self::prefix_idx(bin, p, n_ref)]
     }
 
-    pub fn advance_with_beams(
+    pub fn advance_with_beams_query(
         &mut self,
         ref_alleles: &[u8],
         n_alleles: usize,
         marker: usize,
-        query_alleles: &[u8],
+        query_alleles: &[PbwtQueryAllele],
         beams: &mut [RankBeam],
     ) {
         let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
-        self.advance_with_beams_scratch(
+        self.advance_with_beams_query_scratch(
             ref_alleles,
             n_alleles,
             marker,
@@ -279,17 +331,51 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         );
     }
 
-    pub fn advance_with_beams_scratch(
+    pub fn advance_with_beams_strict(
         &mut self,
         ref_alleles: &[u8],
         n_alleles: usize,
         marker: usize,
-        query_alleles: &[u8],
+        query_alleles: &[PbwtStrictAllele],
+        beams: &mut [RankBeam],
+    ) {
+        let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
+        self.advance_with_beams_strict_scratch(
+            ref_alleles,
+            n_alleles,
+            marker,
+            query_alleles,
+            beams,
+            &mut scratch,
+        );
+    }
+
+
+    pub fn advance_with_beams_query_scratch(
+        &mut self,
+        ref_alleles: &[u8],
+        n_alleles: usize,
+        marker: usize,
+        query_alleles: &[PbwtQueryAllele],
         beams: &mut [RankBeam],
         scratch: &mut Vec<(u32, u32, u32)>,
     ) {
         self.prepare_step(ref_alleles, n_alleles);
-        self.update_beams_with_scratch(beams, query_alleles, n_alleles, scratch);
+        self.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch);
+        self.finalize_step(ref_alleles, n_alleles, marker);
+    }
+
+    pub fn advance_with_beams_strict_scratch(
+        &mut self,
+        ref_alleles: &[u8],
+        n_alleles: usize,
+        marker: usize,
+        query_alleles: &[PbwtStrictAllele],
+        beams: &mut [RankBeam],
+        scratch: &mut Vec<(u32, u32, u32)>,
+    ) {
+        self.prepare_step(ref_alleles, n_alleles);
+        self.update_beams_with_scratch_strict(beams, query_alleles, n_alleles, scratch);
         self.finalize_step(ref_alleles, n_alleles, marker);
     }
 
@@ -380,10 +466,11 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         }
     }
 
-    pub fn update_beams_with_scratch(
+
+    pub fn update_beams_with_scratch_query(
         &self,
         beams: &mut [RankBeam],
-        query_alleles: &[u8],
+        query_alleles: &[PbwtQueryAllele],
         n_alleles: usize,
         scratch: &mut Vec<(u32, u32, u32)>,
     ) {
@@ -394,6 +481,110 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             if q_idx >= beams.len() {
                 break;
             }
+            let qa = qa.value();
+            let old = beams[q_idx];
+            let mut next = RankBeam {
+                intervals: [(0, 0); MAX_RANK_INTERVALS],
+                len: 0,
+            };
+
+            if qa == PbwtQueryAllele::WILDCARD_VALUE {
+                scratch.clear();
+                for &(l, r) in old.intervals() {
+                    for &b in &[0usize, 2usize] {
+                        let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                        let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
+                        if nl < nr {
+                            let len = nr - nl;
+                            let score = len.saturating_mul(self.count_for(b, n_alleles));
+                            scratch.push((nl, nr, score));
+                        }
+                    }
+                }
+
+                scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                let keep = scratch.len().min(MAX_RANK_INTERVALS);
+                for i in 0..keep {
+                    next.intervals[i] = (scratch[i].0, scratch[i].1);
+                }
+                next.len = keep;
+            } else if qa == 255 {
+                scratch.clear();
+                for &(l, r) in old.intervals() {
+                    for b in 0..n_bins {
+                        let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                        let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
+                        if nl < nr {
+                            let len = nr - nl;
+                            let score = len.saturating_mul(self.count_for(b, n_alleles));
+                            scratch.push((nl, nr, score));
+                        }
+                    }
+                }
+
+                scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                let keep = scratch.len().min(MAX_RANK_INTERVALS);
+                for i in 0..keep {
+                    next.intervals[i] = (scratch[i].0, scratch[i].1);
+                }
+                next.len = keep;
+            } else {
+                let b = Self::bin_for_allele(qa, n_alleles);
+                if b < n_bins {
+                    for &(l, r) in old.intervals() {
+                        let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                        let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
+                        next.push_interval(nl, nr);
+                    }
+                } else {
+                    next = RankBeam::full(n_ref as u32);
+                }
+
+                if next.len == 0 {
+                    scratch.clear();
+                    for &(l, r) in old.intervals() {
+                        for b in 0..n_bins {
+                            let nl =
+                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                            let nr =
+                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
+                            if nl < nr {
+                                let len = nr - nl;
+                                let score = len.saturating_mul(self.count_for(b, n_alleles));
+                                scratch.push((nl, nr, score));
+                            }
+                        }
+                    }
+
+                    scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                    let keep = scratch.len().min(MAX_RANK_INTERVALS);
+                    for i in 0..keep {
+                        next.intervals[i] = (scratch[i].0, scratch[i].1);
+                    }
+                    next.len = keep;
+                }
+            }
+
+            next.normalize();
+            beams[q_idx] = next;
+        }
+    }
+
+    pub fn update_beams_with_scratch_strict(
+        &self,
+        beams: &mut [RankBeam],
+        query_alleles: &[PbwtStrictAllele],
+        n_alleles: usize,
+        scratch: &mut Vec<(u32, u32, u32)>,
+    ) {
+        let n_ref = self.ppa.len();
+        let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
+
+        for (q_idx, &qa) in query_alleles.iter().enumerate() {
+            if q_idx >= beams.len() {
+                break;
+            }
+            let qa = qa.value();
             let old = beams[q_idx];
             let mut next = RankBeam {
                 intervals: [(0, 0); MAX_RANK_INTERVALS],
@@ -401,10 +592,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             };
 
             if qa == 255 {
-                // Missing query allele: mapping to the union of all bins can cause an
-                // interval explosion and (with overflow merging) degenerate to the full
-                // reference range on sparse targets. Instead, keep only the most informative
-                // mapped intervals.
                 scratch.clear();
                 for &(l, r) in old.intervals() {
                     for b in 0..n_bins {
@@ -494,23 +681,49 @@ impl ReferencePbwt {
         }
     }
 
-    pub fn advance_with_beams(
+    pub fn advance_with_beams_query(
         &mut self,
         ref_alleles: &[u8],
         n_alleles: usize,
         marker: usize,
-        query_alleles: &[u8],
+        query_alleles: &[PbwtQueryAllele],
         beams: &mut [RankBeam],
     ) {
         match self {
-            Self::U16(inner) => inner.advance_with_beams(
+            Self::U16(inner) => inner.advance_with_beams_query(
                 ref_alleles,
                 n_alleles,
                 marker,
                 query_alleles,
                 beams,
             ),
-            Self::U32(inner) => inner.advance_with_beams(
+            Self::U32(inner) => inner.advance_with_beams_query(
+                ref_alleles,
+                n_alleles,
+                marker,
+                query_alleles,
+                beams,
+            ),
+        }
+    }
+
+    pub fn advance_with_beams_strict(
+        &mut self,
+        ref_alleles: &[u8],
+        n_alleles: usize,
+        marker: usize,
+        query_alleles: &[PbwtStrictAllele],
+        beams: &mut [RankBeam],
+    ) {
+        match self {
+            Self::U16(inner) => inner.advance_with_beams_strict(
+                ref_alleles,
+                n_alleles,
+                marker,
+                query_alleles,
+                beams,
+            ),
+            Self::U32(inner) => inner.advance_with_beams_strict(
                 ref_alleles,
                 n_alleles,
                 marker,

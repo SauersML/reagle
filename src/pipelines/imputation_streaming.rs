@@ -36,7 +36,7 @@ use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
 };
-use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
+use crate::model::reference_pbwt::{PbwtStrictAllele, RankBeam, ReferencePbwt};
 use crate::model::types::RefHapId;
 use crate::model::impute_hmm::{
     ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
@@ -654,15 +654,16 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         .map(|_| RankBeam::full(n_ref_haps as u32))
         .collect();
     let mut ref_alleles = vec![0u8; n_ref_haps];
-    let mut query_alleles = vec![0u8; batch_haps.len()];
+    let mut query_alleles = vec![PbwtStrictAllele::missing(); batch_haps.len()];
     let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
 
     for m in 0..n_markers {
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            let qa = target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
             query_alleles[i] =
-                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+                PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
         if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
             let col = &ref_columns[ref_m.as_usize()];
@@ -676,19 +677,34 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         }
 
         let mut is_biallelic = true;
-        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+        for &a in ref_alleles.iter() {
             if a >= 2 && a != 255 {
                 is_biallelic = false;
                 break;
             }
         }
+        if is_biallelic {
+            for &q in &query_alleles {
+                let a = q.value();
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+        }
         let n_alleles = if is_biallelic { 2 } else { 256 };
 
-        pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, m, &query_alleles, &mut beams_fwd);
+        pbwt_fwd.advance_with_beams_strict(
+            &ref_alleles,
+            n_alleles,
+            m,
+            &query_alleles,
+            &mut beams_fwd,
+        );
 
         if sampling[m] {
             for (i, _) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i];
+                let targ = query_alleles[i].value();
                 if targ == 255 {
                     continue;
                 }
@@ -728,8 +744,9 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         .collect();
     for (rev_step, m) in (0..n_markers).rev().enumerate() {
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            let qa = target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
             query_alleles[i] =
-                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+                PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
         if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
             let col = &ref_columns[ref_m.as_usize()];
@@ -743,15 +760,24 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         }
 
         let mut is_biallelic = true;
-        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+        for &a in ref_alleles.iter() {
             if a >= 2 && a != 255 {
                 is_biallelic = false;
                 break;
             }
         }
+        if is_biallelic {
+            for &q in &query_alleles {
+                let a = q.value();
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+        }
         let n_alleles = if is_biallelic { 2 } else { 256 };
 
-        pbwt_bwd.advance_with_beams(
+        pbwt_bwd.advance_with_beams_strict(
             &ref_alleles,
             n_alleles,
             rev_step,
@@ -761,7 +787,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
 
         if sampling[m] {
             for (i, _) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i];
+                let targ = query_alleles[i].value();
                 if targ == 255 {
                     continue;
                 }

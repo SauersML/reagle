@@ -62,7 +62,7 @@ use crate::model::states::ThreadedHaps;
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
-use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
+use crate::model::reference_pbwt::{PbwtQueryAllele, RankBeam, ReferencePbwt};
 use crate::model::state_allocator::allocate_lms_sparse;
 use crate::utils::telemetry::{Stage, TelemetryBlackboard};
 use mini_mcmc::core::{MarkovChain, Trace};
@@ -459,7 +459,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
         .map(|_| RankBeam::full(n_ref_haps as u32))
         .collect();
     let mut ref_alleles = vec![0u8; n_ref_haps];
-    let mut query_alleles = vec![0u8; batch_haps.len()];
+    let mut query_alleles = vec![PbwtQueryAllele::missing(); batch_haps.len()];
     let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
@@ -486,12 +486,15 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
                 let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
                 if a1 != 255 && a1 == a2 {
-                    query_alleles[i] = a1;
+                    query_alleles[i] =
+                        PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
                 } else {
-                    query_alleles[i] = 255;
+                    query_alleles[i] = PbwtQueryAllele::wildcard();
                 }
             } else {
-                query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+                let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+                query_alleles[i] =
+                    PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
             }
         }
 
@@ -539,20 +542,73 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
         }
 
         let mut is_biallelic = true;
-        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+        for &a in ref_alleles.iter() {
             if a >= 2 && a != 255 {
                 is_biallelic = false;
                 break;
             }
         }
+        if is_biallelic {
+            for &q in &query_alleles {
+                let a = q.value();
+                if a == PbwtQueryAllele::WILDCARD_VALUE {
+                    continue;
+                }
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+        }
         let n_alleles = if is_biallelic { 2 } else { 256 };
 
-        pbwt_fwd.advance_with_beams(&ref_alleles, n_alleles, local_idx, &query_alleles, &mut beams_fwd);
+        pbwt_fwd.advance_with_beams_query(
+            &ref_alleles,
+            n_alleles,
+            local_idx,
+            &query_alleles,
+            &mut beams_fwd,
+        );
 
         if sampling.get(local_idx).copied().unwrap_or(false) {
             for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i];
+                let targ = query_alleles[i].value();
                 if targ == 255 {
+                    continue;
+                }
+                if targ == PbwtQueryAllele::WILDCARD_VALUE {
+                    pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
+                    for &d in donors_buf.iter() {
+                        let idx = d as usize;
+                        if idx >= n_ref_haps {
+                            continue;
+                        }
+                        if exclude_self && idx / 2 == hap_idx / 2 {
+                            continue;
+                        }
+                        let ref_allele = ref_alleles[idx];
+                        if ref_allele == 255 {
+                            continue;
+                        }
+                        if ref_allele != 0 && ref_allele != 1 {
+                            continue;
+                        }
+                        let freq = freqs
+                            .get(m)
+                            .and_then(|f| f.get(ref_allele as usize))
+                            .copied()
+                            .unwrap_or(0.0);
+                        if freq <= 0.0 {
+                            continue;
+                        }
+                        let weight = -(freq.max(min_freq)).ln();
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
+                        }
+                    }
                     continue;
                 }
                 let freq = freqs
@@ -614,12 +670,15 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
                 let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
                 if a1 != 255 && a1 == a2 {
-                    query_alleles[i] = a1;
+                    query_alleles[i] =
+                        PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
                 } else {
-                    query_alleles[i] = 255;
+                    query_alleles[i] = PbwtQueryAllele::wildcard();
                 }
             } else {
-                query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+                let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+                query_alleles[i] =
+                    PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
             }
         }
 
@@ -667,15 +726,27 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
         }
 
         let mut is_biallelic = true;
-        for &a in ref_alleles.iter().chain(query_alleles.iter()) {
+        for &a in ref_alleles.iter() {
             if a >= 2 && a != 255 {
                 is_biallelic = false;
                 break;
             }
         }
+        if is_biallelic {
+            for &q in &query_alleles {
+                let a = q.value();
+                if a == PbwtQueryAllele::WILDCARD_VALUE {
+                    continue;
+                }
+                if a >= 2 && a != 255 {
+                    is_biallelic = false;
+                    break;
+                }
+            }
+        }
         let n_alleles = if is_biallelic { 2 } else { 256 };
 
-        pbwt_bwd.advance_with_beams(
+        pbwt_bwd.advance_with_beams_query(
             &ref_alleles,
             n_alleles,
             rev_step,
@@ -685,8 +756,43 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
 
         if sampling.get(local_idx).copied().unwrap_or(false) {
             for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i];
+                let targ = query_alleles[i].value();
                 if targ == 255 {
+                    continue;
+                }
+                if targ == PbwtQueryAllele::WILDCARD_VALUE {
+                    pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
+                    for &d in donors_buf.iter() {
+                        let idx = d as usize;
+                        if idx >= n_ref_haps {
+                            continue;
+                        }
+                        if exclude_self && idx / 2 == hap_idx / 2 {
+                            continue;
+                        }
+                        let ref_allele = ref_alleles[idx];
+                        if ref_allele == 255 {
+                            continue;
+                        }
+                        if ref_allele != 0 && ref_allele != 1 {
+                            continue;
+                        }
+                        let freq = freqs
+                            .get(m)
+                            .and_then(|f| f.get(ref_allele as usize))
+                            .copied()
+                            .unwrap_or(0.0);
+                        if freq <= 0.0 {
+                            continue;
+                        }
+                        let weight = -(freq.max(min_freq)).ln();
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
+                        }
+                    }
                     continue;
                 }
                 let freq = freqs
@@ -2747,6 +2853,31 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
         }
+        if n_markers <= 60 {
+            let sample = 0usize;
+            let mut phased_count = 0usize;
+            let mut unphased_hets = 0usize;
+            for m in 0..n_markers {
+                let phased = phase_mask
+                    .and_then(|mask| mask.get(m).and_then(|row| row.get(sample)))
+                    .copied()
+                    .unwrap_or(0);
+                if phased != 0 {
+                    phased_count += 1;
+                }
+                let a1 = target_geno.get(m, HapIdx::new((sample * 2) as u32));
+                let a2 = target_geno.get(m, HapIdx::new((sample * 2 + 1) as u32));
+                if phased == 0 && a1 != 255 && a2 != 255 && a1 != a2 {
+                    unphased_hets += 1;
+                }
+            }
+            eprintln!(
+                "[prescan debug] mask_unphased_hets[0]={} phased={} unphased_hets={}",
+                mask_unphased_hets.get(sample).copied().unwrap_or(false),
+                phased_count,
+                unphased_hets
+            );
+        }
         let avail = available_memory_bytes().unwrap_or(0);
         let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_haps).max(1);
         let batches_per_window = (n_haps + batch_size - 1) / batch_size;
@@ -2873,6 +3004,25 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
         }
+        if n_markers <= 60 {
+            if let Some(list) = scores_by_window_by_hap.get(0).and_then(|v| v.get(0)) {
+                let mut hero_score = None;
+                let has_hero = list.iter().any(|(h, _)| {
+                    if *h == 98 {
+                        hero_score = list.iter().find(|(hh, _)| *hh == 98).map(|(_, s)| *s);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                eprintln!(
+                    "[prescan debug] window0_top={:?} hero98_in_top={} hero98_score={:?}",
+                    list.iter().take(10).collect::<Vec<_>>(),
+                    has_hero,
+                    hero_score
+                );
+            }
+        }
 
         let per_window_caps = vec![per_window_cap; num_windows];
         let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
@@ -2942,6 +3092,21 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             let abyss = vec![false; n_ref_haps];
             let (mut candidate_haps, mut scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
+            if s == 0 && n_markers <= 60 {
+                let hero_in_candidates = candidate_haps.iter().any(|&h| h == 98);
+                eprintln!(
+                    "[prescan debug] hero98_in_candidates={}",
+                    hero_in_candidates
+                );
+                if hero_in_candidates {
+                    if let Some(pos) = candidate_haps.iter().position(|&h| h == 98) {
+                        eprintln!(
+                            "[prescan debug] hero98_scores={:?}",
+                            scores_by_hap.get(pos)
+                        );
+                    }
+                }
+            }
             if s == 0 {
                 eprintln!(
                     "[prescan] sample={} candidate_haps={} windows={}",
@@ -3075,6 +3240,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 selected = fallback;
             }
 
+            if s == 0 && n_markers <= 60 {
+                let mut selected_dbg = selected.clone();
+                selected_dbg.sort_unstable();
+                eprintln!(
+                    "[prescan debug] selected_ref_len={} first={:?}",
+                    selected_dbg.len(),
+                    selected_dbg.iter().take(10).collect::<Vec<_>>()
+                );
+            }
+
             let offset = if ref_has_panel { n_haps } else { 0 };
             let mut th = crate::model::states::ThreadedHaps::<CombinedHapSpace>::new(
                 selected.len(),
@@ -3084,6 +3259,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             for h in selected {
                 let idx = h + offset;
                 th.push_new(CombinedHapId::new(idx as u32));
+            }
+            if s == 0 && n_markers <= 60 {
+                let mut buf = vec![CombinedHapId::from(0u32); th.n_states()];
+                th.materialize_at(0, &mut buf);
+                let mut selected_dbg: Vec<usize> =
+                    buf.iter().map(|id| id.as_u32() as usize).collect();
+                selected_dbg.sort_unstable();
+                eprintln!(
+                    "[prescan debug] sample=0 selected_combined_len={} first={:?}",
+                    selected_dbg.len(),
+                    selected_dbg.iter().take(10).collect::<Vec<_>>()
+                );
             }
             th
         })
@@ -3771,6 +3958,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
                                 path2: gp.path2.iter().map(|id| id.as_u32()).collect(),
                             });
+                            let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
+                            let mut anchor_h1 = Vec::with_capacity(n_hi_freq);
+                            let mut anchor_h2 = Vec::with_capacity(n_hi_freq);
+                            for &m in hi_freq_to_orig {
+                                anchor_h1.push(anchor_h1_full[m]);
+                                anchor_h2.push(anchor_h2_full[m]);
+                            }
 
                             let (swap_bits, swap_lr, swap_probs, new_paths) = if self.config.profile {
                                 info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
@@ -3790,6 +3984,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         p_no_err,
                                         p_err,
                                         prior_local.as_ref(),
+                                        Some(&anchor_h1),
+                                        Some(&anchor_h2),
                                         ws,
                                     )
                                 })
@@ -3810,6 +4006,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     p_no_err,
                                     p_err,
                                     prior_local.as_ref(),
+                                    Some(&anchor_h1),
+                                    Some(&anchor_h2),
                                     ws,
                                 )
                             };
@@ -5258,6 +5456,13 @@ fn emit_haploid_constrained(
         return 1.0;
     }
 
+    // Unphased heterozygote with no fixed partner: allow either allele.
+    if geno_a1 != geno_a2 && fixed_allele == 255 {
+        let matches = ref_al == geno_a1 || ref_al == geno_a2 || ref_al == 255;
+        let raw_emit = if matches { p_no_err } else { p_err };
+        return conf * raw_emit + (1.0 - conf) * 0.5;
+    }
+
     // At homozygous sites (fixed_allele == 255), both alleles are same
     // so H1 must emit geno_a1
     // At heterozygous sites, H1 must emit the allele opposite to fixed_allele
@@ -6297,6 +6502,8 @@ fn sample_dynamic_mcmc(
     p_no_err: f32,
     p_err: f32,
     initial_paths: Option<&MosaicPaths>,
+    anchor_hap1: Option<&[u8]>,
+    anchor_hap2: Option<&[u8]>,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
@@ -6315,6 +6522,8 @@ fn sample_dynamic_mcmc(
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
     let hap1_idx = sample_idx * 2;
+    let anchor_h1 = anchor_hap1.unwrap_or(&[]);
+    let anchor_h2 = anchor_hap2.unwrap_or(&[]);
 
     // Initialize H1, H2 alleles from genotype (random phase at hets)
     let mut h1_alleles = vec![0u8; n_markers];
@@ -6322,6 +6531,13 @@ fn sample_dynamic_mcmc(
     for m in 0..n_markers {
         let a1 = seq1[m];
         let a2 = seq2[m];
+        let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
+        let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
+        if anchor_a1 != 255 || anchor_a2 != 255 {
+            h1_alleles[m] = anchor_a1;
+            h2_alleles[m] = anchor_a2;
+            continue;
+        }
         if a1 == 255 && a2 == 255 {
             h1_alleles[m] = 255;
             h2_alleles[m] = 255;
@@ -6541,10 +6757,15 @@ fn sample_dynamic_mcmc(
         for m in 0..n_markers {
             let a1 = seq1[m];
             let a2 = seq2[m];
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
+            let is_anchor = anchor_a1 != 255 || anchor_a2 != 255;
             if a1 == 255 || a2 == 255 || a1 == a2 {
                 fixed_allele[m] = 255; // No constraint (hom/missing)
+            } else if is_anchor {
+                fixed_allele[m] = anchor_a2;
             } else {
-                fixed_allele[m] = h2_alleles[m]; // H1 must be opposite of H2
+                fixed_allele[m] = 255; // Unphased het: no orientation constraint
             }
         }
 
@@ -6576,6 +6797,14 @@ fn sample_dynamic_mcmc(
             let state = path1_idx[m] as usize;
             let a1 = seq1[m];
             let a2 = seq2[m];
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
+            let is_anchor = anchor_a1 != 255 || anchor_a2 != 255;
+            if is_anchor {
+                h1_alleles[m] = anchor_a1;
+                h2_alleles[m] = anchor_a2;
+                continue;
+            }
 
             if a1 == 255 && a2 == 255 {
                 h1_alleles[m] = 255;
@@ -6611,10 +6840,15 @@ fn sample_dynamic_mcmc(
         for m in 0..n_markers {
             let a1 = seq1[m];
             let a2 = seq2[m];
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
+            let is_anchor = anchor_a1 != 255 || anchor_a2 != 255;
             if a1 == 255 || a2 == 255 || a1 == a2 {
                 fixed_allele[m] = 255;
+            } else if is_anchor {
+                fixed_allele[m] = anchor_a1;
             } else {
-                fixed_allele[m] = h1_alleles[m]; // H2 must be opposite of H1
+                fixed_allele[m] = 255; // Unphased het: no orientation constraint
             }
         }
 
@@ -6645,6 +6879,14 @@ fn sample_dynamic_mcmc(
         for m in 0..n_markers {
             let a1 = seq1[m];
             let a2 = seq2[m];
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
+            let is_anchor = anchor_a1 != 255 || anchor_a2 != 255;
+            if is_anchor {
+                h1_alleles[m] = anchor_a1;
+                h2_alleles[m] = anchor_a2;
+                continue;
+            }
 
             if a1 == 255 && a2 == 255 {
                 h2_alleles[m] = 255;
@@ -7337,6 +7579,84 @@ fn sample_swap_bits_mosaic<RefSpace>(
         p_max = p_max.max(p);
         p_sum += p;
     }
+    if has_anchor && !het_positions.is_empty() {
+        let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
+        let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
+        let mut prev_state = vec![0u8; het_positions.len()];
+
+        for (i, &m) in het_positions.iter().enumerate() {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            let p_swap = swap_probs[i].clamp(1e-6, 1.0 - 1e-6);
+            let p_keep = (1.0 - p_swap).clamp(1e-6, 1.0 - 1e-6);
+            let emit0 = p_keep.ln();
+            let emit1 = p_swap.ln();
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
+            let mut force: Option<u8> = None;
+            if anchor_a1 != 255 || anchor_a2 != 255 {
+                if a1 == anchor_a1 && a2 == anchor_a2 {
+                    force = Some(0);
+                } else if a1 == anchor_a2 && a2 == anchor_a1 {
+                    force = Some(1);
+                }
+            }
+
+            let r = p_recomb.get(m).copied().unwrap_or(0.0).clamp(1e-9, 1.0 - 1e-9);
+            let stay = (1.0 - r).ln();
+            let sw = r.ln();
+
+            if i == 0 {
+                dp0[i] = emit0;
+                dp1[i] = emit1;
+            } else {
+                let from0_to0 = dp0[i - 1] + stay;
+                let from1_to0 = dp1[i - 1] + sw;
+                if from0_to0 >= from1_to0 {
+                    dp0[i] = from0_to0 + emit0;
+                    prev_state[i] = 0;
+                } else {
+                    dp0[i] = from1_to0 + emit0;
+                    prev_state[i] = 1;
+                }
+
+                let from0_to1 = dp0[i - 1] + sw;
+                let from1_to1 = dp1[i - 1] + stay;
+                if from0_to1 >= from1_to1 {
+                    dp1[i] = from0_to1 + emit1;
+                } else {
+                    dp1[i] = from1_to1 + emit1;
+                    prev_state[i] |= 2;
+                }
+            }
+
+            if let Some(state) = force {
+                if state == 0 {
+                    dp1[i] = f32::NEG_INFINITY;
+                } else {
+                    dp0[i] = f32::NEG_INFINITY;
+                }
+            }
+        }
+
+        let mut state = if dp1[het_positions.len() - 1] > dp0[het_positions.len() - 1] {
+            1u8
+        } else {
+            0u8
+        };
+        for idx in (0..het_positions.len()).rev() {
+            swap_bits[idx] = state;
+            if idx == 0 {
+                break;
+            }
+            let prev = prev_state[idx];
+            if state == 0 {
+                state = prev & 1;
+            } else {
+                state = if (prev & 2) != 0 { 1 } else { 0 };
+            }
+        }
+    }
     if !het_positions.is_empty() {
         let denom = (het_positions.len().saturating_sub(obs_zero)).max(1) as f32;
         let mean = p_sum / denom;
@@ -7520,7 +7840,8 @@ impl Stage2Phaser {
 
     fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        (-f64::exp_m1(c * gen_dist_cm)) as f32
+        let gen_dist_m = gen_dist_cm / 100.0;
+        (-f64::exp_m1(c * gen_dist_m)) as f32
     }
 
     fn bridge_state_probs(
@@ -7774,6 +8095,106 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn build_test_markers(
+        n_markers: usize,
+        step_bp: u32,
+    ) -> crate::data::marker::Markers<crate::data::AnyMarkerSpace> {
+        use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
+        use crate::data::ChromIdx;
+
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        markers.add_chrom("chr1");
+        for i in 0..n_markers {
+            let m = Marker::new(
+                ChromIdx::new(0),
+                i as u32 * step_bp,
+                Some(format!("m{}", i).into()),
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::T)],
+            );
+            markers.push(m);
+        }
+        markers
+    }
+
+    fn build_ref_panel_with_hero(
+        n_markers: usize,
+        n_ref_samples: usize,
+        hero_sample_idx: usize,
+        hero_pattern: &[u8],
+        seed: u64,
+    ) -> (
+        GenotypeMatrix<crate::data::storage::phase_state::Phased, crate::data::AnyMarkerSpace>,
+        usize,
+    ) {
+        use crate::data::haplotype::Samples;
+        use crate::data::storage::GenotypeColumn;
+        use rand::{Rng, SeedableRng};
+        use std::sync::Arc;
+
+        let n_ref_haps = n_ref_samples * 2;
+        let mut ref_haps = vec![vec![0u8; n_markers]; n_ref_haps];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        for h in 0..n_ref_haps {
+            for m in 0..n_markers {
+                ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
+            }
+        }
+
+        let hero_hap_idx = hero_sample_idx * 2;
+        let anti_hap_idx = hero_hap_idx + 1;
+        for m in 0..n_markers {
+            let a = hero_pattern[m];
+            ref_haps[hero_hap_idx][m] = a;
+            ref_haps[anti_hap_idx][m] = 1 - a;
+        }
+
+        let markers = build_test_markers(n_markers, 1_000);
+        let samples = Arc::new(Samples::from_ids(
+            (0..n_ref_samples).map(|i| format!("r{}", i)).collect(),
+        ));
+        let mut columns = Vec::with_capacity(n_markers);
+        for m in 0..n_markers {
+            let mut alleles = Vec::with_capacity(n_ref_haps);
+            for h in 0..n_ref_haps {
+                alleles.push(ref_haps[h][m]);
+            }
+            columns.push(GenotypeColumn::from_alleles(&alleles, 2));
+        }
+        let ref_gt = GenotypeMatrix::new_phased(markers, columns, samples);
+        (ref_gt, hero_hap_idx)
+    }
+
+    fn build_target_with_sparse_anchors(
+        n_markers: usize,
+        hero_pattern: &[u8],
+        anchor_every: usize,
+    ) -> GenotypeMatrix<crate::data::storage::phase_state::Unphased, crate::data::AnyMarkerSpace>
+    {
+        use crate::data::haplotype::Samples;
+        use crate::data::storage::GenotypeColumn;
+        use std::sync::Arc;
+
+        let markers = build_test_markers(n_markers, 1_000);
+        let samples = Arc::new(Samples::from_ids(vec!["target".to_string()]));
+        let mut columns = Vec::with_capacity(n_markers);
+        let mut phase_mask = vec![vec![0u8; 1]; n_markers];
+
+        for m in 0..n_markers {
+            let hero = hero_pattern[m];
+            let anti = 1 - hero;
+            let (a1, a2) = if anchor_every > 0 && m % anchor_every == 0 {
+                phase_mask[m][0] = 1;
+                (hero, anti)
+            } else {
+                (0, 1)
+            };
+            columns.push(GenotypeColumn::from_alleles(&[a1, a2], 2));
+        }
+
+        GenotypeMatrix::new_unphased(markers, columns, samples).with_phase_mask(Some(phase_mask))
+    }
 
     #[test]
     fn test_pipeline_creation() {
@@ -8088,6 +8509,762 @@ mod tests {
     }
 
     #[test]
+    fn test_prescan_hero_survives_across_sparse_anchor_windows() {
+        let n_markers = 50;
+        let hero_pattern: Vec<u8> = (0..n_markers).map(|m| (m % 2) as u8).collect();
+        let (ref_gt, hero_hap_idx) =
+            build_ref_panel_with_hero(n_markers, 50, 49, &hero_pattern, 42);
+        let target_gt = build_target_with_sparse_anchors(n_markers, &hero_pattern, 10);
+
+        let mut config = Config::default();
+        config.phase_states = 20;
+        config.ne = 10000.0;
+        config.err = Some(0.0001);
+        config.nthreads = Some(1);
+
+        let pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
+
+        let target_geno = MutableGenotypes::from_fn(n_markers, 2, |m, h| {
+            target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.02).collect();
+
+        let threaded = pipeline
+            .build_phasing_prescan_states(
+                &target_gt,
+                &target_geno,
+                Some(&ref_gt),
+                Some(&alignment),
+                n_markers,
+                1,
+                &gen_positions,
+                0.1,
+                None,
+            )
+            .expect("prescan");
+
+        let th = &threaded[0];
+        let hero_combined = (2 + hero_hap_idx) as u32;
+        let windows = partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
+        let mut state_buf = vec![CombinedHapId::from(0u32); th.n_states()];
+
+        println!("[prescan test] windows={:?}", windows);
+        for (w, (start, end)) in windows.iter().copied().enumerate() {
+            let mid = (start + end.saturating_sub(1)) / 2;
+            for &m in &[start, mid] {
+                th.materialize_at(m, &mut state_buf);
+                let has_hero = state_buf
+                    .iter()
+                    .any(|id| id.as_u32() == hero_combined);
+                println!(
+                    "[prescan test] window={} marker={} states={} hero_present={}",
+                    w,
+                    m,
+                    state_buf.len(),
+                    has_hero
+                );
+                assert!(
+                    has_hero,
+                    "Hero hap {} missing from prescan states at marker {} (window {})",
+                    hero_combined,
+                    m,
+                    w
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_sample_swap_bits_mosaic_two_state_anchor_stability() {
+        let n_markers = 40;
+        let hero_pattern: Vec<u8> = (0..n_markers).map(|m| (m % 2) as u8).collect();
+        let (ref_gt, hero_hap_idx) = build_ref_panel_with_hero(n_markers, 1, 0, &hero_pattern, 99);
+
+        println!("[mosaic anchor test] hero_hap_idx={}", hero_hap_idx);
+        let mut th = ThreadedHaps::<CombinedHapSpace>::new(2, 2, n_markers);
+        th.push_new(CombinedHapId::new(0));
+        th.push_new(CombinedHapId::new(1));
+
+        let seq1: Vec<u8> = vec![0; n_markers];
+        let seq2: Vec<u8> = vec![1; n_markers];
+        let conf: Vec<f32> = vec![1.0; n_markers];
+        let mut anchor_h1 = vec![255u8; n_markers];
+        let mut anchor_h2 = vec![255u8; n_markers];
+        for m in (0..n_markers).step_by(10) {
+            anchor_h1[m] = hero_pattern[m];
+            anchor_h2[m] = 1 - hero_pattern[m];
+        }
+
+        let p_recomb = vec![0.001f32; n_markers];
+        let block_starts: Arc<[usize]> =
+            blocks_to_starts(&[(0, n_markers)], n_markers).into_boxed_slice().into();
+        let het_positions: Vec<usize> = (0..n_markers).collect();
+        let p_no_err = 0.999;
+        let p_err = 1.0 - p_no_err;
+        let mut workspace = crate::utils::workspace::ThreadWorkspace::new(8, 0);
+        let ref_provider = RefAlleleProvider::new(GenotypeView::from(&ref_gt), &th);
+
+        let (swap_bits, swap_lr, swap_probs, paths) = sample_swap_bits_mosaic(
+            n_markers,
+            2,
+            &p_recomb,
+            &seq1,
+            &seq2,
+            &conf,
+            ref_provider,
+            None,
+            block_starts,
+            &het_positions,
+            None,
+            Some(&anchor_h1),
+            Some(&anchor_h2),
+            123,
+            0,
+            32,
+            p_no_err,
+            p_err,
+            &mut workspace,
+        );
+
+        let mut switches1 = 0usize;
+        let mut switches2 = 0usize;
+        for m in 1..n_markers {
+            if paths.path1[m] != paths.path1[m - 1] {
+                switches1 += 1;
+            }
+            if paths.path2[m] != paths.path2[m - 1] {
+                switches2 += 1;
+            }
+        }
+        let p_min = swap_probs
+            .iter()
+            .cloned()
+            .fold(1.0f32, |a, b| a.min(b));
+        let p_max = swap_probs
+            .iter()
+            .cloned()
+            .fold(0.0f32, |a, b| a.max(b));
+        let p_mean = swap_probs.iter().sum::<f32>() / swap_probs.len().max(1) as f32;
+        println!(
+            "[mosaic anchor test] switches1={} switches2={} p_min={:.3} p_mean={:.3} p_max={:.3} swap_bits={} swap_lr={}",
+            switches1,
+            switches2,
+            p_min,
+            p_mean,
+            p_max,
+            swap_bits.len(),
+            swap_lr.len()
+        );
+        assert_eq!(
+            switches1 + switches2,
+            0,
+            "Unexpected path switching with anchors in two-state model"
+        );
+    }
+
+    #[test]
+    fn test_prescan_scores_hero_in_anchor_window() {
+        let n_markers = 50;
+        let hero_pattern: Vec<u8> = (0..n_markers).map(|m| (m % 2) as u8).collect();
+        let (ref_gt, hero_hap_idx) =
+            build_ref_panel_with_hero(n_markers, 50, 49, &hero_pattern, 7);
+        let target_gt = build_target_with_sparse_anchors(n_markers, &hero_pattern, 10);
+        let target_geno = MutableGenotypes::from_fn(n_markers, 2, |m, h| {
+            target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+
+        let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.02).collect();
+        let windows = partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
+        let window = windows[0];
+        let per_window_cap = 20usize;
+        let n_ref_haps = ref_gt.n_haplotypes();
+        let sampling = build_sampling_points(
+            &gen_positions[window.0..window.1],
+            0.1,
+            PBWT_MIN_MARKER_STEP,
+            None,
+        );
+        let k_per_hap = per_window_cap
+            .saturating_mul(PBWT_PER_WINDOW_MULT)
+            .max(PBWT_MIN_PER_HAP)
+            .min(PBWT_MAX_PER_HAP)
+            .max(1)
+            .min(n_ref_haps.max(1));
+        let sampled = sampling.iter().filter(|&&b| b).count();
+        println!(
+            "[prescan score test] window={:?} sampled={}",
+            window, sampled
+        );
+
+        let ref_columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
+            .collect();
+        let freqs = compute_ref_freqs(
+            &target_gt,
+            &ref_columns,
+            Some(&alignment),
+            None,
+            None,
+            n_markers,
+        );
+        let mut window_scores = vec![vec![f32::NEG_INFINITY; ref_gt.n_haplotypes()]; 2];
+        score_window_batch_pbwt_segment(
+            &[0, 1],
+            &target_geno,
+            &ref_columns,
+            target_gt.phase_mask(),
+            Some(&[true]),
+            Some(&alignment),
+            &freqs,
+            window,
+            k_per_hap,
+            &sampling,
+            &mut window_scores,
+            false,
+            None,
+            None,
+        );
+
+        let hero_score = window_scores[0][hero_hap_idx];
+        let top = select_top_k(&window_scores[0], 15);
+        let in_top = top.iter().any(|(h, _)| *h == hero_hap_idx);
+        println!(
+            "[prescan score test] top={:?}",
+            top.iter()
+                .map(|(h, s)| (*h, (*s * 1000.0).round() / 1000.0))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "[prescan score test] hero_hap={} score={:.3} in_top10={}",
+            hero_hap_idx, hero_score, in_top
+        );
+        assert!(
+            in_top,
+            "Hero hap {} not in top-10 prescan scores for anchor window",
+            hero_hap_idx
+        );
+    }
+
+    #[test]
+    fn test_allocator_keeps_hero_from_prescan_scores() {
+        let n_markers = 50;
+        let hero_pattern: Vec<u8> = (0..n_markers).map(|m| (m % 2) as u8).collect();
+        let (ref_gt, hero_hap_idx) =
+            build_ref_panel_with_hero(n_markers, 50, 49, &hero_pattern, 11);
+        let target_gt = build_target_with_sparse_anchors(n_markers, &hero_pattern, 10);
+        let target_geno = MutableGenotypes::from_fn(n_markers, 2, |m, h| {
+            target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.02).collect();
+        let windows = partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
+        let num_windows = windows.len();
+        let per_window_cap = 20usize;
+
+        let n_ref_haps = ref_gt.n_haplotypes();
+        let ref_columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
+            .collect();
+        let freqs = compute_ref_freqs(
+            &target_gt,
+            &ref_columns,
+            Some(&alignment),
+            None,
+            None,
+            n_markers,
+        );
+
+        let mut scores_by_window_by_hap: Vec<Vec<Vec<(usize, f32)>>> =
+            vec![Vec::with_capacity(num_windows); 2];
+        let phase_mask = target_gt.phase_mask();
+        let mut informative: Vec<bool> = Vec::new();
+        for &(start, end) in &windows {
+            informative.clear();
+            informative.resize(end.saturating_sub(start), false);
+            if !informative.is_empty() {
+                for m in start..end {
+                    let mut info = false;
+                    if let Some(mask) = phase_mask {
+                        if let Some(row) = mask.get(m) {
+                            if row.iter().any(|&v| v != 0) {
+                                info = true;
+                            }
+                        }
+                    }
+                    if !info {
+                        let alleles = target_geno.marker_alleles(m);
+                        if alleles.iter().any(|&a| a != 255) {
+                            info = true;
+                        }
+                    }
+                    informative[m - start] = info;
+                }
+            }
+            let sampling = build_sampling_points(
+                &gen_positions[start..end],
+                0.1,
+                PBWT_MIN_MARKER_STEP,
+                Some(&informative),
+            );
+            let k_per_hap = per_window_cap
+                .saturating_mul(PBWT_PER_WINDOW_MULT)
+                .max(PBWT_MIN_PER_HAP)
+                .min(PBWT_MAX_PER_HAP)
+                .max(1)
+                .min(n_ref_haps.max(1));
+            let mut window_scores = vec![vec![f32::NEG_INFINITY; n_ref_haps]; 2];
+            score_window_batch_pbwt_segment(
+                &[0, 1],
+                &target_geno,
+                &ref_columns,
+                phase_mask,
+                Some(&[true]),
+                Some(&alignment),
+                &freqs,
+                (start, end),
+                k_per_hap,
+                &sampling,
+                &mut window_scores,
+                false,
+                None,
+                None,
+            );
+            for hap_idx in 0..2 {
+                let top = select_top_k(&window_scores[hap_idx], 160.min(n_ref_haps.max(1)));
+                scores_by_window_by_hap[hap_idx].push(top);
+            }
+        }
+
+        let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
+        let mut touched_indices: Vec<usize> = Vec::new();
+        let mut window_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_windows);
+        let mut prev_window_scores: Vec<(usize, f32)> = Vec::new();
+        for w in 0..num_windows {
+            for &idx in &touched_indices {
+                dense_merge_buffer[idx] = f32::NEG_INFINITY;
+            }
+            touched_indices.clear();
+
+            for &(h, score) in scores_by_window_by_hap[0][w]
+                .iter()
+                .chain(scores_by_window_by_hap[1][w].iter())
+            {
+                if h >= dense_merge_buffer.len() {
+                    continue;
+                }
+                let current = &mut dense_merge_buffer[h];
+                if current.is_finite() {
+                    if score > *current {
+                        *current = score;
+                    }
+                } else {
+                    *current = score;
+                    touched_indices.push(h);
+                }
+            }
+
+            touched_indices.sort_by(|&a, &b| {
+                dense_merge_buffer[b]
+                    .partial_cmp(&dense_merge_buffer[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let cap = 160.min(n_ref_haps.max(1));
+            let take = cap.min(touched_indices.len());
+            let mut list: Vec<(usize, f32)> = Vec::with_capacity(take);
+            for &h in touched_indices.iter().take(take) {
+                list.push((h, dense_merge_buffer[h]));
+            }
+            if list.is_empty() {
+                list.extend(prev_window_scores.iter().copied());
+            } else if !prev_window_scores.is_empty() {
+                let mut map: HashMap<usize, f32> = list.iter().copied().collect();
+                for (h, score) in prev_window_scores.iter().copied() {
+                    map.entry(h).or_insert(score);
+                }
+                list = map.into_iter().collect();
+            }
+            prev_window_scores = list.clone();
+            window_scores.push(list);
+        }
+
+        let abyss = vec![false; n_ref_haps];
+        let (candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
+        let hero_in_candidates = candidate_haps.iter().any(|&h| h == hero_hap_idx);
+        println!(
+            "[allocator test] candidates={} hero_in_candidates={}",
+            candidate_haps.len(),
+            hero_in_candidates
+        );
+        assert!(
+            hero_in_candidates,
+            "Hero hap {} missing from candidate set before allocation",
+            hero_hap_idx
+        );
+
+        let per_window_cap = 20usize;
+        let per_window_caps = vec![per_window_cap; num_windows];
+        let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
+        let mut boundary_cm = Vec::with_capacity(num_windows.saturating_sub(1));
+        for w in 0..num_windows.saturating_sub(1) {
+            let (_, end) = windows[w];
+            let (next_start, _) = windows[w + 1];
+            let left = gen_positions[end.saturating_sub(1).min(gen_positions.len() - 1)];
+            let right = gen_positions[next_start.min(gen_positions.len() - 1)];
+            boundary_cm.push((right - left).abs().max(0.1));
+        }
+        let mut config = Config::default();
+        config.phase_states = 20;
+        config.ne = 10000.0;
+        config.err = Some(0.0001);
+        config.nthreads = Some(1);
+        let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
+        pipeline.params = ModelParams::for_phasing(n_ref_haps + 2, 10000.0, Some(0.0001));
+        let params = pipeline.params.clone();
+        let allocation = allocate_lms_sparse(
+            &scores_by_hap,
+            &candidate_haps,
+            num_windows,
+            &boundary_cm,
+            &params,
+            n_ref_haps,
+            global_slot_budget,
+            &per_window_caps,
+        );
+        let mut selected: Vec<usize> =
+            allocation.intervals_by_hap.into_iter().map(|(h, _)| h).collect();
+        selected.sort_unstable();
+        selected.dedup();
+        eprintln!(
+            "[threaded test] expected_ref_len={} first={:?}",
+            selected.len(),
+            selected.iter().take(10).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "[threaded test] expected_ref_len={} first={:?}",
+            selected.len(),
+            selected.iter().take(10).collect::<Vec<_>>()
+        );
+
+        if PBWT_FORCE_TOP_HAPS > 0 && !window_scores.is_empty() {
+            let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
+            let mut touched_indices: Vec<usize> = Vec::new();
+            for list in &window_scores {
+                for &(h, score) in list {
+                    if h >= dense_merge_buffer.len() {
+                        continue;
+                    }
+                    let current = &mut dense_merge_buffer[h];
+                    if current.is_finite() {
+                        if score > *current {
+                            *current = score;
+                        }
+                    } else {
+                        *current = score;
+                        touched_indices.push(h);
+                    }
+                }
+            }
+            touched_indices.sort_by(|&a, &b| {
+                dense_merge_buffer[b]
+                    .partial_cmp(&dense_merge_buffer[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let take = PBWT_FORCE_TOP_HAPS.min(touched_indices.len());
+            for &h in touched_indices.iter().take(take) {
+                if !selected.contains(&h) {
+                    selected.push(h);
+                }
+            }
+        }
+
+        if PBWT_ANCHOR_TOP_HAPS > 0 {
+            let mut anchors_by_hap: Vec<Vec<(usize, u8, u8)>> = vec![Vec::new(); 2];
+            let phase_mask = target_gt.phase_mask();
+            for s in 0..1usize {
+                let hap1 = s * 2;
+                let hap2 = hap1 + 1;
+                for m in 0..n_markers {
+                    let phased = phase_mask
+                        .and_then(|mask| mask.get(m).and_then(|row| row.get(s)))
+                        .copied()
+                        .unwrap_or(0);
+                    if phased == 0 {
+                        continue;
+                    }
+                    let a1 = target_geno.get(m, HapIdx::new(hap1 as u32));
+                    let a2 = target_geno.get(m, HapIdx::new(hap2 as u32));
+                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                        continue;
+                    }
+                    anchors_by_hap[hap1].push((m, a1, a2));
+                    anchors_by_hap[hap2].push((m, a2, a1));
+                }
+            }
+
+            let mut anchor_scores = vec![0i32; n_ref_haps];
+            for &(start, end) in &windows {
+                let mut window_anchors: Vec<(usize, u8, u8)> = Vec::new();
+                for &(m, a1, a2) in anchors_by_hap[0]
+                    .iter()
+                    .chain(anchors_by_hap[1].iter())
+                {
+                    if m >= start && m < end {
+                        window_anchors.push((m, a1, a2));
+                    }
+                }
+                if window_anchors.is_empty() {
+                    continue;
+                }
+                anchor_scores.fill(0);
+                for h in 0..n_ref_haps {
+                    let hap_idx = HapIdx::new(h as u32);
+                    let mut score = 0i32;
+                    for (m, a1, _) in &window_anchors {
+                        let ref_al = ref_columns
+                            .get(*m)
+                            .map(|c| c.get(hap_idx))
+                            .unwrap_or(255);
+                        if ref_al == 255 {
+                            continue;
+                        }
+                        if ref_al == *a1 {
+                            score += 1;
+                        } else {
+                            score -= 1;
+                        }
+                    }
+                    anchor_scores[h] = score;
+                }
+                let mut idxs: Vec<usize> = (0..n_ref_haps).collect();
+                idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
+                let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
+                for &h in idxs.iter().take(take) {
+                    if !selected.contains(&h) {
+                        selected.push(h);
+                    }
+                }
+            }
+        }
+        let hero_selected = selected.iter().any(|&h| h == hero_hap_idx);
+        println!(
+            "[allocator test] selected={} hero_selected={}",
+            selected.len(),
+            hero_selected
+        );
+        assert!(
+            hero_selected,
+            "Hero hap {} dropped by allocator despite positive scores",
+            hero_hap_idx
+        );
+    }
+
+    #[test]
+    fn test_threaded_haps_matches_selected_indices() {
+        let n_markers = 50;
+        let hero_pattern: Vec<u8> = (0..n_markers).map(|m| (m % 2) as u8).collect();
+        let (ref_gt, hero_hap_idx) =
+            build_ref_panel_with_hero(n_markers, 50, 49, &hero_pattern, 13);
+        let target_gt = build_target_with_sparse_anchors(n_markers, &hero_pattern, 10);
+        let target_geno = MutableGenotypes::from_fn(n_markers, 2, |m, h| {
+            target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
+        });
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.02).collect();
+        let windows = partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
+        let num_windows = windows.len();
+
+        let n_ref_haps = ref_gt.n_haplotypes();
+        let ref_columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
+            .collect();
+        let freqs = compute_ref_freqs(
+            &target_gt,
+            &ref_columns,
+            Some(&alignment),
+            None,
+            None,
+            n_markers,
+        );
+
+        let mut scores_by_window_by_hap: Vec<Vec<Vec<(usize, f32)>>> =
+            vec![Vec::with_capacity(num_windows); 2];
+        for &(start, end) in &windows {
+            let sampling = build_sampling_points(
+                &gen_positions[start..end],
+                0.1,
+                PBWT_MIN_MARKER_STEP,
+                None,
+            );
+            let mut window_scores = vec![vec![f32::NEG_INFINITY; n_ref_haps]; 2];
+            score_window_batch_pbwt_segment(
+                &[0, 1],
+                &target_geno,
+                &ref_columns,
+                target_gt.phase_mask(),
+                Some(&[true]),
+                Some(&alignment),
+                &freqs,
+                (start, end),
+                64,
+                &sampling,
+                &mut window_scores,
+                false,
+                None,
+                None,
+            );
+            for hap_idx in 0..2 {
+                let top = select_top_k(&window_scores[hap_idx], 160.min(n_ref_haps.max(1)));
+                scores_by_window_by_hap[hap_idx].push(top);
+            }
+        }
+
+        let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
+        let mut touched_indices: Vec<usize> = Vec::new();
+        let mut window_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_windows);
+        let mut prev_window_scores: Vec<(usize, f32)> = Vec::new();
+        for w in 0..num_windows {
+            for &idx in &touched_indices {
+                dense_merge_buffer[idx] = f32::NEG_INFINITY;
+            }
+            touched_indices.clear();
+
+            for &(h, score) in scores_by_window_by_hap[0][w]
+                .iter()
+                .chain(scores_by_window_by_hap[1][w].iter())
+            {
+                if h >= dense_merge_buffer.len() {
+                    continue;
+                }
+                let current = &mut dense_merge_buffer[h];
+                if current.is_finite() {
+                    if score > *current {
+                        *current = score;
+                    }
+                } else {
+                    *current = score;
+                    touched_indices.push(h);
+                }
+            }
+
+            touched_indices.sort_by(|&a, &b| {
+                dense_merge_buffer[b]
+                    .partial_cmp(&dense_merge_buffer[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let cap = 160.min(n_ref_haps.max(1));
+            let take = cap.min(touched_indices.len());
+            let mut list: Vec<(usize, f32)> = Vec::with_capacity(take);
+            for &h in touched_indices.iter().take(take) {
+                list.push((h, dense_merge_buffer[h]));
+            }
+            if list.is_empty() {
+                list.extend(prev_window_scores.iter().copied());
+            } else if !prev_window_scores.is_empty() {
+                let mut map: HashMap<usize, f32> = list.iter().copied().collect();
+                for (h, score) in prev_window_scores.iter().copied() {
+                    map.entry(h).or_insert(score);
+                }
+                list = map.into_iter().collect();
+            }
+            prev_window_scores = list.clone();
+            window_scores.push(list);
+        }
+
+        let abyss = vec![false; n_ref_haps];
+        let (candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
+        let per_window_cap = 20usize;
+        let per_window_caps = vec![per_window_cap; num_windows];
+        let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
+        let mut boundary_cm = Vec::with_capacity(num_windows.saturating_sub(1));
+        for w in 0..num_windows.saturating_sub(1) {
+            let (_, end) = windows[w];
+            let (next_start, _) = windows[w + 1];
+            let left = gen_positions[end.saturating_sub(1).min(gen_positions.len() - 1)];
+            let right = gen_positions[next_start.min(gen_positions.len() - 1)];
+            boundary_cm.push((right - left).abs().max(0.1));
+        }
+        let mut config = Config::default();
+        config.phase_states = 20;
+        config.ne = 10000.0;
+        config.err = Some(0.0001);
+        config.nthreads = Some(1);
+        let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
+        pipeline.params = ModelParams::for_phasing(n_ref_haps + 2, 10000.0, Some(0.0001));
+        let params = pipeline.params.clone();
+        let allocation = allocate_lms_sparse(
+            &scores_by_hap,
+            &candidate_haps,
+            num_windows,
+            &boundary_cm,
+            &params,
+            n_ref_haps,
+            global_slot_budget,
+            &per_window_caps,
+        );
+        let mut selected: Vec<usize> =
+            allocation.intervals_by_hap.into_iter().map(|(h, _)| h).collect();
+        selected.sort_unstable();
+        selected.dedup();
+        eprintln!(
+            "[threaded test] expected_ref_len={} first={:?}",
+            selected.len(),
+            selected.iter().take(10).collect::<Vec<_>>()
+        );
+
+        let offset = 2usize;
+        let expected: std::collections::HashSet<u32> = selected
+            .iter()
+            .map(|h| (h + offset) as u32)
+            .collect();
+
+        let threaded = pipeline
+            .build_phasing_prescan_states(
+                &target_gt,
+                &target_geno,
+                Some(&ref_gt),
+                Some(&alignment),
+                n_markers,
+                1,
+                &gen_positions,
+                0.1,
+                None,
+            )
+            .expect("prescan");
+        let th = &threaded[0];
+        let mut state_buf = vec![CombinedHapId::from(0u32); th.n_states()];
+        th.materialize_at(0, &mut state_buf);
+        let actual: std::collections::HashSet<u32> =
+            state_buf.iter().map(|id| id.as_u32()).collect();
+
+        let hero_combined = (hero_hap_idx + offset) as u32;
+        println!(
+            "[threaded test] expected={} actual={} hero_combined={} hero_in_expected={} hero_in_actual={}",
+            expected.len(),
+            actual.len(),
+            hero_combined,
+            expected.contains(&hero_combined),
+            actual.contains(&hero_combined)
+        );
+
+        let mut missing: Vec<u32> = expected.difference(&actual).copied().collect();
+        missing.sort_unstable();
+        let mut extra: Vec<u32> = actual.difference(&expected).copied().collect();
+        extra.sort_unstable();
+        println!(
+            "[threaded test] missing_first={:?} extra_first={:?}",
+            missing.iter().take(10).collect::<Vec<_>>(),
+            extra.iter().take(10).collect::<Vec<_>>()
+        );
+
+        assert!(
+            expected == actual,
+            "ThreadedHaps state set does not match selected indices"
+        );
+    }
+
+    #[test]
     fn test_refresh_path_ref_from_states_updates_all_valid_markers() {
         let mut path_ref = vec![0u32, 0u32, 0u32, 0u32];
         let path_idx = vec![0u32, 1u32, 2u32, 1u32];
@@ -8166,6 +9343,8 @@ mod tests {
             5,     // n_mcmc_steps
             0.999,
             0.001,
+            None,
+            None,
             None,
             &mut workspace,
         );
@@ -8247,6 +9426,8 @@ mod tests {
             5,
             0.999,
             0.001,
+            None,
+            None,
             None,
             &mut workspace,
         );

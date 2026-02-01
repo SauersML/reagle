@@ -27,6 +27,7 @@ Usage:
   python integration_test.py prepare-profile  # Prepare 5% subset for profiling
   python integration_test.py beagle       # Run Beagle imputation only
   python integration_test.py reagle       # Run Reagle imputation only
+  python integration_test.py phasing-compare  # Compare phasing vs EagleImp/SHAPEIT5
   python integration_test.py metrics      # Calculate metrics only
 """
 
@@ -36,6 +37,7 @@ import subprocess
 import random
 import gzip
 import json
+import shutil
 from pathlib import Path
 from collections import defaultdict
 import math
@@ -278,6 +280,97 @@ def check_dependencies():
         sys.exit(1)
 
     print("All dependencies found.")
+
+
+def find_executable(name, env_var=None):
+    """Locate an executable using an env var override or PATH."""
+    if env_var:
+        override = os.environ.get(env_var)
+        if override:
+            path = Path(override)
+            if path.exists():
+                return path
+    found = shutil.which(name)
+    return Path(found) if found else None
+
+
+def qref_path_for_ref(ref_path):
+    """Return the expected .qref path for a reference VCF/BCF."""
+    ref_path = Path(ref_path)
+    suffixes = ref_path.suffixes
+    base = ref_path
+    if len(suffixes) >= 2 and suffixes[-2:] == [".vcf", ".gz"]:
+        base = ref_path.with_suffix("").with_suffix("")
+    elif suffixes and suffixes[-1] in [".vcf", ".bcf", ".gz"]:
+        base = ref_path.with_suffix("")
+    return base.with_suffix(".qref")
+
+
+def ensure_eagleimp_qref(ref_vcf, eagleimp_bin):
+    """Create a .qref reference if missing and return its path."""
+    qref_path = qref_path_for_ref(ref_vcf)
+    if qref_path.exists():
+        return qref_path
+    print(f"Creating Qref from {ref_vcf}...")
+    run(f"{eagleimp_bin} --ref {ref_vcf} --makeQref")
+    if not qref_path.exists():
+        raise RuntimeError(f"Expected Qref not found at {qref_path}")
+    return qref_path
+
+
+def ensure_simple_genetic_map(ref_vcf, map_path, chrom="22"):
+    """Create a simple genetic map from VCF positions (1 cM per Mb)."""
+    map_path = Path(map_path)
+    if map_path.exists() and map_path.stat().st_size > 0:
+        return map_path
+
+    chrom_label = find_chrom_label(ref_vcf, chrom) or f"chr{chrom}"
+    positions = []
+    with _open_maybe_gzip(ref_vcf) as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip().split("\t")
+            if len(fields) < 2:
+                continue
+            if fields[0] != chrom_label:
+                continue
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            positions.append(pos)
+
+    if not positions:
+        raise RuntimeError(f"No positions found for {chrom_label} in {ref_vcf}")
+
+    positions = sorted(set(positions))
+    map_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(map_path, "w") as f:
+        f.write("position\trate\tmap\n")
+        for pos in positions:
+            cm = pos / 1_000_000.0
+            f.write(f"{pos}\t1.0\t{cm:.6f}\n")
+
+    return map_path
+
+
+def find_eagleimp_phased_output(output_prefix, data_dir):
+    """Find EagleImp phased output from common naming conventions."""
+    candidates = [
+        Path(str(output_prefix) + ".phased.vcf.gz"),
+        Path(str(output_prefix) + ".phased.bcf"),
+        Path(str(output_prefix) + ".vcf.gz"),
+        Path(str(output_prefix) + ".bcf"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    for candidate in Path(data_dir).glob("*eagleimp*phased*.vcf.gz"):
+        return candidate
+    for candidate in Path(data_dir).glob("*eagleimp*phased*.bcf"):
+        return candidate
+    return None
 
 
 def download_if_missing(url, local_path):
@@ -577,7 +670,7 @@ def _parse_truth_line(line, sample_indices):
     return key, sample_data, is_multiallelic
 
 
-def _parse_imputed_line(line, sample_indices):
+def _parse_imputed_line(line, sample_indices, require_ds_gp=True):
     """Parse an imputed VCF line into (key, sample_data_list, is_multiallelic, missing_required)."""
     parts = line.split('\t')
     if len(parts) < 5:
@@ -597,25 +690,26 @@ def _parse_imputed_line(line, sample_indices):
             gt = parse_genotype(gt_field)
             is_phased = '|' in gt_field
 
-            # Expecting GT:DS:GP from bcftools query
             ds = None
             gp = None
 
-            # Parse DS (Estimated Dosage) - may be multiallelic (comma-separated)
-            if len(fields) > 1 and fields[1] != '.':
-                ds = _parse_ds_field(fields[1])
-
-            # Parse GP (Genotype Probabilities)
-            if len(fields) > 2 and fields[2] != '.':
-                try:
-                    gp_parts = fields[2].split(',')
-                    if len(gp_parts) == 3:
-                        gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
-                except:
-                    pass
-
-            if ds is None or gp is None:
-                missing_required = True
+            if require_ds_gp:
+                # Expecting GT:DS:GP from bcftools query
+                if len(fields) > 1 and fields[1] != '.':
+                    ds = _parse_ds_field(fields[1])
+                if len(fields) > 2 and fields[2] != '.':
+                    try:
+                        gp_parts = fields[2].split(',')
+                        if len(gp_parts) == 3:
+                            gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
+                    except:
+                        pass
+                if ds is None or gp is None:
+                    missing_required = True
+            else:
+                # Phasing-only comparison: derive dosage from GT, GP unavailable.
+                if gt is not None:
+                    ds = _gt_nonref_dosage(gt)
 
             sample_data.append((gt, ds, is_phased, gp))
         else:
@@ -664,7 +758,7 @@ def get_vcf_samples(vcf_path):
     return samples
 
 
-def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, reference_vcf=None):
+def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, reference_vcf=None, require_ds_gp=True):
     """
     Calculate comprehensive imputation accuracy metrics.
 
@@ -1028,6 +1122,9 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     sample_sen_min = [1.0] * n_common
     sample_sen_max = [0.0] * n_common
     sample_sen_count = [0] * n_common
+    sample_phase_concordant = [0] * n_common
+    sample_phase_total = [0] * n_common
+    sample_phase_flip = [None] * n_common
 
     # For IQS calculation: track per-site concordance and expected concordance
     site_iqs_sum = 0.0
@@ -1046,6 +1143,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     switch_opportunities = 0
     switch_errors_input = 0
     switch_opportunities_input = 0
+    phase_concordant = 0
+    phase_total = 0
 
     # SEN (Scaled Euclidean Norm) score
     sen_sum = 0.0
@@ -1091,7 +1190,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         "sum_t": 0.0, "sum_i": 0.0, "sum_ti": 0.0, "sum_tt": 0.0, "sum_ii": 0.0,
         "iqs_sum": 0.0, "iqs_count": 0, "nonref_concordant": 0, "nonref_total": 0,
         "confusion": [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
-        "switch_errors": 0, "switch_opportunities": 0
+        "switch_errors": 0, "switch_opportunities": 0,
+        "phase_concordant": 0, "phase_total": 0
     })
 
     # Mask-and-impute metrics (per-sample proxy)
@@ -1157,11 +1257,15 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     except Exception as e:
         print(f"Warning: Could not check VCF header: {e}")
     
-    if has_ds and has_gp:
-        imputed_cmd = imputed_cmd_full
-        print(f"Using GT:DS:GP format for {imputed_vcf}")
+    if require_ds_gp:
+        if has_ds and has_gp:
+            imputed_cmd = imputed_cmd_full
+            print(f"Using GT:DS:GP format for {imputed_vcf}")
+        else:
+            raise RuntimeError("Imputed VCF must include GT:DS:GP in header (no fallbacks).")
     else:
-        raise RuntimeError("Imputed VCF must include GT:DS:GP in header (no fallbacks).")
+        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
+        print(f"Using GT-only format for {imputed_vcf}")
     
     imputed_iter = _stream_vcf_lines(imputed_cmd)
 
@@ -1176,7 +1280,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     def get_next_imputed():
         try:
             line = next(imputed_iter)
-            return _parse_imputed_line(line, imputed_indices)
+            return _parse_imputed_line(line, imputed_indices, require_ds_gp=require_ds_gp)
         except StopIteration:
             return None, None, False, False
 
@@ -1438,6 +1542,21 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
                     # Switch errors
                     if t_class == 1 and i_class == 1 and t_phased and i_phased:
+                        # Phase concordance should be invariant to global haplotype labeling.
+                        if sample_phase_flip[sample_idx] is None:
+                            sample_phase_flip[sample_idx] = (i_gt != t_gt)
+                        flip = sample_phase_flip[sample_idx] or False
+                        phase_match = (i_gt != t_gt) if flip else (i_gt == t_gt)
+                        phase_total += 1
+                        sample_phase_total[sample_idx] += 1
+                        if phase_match:
+                            phase_concordant += 1
+                            sample_phase_concordant[sample_idx] += 1
+                        if maf_bin is not None:
+                            maf_bins[maf_bin]["phase_total"] += 1
+                            if phase_match:
+                                maf_bins[maf_bin]["phase_concordant"] += 1
+
                         sample_name = common_samples_list[sample_idx]
                         pos = site[1]
                         if current_block_start[sample_idx] < 0:
@@ -1578,7 +1697,20 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     all_lengths = []
     for lengths in phase_blocks.values():
         all_lengths.extend(lengths)
-    
+
+    def _quantile(sorted_vals, q):
+        if not sorted_vals:
+            return None
+        if len(sorted_vals) == 1:
+            return sorted_vals[0]
+        pos = q * (len(sorted_vals) - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return sorted_vals[lo]
+        frac = pos - lo
+        return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
     if all_lengths:
         all_lengths.sort(reverse=True)
         total_len = sum(all_lengths)
@@ -1591,8 +1723,68 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 n50 = l
                 break
         metrics["n50_phase_block"] = n50
+        lengths_sorted = sorted(all_lengths)
+        metrics["phase_block_count"] = len(all_lengths)
+        metrics["phase_block_len_mean"] = sum(all_lengths) / len(all_lengths)
+        metrics["phase_block_len_min"] = min(all_lengths)
+        metrics["phase_block_len_max"] = max(all_lengths)
+        metrics["phase_block_len_median"] = _quantile(lengths_sorted, 0.5)
+        metrics["phase_block_len_p10"] = _quantile(lengths_sorted, 0.10)
+        metrics["phase_block_len_p90"] = _quantile(lengths_sorted, 0.90)
     else:
         metrics["n50_phase_block"] = 0.0
+        metrics["phase_block_count"] = 0
+        metrics["phase_block_len_mean"] = 0.0
+        metrics["phase_block_len_min"] = 0.0
+        metrics["phase_block_len_max"] = 0.0
+        metrics["phase_block_len_median"] = 0.0
+        metrics["phase_block_len_p10"] = 0.0
+        metrics["phase_block_len_p90"] = 0.0
+
+    # Per-sample phase block stats
+    sample_block_counts = []
+    sample_block_means = []
+    sample_block_medians = []
+    sample_block_mins = []
+    sample_block_maxs = []
+    sample_block_n50s = []
+    for sample_name in common_samples_list:
+        lengths = phase_blocks.get(sample_name, [])
+        if not lengths:
+            continue
+        lengths_sorted = sorted(lengths)
+        sample_block_counts.append(len(lengths))
+        sample_block_means.append(sum(lengths) / len(lengths))
+        sample_block_medians.append(_quantile(lengths_sorted, 0.5))
+        sample_block_mins.append(min(lengths))
+        sample_block_maxs.append(max(lengths))
+        # N50 per sample
+        lengths_desc = sorted(lengths, reverse=True)
+        total_len = sum(lengths_desc)
+        target = total_len / 2
+        running_sum = 0
+        n50 = 0
+        for l in lengths_desc:
+            running_sum += l
+            if running_sum >= target:
+                n50 = l
+                break
+        sample_block_n50s.append(n50)
+
+    if sample_block_counts:
+        metrics["sample_phase_block_count_mean"] = sum(sample_block_counts) / len(sample_block_counts)
+        metrics["sample_phase_block_count_min"] = min(sample_block_counts)
+        metrics["sample_phase_block_count_max"] = max(sample_block_counts)
+    if sample_block_means:
+        metrics["sample_phase_block_len_mean"] = sum(sample_block_means) / len(sample_block_means)
+        metrics["sample_phase_block_len_min"] = min(sample_block_mins)
+        metrics["sample_phase_block_len_max"] = max(sample_block_maxs)
+    if sample_block_medians:
+        metrics["sample_phase_block_len_median_mean"] = sum(sample_block_medians) / len(sample_block_medians)
+    if sample_block_n50s:
+        metrics["sample_phase_block_n50_mean"] = sum(sample_block_n50s) / len(sample_block_n50s)
+        metrics["sample_phase_block_n50_min"] = min(sample_block_n50s)
+        metrics["sample_phase_block_n50_max"] = max(sample_block_n50s)
 
     # Precision/Recall/F1 (Binary classification: Ref vs Non-Ref)
     # TP: Truth=Alt, Imputed=Alt
@@ -1690,6 +1882,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             metrics["switch_error_rate_input_sites"] = switch_errors_input / switch_opportunities_input
             metrics["switch_errors_input_sites"] = switch_errors_input
             metrics["switch_opportunities_input_sites"] = switch_opportunities_input
+        if phase_total > 0:
+            metrics["phase_concordance"] = phase_concordant / phase_total
+            metrics["phase_concordant"] = phase_concordant
+            metrics["phase_total"] = phase_total
+            metrics["phase_flip_rate"] = 1.0 - metrics["phase_concordance"]
         
         # Confusion matrix
         metrics["confusion_matrix"] = confusion
@@ -1776,6 +1973,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         sample_sen_means = []
         sample_sen_mins = []
         sample_sen_maxs = []
+        sample_phase_concordances = []
 
         for i in range(n_common):
             n = sample_total[i]
@@ -1794,6 +1992,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 sample_sen_means.append(sample_sen_sum[i] / sample_sen_count[i])
                 sample_sen_mins.append(sample_sen_min[i])
                 sample_sen_maxs.append(sample_sen_max[i])
+            if sample_phase_total[i] > 0:
+                sample_phase_concordances.append(sample_phase_concordant[i] / sample_phase_total[i])
         
         if sample_concordances:
             metrics["sample_concordance_mean"] = sum(sample_concordances) / len(sample_concordances)
@@ -1807,6 +2007,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             metrics["sample_sen_median"] = None
             metrics["sample_sen_min"] = min(sample_sen_mins)
             metrics["sample_sen_max"] = max(sample_sen_maxs)
+        if sample_phase_concordances:
+            metrics["sample_phase_concordance_mean"] = sum(sample_phase_concordances) / len(sample_phase_concordances)
+            metrics["sample_phase_concordance_min"] = min(sample_phase_concordances)
+            metrics["sample_phase_concordance_max"] = max(sample_phase_concordances)
 
         # Per-MAF bin metrics
         metrics["by_maf"] = {}
@@ -1852,6 +2056,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     bin_metrics["switch_error_rate"] = data["switch_errors"] / data["switch_opportunities"]
                     bin_metrics["switch_errors"] = data["switch_errors"]
                     bin_metrics["switch_opportunities"] = data["switch_opportunities"]
+                if data["phase_total"] > 0:
+                    bin_metrics["phase_concordance"] = data["phase_concordant"] / data["phase_total"]
+                    bin_metrics["phase_concordant"] = data["phase_concordant"]
+                    bin_metrics["phase_total"] = data["phase_total"]
 
                 # Sufficient stats for genome-wide MAF bin aggregation
                 bin_metrics["agg_stats"] = {
@@ -1866,6 +2074,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     "nonref_total": data["nonref_total"],
                     "switch_err": data["switch_errors"],
                     "switch_opp": data["switch_opportunities"],
+                    "phase_concordant": data["phase_concordant"],
+                    "phase_total": data["phase_total"],
                     "tp": b_tp, "fp": b_fp, "fn": b_fn
                 }
 
@@ -1959,8 +2169,15 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             print(f"\n🔀 PHASING QUALITY")
             print(f"   Switch error rate:    {metrics.get('switch_error_rate'):.4f} ({metrics.get('switch_errors')}/{metrics.get('switch_opportunities')})")
             print(f"   N50 Phase Block:      {metrics.get('n50_phase_block'):.0f} bp")
+            if metrics.get("phase_concordance") is not None:
+                print(f"   Phase concordance:    {metrics.get('phase_concordance'):.4f}")
+                print(f"   Phase flip rate:      {metrics.get('phase_flip_rate'):.4f}")
             if metrics.get('switch_error_rate_input_sites') is not None:
                 print(f"   Switch error (input): {metrics.get('switch_error_rate_input_sites'):.4f} ({metrics.get('switch_errors_input_sites')}/{metrics.get('switch_opportunities_input_sites')})")
+            if metrics.get("phase_block_len_mean") is not None:
+                print(f"   Phase block length:   mean={metrics['phase_block_len_mean']:.0f} bp, median={metrics['phase_block_len_median']:.0f} bp")
+                print(f"   Phase block length:   p10={metrics['phase_block_len_p10']:.0f} bp, p90={metrics['phase_block_len_p90']:.0f} bp")
+                print(f"   Phase block count:    {metrics.get('phase_block_count', 0)}")
         
         print(f"\n📋 CONFUSION MATRIX (Truth vs Imputed)")
         print(f"   {'':12} {'HomRef':>10} {'Het':>10} {'HomAlt':>10}")
@@ -2034,11 +2251,19 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             print(f"   SEN:         mean={metrics['sample_sen_mean']:.4f}, min={metrics['sample_sen_min']:.4f}, max={metrics['sample_sen_max']:.4f}")
         if metrics.get('sample_switch_error_mean') is not None:
             print(f"   Switch Err:  mean={metrics['sample_switch_error_mean']:.4f}, min={metrics['sample_switch_error_min']:.4f}, max={metrics['sample_switch_error_max']:.4f}")
+        if metrics.get('sample_phase_concordance_mean') is not None:
+            print(f"   Phase conc:  mean={metrics['sample_phase_concordance_mean']:.4f}, min={metrics['sample_phase_concordance_min']:.4f}, max={metrics['sample_phase_concordance_max']:.4f}")
+        if metrics.get('sample_phase_block_len_mean') is not None:
+            print(f"   Block len:   mean={metrics['sample_phase_block_len_mean']:.0f} bp, min={metrics['sample_phase_block_len_min']:.0f}, max={metrics['sample_phase_block_len_max']:.0f}")
+        if metrics.get('sample_phase_block_n50_mean') is not None:
+            print(f"   Block N50:   mean={metrics['sample_phase_block_n50_mean']:.0f} bp, min={metrics['sample_phase_block_n50_min']:.0f}, max={metrics['sample_phase_block_n50_max']:.0f}")
+        if metrics.get('sample_phase_block_count_mean') is not None:
+            print(f"   Block cnt:   mean={metrics['sample_phase_block_count_mean']:.1f}, min={metrics['sample_phase_block_count_min']:.0f}, max={metrics['sample_phase_block_count_max']:.0f}")
 
         if "by_maf" in metrics:
             print(f"\n📈 BY MAF BIN (sorted by frequency)")
-            print(f"   {'MAF Bin':<20} {'F1':>8} {'Conc':>8} {'R²':>8} {'SwitchErr':>10} {'N':>10}")
-            print(f"   {'-'*20} {'-'*8} {'-'*8} {'-'*8} {'-'*10} {'-'*10}")
+            print(f"   {'MAF Bin':<20} {'F1':>8} {'Conc':>8} {'R²':>8} {'SwitchErr':>10} {'PhaseConc':>10} {'N':>10}")
+            print(f"   {'-'*20} {'-'*8} {'-'*8} {'-'*8} {'-'*10} {'-'*10} {'-'*10}")
             # Sort by actual frequency order
             bin_order = ["ultra-rare (<0.1%)", "very-rare (0.1-0.5%)", "rare (0.5-1%)", 
                         "low-freq (1-5%)", "medium (5-20%)", "common (>20%)"]
@@ -2049,7 +2274,8 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     conc = f"{bin_metrics['unphased_concordance']:.4f}"
                     r2_str = f"{bin_metrics.get('r_squared'):.4f}" if bin_metrics.get('r_squared') else "N/A"
                     switch_str = f"{bin_metrics.get('switch_error_rate'):.4f}" if bin_metrics.get('switch_error_rate') is not None else "N/A"
-                    print(f"   {maf_bin:<20} {f1_str:>8} {conc:>8} {r2_str:>8} {switch_str:>10} {bin_metrics['n_genotypes']:>10,}")
+                    phase_str = f"{bin_metrics.get('phase_concordance'):.4f}" if bin_metrics.get('phase_concordance') is not None else "N/A"
+                    print(f"   {maf_bin:<20} {f1_str:>8} {conc:>8} {r2_str:>8} {switch_str:>10} {phase_str:>10} {bin_metrics['n_genotypes']:>10,}")
 
         if metrics.get("masked_total"):
             print(f"\n🧪 MASKED-SNP METRICS (proxy)")
@@ -2098,8 +2324,33 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             if metrics.get('switch_error_rate') is not None:
                 f.write(f"Switch error rate: {metrics['switch_error_rate']:.6f}\n")
                 f.write(f"N50 Phase Block: {metrics.get('n50_phase_block'):.0f} bp\n")
+                if metrics.get('phase_concordance') is not None:
+                    f.write(f"Phase concordance: {metrics['phase_concordance']:.6f}\n")
+                    f.write(f"Phase flip rate: {metrics['phase_flip_rate']:.6f}\n")
+                if metrics.get('phase_block_len_mean') is not None:
+                    f.write(f"Phase block length mean: {metrics['phase_block_len_mean']:.0f} bp\n")
+                    f.write(f"Phase block length median: {metrics['phase_block_len_median']:.0f} bp\n")
+                    f.write(f"Phase block length p10: {metrics['phase_block_len_p10']:.0f} bp\n")
+                    f.write(f"Phase block length p90: {metrics['phase_block_len_p90']:.0f} bp\n")
+                    f.write(f"Phase block count: {metrics.get('phase_block_count', 0)}\n")
             if metrics.get('switch_error_rate_input_sites') is not None:
                 f.write(f"Switch error (input sites): {metrics['switch_error_rate_input_sites']:.6f}\n")
+            if metrics.get('sample_phase_concordance_mean') is not None:
+                f.write(f"Per-sample phase concordance mean: {metrics['sample_phase_concordance_mean']:.6f}\n")
+                f.write(f"Per-sample phase concordance min: {metrics['sample_phase_concordance_min']:.6f}\n")
+                f.write(f"Per-sample phase concordance max: {metrics['sample_phase_concordance_max']:.6f}\n")
+            if metrics.get('sample_phase_block_len_mean') is not None:
+                f.write(f"Per-sample phase block mean: {metrics['sample_phase_block_len_mean']:.0f} bp\n")
+                f.write(f"Per-sample phase block min: {metrics['sample_phase_block_len_min']:.0f} bp\n")
+                f.write(f"Per-sample phase block max: {metrics['sample_phase_block_len_max']:.0f} bp\n")
+            if metrics.get('sample_phase_block_n50_mean') is not None:
+                f.write(f"Per-sample phase block N50 mean: {metrics['sample_phase_block_n50_mean']:.0f} bp\n")
+                f.write(f"Per-sample phase block N50 min: {metrics['sample_phase_block_n50_min']:.0f} bp\n")
+                f.write(f"Per-sample phase block N50 max: {metrics['sample_phase_block_n50_max']:.0f} bp\n")
+            if metrics.get('sample_phase_block_count_mean') is not None:
+                f.write(f"Per-sample phase block count mean: {metrics['sample_phase_block_count_mean']:.1f}\n")
+                f.write(f"Per-sample phase block count min: {metrics['sample_phase_block_count_min']:.0f}\n")
+                f.write(f"Per-sample phase block count max: {metrics['sample_phase_block_count_max']:.0f}\n")
             
             f.write("\nCONFUSION MATRIX\n")
             f.write("-" * 40 + "\n")
@@ -2121,6 +2372,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     f.write(f"  R²: {bin_metrics['r_squared']:.6f}\n")
                 if bin_metrics.get('iqs'):
                     f.write(f"  IQS: {bin_metrics['iqs']:.6f}\n")
+                if bin_metrics.get('switch_error_rate') is not None:
+                    f.write(f"  Switch error rate: {bin_metrics['switch_error_rate']:.6f}\n")
+                if bin_metrics.get('phase_concordance') is not None:
+                    f.write(f"  Phase concordance: {bin_metrics['phase_concordance']:.6f}\n")
                 f.write(f"  N genotypes: {bin_metrics['n_genotypes']}\n")
     
     print(f"\n📄 Detailed metrics saved to: {metrics_file}")
@@ -2639,6 +2894,128 @@ def stage_reagle():
         sys.exit(1)
 
 
+def stage_phasing_compare():
+    """Compare phasing accuracy between Reagle, EagleImp, and SHAPEIT5."""
+    print("=" * 60)
+    print("STAGE: PHASING COMPARE - Reagle vs EagleImp vs SHAPEIT5")
+    print("=" * 60)
+
+    paths = get_paths()
+
+    # Verify required files exist
+    for name in ["ref_vcf", "truth_vcf", "input_vcf"]:
+        if not paths[name].exists():
+            print(f"ERROR: Required file not found: {paths[name]}")
+            print("Run 'prepare' stage first.")
+            sys.exit(1)
+
+    input_vcf = paths["input_vcf"]
+    if has_phased_genotypes(input_vcf):
+        print("Input VCF appears phased; creating an unphased copy for phasing comparison.")
+        unphased_input = paths["data_dir"] / "input_unphased.vcf.gz"
+        run(f"bcftools +setGT {input_vcf} -O z -o {unphased_input} -- -t a -n u")
+        run(f"bcftools index -f {unphased_input}")
+        input_vcf = unphased_input
+
+    if not paths["reagle_bin"].exists():
+        print(f"ERROR: Reagle binary not found: {paths['reagle_bin']}")
+        print("Build Reagle first with: cargo build --release")
+        sys.exit(1)
+
+    eagleimp_bin = find_executable("eagleimp", env_var="EAGLEIMP_BIN")
+    if not eagleimp_bin:
+        print("ERROR: EagleImp binary not found (set EAGLEIMP_BIN or ensure in PATH).")
+        sys.exit(1)
+
+    # Prepare EagleImp inputs (Qref + genetic map)
+    gen_map_env = os.environ.get("EAGLEIMP_GENMAP")
+    if gen_map_env:
+        gen_map = Path(gen_map_env)
+    else:
+        gen_map = ensure_simple_genetic_map(paths["ref_vcf"], paths["data_dir"] / "chr22.simple.map.txt", chrom="22")
+
+    # EagleImp expects reference filenames to start with the chromosome label.
+    eagleimp_ref = paths["data_dir"] / "22.ref.vcf.gz"
+    eagleimp_ref_index = Path(str(eagleimp_ref) + ".csi")
+    if not eagleimp_ref.exists():
+        eagleimp_ref.symlink_to(paths["ref_vcf"])
+    if not eagleimp_ref_index.exists():
+        src_index = Path(str(paths["ref_vcf"]) + ".csi")
+        if src_index.exists():
+            eagleimp_ref_index.symlink_to(src_index)
+
+    qref_path = ensure_eagleimp_qref(eagleimp_ref, eagleimp_bin)
+
+    # Run Reagle phasing
+    reagle_prefix = paths["data_dir"] / "reagle_phased"
+    reagle_vcf = Path(str(reagle_prefix) + ".vcf.gz")
+    if not reagle_vcf.exists():
+        print("\n--- Running Reagle (phasing-only) ---")
+        run(f"{paths['reagle_bin']} --gt {input_vcf} --out {reagle_prefix}")
+    ensure_index(reagle_vcf)
+
+    # Run EagleImp phasing
+    eagleimp_prefix = paths["data_dir"] / "eagleimp_phased"
+    eagleimp_vcf = find_eagleimp_phased_output(eagleimp_prefix, paths["data_dir"])
+    if not eagleimp_vcf or not eagleimp_vcf.exists():
+        print("\n--- Running EagleImp (phasing-only) ---")
+        run(
+            f"{eagleimp_bin} --geneticMap {gen_map} --ref {qref_path} --target {input_vcf} "
+            f"--skipImputation --outputPhasedFile -o {eagleimp_prefix}"
+        )
+        eagleimp_vcf = find_eagleimp_phased_output(eagleimp_prefix, paths["data_dir"])
+
+    if not eagleimp_vcf or not eagleimp_vcf.exists():
+        print("ERROR: EagleImp phased output not found after run.")
+        sys.exit(1)
+
+    if str(eagleimp_vcf).endswith(".vcf.gz"):
+        ensure_index(eagleimp_vcf)
+
+    # Compute phasing metrics against SHAPEIT5 truth
+    print("\n" + "=" * 60)
+    print("Calculating phasing accuracy metrics...")
+    print("=" * 60)
+
+    metrics = {}
+    metrics["reagle"] = calculate_metrics(
+        str(paths["truth_vcf"]),
+        str(reagle_vcf),
+        str(paths["data_dir"] / "reagle_phasing"),
+        input_vcf=str(input_vcf),
+        reference_vcf=str(paths["ref_vcf"]),
+        require_ds_gp=False
+    )
+    metrics["eagleimp"] = calculate_metrics(
+        str(paths["truth_vcf"]),
+        str(eagleimp_vcf),
+        str(paths["data_dir"] / "eagleimp_phasing"),
+        input_vcf=str(input_vcf),
+        reference_vcf=str(paths["ref_vcf"]),
+        require_ds_gp=False
+    )
+    metrics["shapeit5"] = calculate_metrics(
+        str(paths["truth_vcf"]),
+        str(paths["truth_vcf"]),
+        str(paths["data_dir"] / "shapeit5_phasing"),
+        input_vcf=str(input_vcf),
+        reference_vcf=str(paths["ref_vcf"]),
+        require_ds_gp=False
+    )
+
+    print("\nPHASING SUMMARY")
+    for name, data in metrics.items():
+        if not data:
+            print(f"{name.upper()}: FAILED/SKIPPED")
+            continue
+        ser = data.get("switch_error_rate", 0.0)
+        n50 = data.get("n50_phase_block", 0.0)
+        phase_conc = data.get("phase_concordance", 0.0)
+        print(f"{name.upper()}: SER={ser:.4f} PhaseConc={phase_conc:.4f} N50={n50:.0f} bp")
+
+    print("\nPhasing comparison completed successfully.")
+
+
 def stage_metrics():
     """Calculate and compare metrics for both tools."""
     print("=" * 60)
@@ -2753,6 +3130,7 @@ Stages:
   prepare-profile  Prepare middle 5% of chr22 target markers for profiling
   beagle       Run Java Beagle imputation
   reagle       Run Reagle imputation
+  phasing-compare  Compare phasing accuracy (Reagle vs EagleImp vs SHAPEIT5)
   impute5      Run IMPUTE5 imputation
   minimac      Run Minimac4 imputation
   glimpse      Run GLIMPSE imputation
@@ -2780,7 +3158,7 @@ Examples:
         nargs='?',
         default='all',
         choices=['all', 'prepare', 'prepare-profile', 'beagle', 'reagle', 'impute5', 'minimac', 
-                 'glimpse', 'metrics', 'prepare-chr', 'impute-chr', 
+                 'glimpse', 'metrics', 'phasing-compare', 'prepare-chr', 'impute-chr', 
                  'metrics-chr', 'summary'],
         help='Stage to run (default: all)'
     )
@@ -2815,6 +3193,8 @@ Examples:
         stage_beagle()
     elif args.stage == 'reagle':
         stage_reagle()
+    elif args.stage == 'phasing-compare':
+        stage_phasing_compare()
     elif args.stage == 'impute5':
         stage_impute5()
     elif args.stage == 'minimac':
