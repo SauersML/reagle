@@ -3181,7 +3181,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 let hap1 = s * 2;
                 let hap2 = s * 2 + 1;
                 let mut anchor_scores = vec![0i32; n_ref_haps];
-                for &(start, end) in &window_blocks {
+                let mut candidate_map: HashMap<usize, usize> = candidate_haps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &h)| (h, i))
+                    .collect();
+
+                for (w_idx, &(start, end)) in window_blocks.iter().enumerate() {
                     let mut window_anchors: Vec<(usize, u8, u8)> = Vec::new();
                     if let Some(list) = anchors_by_hap.get(hap1) {
                         for &(m, a1, a2) in list {
@@ -3228,9 +3234,24 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
                     let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
                     for &h in idxs.iter().take(take) {
-                        if !candidate_haps.contains(&h) {
+                        let score = anchor_scores[h];
+                        if score <= 0 {
+                            continue;
+                        }
+                        let c_idx = *candidate_map.entry(h).or_insert_with(|| {
                             candidate_haps.push(h);
                             scores_by_hap.push(Vec::new());
+                            candidate_haps.len() - 1
+                        });
+                        let score_f32 = score as f32;
+                        let list = &mut scores_by_hap[c_idx];
+                        match list.binary_search_by_key(&w_idx, |&(w, _)| w) {
+                            Ok(pos) => {
+                                if score_f32 > list[pos].1 {
+                                    list[pos].1 = score_f32;
+                                }
+                            }
+                            Err(pos) => list.insert(pos, (w_idx, score_f32)),
                         }
                     }
                 }
