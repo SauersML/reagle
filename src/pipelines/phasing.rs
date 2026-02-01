@@ -1491,6 +1491,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
         self.params
             .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        self.params.burnin = self.config.burnin;
+        self.params.iterations = self.config.iterations;
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
