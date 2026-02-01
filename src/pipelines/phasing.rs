@@ -83,6 +83,7 @@ const PBWT_ANCHOR_TOP_HAPS: usize = 32;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
@@ -266,16 +267,6 @@ fn build_sampling_points(
         }
     }
     sampling[n - 1] = true;
-    let count = sampling.iter().filter(|&&b| b).count();
-    eprintln!(
-        "[pbwt sampling] markers={} step_cm={:.6} min_step={} sampled={} first_cm={:.6} last_cm={:.6}",
-        n,
-        step,
-        min_step,
-        count,
-        gen_positions.first().copied().unwrap_or(0.0),
-        gen_positions.last().copied().unwrap_or(0.0)
-    );
     sampling
 }
 
@@ -2893,18 +2884,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             let abyss = vec![false; n_ref_haps];
             let (mut candidate_haps, mut scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
-            if s == 0 {
-                eprintln!(
-                    "[prescan] sample={} candidate_haps={} windows={}",
-                    s,
-                    candidate_haps.len(),
-                    num_windows
-                );
-                for &h in &debug_watch {
-                    let found = candidate_haps.iter().any(|&c| c == h);
-                    eprintln!("[prescan] watch_hap={} present={}", h, found);
-                }
-            }
             if ref_has_panel && PBWT_ANCHOR_TOP_HAPS > 0 {
                 let hap1 = s * 2;
                 let hap2 = s * 2 + 1;
@@ -6250,6 +6229,92 @@ fn ffbs_haploid_constrained(
     }
 }
 
+fn find_best_constant_pair_pbwt(
+    n_markers: usize,
+    n_states: usize,
+    seq1: &[u8],
+    seq2: &[u8],
+    phase_ibs: &BidirectionalPhaseIbs,
+    scores: &mut Vec<f32>,
+) -> Option<MosaicPaths> {
+    if n_states < 2 {
+        return None;
+    }
+
+    let need = n_states * n_states;
+    if scores.len() < need {
+        scores.resize(need, 0.0);
+    } else {
+        scores[..need].fill(0.0);
+    }
+
+    let mut informative = 0usize;
+    for m in 0..n_markers {
+        let a1 = seq1[m];
+        let a2 = seq2[m];
+        if a1 == 255 && a2 == 255 {
+            continue;
+        }
+        informative += 1;
+
+        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+
+        for i in 0..n_states {
+            let r1 = phase_ibs.allele(m, i as u32);
+            // Treat alleles > 1 as missing/uninformative for biallelic heuristic
+            if r1 == 255 || r1 > 1 {
+                continue;
+            }
+
+            for j in 0..i {
+                let r2 = phase_ibs.allele(m, j as u32);
+                if r2 == 255 || r2 > 1 {
+                    continue;
+                }
+
+                let compatible = if is_het {
+                    (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                } else {
+                    let obs = if a1 != 255 { a1 } else { a2 };
+                    r1 == obs && r2 == obs
+                };
+
+                if compatible {
+                    scores[i * n_states + j] += 1.0;
+                } else {
+                    scores[i * n_states + j] -= 1.0;
+                }
+            }
+        }
+    }
+
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_pair = (0, 1);
+
+    for i in 0..n_states {
+        for j in 0..i {
+            let s = scores[i * n_states + j];
+            if s > best_score {
+                best_score = s;
+                best_pair = (i, j);
+            }
+        }
+    }
+
+    if informative == 0 {
+        return None;
+    }
+    let threshold = 0.5 * (informative as f32);
+    if best_score < threshold || n_markers > HEURISTIC_MAX_MARKERS {
+        return None;
+    }
+
+    let path1 = vec![best_pair.0 as u32; n_markers];
+    let path2 = vec![best_pair.1 as u32; n_markers];
+
+    Some(MosaicPaths { path1, path2 })
+}
+
 /// Dynamic MCMC phasing using SHAPEIT5-style Gibbs sampling.
 ///
 /// This implements the correct MCMC approach with implicit anchoring:
@@ -6321,10 +6386,25 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    // Attempt pairwise initialization if no initial paths provided
+    let heuristic_paths_buf = if initial_paths.is_none() {
+        find_best_constant_pair_pbwt(
+            n_markers,
+            n_states,
+            seq1,
+            seq2,
+            phase_ibs,
+            &mut workspace.scores,
+        )
+    } else {
+        None
+    };
+    let start_paths = initial_paths.or(heuristic_paths_buf.as_ref());
+
     // Seed alleles from initial paths if available (from heuristic)
     // This ensures MCMC starts in a high-probability region rather than drifting
     // from a random start.
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             for m in 0..n_markers {
                 let a1 = seq1[m];
@@ -6788,7 +6868,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         return None;
     }
     let threshold = 0.5 * (informative as f32);
-    if best_score < threshold || n_markers > 500 {
+    if best_score < threshold || n_markers > HEURISTIC_MAX_MARKERS {
         return None;
     }
 
