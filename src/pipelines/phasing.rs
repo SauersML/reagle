@@ -6790,11 +6790,11 @@ fn sample_dynamic_mcmc(
 
                     // Check if this reference pair can explain the genotype
                     if a1 == a2 {
-                        // Homozygous: both refs must match or contain the allele
-                        // (Allow missing ref to match)
+                        // Homozygous: at least one ref must match (allows switching at hom sites)
+                        // This prevents rejecting good scaffold pairs that only differ at homs.
                         let match1 = ref1 == a1 || ref1 == 255;
                         let match2 = ref2 == a1 || ref2 == 255;
-                        if match1 && match2 {
+                        if match1 || match2 {
                             score += 1.0;
                         } else {
                             score -= 1.0;
@@ -7260,10 +7260,10 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
                     // Het: need (r1=a1, r2=a2) OR (r1=a2, r2=a1)
                     (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
                 } else {
-                    // Hom (or one missing): need r1=obs and r2=obs
-                    // If a1 or a2 is missing, we match the present one.
+                    // Hom (or one missing): at least one should match
+                    // This is more robust for finding scaffold haplotypes that might switch at homs.
                     let obs = if a1 != 255 { a1 } else { a2 };
-                    r1 == obs && r2 == obs
+                    r1 == obs || r2 == obs
                 };
 
                 if compatible {
