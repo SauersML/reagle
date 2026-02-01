@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -78,8 +78,8 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_FORCE_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -6654,6 +6654,7 @@ fn sample_dynamic_mcmc(
         );
     }
 
+
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
     let hap1_idx = sample_idx * 2;
     let anchor_h1 = anchor_hap1.unwrap_or(&[]);
@@ -6739,6 +6740,81 @@ fn sample_dynamic_mcmc(
         );
     }
 
+    // Inline heuristic for Dynamic MCMC initialization:
+    // If no external initial path is provided, try to find a constant pair of
+    // neighbors from the PBWT selection that explains the genotype well.
+    // This prevents symmetric switching by locking the initial phase to a consistent pair.
+    let mut heuristic_pair = None;
+    if initial_paths.is_none() && n_markers <= 500 {
+        let informative_markers = (0..n_markers)
+            .filter(|&m| seq1[m] != 255 && seq2[m] != 255)
+            .count();
+        if informative_markers > 0 {
+            let threshold = 0.9 * informative_markers as f32;
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_pair = None;
+
+            // Scan all pairs of initial neighbors
+            for (i, &h1) in initial_neighbors.iter().enumerate() {
+                for &h2 in initial_neighbors.iter().take(i) {
+                    let mut score = 0.0;
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 || a2 == 255 {
+                            continue;
+                        }
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 {
+                            continue;
+                        }
+
+                        let match1 = (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1);
+                        let match_hom = a1 == a2 && r1 == a1 && r2 == a1;
+
+                        if match1 || match_hom {
+                            score += 1.0;
+                        } else {
+                            score -= 1.0;
+                        }
+                    }
+
+                    if score > best_score {
+                        best_score = score;
+                        best_pair = Some((h1, h2));
+                    }
+                }
+            }
+
+            if best_score >= threshold {
+                if let Some((h1, h2)) = best_pair {
+                    heuristic_pair = Some((h1, h2));
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                            continue;
+                        }
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 {
+                            continue;
+                        }
+                        // Set phase based on best pair
+                        if r1 == a1 && r2 == a2 {
+                            h1_alleles[m] = a1;
+                            h2_alleles[m] = a2;
+                        } else if r1 == a2 && r2 == a1 {
+                            h1_alleles[m] = a2;
+                            h2_alleles[m] = a1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Separate paths for H1 and H2 to avoid cross-talk in Gibbs sampling
     // Store reference hap IDs (for persistence) and local state indices (per step)
     let mut path1_ref = vec![0u32; n_markers];
@@ -6756,6 +6832,9 @@ fn sample_dynamic_mcmc(
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
         }
+    } else if let Some((h1, h2)) = heuristic_pair {
+        path1_ref.fill(h1);
+        path2_ref.fill(h2);
     } else if let Some(&seed_hap) = neighbors.first() {
         path1_ref.fill(seed_hap);
         path2_ref.fill(seed_hap);
@@ -7182,7 +7261,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
+    let threshold = 0.9 * (informative as f32);
     if best_score < threshold || n_markers > 500 {
         return None;
     }
@@ -7638,7 +7717,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
 
-    if !has_anchor {
+    // Skip the secondary (flipped) chain if we have an anchor OR if we started with
+    // a high-quality heuristic path (start_paths is Some).
+    // Averaging symmetric modes degrades confidence if we already have a good guess.
+    if !has_anchor && start_paths.is_none() {
         let flipped_paths =
             if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
                 Some(MosaicPaths {
