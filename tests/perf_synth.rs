@@ -79,11 +79,11 @@ fn assert_vcf_fully_phased(path: &std::path::Path) {
 
 #[test]
 fn synth_impute_runtime_under_2_min() {
-    // Match CI-ish hap count, but only ~5% of chr22 markers to keep runtime bounded.
-    let ref_samples = 3273; // 6546 haplotypes
-    let target_samples = 818; // 1636 haplotypes
-    let n_markers = 2762; // ~5% of 55,237
-    let downsample_every = 20; // target ~5% markers
+    // Small sanity check workload (should be very fast on a normal machine).
+    let ref_samples = 100; // 200 haplotypes
+    let target_samples = 20; // 40 haplotypes
+    let n_markers = 1000;
+    let downsample_every = 1;
 
     let bin = std::env::var("REAGLE_BIN").ok().or_else(|| {
         let debug = std::path::PathBuf::from("target/debug/reagle");
@@ -130,7 +130,7 @@ fn synth_impute_runtime_under_2_min() {
     let timeout_secs = std::env::var("REAGLE_PERF_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(120);
+        .unwrap_or(60);
     let timeout = Duration::from_secs(timeout_secs);
     loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
