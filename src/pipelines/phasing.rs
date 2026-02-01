@@ -6262,6 +6262,98 @@ fn ffbs_haploid_constrained(
 /// haplotypes that match the current phase estimate via the "Latent State" approach:
 /// neighbors are found by looking up the position of the PREVIOUSLY SAMPLED reference
 /// state in the PBWT, giving O(1) lookup and preserving phase inertia.
+fn find_best_constant_pair_pbwt(
+    n_markers: usize,
+    n_states: usize,
+    seq1: &[u8],
+    seq2: &[u8],
+    phase_ibs: &BidirectionalPhaseIbs,
+    scores: &mut Vec<f32>,
+) -> Option<MosaicPaths> {
+    if n_states < 2 {
+        return None;
+    }
+
+    let n_haps = phase_ibs.n_haps();
+    let limit = n_states.min(n_haps);
+
+    let need = n_states * n_states;
+    if scores.len() < need {
+        scores.resize(need, 0.0);
+    } else {
+        scores[..need].fill(0.0);
+    }
+
+    let mut informative = 0usize;
+    for m in 0..n_markers {
+        let a1 = seq1[m];
+        let a2 = seq2[m];
+        if a1 == 255 && a2 == 255 {
+            continue;
+        }
+        informative += 1;
+
+        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+
+        for i in 0..limit {
+            let r1 = phase_ibs.allele(m, i as u32);
+            if r1 == 255 {
+                continue;
+            }
+
+            // Symmetric scan: only check j < i (lower triangle)
+            for j in 0..i {
+                let r2 = phase_ibs.allele(m, j as u32);
+                if r2 == 255 {
+                    continue;
+                }
+
+                let compatible = if is_het {
+                    // Het: need (r1=a1, r2=a2) OR (r1=a2, r2=a1)
+                    (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                } else {
+                    // Hom (or one missing): need r1=obs and r2=obs
+                    // If a1 or a2 is missing, we match the present one.
+                    let obs = if a1 != 255 { a1 } else { a2 };
+                    r1 == obs && r2 == obs
+                };
+
+                if compatible {
+                    scores[i * n_states + j] += 1.0;
+                } else {
+                    scores[i * n_states + j] -= 1.0;
+                }
+            }
+        }
+    }
+
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_pair = (0, 1);
+
+    for i in 0..limit {
+        for j in 0..i {
+            let s = scores[i * n_states + j];
+            if s > best_score {
+                best_score = s;
+                best_pair = (i, j);
+            }
+        }
+    }
+
+    if informative == 0 {
+        return None;
+    }
+    let threshold = 0.5 * (informative as f32);
+    if best_score < threshold || n_markers > 500 {
+        return None;
+    }
+
+    let path1 = vec![best_pair.0 as u32; n_markers];
+    let path2 = vec![best_pair.1 as u32; n_markers];
+
+    Some(MosaicPaths { path1, path2 })
+}
+
 fn sample_dynamic_mcmc(
     n_markers: usize,
     n_states: usize,
@@ -6321,10 +6413,28 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    // Attempt pairwise initialization if no initial paths provided
+    // This breaks symmetry in cases where H1/H2 are interchangeable but
+    // the reference supports one configuration over the other.
+    let heuristic_paths = if initial_paths.is_none() {
+        find_best_constant_pair_pbwt(
+            n_markers,
+            n_states,
+            seq1,
+            seq2,
+            phase_ibs,
+            &mut workspace.scores,
+        )
+    } else {
+        None
+    };
+
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
     // Seed alleles from initial paths if available (from heuristic)
     // This ensures MCMC starts in a high-probability region rather than drifting
     // from a random start.
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             for m in 0..n_markers {
                 let a1 = seq1[m];
@@ -6382,7 +6492,7 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
