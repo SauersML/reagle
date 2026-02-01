@@ -244,7 +244,10 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // sum_gen_dist is in cM, but we want intensity in Morgans^-1.
+        // intensity (cM^-1) = switches / cM
+        // intensity (M^-1) = switches / (cM / 100) = 100 * switches / cM
+        Some((100.0 * self.sum_expected_switches / self.sum_gen_dist) as f32)
     }
 
     /// Estimate mismatch probability
