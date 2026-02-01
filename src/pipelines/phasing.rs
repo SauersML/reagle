@@ -57,7 +57,7 @@ impl std::ops::Deref for StreamWindowWithResult {
     }
 }
 use crate::data::alignment::{AlignmentStats, MarkerAlignment};
-use crate::model::types::{CombinedHapId, CombinedHapSpace};
+use crate::model::types::{combined_from_ref, CombinedHapId, CombinedHapSpace, RefHapId};
 use crate::model::states::ThreadedHaps;
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
@@ -3288,8 +3288,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &per_window_caps,
             );
 
-            let mut selected: Vec<usize> =
-                allocation.intervals_by_hap.into_iter().map(|(h, _)| h).collect();
+            let mut selected: Vec<RefHapId> =
+                allocation.intervals_by_hap.into_iter().map(|(h, _)| RefHapId::from(h)).collect();
             selected.sort_unstable();
             selected.dedup();
             if PBWT_FORCE_TOP_HAPS > 0 && !window_scores.is_empty() {
@@ -3320,22 +3320,24 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 });
                 let take = PBWT_FORCE_TOP_HAPS.min(touched_indices.len());
                 for &h in touched_indices.iter().take(take) {
-                    if !selected.contains(&h) {
-                        selected.push(h);
+                    let hid = RefHapId::from(h);
+                    if !selected.contains(&hid) {
+                        selected.push(hid);
                     }
                 }
             }
             if exclude_self {
-                selected.retain(|h| h / 2 != s);
+                selected.retain(|h| (h.as_usize() / 2) != s);
             }
             if selected.is_empty() {
                 let fallback_cap = per_window_cap.min(n_ref_haps.max(1)).max(1);
-                let mut fallback: Vec<usize> = (0..fallback_cap).collect();
+                let mut fallback: Vec<RefHapId> =
+                    (0..fallback_cap).map(RefHapId::from).collect();
                 if exclude_self {
-                    fallback.retain(|h| h / 2 != s);
+                    fallback.retain(|h| (h.as_usize() / 2) != s);
                 }
                 if fallback.is_empty() {
-                    fallback.push(0);
+                    fallback.push(RefHapId::from(0usize));
                 }
                 selected = fallback;
             }
@@ -3357,8 +3359,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 n_markers,
             );
             for h in selected {
-                let idx = h + offset;
-                th.push_new(CombinedHapId::new(idx as u32));
+                let combined = combined_from_ref(h, offset as u32);
+                th.push_new(combined);
             }
             if s == 0 && n_markers <= 60 {
                 let mut buf = vec![CombinedHapId::from(0u32); th.n_states()];
