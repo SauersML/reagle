@@ -6443,6 +6443,107 @@ fn sample_dynamic_mcmc(
 
     mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
 
+    // Heuristic initialization to avoid symmetric switching traps
+    if initial_paths.is_none() {
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_pair = None;
+        let mut informative = 0;
+
+        for m in 0..n_markers {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            if a1 != 255 || a2 != 255 {
+                informative += 1;
+            }
+        }
+
+        // Only run on small windows with sufficient signal
+        let threshold = 0.9 * informative as f32;
+        if informative > 0 && n_markers <= 500 {
+            let k = neighbors.len();
+            for i in 0..k {
+                let h1 = neighbors[i];
+                if h1 as u32 == hap1_idx || h1 as u32 == hap1_idx + 1 {
+                    continue;
+                }
+
+                for j in 0..=i {
+                    let h2 = neighbors[j];
+                    if h2 as u32 == hap1_idx || h2 as u32 == hap1_idx + 1 {
+                        continue;
+                    }
+
+                    let mut score = 0.0f32;
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 && a2 == 255 {
+                            continue;
+                        }
+
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 {
+                            continue;
+                        }
+
+                        let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                        let compatible = if is_het {
+                            (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                        } else {
+                            let obs = if a1 != 255 { a1 } else { a2 };
+                            r1 == obs && r2 == obs
+                        };
+
+                        if compatible {
+                            score += 1.0;
+                        } else {
+                            score -= 1.0;
+                        }
+                    }
+
+                    if score > best_score {
+                        best_score = score;
+                        best_pair = Some((h1, h2));
+                    }
+                }
+            }
+
+            if let Some((h1, h2)) = best_pair {
+                if best_score >= threshold {
+                    // Apply to h1_alleles/h2_alleles and path_refs
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 && a2 == 255 {
+                            continue;
+                        }
+
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 {
+                            continue;
+                        }
+
+                        // Check orientation
+                        let matches_orient1 = r1 == a1 && r2 == a2;
+                        let matches_orient2 = r1 == a2 && r2 == a1;
+
+                        if matches_orient1 && !matches_orient2 {
+                            h1_alleles[m] = r1;
+                            h2_alleles[m] = r2;
+                        } else if matches_orient2 && !matches_orient1 {
+                            h1_alleles[m] = r1;
+                            h2_alleles[m] = r2;
+                        }
+                    }
+                    path1_ref.fill(h1);
+                    path2_ref.fill(h2);
+                }
+            }
+        }
+    }
+
     let collect_dynamic_neighbors = |path_ref: &[u32], sample_idx: u32| -> Vec<u32> {
         let stride = (n_markers / 8).max(1);
         // Prefer informative anchors: within each stride window, choose the best marker.
