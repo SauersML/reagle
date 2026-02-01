@@ -6297,6 +6297,21 @@ fn sample_dynamic_mcmc(
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
     let hap1_idx = sample_idx * 2;
 
+    // Initialize path with starting states from standard neighbor finding
+    // This gives the first iteration something to work with
+    let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
+    if initial_neighbors.is_empty() {
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MosaicPaths {
+                path1: Vec::new(),
+                path2: Vec::new(),
+            },
+        );
+    }
+
     // Initialize H1, H2 alleles from genotype (random phase at hets)
     let mut h1_alleles = vec![0u8; n_markers];
     let mut h2_alleles = vec![0u8; n_markers];
@@ -6317,6 +6332,36 @@ fn sample_dynamic_mcmc(
             } else {
                 h1_alleles[m] = a2;
                 h2_alleles[m] = a1;
+            }
+        }
+    }
+
+    // Seed alleles from best neighbor if available (if no explicit paths)
+    // This prevents "Mosaic Traps" (symmetric switching) in the first iteration
+    // by ensuring we start with a phase consistent with the best available neighbor.
+    //
+    // Only apply this seeding if the neighbor match covers a significant portion
+    // of the window (> 50%), indicating a robust global haplotype match.
+    // Seeding from short/fragmentary matches in large windows can bias the phase
+    // towards a specific reference that is only locally correct.
+    if let Some(&best_hap) = initial_neighbors.first() {
+        if initial_paths.is_none() {
+            let span = phase_ibs.best_match_span(hap1_idx, n_markers / 2);
+            if span >= n_markers / 2 {
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 != 255 && a2 != 255 && a1 != a2 {
+                        let ref_al = phase_ibs.allele(m, best_hap);
+                        if ref_al == a1 {
+                            h1_alleles[m] = a1;
+                            h2_alleles[m] = a2;
+                        } else if ref_al == a2 {
+                            h1_alleles[m] = a2;
+                            h2_alleles[m] = a1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -6353,21 +6398,6 @@ fn sample_dynamic_mcmc(
                 }
             }
         }
-    }
-
-    // Initialize path with starting states from standard neighbor finding
-    // This gives the first iteration something to work with
-    let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
-    if initial_neighbors.is_empty() {
-        return (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            MosaicPaths {
-                path1: Vec::new(),
-                path2: Vec::new(),
-            },
-        );
     }
 
     // Separate paths for H1 and H2 to avoid cross-talk in Gibbs sampling
