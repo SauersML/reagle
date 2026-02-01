@@ -419,6 +419,8 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
     batch_haps: &[usize],
     geno: &MutableGenotypes,
     ref_columns: &[GenotypeColumn],
+    phase_mask: Option<&Vec<Vec<u8>>>,
+    mask_unphased_hets: Option<&[bool]>,
     alignment: Option<&MarkerAlignment<TargetSpace, RefSpace>>,
     freqs: &[Vec<f32>],
     window: (usize, usize),
@@ -457,7 +459,29 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
             .and_then(|map| map.get(m).copied())
             .unwrap_or(m);
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+            let sample_idx = hap_idx / 2;
+            let phased = phase_mask
+                .and_then(|mask| mask.get(orig_m).and_then(|row| row.get(sample_idx)))
+                .copied()
+                .unwrap_or(0);
+            if phased == 0
+                && mask_unphased_hets
+                    .and_then(|flags| flags.get(sample_idx))
+                    .copied()
+                    .unwrap_or(false)
+            {
+                let hap1 = sample_idx * 2;
+                let hap2 = hap1 + 1;
+                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
+                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                if a1 != 255 && a1 == a2 {
+                    query_alleles[i] = a1;
+                } else {
+                    query_alleles[i] = 255;
+                }
+            } else {
+                query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+            }
         }
 
         if let Some(alignment) = alignment {
@@ -563,7 +587,29 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
             .and_then(|map| map.get(m).copied())
             .unwrap_or(m);
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+            let sample_idx = hap_idx / 2;
+            let phased = phase_mask
+                .and_then(|mask| mask.get(orig_m).and_then(|row| row.get(sample_idx)))
+                .copied()
+                .unwrap_or(0);
+            if phased == 0
+                && mask_unphased_hets
+                    .and_then(|flags| flags.get(sample_idx))
+                    .copied()
+                    .unwrap_or(false)
+            {
+                let hap1 = sample_idx * 2;
+                let hap2 = hap1 + 1;
+                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
+                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                if a1 != 255 && a1 == a2 {
+                    query_alleles[i] = a1;
+                } else {
+                    query_alleles[i] = 255;
+                }
+            } else {
+                query_alleles[i] = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+            }
         }
 
         if let Some(alignment) = alignment {
@@ -2644,6 +2690,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             n_markers,
         );
         let phase_mask = target_gt.phase_mask();
+        let mut mask_unphased_hets = vec![false; n_haps / 2];
         let mut anchors_by_hap: Vec<Vec<(usize, u8, u8)>> = vec![Vec::new(); n_haps];
         let mut ref_col_for_marker = vec![usize::MAX; n_markers];
         if ref_gt.is_some() {
@@ -2685,6 +2732,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
                     anchors_by_hap[hap1].push((m, a1, a2));
                     anchors_by_hap[hap2].push((m, a2, a1));
+                    mask_unphased_hets[s] = true;
                 }
             }
         }
@@ -2759,6 +2807,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     &batch_haps_buf,
                     target_geno,
                     &ref_columns,
+                    phase_mask,
+                    Some(&mask_unphased_hets),
                     alignment,
                     &freqs,
                     (start, end),
@@ -2842,7 +2892,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
 
             let abyss = vec![false; n_ref_haps];
-            let (mut candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
+            let (mut candidate_haps, mut scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
             if s == 0 {
                 eprintln!(
                     "[prescan] sample={} candidate_haps={} windows={}",
@@ -2908,6 +2958,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     for &h in idxs.iter().take(take) {
                         if !candidate_haps.contains(&h) {
                             candidate_haps.push(h);
+                            scores_by_hap.push(Vec::new());
                         }
                     }
                 }
@@ -6823,7 +6874,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     // Attempt pairwise initialization if no initial paths provided
-    let heuristic_paths = if initial_paths.is_none() {
+    let mut heuristic_paths = if initial_paths.is_none() {
         find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
@@ -6835,7 +6886,131 @@ fn sample_swap_bits_mosaic<RefSpace>(
     } else {
         None
     };
-    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
+    let anchor_h1 = anchor_hap1.unwrap_or(&[]);
+    let anchor_h2 = anchor_hap2.unwrap_or(&[]);
+    let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
+
+    // Align heuristic orientation to anchors when present.
+    if has_anchor {
+        if let Some(paths) = heuristic_paths.as_mut() {
+            let mut score_direct: i32 = 0;
+            let mut score_flip: i32 = 0;
+            let ref_alleles = &mut workspace.ref_alleles;
+            for m in 0..n_markers {
+                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
+                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
+                if a1 == 255 && a2 == 255 {
+                    continue;
+                }
+                ref_provider.fill_ref_alleles(m, ref_alleles);
+                let p1 = paths.path1[m] as usize;
+                let p2 = paths.path2[m] as usize;
+                if p1 >= n_states || p2 >= n_states {
+                    continue;
+                }
+                let r1 = ref_alleles[p1];
+                let r2 = ref_alleles[p2];
+                if a1 != 255 {
+                    if r1 == a1 {
+                        score_direct += 1;
+                    } else {
+                        score_direct -= 1;
+                    }
+                    if r2 == a1 {
+                        score_flip += 1;
+                    } else {
+                        score_flip -= 1;
+                    }
+                }
+                if a2 != 255 {
+                    if r2 == a2 {
+                        score_direct += 1;
+                    } else {
+                        score_direct -= 1;
+                    }
+                    if r1 == a2 {
+                        score_flip += 1;
+                    } else {
+                        score_flip -= 1;
+                    }
+                }
+            }
+            if score_flip > score_direct {
+                std::mem::swap(&mut paths.path1, &mut paths.path2);
+                eprintln!(
+                    "[anchor init] flipped heuristic paths (direct={} flip={})",
+                    score_direct, score_flip
+                );
+            } else {
+                eprintln!(
+                    "[anchor init] kept heuristic paths (direct={} flip={})",
+                    score_direct, score_flip
+                );
+            }
+        }
+    }
+
+    let mut start_paths = initial_paths.or(heuristic_paths.as_ref());
+    let mut start_paths_owned: Option<MosaicPaths> = None;
+    if has_anchor {
+        if let Some(paths) = start_paths {
+            let mut score_direct: i32 = 0;
+            let mut score_flip: i32 = 0;
+            let ref_alleles = &mut workspace.ref_alleles;
+            for m in 0..n_markers {
+                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
+                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
+                if a1 == 255 && a2 == 255 {
+                    continue;
+                }
+                ref_provider.fill_ref_alleles(m, ref_alleles);
+                let p1 = paths.path1[m] as usize;
+                let p2 = paths.path2[m] as usize;
+                if p1 >= n_states || p2 >= n_states {
+                    continue;
+                }
+                let r1 = ref_alleles[p1];
+                let r2 = ref_alleles[p2];
+                if a1 != 255 {
+                    if r1 == a1 {
+                        score_direct += 1;
+                    } else {
+                        score_direct -= 1;
+                    }
+                    if r2 == a1 {
+                        score_flip += 1;
+                    } else {
+                        score_flip -= 1;
+                    }
+                }
+                if a2 != 255 {
+                    if r2 == a2 {
+                        score_direct += 1;
+                    } else {
+                        score_direct -= 1;
+                    }
+                    if r1 == a2 {
+                        score_flip += 1;
+                    } else {
+                        score_flip -= 1;
+                    }
+                }
+            }
+            if score_flip > score_direct {
+                let mut owned = paths.clone();
+                std::mem::swap(&mut owned.path1, &mut owned.path2);
+                start_paths_owned = Some(owned);
+                eprintln!(
+                    "[anchor init] flipped start paths (direct={} flip={})",
+                    score_direct, score_flip
+                );
+            }
+        }
+    }
+    if start_paths_owned.is_some() {
+        start_paths = start_paths_owned.as_ref();
+    }
 
     // Only build combined checkpoints if we don't have a start path
     // This optimization avoids the expensive Combined HMM step when we have a good guess
