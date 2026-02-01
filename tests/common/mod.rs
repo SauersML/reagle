@@ -28,6 +28,15 @@ pub fn cache_dir() -> PathBuf {
     dir
 }
 
+/// Check if bcftools is available in the PATH
+pub fn check_bcftools_available() -> bool {
+    Command::new("bcftools")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Download a file if it doesn't exist
 pub fn download_if_missing(url: &str, dest: &Path) -> bool {
     if dest.exists() {

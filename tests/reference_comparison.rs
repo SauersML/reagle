@@ -781,8 +781,11 @@ fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::proces
 
 #[test]
 #[serial]
-#[serial]
 fn test_phasing_rust_vs_java() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_phasing_rust_vs_java: bcftools not found");
+        return;
+    }
     // Run on all available data sources
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
@@ -886,6 +889,10 @@ fn run_phasing_comparison(source: &TestDataSource) {
 #[test]
 #[serial]
 fn test_imputation_vcf_ref_rust_vs_java() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_imputation_vcf_ref_rust_vs_java: bcftools not found");
+        return;
+    }
     // Run on all available data sources
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
@@ -951,6 +958,10 @@ fn run_imputation_comparison(source: &TestDataSource) {
 #[test]
 #[serial]
 fn test_java_beagle_bref3_creation() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_java_beagle_bref3_creation: bcftools not found");
+        return;
+    }
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
 
@@ -993,6 +1004,10 @@ fn test_java_beagle_bref3_creation() {
 #[test]
 #[serial]
 fn test_imputation_bref3_ref_rust_vs_java() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_imputation_bref3_ref_rust_vs_java: bcftools not found");
+        return;
+    }
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
 
@@ -1058,6 +1073,10 @@ fn test_imputation_bref3_ref_rust_vs_java() {
 #[test]
 #[serial]
 fn test_phasing_multi_window_long_map_vs_java() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_phasing_multi_window_long_map_vs_java: bcftools not found");
+        return;
+    }
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
 
@@ -1142,6 +1161,10 @@ fn test_phasing_multi_window_long_map_vs_java() {
 #[test]
 #[serial]
 fn test_imputation_multi_window_long_map_vs_java() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_imputation_multi_window_long_map_vs_java: bcftools not found");
+        return;
+    }
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
 
@@ -1206,6 +1229,10 @@ fn test_imputation_multi_window_long_map_vs_java() {
 #[test]
 #[serial]
 fn test_full_workflow_rust_vs_java() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_full_workflow_rust_vs_java: bcftools not found");
+        return;
+    }
     // Run full workflow on all data sources
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
@@ -1371,6 +1398,10 @@ fn run_bref3_java_only_test() {
 #[test]
 #[serial]
 fn test_output_structure_rust_vs_java() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_output_structure_rust_vs_java: bcftools not found");
+        return;
+    }
     // Run on all available data sources
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
@@ -1522,6 +1553,10 @@ fn validate_output(vcf_path: &Path, name: &str) -> (usize, usize, usize, usize) 
 #[test]
 #[serial]
 fn test_java_beagle_vcf_vs_bref3_consistency() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_java_beagle_vcf_vs_bref3_consistency: bcftools not found");
+        return;
+    }
     // Verify that imputation with VCF ref and bref3 ref produce identical results
     // Using sparse target for true imputation with DS/GP output
     let files = setup_test_files();
@@ -2004,6 +2039,10 @@ fn evaluate_imputation(
 #[test]
 #[serial]
 fn test_mask_and_recover_rust_vs_java() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_mask_and_recover_rust_vs_java: bcftools not found");
+        return;
+    }
     // Run on all available data sources
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
@@ -2369,6 +2408,10 @@ fn compare_against_beagle(
 #[test]
 #[serial]
 fn test_comparison_framework_self_check() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_comparison_framework_self_check: bcftools not found");
+        return;
+    }
     // Sanity check: BEAGLE compared against itself should pass trivially
     // Use disjoint ref/gt sample sets to ensure BEAGLE emits GP for target samples.
     let files = setup_test_files();
@@ -3231,6 +3274,10 @@ fn compare_genotyped_dosages_to_truth(
 #[test]
 #[serial]
 fn test_genotyped_dosage_correlation_with_truth() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_genotyped_dosage_correlation_with_truth: bcftools not found");
+        return;
+    }
     // Test that genotyped markers (non-imputed) have near-perfect correlation
     // between Rust output dosage and ground truth dosage
     let (sources, test_files) = get_all_data_sources();
@@ -3302,6 +3349,10 @@ fn test_genotyped_dosage_correlation_with_truth() {
 #[test]
 #[serial]
 fn test_strict_dr2_and_dosage_comparison() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_strict_dr2_and_dosage_comparison: bcftools not found");
+        return;
+    }
     // Comprehensive quality metrics comparison between Rust and Java
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
@@ -3370,6 +3421,10 @@ fn test_strict_dr2_and_dosage_comparison() {
 #[test]
 #[serial]
 fn test_diverse_mask_scenarios() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_diverse_mask_scenarios: bcftools not found");
+        return;
+    }
     // Test imputation with different masking fractions
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
@@ -3604,6 +3659,10 @@ fn test_diverse_mask_scenarios() {
 #[test]
 #[serial]
 fn test_multiple_seeds_consistency() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_multiple_seeds_consistency: bcftools not found");
+        return;
+    }
     // Verify that different seeds don't cause catastrophic failures
     // and results remain consistent with Java
     let (sources, test_files) = get_all_data_sources();
@@ -3757,6 +3816,10 @@ fn test_multiple_seeds_consistency() {
 #[test]
 #[serial]
 fn test_per_sample_imputation_accuracy() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_per_sample_imputation_accuracy: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
@@ -3968,6 +4031,10 @@ fn test_per_sample_imputation_accuracy() {
 #[test]
 #[serial]
 fn test_dr2_genotyped_vs_imputed() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_dr2_genotyped_vs_imputed: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
@@ -4213,6 +4280,10 @@ fn test_dr2_genotyped_vs_imputed() {
 #[test]
 #[serial]
 fn test_dosage_by_distance_from_genotyped() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_dosage_by_distance_from_genotyped: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
@@ -4448,6 +4519,10 @@ fn test_dosage_by_distance_from_genotyped() {
 #[test]
 #[serial]
 fn test_posterior_probability_calibration() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_posterior_probability_calibration: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
@@ -4651,6 +4726,10 @@ fn test_posterior_probability_calibration() {
 #[test]
 #[serial]
 fn test_genotyped_dosage_matches_hard_call() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_genotyped_dosage_matches_hard_call: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     let files = setup_test_files();
@@ -4863,6 +4942,10 @@ fn test_genotyped_dosage_matches_hard_call() {
 #[test]
 #[serial]
 fn test_phasing_sanity_checks() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_phasing_sanity_checks: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
     for source in sources {
@@ -5042,6 +5125,10 @@ fn test_phasing_sanity_checks() {
 #[test]
 #[serial]
 fn test_phasing_switch_error_rate() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_phasing_switch_error_rate: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
     for source in sources {
@@ -5209,6 +5296,10 @@ fn test_phasing_switch_error_rate() {
 #[test]
 #[serial]
 fn test_phasing_determinism() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_phasing_determinism: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
 
@@ -5272,6 +5363,10 @@ fn test_phasing_determinism() {
 #[test]
 #[serial]
 fn test_phasing_heterozygote_stress() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_phasing_heterozygote_stress: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
 
@@ -5433,6 +5528,10 @@ chr1	10000	.	C	A	.	.	.	GT	0/1
 #[test]
 #[serial]
 fn test_perfect_ld_trap_rare_variants_aggregate() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_perfect_ld_trap_rare_variants_aggregate: bcftools not found");
+        return;
+    }
     let beagle = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
 
@@ -5668,6 +5767,10 @@ fn test_perfect_ld_trap_rare_variants_aggregate() {
 #[test]
 #[serial]
 fn test_gl_confidence_affects_emission() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_gl_confidence_affects_emission: bcftools not found");
+        return;
+    }
     use reagle::data::marker::MarkerIdx;
     use reagle::io::vcf::VcfReader;
 
@@ -5711,6 +5814,10 @@ fn test_gl_confidence_affects_emission() {
 #[test]
 #[serial]
 fn test_dr2_zero_variance_genotyped_marker() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_dr2_zero_variance_genotyped_marker: bcftools not found");
+        return;
+    }
     println!("\n{}", "=".repeat(70));
     println!("=== DR2 for Zero-Variance Genotyped Markers ===");
     println!("{}", "=".repeat(70));
@@ -5782,6 +5889,10 @@ fn test_dr2_zero_variance_genotyped_marker() {
 #[test]
 #[serial]
 fn test_imputation_vs_ground_truth() {
+    if !common::check_bcftools_available() {
+        println!("Skipping test_imputation_vs_ground_truth: bcftools not found");
+        return;
+    }
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files);
     for source in sources {
