@@ -6382,7 +6382,85 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    let mut heuristic_paths: Option<MosaicPaths> = None;
+    if initial_paths.is_none() && n_markers <= 500 {
+        let scores = &mut workspace.scores;
+        let need = n_states * n_states;
+        if scores.len() < need {
+            scores.resize(need, 0.0);
+        }
+        scores[..need].fill(0.0);
+
+        let mut informative = 0usize;
+        for m in 0..n_markers {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            if a1 == 255 && a2 == 255 {
+                continue;
+            }
+            informative += 1;
+
+            let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+
+            for i in 0..n_states {
+                let r1 = if (i as usize) < phase_ibs.n_haps() {
+                    phase_ibs.allele(m, i as u32)
+                } else {
+                    255
+                };
+                if r1 == 255 {
+                    continue;
+                }
+
+                for j in 0..i {
+                    let r2 = if (j as usize) < phase_ibs.n_haps() {
+                        phase_ibs.allele(m, j as u32)
+                    } else {
+                        255
+                    };
+                    if r2 == 255 {
+                        continue;
+                    }
+
+                    let compatible = if is_het {
+                        (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                    } else {
+                        let obs = if a1 != 255 { a1 } else { a2 };
+                        r1 == obs && r2 == obs
+                    };
+
+                    if compatible {
+                        scores[i * n_states + j] += 1.0;
+                    } else {
+                        scores[i * n_states + j] -= 1.0;
+                    }
+                }
+            }
+        }
+
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_pair = (0, 1);
+        for i in 0..n_states {
+            for j in 0..i {
+                let s = scores[i * n_states + j];
+                if s > best_score {
+                    best_score = s;
+                    best_pair = (i, j);
+                }
+            }
+        }
+
+        if informative > 0 && best_score >= (0.5 * informative as f32) {
+            heuristic_paths = Some(MosaicPaths {
+                path1: vec![best_pair.0 as u32; n_markers],
+                path2: vec![best_pair.1 as u32; n_markers],
+            });
+        }
+    }
+
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
