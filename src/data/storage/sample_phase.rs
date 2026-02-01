@@ -160,6 +160,12 @@ impl SamplePhase {
         self.phase_confidence[marker]
     }
 
+    /// Number of markers tracked by this SamplePhase.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.hap1.len()
+    }
+
     /// Set phase confidence for a marker (0.0-1.0) for the current orientation.
     #[inline]
     pub fn set_phase_confidence(&mut self, marker: usize, p: f32) {

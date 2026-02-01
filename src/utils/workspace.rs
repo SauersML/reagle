@@ -31,6 +31,8 @@ pub struct ThreadWorkspace {
     pub hap2_partner_allele: Vec<u8>,
     pub hap1_use_combined: Vec<bool>,
     pub hap2_use_combined: Vec<bool>,
+    pub hap1_hard_match: Vec<bool>,
+    pub hap2_hard_match: Vec<bool>,
     /// Reusable per-sample buffers to avoid hot-loop allocations
     pub seq1: Vec<u8>,
     pub seq2: Vec<u8>,
@@ -49,12 +51,10 @@ pub struct ThreadWorkspace {
     pub hap2_checkpoint_data: Vec<f32>,
     /// Reusable buffers for initialization/scoring in phasing
     pub scores: Vec<f32>,
-    pub swap_counts: Vec<u32>,
-    pub obs_counts: Vec<u32>,
-    pub last_orients: Vec<u8>,
     pub dummy_target: Vec<u8>,
     pub dummy_partner: Vec<u8>,
     pub dummy_combined: Vec<bool>,
+    pub dummy_hard_match: Vec<bool>,
     /// Cached marker count
     n_markers: usize,
     /// Number of states (cached for convenience)
@@ -86,6 +86,8 @@ impl ThreadWorkspace {
             hap2_partner_allele: Vec::new(),
             hap1_use_combined: Vec::new(),
             hap2_use_combined: Vec::new(),
+            hap1_hard_match: Vec::new(),
+            hap2_hard_match: Vec::new(),
             seq1: Vec::new(),
             seq2: Vec::new(),
             sample_conf: Vec::new(),
@@ -99,12 +101,10 @@ impl ThreadWorkspace {
             hap1_checkpoint_data: Vec::new(),
             hap2_checkpoint_data: Vec::new(),
             scores: Vec::new(),
-            swap_counts: Vec::new(),
-            obs_counts: Vec::new(),
-            last_orients: Vec::new(),
             dummy_target: Vec::new(),
             dummy_partner: Vec::new(),
             dummy_combined: Vec::new(),
+            dummy_hard_match: Vec::new(),
             n_markers: 0,
             n_states,
         }
@@ -173,6 +173,12 @@ impl ThreadWorkspace {
         }
         if self.hap2_use_combined.len() < n_markers {
             self.hap2_use_combined.resize(n_markers, true);
+        }
+        if self.hap1_hard_match.len() < n_markers {
+            self.hap1_hard_match.resize(n_markers, false);
+        }
+        if self.hap2_hard_match.len() < n_markers {
+            self.hap2_hard_match.resize(n_markers, false);
         }
 
         let block_len = n_states * max_block_len;
