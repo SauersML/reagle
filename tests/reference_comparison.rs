@@ -203,6 +203,7 @@ fn parse_vcf(path: &Path) -> (Vec<String>, Vec<ParsedRecord>) {
         let gt_idx = format_fields.iter().position(|&f| f == "GT");
         let ds_idx = format_fields.iter().position(|&f| f == "DS");
         let gp_idx = format_fields.iter().position(|&f| f == "GP");
+        let pp_idx = format_fields.iter().position(|&f| f == "PP");
 
         // Parse genotypes
         let mut genotypes = Vec::new();
@@ -228,6 +229,33 @@ fn parse_vcf(path: &Path) -> (Vec<String>, Vec<ParsedRecord>) {
                     } else {
                         None
                     }
+                })
+                .or_else(|| {
+                    pp_idx
+                        .and_then(|i| sample_fields.get(i))
+                        .and_then(|s: &&str| {
+                            let phred: Vec<f64> =
+                                s.split(',').filter_map(|p: &str| p.parse().ok()).collect();
+                            if phred.len() == 3 {
+                                let mut probs = [0.0; 3];
+                                let mut sum = 0.0;
+                                for (idx, p) in phred.iter().enumerate() {
+                                    let v = 10f64.powf(-p / 10.0);
+                                    probs[idx] = v;
+                                    sum += v;
+                                }
+                                if sum > 0.0 {
+                                    for v in &mut probs {
+                                        *v /= sum;
+                                    }
+                                    Some(probs)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
                 });
 
             genotypes.push(ParsedGenotype { gt, ds, gp });
@@ -2234,16 +2262,157 @@ fn compare_against_beagle(
 #[serial]
 fn test_comparison_framework_self_check() {
     // Sanity check: BEAGLE compared against itself should pass trivially
-    // Masks samples from ref panel - BEAGLE only outputs GP when gt samples are IN ref
+    // Use disjoint ref/gt sample sets to ensure BEAGLE emits GP for target samples.
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
 
-    let ref_path = work_dir.path().join("ref.vcf.gz");
-    fs::copy(&files.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let ref_full = work_dir.path().join("ref_full.vcf.gz");
+    fs::copy(&files.ref_vcf, &ref_full).expect("Copy ref VCF");
 
-    // Create masked version from ref itself (samples must be in ref for BEAGLE GP output)
+    let split_vcf = |input: &Path, out_path: &Path, keep_first: usize, keep: bool| {
+        let output = Command::new("gzip")
+            .args(["-dc", input.to_str().unwrap()])
+            .output()
+            .expect("gzip");
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut out = String::new();
+        for line in text.lines() {
+            if line.starts_with("#CHROM") {
+                let parts: Vec<&str> = line.split('\t').collect();
+                let fixed = parts[..9].to_vec();
+                let samples: Vec<&str> = parts[9..].to_vec();
+                let split = keep_first.min(samples.len());
+                let kept: Vec<&str> = if keep {
+                    samples[..split].to_vec()
+                } else {
+                    samples[split..].to_vec()
+                };
+                let mut rebuilt = Vec::with_capacity(9 + kept.len());
+                rebuilt.extend(fixed);
+                rebuilt.extend(kept);
+                out.push_str(&rebuilt.join("\t"));
+                out.push('\n');
+            } else if line.starts_with('#') {
+                out.push_str(line);
+                out.push('\n');
+            } else {
+                let parts: Vec<&str> = line.split('\t').collect();
+                let fixed = parts[..9].to_vec();
+                let samples: Vec<&str> = parts[9..].to_vec();
+                let split = keep_first.min(samples.len());
+                let kept: Vec<&str> = if keep {
+                    samples[..split].to_vec()
+                } else {
+                    samples[split..].to_vec()
+                };
+                let mut rebuilt = Vec::with_capacity(9 + kept.len());
+                rebuilt.extend(fixed);
+                rebuilt.extend(kept);
+                out.push_str(&rebuilt.join("\t"));
+                out.push('\n');
+            }
+        }
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(File::create(out_path).unwrap())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("stdin")
+                    .write_all(out.as_bytes())?;
+                child.wait()
+            })
+            .expect("gzip");
+        assert!(status.success());
+    };
+
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    let gt_path = work_dir.path().join("gt.vcf.gz");
+    split_vcf(&ref_full, &gt_path, 10, true);
+    split_vcf(&ref_full, &ref_path, 10, false);
+
+    // Create masked version with periodic marker drops to force GP output.
     let masked_path = work_dir.path().join("masked.vcf");
-    let truth_map = create_masked_vcf(&ref_path, &masked_path, 0.05, 99);
+    let truth_map = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let decompress_output = Command::new("gzip")
+            .args(["-dc", gt_path.to_str().unwrap()])
+            .output()
+            .expect("Failed to run gzip");
+        assert!(decompress_output.status.success());
+        let content = String::from_utf8_lossy(&decompress_output.stdout);
+        let mut output = File::create(&masked_path).expect("Create output file");
+        let mut truth_map = HashMap::new();
+        let mut sample_count = 0usize;
+        let mut marker_idx = 0usize;
+
+        for line in content.lines() {
+            if line.starts_with('#') {
+                writeln!(output, "{}", line).expect("Write header");
+                if line.starts_with("#CHROM") {
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    sample_count = fields.len() - 9;
+                }
+                continue;
+            }
+
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 10 {
+                writeln!(output, "{}", line).expect("Write line");
+                continue;
+            }
+
+            let chrom = fields[0].to_string();
+            let pos: u64 = fields[1].parse().expect("Parse pos");
+
+            // Drop every 20th marker to force imputation of ungenotyped markers.
+            if marker_idx % 20 == 0 {
+                for sample_idx in 0..sample_count {
+                    let gt: &str = fields[9 + sample_idx].split(':').next().unwrap_or(".");
+                    truth_map.insert((chrom.clone(), pos, sample_idx), gt.to_string());
+                }
+                marker_idx += 1;
+                continue;
+            }
+
+            // Decide which samples to mask at this position
+            let samples_to_mask: Vec<usize> = (0..sample_count)
+                .filter(|_| rand::Rng::random::<f64>(&mut rng) < 0.05)
+                .collect();
+
+            if samples_to_mask.is_empty() {
+                writeln!(output, "{}", line).expect("Write line");
+                marker_idx += 1;
+                continue;
+            }
+
+            // Build new line with masked genotypes - simplify FORMAT to just GT
+            let mut new_fields: Vec<String> =
+                fields[..8].iter().map(|s: &&str| s.to_string()).collect();
+            new_fields.push("GT".to_string());
+
+            for (sample_idx, sample_data) in fields[9..].iter().enumerate() {
+                if samples_to_mask.contains(&sample_idx) {
+                    let gt: &str = sample_data.split(':').next().unwrap_or(".");
+                    truth_map.insert((chrom.clone(), pos, sample_idx), gt.to_string());
+                    new_fields.push("./.".to_string());
+                } else {
+                    let gt: &str = sample_data.split(':').next().unwrap_or(".");
+                    new_fields.push(gt.to_string());
+                }
+            }
+
+            writeln!(output, "{}", new_fields.join("\t")).expect("Write masked line");
+            marker_idx += 1;
+        }
+
+        truth_map
+    };
 
     // Compress
     let masked_gz = work_dir.path().join("masked.vcf.gz");
@@ -2265,6 +2434,7 @@ fn test_comparison_framework_self_check() {
             ("out", out_prefix.to_str().unwrap()),
             ("seed", "99"),
             ("impute", "true"),
+            ("ap", "true"),
             ("gp", "true"),
         ],
         work_dir.path(),
@@ -2302,14 +2472,14 @@ fn test_comparison_framework_self_check() {
         .output()
         .expect("gzip");
     let vcf_str = String::from_utf8_lossy(&vcf_out.stdout);
-    for line in vcf_str.lines().filter(|l| !l.starts_with("##")).take(3) {
+    for line in vcf_str.lines().filter(|l| !l.starts_with('#')).take(3) {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() > 9 {
             eprintln!("DEBUG imputed: FORMAT={} SAMPLE0={}", parts[8], parts[9]);
         }
     }
 
-    // Check GP count - some BEAGLE builds omit GP even with gp=true; allow NaN Brier in that case.
+    // Check GP count - BEAGLE should emit GP for target samples.
     let gp_count = imputed_records
         .iter()
         .flat_map(|r| r.genotypes.iter())
@@ -2319,6 +2489,10 @@ fn test_comparison_framework_self_check() {
         "DEBUG: GP count = {}, total genotypes = {}",
         gp_count,
         imputed_records.iter().map(|r| r.genotypes.len()).sum::<usize>()
+    );
+    assert!(
+        gp_count > 0,
+        "BEAGLE must output GP values for Brier score calculation. Check gt/ref split."
     );
 
     let accuracy = evaluate_imputation(&imputed_records, &truth_map, &ref_records);
