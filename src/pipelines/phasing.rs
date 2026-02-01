@@ -2958,7 +2958,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 let hap1 = s * 2;
                 let hap2 = s * 2 + 1;
                 let mut anchor_scores = vec![0i32; n_ref_haps];
-                for &(start, end) in &window_blocks {
+                for (w_idx, &(start, end)) in window_blocks.iter().enumerate() {
                     let mut window_anchors: Vec<(usize, u8, u8)> = Vec::new();
                     if let Some(list) = anchors_by_hap.get(hap1) {
                         for &(m, a1, a2) in list {
@@ -3005,9 +3005,27 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
                     let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
                     for &h in idxs.iter().take(take) {
-                        if !candidate_haps.contains(&h) {
+                        let score_val = anchor_scores[h];
+                        if score_val <= 0 {
+                            continue;
+                        }
+                        let c_idx = if let Some(pos) = candidate_haps.iter().position(|&x| x == h) {
+                            pos
+                        } else {
                             candidate_haps.push(h);
                             scores_by_hap.push(Vec::new());
+                            candidate_haps.len() - 1
+                        };
+
+                        let weight = score_val as f32 * 5.0;
+                        let list = &mut scores_by_hap[c_idx];
+                        match list.binary_search_by_key(&w_idx, |&(w, _)| w) {
+                            Ok(pos) => {
+                                list[pos].1 += weight;
+                            }
+                            Err(pos) => {
+                                list.insert(pos, (w_idx, weight));
+                            }
                         }
                     }
                 }
