@@ -2830,7 +2830,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let per_window_caps = vec![per_window_cap; num_windows];
         let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
         let exclude_self = ref_gt.is_none();
-        let debug_watch = vec![198usize, 199usize];
         let ref_has_panel = ref_gt.is_some();
         let out: Vec<crate::model::states::ThreadedHaps> = (0..n_samples)
             .into_par_iter()
