@@ -6250,6 +6250,103 @@ fn ffbs_haploid_constrained(
     }
 }
 
+fn find_best_constant_pair_pbwt(
+    n_markers: usize,
+    n_states: usize,
+    seq1: &[u8],
+    seq2: &[u8],
+    phase_ibs: &BidirectionalPhaseIbs,
+    scores: &mut Vec<f32>,
+) -> Option<MosaicPaths> {
+    if n_states < 2 {
+        return None;
+    }
+
+    let need = n_states * n_states;
+    if scores.len() < need {
+        scores.resize(need, 0.0);
+    } else {
+        scores[..need].fill(0.0);
+    }
+
+    // Safety check: n_states must be <= phase_ibs.n_haps() to avoid panic
+    // If n_states is larger than the total number of haplotypes in the PBWT,
+    // we clamp it.
+    let limit = phase_ibs.n_haps().min(n_states);
+    if limit < 2 {
+        return None;
+    }
+
+    let mut informative = 0usize;
+    for m in 0..n_markers {
+        let a1 = seq1[m];
+        let a2 = seq2[m];
+        if a1 == 255 && a2 == 255 {
+            continue;
+        }
+        informative += 1;
+
+        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+
+        // We iterate states and fetch alleles directly from phase_ibs
+        for i in 0..limit {
+            let r1 = phase_ibs.allele(m, i as u32);
+            if r1 == 255 {
+                continue;
+            }
+
+            for j in 0..i {
+                let r2 = phase_ibs.allele(m, j as u32);
+                if r2 == 255 {
+                    continue;
+                }
+
+                let compatible = if is_het {
+                    (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                } else {
+                    let obs = if a1 != 255 { a1 } else { a2 };
+                    r1 == obs && r2 == obs
+                };
+
+                if compatible {
+                    scores[i * n_states + j] += 1.0;
+                } else {
+                    scores[i * n_states + j] -= 1.0;
+                }
+            }
+        }
+    }
+
+    // Find best pair
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_pair = (0, 1);
+
+    for i in 0..limit {
+        for j in 0..i {
+            let s = scores[i * n_states + j];
+            if s > best_score {
+                best_score = s;
+                best_pair = (i, j);
+            }
+        }
+    }
+
+    if informative == 0 {
+        return None;
+    }
+    // Strict threshold: must match > 90% of sites to be considered a "strong" initialization
+    // The previous 50% was too weak.
+    let threshold = 0.9 * (informative as f32);
+    if best_score < threshold || n_markers > 500 {
+        return None;
+    }
+
+    let path1 = vec![best_pair.0 as u32; n_markers];
+    let path2 = vec![best_pair.1 as u32; n_markers];
+
+    Some(MosaicPaths { path1, path2 })
+}
+
 /// Dynamic MCMC phasing using SHAPEIT5-style Gibbs sampling.
 ///
 /// This implements the correct MCMC approach with implicit anchoring:
@@ -6382,7 +6479,22 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    let mut heuristic_paths = if initial_paths.is_none() {
+        find_best_constant_pair_pbwt(
+            n_markers,
+            n_states,
+            seq1,
+            seq2,
+            phase_ibs,
+            &mut workspace.scores,
+        )
+    } else {
+        None
+    };
+
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
