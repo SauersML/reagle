@@ -3881,8 +3881,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
                             let p = if swap_bit == 1 { p_orient } else { 1.0 - p_orient };
                             p_swap[pos] = p.clamp(0.0, 1.0);
+                            swap_mask[pos] = p_swap[pos] > 0.5;
                         }
-                        let mut forced_orient: Vec<Option<u8>> = vec![None; n_hi_freq];
                         for i in 0..n_hi_freq {
                             let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
@@ -3892,23 +3892,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             if is_phased_het {
                                 let a1_anchor = sp.allele1(m);
                                 let a2_anchor = sp.allele2(m);
-                                let orient = if a1 == a1_anchor && a2 == a2_anchor {
-                                    0
+                                if a1 == a1_anchor && a2 == a2_anchor {
+                                    swap_mask[i] = false;
                                 } else if a1 == a2_anchor && a2 == a1_anchor {
-                                    1
-                                } else {
-                                    0
-                                };
-                                forced_orient[i] = Some(orient);
+                                    swap_mask[i] = true;
+                                }
                                 anchor_resets += 1;
                             }
-                        }
-                        for i in 0..n_hi_freq {
-                            swap_mask[i] = match forced_orient[i] {
-                                Some(0) => false,
-                                Some(1) => true,
-                                _ => p_swap[i] > 0.5,
-                            };
                         }
 
                         eprintln!(
@@ -3917,6 +3907,33 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             anchor_resets,
                             het_positions.len()
                         );
+
+                        if let Some(ref paths) = new_paths {
+                            if paths.path1.len() == n_hi_freq && paths.path2.len() == n_hi_freq {
+                                for i in 0..n_hi_freq {
+                                    let a1 = seq1[i];
+                                    let a2 = seq2[i];
+                                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                                        continue;
+                                    }
+                                    let h1 = paths.path1[i].as_u32();
+                                    let h2 = paths.path2[i].as_u32();
+                                    let ref1 = subset_view.allele(
+                                        MarkerIdx::new(i as u32),
+                                        HapIdx::new(h1),
+                                    );
+                                    let ref2 = subset_view.allele(
+                                        MarkerIdx::new(i as u32),
+                                        HapIdx::new(h2),
+                                    );
+                                    if ref1 == a1 && ref2 == a2 {
+                                        swap_mask[i] = false;
+                                    } else if ref1 == a2 && ref2 == a1 {
+                                        swap_mask[i] = true;
+                                    }
+                                }
+                            }
+                        }
 
                         let het_lr_values: Vec<(usize, f32)> = het_positions
                             .iter()
@@ -6837,43 +6854,14 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     // Attempt pairwise initialization if no initial paths provided
     let mut heuristic_paths = if initial_paths.is_none() {
-        if has_anchor {
-            let mut init_seq1 = Vec::with_capacity(n_markers);
-            let mut init_seq2 = Vec::with_capacity(n_markers);
-            for m in 0..n_markers {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                let h1 = anchor_h1.get(m).copied().unwrap_or(255);
-                let h2 = anchor_h2.get(m).copied().unwrap_or(255);
-                if h1 != 255 || h2 != 255 {
-                    init_seq1.push(a1);
-                    init_seq2.push(a2);
-                } else if a1 != 255 && a2 != 255 && a1 != a2 {
-                    init_seq1.push(255);
-                    init_seq2.push(255);
-                } else {
-                    init_seq1.push(a1);
-                    init_seq2.push(a2);
-                }
-            }
-            find_best_constant_pair_with_buffer(
-                n_markers,
-                n_states,
-                &init_seq1,
-                &init_seq2,
-                &mut ref_provider,
-                &mut workspace.scores,
-            )
-        } else {
-            find_best_constant_pair_with_buffer(
-                n_markers,
-                n_states,
-                seq1,
-                seq2,
-                &mut ref_provider,
-                &mut workspace.scores,
-            )
-        }
+        find_best_constant_pair_with_buffer(
+            n_markers,
+            n_states,
+            seq1,
+            seq2,
+            &mut ref_provider,
+            &mut workspace.scores,
+        )
     } else {
         None
     };
@@ -7249,39 +7237,44 @@ fn sample_swap_bits_mosaic<RefSpace>(
     };
 
     let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
-    let (swap_counts1, obs_counts1, new_paths, buffers) =
+    let (swap_counts1, obs_counts1, new_paths, mut buffers) =
         run_chain(chain_seed, start_paths, buffers, ref_provider);
 
-    let flipped_paths = if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
-        Some(MosaicPaths {
-            path1: new_paths.path2.clone(),
-            path2: new_paths.path1.clone(),
-        })
-    } else {
-        None
-    };
+    let mut swap_counts = swap_counts1;
+    let mut obs_counts = obs_counts1;
 
-    let chain_seed_2 = seed.wrapping_add(0xBAD_CAFE_F00Du64);
-    let ref_provider_2 = RefAlleleProvider::new(ref_view, threaded_haps);
-    let (swap_counts2, obs_counts2, paths2, buffers) = run_chain(
-        chain_seed_2,
-        flipped_paths.as_ref(),
-        buffers,
-        ref_provider_2,
-    );
-    if paths2.path1.len() != n_markers || paths2.path2.len() != n_markers {
-        eprintln!(
-            "[mosaic paths] secondary chain path lengths: path1={} path2={}",
-            paths2.path1.len(),
-            paths2.path2.len()
+    if !has_anchor {
+        let flipped_paths =
+            if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
+                Some(MosaicPaths {
+                    path1: new_paths.path2.clone(),
+                    path2: new_paths.path1.clone(),
+                })
+            } else {
+                None
+            };
+
+        let chain_seed_2 = seed.wrapping_add(0xBAD_CAFE_F00Du64);
+        let ref_provider_2 = RefAlleleProvider::new(ref_view, threaded_haps);
+        let (swap_counts2, obs_counts2, paths2, buffers2) = run_chain(
+            chain_seed_2,
+            flipped_paths.as_ref(),
+            buffers,
+            ref_provider_2,
         );
-    }
+        buffers = buffers2;
+        if paths2.path1.len() != n_markers || paths2.path2.len() != n_markers {
+            eprintln!(
+                "[mosaic paths] secondary chain path lengths: path1={} path2={}",
+                paths2.path1.len(),
+                paths2.path2.len()
+            );
+        }
 
-    let mut swap_counts = vec![0u32; het_positions.len()];
-    let mut obs_counts = vec![0u32; het_positions.len()];
-    for i in 0..het_positions.len() {
-        swap_counts[i] = swap_counts1[i].saturating_add(swap_counts2[i]);
-        obs_counts[i] = obs_counts1[i].saturating_add(obs_counts2[i]);
+        for i in 0..het_positions.len() {
+            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
+            obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
+        }
     }
 
     let mut swap_bits = Vec::with_capacity(het_positions.len());
