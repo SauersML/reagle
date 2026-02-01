@@ -5678,7 +5678,26 @@ fn sample_dynamic_mcmc(
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
     let hap1_idx = sample_idx * 2;
 
-    // Initialize H1, H2 alleles from genotype (random phase at hets)
+    let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
+    let n_blocks = block_starts.len().max(1);
+    workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
+
+    // Attempt pairwise initialization if no initial paths provided
+    let heuristic_paths = if initial_paths.is_none() {
+        find_best_constant_pair_with_buffer(
+            n_markers,
+            n_states,
+            seq1,
+            seq2,
+            &mut ref_provider,
+            &mut workspace.scores,
+        )
+    } else {
+        None
+    };
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
+    // Initialize H1, H2 alleles
     let mut h1_alleles = vec![0u8; n_markers];
     let mut h2_alleles = vec![0u8; n_markers];
     for m in 0..n_markers {
@@ -5691,7 +5710,7 @@ fn sample_dynamic_mcmc(
             h1_alleles[m] = a1;
             h2_alleles[m] = a1;
         } else {
-            // Het: random initial phase
+            // Het: random initial phase by default
             if rng.random::<bool>() {
                 h1_alleles[m] = a1;
                 h2_alleles[m] = a2;
@@ -5702,10 +5721,11 @@ fn sample_dynamic_mcmc(
         }
     }
 
-    // Seed alleles from initial paths if available (from heuristic)
-    // This ensures MCMC starts in a high-probability region rather than drifting
-    // from a random start.
-    if let Some(paths) = initial_paths {
+    // Seed alleles from start paths (initial or heuristic)
+    // This is CRITICAL: using the heuristic phase at heterozygous sites prevents the
+    // "Stability Trap" where random initialization + mutual constraint locks H1 and H2
+    // into a bad configuration (e.g. 0|0 vs 1|1).
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             for m in 0..n_markers {
                 let a1 = seq1[m];
@@ -5763,7 +5783,7 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
