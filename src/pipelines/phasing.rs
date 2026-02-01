@@ -8657,12 +8657,13 @@ mod tests {
         let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.02).collect();
 
         let mut config = Config::default();
-        config.phase_states = 20;
+        config.phase_states = ref_gt.n_haplotypes();
         config.ne = 10000.0;
         config.err = Some(0.0001);
         config.nthreads = Some(1);
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
-        pipeline.params = ModelParams::for_phasing(ref_gt.n_haplotypes() + 2, 10000.0, Some(0.0001));
+        pipeline.params =
+            ModelParams::for_phasing(ref_gt.n_haplotypes() + 2, 10000.0, Some(0.0001));
 
         let threaded = pipeline
             .build_phasing_prescan_states(
@@ -8680,9 +8681,13 @@ mod tests {
 
         let th = &threaded[0];
         let mut state_buf = vec![CombinedHapId::from(0u32); th.n_states()];
+        let offset = target_geno.n_haps() as u32;
+        let mut expected: Vec<u32> = (0..ref_gt.n_haplotypes())
+            .map(|h| offset + h as u32)
+            .collect();
+        expected.sort_unstable();
 
         let markers = [0usize, n_markers / 2, n_markers - 1];
-        let mut first_set = None;
         for &m in &markers {
             th.materialize_at(m, &mut state_buf);
             let mut actual: Vec<u32> = state_buf.iter().map(|id| id.as_u32()).collect();
@@ -8700,21 +8705,14 @@ mod tests {
                 "ThreadedHaps materialize_at size mismatch at marker {}",
                 m
             );
-            if let Some(first) = &first_set {
-                assert_eq!(
-                    first,
-                    &actual,
-                    "ThreadedHaps state set changed across markers"
-                );
-            } else {
-                first_set = Some(actual);
-            }
+            assert_eq!(
+                actual, expected,
+                "ThreadedHaps states differ from expected full ref set at marker {}",
+                m
+            );
         }
-        let hero_combined = (2 + hero_hap_idx) as u32;
-        let contains_hero = first_set
-            .as_ref()
-            .map(|set| set.iter().any(|&id| id == hero_combined))
-            .unwrap_or(false);
+        let hero_combined = (offset as usize + hero_hap_idx) as u32;
+        let contains_hero = expected.iter().any(|&id| id == hero_combined);
         println!(
             "[prescan test] states={} hero_present={}",
             th.n_states(),
@@ -9221,12 +9219,13 @@ mod tests {
         let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.02).collect();
 
         let mut config = Config::default();
-        config.phase_states = 20;
+        config.phase_states = ref_gt.n_haplotypes();
         config.ne = 10000.0;
         config.err = Some(0.0001);
         config.nthreads = Some(1);
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
-        pipeline.params = ModelParams::for_phasing(ref_gt.n_haplotypes() + 2, 10000.0, Some(0.0001));
+        pipeline.params =
+            ModelParams::for_phasing(ref_gt.n_haplotypes() + 2, 10000.0, Some(0.0001));
 
         let threaded = pipeline
             .build_phasing_prescan_states(
@@ -9243,8 +9242,12 @@ mod tests {
             .expect("prescan");
         let th = &threaded[0];
         let mut state_buf = vec![CombinedHapId::from(0u32); th.n_states()];
+        let offset = target_geno.n_haps() as u32;
+        let mut expected: Vec<u32> = (0..ref_gt.n_haplotypes())
+            .map(|h| offset + h as u32)
+            .collect();
+        expected.sort_unstable();
         let markers = [0usize, n_markers / 2, n_markers - 1];
-        let mut first_set = None;
         for &m in &markers {
             th.materialize_at(m, &mut state_buf);
             let mut actual: Vec<u32> = state_buf.iter().map(|id| id.as_u32()).collect();
@@ -9262,21 +9265,14 @@ mod tests {
                 "ThreadedHaps materialize_at size mismatch at marker {}",
                 m
             );
-            if let Some(first) = &first_set {
-                assert_eq!(
-                    first,
-                    &actual,
-                    "ThreadedHaps state set changed across markers"
-                );
-            } else {
-                first_set = Some(actual);
-            }
+            assert_eq!(
+                actual, expected,
+                "ThreadedHaps states differ from expected full ref set at marker {}",
+                m
+            );
         }
-        let hero_combined = (hero_hap_idx + 2) as u32;
-        let contains_hero = first_set
-            .as_ref()
-            .map(|set| set.iter().any(|&id| id == hero_combined))
-            .unwrap_or(false);
+        let hero_combined = (offset as usize + hero_hap_idx) as u32;
+        let contains_hero = expected.iter().any(|&id| id == hero_combined);
         println!(
             "[threaded test] states={} hero_present={}",
             th.n_states(),

@@ -141,6 +141,8 @@ struct ParsedGenotype {
 struct ParsedRecord {
     chrom: String,
     pos: u64,
+    ref_allele: String,
+    alt_alleles: Vec<String>,
     /// INFO field key-value pairs
     info: HashMap<String, String>,
     /// Genotypes per sample
@@ -184,6 +186,8 @@ fn parse_vcf(path: &Path) -> (Vec<String>, Vec<ParsedRecord>) {
 
         let chrom = fields[0].to_string();
         let pos: u64 = fields[1].parse().expect("Parse position");
+        let ref_allele = fields[3].to_string();
+        let alt_alleles: Vec<String> = fields[4].split(',').map(|s| s.to_string()).collect();
 
         // Parse INFO field
         let info: HashMap<String, String> = fields[7]
@@ -264,6 +268,8 @@ fn parse_vcf(path: &Path) -> (Vec<String>, Vec<ParsedRecord>) {
         records.push(ParsedRecord {
             chrom,
             pos,
+            ref_allele,
+            alt_alleles,
             info,
             genotypes,
         });
@@ -336,6 +342,70 @@ fn normalize_gt_unphased(gt: &str) -> String {
     let mut sorted = alleles.clone();
     sorted.sort();
     format!("{}/{}", sorted[0], sorted[1])
+}
+
+fn is_biallelic_swap(target: &ParsedRecord, output: &ParsedRecord) -> Option<bool> {
+    if target.alt_alleles.len() != 1 || output.alt_alleles.len() != 1 {
+        return None;
+    }
+    let targ_ref = target.ref_allele.as_str();
+    let targ_alt = target.alt_alleles[0].as_str();
+    let out_ref = output.ref_allele.as_str();
+    let out_alt = output.alt_alleles[0].as_str();
+    if targ_ref == out_ref && targ_alt == out_alt {
+        Some(false)
+    } else if targ_ref == out_alt && targ_alt == out_ref {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn map_gt_for_swap(gt: &str, swap: bool) -> String {
+    if !swap || gt.is_empty() {
+        return gt.to_string();
+    }
+    if gt == "." || gt == "./." || gt == ".|." {
+        return gt.to_string();
+    }
+    let sep = if gt.contains('|') { '|' } else { '/' };
+    let alleles: Vec<&str> = gt.split(sep).collect();
+    if alleles.len() != 2 {
+        return gt.to_string();
+    }
+    let map_allele = |a: &str| -> String {
+        match a {
+            "0" => "1".to_string(),
+            "1" => "0".to_string(),
+            _ => a.to_string(),
+        }
+    };
+    let mapped = format!("{}/{}", map_allele(alleles[0]), map_allele(alleles[1]));
+    if sep == '|' {
+        mapped.replace('/', "|")
+    } else {
+        mapped
+    }
+}
+
+fn map_gp_for_swap(gp: [f64; 3], swap: bool) -> [f64; 3] {
+    if swap {
+        [gp[2], gp[1], gp[0]]
+    } else {
+        gp
+    }
+}
+
+fn map_ds_for_swap(ds: f64, swap: bool) -> f64 {
+    if swap { 2.0 - ds } else { ds }
+}
+
+fn build_record_index(records: &[ParsedRecord]) -> HashMap<(String, u64), usize> {
+    records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| ((r.chrom.clone(), r.pos), i))
+        .collect()
 }
 
 /// Count phase switches between two phased genotype vectors
@@ -1788,12 +1858,18 @@ fn calculate_brier_score(gp: [f64; 3], truth_gt: &str) -> f64 {
 fn summarize_gp(
     imputed_records: &[ParsedRecord],
     truth_map: &HashMap<(String, u64, usize), String>,
+    truth_idx: Option<&HashMap<(String, u64), usize>>,
+    truth_records: Option<&[ParsedRecord]>,
 ) -> (usize, f64, f64) {
     let mut count = 0usize;
     let mut max_sum = 0.0f64;
     let mut truth_sum = 0.0f64;
 
     for record in imputed_records {
+        let swap = truth_idx
+            .and_then(|idx| idx.get(&(record.chrom.clone(), record.pos)).copied())
+            .and_then(|i| truth_records.and_then(|records| records.get(i)))
+            .and_then(|truth_rec| is_biallelic_swap(truth_rec, record));
         for (sample_idx, gt) in record.genotypes.iter().enumerate() {
             let key = (record.chrom.clone(), record.pos, sample_idx);
             if truth_map.get(&key).is_none() {
@@ -1802,13 +1878,16 @@ fn summarize_gp(
             let Some(gp) = gt.gp else {
                 continue;
             };
+            let mapped_gp = match swap {
+                Some(true) => map_gp_for_swap(gp, true),
+                _ => gp,
+            };
             count += 1;
-            max_sum += gp.iter().cloned().fold(0.0, f64::max);
-            let truth_prob = match normalize_gt_unphased(truth_map.get(&key).unwrap()).as_str()
-            {
-                "0/0" => gp[0],
-                "0/1" | "1/0" => gp[1],
-                "1/1" => gp[2],
+            max_sum += mapped_gp.iter().cloned().fold(0.0, f64::max);
+            let truth_prob = match normalize_gt_unphased(truth_map.get(&key).unwrap()).as_str() {
+                "0/0" => mapped_gp[0],
+                "0/1" | "1/0" => mapped_gp[1],
+                "1/1" => mapped_gp[2],
                 _ => 0.0,
             };
             truth_sum += truth_prob;
@@ -1830,6 +1909,8 @@ fn evaluate_imputation(
     imputed_records: &[ParsedRecord],
     truth_map: &HashMap<(String, u64, usize), String>,
     ref_records: &[ParsedRecord], // For MAF calculation
+    truth_idx: Option<&HashMap<(String, u64), usize>>,
+    truth_records: Option<&[ParsedRecord]>,
 ) -> ImputationAccuracy {
     let mut acc = ImputationAccuracy::default();
 
@@ -1840,6 +1921,10 @@ fn evaluate_imputation(
         .collect();
 
     for record in imputed_records {
+        let swap = truth_idx
+            .and_then(|idx| idx.get(&(record.chrom.clone(), record.pos)).copied())
+            .and_then(|i| truth_records.and_then(|records| records.get(i)))
+            .and_then(|truth_rec| is_biallelic_swap(truth_rec, record));
         let maf = maf_lookup
             .get(&(record.chrom.clone(), record.pos))
             .copied()
@@ -1852,7 +1937,11 @@ fn evaluate_imputation(
             if let Some(truth_gt) = truth_map.get(&key) {
                 acc.total_compared += 1;
 
-                let imputed_normalized = normalize_gt_unphased(&gt.gt);
+                let mapped_gt = match swap {
+                    Some(true) => map_gt_for_swap(&gt.gt, true),
+                    _ => gt.gt.clone(),
+                };
+                let imputed_normalized = normalize_gt_unphased(&mapped_gt);
                 let truth_normalized = normalize_gt_unphased(truth_gt);
 
                 let is_correct = imputed_normalized == truth_normalized;
@@ -1865,7 +1954,7 @@ fn evaluate_imputation(
                 if is_rare {
                     acc.rare_total += 1;
                     let truth_has_alt = truth_gt.contains('1');
-                    let imputed_has_alt = gt.gt.contains('1');
+                    let imputed_has_alt = mapped_gt.contains('1');
 
                     match (imputed_has_alt, truth_has_alt) {
                         (true, true) => acc.rare_true_positives += 1,
@@ -1897,7 +1986,11 @@ fn evaluate_imputation(
 
                 // Brier Score calculation (requires GP)
                 if let Some(gp) = gt.gp {
-                    let bs = calculate_brier_score(gp, truth_gt);
+                    let mapped_gp = match swap {
+                        Some(true) => map_gp_for_swap(gp, true),
+                        _ => gp,
+                    };
+                    let bs = calculate_brier_score(mapped_gp, truth_gt);
                     acc.brier_score_sum += bs;
                     acc.brier_score_count += 1;
                 }
@@ -1989,14 +2082,29 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
 
     // Parse outputs
     let (_, target_records) = parse_vcf(&target_path);
+    let truth_idx = build_record_index(&target_records);
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_imputed.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_imputed.vcf.gz"));
 
     // Evaluate both against ground truth
-    let java_acc = evaluate_imputation(&java_records, &truth_map, &target_records);
-    let rust_acc = evaluate_imputation(&rust_records, &truth_map, &target_records);
-    let (java_gp_n, java_gp_max, java_gp_truth) = summarize_gp(&java_records, &truth_map);
-    let (rust_gp_n, rust_gp_max, rust_gp_truth) = summarize_gp(&rust_records, &truth_map);
+    let java_acc = evaluate_imputation(
+        &java_records,
+        &truth_map,
+        &target_records,
+        Some(&truth_idx),
+        Some(&target_records),
+    );
+    let rust_acc = evaluate_imputation(
+        &rust_records,
+        &truth_map,
+        &target_records,
+        Some(&truth_idx),
+        Some(&target_records),
+    );
+    let (java_gp_n, java_gp_max, java_gp_truth) =
+        summarize_gp(&java_records, &truth_map, Some(&truth_idx), Some(&target_records));
+    let (rust_gp_n, rust_gp_max, rust_gp_truth) =
+        summarize_gp(&rust_records, &truth_map, Some(&truth_idx), Some(&target_records));
 
     // Print results side-by-side
     println!("\n=== [{}] Mask-and-Recover: Rust vs Java ===", source.name);
@@ -2173,7 +2281,7 @@ pub fn compute_beagle_baseline(
     // Parse and evaluate
     let (_, ref_records) = parse_vcf(input_vcf);
     let (_, imputed_records) = parse_vcf(&work_dir.path().join("imputed.vcf.gz"));
-    let accuracy = evaluate_imputation(&imputed_records, &truth_map, &ref_records);
+    let accuracy = evaluate_imputation(&imputed_records, &truth_map, &ref_records, None, None);
 
     BeagleBaseline {
         concordance: accuracy.concordance(),
@@ -2198,7 +2306,7 @@ fn compare_against_beagle(
     impl_name: &str,
 ) -> bool {
     let (_, output_records) = parse_vcf(output_vcf);
-    let accuracy = evaluate_imputation(&output_records, truth_map, ref_records);
+    let accuracy = evaluate_imputation(&output_records, truth_map, ref_records, None, None);
 
     println!("\n=== {} vs Java BEAGLE Comparison ===", impl_name);
     println!(
@@ -2495,7 +2603,7 @@ fn test_comparison_framework_self_check() {
         "BEAGLE must output GP values for Brier score calculation. Check gt/ref split."
     );
 
-    let accuracy = evaluate_imputation(&imputed_records, &truth_map, &ref_records);
+    let accuracy = evaluate_imputation(&imputed_records, &truth_map, &ref_records, None, None);
 
     // Create baseline from the same run
     let baseline = BeagleBaseline {
@@ -3171,7 +3279,7 @@ fn test_genotyped_dosage_correlation_with_truth() {
             rust_result.err()
         );
 
-        // Parse outputs
+        // Parse outputs + target genotypes
         let (_, target_records) = parse_vcf(&target_path);
         let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
         let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
@@ -3338,13 +3446,28 @@ fn test_diverse_mask_scenarios() {
 
         // Parse and evaluate
         let (_, target_records) = parse_vcf(&target_path);
+        let truth_idx = build_record_index(&target_records);
         let (_, java_records) = parse_vcf(&work_dir.path().join("java_imputed.vcf.gz"));
         let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_imputed.vcf.gz"));
 
-        let java_acc = evaluate_imputation(&java_records, &truth_map, &target_records);
-        let rust_acc = evaluate_imputation(&rust_records, &truth_map, &target_records);
-        let (java_gp_n, java_gp_max, java_gp_truth) = summarize_gp(&java_records, &truth_map);
-        let (rust_gp_n, rust_gp_max, rust_gp_truth) = summarize_gp(&rust_records, &truth_map);
+        let java_acc = evaluate_imputation(
+            &java_records,
+            &truth_map,
+            &target_records,
+            Some(&truth_idx),
+            Some(&target_records),
+        );
+        let rust_acc = evaluate_imputation(
+            &rust_records,
+            &truth_map,
+            &target_records,
+            Some(&truth_idx),
+            Some(&target_records),
+        );
+        let (java_gp_n, java_gp_max, java_gp_truth) =
+            summarize_gp(&java_records, &truth_map, Some(&truth_idx), Some(&target_records));
+        let (rust_gp_n, rust_gp_max, rust_gp_truth) =
+            summarize_gp(&rust_records, &truth_map, Some(&truth_idx), Some(&target_records));
 
         // Print results
         println!("\n{:<25} {:>12} {:>12}", "Metric", "Java", "Rust");
@@ -3411,8 +3534,19 @@ fn test_diverse_mask_scenarios() {
             let rust_gt = rust_records
                 .iter()
                 .find(|r| r.chrom == key.0 && r.pos == key.1)
-                .and_then(|r| r.genotypes.get(key.2))
-                .map(|g| normalize_gt_unphased(&g.gt));
+                .and_then(|r| {
+                    let swap = truth_idx
+                        .get(&(r.chrom.clone(), r.pos))
+                        .and_then(|i| target_records.get(*i))
+                        .and_then(|t| is_biallelic_swap(t, r));
+                    r.genotypes.get(key.2).map(|g| {
+                        let mapped = match swap {
+                            Some(true) => map_gt_for_swap(&g.gt, true),
+                            _ => g.gt.clone(),
+                        };
+                        normalize_gt_unphased(&mapped)
+                    })
+                });
             let java_ok = java_gt.as_deref() == Some(truth_norm.as_str());
             let rust_ok = rust_gt.as_deref() == Some(truth_norm.as_str());
             if java_ok && !rust_ok {
@@ -3539,11 +3673,24 @@ fn test_multiple_seeds_consistency() {
 
         // Evaluate
         let (_, target_records) = parse_vcf(&target_path);
+        let truth_idx = build_record_index(&target_records);
         let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
         let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
 
-        let java_acc = evaluate_imputation(&java_records, &truth_map, &target_records);
-        let rust_acc = evaluate_imputation(&rust_records, &truth_map, &target_records);
+        let java_acc = evaluate_imputation(
+            &java_records,
+            &truth_map,
+            &target_records,
+            Some(&truth_idx),
+            Some(&target_records),
+        );
+        let rust_acc = evaluate_imputation(
+            &rust_records,
+            &truth_map,
+            &target_records,
+            Some(&truth_idx),
+            Some(&target_records),
+        );
 
         println!(
             "Seed {}: Java {:.2}%, Rust {:.2}%",
@@ -3866,7 +4013,6 @@ fn test_dr2_genotyped_vs_imputed() {
     // Parse outputs
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
-
     // Separate genotyped and imputed markers
     let mut genotyped_java_dr2: Vec<(u64, f64)> = Vec::new();
     let mut genotyped_rust_dr2: Vec<(u64, f64)> = Vec::new();
@@ -4116,6 +4262,7 @@ fn test_dosage_by_distance_from_genotyped() {
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
     let (_, truth_records) = parse_vcf(&truth_path);
     let truth_map: HashMap<u64, &ParsedRecord> = truth_records.iter().map(|r| (r.pos, r)).collect();
+    let truth_idx = build_record_index(&truth_records);
 
     // Find genotyped marker positions
     let genotyped_positions: Vec<u64> = java_records
@@ -4157,6 +4304,14 @@ fn test_dosage_by_distance_from_genotyped() {
             Some(r) => *r,
             None => continue,
         };
+        let swap_java = truth_idx
+            .get(&(j_rec.chrom.clone(), j_rec.pos))
+            .and_then(|i| truth_records.get(*i))
+            .and_then(|t| is_biallelic_swap(t, j_rec));
+        let swap_rust = truth_idx
+            .get(&(r_rec.chrom.clone(), r_rec.pos))
+            .and_then(|i| truth_records.get(*i))
+            .and_then(|t| is_biallelic_swap(t, r_rec));
 
         let mut java_err = 0.0;
         let mut rust_err = 0.0;
@@ -4174,8 +4329,14 @@ fn test_dosage_by_distance_from_genotyped() {
                 Some(ds) => ds,
                 None => continue,
             };
-            let java_ds = j_gt.ds.or_else(|| gt_to_dosage(&j_gt.gt));
-            let rust_ds = r_gt.ds.or_else(|| gt_to_dosage(&r_gt.gt));
+            let mut java_ds = j_gt.ds.or_else(|| gt_to_dosage(&j_gt.gt));
+            let mut rust_ds = r_gt.ds.or_else(|| gt_to_dosage(&r_gt.gt));
+            if let (Some(ds), Some(true)) = (java_ds, swap_java) {
+                java_ds = Some(map_ds_for_swap(ds, true));
+            }
+            if let (Some(ds), Some(true)) = (rust_ds, swap_rust) {
+                rust_ds = Some(map_ds_for_swap(ds, true));
+            }
             let (Some(j_ds), Some(r_ds)) = (java_ds, rust_ds) else {
                 continue;
             };
@@ -4532,9 +4693,14 @@ fn test_genotyped_dosage_matches_hard_call() {
         rust_result.err()
     );
 
-    // Parse outputs
+    // Parse outputs + target genotypes
+    let (_, target_records) = parse_vcf(&target_path);
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+    let target_gt_map: HashMap<u64, Vec<String>> = target_records
+        .iter()
+        .map(|r| (r.pos, r.genotypes.iter().map(|g| g.gt.clone()).collect()))
+        .collect();
 
     // Helper to convert GT to expected dosage
     fn gt_to_dosage(gt: &str) -> Option<f64> {
@@ -4561,24 +4727,34 @@ fn test_genotyped_dosage_matches_hard_call() {
             continue;
         }
 
-        for (j_gt, r_gt) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()) {
+        for (s_idx, (j_gt, r_gt)) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()).enumerate() {
+            if let Some(gts) = target_gt_map.get(&j_rec.pos) {
+                if let Some(tgt_gt) = gts.get(s_idx) {
+                    if tgt_gt.contains('.') {
+                        continue;
+                    }
+                }
+            }
             total_genotyped_samples += 1;
 
-            // Get expected dosage from hard call
-            let expected_ds = match gt_to_dosage(&j_gt.gt) {
+            let expected_java_ds = match gt_to_dosage(&j_gt.gt) {
+                Some(d) => d,
+                None => continue,
+            };
+            let expected_rust_ds = match gt_to_dosage(&r_gt.gt) {
                 Some(d) => d,
                 None => continue,
             };
 
             // Check Java DS
             if let Some(j_ds) = j_gt.ds {
-                if (j_ds - expected_ds).abs() > 0.01 {
+                if (j_ds - expected_java_ds).abs() > 0.01 {
                     java_mismatches += 1;
                     if java_mismatch_examples.len() < 5 {
                         java_mismatch_examples.push((
                             j_rec.pos,
                             j_gt.gt.clone(),
-                            expected_ds,
+                            expected_java_ds,
                             j_ds,
                         ));
                     }
@@ -4587,13 +4763,30 @@ fn test_genotyped_dosage_matches_hard_call() {
 
             // Check Rust DS
             if let Some(r_ds) = r_gt.ds {
-                if (r_ds - expected_ds).abs() > 0.01 {
+                if (r_ds - expected_rust_ds).abs() > 0.01 {
                     rust_mismatches += 1;
                     if rust_mismatch_examples.len() < 5 {
+                        let tgt_gt = target_gt_map
+                            .get(&j_rec.pos)
+                            .and_then(|gts| gts.get(s_idx))
+                            .cloned()
+                            .unwrap_or_else(|| "<missing>".to_string());
+                        println!(
+                            "[debug mismatch] pos={} sample={} target_gt={} java_imp={} rust_imp={} rust_ref={} rust_alt={} java_ref={} java_alt={}",
+                            j_rec.pos,
+                            s_idx,
+                            tgt_gt,
+                            j_rec.info.contains_key("IMP"),
+                            r_rec.info.contains_key("IMP"),
+                            r_rec.ref_allele,
+                            r_rec.alt_alleles.join(","),
+                            j_rec.ref_allele,
+                            j_rec.alt_alleles.join(",")
+                        );
                         rust_mismatch_examples.push((
                             r_rec.pos,
                             r_gt.gt.clone(),
-                            expected_ds,
+                            expected_rust_ds,
                             r_ds,
                         ));
                     }
