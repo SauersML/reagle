@@ -3903,62 +3903,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 anchor_resets += 1;
                             }
                         }
-                        // Viterbi over orientation with anchor constraints.
-                        if n_hi_freq > 0 {
-                            let mut dp0 = vec![0.0f32; n_hi_freq];
-                            let mut dp1 = vec![0.0f32; n_hi_freq];
-                            let mut prev0 = vec![0u8; n_hi_freq];
-                            let mut prev1 = vec![0u8; n_hi_freq];
-
-                            let emit0 = (1.0 - p_swap[0]).clamp(1e-6, 1.0);
-                            let emit1 = p_swap[0].clamp(1e-6, 1.0);
-                            let (e0, e1) = match forced_orient[0] {
-                                Some(0) => (emit0, 1e-12),
-                                Some(1) => (1e-12, emit1),
-                                _ => (emit0, emit1),
+                        for i in 0..n_hi_freq {
+                            swap_mask[i] = match forced_orient[i] {
+                                Some(0) => false,
+                                Some(1) => true,
+                                _ => p_swap[i] > 0.5,
                             };
-                            dp0[0] = e0.ln();
-                            dp1[0] = e1.ln();
-
-                            for i in 1..n_hi_freq {
-                                let r = stage1_p_recomb.get(i).copied().unwrap_or(0.0).clamp(1e-6, 1.0);
-                                let stay = (1.0 - r).clamp(1e-6, 1.0);
-                                let switch = r;
-                                let emit0 = (1.0 - p_swap[i]).clamp(1e-6, 1.0);
-                                let emit1 = p_swap[i].clamp(1e-6, 1.0);
-                                let (e0, e1) = match forced_orient[i] {
-                                    Some(0) => (emit0, 1e-12),
-                                    Some(1) => (1e-12, emit1),
-                                    _ => (emit0, emit1),
-                                };
-                                let stay0 = dp0[i - 1] + stay.ln();
-                                let sw0 = dp1[i - 1] + switch.ln();
-                                if stay0 >= sw0 {
-                                    dp0[i] = stay0 + e0.ln();
-                                    prev0[i] = 0;
-                                } else {
-                                    dp0[i] = sw0 + e0.ln();
-                                    prev0[i] = 1;
-                                }
-                                let stay1 = dp1[i - 1] + stay.ln();
-                                let sw1 = dp0[i - 1] + switch.ln();
-                                if stay1 >= sw1 {
-                                    dp1[i] = stay1 + e1.ln();
-                                    prev1[i] = 1;
-                                } else {
-                                    dp1[i] = sw1 + e1.ln();
-                                    prev1[i] = 0;
-                                }
-                            }
-                            let mut state = if dp1[n_hi_freq - 1] > dp0[n_hi_freq - 1] {
-                                1u8
-                            } else {
-                                0u8
-                            };
-                            for i in (0..n_hi_freq).rev() {
-                                swap_mask[i] = state == 1;
-                                state = if state == 0 { prev0[i] } else { prev1[i] };
-                            }
                         }
 
                         eprintln!(
@@ -3976,7 +3926,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let het_phase_values: Vec<(usize, f32)> = het_positions
                             .iter()
                             .copied()
-                            .zip(swap_probs.into_iter())
+                            .zip(swap_probs.iter().copied())
+                            .map(|(idx, p_swap)| {
+                                let conf = p_swap.max(1.0 - p_swap);
+                                (idx, conf)
+                            })
                             .collect();
 
                         ws.seq1 = seq1;
@@ -6751,12 +6705,14 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     }
 
     let mut ref_alleles = vec![255u8; n_states];
+    let mut informative = 0usize;
     for m in 0..n_markers {
         let a1 = seq1[m];
         let a2 = seq2[m];
         if a1 == 255 && a2 == 255 {
             continue;
         }
+        informative += 1;
 
         let is_het = a1 != a2 && a1 != 255 && a2 != 255;
 
@@ -6811,7 +6767,10 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // If best score is too low (worse than random), maybe don't use it?
     // But random initialization is also bad. This is likely the "least bad" start.
     // So we return it.
-    let threshold = 0.5 * (n_markers as f32);
+    if informative == 0 {
+        return None;
+    }
+    let threshold = 0.5 * (informative as f32);
     if best_score < threshold || n_markers > 500 {
         return None;
     }
@@ -6872,24 +6831,52 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
     workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
-    let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
-    // Attempt pairwise initialization if no initial paths provided
-    let mut heuristic_paths = if initial_paths.is_none() {
-        find_best_constant_pair_with_buffer(
-            n_markers,
-            n_states,
-            seq1,
-            seq2,
-            &mut ref_provider,
-            &mut workspace.scores,
-        )
-    } else {
-        None
-    };
-
     let anchor_h1 = anchor_hap1.unwrap_or(&[]);
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
+    let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
+    // Attempt pairwise initialization if no initial paths provided
+    let mut heuristic_paths = if initial_paths.is_none() {
+        if has_anchor {
+            let mut init_seq1 = Vec::with_capacity(n_markers);
+            let mut init_seq2 = Vec::with_capacity(n_markers);
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                let h1 = anchor_h1.get(m).copied().unwrap_or(255);
+                let h2 = anchor_h2.get(m).copied().unwrap_or(255);
+                if h1 != 255 || h2 != 255 {
+                    init_seq1.push(a1);
+                    init_seq2.push(a2);
+                } else if a1 != 255 && a2 != 255 && a1 != a2 {
+                    init_seq1.push(255);
+                    init_seq2.push(255);
+                } else {
+                    init_seq1.push(a1);
+                    init_seq2.push(a2);
+                }
+            }
+            find_best_constant_pair_with_buffer(
+                n_markers,
+                n_states,
+                &init_seq1,
+                &init_seq2,
+                &mut ref_provider,
+                &mut workspace.scores,
+            )
+        } else {
+            find_best_constant_pair_with_buffer(
+                n_markers,
+                n_states,
+                seq1,
+                seq2,
+                &mut ref_provider,
+                &mut workspace.scores,
+            )
+        }
+    } else {
+        None
+    };
 
     // Align heuristic orientation to anchors when present.
     if has_anchor {
@@ -7067,6 +7054,16 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Pure Stochastic EM: single chain
     let chain_anchor_hap1 = anchor_hap1.unwrap_or(&[]).to_vec();
     let chain_anchor_hap2 = anchor_hap2.unwrap_or(&[]).to_vec();
+    let mut anchor_indices: Vec<usize> = Vec::new();
+    if !chain_anchor_hap1.is_empty() || !chain_anchor_hap2.is_empty() {
+        for m in 0..n_markers {
+            let a1 = chain_anchor_hap1.get(m).copied().unwrap_or(255);
+            let a2 = chain_anchor_hap2.get(m).copied().unwrap_or(255);
+            if a1 != 255 || a2 != 255 {
+                anchor_indices.push(m);
+            }
+        }
+    }
     let lr_samples = lr_samples_param.max(1);
 
     let run_chain = |seed: u64,
@@ -7121,6 +7118,49 @@ fn sample_swap_bits_mosaic<RefSpace>(
             chain.step();
             let is_last = sample_idx + 1 == lr_samples;
 
+            let mut sample_flip: Option<bool> = None;
+            if !anchor_indices.is_empty() {
+                let mut direct = 0u32;
+                let mut flipped = 0u32;
+                for &m in &anchor_indices {
+                    let a1 = chain_anchor_hap1.get(m).copied().unwrap_or(255);
+                    let a2 = chain_anchor_hap2.get(m).copied().unwrap_or(255);
+                    if a1 == 255 && a2 == 255 {
+                        continue;
+                    }
+                    chain.ref_provider.fill_ref_alleles(m, &mut chain.ref_alleles);
+                    let p1 = chain.path1[m] as usize;
+                    let p2 = chain.path2[m] as usize;
+                    if p1 >= n_states || p2 >= n_states {
+                        continue;
+                    }
+                    let r1 = chain.ref_alleles[p1];
+                    let r2 = chain.ref_alleles[p2];
+                    if a1 != 255 && a2 != 255 {
+                        if r1 == a1 && r2 == a2 {
+                            direct += 1;
+                        } else if r1 == a2 && r2 == a1 {
+                            flipped += 1;
+                        }
+                    } else if a1 != 255 {
+                        if r1 == a1 {
+                            direct += 1;
+                        } else if r2 == a1 {
+                            flipped += 1;
+                        }
+                    } else if a2 != 255 {
+                        if r2 == a2 {
+                            direct += 1;
+                        } else if r1 == a2 {
+                            flipped += 1;
+                        }
+                    }
+                }
+                if direct > 0 || flipped > 0 {
+                    sample_flip = Some(flipped > direct);
+                }
+            }
+
             for (i, &m) in het_positions.iter().enumerate() {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
@@ -7130,11 +7170,14 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
                 let p1 = chain.path1[m] as usize;
                 let p2 = chain.path2[m] as usize;
+                if p1 >= n_states || p2 >= n_states {
+                    continue;
+                }
                 chain.ref_provider.fill_ref_alleles(m, &mut chain.ref_alleles);
                 let ref1 = chain.ref_alleles[p1];
                 let ref2 = chain.ref_alleles[p2];
 
-                let orient = if ref1 == a1 && ref2 == a2 {
+                let mut orient = if ref1 == a1 && ref2 == a2 {
                     Some(0u8)
                 } else if ref1 == a2 && ref2 == a1 {
                     Some(1u8)
@@ -7149,6 +7192,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 } else {
                     None
                 };
+                if let (Some(flip), Some(val)) = (sample_flip, orient) {
+                    if flip {
+                        orient = Some(1 - val);
+                    }
+                }
 
                 if let Some(orient) = orient {
                     swap_counts[i] += orient as u32;
@@ -7271,9 +7319,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             (max_p / min_p).min(1e6)
         };
         swap_lr.push(lr);
-        let p_orient = if chosen_swap { p_swap } else { p_keep };
-        swap_probs.push(p_orient.clamp(0.0, 1.0));
-        let p = p_orient.clamp(0.0, 1.0);
+        swap_probs.push(p_swap.clamp(0.0, 1.0));
+        let p = p_swap.clamp(0.0, 1.0);
         p_min = p_min.min(p);
         p_max = p_max.max(p);
         p_sum += p;
