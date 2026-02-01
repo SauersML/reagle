@@ -80,7 +80,7 @@ impl ModelParams {
 
         Self {
             p_mismatch,
-            recomb_intensity,
+            recomb_intensity: recomb_intensity.min(Self::MAX_RECOMB_INTENSITY),
             n_states: Self::DEFAULT_PHASE_STATES.min(n_haps.saturating_sub(2)),
             burnin: Self::DEFAULT_BURNIN,
             iterations: Self::DEFAULT_ITERATIONS,
@@ -325,11 +325,20 @@ mod tests {
 
     #[test]
     fn test_recomb_intensity_formula() {
-        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
+        // Use a smaller Ne so we don't hit the clamp (MAX_RECOMB_INTENSITY = 5.0)
+        let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
+        // Should be 0.04 * 100_000 / 1000 = 4.0
+        let expected = 0.04 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_recomb_intensity_clamping() {
+        // High Ne/Low N -> High intensity (40.0)
+        // Should be clamped to MAX_RECOMB_INTENSITY (5.0)
+        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
+        assert!((params.recomb_intensity - ModelParams::MAX_RECOMB_INTENSITY).abs() < 0.01);
     }
 
     #[test]
