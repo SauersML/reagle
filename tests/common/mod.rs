@@ -28,6 +28,20 @@ pub fn cache_dir() -> PathBuf {
     dir
 }
 
+/// Check if required external tools are available
+pub fn check_external_requirements() -> Result<(), String> {
+    if Command::new("bcftools").arg("--version").output().is_err() {
+        return Err("bcftools not found in PATH".to_string());
+    }
+    if Command::new("java").arg("-version").output().is_err() {
+        return Err("java not found in PATH".to_string());
+    }
+    if Command::new("gzip").arg("--version").output().is_err() {
+        return Err("gzip not found in PATH".to_string());
+    }
+    Ok(())
+}
+
 /// Download a file if it doesn't exist
 pub fn download_if_missing(url: &str, dest: &Path) -> bool {
     if dest.exists() {
