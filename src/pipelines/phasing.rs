@@ -3164,6 +3164,48 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         );
                     }
                 }
+                if n_markers <= 12 && ref_has_panel {
+                    let mut all_zero = Vec::new();
+                    let mut all_one = Vec::new();
+                    for h in 0..n_ref_haps {
+                        let hap_idx = HapIdx::new(h as u32);
+                        let mut ok0 = true;
+                        let mut ok1 = true;
+                        for m in 0..n_markers {
+                            let ref_col_idx = ref_col_for_marker[m];
+                            if ref_col_idx == usize::MAX {
+                                continue;
+                            }
+                            let ref_al = ref_columns
+                                .get(ref_col_idx)
+                                .map(|c| c.get(hap_idx))
+                                .unwrap_or(255);
+                            if ref_al != 0 {
+                                ok0 = false;
+                            }
+                            if ref_al != 1 {
+                                ok1 = false;
+                            }
+                            if !ok0 && !ok1 {
+                                break;
+                            }
+                        }
+                        if ok0 {
+                            all_zero.push(h);
+                        }
+                        if ok1 {
+                            all_one.push(h);
+                        }
+                    }
+                    eprintln!("[prescan debug] all_zero_haps={:?}", all_zero);
+                    eprintln!("[prescan debug] all_one_haps={:?}", all_one);
+                    let zero_in_candidates = all_zero.iter().any(|h| candidate_haps.contains(h));
+                    let one_in_candidates = all_one.iter().any(|h| candidate_haps.contains(h));
+                    eprintln!(
+                        "[prescan debug] all_zero_in_candidates={} all_one_in_candidates={}",
+                        zero_in_candidates, one_in_candidates
+                    );
+                }
             }
             if s == 0 {
                 eprintln!(
@@ -4226,12 +4268,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
                         if s == 0 && n_hi_freq <= 12 {
                             let mut rows = Vec::with_capacity(n_hi_freq);
+                            let mut p1_ids = Vec::with_capacity(n_hi_freq);
+                            let mut p2_ids = Vec::with_capacity(n_hi_freq);
                             for i in 0..n_hi_freq {
                                 let a1 = seq1[i];
                                 let a2 = seq2[i];
                                 let (ref1, ref2) = if let Some(ref paths) = new_paths {
                                     if paths.path1.len() == n_hi_freq && paths.path2.len() == n_hi_freq
                                     {
+                                        p1_ids.push(paths.path1[i].as_u32());
+                                        p2_ids.push(paths.path2[i].as_u32());
                                         let h1 = paths.path1[i].as_u32();
                                         let h2 = paths.path2[i].as_u32();
                                         (
@@ -4245,6 +4291,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     (255, 255)
                                 };
                                 rows.push((i, a1, a2, ref1, ref2, swap_mask[i]));
+                            }
+                            if !p1_ids.is_empty() {
+                                eprintln!("[swap debug] path1_ids={:?}", p1_ids);
+                                eprintln!("[swap debug] path2_ids={:?}", p2_ids);
                             }
                             eprintln!("[swap debug] i a1 a2 ref1 ref2 swap={:?}", rows);
                         }

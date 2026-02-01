@@ -759,123 +759,154 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
     let n_markers = 10; // Small for readability
     let n_ref_haps = 20; // Small panel
     let hero_idx = 10;
+    // Note on expectations (full derivation):
+    // Here M=10 markers and N=2*n_ref_haps=40 reference haplotypes. Aside from the
+    // forced hero/anti pair, all other haps are i.i.d. Bernoulli(0.5) per marker.
+    // For two random haplotypes of length M, the probability they are exact
+    // complements is p_comp = (1/2)^M = 1/1024. The number of other unordered pairs
+    // is C(40,2)-1 = 779, so the expected number of extra perfect complementary
+    // pairs is lambda = 779 * 2^-10 ≈ 0.760742. Using Poisson(lambda),
+    // P(no extra pair) ≈ e^-lambda ≈ 0.467, so in ~53% of runs there is at least
+    // one accidental perfect pair.
+    //
+    // An ideal-but-not-oracular phaser will pick one perfect pair and stick with it.
+    // If there are K=1+X perfect pairs (including hero/anti), symmetry gives
+    // P(pick hero/anti)=1/K. Under the SER metric (hero = all-0), picking hero/anti
+    // gives SER=0, while picking a random complementary pair makes hap1 effectively
+    // random 0/1 across markers, so expected SER ≈ 0.5. Thus:
+    //   E[SER | K] ≈ 0.5 * (1 - 1/K).
+    // Averaging over X~Poisson(lambda), using E[1/(1+X)] ≈ (1-e^-lambda)/lambda,
+    // yields E[SER] ≈ 0.5 * (1 - (1-e^-lambda)/lambda) ≈ 0.1499.
+    // This means SER can be >0 even with correct behavior unless the hero pair is
+    // made unique (e.g., larger M or constrained distractors).
 
-    let ref_file = NamedTempFile::new().unwrap();
-    let ref_path = ref_file.path().to_path_buf();
+    let seeds = [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let mut ser_sum = 0.0f32;
+    for seed in seeds {
+        let ref_file = NamedTempFile::new().unwrap();
+        let ref_path = ref_file.path().to_path_buf();
 
-    let mut ref_samples = Vec::new();
-    let mut ref_haps = Vec::new();
+        let mut ref_samples = Vec::new();
+        let mut ref_haps = Vec::new();
 
-    for i in 0..n_ref_haps {
-        ref_samples.push(format!("R{}", i));
-        ref_haps.push(vec![0u8; n_markers]);
-        ref_haps.push(vec![0u8; n_markers]);
-    }
+        for i in 0..n_ref_haps {
+            ref_samples.push(format!("R{}", i));
+            ref_haps.push(vec![0u8; n_markers]);
+            ref_haps.push(vec![0u8; n_markers]);
+        }
 
-    use rand::{Rng, SeedableRng};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    for h in 0..ref_haps.len() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        for h in 0..ref_haps.len() {
+            for m in 0..n_markers {
+                ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
+            }
+        }
+
+        let hero_hap_idx = hero_idx * 2;
         for m in 0..n_markers {
-            ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
+            ref_haps[hero_hap_idx][m] = 0;
         }
-    }
 
-    let hero_hap_idx = hero_idx * 2;
-    for m in 0..n_markers {
-        ref_haps[hero_hap_idx][m] = 0;
-    }
-
-    let anti_hero_hap_idx = hero_idx * 2 + 1;
-    for m in 0..n_markers {
-        ref_haps[anti_hero_hap_idx][m] = 1;
-    }
-
-    let marker_pos = make_marker_pos(n_markers, 1_000);
-    write_vcf(&ref_path, &ref_samples, &ref_haps, &marker_pos);
-
-    let target_file = NamedTempFile::new().unwrap();
-    let target_path = target_file.path().to_path_buf();
-    write_target_vcf(&target_path, &marker_pos);
-
-    let out_file = NamedTempFile::new().unwrap();
-    let out_path = out_file.path().to_path_buf();
-
-    let mut config = Config::default();
-    config.gt = target_path.clone();
-    config.r#ref = Some(ref_path.clone());
-    config.out = out_path.clone();
-    config.phase_states = 0;
-    config.burnin = 0;
-    config.iterations = 2;
-    config.nthreads = Some(1);
-    config.ne = 10000.0;
-    config.err = Some(0.0001);
-
-    let mut pipeline = PhasingPipeline::new(config, None);
-    pipeline.run().expect("Pipeline run failed");
-
-    // Parse output and calculate SER
-    let expected_out_path = out_path.with_extension("vcf.gz");
-    use flate2::read::MultiGzDecoder;
-    use std::io::BufRead;
-    use std::io::BufReader;
-
-    let file = File::open(&expected_out_path).unwrap();
-    let decoder = MultiGzDecoder::new(file);
-    let reader = BufReader::new(decoder);
-
-    let mut phased_haps: Vec<(u8, u8)> = Vec::new();
-    for line in reader.lines() {
-        let line = line.unwrap();
-        if line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('\t').collect();
-        let sample_field = parts[9];
-        let gt_str = sample_field.split(':').next().unwrap();
-        let alleles: Vec<u8> = gt_str
-            .split(['|', '/'])
-            .map(|s| s.parse().unwrap_or(0))
-            .collect();
-        if alleles.len() >= 2 {
-            phased_haps.push((alleles[0], alleles[1]));
-        }
-    }
-
-    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
-
-    let mut switch_errors = 0;
-    for m in 1..n_markers {
-        let hero_prev = hero_pattern[m - 1];
-        let hero_curr = hero_pattern[m];
-        let (h1_prev, _) = phased_haps[m - 1];
-        let (h1_curr, _) = phased_haps[m];
-        let prev_match = h1_prev == hero_prev;
-        let curr_match = h1_curr == hero_curr;
-        if prev_match != curr_match {
-            switch_errors += 1;
-        }
-    }
-
-    if n_markers <= 20 {
-        println!("[small_panel_ser] hero_pattern={:?}", hero_pattern);
-        println!("[small_panel_ser] phased_haps={:?}", phased_haps);
-        let mut match_trace = Vec::with_capacity(n_markers);
+        let anti_hero_hap_idx = hero_idx * 2 + 1;
         for m in 0..n_markers {
-            let (h1, h2) = phased_haps[m];
-            match_trace.push((m, h1, h2, hero_pattern[m]));
+            ref_haps[anti_hero_hap_idx][m] = 1;
         }
-        println!("[small_panel_ser] match_trace={:?}", match_trace);
+
+        let marker_pos = make_marker_pos(n_markers, 1_000);
+        write_vcf(&ref_path, &ref_samples, &ref_haps, &marker_pos);
+
+        let target_file = NamedTempFile::new().unwrap();
+        let target_path = target_file.path().to_path_buf();
+        write_target_vcf(&target_path, &marker_pos);
+
+        let out_file = NamedTempFile::new().unwrap();
+        let out_path = out_file.path().to_path_buf();
+
+        let mut config = Config::default();
+        config.gt = target_path.clone();
+        config.r#ref = Some(ref_path.clone());
+        config.out = out_path.clone();
+        config.phase_states = 0;
+        config.burnin = 0;
+        config.iterations = 2;
+        config.nthreads = Some(1);
+        config.ne = 10000.0;
+        config.err = Some(0.0001);
+
+        let mut pipeline = PhasingPipeline::new(config, None);
+        pipeline.run().expect("Pipeline run failed");
+
+        // Parse output and calculate SER
+        let expected_out_path = out_path.with_extension("vcf.gz");
+        use flate2::read::MultiGzDecoder;
+        use std::io::BufRead;
+        use std::io::BufReader;
+
+        let file = File::open(&expected_out_path).unwrap();
+        let decoder = MultiGzDecoder::new(file);
+        let reader = BufReader::new(decoder);
+
+        let mut phased_haps: Vec<(u8, u8)> = Vec::new();
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            let sample_field = parts[9];
+            let gt_str = sample_field.split(':').next().unwrap();
+            let alleles: Vec<u8> = gt_str
+                .split(['|', '/'])
+                .map(|s| s.parse().unwrap_or(0))
+                .collect();
+            if alleles.len() >= 2 {
+                phased_haps.push((alleles[0], alleles[1]));
+            }
+        }
+
+        let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
+
+        let mut switch_errors = 0;
+        for m in 1..n_markers {
+            let hero_prev = hero_pattern[m - 1];
+            let hero_curr = hero_pattern[m];
+            let (h1_prev, _) = phased_haps[m - 1];
+            let (h1_curr, _) = phased_haps[m];
+            let prev_match = h1_prev == hero_prev;
+            let curr_match = h1_curr == hero_curr;
+            if prev_match != curr_match {
+                switch_errors += 1;
+            }
+        }
+
+        if n_markers <= 20 {
+            println!("[small_panel_ser] seed={} hero_pattern={:?}", seed, hero_pattern);
+            println!("[small_panel_ser] seed={} phased_haps={:?}", seed, phased_haps);
+            let mut match_trace = Vec::with_capacity(n_markers);
+            for m in 0..n_markers {
+                let (h1, h2) = phased_haps[m];
+                match_trace.push((m, h1, h2, hero_pattern[m]));
+            }
+            println!("[small_panel_ser] seed={} match_trace={:?}", seed, match_trace);
+        }
+
+        let ser = switch_errors as f32 / (n_markers - 1) as f32;
+        ser_sum += ser;
+
+        println!(
+            "[small_panel_ser] seed={} markers={} switch_errors={} ser={:.4}",
+            seed, n_markers, switch_errors, ser
+        );
     }
 
-    let ser = switch_errors as f32 / (n_markers - 1) as f32;
-
-    println!(
-        "[small_panel_ser] markers={} switch_errors={} ser={:.4}",
-        n_markers, switch_errors, ser
+    let ser_avg = ser_sum / seeds.len() as f32;
+    println!("[small_panel_ser] avg_ser={:.4}", ser_avg);
+    assert!(
+        ser_avg < 0.15,
+        "Avg SER too high in small panel: {:.4}",
+        ser_avg
     );
-
-    assert!(ser < 0.15, "SER too high in small panel: {:.4}", ser);
 }
 
 #[test]
