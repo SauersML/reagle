@@ -6282,6 +6282,91 @@ fn sample_dynamic_mcmc(
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
 
+    // Heuristic initialization for symmetric cases
+    let mut local_heuristic_paths: Option<MosaicPaths> = None;
+    if initial_paths.is_none() && n_markers <= 500 && n_states < 128 {
+        let need = n_states * n_states;
+        if workspace.scores.len() < need {
+            workspace.scores.resize(need, 0.0);
+        } else {
+            workspace.scores[..need].fill(0.0);
+        }
+
+        let n_ref_haps = phase_ibs.n_haps();
+        let n_scan = n_states.min(n_ref_haps);
+
+        // Pre-resize ref_alleles buffer if needed
+        if workspace.ref_alleles.len() < n_scan {
+            workspace.ref_alleles.resize(n_scan, 255);
+        }
+
+        let mut informative = 0usize;
+        for m in 0..n_markers {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            if a1 == 255 && a2 == 255 {
+                continue;
+            }
+            informative += 1;
+
+            let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+
+            // Fetch all candidate alleles at this marker
+            for h in 0..n_scan {
+                workspace.ref_alleles[h] = phase_ibs.allele(m, h as u32);
+            }
+
+            for i in 0..n_scan {
+                let r1 = workspace.ref_alleles[i];
+                if r1 == 255 {
+                    continue;
+                }
+
+                for j in 0..i {
+                    let r2 = workspace.ref_alleles[j];
+                    if r2 == 255 {
+                        continue;
+                    }
+
+                    let compatible = if is_het {
+                        (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                    } else {
+                        let obs = if a1 != 255 { a1 } else { a2 };
+                        r1 == obs && r2 == obs
+                    };
+
+                    if compatible {
+                        workspace.scores[i * n_states + j] += 1.0;
+                    } else {
+                        workspace.scores[i * n_states + j] -= 1.0;
+                    }
+                }
+            }
+        }
+
+        // Find best pair
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_pair = (0, 0);
+
+        for i in 0..n_scan {
+            for j in 0..i {
+                let s = workspace.scores[i * n_states + j];
+                if s > best_score {
+                    best_score = s;
+                    best_pair = (i, j);
+                }
+            }
+        }
+
+        if informative > 0 && best_score >= 0.5 * (informative as f32) {
+            let path1 = vec![best_pair.0 as u32; n_markers];
+            let path2 = vec![best_pair.1 as u32; n_markers];
+            local_heuristic_paths = Some(MosaicPaths { path1, path2 });
+        }
+    }
+
+    let initial_paths = initial_paths.or(local_heuristic_paths.as_ref());
+
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
         return (
             Vec::new(),
