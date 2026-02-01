@@ -3411,6 +3411,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 .iter()
                                 .copied()
                                 .zip(swap_probs.into_iter())
+                                .map(|(idx, p_swap)| {
+                                    let conf = p_swap.max(1.0 - p_swap);
+                                    (idx, conf)
+                                })
                                 .collect();
                             assert!(swap_lr.len() <= n_markers);
                             assert!(het_phase_out.len() <= het_positions.len());
@@ -6443,8 +6447,8 @@ fn sample_dynamic_mcmc(
                     }
                 }
 
-                let threshold = 0.9 * (informative as f32);
-                if best_score >= threshold && n_markers <= 500 {
+                let threshold = 0.2 * (informative as f32);
+                if best_score >= threshold && n_markers <= 1000 {
                     let h1 = neighbors[best_pair.0];
                     let h2 = neighbors[best_pair.1];
 
@@ -6877,11 +6881,13 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
-    if best_score < threshold || n_markers > 500 {
+    let threshold = 0.2 * (informative as f32);
+    if best_score < threshold || n_markers > 1000 {
+        eprintln!("[heuristic] REJECT best_score={:.1} threshold={:.1} markers={}", best_score, threshold, n_markers);
         return None;
     }
 
+    eprintln!("[heuristic] ACCEPT best_score={:.1} threshold={:.1} markers={}", best_score, threshold, n_markers);
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
@@ -7333,7 +7339,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
 
-    if !has_anchor {
+    // Only run secondary chain if we don't have a strong prior/heuristic start.
+    // Running the twin chain when we have a valid path causes confidence to drop to 0.5
+    // in symmetric scenarios, preventing convergence to a single mode.
+    if !has_anchor && start_paths.is_none() {
         let flipped_paths =
             if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
                 Some(MosaicPaths {
