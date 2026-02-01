@@ -9535,3 +9535,30 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod additional_tests {
+    use super::*;
+
+    #[test]
+    fn test_emit_haploid_constrained_missing_ref() {
+        let p_no_err = 0.999;
+        let p_err = 0.001;
+        let conf = 1.0;
+
+        // Ref missing (255)
+        // Should be 0.5 regardless of constraints
+        
+        // 1. Unphased het (0/1), no fixed allele (255)
+        let emit = emit_haploid_constrained(255, 0, 1, 255, conf, p_no_err, p_err);
+        assert!((emit - 0.5).abs() < 1e-6, "Ref missing should return 0.5 for unphased het, got {}", emit);
+
+        // 2. Hom (0/0), fixed allele (255) -> target 0
+        let emit = emit_haploid_constrained(255, 0, 0, 255, conf, p_no_err, p_err);
+        assert!((emit - 0.5).abs() < 1e-6, "Ref missing should return 0.5 for hom, got {}", emit);
+
+        // 3. Constrained het (0/1), fixed allele 0 -> target 1
+        let emit = emit_haploid_constrained(255, 0, 1, 0, conf, p_no_err, p_err);
+        assert!((emit - 0.5).abs() < 1e-6, "Ref missing should return 0.5 for constrained het, got {}", emit);
+    }
+}
