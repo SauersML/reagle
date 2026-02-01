@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -6783,6 +6783,7 @@ fn sample_dynamic_mcmc(
 /// This breaks the symmetry of the Combined HMM initialization (which cannot distinguish
 /// between phasing configurations at 0/1 sites) and helps the Gibbs sampler escape
 /// "Mosaic Traps" where H1 and H2 lock each other into high-switching local optima.
+#[cfg(test)]
 fn find_best_constant_pair_with_buffer<RefSpace>(
     n_markers: usize,
     n_states: usize,
@@ -6933,19 +6934,19 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let start_paths = initial_paths;
 
     // Attempt heuristic initialization if no start path
-    let heuristic_paths = if start_paths.is_none() {
-        find_best_constant_pair_with_buffer(
-            n_markers,
-            n_states,
-            seq1,
-            seq2,
-            &mut ref_provider,
-            &mut workspace.scores,
-        )
-    } else {
-        None
-    };
-    let start_paths = start_paths.or(heuristic_paths.as_ref());
+    // let heuristic_paths = if start_paths.is_none() {
+    //     find_best_constant_pair_with_buffer(
+    //         n_markers,
+    //         n_states,
+    //         seq1,
+    //         seq2,
+    //         &mut ref_provider,
+    //         &mut workspace.scores,
+    //     )
+    // } else {
+    //     None
+    // };
+    // let start_paths = start_paths.or(heuristic_paths.as_ref());
 
     // Only build combined checkpoints if we don't have a start path
     // This optimization avoids the expensive Combined HMM step when we have a good guess
