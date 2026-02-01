@@ -2013,7 +2013,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         };
 
         // Load reference panel if provided (for reference-guided phasing)
-        let mut ref_pos_map: Option<HashMap<(String, u32), usize>> = None;
+        let mut ref_pos_map: Option<HashMap<(String, u32), Vec<usize>>> = None;
         if let Some(ref_path) = &self.config.r#ref {
             eprintln!("Loading reference panel for streaming phasing...");
             let ref_gt: GenotypeMatrix<Phased> =

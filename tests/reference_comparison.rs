@@ -3759,8 +3759,6 @@ fn test_multiple_seeds_consistency() {
 fn test_per_sample_imputation_accuracy() {
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
-    let files = setup_test_files();
-
     println!("\n{}", "=".repeat(60));
     println!("=== Per-Sample Imputation Accuracy Test ===");
     println!("{}", "=".repeat(60));
@@ -3795,7 +3793,7 @@ fn test_per_sample_imputation_accuracy() {
     // Run Java
     let java_out = work_dir.path().join("java_out");
     let java_output = run_beagle(
-        &files.beagle_jar,
+        &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
             ("gt", masked_gz.to_str().unwrap()),
@@ -3970,8 +3968,6 @@ fn test_per_sample_imputation_accuracy() {
 fn test_dr2_genotyped_vs_imputed() {
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
-    let files = setup_test_files();
-
     println!("\n{}", "=".repeat(70));
     println!("=== DR2: Genotyped vs Imputed (Separate Analysis) ===");
     println!("{}", "=".repeat(70));
@@ -3987,7 +3983,7 @@ fn test_dr2_genotyped_vs_imputed() {
     // Run Java
     let java_out = work_dir.path().join("java_out");
     let java_output = run_beagle(
-        &files.beagle_jar,
+        &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
             ("gt", target_path.to_str().unwrap()),
@@ -4215,8 +4211,6 @@ fn test_dr2_genotyped_vs_imputed() {
 fn test_dosage_by_distance_from_genotyped() {
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
-    let files = setup_test_files();
-
     println!("\n{}", "=".repeat(70));
     println!("=== Dosage by Distance from Genotyped Markers ===");
     println!("{}", "=".repeat(70));
@@ -4234,7 +4228,7 @@ fn test_dosage_by_distance_from_genotyped() {
     // Run Java
     let java_out = work_dir.path().join("java_out");
     let java_output = run_beagle(
-        &files.beagle_jar,
+        &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
             ("gt", target_path.to_str().unwrap()),
@@ -4846,6 +4840,94 @@ fn test_genotyped_dosage_matches_hard_call() {
         "GENOTYPED DOSAGE BUG: Rust has {} mismatches (DS != GT), Java has {}",
         rust_mismatches,
         java_mismatches
+    );
+}
+
+/// Test: Any marker that exists in the sparse target VCF (genotyped) must not be labeled IMP,
+/// even if REF/ALT are swapped during alignment.
+#[test]
+#[serial]
+fn test_genotyped_markers_not_imputed_even_when_swapped() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(
+        !sources.is_empty(),
+        "test_files: {:?}",
+        test_files
+    );
+    let source = &sources[0];
+
+    println!("\n{}", "=".repeat(70));
+    println!("=== Genotyped Markers Should Not Be Marked IMP (Swapped OK) ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    // Run Rust imputation
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_out");
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    assert!(
+        rust_result.is_ok(),
+        "Rust imputation failed: {:?}",
+        rust_result.err()
+    );
+
+    let (_, target_records) = parse_vcf(&target_path);
+    let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+
+    let mut target_map: HashMap<(String, u64), (String, Vec<String>)> = HashMap::new();
+    for rec in &target_records {
+        target_map.insert(
+            (rec.chrom.clone(), rec.pos),
+            (rec.ref_allele.clone(), rec.alt_alleles.clone()),
+        );
+    }
+
+    let mut bad = Vec::new();
+    for rec in &rust_records {
+        let Some((t_ref, t_alts)) = target_map.get(&(rec.chrom.clone(), rec.pos)) else {
+            continue;
+        };
+        if t_alts.len() != 1 || rec.alt_alleles.len() != 1 {
+            continue;
+        }
+        let t_alt = &t_alts[0];
+        let r_alt = &rec.alt_alleles[0];
+        let matches_direct = &rec.ref_allele == t_ref && r_alt == t_alt;
+        let matches_swapped = &rec.ref_allele == t_alt && r_alt == t_ref;
+        if matches_direct || matches_swapped {
+            if rec.info.contains_key("IMP") {
+                bad.push((rec.chrom.clone(), rec.pos, rec.ref_allele.clone(), r_alt.clone()));
+            }
+        }
+    }
+
+    if !bad.is_empty() {
+        println!(
+            "Found {} genotyped markers incorrectly labeled IMP (showing up to 5):",
+            bad.len()
+        );
+        for (i, (chr, pos, r_ref, r_alt)) in bad.iter().take(5).enumerate() {
+            println!(
+                "  {}: {}:{} {}>{}",
+                i + 1,
+                chr,
+                pos,
+                r_ref,
+                r_alt
+            );
+        }
+    }
+
+    assert!(
+        bad.is_empty(),
+        "Genotyped markers were labeled IMP in Rust output"
     );
 }
 

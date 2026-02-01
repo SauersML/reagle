@@ -1961,4 +1961,80 @@ mod tests {
         let conf = compute_gl_confidence("0,0,-10", 0, 0).unwrap();
         assert_eq!(conf, 0);
     }
+
+    #[test]
+    fn test_vcf_gl_confidence_parsing_uniform() {
+        use std::io::Write;
+
+        let tmp = tempfile::NamedTempFile::new().expect("tmp vcf");
+        let mut file = tmp.reopen().expect("reopen vcf");
+        writeln!(file, "##fileformat=VCFv4.2").unwrap();
+        writeln!(
+            file,
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "##FORMAT=<ID=GL,Number=G,Type=Float,Description=\"Genotype Likelihood\">"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "1\t100\t.\tA\tC\t.\tPASS\t.\tGT:GL\t0/1:0,0,0"
+        )
+        .unwrap();
+
+        let (mut reader, handle) = VcfReader::open(tmp.path()).unwrap();
+        let gt = reader.read_all(handle).unwrap();
+        let conf = gt.sample_confidence_f32(MarkerIdx::new(0), 0);
+        assert!(
+            conf < 0.1,
+            "Uniform GL should yield low confidence, got {:.3}",
+            conf
+        );
+    }
+
+    #[test]
+    fn test_vcf_gl_confidence_parsing_high() {
+        use std::io::Write;
+
+        let tmp = tempfile::NamedTempFile::new().expect("tmp vcf");
+        let mut file = tmp.reopen().expect("reopen vcf");
+        writeln!(file, "##fileformat=VCFv4.2").unwrap();
+        writeln!(
+            file,
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "##FORMAT=<ID=GL,Number=G,Type=Float,Description=\"Genotype Likelihood\">"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "1\t100\t.\tA\tC\t.\tPASS\t.\tGT:GL\t0/0:0,-5,-10"
+        )
+        .unwrap();
+
+        let (mut reader, handle) = VcfReader::open(tmp.path()).unwrap();
+        let gt = reader.read_all(handle).unwrap();
+        let conf = gt.sample_confidence_f32(MarkerIdx::new(0), 0);
+        assert!(
+            conf > 0.9,
+            "Strong GL should yield high confidence, got {:.3}",
+            conf
+        );
+    }
 }
