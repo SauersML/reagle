@@ -4,7 +4,7 @@
 //! the active state set changes (core + dynamic). Uses a CSR-style structure to
 //! avoid dense O(N^2) remapping while conserving probability mass.
 
-use crate::model::types::GlobalId;
+use crate::model::types::RefHapId;
 
 #[derive(Clone, Debug)]
 pub struct NormalizedProbs(Vec<f32>);
@@ -28,7 +28,7 @@ pub struct TransitionMatrix {
 }
 
 impl TransitionMatrix {
-    pub fn build(prev_states: &[GlobalId], next_states: &[GlobalId]) -> Self {
+    pub fn build(prev_states: &[RefHapId], next_states: &[RefHapId]) -> Self {
         let n_prev = prev_states.len();
         let n_next = next_states.len();
         let mut row_offsets = Vec::with_capacity(n_prev + 1);

@@ -57,9 +57,9 @@ impl std::ops::Deref for StreamWindowWithResult {
     }
 }
 use crate::data::alignment::{AlignmentStats, MarkerAlignment};
-use crate::model::types::GlobalId;
+use crate::model::types::{CombinedHapId, CombinedHapSpace};
 use crate::model::states::ThreadedHaps;
-use crate::model::hmm::{MosaicHmm, RefColumnProvider};
+use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
@@ -86,17 +86,20 @@ const INVALID_ALLELE: u8 = 254;
 
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
-    threaded_haps: &'a ThreadedHaps,
-    state_buf: Vec<GlobalId>,
+    threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
+    state_buf: Vec<CombinedHapId>,
 }
 
 impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
-    fn new(ref_gt: GenotypeView<'a, TargetSpace, RefSpace>, threaded_haps: &'a ThreadedHaps) -> Self {
+    fn new(
+        ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
+        threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
+    ) -> Self {
         let n_states = threaded_haps.n_states();
         Self {
             ref_gt,
             threaded_haps,
-            state_buf: vec![GlobalId::from(0u32); n_states],
+            state_buf: vec![CombinedHapId::from(0u32); n_states],
         }
     }
 
@@ -104,7 +107,7 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
     fn fill_ref_alleles(&mut self, marker: usize, out: &mut [u8]) {
         let n_states = self.threaded_haps.n_states().min(out.len());
         if self.state_buf.len() < n_states {
-            self.state_buf.resize(n_states, GlobalId::from(0u32));
+            self.state_buf.resize(n_states, CombinedHapId::from(0u32));
         }
         self.threaded_haps.materialize_at(marker, &mut self.state_buf);
         let marker_idx = MarkerIdx::new(marker as u32);
@@ -247,6 +250,7 @@ fn build_sampling_points(
     gen_positions: &[f64],
     step_cm: f64,
     min_marker_step: usize,
+    informative: Option<&[bool]>,
 ) -> Vec<bool> {
     let n = gen_positions.len();
     let mut sampling = vec![false; n];
@@ -263,6 +267,13 @@ fn build_sampling_points(
             sampling[m] = true;
             next_cm = cm + step;
             next_marker = m.saturating_add(min_step);
+        }
+        if informative
+            .and_then(|flags| flags.get(m))
+            .copied()
+            .unwrap_or(false)
+        {
+            sampling[m] = true;
         }
     }
     sampling[n - 1] = true;
@@ -852,17 +863,17 @@ struct MosaicPaths {
 
 #[derive(Clone, Debug)]
 pub struct GlobalMosaicPaths {
-    pub path1: Vec<GlobalId>,
-    pub path2: Vec<GlobalId>,
+    pub path1: Vec<CombinedHapId>,
+    pub path2: Vec<CombinedHapId>,
 }
 
 fn local_to_global_paths(
     local: &MosaicPaths,
-    threaded: &crate::model::states::ThreadedHaps,
+    threaded: &crate::model::states::ThreadedHaps<CombinedHapSpace>,
     n_markers: usize,
 ) -> GlobalMosaicPaths {
     let n_states = threaded.n_states();
-    let mut buffer = vec![GlobalId::from(0u32); n_states];
+    let mut buffer = vec![CombinedHapId::from(0u32); n_states];
     let mut path1 = Vec::with_capacity(n_markers);
     let mut path2 = Vec::with_capacity(n_markers);
 
@@ -874,12 +885,12 @@ fn local_to_global_paths(
         path1.push(if s1 < n_states {
             buffer[s1]
         } else {
-            GlobalId::from(0u32)
+            CombinedHapId::from(0u32)
         });
         path2.push(if s2 < n_states {
             buffer[s2]
         } else {
-            GlobalId::from(0u32)
+            CombinedHapId::from(0u32)
         });
     }
 
@@ -888,11 +899,11 @@ fn local_to_global_paths(
 
 fn global_to_local_paths(
     global: &GlobalMosaicPaths,
-    threaded: &crate::model::states::ThreadedHaps,
+    threaded: &crate::model::states::ThreadedHaps<CombinedHapSpace>,
     n_markers: usize,
 ) -> Option<MosaicPaths> {
     let n_states = threaded.n_states();
-    let mut buffer = vec![GlobalId::from(0u32); n_states];
+    let mut buffer = vec![CombinedHapId::from(0u32); n_states];
     let mut path1 = Vec::with_capacity(n_markers);
     let mut path2 = Vec::with_capacity(n_markers);
 
@@ -2611,7 +2622,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         gen_positions: &[f64],
         step_cm: f32,
         marker_map: Option<&[usize]>,
-    ) -> Result<Vec<crate::model::states::ThreadedHaps>> {
+    ) -> Result<Vec<crate::model::states::ThreadedHaps<CombinedHapSpace>>> {
         let telemetry_snapshot = self.telemetry.as_ref().map(|bb| bb.snapshot());
         let n_haps = target_geno.n_haps();
         let n_ref_haps = ref_gt.map(|r| r.n_haplotypes()).unwrap_or(n_haps).max(1);
@@ -2771,8 +2782,35 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     span_markers
                 ));
             }
-            let sampling =
-                build_sampling_points(&gen_positions[start..end], step_cm, PBWT_MIN_MARKER_STEP);
+            let mut informative: Vec<bool> = vec![false; end.saturating_sub(start)];
+            if !informative.is_empty() {
+                for m in start..end {
+                    let orig_m = marker_map
+                        .and_then(|map| map.get(m).copied())
+                        .unwrap_or(m);
+                    let mut info = false;
+                    if let Some(mask) = phase_mask {
+                        if let Some(row) = mask.get(orig_m) {
+                            if row.iter().any(|&v| v != 0) {
+                                info = true;
+                            }
+                        }
+                    }
+                    if !info {
+                        let alleles = target_geno.marker_alleles(orig_m);
+                        if alleles.iter().any(|&a| a != 255) {
+                            info = true;
+                        }
+                    }
+                    informative[m - start] = info;
+                }
+            }
+            let sampling = build_sampling_points(
+                &gen_positions[start..end],
+                step_cm,
+                PBWT_MIN_MARKER_STEP,
+                Some(&informative),
+            );
             let k_per_hap = per_window_cap
                 .saturating_mul(PBWT_PER_WINDOW_MULT)
                 .max(PBWT_MIN_PER_HAP)
@@ -2841,7 +2879,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let exclude_self = ref_gt.is_none();
         let debug_watch = vec![198usize, 199usize];
         let ref_has_panel = ref_gt.is_some();
-        let out: Vec<crate::model::states::ThreadedHaps> = (0..n_samples)
+        let out: Vec<crate::model::states::ThreadedHaps<CombinedHapSpace>> = (0..n_samples)
             .into_par_iter()
             .map(|s| {
             let hap1 = s * 2;
@@ -2850,6 +2888,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             let mut touched_indices: Vec<usize> =
                 Vec::with_capacity(per_window_cap.saturating_mul(PBWT_PER_WINDOW_MULT).max(1));
             let mut window_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_windows);
+            let mut prev_window_scores: Vec<(usize, f32)> = Vec::new();
             for w in 0..num_windows {
                 for &idx in &touched_indices {
                     dense_merge_buffer[idx] = f32::NEG_INFINITY;
@@ -2888,6 +2927,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 for &h in touched_indices.iter().take(take) {
                     list.push((h, dense_merge_buffer[h]));
                 }
+                if list.is_empty() {
+                    list.extend(prev_window_scores.iter().copied());
+                } else if !prev_window_scores.is_empty() {
+                    let mut map: HashMap<usize, f32> = list.iter().copied().collect();
+                    for (h, score) in prev_window_scores.iter().copied() {
+                        map.entry(h).or_insert(score);
+                    }
+                    list = map.into_iter().collect();
+                }
+                prev_window_scores = list.clone();
                 window_scores.push(list);
             }
 
@@ -3027,14 +3076,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
 
             let offset = if ref_has_panel { n_haps } else { 0 };
-            let mut th = crate::model::states::ThreadedHaps::new(
+            let mut th = crate::model::states::ThreadedHaps::<CombinedHapSpace>::new(
                 selected.len(),
                 selected.len(),
                 n_markers,
             );
             for h in selected {
                 let idx = h + offset;
-                th.push_new(GlobalId::new(idx as u32));
+                th.push_new(CombinedHapId::new(idx as u32));
             }
             th
         })
@@ -3142,19 +3191,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     } else {
                         GenotypeView::Mutable(ref_geno)
                     };
-                let ref_provider_base = if let (Some(ref_gt), Some(alignment)) =
-                    (&self.reference_gt, &self.alignment)
-                {
-                    Some(RefColumnProvider::new(
-                        ref_gt.columns(),
-                        Some(alignment),
-                        None,
-                        None,
-                    ))
-                } else {
-                    None
-                };
-
                 let prior_paths = &mcmc_paths[..];
                 let sample_phase_view: &[SamplePhase] = &*sample_phases;
                 let mut swap_results: Vec<(
@@ -3239,7 +3275,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     Some(&plp),
                                     None,
                                     None,
-                                    ref_provider_base.as_ref(),
                                     &threaded_haps_full,
                                     &mut fwd1,
                                     &mut bwd1,
@@ -3252,7 +3287,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     Some(&plp),
                                     None,
                                     None,
-                                    ref_provider_base.as_ref(),
                                     &threaded_haps_full,
                                     &mut fwd2,
                                     &mut bwd2,
@@ -3479,7 +3513,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         &mut self,
         target_gt: &GenotypeMatrix,
         geno: &mut MutableGenotypes,
-        threaded_haps_vec: &[crate::model::states::ThreadedHaps],
+        threaded_haps_vec: &[crate::model::states::ThreadedHaps<CombinedHapSpace>],
         stage1_p_recomb: &[f32],
         stage1_gen_dists: &[f64],
         hi_freq_to_orig: &[usize],
@@ -3654,16 +3688,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     }
                                 }
                                 if best_hap1.1 > 0 || best_hap2.1 > 0 {
-                                    let mut existing = vec![GlobalId::from(0u32); threaded_haps.n_states()];
+                                    let mut existing = vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
                                     threaded_haps.materialize_at(0, &mut existing);
                                     let has_hap = |hap: u32| existing.iter().any(|g| g.as_u32() == hap);
                                     let hap1_id = (offset + best_hap1.0) as u32;
                                     if best_hap1.1 > 0 && !has_hap(hap1_id) {
-                                        threaded_haps.push_new(GlobalId::new(hap1_id));
+                                        threaded_haps.push_new(CombinedHapId::new(hap1_id));
                                     }
                                     let hap2_id = (offset + best_hap2.0) as u32;
                                     if best_hap2.1 > 0 && !has_hap(hap2_id) {
-                                        threaded_haps.push_new(GlobalId::new(hap2_id));
+                                        threaded_haps.push_new(CombinedHapId::new(hap2_id));
                                     }
                                 }
 
@@ -3700,14 +3734,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     let take = PBWT_FORCE_TOP_HAPS.min(idxs.len());
                                     if take > 0 {
                                         let mut existing =
-                                            vec![GlobalId::from(0u32); threaded_haps.n_states()];
+                                            vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
                                         threaded_haps.materialize_at(0, &mut existing);
                                         let has_hap =
                                             |hap: u32| existing.iter().any(|g| g.as_u32() == hap);
                                         for &h in idxs.iter().take(take) {
                                             let hap_id = (offset + h) as u32;
                                             if !has_hap(hap_id) {
-                                                threaded_haps.push_new(GlobalId::new(hap_id));
+                                                threaded_haps.push_new(CombinedHapId::new(hap_id));
                                             }
                                         }
                                     }
@@ -3780,8 +3814,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 )
                             };
                             let global_paths = GlobalMosaicPaths {
-                                path1: new_paths.path1.into_iter().map(GlobalId::from).collect(),
-                                path2: new_paths.path2.into_iter().map(GlobalId::from).collect(),
+                                path1: new_paths.path1.into_iter().map(CombinedHapId::from).collect(),
+                                path2: new_paths.path2.into_iter().map(CombinedHapId::from).collect(),
                             };
                             (swap_bits, swap_lr, swap_probs, Some(global_paths))
                         } else {
@@ -4345,19 +4379,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 carrier_haps[m] = carriers;
             }
 
-            let ref_provider_base = if let (Some(ref_gt), Some(alignment)) =
-                (&self.reference_gt, &self.alignment)
-            {
-                Some(RefColumnProvider::new(
-                    ref_gt.columns(),
-                    Some(alignment),
-                    Some(hi_freq_markers),
-                    None,
-                ))
-            } else {
-                None
-            };
-
             // Process samples in parallel - collect results: Stage2Decision
             // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
             sample_phases
@@ -4428,7 +4449,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 && h2_idx < hap_priors.len()
                                 && n_states > 0
                             {
-                                let mut state_haps = vec![GlobalId::new(0); n_states];
+                                let mut state_haps = vec![CombinedHapId::new(0); n_states];
                                 threaded_haps.materialize_at(prior_stage1_idx, &mut state_haps);
 
                                 (
@@ -4462,7 +4483,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         Some(&plp),
                         Some(&allele_freqs_stage1),
                         init_prior1,
-                        ref_provider_base.as_ref(),
                         &threaded_haps,
                         &mut fwd1,
                         &mut bwd1,
@@ -4478,7 +4498,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         Some(&plp),
                         Some(&allele_freqs_stage1),
                         init_prior2,
-                        ref_provider_base.as_ref(),
                         &threaded_haps,
                         &mut fwd2,
                         &mut bwd2,
@@ -4520,7 +4539,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     {
                         let stage1_idx = next_overlap_indices[0];
                         if stage1_idx < probs1.len() && n_states > 0 {
-                            let mut state_haps = vec![GlobalId::new(0); n_states];
+                            let mut state_haps = vec![CombinedHapId::new(0); n_states];
                             threaded_haps.materialize_at(stage1_idx, &mut state_haps);
 
                             let prior1 = build_haplotype_priors_from_state_probs(
@@ -4544,13 +4563,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                     // Lazy cache for state->hap mapping - O(1) indexing with Option<Vec>
                     // Uses immutable materialize_at() to avoid clone() overhead
-                    let mut hap_cache: Vec<Option<Vec<GlobalId>>> = vec![None; n_markers];
+                    let mut hap_cache: Vec<Option<Vec<CombinedHapId>>> = vec![None; n_markers];
 
                     macro_rules! get_haps {
                         ($marker:expr) => {{
                             let m = $marker;
                             if hap_cache[m].is_none() {
-                                let mut haps = vec![GlobalId::new(0); n_states];
+                                let mut haps = vec![CombinedHapId::new(0); n_states];
                                 threaded_haps.materialize_at(m, &mut haps);
                                 hap_cache[m] = Some(haps);
                             }
@@ -4912,7 +4931,7 @@ const PRIOR_EXPORT_MIN_PROB: f32 = 1e-5;
 /// Project haplotype-identity priors onto the current window's local state set.
 fn project_haplotype_priors_to_states(
     priors: &HaplotypePriors,
-    state_haps: &[GlobalId],
+    state_haps: &[CombinedHapId],
 ) -> Vec<f32> {
     let n_states = state_haps.len();
     if n_states == 0 {
@@ -4955,7 +4974,7 @@ fn project_haplotype_priors_to_states(
 /// Build haplotype priors from state posteriors.
 fn build_haplotype_priors_from_state_probs(
     state_probs: &[f32],
-    state_haps: &[GlobalId],
+    state_haps: &[CombinedHapId],
     min_prob: f32,
 ) -> HaplotypePriors {
     let mut mass_by_hap: std::collections::HashMap<u32, f32> =
@@ -7457,7 +7476,7 @@ impl Stage2Phaser {
         &self,
         marker: usize,
         state_probs: &[Vec<f32>],   // [stage1_marker][state]
-        haps_at_mkr_a: &[GlobalId], // haplotypes at flanking Stage 1 marker
+        haps_at_mkr_a: &[CombinedHapId], // haplotypes at flanking Stage 1 marker
         get_allele: &F,             // Closure to get allele for any haplotype
         a1: u8,
         a2: u8,
@@ -8281,9 +8300,9 @@ mod tests {
         let geno = MutableGenotypes::from_fn(n_markers, n_states, |m, h| {
             data[m * n_states + h]
         });
-        let mut threaded = ThreadedHaps::new(n_states, n_states, n_markers);
+        let mut threaded = ThreadedHaps::<CombinedHapSpace>::new(n_states, n_states, n_markers);
         for h in 0..n_states {
-            threaded.push_new(GlobalId::new(h as u32));
+            threaded.push_new(CombinedHapId::new(h as u32));
         }
         let mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, AnyMarkerSpace> =
             RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded);

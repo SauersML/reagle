@@ -14,7 +14,6 @@
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
 use crate::model::parameters::ModelParams;
-use crate::model::types::GlobalId;
 use wide::f32x8;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -582,9 +581,7 @@ use crate::model::pl_emission::{
     PlProvider, allele_probs_cond_from_pl, allele_probs_uncond_from_pl, emit_from_allele_probs,
 };
 use crate::model::states::{MosaicCursor, StateSwitch, ThreadedHaps};
-use crate::data::alignment::MarkerAlignment;
-use crate::data::marker::AnyMarkerSpace;
-use crate::data::storage::GenotypeColumn;
+use crate::model::types::{HapId, CombinedHapSpace};
 
 /// High-performance Li-Stephens HMM using mosaic states with A-B-C loop pattern.
 ///
@@ -597,7 +594,12 @@ use crate::data::storage::GenotypeColumn;
 /// - **Phase A**: State maintenance (integer logic, branch-predictable)
 /// - **Phase B**: Allele materialization (memory fetch into contiguous scratch)
 /// - **Phase C**: Math kernel (SIMD-vectorizable on flat data)
-pub struct MosaicHmm<'a, TargetSpace = crate::data::AnyMarkerSpace, RefSpace = crate::data::AnyMarkerSpace> {
+pub struct MosaicHmm<
+    'a,
+    TargetSpace = crate::data::AnyMarkerSpace,
+    RefSpace = crate::data::AnyMarkerSpace,
+    HapSpace = CombinedHapSpace,
+> {
     /// Reference panel genotypes
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     /// Model parameters
@@ -606,56 +608,9 @@ pub struct MosaicHmm<'a, TargetSpace = crate::data::AnyMarkerSpace, RefSpace = c
     n_states: usize,
     /// Recombination probabilities between consecutive markers
     p_recomb: Vec<f32>,
+    hap_space: std::marker::PhantomData<HapSpace>,
 }
-
-/// Optional reference column provider for block-aware emissions.
-pub struct RefColumnProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
-    ref_columns: &'a [GenotypeColumn],
-    alignment: Option<&'a MarkerAlignment<TargetSpace, RefSpace>>,
-    marker_map: Option<&'a [usize]>,
-    ref_index_map: Option<&'a [usize]>,
-}
-
-impl<'a, TargetSpace, RefSpace> RefColumnProvider<'a, TargetSpace, RefSpace> {
-    pub fn new(
-        ref_columns: &'a [GenotypeColumn],
-        alignment: Option<&'a MarkerAlignment<TargetSpace, RefSpace>>,
-        marker_map: Option<&'a [usize]>,
-        ref_index_map: Option<&'a [usize]>,
-    ) -> Self {
-        Self {
-            ref_columns,
-            alignment,
-            marker_map,
-            ref_index_map,
-        }
-    }
-
-    #[inline]
-    fn column_for_marker(&self, marker_idx: usize) -> Option<&'a GenotypeColumn> {
-        let orig_m = self
-            .marker_map
-            .and_then(|map| map.get(marker_idx).copied())
-            .unwrap_or(marker_idx);
-        let ref_m = if let Some(alignment) = self.alignment {
-            alignment.target_to_ref(MarkerIdx::new(orig_m as u32))?
-        } else {
-            MarkerIdx::new(orig_m as u32)
-        };
-        let col_idx = if let Some(map) = self.ref_index_map {
-            let idx = *map.get(ref_m.as_usize())?;
-            if idx == usize::MAX {
-                return None;
-            }
-            idx
-        } else {
-            ref_m.as_usize()
-        };
-        self.ref_columns.get(col_idx)
-    }
-}
-
-impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
+impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, HapSpace> {
     /// Create a new MosaicHmm
     pub fn new(
         ref_gt: impl Into<GenotypeView<'a, TargetSpace, RefSpace>>,
@@ -668,6 +623,7 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
             params,
             n_states,
             p_recomb,
+            hap_space: std::marker::PhantomData,
         }
     }
 
@@ -689,8 +645,7 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
         pl_provider: Option<&PlProvider>,
         allele_freqs: Option<&[f32]>,
         init_prior: Option<&[f32]>,
-        ref_provider: Option<&RefColumnProvider<'_, TargetSpace, RefSpace>>,
-        threaded_haps: &ThreadedHaps,
+        threaded_haps: &ThreadedHaps<HapSpace>,
         fwd: &mut Vec<f32>,
         bwd: &mut Vec<f32>,
     ) -> f64 {
@@ -716,10 +671,8 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
         let mut log_likelihood = 0.0f64;
 
         let mut ref_alleles = vec![255u8; n_states];
-        let mut state_buf = vec![GlobalId::from(0u32); n_states];
-        let mut state_patterns: Vec<u32> = vec![0u32; n_states];
-        let mut pattern_emissions: Vec<f32> = Vec::new();
-        let fill_ref_alleles = |m: usize, ref_alleles: &mut [u8], state_buf: &[GlobalId]| {
+        let mut state_buf = vec![HapId::<HapSpace>::new(0u32); n_states];
+        let fill_ref_alleles = |m: usize, ref_alleles: &mut [u8], state_buf: &[HapId<HapSpace>]| {
             let marker = MarkerIdx::new(m as u32);
             for k in 0..n_states {
                 let hap = HapIdx::new(state_buf[k].as_u32());
@@ -766,99 +719,14 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
                 }
             };
 
-        let mut try_fill_pattern_emissions =
+        let try_fill_pattern_emissions =
             |m: usize,
              partner: u8,
              allele_probs_opt: Option<&[f32]>,
              emissions: &mut [f32],
-             state_buf: &[GlobalId]| {
-                let Some(provider) = ref_provider else {
-                    return false;
-                };
-                let Some(col) = provider.column_for_marker(m) else {
-                    return false;
-                };
-                match col {
-                    GenotypeColumn::SeqCoded(c) => {
-                        let hap_to_seq = c.hap_to_seq();
-                        for k in 0..n_states {
-                            state_patterns[k] = hap_to_seq[state_buf[k].as_usize()] as u32;
-                        }
-                        let seq_alleles = c.seq_alleles();
-                        pattern_emissions.resize(seq_alleles.len(), 1.0);
-                        if let Some(allele_probs) = allele_probs_opt {
-                            let n_alleles = allele_probs.len();
-                            let p_no_err = p_no_err_base;
-                            let p_err_other = if n_alleles > 1 {
-                                p_err_base / (n_alleles as f32 - 1.0)
-                            } else {
-                                0.0
-                            };
-                            for (pid, &allele) in seq_alleles.iter().enumerate() {
-                                pattern_emissions[pid] = emit_from_allele_probs(
-                                    allele,
-                                    allele_probs,
-                                    p_no_err,
-                                    p_err_other,
-                                );
-                            }
-                        } else if let Some(req) = required_allele(m, partner) {
-                            let conf = conf_at(m);
-                            let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
-                            let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
-                            for (pid, &allele) in seq_alleles.iter().enumerate() {
-                                pattern_emissions[pid] = if allele == req { p_no_err } else { p_err };
-                            }
-                        } else {
-                            pattern_emissions.fill(1.0);
-                        }
-                        for k in 0..n_states {
-                            let pid = state_patterns[k] as usize;
-                            emissions[k] = pattern_emissions.get(pid).copied().unwrap_or(1.0);
-                        }
-                        true
-                    }
-                    GenotypeColumn::Dictionary(dict, offset) => {
-                        let n_patterns = dict.n_patterns();
-                        pattern_emissions.resize(n_patterns, 1.0);
-                        if let Some(allele_probs) = allele_probs_opt {
-                            let n_alleles = allele_probs.len();
-                            let p_no_err = p_no_err_base;
-                            let p_err_other = if n_alleles > 1 {
-                                p_err_base / (n_alleles as f32 - 1.0)
-                            } else {
-                                0.0
-                            };
-                            for pid in 0..n_patterns {
-                                let allele = dict.pattern_allele(*offset, pid);
-                                pattern_emissions[pid] = emit_from_allele_probs(
-                                    allele,
-                                    allele_probs,
-                                    p_no_err,
-                                    p_err_other,
-                                );
-                            }
-                        } else if let Some(req) = required_allele(m, partner) {
-                            let conf = conf_at(m);
-                            let p_no_err = p_no_err_base * conf + 0.5 * (1.0 - conf);
-                            let p_err = p_err_base * conf + 0.5 * (1.0 - conf);
-                            for pid in 0..n_patterns {
-                                let allele = dict.pattern_allele(*offset, pid);
-                                pattern_emissions[pid] = if allele == req { p_no_err } else { p_err };
-                            }
-                        } else {
-                            pattern_emissions.fill(1.0);
-                        }
-                        for k in 0..n_states {
-                            let hap = HapIdx::new(state_buf[k].as_u32());
-                            state_patterns[k] = dict.hap_pattern_idx(hap) as u32;
-                            let pid = state_patterns[k] as usize;
-                            emissions[k] = pattern_emissions.get(pid).copied().unwrap_or(1.0);
-                        }
-                        true
-                    }
-                    _ => false,
-                }
+             state_buf: &[HapId<HapSpace>]| {
+                let _ = (m, partner, allele_probs_opt, emissions, state_buf);
+                false
             };
 
         let mut process_marker = |m: usize| {
@@ -1148,7 +1016,7 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
     pub fn collect_stats(
         &self,
         target_alleles: &[u8],
-        threaded_haps: &ThreadedHaps,
+        threaded_haps: &ThreadedHaps<HapSpace>,
         gen_dists: &[f64],
         estimates: &mut crate::model::parameters::ParamEstimates,
     ) {
@@ -1168,7 +1036,7 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
 
         // Create cursor and record history during forward traversal
         let mut cursor = MosaicCursor::from_threaded(threaded_haps);
-        let mut history: Vec<StateSwitch> = Vec::with_capacity(n_markers);
+        let mut history: Vec<StateSwitch<HapSpace>> = Vec::with_capacity(n_markers);
 
         // First pass: advance cursor to end while recording history AND storing checkpoints
         let mut fwd_checkpoints = vec![0.0f32; n_checkpoints * n_states];
@@ -1251,7 +1119,7 @@ impl<'a, TargetSpace, RefSpace> MosaicHmm<'a, TargetSpace, RefSpace> {
             // Recompute forward from checkpoint to m
             // Need a separate cursor for recomputation
             let mut recomp_cursor = MosaicCursor::from_threaded(threaded_haps);
-            let mut recomp_history: Vec<StateSwitch> = Vec::with_capacity(m + 1);
+            let mut recomp_history: Vec<StateSwitch<HapSpace>> = Vec::with_capacity(m + 1);
 
             // Advance recomp cursor to checkpoint_start
             for recomp_m in 0..=checkpoint_start {
@@ -1357,7 +1225,7 @@ mod tests {
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
-    use crate::model::types::GlobalId;
+    use crate::model::types::RefHapSpace;
     use std::sync::Arc;
 
     fn make_test_ref_panel() -> GenotypeMatrix {
@@ -1432,18 +1300,18 @@ mod tests {
 
         // Build ThreadedHaps using PRODUCTION API with actual segment transitions
         // This tests MosaicCursor segment-switching logic that from_static_haps bypassed
-        let mut threaded_haps = ThreadedHaps::new(n_states, n_states * 2, n_markers);
+        let mut threaded_haps = ThreadedHaps::<RefHapSpace>::new(n_states, n_states * 2, n_markers);
 
         // State 0: hap 0 for markers 0-2, then hap 1 for markers 3-4 (segment switch at marker 3)
-        threaded_haps.push_new(GlobalId::new(0));
-        threaded_haps.add_segment(0, GlobalId::new(1), 3);
+        threaded_haps.push_new(HapId::new(0));
+        threaded_haps.add_segment(0, HapId::new(1), 3);
 
         // State 1: hap 2 for entire chromosome (no switch - tests static case too)
-        threaded_haps.push_new(GlobalId::new(2));
+        threaded_haps.push_new(HapId::new(2));
 
         // State 2: hap 4 for markers 0-1, then hap 5 for markers 2-4 (segment switch at marker 2)
-        threaded_haps.push_new(GlobalId::new(4));
-        threaded_haps.add_segment(2, GlobalId::new(5), 2);
+        threaded_haps.push_new(HapId::new(4));
+        threaded_haps.add_segment(2, HapId::new(5), 2);
 
         let hmm = MosaicHmm::new(&ref_panel, &params, n_states, p_recomb);
 
@@ -1455,7 +1323,6 @@ mod tests {
             &target_alleles,
             &target_alleles,
             &target_alleles,
-            None,
             None,
             None,
             None,

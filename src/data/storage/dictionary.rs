@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::data::HapIdx;
+use crate::model::types::RefHapId;
 
 /// Dictionary-compressed storage for haplotype blocks
 #[derive(Clone, Debug)]
@@ -117,7 +118,7 @@ impl DictionaryColumn {
 
     /// Pattern index for a haplotype
     #[inline]
-    pub fn hap_pattern_idx(&self, hap: HapIdx) -> usize {
+    pub fn hap_pattern_idx(&self, hap: RefHapId) -> usize {
         self.hap_to_pattern[hap.as_usize()] as usize
     }
 
@@ -219,4 +220,5 @@ mod tests {
         assert_eq!(dict.get(1, HapIdx::new(2)), 0);
         assert_eq!(dict.get(2, HapIdx::new(2)), 1);
     }
+
 }

@@ -189,9 +189,6 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
     }
 
     /// Get all genotype columns
-    pub fn columns(&self) -> &[GenotypeColumn] {
-        &self.columns
-    }
 
     /// Get allele at (marker, haplotype)
     #[inline]

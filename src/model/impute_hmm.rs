@@ -10,7 +10,7 @@ use crate::data::storage::{
 };
 use crate::data::HapIdx;
 use crate::model::weighted_kernel::WeightedHmmUpdater;
-use crate::model::types::GlobalId;
+use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::OnceLock;
 
@@ -308,7 +308,7 @@ impl ImputeWorkspace {
 trait RefColumnLike {
     fn fill_ref_alleles(
         &self,
-        state_haps: &[HapIdx],
+        state_haps: &[RefHapId],
         out: &mut [u8],
         dict_pattern_alleles: &mut Vec<u8>,
     );
@@ -318,7 +318,7 @@ impl<T: RefColumnLike + ?Sized> RefColumnLike for &T {
     #[inline]
     fn fill_ref_alleles(
         &self,
-        state_haps: &[HapIdx],
+        state_haps: &[RefHapId],
         out: &mut [u8],
         dict_pattern_alleles: &mut Vec<u8>,
     ) {
@@ -330,7 +330,7 @@ impl RefColumnLike for DenseColumn {
     #[inline]
     fn fill_ref_alleles(
         &self,
-        state_haps: &[HapIdx],
+        state_haps: &[RefHapId],
         out: &mut [u8],
         dict_pattern_alleles: &mut Vec<u8>,
     ) {
@@ -363,7 +363,7 @@ impl RefColumnLike for DenseColumn {
             }
         } else {
             for (i, hap) in state_haps.iter().enumerate() {
-                out[i] = self.get(*hap);
+                out[i] = self.get(HapIdx::new(hap.as_u32()));
             }
         }
     }
@@ -373,13 +373,13 @@ impl RefColumnLike for SparseColumn {
     #[inline]
     fn fill_ref_alleles(
         &self,
-        state_haps: &[HapIdx],
+        state_haps: &[RefHapId],
         out: &mut [u8],
         dict_pattern_alleles: &mut Vec<u8>,
     ) {
         std::hint::black_box(dict_pattern_alleles.len());
         for (i, hap) in state_haps.iter().enumerate() {
-            out[i] = self.get(*hap);
+            out[i] = self.get(HapIdx::new(hap.as_u32()));
         }
     }
 }
@@ -388,7 +388,7 @@ impl RefColumnLike for SeqCodedColumn {
     #[inline]
     fn fill_ref_alleles(
         &self,
-        state_haps: &[HapIdx],
+        state_haps: &[RefHapId],
         out: &mut [u8],
         dict_pattern_alleles: &mut Vec<u8>,
     ) {
@@ -411,7 +411,7 @@ impl RefColumnLike for DictColRef<'_> {
     #[inline]
     fn fill_ref_alleles(
         &self,
-        state_haps: &[HapIdx],
+        state_haps: &[RefHapId],
         out: &mut [u8],
         dict_pattern_alleles: &mut Vec<u8>,
     ) {
@@ -433,7 +433,7 @@ impl RefColumnLike for GenotypeColumn {
     #[inline]
     fn fill_ref_alleles(
         &self,
-        state_haps: &[HapIdx],
+        state_haps: &[RefHapId],
         out: &mut [u8],
         dict_pattern_alleles: &mut Vec<u8>,
     ) {
@@ -461,7 +461,7 @@ impl RefColumnLike for GenotypeColumn {
 #[inline]
 fn refresh_ref_alleles<'a, C: RefColumnLike + ?Sized>(
     col: &C,
-    state_haps: &[HapIdx],
+    state_haps: &[RefHapId],
     state_alleles: &'a mut [u8],
     dict_pattern_alleles: &mut Vec<u8>,
 ) -> RefAlleles<'a> {
@@ -473,7 +473,7 @@ fn refresh_ref_alleles<'a, C: RefColumnLike + ?Sized>(
 fn refresh_seq_patterns<'a>(
     col: &'a SeqCodedColumn,
     last_hap_ptr: &mut *const u16,
-    state_haps: &[HapIdx],
+    state_haps: &[RefHapId],
     state_patterns: &'a mut [u16],
 ) -> SeqPatternAlleles<'a> {
     let hap_to_seq = col.hap_to_seq();
@@ -493,7 +493,7 @@ fn refresh_seq_patterns<'a>(
 fn refresh_dict_patterns<'a>(
     col: &DictColRef<'_>,
     last_dict_ptr: &mut *const DictionaryColumn,
-    state_haps: &[HapIdx],
+    state_haps: &[RefHapId],
     state_patterns: &'a mut [u16],
     dict_pattern_alleles: &'a mut Vec<u8>,
 ) -> DictPatternAlleles<'a> {
@@ -705,7 +705,7 @@ fn transition_only_backward_update(
 #[inline]
 fn fill_state_patterns_seqcoded(
     hap_to_seq: &[u16],
-    state_haps: &[HapIdx],
+    state_haps: &[RefHapId],
     out: &mut [u16],
 ) {
     for (i, hap) in state_haps.iter().enumerate() {
@@ -716,7 +716,7 @@ fn fill_state_patterns_seqcoded(
 #[inline]
 fn fill_state_patterns_dict(
     col: &DictionaryColumn,
-    state_haps: &[HapIdx],
+    state_haps: &[RefHapId],
     out: &mut [u16],
 ) {
     for (i, hap) in state_haps.iter().enumerate() {
@@ -726,7 +726,7 @@ fn fill_state_patterns_dict(
 
 /// Monomorphized HMM core over a concrete genotype column type.
 fn run_impute_hmm_impl<Space, C: RefColumnLike>(
-    state_haps: &[GlobalId],
+    state_haps: &[RefHapId],
     ref_columns: &[C],
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
@@ -742,10 +742,6 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
-    let state_hap_idx: Vec<HapIdx> = state_haps
-        .iter()
-        .map(|h| HapIdx::new(h.as_u32()))
-        .collect();
     if active_states > 0 {
         // Li-Stephens transition for full panel:
         //   P(switch to h_j) = r / N
@@ -819,7 +815,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                 } else {
                     let ref_alleles = refresh_ref_alleles(
                         &ref_columns[m],
-                        &state_hap_idx,
+                        state_haps,
                         &mut ws.state_alleles[..active_states],
                         &mut ws.dict_pattern_alleles,
                     );
@@ -900,7 +896,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
             // Always refresh ref alleles for posterior calculation, even if emissions are uniform.
             let ref_alleles = refresh_ref_alleles(
                 &ref_columns[m_rev],
-                &state_hap_idx,
+                state_haps,
                 &mut ws.state_alleles[..active_states],
                 &mut ws.dict_pattern_alleles,
             );
@@ -1069,7 +1065,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
 }
 
 fn run_impute_hmm_seqcoded<Space>(
-    state_haps: &[GlobalId],
+    state_haps: &[RefHapId],
     ref_columns: &[&SeqCodedColumn],
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
@@ -1085,10 +1081,6 @@ fn run_impute_hmm_seqcoded<Space>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
-    let state_hap_idx: Vec<HapIdx> = state_haps
-        .iter()
-        .map(|h| HapIdx::new(h.as_u32()))
-        .collect();
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
@@ -1131,7 +1123,7 @@ fn run_impute_hmm_seqcoded<Space>(
                 let seq_patterns = refresh_seq_patterns(
                     col,
                     &mut last_hap_ptr,
-                    &state_hap_idx,
+                    state_haps,
                     &mut ws.state_patterns,
                 );
 
@@ -1223,7 +1215,7 @@ fn run_impute_hmm_seqcoded<Space>(
                 let seq_patterns = refresh_seq_patterns(
                     col,
                     &mut last_hap_ptr,
-                    &state_hap_idx,
+                    state_haps,
                     &mut ws.state_patterns,
                 );
 
@@ -1389,7 +1381,7 @@ fn run_impute_hmm_seqcoded<Space>(
 }
 
 fn run_impute_hmm_dict<Space>(
-    state_haps: &[GlobalId],
+    state_haps: &[RefHapId],
     ref_columns: &[DictColRef<'_>],
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
@@ -1405,10 +1397,6 @@ fn run_impute_hmm_dict<Space>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
-    let state_hap_idx: Vec<HapIdx> = state_haps
-        .iter()
-        .map(|h| HapIdx::new(h.as_u32()))
-        .collect();
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
@@ -1459,7 +1447,7 @@ fn run_impute_hmm_dict<Space>(
                     let dict_patterns = refresh_dict_patterns(
                         col,
                         &mut last_dict_ptr,
-                        &state_hap_idx,
+                        state_haps,
                         &mut ws.state_patterns,
                         &mut ws.dict_pattern_alleles,
                     );
@@ -1543,7 +1531,7 @@ fn run_impute_hmm_dict<Space>(
                 let dict_patterns = refresh_dict_patterns(
                     col,
                     &mut last_dict_ptr,
-                    &state_hap_idx,
+                    state_haps,
                     &mut ws.state_patterns,
                     &mut ws.dict_pattern_alleles,
                 );
@@ -1713,7 +1701,7 @@ fn run_impute_hmm_dict<Space>(
 ///
 /// Returns (posteriors, optional state posterior at prior marker, EM stats).
 pub fn run_impute_hmm<Space>(
-    state_haps: &[GlobalId],
+    state_haps: &[RefHapId],
     ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
@@ -1856,13 +1844,13 @@ pub fn run_impute_hmm<Space>(
     )
 }
 
-/// Convert dense state posteriors into sparse global priors (sorted by GlobalId).
+/// Convert dense state posteriors into sparse global priors (sorted by RefHapId).
 pub fn state_posteriors_to_priors(
-    state_haps: &[GlobalId],
+    state_haps: &[RefHapId],
     state_post: &[f32],
     threshold: f32,
-) -> Vec<(GlobalId, f32)> {
-    let mut out: Vec<(GlobalId, f32)> = state_haps
+) -> Vec<(RefHapId, f32)> {
+    let mut out: Vec<(RefHapId, f32)> = state_haps
         .iter()
         .zip(state_post.iter())
         .filter(|(_, p)| p.is_finite() && **p > threshold)

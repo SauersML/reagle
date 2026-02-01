@@ -37,7 +37,7 @@ use crate::model::pl_emission::{
     infer_n_alleles_from_pl_len,
 };
 use crate::model::reference_pbwt::{RankBeam, ReferencePbwt};
-use crate::model::types::GlobalId;
+use crate::model::types::RefHapId;
 use crate::model::impute_hmm::{
     ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
 };
@@ -188,7 +188,7 @@ fn estimate_state_budget(
 #[derive(Clone, Debug)]
 struct ImputationPlan {
     n_ref_haps: usize,
-    core_states: Vec<Vec<GlobalId>>,          // per target hap (derived)
+    core_states: Vec<Vec<RefHapId>>,          // per target hap (derived)
     window_intervals: Vec<Vec<HapIntervals>>, // per target hap (sparse)
     abyss_mask: Vec<Vec<bool>>,               // per target hap
     per_window_cap: usize,
@@ -199,7 +199,7 @@ struct ImputationPlan {
 
 #[derive(Clone, Debug)]
 struct HapIntervals {
-    hap: GlobalId,
+    hap: RefHapId,
     intervals: Vec<(u32, u32)>,
 }
 
@@ -2082,7 +2082,7 @@ fn build_imputation_plan(
                         if abyss[h] {
                             continue;
                         }
-                        let hap = GlobalId::new(h as u32);
+                        let hap = RefHapId::new(h as u32);
                         intervals.push(HapIntervals {
                             hap,
                             intervals: vec![(0, end)],
@@ -2108,7 +2108,7 @@ fn build_imputation_plan(
                     let mut intervals = Vec::new();
                     for (hap, spans) in allocation.intervals_by_hap.into_iter() {
                         intervals.push(HapIntervals {
-                            hap: GlobalId::new(hap as u32),
+                            hap: RefHapId::new(hap as u32),
                             intervals: spans,
                         });
                     }
@@ -3057,19 +3057,19 @@ impl crate::pipelines::ImputationPipeline {
             .unwrap_or(plan.per_window_cap)
             .max(1);
         let full_states = if plan.full_panel {
-            let mut full: Vec<GlobalId> = Vec::with_capacity(plan.n_ref_haps);
+            let mut full: Vec<RefHapId> = Vec::with_capacity(plan.n_ref_haps);
             for h in 0..plan.n_ref_haps {
-                full.push(GlobalId::new(h as u32));
+                full.push(RefHapId::new(h as u32));
             }
             Some(full)
         } else {
             None
         };
 
-        let mut state_haps_by_hap: Vec<Vec<GlobalId>> = Vec::with_capacity(n_target_samples * 2);
+        let mut state_haps_by_hap: Vec<Vec<RefHapId>> = Vec::with_capacity(n_target_samples * 2);
         if full_states.is_none() {
             for hap_idx in 0..(n_target_samples * 2) {
-                let mut state_haps: Vec<GlobalId> = Vec::new();
+                let mut state_haps: Vec<RefHapId> = Vec::new();
                 if hap_idx < plan.window_intervals.len() {
                     for hi in plan.window_intervals[hap_idx].iter() {
                         if hi.contains(window_idx) {
@@ -3095,7 +3095,7 @@ impl crate::pipelines::ImputationPipeline {
                         let abyss = &plan.abyss_mask[hap_idx];
                         for h in 0..plan.n_ref_haps {
                             if !abyss.get(h).copied().unwrap_or(true) {
-                                state_haps.push(GlobalId::new(h as u32));
+                                state_haps.push(RefHapId::new(h as u32));
                                 if state_haps.len() >= per_window_cap_local {
                                     break;
                                 }
@@ -3121,8 +3121,8 @@ impl crate::pipelines::ImputationPipeline {
                             out.push(None);
                             continue;
                         }
-                        let prev_states: Vec<GlobalId> =
-                            p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
+                        let prev_states: Vec<RefHapId> =
+                            p.ids().iter().map(|id| RefHapId::new(id.0)).collect();
                         let next_states = if let Some(full) = full_states.as_ref() {
                             full.as_slice()
                         } else {
@@ -3650,8 +3650,8 @@ impl crate::pipelines::ImputationPipeline {
                         let mapped = if let Some(mapper) = mapper {
                             mapper.map(p.probs()).into_vec()
                         } else {
-                            let prev_states: Vec<GlobalId> =
-                                p.ids().iter().map(|id| GlobalId::new(id.0)).collect();
+                            let prev_states: Vec<RefHapId> =
+                                p.ids().iter().map(|id| RefHapId::new(id.0)).collect();
                             let mapper = TransitionMatrix::build(&prev_states, state_haps);
                             mapper.map(p.probs()).into_vec()
                         };

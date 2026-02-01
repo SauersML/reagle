@@ -6,19 +6,34 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::marker::PhantomData;
 
-/// Global haplotype index (0..N_ref_haplotypes)
-///
-/// This identifies a specific haplotype in the reference panel across all windows.
-/// It remains stable throughout the entire chromosome and enables tracking
-/// probability flow through the correct physical DNA molecules.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct GlobalId(pub u32);
+/// Marker type: reference haplotype space (0..N_ref_haplotypes)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RefHapSpace;
 
-impl GlobalId {
+
+/// Marker type: combined haplotype space (target first, then reference)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CombinedHapSpace;
+
+/// Zero-cost haplotype ID tagged by space.
+#[repr(transparent)]
+#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct HapId<Space>(u32, PhantomData<Space>);
+
+impl<Space> Copy for HapId<Space> {}
+
+impl<Space> Clone for HapId<Space> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Space> HapId<Space> {
     #[inline]
     pub fn new(id: u32) -> Self {
-        Self(id)
+        Self(id, PhantomData)
     }
 
     #[inline]
@@ -32,33 +47,36 @@ impl GlobalId {
     }
 }
 
-impl fmt::Debug for GlobalId {
+impl<Space> fmt::Debug for HapId<Space> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GlobalId({})", self.0)
+        write!(f, "HapId({})", self.0)
     }
 }
 
-impl fmt::Display for GlobalId {
+impl<Space> fmt::Display for HapId<Space> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "G{}", self.0)
+        write!(f, "H{}", self.0)
     }
 }
 
-impl From<u32> for GlobalId {
+impl<Space> From<u32> for HapId<Space> {
     fn from(id: u32) -> Self {
-        Self(id)
+        Self::new(id)
     }
 }
 
-impl From<usize> for GlobalId {
+impl<Space> From<usize> for HapId<Space> {
     fn from(id: usize) -> Self {
-        Self(id as u32)
+        Self::new(id as u32)
     }
 }
+
+pub type RefHapId = HapId<RefHapSpace>;
+pub type CombinedHapId = HapId<CombinedHapSpace>;
 
 /// HMM state index (0..n_states)
 ///
-/// Distinct from GlobalId to avoid mixing reference hap IDs with local state indices.
+/// Distinct from haplotype IDs to avoid mixing reference hap IDs with local state indices.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StateId(pub u32);
 
@@ -124,10 +142,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_global_id_basic() {
-        let gid = GlobalId::new(42);
-        assert_eq!(gid.as_u32(), 42);
-        assert_eq!(gid.as_usize(), 42);
+    fn test_ref_hap_id_basic() {
+        let hid = RefHapId::new(42);
+        assert_eq!(hid.as_u32(), 42);
+        assert_eq!(hid.as_usize(), 42);
     }
 
 }
