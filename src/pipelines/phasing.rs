@@ -5135,10 +5135,6 @@ fn emit_prob_hard(ref_al: u8, targ_al: u8, conf: f32, p_no_err: f32, p_err: f32,
         if targ_al == INVALID_ALLELE {
             return 0.0;
         }
-        // Treat missing reference allele (255) as neutral (0.5) in hard mode.
-        if ref_al == 255 {
-            return 0.5;
-        }
         return if ref_al == targ_al { p_no_err } else { 0.0 };
     }
     emit_prob(ref_al, targ_al, conf, p_no_err, p_err)
@@ -5274,13 +5270,8 @@ fn emit_haploid_constrained(
     };
 
     // Emission: does ref_al match the required allele?
-    // Treat missing reference allele (255) as neutral (0.5).
-    let raw_emit = if ref_al == 255 {
-        0.5
-    } else {
-        let matches = (ref_al == required_allele) as u8 as f32;
-        matches * p_no_err + (1.0 - matches) * p_err
-    };
+    let matches = (ref_al == required_allele) as u8 as f32;
+    let raw_emit = matches * p_no_err + (1.0 - matches) * p_err;
 
     // Blend with uniform based on confidence
     conf * raw_emit + (1.0 - conf) * 0.5
@@ -8343,26 +8334,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_emit_haploid_constrained_missing_ref() {
-        // Missing reference (255) should be neutral (0.5), not mismatch (~0.001) or match (~0.999)
-        // because we don't want to penalize missing data, but we also don't want it to be sticky.
-        let p_no_err = 0.999;
-        let p_err = 0.001;
-        let conf = 1.0;
-
-        let val = emit_haploid_constrained(255, 0, 1, 0, conf, p_no_err, p_err);
-        assert!((val - 0.5).abs() < 1e-6, "Expected 0.5 for missing ref, got {}", val);
-    }
-
-    #[test]
-    fn test_emit_prob_hard_missing_ref() {
-        // Missing reference (255) in hard mode should be neutral (0.5).
-        let p_no_err = 0.999;
-        let p_err = 0.001;
-        let conf = 1.0;
-
-        let val = emit_prob_hard(255, 0, conf, p_no_err, p_err, true);
-        assert!((val - 0.5).abs() < 1e-6, "Expected 0.5 for missing ref in hard mode, got {}", val);
-    }
 }
