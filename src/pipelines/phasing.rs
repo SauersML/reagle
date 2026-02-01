@@ -6883,11 +6883,9 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     }
     let threshold = 0.2 * (informative as f32);
     if best_score < threshold || n_markers > 1000 {
-        eprintln!("[heuristic] REJECT best_score={:.1} threshold={:.1} markers={}", best_score, threshold, n_markers);
         return None;
     }
 
-    eprintln!("[heuristic] ACCEPT best_score={:.1} threshold={:.1} markers={}", best_score, threshold, n_markers);
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
@@ -7009,15 +7007,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
             if score_flip > score_direct {
                 std::mem::swap(&mut paths.path1, &mut paths.path2);
-                eprintln!(
-                    "[anchor init] flipped heuristic paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
-            } else {
-                eprintln!(
-                    "[anchor init] kept heuristic paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
             }
         }
     }
@@ -7072,10 +7061,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let mut owned = paths.clone();
                 std::mem::swap(&mut owned.path1, &mut owned.path2);
                 start_paths_owned = Some(owned);
-                eprintln!(
-                    "[anchor init] flipped start paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
             }
         }
     }
@@ -7362,13 +7347,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider_2,
         );
         buffers = buffers2;
-        if paths2.path1.len() != n_markers || paths2.path2.len() != n_markers {
-            eprintln!(
-                "[mosaic paths] secondary chain path lengths: path1={} path2={}",
-                paths2.path1.len(),
-                paths2.path2.len()
-            );
-        }
 
         for i in 0..het_positions.len() {
             swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
@@ -7417,32 +7395,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         p_max = p_max.max(p);
         p_sum += p;
     }
-    if !het_positions.is_empty() {
-        let denom = (het_positions.len().saturating_sub(obs_zero)).max(1) as f32;
-        let mean = p_sum / denom;
-        eprintln!(
-            "[swap stats] hets={} obs0={} p_min={:.3} p_mean={:.3} p_max={:.3} anchors={}",
-            het_positions.len(),
-            obs_zero,
-            p_min,
-            mean,
-            p_max,
-            chain_anchor_hap1.iter().filter(|&&a| a != 255).count()
-        );
-        if n_markers <= 60 {
-            let limit = het_positions.len().min(12);
-            for i in 0..limit {
-                let m = het_positions[i];
-                eprintln!(
-                    "[swap stats] m={} obs={} swap_ct={} p={:.3}",
-                    m,
-                    obs_counts[i],
-                    swap_counts[i],
-                    swap_probs[i]
-                );
-            }
-        }
-    }
+    // Debug logging removed
 
     // Return buffers to workspace for reuse
     workspace.fwd = buffers.fwd;
