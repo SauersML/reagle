@@ -7257,8 +7257,30 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         return None;
     }
 
-    let path1 = vec![best_pair.0 as u32; n_markers];
-    let path2 = vec![best_pair.1 as u32; n_markers];
+    // Canonicalize orientation: H1 should be "smaller" than H2 to ensure
+    // deterministic phasing regardless of state index permutation.
+    // Find first marker where they differ.
+    let mut swap_pair = false;
+    for m in 0..n_markers {
+        ref_provider.fill_ref_alleles(m, &mut ref_alleles);
+        let r1 = ref_alleles[best_pair.0];
+        let r2 = ref_alleles[best_pair.1];
+        if r1 != 255 && r2 != 255 && r1 != r2 {
+            if r1 > r2 {
+                swap_pair = true;
+            }
+            break;
+        }
+    }
+
+    let (s1, s2) = if swap_pair {
+        (best_pair.1, best_pair.0)
+    } else {
+        best_pair
+    };
+
+    let path1 = vec![s1 as u32; n_markers];
+    let path2 = vec![s2 as u32; n_markers];
 
     Some(MosaicPaths { path1, path2 })
 }
