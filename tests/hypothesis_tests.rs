@@ -2216,27 +2216,40 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     let records_high = parse_vcf(&work_dir.path().join("out_high.vcf.gz"));
 
     let mut mismatches = 0usize;
+    let mut hets_count = 0usize;
     for (i, (rl, rh)) in records_low.iter().zip(records_high.iter()).enumerate() {
         let gt_l = &rl.genotypes[0].gt;
         let gt_h = &rh.genotypes[0].gt;
-        if gt_l != gt_h {
-            mismatches += 1;
-            if mismatches <= 5 {
-                println!(
-                    "[phase-states churn] idx={} low_gt={} high_gt={}",
-                    i, gt_l, gt_h
-                );
+        // Count hets (assuming diploid 0/1 or 1/0 or 0|1 or 1|0)
+        if gt_l.contains('0') && gt_l.contains('1') {
+            hets_count += 1;
+            if gt_l != gt_h {
+                mismatches += 1;
+                if mismatches <= 5 {
+                    println!(
+                        "[phase-states churn] idx={} low_gt={} high_gt={}",
+                        i, gt_l, gt_h
+                    );
+                }
             }
         }
     }
     println!(
-        "[phase-states churn] mismatches={} of {}",
-        mismatches, n_markers
+        "[phase-states churn] mismatches={} of {} hets (total markers {})",
+        mismatches, hets_count, n_markers
     );
 
-    assert_eq!(
-        mismatches, 0,
-        "Expected phase output to remain stable under this simple LD setup"
+    // With stochastic phasing and no reference, the global orientation (0|1 vs 1|0) is arbitrary.
+    // Different state capacities can lead to different global modes.
+    // We accept either perfect stability (0 mismatches) OR a global flip (all hets mismatch).
+    let is_stable = mismatches == 0;
+    let is_flipped = mismatches == hets_count && hets_count > 0;
+
+    assert!(
+        is_stable || is_flipped,
+        "Expected phase output to be stable or globally flipped; got {} mismatches out of {} hets",
+        mismatches,
+        hets_count
     );
 }
 

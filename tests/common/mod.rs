@@ -18,6 +18,15 @@ use std::process::Command;
 const HGDP_1KG_CHR22_URL: &str = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf";
 const GSA_SITES_URL: &str = "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv";
 
+/// Check if bcftools is available
+pub fn has_bcftools() -> bool {
+    Command::new("bcftools")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Get the test data cache directory
 pub fn cache_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
