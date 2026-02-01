@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -78,8 +78,9 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_FORCE_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -3224,29 +3225,30 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 let hap2 = s * 2 + 1;
                 let mut anchor_scores = vec![0i32; n_ref_haps];
                 for &(start, end) in &window_blocks {
-                    let mut window_anchors: Vec<(usize, u8, u8)> = Vec::new();
+                    let mut window_anchors1: Vec<(usize, u8, u8)> = Vec::new();
                     if let Some(list) = anchors_by_hap.get(hap1) {
                         for &(m, a1, a2) in list {
                             if m >= start && m < end {
-                                window_anchors.push((m, a1, a2));
+                                window_anchors1.push((m, a1, a2));
                             }
                         }
                     }
+                    let mut window_anchors2: Vec<(usize, u8, u8)> = Vec::new();
                     if let Some(list) = anchors_by_hap.get(hap2) {
                         for &(m, a1, a2) in list {
                             if m >= start && m < end {
-                                window_anchors.push((m, a1, a2));
+                                window_anchors2.push((m, a1, a2));
                             }
                         }
                     }
-                    if window_anchors.is_empty() {
+                    if window_anchors1.is_empty() && window_anchors2.is_empty() {
                         continue;
                     }
                     anchor_scores.fill(0);
                     for h in 0..n_ref_haps {
                         let hap_idx = HapIdx::new(h as u32);
-                        let mut score = 0i32;
-                        for (m, a1, _) in &window_anchors {
+                        let mut score1 = 0i32;
+                        for (m, a1, _) in &window_anchors1 {
                             let ref_col_idx = ref_col_for_marker[*m];
                             if ref_col_idx == usize::MAX {
                                 continue;
@@ -3259,12 +3261,31 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 continue;
                             }
                             if ref_al == *a1 {
-                                score += 1;
+                                score1 += 1;
                             } else {
-                                score -= 1;
+                                score1 -= 1;
                             }
                         }
-                        anchor_scores[h] = score;
+                        let mut score2 = 0i32;
+                        for (m, a1, _) in &window_anchors2 {
+                            let ref_col_idx = ref_col_for_marker[*m];
+                            if ref_col_idx == usize::MAX {
+                                continue;
+                            }
+                            let ref_al = ref_columns
+                                .get(ref_col_idx)
+                                .map(|c| c.get(hap_idx))
+                                .unwrap_or(255);
+                            if ref_al == 255 {
+                                continue;
+                            }
+                            if ref_al == *a1 {
+                                score2 += 1;
+                            } else {
+                                score2 -= 1;
+                            }
+                        }
+                        anchor_scores[h] = score1.max(score2);
                     }
                     let mut idxs: Vec<usize> = (0..n_ref_haps).collect();
                     idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
@@ -6737,6 +6758,98 @@ fn sample_dynamic_mcmc(
                 path2: Vec::new(),
             },
         );
+    }
+
+    // Inline heuristic: if we don't have initial paths, try to find a consistent pair
+    // from the initial neighbors. This helps prevent symmetric switching.
+    // Only worth doing if the window is small enough to check efficiently.
+    if initial_paths.is_none() && n_markers <= 500 && initial_neighbors.len() >= 2 {
+        let mut best_score = -1.0f32;
+        let mut best_pair = None;
+        let mut informative_markers = 0usize;
+
+        // Check compatibility for a pair of reference haplotypes
+        for i in 0..initial_neighbors.len() {
+            let h1_idx = initial_neighbors[i];
+            for j in 0..i {
+                let h2_idx = initial_neighbors[j];
+                let mut score = 0.0f32;
+                let mut markers = 0usize;
+
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 || a2 == 255 {
+                        continue;
+                    }
+                    // Only count markers where we have genotype info
+                    markers += 1;
+
+                    let ref1 = phase_ibs.allele(m, h1_idx);
+                    let ref2 = phase_ibs.allele(m, h2_idx);
+
+                    // Check if this reference pair can explain the genotype
+                    if a1 == a2 {
+                        // Homozygous: both refs must match or contain the allele
+                        // (Allow missing ref to match)
+                        let match1 = ref1 == a1 || ref1 == 255;
+                        let match2 = ref2 == a1 || ref2 == 255;
+                        if match1 && match2 {
+                            score += 1.0;
+                        } else {
+                            score -= 1.0;
+                        }
+                    } else {
+                        // Heterozygous: one matches a1, one matches a2
+                        let case1 = (ref1 == a1 || ref1 == 255) && (ref2 == a2 || ref2 == 255);
+                        let case2 = (ref1 == a2 || ref1 == 255) && (ref2 == a1 || ref2 == 255);
+                        if case1 || case2 {
+                            score += 1.0;
+                        } else {
+                            score -= 1.0;
+                        }
+                    }
+                }
+
+                if markers > 0 && score > best_score {
+                    best_score = score;
+                    best_pair = Some((h1_idx, h2_idx));
+                    informative_markers = markers;
+                }
+            }
+        }
+
+        // Apply if we found a good match (> 90% of informative markers)
+        if let Some((h1_idx, h2_idx)) = best_pair {
+            if best_score > 0.9 * informative_markers as f32 {
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 || a2 == 255 {
+                        continue;
+                    }
+                    if a1 == a2 {
+                        // Already set correctly for homs
+                        continue;
+                    }
+
+                    let ref1 = phase_ibs.allele(m, h1_idx);
+                    let ref2 = phase_ibs.allele(m, h2_idx);
+
+                    // Determine orientation based on best pair
+                    let matches_orient1 = (ref1 == a1 || ref1 == 255) && (ref2 == a2 || ref2 == 255);
+                    let matches_orient2 = (ref1 == a2 || ref1 == 255) && (ref2 == a1 || ref2 == 255);
+
+                    if matches_orient1 && !matches_orient2 {
+                        h1_alleles[m] = a1;
+                        h2_alleles[m] = a2;
+                    } else if matches_orient2 && !matches_orient1 {
+                        h1_alleles[m] = a2;
+                        h2_alleles[m] = a1;
+                    }
+                }
+            }
+        }
     }
 
     // Separate paths for H1 and H2 to avoid cross-talk in Gibbs sampling
