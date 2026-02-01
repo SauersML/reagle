@@ -94,6 +94,43 @@ pub struct ImputeWorkspace {
     active_markers: usize,
 }
 
+struct RefAlleles<'a> {
+    slice: &'a [u8],
+}
+
+impl<'a> RefAlleles<'a> {
+    #[inline]
+    fn get(&self, idx: usize) -> u8 {
+        self.slice[idx]
+    }
+}
+
+struct SeqPatternAlleles<'a> {
+    seq_alleles: &'a [u8],
+    state_patterns: &'a [u16],
+}
+
+impl<'a> SeqPatternAlleles<'a> {
+    #[inline]
+    fn allele_for_state(&self, state_idx: usize) -> u8 {
+        let pid = self.state_patterns[state_idx] as usize;
+        *self.seq_alleles.get(pid).unwrap_or(&255)
+    }
+}
+
+struct DictPatternAlleles<'a> {
+    pattern_alleles: &'a [u8],
+    state_patterns: &'a [u16],
+}
+
+impl<'a> DictPatternAlleles<'a> {
+    #[inline]
+    fn allele_for_state(&self, state_idx: usize) -> u8 {
+        let pid = self.state_patterns[state_idx] as usize;
+        *self.pattern_alleles.get(pid).unwrap_or(&255)
+    }
+}
+
 /// Lazily computed reference allele frequencies per marker.
 pub struct RefAlleleFreqs<'a, Space = crate::data::marker::AnyMarkerSpace> {
     ref_columns: &'a [GenotypeColumn],
@@ -422,8 +459,65 @@ impl RefColumnLike for GenotypeColumn {
 }
 
 #[inline]
+fn refresh_ref_alleles<'a, C: RefColumnLike + ?Sized>(
+    col: &C,
+    state_haps: &[HapIdx],
+    state_alleles: &'a mut [u8],
+    dict_pattern_alleles: &mut Vec<u8>,
+) -> RefAlleles<'a> {
+    col.fill_ref_alleles(state_haps, state_alleles, dict_pattern_alleles);
+    RefAlleles { slice: state_alleles }
+}
+
+#[inline]
+fn refresh_seq_patterns<'a>(
+    col: &'a SeqCodedColumn,
+    last_hap_ptr: &mut *const u16,
+    state_haps: &[HapIdx],
+    state_patterns: &'a mut [u16],
+) -> SeqPatternAlleles<'a> {
+    let hap_to_seq = col.hap_to_seq();
+    let hap_ptr = hap_to_seq.as_ptr();
+    if hap_ptr != *last_hap_ptr {
+        fill_state_patterns_seqcoded(hap_to_seq, state_haps, state_patterns);
+        *last_hap_ptr = hap_ptr;
+    }
+    let seq_alleles = col.seq_alleles();
+    SeqPatternAlleles {
+        seq_alleles,
+        state_patterns,
+    }
+}
+
+#[inline]
+fn refresh_dict_patterns<'a>(
+    col: &DictColRef<'_>,
+    last_dict_ptr: &mut *const DictionaryColumn,
+    state_haps: &[HapIdx],
+    state_patterns: &'a mut [u16],
+    dict_pattern_alleles: &'a mut Vec<u8>,
+) -> DictPatternAlleles<'a> {
+    let dict_ptr = col.col as *const DictionaryColumn;
+    if dict_ptr != *last_dict_ptr {
+        fill_state_patterns_dict(col.col, state_haps, state_patterns);
+        *last_dict_ptr = dict_ptr;
+    }
+    let n_patterns = col.col.n_patterns();
+    if dict_pattern_alleles.len() < n_patterns {
+        dict_pattern_alleles.resize(n_patterns, 0);
+    }
+    for pattern_idx in 0..n_patterns {
+        dict_pattern_alleles[pattern_idx] = col.col.pattern_allele(col.offset, pattern_idx);
+    }
+    DictPatternAlleles {
+        pattern_alleles: &dict_pattern_alleles[..n_patterns],
+        state_patterns,
+    }
+}
+
+#[inline]
 fn fill_emissions(
-    ref_alleles: &[u8],
+    ref_alleles: &RefAlleles<'_>,
     target_probs: &[f32],
     error_rate: f32,
     emission_by_allele: &mut Vec<f32>,
@@ -451,10 +545,10 @@ fn fill_emissions(
     }
 
     let prefetch_stride = 64usize;
-    for (i, &ref_allele) in ref_alleles.iter().enumerate() {
-        if i + prefetch_stride < ref_alleles.len() {
+    for (i, &ref_allele) in ref_alleles.slice.iter().enumerate() {
+        if i + prefetch_stride < ref_alleles.slice.len() {
             unsafe {
-                prefetch_read(ref_alleles.as_ptr().add(i + prefetch_stride));
+                prefetch_read(ref_alleles.slice.as_ptr().add(i + prefetch_stride));
             }
         }
         if ref_allele == 255 {
@@ -715,14 +809,6 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                 let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
                 let uniform = target_probs.is_uniform_marker(m);
 
-                let ref_slice = &mut ws.state_alleles[..active_states];
-                if !(pass == 0 && uniform) {
-                    ref_columns[m].fill_ref_alleles(
-                        &state_hap_idx,
-                        ref_slice,
-                        &mut ws.dict_pattern_alleles,
-                    );
-                }
                 if uniform {
                     fwd_sum = transition_only_forward_update(
                         &mut ws.fwd[..active_states],
@@ -731,8 +817,14 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                         total_ref_haps.max(1),
                     );
                 } else {
+                    let ref_alleles = refresh_ref_alleles(
+                        &ref_columns[m],
+                        &state_hap_idx,
+                        &mut ws.state_alleles[..active_states],
+                        &mut ws.dict_pattern_alleles,
+                    );
                     fill_emissions(
-                        ref_slice,
+                        &ref_alleles,
                         probs,
                         current_error,
                         &mut ws.emission_by_allele,
@@ -804,12 +896,12 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                 let uniform = target_probs.is_uniform_marker(m_rev);
 
             let start = m_rev * active_states;
-            let ref_slice = &mut ws.state_alleles[..active_states];
             let fwd_slice = &ws.fwd_history[start..start + active_states];
             // Always refresh ref alleles for posterior calculation, even if emissions are uniform.
-            ref_columns[m_rev].fill_ref_alleles(
+            let ref_alleles = refresh_ref_alleles(
+                &ref_columns[m_rev],
                 &state_hap_idx,
-                ref_slice,
+                &mut ws.state_alleles[..active_states],
                 &mut ws.dict_pattern_alleles,
             );
 
@@ -828,7 +920,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                     ws.allele_probs.resize(n_alleles, 0.0f32);
                     let mut total = 0.0f32;
                     for i in 0..active_states {
-                        let ref_allele = ref_slice[i];
+                        let ref_allele = ref_alleles.get(i);
                         if ref_allele == 255 {
                             continue;
                         }
@@ -909,7 +1001,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                     );
                 } else {
                     fill_emissions(
-                        ref_slice,
+                        &ref_alleles,
                         probs,
                         current_error,
                         &mut ws.emission_by_allele,
@@ -921,7 +1013,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                         let mut mismatch_expect = 0.0f64;
                         for i in 0..active_states {
                             let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                            let ref_allele = ref_slice[i];
+                            let ref_allele = ref_alleles.get(i);
                             if ref_allele == 255 {
                                 continue;
                             }
@@ -1036,17 +1128,12 @@ fn run_impute_hmm_seqcoded<Space>(
                 let uniform = target_probs.is_uniform_marker(m);
 
                 let col = ref_columns[m];
-                let hap_to_seq = col.hap_to_seq();
-                let hap_ptr = hap_to_seq.as_ptr();
-                if hap_ptr != last_hap_ptr {
-                    fill_state_patterns_seqcoded(
-                        hap_to_seq,
-                        &state_hap_idx,
-                        &mut ws.state_patterns,
-                    );
-                    last_hap_ptr = hap_ptr;
-                }
-                let seq_alleles = col.seq_alleles();
+                let seq_patterns = refresh_seq_patterns(
+                    col,
+                    &mut last_hap_ptr,
+                    &state_hap_idx,
+                    &mut ws.state_patterns,
+                );
 
                 if uniform {
                     fwd_sum = transition_only_forward_update(
@@ -1057,14 +1144,14 @@ fn run_impute_hmm_seqcoded<Space>(
                     );
                 } else {
                     let _ = fill_pattern_emissions(
-                        seq_alleles,
+                        seq_patterns.seq_alleles,
                         probs,
                         current_error,
                         &mut ws.emission_by_allele,
                         &mut ws.pattern_emissions,
                     );
                     for i in 0..active_states {
-                        let pid = ws.state_patterns[i] as usize;
+                        let pid = seq_patterns.state_patterns[i] as usize;
                         ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
                     }
 
@@ -1133,17 +1220,12 @@ fn run_impute_hmm_seqcoded<Space>(
                 let uniform = target_probs.is_uniform_marker(m_rev);
 
                 let col = ref_columns[m_rev];
-                let hap_to_seq = col.hap_to_seq();
-                let hap_ptr = hap_to_seq.as_ptr();
-                if hap_ptr != last_hap_ptr {
-                    fill_state_patterns_seqcoded(
-                        hap_to_seq,
-                        &state_hap_idx,
-                        &mut ws.state_patterns,
-                    );
-                    last_hap_ptr = hap_ptr;
-                }
-                let seq_alleles = col.seq_alleles();
+                let seq_patterns = refresh_seq_patterns(
+                    col,
+                    &mut last_hap_ptr,
+                    &state_hap_idx,
+                    &mut ws.state_patterns,
+                );
 
                 let start = m_rev * active_states;
                 let fwd_slice = &ws.fwd_history[start..start + active_states];
@@ -1161,8 +1243,7 @@ fn run_impute_hmm_seqcoded<Space>(
                     ws.allele_probs.resize(n_alleles, 0.0f32);
                     let mut total = 0.0f32;
                     for i in 0..active_states {
-                        let pid = ws.state_patterns[i] as usize;
-                        let ref_allele = *seq_alleles.get(pid).unwrap_or(&255);
+                        let ref_allele = seq_patterns.allele_for_state(i);
                         if ref_allele == 255 {
                             continue;
                         }
@@ -1238,7 +1319,7 @@ fn run_impute_hmm_seqcoded<Space>(
                     );
                 } else {
                     let mismatch_prob = fill_pattern_emissions(
-                        seq_alleles,
+                        seq_patterns.seq_alleles,
                         probs,
                         current_error,
                         &mut ws.emission_by_allele,
@@ -1249,8 +1330,7 @@ fn run_impute_hmm_seqcoded<Space>(
                         let mut mismatch_expect = 0.0f64;
                         for i in 0..active_states {
                             let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                            let pid = ws.state_patterns[i] as usize;
-                            let ref_allele = *seq_alleles.get(pid).unwrap_or(&255);
+                            let ref_allele = seq_patterns.allele_for_state(i);
                             if ref_allele == 255 {
                                 continue;
                             }
@@ -1274,7 +1354,7 @@ fn run_impute_hmm_seqcoded<Space>(
                     }
                     let mut emit_beta_sum = 0.0f32;
                     for i in 0..active_states {
-                        let pid = ws.state_patterns[i] as usize;
+                        let pid = seq_patterns.state_patterns[i] as usize;
                         let emit = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
                         ws.emissions[i] = emit;
                         emit_beta_sum += emit * ws.bwd[i];
@@ -1367,22 +1447,6 @@ fn run_impute_hmm_dict<Space>(
                 let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
                 let uniform = target_probs.is_uniform_marker(m);
 
-                let col = &ref_columns[m];
-                let dict_ptr = col.col as *const DictionaryColumn;
-                if dict_ptr != last_dict_ptr {
-                    fill_state_patterns_dict(col.col, &state_hap_idx, &mut ws.state_patterns);
-                    last_dict_ptr = dict_ptr;
-                }
-
-                let n_patterns = col.col.n_patterns();
-                if ws.dict_pattern_alleles.len() < n_patterns {
-                    ws.dict_pattern_alleles.resize(n_patterns, 0);
-                }
-                for pattern_idx in 0..n_patterns {
-                    ws.dict_pattern_alleles[pattern_idx] =
-                        col.col.pattern_allele(col.offset, pattern_idx);
-                }
-
                 if uniform {
                     fwd_sum = transition_only_forward_update(
                         &mut ws.fwd[..active_states],
@@ -1391,15 +1455,23 @@ fn run_impute_hmm_dict<Space>(
                         total_ref_haps.max(1),
                     );
                 } else {
+                    let col = &ref_columns[m];
+                    let dict_patterns = refresh_dict_patterns(
+                        col,
+                        &mut last_dict_ptr,
+                        &state_hap_idx,
+                        &mut ws.state_patterns,
+                        &mut ws.dict_pattern_alleles,
+                    );
                     let _ = fill_pattern_emissions(
-                        &ws.dict_pattern_alleles[..n_patterns],
+                        dict_patterns.pattern_alleles,
                         probs,
                         current_error,
                         &mut ws.emission_by_allele,
                         &mut ws.pattern_emissions,
                     );
                     for i in 0..active_states {
-                        let pid = ws.state_patterns[i] as usize;
+                        let pid = dict_patterns.state_patterns[i] as usize;
                         ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
                     }
 
@@ -1468,19 +1540,13 @@ fn run_impute_hmm_dict<Space>(
                 let uniform = target_probs.is_uniform_marker(m_rev);
 
                 let col = &ref_columns[m_rev];
-                let dict_ptr = col.col as *const DictionaryColumn;
-                if dict_ptr != last_dict_ptr {
-                    fill_state_patterns_dict(col.col, &state_hap_idx, &mut ws.state_patterns);
-                    last_dict_ptr = dict_ptr;
-                }
-                let n_patterns = col.col.n_patterns();
-                if ws.dict_pattern_alleles.len() < n_patterns {
-                    ws.dict_pattern_alleles.resize(n_patterns, 0);
-                }
-                for pattern_idx in 0..n_patterns {
-                    ws.dict_pattern_alleles[pattern_idx] =
-                        col.col.pattern_allele(col.offset, pattern_idx);
-                }
+                let dict_patterns = refresh_dict_patterns(
+                    col,
+                    &mut last_dict_ptr,
+                    &state_hap_idx,
+                    &mut ws.state_patterns,
+                    &mut ws.dict_pattern_alleles,
+                );
 
                 let start = m_rev * active_states;
                 let fwd_slice = &ws.fwd_history[start..start + active_states];
@@ -1498,9 +1564,7 @@ fn run_impute_hmm_dict<Space>(
                         ws.allele_probs.resize(n_alleles, 0.0f32);
                         let mut total = 0.0f32;
                         for i in 0..active_states {
-                            let pid = ws.state_patterns[i] as usize;
-                            let ref_allele =
-                                *ws.dict_pattern_alleles.get(pid).unwrap_or(&255);
+                            let ref_allele = dict_patterns.allele_for_state(i);
                             if ref_allele == 255 {
                                 continue;
                             }
@@ -1576,7 +1640,7 @@ fn run_impute_hmm_dict<Space>(
                     );
                 } else {
                     let mismatch_prob = fill_pattern_emissions(
-                        &ws.dict_pattern_alleles[..n_patterns],
+                        dict_patterns.pattern_alleles,
                         probs,
                         current_error,
                         &mut ws.emission_by_allele,
@@ -1587,9 +1651,7 @@ fn run_impute_hmm_dict<Space>(
                         let mut mismatch_expect = 0.0f64;
                         for i in 0..active_states {
                             let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                            let pid = ws.state_patterns[i] as usize;
-                            let ref_allele =
-                                *ws.dict_pattern_alleles.get(pid).unwrap_or(&255);
+                            let ref_allele = dict_patterns.allele_for_state(i);
                             if ref_allele == 255 {
                                 continue;
                             }
@@ -1613,7 +1675,7 @@ fn run_impute_hmm_dict<Space>(
                     }
                     let mut emit_beta_sum = 0.0f32;
                     for i in 0..active_states {
-                        let pid = ws.state_patterns[i] as usize;
+                        let pid = dict_patterns.state_patterns[i] as usize;
                         let emit = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
                         ws.emissions[i] = emit;
                         emit_beta_sum += emit * ws.bwd[i];
