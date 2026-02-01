@@ -80,7 +80,7 @@ impl ModelParams {
 
         Self {
             p_mismatch,
-            recomb_intensity,
+            recomb_intensity: recomb_intensity.min(Self::MAX_RECOMB_INTENSITY),
             n_states: Self::DEFAULT_PHASE_STATES.min(n_haps.saturating_sub(2)),
             burnin: Self::DEFAULT_BURNIN,
             iterations: Self::DEFAULT_ITERATIONS,
