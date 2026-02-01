@@ -3451,7 +3451,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
 
                     for (m, p_orient) in het_phase_values {
-                        sp.set_phase_confidence(m, p_orient);
+                        let conf = if p_orient > 0.5 {
+                            p_orient
+                        } else {
+                            1.0 - p_orient
+                        };
+                        sp.set_phase_confidence(m, conf);
                     }
 
                     let lr_threshold = self.params.lr_threshold;
@@ -4027,7 +4032,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             for (hi_freq_idx, p_orient) in het_phase_values {
                 let m = hi_freq_to_orig[hi_freq_idx];
-                sp.set_phase_confidence(m, p_orient);
+                let conf = if p_orient > 0.5 {
+                    p_orient
+                } else {
+                    1.0 - p_orient
+                };
+                sp.set_phase_confidence(m, conf);
             }
 
             if let Some(paths) = new_paths {
@@ -7340,7 +7350,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
 
-    if !has_anchor {
+    // Only run the secondary chain if we don't have anchors AND we didn't have a confident start path.
+    // If we have a start path (from heuristic or previous iteration), running the flipped chain
+    // destroys phase confidence in symmetric scenarios by averaging (A,B) and (B,A) to 0.5.
+    if !has_anchor && start_paths.is_none() {
         let flipped_paths =
             if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
                 Some(MosaicPaths {
