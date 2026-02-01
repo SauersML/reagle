@@ -2042,7 +2042,14 @@ fn test_phasing_confidence() {
         })
         .collect();
 
-    let target_gt = GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
+    let mut target_gt = GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
+    let mut phase_mask = vec![vec![0u8; n_target_samples]; n_markers];
+    for m in 0..n_markers {
+        for s in 0..n_target_samples {
+            phase_mask[m][s] = 1;
+        }
+    }
+    target_gt = target_gt.with_phase_mask(Some(phase_mask));
 
     // Build reference haplotype matrix with clear patterns
     let mut ref_markers = Markers::<reagle::data::AnyMarkerSpace>::new();
