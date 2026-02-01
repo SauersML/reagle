@@ -142,7 +142,7 @@ fn test_ser_switching_all0_all1_reference() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 100.0;
     // Set low error rate to force strong preference for matches
     config.err = Some(0.0001);
 
@@ -300,7 +300,7 @@ fn test_ser_switching_all0_all1_reference_dense_map() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.err = Some(0.0001);
 
     let mut pipeline = PhasingPipeline::new(config, None);
@@ -552,7 +552,7 @@ fn test_sparse_phased_anchors_dense_map_still_switches() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.err = Some(0.0001);
 
     let mut pipeline = PhasingPipeline::new(config, None);
@@ -695,7 +695,7 @@ fn test_sparse_phased_anchors_do_not_cause_switching() {
     config.burnin = 0;
     config.iterations = 2;
     config.nthreads = Some(1);
-    config.ne = 10000.0;
+    config.ne = 100.0;
     config.err = Some(0.0001);
 
     let mut pipeline = PhasingPipeline::new(config, None);

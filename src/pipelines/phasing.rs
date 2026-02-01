@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -78,8 +78,8 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_FORCE_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 128;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
@@ -2878,6 +2878,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     dense_merge_buffer[b]
                         .partial_cmp(&dense_merge_buffer[a])
                         .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            let ha = a.wrapping_mul(0x9E3779B9);
+                            let hb = b.wrapping_mul(0x9E3779B9);
+                            ha.cmp(&hb)
+                        })
                 });
                 let cap = per_window_cap
                     .saturating_mul(PBWT_PER_WINDOW_MULT)
@@ -2953,7 +2958,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         anchor_scores[h] = score;
                     }
                     let mut idxs: Vec<usize> = (0..n_ref_haps).collect();
-                    idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
+                    idxs.sort_by(|&a, &b| {
+                        anchor_scores[b].cmp(&anchor_scores[a]).then_with(|| {
+                            let ha = a.wrapping_mul(0x9E3779B9);
+                            let hb = b.wrapping_mul(0x9E3779B9);
+                            ha.cmp(&hb)
+                        })
+                    });
                     let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
                     for &h in idxs.iter().take(take) {
                         if !candidate_haps.contains(&h) {
@@ -3003,6 +3014,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     dense_merge_buffer[b]
                         .partial_cmp(&dense_merge_buffer[a])
                         .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            let ha = a.wrapping_mul(0x9E3779B9);
+                            let hb = b.wrapping_mul(0x9E3779B9);
+                            ha.cmp(&hb)
+                        })
                 });
                 let take = PBWT_FORCE_TOP_HAPS.min(touched_indices.len());
                 for &h in touched_indices.iter().take(take) {
@@ -3702,7 +3718,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         scores[h] = score;
                                     }
                                     let mut idxs: Vec<usize> = (0..n_ref_haps).collect();
-                                    idxs.sort_by(|&a, &b| scores[b].cmp(&scores[a]));
+                                    idxs.sort_by(|&a, &b| {
+                                        scores[b].cmp(&scores[a]).then_with(|| {
+                                            let ha = a.wrapping_mul(0x9E3779B9);
+                                            let hb = b.wrapping_mul(0x9E3779B9);
+                                            ha.cmp(&hb)
+                                        })
+                                    });
                                     let take = PBWT_FORCE_TOP_HAPS.min(idxs.len());
                                     if take > 0 {
                                         let mut existing =
