@@ -2441,9 +2441,15 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        self.params.recomb_intensity = self
+            .params
+            .recomb_intensity
+            .min(crate::model::parameters::ModelParams::MAX_RECOMB_INTENSITY);
         if let Some(recomb_intensity) = phased_recomb_intensity {
             if recomb_intensity.is_finite() && recomb_intensity > 0.0 {
-                self.params.recomb_intensity = recomb_intensity;
+                self.params.recomb_intensity = recomb_intensity.min(
+                    crate::model::parameters::ModelParams::MAX_RECOMB_INTENSITY,
+                );
             }
         }
         // Do not inherit phasing mismatch estimates for imputation. Imputation

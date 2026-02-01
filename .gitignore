@@ -8,6 +8,7 @@ target
 !README*.md
 jules.patch
 build.log
+*.log
 **/build
 Rust/.gitignore
 **/Cargo.lock

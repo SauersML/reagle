@@ -262,6 +262,29 @@ def prepare_truth(source, output_vcf, panel_path):
     subprocess.check_call(cmd, shell=True)
     subprocess.check_call(["tabix", "-p", "vcf", output_vcf])
 
+    def _truth_header_ok(vcf_path):
+        try:
+            header = subprocess.check_output(
+                ["bcftools", "view", "-h", vcf_path],
+                text=True
+            )
+        except Exception:
+            return False
+        has_gt = "##FORMAT=<ID=GT" in header
+        has_contig = "##contig=<ID=" in header
+        return has_gt and has_contig
+
+    if not _truth_header_ok(output_vcf):
+        print("Truth header missing FORMAT/contig lines; rebuilding header...")
+        header_txt = "truth_header.txt"
+        subprocess.check_call(f"bcftools view -h {truth_hg38_vcf} > {header_txt}", shell=True)
+        fixed = output_vcf + ".tmp"
+        subprocess.check_call(["bcftools", "reheader", "-h", header_txt, output_vcf, "-o", fixed])
+        os.replace(fixed, output_vcf)
+        subprocess.check_call(["tabix", "-f", "-p", "vcf", output_vcf])
+        if os.path.exists(header_txt):
+            os.remove(header_txt)
+
     for f in [source_vcf, truth_hg38_vcf, truth_hg38_vcf + ".csi", "chr_map.txt"]:
         if os.path.exists(f):
             os.remove(f)

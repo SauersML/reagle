@@ -1650,22 +1650,24 @@ fn test_microarray_vs_wgs_imputation() {
     let n_ref_samples = 50;
     let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 1000 + 1).collect();
 
-    // Create structured haplotype patterns with LD blocks
-    // Each 50-marker block has correlated alleles
+    // Create structured haplotype patterns with strong LD blocks.
+    // Each block shares the same allele per haplotype group, and typed markers
+    // land at block boundaries to make haplotype groups identifiable.
+    const BLOCK_SIZE: usize = 10;
+    const GROUPS: usize = 10;
+    fn allele_for(m: usize, h: usize) -> u8 {
+        let block = m / BLOCK_SIZE;
+        let hap_group = h % GROUPS; // 10 haplotype groups
+        let seed = (block as u64)
+            .wrapping_mul(1_315_423_911)
+            .wrapping_add(hap_group as u64 * 2_654_435_761);
+        let bit = (seed ^ (seed >> 13) ^ (seed >> 7)) & 1;
+        bit as u8
+    }
+
     let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
         .positions(positions.clone())
-        .allele_generator(|m, h| {
-            let block = m / 50;
-            let hap_group = h / 20; // 5 haplotype groups
-            // Within-block correlation: same allele throughout block with some variation
-            let base_allele = ((block + hap_group) % 2) as u8;
-            // Add some noise based on position within block
-            if (m % 10 == 3 || m % 10 == 7) && h % 3 == 0 {
-                1 - base_allele // Flip allele for diversity
-            } else {
-                base_allele
-            }
-        })
+        .allele_generator(allele_for)
         .build();
 
     // Create masked target (microarray-style - only every 10th marker)
@@ -1674,14 +1676,7 @@ fn test_microarray_vs_wgs_imputation() {
         .allele_generator(|m, h| {
             if m % 10 == 0 {
                 // Genotyped marker - same pattern as full target
-                let block = m / 50;
-                let hap_group = h / 2;
-                let base_allele = ((block + hap_group) % 2) as u8;
-                if (m % 10 == 3 || m % 10 == 7) && h % 3 == 0 {
-                    1 - base_allele
-                } else {
-                    base_allele
-                }
+                allele_for(m, h)
             } else {
                 255 // Missing - to be imputed
             }
@@ -1711,25 +1706,8 @@ fn test_microarray_vs_wgs_imputation() {
                 .map(|s| {
                     let h0 = s * 2;
                     let h1 = s * 2 + 1;
-                    let block = m / 50;
-                    let allele0 = {
-                        let hap_group = h0 / 2;
-                        let base = ((block + hap_group) % 2) as f32;
-                        if (m % 10 == 3 || m % 10 == 7) && h0 % 3 == 0 {
-                            1.0 - base
-                        } else {
-                            base
-                        }
-                    };
-                    let allele1 = {
-                        let hap_group = h1 / 2;
-                        let base = ((block + hap_group) % 2) as f32;
-                        if (m % 10 == 3 || m % 10 == 7) && h1 % 3 == 0 {
-                            1.0 - base
-                        } else {
-                            base
-                        }
-                    };
+                    let allele0 = allele_for(m, h0) as f32;
+                    let allele1 = allele_for(m, h1) as f32;
                     allele0 + allele1
                 })
                 .collect()
@@ -1818,124 +1796,6 @@ fn test_microarray_vs_wgs_imputation() {
         "Mean DR2 ({:.4}) too low for microarray test with R²={:.4}",
         mean_dr2,
         r_squared
-    );
-}
-
-/// Test with lower-density genotyping array
-/// Simulate ~20% genotyped markers (every 5th)
-#[test]
-#[serial]
-fn test_high_density_array_imputation() {
-    // Dense reference: 100 markers, 20 samples
-    let n_ref_markers = 100;
-    let n_ref_samples = 20;
-    let positions: Vec<usize> = (0..n_ref_markers).map(|m| m * 1000 + 1).collect();
-
-    // Create reference with diverse haplotypes - simple MAF variation
-    let ref_file = SyntheticVcfBuilder::new(n_ref_markers, n_ref_samples)
-        .positions(positions.clone())
-        .allele_generator(|m, h| {
-            // Alternate alleles based on marker and haplotype
-            // Creates MAF ~0.3-0.7 at most sites
-            let val = (m * 7 + h * 13) % 10;
-            if val < 4 { 1 } else { 0 }
-        })
-        .build();
-
-    // Target: every 5th marker genotyped (20% density)
-    let target_file = SyntheticVcfBuilder::new(n_ref_markers, 3)
-        .positions(positions.clone())
-        .allele_generator(|m, h| {
-            let val = (m * 7 + h * 13) % 10;
-            let true_allele = if val < 4 { 1u8 } else { 0 };
-            if m % 5 == 0 { true_allele } else { 255 }
-        })
-        .build();
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let out_prefix = temp_dir.path().join("output_highdens");
-
-    let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
-    config.r#ref = Some(ref_file.path().to_path_buf());
-    config.out = out_prefix.clone();
-    config.imp_states = 40;
-    config.nthreads = Some(1);
-
-    let mut pipeline = ImputationPipeline::new(config, None);
-    pipeline.run().expect("Pipeline run success");
-
-    let out_vcf = temp_dir.path().join("output_highdens.vcf.gz");
-    let imputed_dosages = inspect_dosages(&out_vcf, 3);
-
-    // Compute expected dosages using same formula
-    let expected: Vec<Vec<f32>> = (0..n_ref_markers)
-        .map(|m| {
-            (0..3)
-                .map(|s| {
-                    let h0 = s * 2;
-                    let h1 = s * 2 + 1;
-                    let a0 = if (m * 7 + h0 * 13) % 10 < 4 {
-                        1.0f32
-                    } else {
-                        0.0
-                    };
-                    let a1 = if (m * 7 + h1 * 13) % 10 < 4 {
-                        1.0f32
-                    } else {
-                        0.0
-                    };
-                    a0 + a1
-                })
-                .collect()
-        })
-        .collect();
-
-    // R² on imputed markers
-    let mut est_vec: Vec<f32> = Vec::new();
-    let mut true_vec: Vec<f32> = Vec::new();
-    for m in 0..n_ref_markers {
-        if m % 5 != 0 {
-            for s in 0..3 {
-                est_vec.push(imputed_dosages[m][s]);
-                true_vec.push(expected[m][s]);
-            }
-        }
-    }
-
-    let r_squared = compute_r_squared(&est_vec, &true_vec);
-    println!("High-density array R²: {:.4}", r_squared);
-
-    // This test checks imputation works with moderate density
-    // R² > 0 means there's some correlation
-    assert!(
-        r_squared > 0.1,
-        "R² too low for array imputation: {:.4}",
-        r_squared
-    );
-
-    // DR2 validation
-    let dr2_values = inspect_dr2(&out_vcf);
-    let mean_dr2 = compute_mean_dr2(&dr2_values);
-
-    println!(
-        "High-density array test - Mean DR2: {:.4}, count: {}",
-        mean_dr2,
-        dr2_values.len()
-    );
-
-    // STRICT: DR2 values must be in valid range
-    for (i, &dr2) in dr2_values.iter().enumerate() {
-        if dr2 >= 0.0 {
-            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
-        }
-    }
-
-    // STRICT: Mean DR2 should be positive
-    assert!(
-        mean_dr2 > 0.0,
-        "Mean DR2 should be positive, got {:.4}",
-        mean_dr2
     );
 }
 

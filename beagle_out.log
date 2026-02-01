@@ -1,7 +1,7 @@
 beagle.27Feb25.75f.jar (version 5.5)
 Copyright (C) 2014-2024 Brian L. Browning
 Enter "java -jar beagle.27Feb25.75f.jar" to list command line argument
-Start time: 04:34 PM CST on 31 Jan 2026
+Start time: 05:50 PM CST on 31 Jan 2026
 
 Command line: java -Xmx6144m -jar beagle.27Feb25.75f.jar
   ref=ref_beagle.vcf.gz
@@ -16,16 +16,41 @@ No genetic map is specified: using 1 cM = 1 Mb
 Reference samples:                4,091
 Study     samples:                    1
 
-Window 1 [chr22:15382411-50776368]
-Reference markers:                6,857
-Study     markers:                5,930
+Window 1 [chr22:10526260-50526257]
+Reference markers:            1,084,677
+Study     markers:                7,609
 
-Burnin  iteration 1:           0 seconds
+Burnin  iteration 1:           1 second
 Burnin  iteration 2:           0 seconds
 Burnin  iteration 3:           0 seconds
 
-Estimated ne:                  97619
-Estimated err:                 2.1e-02
+Estimated ne:                  1082007
+Estimated err:                 2.2e-03
+
+Phasing iteration 1:           0 seconds
+Phasing iteration 2:           0 seconds
+Phasing iteration 3:           0 seconds
+Phasing iteration 4:           0 seconds
+Phasing iteration 5:           0 seconds
+Phasing iteration 6:           0 seconds
+Phasing iteration 7:           0 seconds
+Phasing iteration 8:           0 seconds
+Phasing iteration 9:           0 seconds
+Phasing iteration 10:          0 seconds
+Phasing iteration 11:          0 seconds
+Phasing iteration 12:          0 seconds
+
+Imputation time:               1 second
+
+Window 2 [chr22:48526174-50807835]
+Reference markers:               83,479
+Study     markers:                  776
+
+Burnin  iteration 1:           0 seconds
+Burnin  iteration 2:           0 seconds
+
+Estimated ne:                  1480992
+Estimated err:                 4.6e-03
 
 Phasing iteration 1:           0 seconds
 Phasing iteration 2:           0 seconds
@@ -44,12 +69,12 @@ Imputation time:               0 seconds
 
 Cumulative Statistics:
 
-Reference markers:                6,857
-Study     markers:                5,930
+Reference markers:            1,093,149
+Study     markers:                7,684
 
-Haplotype phasing time:        2 seconds
-Imputation time:               0 seconds
-Total time:                    3 seconds
+Haplotype phasing time:        4 seconds
+Imputation time:               1 second
+Total time:                    41 seconds
 
-End time: 04:34 PM CST on 31 Jan 2026
+End time: 05:51 PM CST on 31 Jan 2026
 beagle.27Feb25.75f.jar finished
