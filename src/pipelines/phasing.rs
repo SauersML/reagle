@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
@@ -82,15 +82,21 @@ struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerS
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     threaded_haps: &'a ThreadedHaps,
     state_buf: Vec<GlobalId>,
+    hap_offset: usize,
 }
 
 impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
-    fn new(ref_gt: GenotypeView<'a, TargetSpace, RefSpace>, threaded_haps: &'a ThreadedHaps) -> Self {
+    fn new(
+        ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
+        threaded_haps: &'a ThreadedHaps,
+        hap_offset: usize,
+    ) -> Self {
         let n_states = threaded_haps.n_states();
         Self {
             ref_gt,
             threaded_haps,
             state_buf: vec![GlobalId::from(0u32); n_states],
+            hap_offset,
         }
     }
 
@@ -103,7 +109,7 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
         self.threaded_haps.materialize_at(marker, &mut self.state_buf);
         let marker_idx = MarkerIdx::new(marker as u32);
         for i in 0..n_states {
-            let hap = HapIdx::new(self.state_buf[i].as_u32());
+            let hap = HapIdx::new(self.state_buf[i].as_u32() + self.hap_offset as u32);
             out[i] = self.ref_gt.allele(marker_idx, hap);
         }
     }
@@ -2893,6 +2899,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 };
 
                 let prior_paths = &mcmc_paths[..];
+                let hap_offset = if self.reference_gt.is_some() { n_haps } else { 0 };
                 let mut swap_results: Vec<(
                     BitVec<u8, Lsb0>,
                     Vec<(usize, f32)>,
@@ -3048,7 +3055,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     let ws = workspace.as_mut().unwrap();
                                     ws.clear(); // Explicit reset between samples to prevent state contamination
                                     let ref_provider =
-                                        RefAlleleProvider::new(ref_view, &threaded_haps);
+                                        RefAlleleProvider::new(ref_view, &threaded_haps, hap_offset);
 
                                     let donor_blocks =
                                         partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
@@ -3187,6 +3194,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             return Ok((0, 0));
         }
         let n_haps = geno.n_haps();
+        let hap_offset = if self.reference_gt.is_some() { n_haps } else { 0 };
 
         let n_samples = sample_phases.len();
         let n_hi_freq = hi_freq_to_orig.len();
@@ -3374,10 +3382,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             // Classic Beagle-style: static state space MCMC with thread-local workspace
                             let ref_provider = if self.config.profile {
                                 info_span!("prep_allele_provider", sample = s).in_scope(|| {
-                                    RefAlleleProvider::new(subset_view, &threaded_haps)
+                                    RefAlleleProvider::new(subset_view, &threaded_haps, hap_offset)
                                 })
                             } else {
-                                RefAlleleProvider::new(subset_view, &threaded_haps)
+                                RefAlleleProvider::new(subset_view, &threaded_haps, hap_offset)
                             };
 
                             let local_prior = prior_paths[s]
@@ -7611,7 +7619,7 @@ mod tests {
             threaded.push_new(GlobalId::new(h as u32));
         }
         let mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, AnyMarkerSpace> =
-            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded);
+            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded, 0);
 
         let seq1 = vec![0, 0, 0];
         let seq2 = vec![1, 1, 1];
