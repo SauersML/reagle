@@ -303,7 +303,7 @@ def qref_path_for_ref(ref_path):
         base = ref_path.with_suffix("").with_suffix("")
     elif suffixes and suffixes[-1] in [".vcf", ".bcf", ".gz"]:
         base = ref_path.with_suffix("")
-    return base.with_suffix(".qref")
+    return Path(f"{base}.qref")
 
 
 def ensure_eagleimp_qref(ref_vcf, eagleimp_bin):
@@ -313,9 +313,14 @@ def ensure_eagleimp_qref(ref_vcf, eagleimp_bin):
         return qref_path
     print(f"Creating Qref from {ref_vcf}...")
     run(f"{eagleimp_bin} --ref {ref_vcf} --makeQref")
-    if not qref_path.exists():
-        raise RuntimeError(f"Expected Qref not found at {qref_path}")
-    return qref_path
+    if qref_path.exists():
+        return qref_path
+    # EagleImp may drop extra suffixes (e.g., 22.ref.vcf.gz -> 22.qref)
+    alt_name = ref_vcf.name.split(".", 1)[0] + ".qref"
+    alt_path = ref_vcf.parent / alt_name
+    if alt_path.exists():
+        return alt_path
+    raise RuntimeError(f"Expected Qref not found at {qref_path}")
 
 
 def ensure_simple_genetic_map(ref_vcf, map_path, chrom="22"):

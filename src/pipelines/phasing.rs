@@ -8328,6 +8328,160 @@ mod tests {
         GenotypeMatrix::new_unphased(markers, columns, samples).with_phase_mask(Some(phase_mask))
     }
 
+    fn expected_states_by_window(
+        target_gt: &GenotypeMatrix<
+            crate::data::storage::phase_state::Unphased,
+            crate::data::AnyMarkerSpace,
+        >,
+        target_geno: &MutableGenotypes,
+        ref_gt: &GenotypeMatrix<
+            crate::data::storage::phase_state::Phased,
+            crate::data::AnyMarkerSpace,
+        >,
+        alignment: &MarkerAlignment<crate::data::AnyMarkerSpace, crate::data::AnyMarkerSpace>,
+        gen_positions: &[f64],
+        per_window_cap: usize,
+        params: &ModelParams,
+    ) -> (Vec<std::collections::HashSet<u32>>, Vec<(usize, usize)>) {
+        let n_markers = target_gt.n_markers();
+        let windows = partition_markers_by_cm(gen_positions, stage1_block_cm(gen_positions));
+        let num_windows = windows.len();
+        let n_ref_haps = ref_gt.n_haplotypes();
+
+        let ref_columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
+            .collect();
+        let freqs = compute_ref_freqs(
+            target_gt,
+            &ref_columns,
+            Some(alignment),
+            None,
+            None,
+            n_markers,
+        );
+
+        let mut scores_by_window_by_hap: Vec<Vec<Vec<(usize, f32)>>> =
+            vec![Vec::with_capacity(num_windows); 2];
+        for &(start, end) in &windows {
+            let sampling = build_sampling_points(
+                &gen_positions[start..end],
+                0.1,
+                PBWT_MIN_MARKER_STEP,
+                None,
+            );
+            let mut window_scores = vec![vec![f32::NEG_INFINITY; n_ref_haps]; 2];
+            score_window_batch_pbwt_segment(
+                &[0, 1],
+                target_geno,
+                &ref_columns,
+                target_gt.phase_mask(),
+                Some(&[true]),
+                Some(alignment),
+                &freqs,
+                (start, end),
+                64,
+                &sampling,
+                &mut window_scores,
+                false,
+                None,
+                None,
+            );
+            for hap_idx in 0..2 {
+                let top = select_top_k(&window_scores[hap_idx], 160.min(n_ref_haps.max(1)));
+                scores_by_window_by_hap[hap_idx].push(top);
+            }
+        }
+
+        let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
+        let mut touched_indices: Vec<usize> = Vec::new();
+        let mut window_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_windows);
+        let mut prev_window_scores: Vec<(usize, f32)> = Vec::new();
+        for w in 0..num_windows {
+            for &idx in &touched_indices {
+                dense_merge_buffer[idx] = f32::NEG_INFINITY;
+            }
+            touched_indices.clear();
+
+            for &(h, score) in scores_by_window_by_hap[0][w]
+                .iter()
+                .chain(scores_by_window_by_hap[1][w].iter())
+            {
+                if h >= dense_merge_buffer.len() {
+                    continue;
+                }
+                let current = &mut dense_merge_buffer[h];
+                if current.is_finite() {
+                    if score > *current {
+                        *current = score;
+                    }
+                } else {
+                    *current = score;
+                    touched_indices.push(h);
+                }
+            }
+
+            touched_indices.sort_by(|&a, &b| {
+                dense_merge_buffer[b]
+                    .partial_cmp(&dense_merge_buffer[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let cap = 160.min(n_ref_haps.max(1));
+            let take = cap.min(touched_indices.len());
+            let mut list: Vec<(usize, f32)> = Vec::with_capacity(take);
+            for &h in touched_indices.iter().take(take) {
+                list.push((h, dense_merge_buffer[h]));
+            }
+            if list.is_empty() {
+                list.extend(prev_window_scores.iter().copied());
+            } else if !prev_window_scores.is_empty() {
+                let mut map: HashMap<usize, f32> = list.iter().copied().collect();
+                for (h, score) in prev_window_scores.iter().copied() {
+                    map.entry(h).or_insert(score);
+                }
+                list = map.into_iter().collect();
+            }
+            prev_window_scores = list.clone();
+            window_scores.push(list);
+        }
+
+        let abyss = vec![false; n_ref_haps];
+        let (candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
+        let per_window_caps = vec![per_window_cap; num_windows];
+        let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
+        let mut boundary_cm = Vec::with_capacity(num_windows.saturating_sub(1));
+        for w in 0..num_windows.saturating_sub(1) {
+            let (_, end) = windows[w];
+            let (next_start, _) = windows[w + 1];
+            let left = gen_positions[end.saturating_sub(1).min(gen_positions.len() - 1)];
+            let right = gen_positions[next_start.min(gen_positions.len() - 1)];
+            boundary_cm.push((right - left).abs().max(0.1));
+        }
+
+        let allocation = allocate_lms_sparse(
+            &scores_by_hap,
+            &candidate_haps,
+            num_windows,
+            &boundary_cm,
+            params,
+            n_ref_haps,
+            global_slot_budget,
+            &per_window_caps,
+        );
+        let offset = 2usize;
+        let mut expected_by_window: Vec<std::collections::HashSet<u32>> =
+            vec![std::collections::HashSet::new(); num_windows];
+        for (hap, intervals) in allocation.intervals_by_hap.iter() {
+            let combined = (hap + offset) as u32;
+            for &(s, e) in intervals {
+                for w in s as usize..e as usize {
+                    expected_by_window[w].insert(combined);
+                }
+            }
+        }
+
+        (expected_by_window, windows)
+    }
+
     #[test]
     fn test_pipeline_creation() {
         let config = Config {
@@ -8648,19 +8802,29 @@ mod tests {
             build_ref_panel_with_hero(n_markers, 50, 49, &hero_pattern, 42);
         let target_gt = build_target_with_sparse_anchors(n_markers, &hero_pattern, 10);
 
-        let mut config = Config::default();
-        config.phase_states = 20;
-        config.ne = 10000.0;
-        config.err = Some(0.0001);
-        config.nthreads = Some(1);
-
-        let pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
-
         let target_geno = MutableGenotypes::from_fn(n_markers, 2, |m, h| {
             target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
         });
         let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
         let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.02).collect();
+
+        let mut config = Config::default();
+        config.phase_states = 20;
+        config.ne = 10000.0;
+        config.err = Some(0.0001);
+        config.nthreads = Some(1);
+        let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
+        pipeline.params = ModelParams::for_phasing(ref_gt.n_haplotypes() + 2, 10000.0, Some(0.0001));
+        let params = pipeline.params.clone();
+        let (expected_by_window, windows) = expected_states_by_window(
+            &target_gt,
+            &target_geno,
+            &ref_gt,
+            &alignment,
+            &gen_positions,
+            20,
+            &params,
+        );
 
         let threaded = pipeline
             .build_phasing_prescan_states(
@@ -8677,8 +8841,6 @@ mod tests {
             .expect("prescan");
 
         let th = &threaded[0];
-        let hero_combined = (2 + hero_hap_idx) as u32;
-        let windows = partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
         let mut state_buf = vec![CombinedHapId::from(0u32); th.n_states()];
 
         println!("[prescan test] windows={:?}", windows);
@@ -8686,20 +8848,22 @@ mod tests {
             let mid = (start + end.saturating_sub(1)) / 2;
             for &m in &[start, mid] {
                 th.materialize_at(m, &mut state_buf);
-                let has_hero = state_buf
-                    .iter()
-                    .any(|id| id.as_u32() == hero_combined);
+                let actual: std::collections::HashSet<u32> =
+                    state_buf.iter().map(|id| id.as_u32()).collect();
+                let expected = &expected_by_window[w];
+                let hero_combined = (2 + hero_hap_idx) as u32;
                 println!(
-                    "[prescan test] window={} marker={} states={} hero_present={}",
+                    "[prescan test] window={} marker={} expected={} actual={} hero_in_expected={} hero_in_actual={}",
                     w,
                     m,
-                    state_buf.len(),
-                    has_hero
+                    expected.len(),
+                    actual.len(),
+                    expected.contains(&hero_combined),
+                    actual.contains(&hero_combined)
                 );
                 assert!(
-                    has_hero,
-                    "Hero hap {} missing from prescan states at marker {} (window {})",
-                    hero_combined,
+                    expected == &actual,
+                    "ThreadedHaps window state mismatch at marker {} (window {})",
                     m,
                     w
                 );
@@ -8892,7 +9056,6 @@ mod tests {
         let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
         let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.02).collect();
         let windows = partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
-        let num_windows = windows.len();
         let per_window_cap = 20usize;
 
         let n_ref_haps = ref_gt.n_haplotypes();
@@ -9207,149 +9370,24 @@ mod tests {
         let windows = partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
         let num_windows = windows.len();
 
-        let n_ref_haps = ref_gt.n_haplotypes();
-        let ref_columns: Vec<GenotypeColumn> = (0..n_markers)
-            .map(|m| ref_gt.column(MarkerIdx::new(m as u32)).clone())
-            .collect();
-        let freqs = compute_ref_freqs(
-            &target_gt,
-            &ref_columns,
-            Some(&alignment),
-            None,
-            None,
-            n_markers,
-        );
-
-        let mut scores_by_window_by_hap: Vec<Vec<Vec<(usize, f32)>>> =
-            vec![Vec::with_capacity(num_windows); 2];
-        for &(start, end) in &windows {
-            let sampling = build_sampling_points(
-                &gen_positions[start..end],
-                0.1,
-                PBWT_MIN_MARKER_STEP,
-                None,
-            );
-            let mut window_scores = vec![vec![f32::NEG_INFINITY; n_ref_haps]; 2];
-            score_window_batch_pbwt_segment(
-                &[0, 1],
-                &target_geno,
-                &ref_columns,
-                target_gt.phase_mask(),
-                Some(&[true]),
-                Some(&alignment),
-                &freqs,
-                (start, end),
-                64,
-                &sampling,
-                &mut window_scores,
-                false,
-                None,
-                None,
-            );
-            for hap_idx in 0..2 {
-                let top = select_top_k(&window_scores[hap_idx], 160.min(n_ref_haps.max(1)));
-                scores_by_window_by_hap[hap_idx].push(top);
-            }
-        }
-
-        let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
-        let mut touched_indices: Vec<usize> = Vec::new();
-        let mut window_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_windows);
-        let mut prev_window_scores: Vec<(usize, f32)> = Vec::new();
-        for w in 0..num_windows {
-            for &idx in &touched_indices {
-                dense_merge_buffer[idx] = f32::NEG_INFINITY;
-            }
-            touched_indices.clear();
-
-            for &(h, score) in scores_by_window_by_hap[0][w]
-                .iter()
-                .chain(scores_by_window_by_hap[1][w].iter())
-            {
-                if h >= dense_merge_buffer.len() {
-                    continue;
-                }
-                let current = &mut dense_merge_buffer[h];
-                if current.is_finite() {
-                    if score > *current {
-                        *current = score;
-                    }
-                } else {
-                    *current = score;
-                    touched_indices.push(h);
-                }
-            }
-
-            touched_indices.sort_by(|&a, &b| {
-                dense_merge_buffer[b]
-                    .partial_cmp(&dense_merge_buffer[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let cap = 160.min(n_ref_haps.max(1));
-            let take = cap.min(touched_indices.len());
-            let mut list: Vec<(usize, f32)> = Vec::with_capacity(take);
-            for &h in touched_indices.iter().take(take) {
-                list.push((h, dense_merge_buffer[h]));
-            }
-            if list.is_empty() {
-                list.extend(prev_window_scores.iter().copied());
-            } else if !prev_window_scores.is_empty() {
-                let mut map: HashMap<usize, f32> = list.iter().copied().collect();
-                for (h, score) in prev_window_scores.iter().copied() {
-                    map.entry(h).or_insert(score);
-                }
-                list = map.into_iter().collect();
-            }
-            prev_window_scores = list.clone();
-            window_scores.push(list);
-        }
-
-        let abyss = vec![false; n_ref_haps];
-        let (candidate_haps, scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
-        let per_window_cap = 20usize;
-        let per_window_caps = vec![per_window_cap; num_windows];
-        let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
-        let mut boundary_cm = Vec::with_capacity(num_windows.saturating_sub(1));
-        for w in 0..num_windows.saturating_sub(1) {
-            let (_, end) = windows[w];
-            let (next_start, _) = windows[w + 1];
-            let left = gen_positions[end.saturating_sub(1).min(gen_positions.len() - 1)];
-            let right = gen_positions[next_start.min(gen_positions.len() - 1)];
-            boundary_cm.push((right - left).abs().max(0.1));
-        }
         let mut config = Config::default();
         config.phase_states = 20;
         config.ne = 10000.0;
         config.err = Some(0.0001);
         config.nthreads = Some(1);
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
-        pipeline.params = ModelParams::for_phasing(n_ref_haps + 2, 10000.0, Some(0.0001));
+        pipeline.params = ModelParams::for_phasing(ref_gt.n_haplotypes() + 2, 10000.0, Some(0.0001));
         let params = pipeline.params.clone();
-        let allocation = allocate_lms_sparse(
-            &scores_by_hap,
-            &candidate_haps,
-            num_windows,
-            &boundary_cm,
+        let per_window_cap = 20usize;
+        let (expected_by_window, windows) = expected_states_by_window(
+            &target_gt,
+            &target_geno,
+            &ref_gt,
+            &alignment,
+            &gen_positions,
+            per_window_cap,
             &params,
-            n_ref_haps,
-            global_slot_budget,
-            &per_window_caps,
         );
-        let mut selected: Vec<usize> =
-            allocation.intervals_by_hap.into_iter().map(|(h, _)| h).collect();
-        selected.sort_unstable();
-        selected.dedup();
-        eprintln!(
-            "[threaded test] expected_ref_len={} first={:?}",
-            selected.len(),
-            selected.iter().take(10).collect::<Vec<_>>()
-        );
-
-        let offset = 2usize;
-        let expected: std::collections::HashSet<u32> = selected
-            .iter()
-            .map(|h| (h + offset) as u32)
-            .collect();
 
         let threaded = pipeline
             .build_phasing_prescan_states(
@@ -9366,34 +9404,37 @@ mod tests {
             .expect("prescan");
         let th = &threaded[0];
         let mut state_buf = vec![CombinedHapId::from(0u32); th.n_states()];
-        th.materialize_at(0, &mut state_buf);
-        let actual: std::collections::HashSet<u32> =
-            state_buf.iter().map(|id| id.as_u32()).collect();
-
-        let hero_combined = (hero_hap_idx + offset) as u32;
-        println!(
-            "[threaded test] expected={} actual={} hero_combined={} hero_in_expected={} hero_in_actual={}",
-            expected.len(),
-            actual.len(),
-            hero_combined,
-            expected.contains(&hero_combined),
-            actual.contains(&hero_combined)
-        );
-
-        let mut missing: Vec<u32> = expected.difference(&actual).copied().collect();
-        missing.sort_unstable();
-        let mut extra: Vec<u32> = actual.difference(&expected).copied().collect();
-        extra.sort_unstable();
-        println!(
-            "[threaded test] missing_first={:?} extra_first={:?}",
-            missing.iter().take(10).collect::<Vec<_>>(),
-            extra.iter().take(10).collect::<Vec<_>>()
-        );
-
-        assert!(
-            expected == actual,
-            "ThreadedHaps state set does not match selected indices"
-        );
+        for (w, (start, end)) in windows.iter().copied().enumerate() {
+            let mid = (start + end.saturating_sub(1)) / 2;
+            let expected = &expected_by_window[w];
+            th.materialize_at(mid, &mut state_buf);
+            let actual: std::collections::HashSet<u32> =
+                state_buf.iter().map(|id| id.as_u32()).collect();
+            let hero_combined = (hero_hap_idx + 2) as u32;
+            println!(
+                "[threaded test] window={} expected={} actual={} hero_in_expected={} hero_in_actual={}",
+                w,
+                expected.len(),
+                actual.len(),
+                expected.contains(&hero_combined),
+                actual.contains(&hero_combined)
+            );
+            let mut missing: Vec<u32> = expected.difference(&actual).copied().collect();
+            missing.sort_unstable();
+            let mut extra: Vec<u32> = actual.difference(&expected).copied().collect();
+            extra.sort_unstable();
+            println!(
+                "[threaded test] window={} missing_first={:?} extra_first={:?}",
+                w,
+                missing.iter().take(10).collect::<Vec<_>>(),
+                extra.iter().take(10).collect::<Vec<_>>()
+            );
+            assert!(
+                expected == &actual,
+                "ThreadedHaps state set does not match selected indices for window {}",
+                w
+            );
+        }
     }
 
     #[test]
