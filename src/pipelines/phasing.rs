@@ -6384,6 +6384,104 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    // Try to find a good constant starting path heuristic if none provided
+    let heuristic_paths = if initial_paths.is_none() && n_markers <= 500 {
+        let n_candidates = n_states.min(phase_ibs.n_haps());
+        if n_candidates >= 2 {
+            let mut scores = vec![0.0f32; n_candidates * n_candidates];
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 && a2 == 255 {
+                    continue;
+                }
+                let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                for i in 0..n_candidates {
+                    let r1 = phase_ibs.allele(m, i as u32);
+                    if r1 == 255 {
+                        continue;
+                    }
+                    for j in 0..i {
+                        let r2 = phase_ibs.allele(m, j as u32);
+                        if r2 == 255 {
+                            continue;
+                        }
+                        let compatible = if is_het {
+                            (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                        } else {
+                            let obs = if a1 != 255 { a1 } else { a2 };
+                            r1 == obs && r2 == obs
+                        };
+                        if compatible {
+                            scores[i * n_candidates + j] += 1.0;
+                        } else {
+                            scores[i * n_candidates + j] -= 1.0;
+                        }
+                    }
+                }
+            }
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_pair = (0, 1);
+            for i in 0..n_candidates {
+                for j in 0..i {
+                    let s = scores[i * n_candidates + j];
+                    if s > best_score {
+                        best_score = s;
+                        best_pair = (i, j);
+                    }
+                }
+            }
+            if best_score >= 0.5 * (n_markers as f32) {
+                Some(MosaicPaths {
+                    path1: vec![best_pair.0 as u32; n_markers],
+                    path2: vec![best_pair.1 as u32; n_markers],
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
+    // Seed alleles from initial paths if available
+    // This ensures MCMC starts in a high-probability region rather than drifting
+    // from a random start.
+    if let Some(paths) = start_paths {
+        if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 || a1 == a2 {
+                    continue;
+                }
+
+                let h1_idx = paths.path1[m] as usize;
+                let h2_idx = paths.path2[m] as usize;
+
+                if h1_idx < phase_ibs.n_haps() && h2_idx < phase_ibs.n_haps() {
+                    let ref1 = phase_ibs.allele(m, h1_idx as u32);
+                    let ref2 = phase_ibs.allele(m, h2_idx as u32);
+
+                    let matches_orient1 = ref1 == a1 && ref2 == a2;
+                    let matches_orient2 = ref1 == a2 && ref2 == a1;
+
+                    if matches_orient1 && !matches_orient2 {
+                        h1_alleles[m] = a1;
+                        h2_alleles[m] = a2;
+                    } else if matches_orient2 && !matches_orient1 {
+                        h1_alleles[m] = a2;
+                        h2_alleles[m] = a1;
+                    }
+                }
+            }
+        }
+    }
+
     // Initialize path with starting states from standard neighbor finding
     // This gives the first iteration something to work with
     let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
@@ -6411,7 +6509,7 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
