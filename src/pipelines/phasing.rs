@@ -2244,6 +2244,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .collect()
             };
 
+        let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
+
         let n_burnin = self.config.burnin.min(3);
         let n_iterations = self.config.iterations.min(6);
         let total_iterations = n_burnin + n_iterations;
@@ -2305,6 +2307,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &mut geno,
                 &p_recomb,
                 &gen_dists,
+                &ibs2,
                 &mut sample_phases,
                 &mut mcmc_paths,
                 atomic_estimates.as_ref(),
@@ -2598,6 +2601,54 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         BidirectionalPhaseIbs::build_for_subset(alleles_by_marker, n_haps, n_subset, marker_indices)
+    }
+
+    /// Build bidirectional PBWT for a subset of markers, combining target and reference
+    fn build_bidirectional_pbwt_composite(
+        &self,
+        geno: &MutableGenotypes,
+        marker_indices: &[usize],
+        n_target_haps: usize,
+    ) -> BidirectionalPhaseIbs {
+        let n_subset = marker_indices.len();
+        let n_ref_haps = self
+            .reference_gt
+            .as_ref()
+            .map(|r| r.n_haplotypes())
+            .unwrap_or(0);
+        let n_total_haps = n_target_haps + n_ref_haps;
+
+        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
+
+        for &orig_m in marker_indices {
+            let mut row = vec![255u8; n_total_haps];
+
+            // 1. Target
+            let target_slice = geno.marker_alleles(orig_m);
+            let copy_len = target_slice.len().min(n_target_haps);
+            row[..copy_len].copy_from_slice(&target_slice[..copy_len]);
+
+            // 2. Reference
+            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_m as u32)) {
+                    let ref_col = ref_gt.column(ref_m);
+                    for rh in 0..n_ref_haps {
+                        let ref_a = ref_col.get(HapIdx::new(rh as u32));
+                        let mapped = alignment.reverse_map_allele(orig_m, ref_a);
+                        row[n_target_haps + rh] = mapped;
+                    }
+                }
+            }
+
+            alleles_by_marker.push(row);
+        }
+
+        BidirectionalPhaseIbs::build_for_subset(
+            alleles_by_marker,
+            n_total_haps,
+            n_subset,
+            marker_indices,
+        )
     }
 
     fn build_phasing_prescan_states<RefPanelSpace>(
@@ -3074,6 +3125,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         geno: &mut MutableGenotypes,
         p_recomb: &[f32],
         gen_dists: &[f64],
+        ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
         mcmc_paths: &mut [Option<GlobalMosaicPaths>],
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
@@ -3157,6 +3209,29 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                 let prior_paths = &mcmc_paths[..];
                 let sample_phase_view: &[SamplePhase] = &*sample_phases;
+
+                let use_dynamic_mcmc = self.config.dynamic_mcmc;
+                let phase_ibs = if use_dynamic_mcmc {
+                    let all_markers: Vec<usize> = (0..n_markers).collect();
+                    if self.config.profile {
+                        info_span!("build_bidirectional_pbwt_composite").in_scope(|| {
+                            Some(self.build_bidirectional_pbwt_composite(
+                                ref_geno,
+                                &all_markers,
+                                n_haps,
+                            ))
+                        })
+                    } else {
+                        Some(self.build_bidirectional_pbwt_composite(
+                            ref_geno,
+                            &all_markers,
+                            n_haps,
+                        ))
+                    }
+                } else {
+                    None
+                };
+
                 let mut swap_results: Vec<(
                     BitVec<u8, Lsb0>,
                     Vec<(usize, f32)>,
@@ -3341,23 +3416,80 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let p_err = self.params.p_mismatch;
                             let p_no_err = 1.0 - p_err;
 
-                            let (swap_bits, swap_lr, swap_probs, new_paths) = THREAD_WORKSPACE
-                                .with(|ws| {
+                            let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
+                                let prior_local_dyn = prior_paths[s].as_ref().map(|gp| MosaicPaths {
+                                    path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
+                                    path2: gp.path2.iter().map(|id| id.as_u32()).collect(),
+                                });
+
+                                THREAD_WORKSPACE.with(|ws| {
                                     let mut workspace = ws.borrow_mut();
                                     if workspace.is_none() {
-                                        *workspace = Some(
-                                            crate::utils::workspace::ThreadWorkspace::new(64, 0),
-                                        );
+                                        *workspace =
+                                            Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
                                     }
                                     let ws = workspace.as_mut().unwrap();
-                                    ws.clear(); // Explicit reset between samples to prevent state contamination
-                                    let ref_provider =
-                                        RefAlleleProvider::new(ref_view, &threaded_haps);
+                                    ws.clear();
+
+                                    if self.config.profile {
+                                        info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
+                                            sample_dynamic_mcmc(
+                                                n_markers,
+                                                n_states,
+                                                p_recomb,
+                                                &seq1,
+                                                &seq2,
+                                                &sample_conf,
+                                                phase_ibs.as_ref().expect("phase_ibs"),
+                                                ibs2,
+                                                s as u32,
+                                                &het_positions,
+                                                sample_seed,
+                                                self.config.mcmc_steps,
+                                                p_no_err,
+                                                p_err,
+                                                prior_local_dyn.as_ref(),
+                                                ws,
+                                            )
+                                        })
+                                    } else {
+                                        sample_dynamic_mcmc(
+                                            n_markers,
+                                            n_states,
+                                            p_recomb,
+                                            &seq1,
+                                            &seq2,
+                                            &sample_conf,
+                                            phase_ibs.as_ref().expect("phase_ibs"),
+                                            ibs2,
+                                            s as u32,
+                                            &het_positions,
+                                            sample_seed,
+                                            self.config.mcmc_steps,
+                                            p_no_err,
+                                            p_err,
+                                            prior_local_dyn.as_ref(),
+                                            ws,
+                                        )
+                                    }
+                                })
+                            } else {
+                                THREAD_WORKSPACE.with(|ws| {
+                                    let mut workspace = ws.borrow_mut();
+                                    if workspace.is_none() {
+                                        *workspace =
+                                            Some(crate::utils::workspace::ThreadWorkspace::new(64, 0));
+                                    }
+                                    let ws = workspace.as_mut().unwrap();
+                                    ws.clear();
+                                    let ref_provider = RefAlleleProvider::new(ref_view, &threaded_haps);
                                     let (anchor_h1, anchor_h2) =
                                         build_anchor_constraints(&sample_phase_view[s]);
 
-                                    let donor_blocks =
-                                        partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
+                                    let donor_blocks = partition_markers_by_cm(
+                                        &gen_positions,
+                                        stage1_block_cm(&gen_positions),
+                                    );
                                     let block_starts: Arc<[usize]> =
                                         blocks_to_starts(&donor_blocks, n_markers)
                                             .into_boxed_slice()
@@ -3392,7 +3524,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         ws,
                                     );
                                     result
-                                });
+                                })
+                            };
                             if new_paths.path1.is_empty() {
                                 *paths_out = None;
                             } else {
@@ -3531,9 +3664,24 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 };
 
             // 2. Build bidirectional PBWT on high-frequency markers only
-            let use_dynamic_mcmc = self.config.dynamic_mcmc && self.reference_gt.is_none();
+            // Enable dynamic MCMC even with reference panel using composite PBWT
+            let use_dynamic_mcmc = self.config.dynamic_mcmc;
             let phase_ibs = if use_dynamic_mcmc {
-                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
+                if self.config.profile {
+                    info_span!("build_bidirectional_pbwt_composite").in_scope(|| {
+                        Some(self.build_bidirectional_pbwt_composite(
+                            ref_geno,
+                            hi_freq_to_orig,
+                            n_haps,
+                        ))
+                    })
+                } else {
+                    Some(self.build_bidirectional_pbwt_composite(
+                        ref_geno,
+                        hi_freq_to_orig,
+                        n_haps,
+                    ))
+                }
             } else {
                 None
             };
