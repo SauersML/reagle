@@ -6219,6 +6219,10 @@ fn ffbs_haploid_constrained(
             fwd_sum += fwd_curr[i];
         }
         fwd_sum = fwd_sum.max(1e-30);
+        
+        if m < 5 { // Debug log for first few markers
+            eprintln!("[ffbs m={}] fwd_curr: {:?}, sum={}", m, &fwd_curr[..actual_n_states], fwd_sum);
+        }
 
         let start = m * actual_n_states;
         fwd_at_marker[start..start + actual_n_states]
@@ -6326,6 +6330,8 @@ fn sample_dynamic_mcmc(
     // from a random start.
     if let Some(paths) = initial_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
+            let mut matches_count = 0;
+            let mut mismatch_count = 0;
             for m in 0..n_markers {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
@@ -6346,12 +6352,17 @@ fn sample_dynamic_mcmc(
                     if matches_orient1 && !matches_orient2 {
                         h1_alleles[m] = a1;
                         h2_alleles[m] = a2;
+                        matches_count += 1;
                     } else if matches_orient2 && !matches_orient1 {
                         h1_alleles[m] = a2;
                         h2_alleles[m] = a1;
+                        matches_count += 1;
+                    } else {
+                        mismatch_count += 1;
                     }
                 }
             }
+            eprintln!("[init] Heuristic seeding applied. matches={} mismatches={}", matches_count, mismatch_count);
         }
     }
 
@@ -6517,6 +6528,9 @@ fn sample_dynamic_mcmc(
             continue;
         }
         mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
+        if step == 0 {
+             eprintln!("[mcmc step {}] H1 neighbors: {:?}", step, neighbors);
+        }
 
         // 2. Build constraint: at hets, H1 must produce genotype with H2
         for m in 0..n_markers {
@@ -6546,6 +6560,9 @@ fn sample_dynamic_mcmc(
             &mut rng,
             workspace,
         );
+        if step == 0 {
+             eprintln!("[mcmc step {}] H1 path_idx sample: {:?}", step, &path1_idx[..10.min(path1_idx.len())]);
+        }
 
         // Refresh the latent reference path at all markers for the next iteration.
         refresh_path_ref_from_states(&mut path1_ref, &path1_idx, &neighbors);
@@ -6788,6 +6805,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         return None;
     }
     let threshold = 0.5 * (informative as f32);
+    eprintln!("[heuristic] best_pair={:?} score={} threshold={} markers={}", best_pair, best_score, threshold, n_markers);
     if best_score < threshold || n_markers > 500 {
         return None;
     }
