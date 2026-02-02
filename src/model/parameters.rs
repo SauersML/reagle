@@ -244,7 +244,10 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // sum_gen_dist is in cM, but recomb_intensity is in switches/Morgan.
+        // 1 Morgan = 100 cM.
+        // Ratio is switches/cM. We need switches/Morgan, so multiply by 100.
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability
