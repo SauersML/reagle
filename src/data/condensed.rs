@@ -321,12 +321,9 @@ fn build_segment_mask<RefSpace>(
                 .map(|&(f0, f1)| if a1 == 0 { f0 } else { f1 })
                 .unwrap_or(0.5);
 
-            // Constrain only if this is the minor allele (provides > 1 bit of info)
-            if allele_freq < 0.5 {
-                if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
-                    mask_and_inplace(&mut mask, &tmp);
-                    any_constraint = true;
-                }
+            if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
+                mask_and_inplace(&mut mask, &tmp);
+                any_constraint = true;
             }
         } else if a1 <= 1 && a2 <= 1 {
             // If heterozygous and phased, constrain segment to match either allele.
