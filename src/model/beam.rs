@@ -37,6 +37,7 @@ impl Default for BeamConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct BeamCosts {
     pub p_err: f64,
+    pub recomb_intensity: f64,
 }
 
 impl BeamCosts {
@@ -44,6 +45,7 @@ impl BeamCosts {
         let p_err = params.p_mismatch.max(1e-9).min(1.0 - 1e-9);
         Self {
             p_err: p_err as f64,
+            recomb_intensity: params.recomb_intensity.max(1e-12) as f64,
         }
     }
 }
@@ -351,6 +353,18 @@ impl PbwtBeamIndex {
             for (h, pos, len) in pos_lens {
                 pos_len_map.insert(h, (pos, len));
             }
+            let mut select_longest = |donors: &mut Vec<u32>| {
+                donors.sort_unstable_by(|a, b| {
+                    let la = pos_len_map.get(a).map(|(_, l)| *l).unwrap_or(0.0);
+                    let lb = pos_len_map.get(b).map(|(_, l)| *l).unwrap_or(0.0);
+                    lb.partial_cmp(&la).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                if donors.len() > k {
+                    donors.truncate(k);
+                }
+            };
+            select_longest(&mut d0);
+            select_longest(&mut d1);
             let meta0 = build_donor_meta(&d0, &beams[0], &pos_len_map);
             let meta1 = build_donor_meta(&d1, &beams[1], &pos_len_map);
             donor_meta0.push(Some(meta0));
@@ -1118,15 +1132,18 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         dist_morgans: f32,
         same_cluster: bool,
     ) -> i32 {
-        // Coalescent-based stay probability from PBWT match length:
-        //   prior: t ~ Exp(1) over TMRCA (coalescent units)
-        //   L | t ~ Exp(rate = 2t)  =>  t | L ~ Gamma(α=2, β=1+2L)
-        //   P(stay | L, d) = E[exp(-2 t d)] = (β / (β + 2d))^α
+        // Coalescent-based stay probability from PBWT match length with
+        // explicit recombination intensity scaling (rho = 4Ne in Morgans):
+        //   prior: t ~ Gamma(α=2, β=1) over TMRCA (coalescent units)
+        //   L | t ~ Exp(rate = rho * t)
+        //   t | L ~ Gamma(α=2, β=1 + rho * L)
+        //   P(stay | L, d) = E[exp(-rho * t * d)] = (β / (β + rho * d))^α
         // Switch odds = P(switch)/P(stay), cost = -ln(odds).
         let l = match_len_morgans.max(0.0) as f64;
         let d = dist_morgans.max(0.0) as f64;
-        let beta = 1.0 + 2.0 * l;
-        let denom = beta + 2.0 * d;
+        let rho = self.costs.recomb_intensity;
+        let beta = 1.0 + rho * l;
+        let denom = beta + rho * d;
         let p_stay = if denom > 0.0 {
             (beta / denom).powi(2)
         } else {

@@ -212,13 +212,14 @@ impl SamplePhase {
 
     /// Mark a marker as unphased.
     ///
-    /// Only has effect if the marker is currently Phased.
     pub fn mark_unphased(&mut self, marker: usize) {
-        if self.status[marker] == ClusterStatus::Phased {
-            self.status_counts[ClusterStatus::Phased as usize] -= 1;
-            self.status_counts[ClusterStatus::Unphased as usize] += 1;
-            self.status[marker] = ClusterStatus::Unphased;
+        let current = self.status[marker];
+        if current == ClusterStatus::Unphased {
+            return;
         }
+        self.status_counts[current as usize] = self.status_counts[current as usize].saturating_sub(1);
+        self.status_counts[ClusterStatus::Unphased as usize] += 1;
+        self.status[marker] = ClusterStatus::Unphased;
     }
 
     /// Returns true if the marker has missing genotype data.
