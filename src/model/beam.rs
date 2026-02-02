@@ -292,6 +292,24 @@ pub struct BeamPhaser<'a, RefSpace = AnyMarkerSpace> {
     packed_ref: &'a PackedRefView<RefSpace>,
 }
 
+struct BeamScratch {
+    hap1_candidates: Vec<(usize, i32)>,
+    hap2_candidates: Vec<(usize, i32)>,
+    hap1_allele: Vec<(usize, i32, i32)>,
+    hap2_allele: Vec<(usize, i32, i32)>,
+}
+
+impl BeamScratch {
+    fn new(cap: usize) -> Self {
+        Self {
+            hap1_candidates: Vec::with_capacity(cap),
+            hap2_candidates: Vec::with_capacity(cap),
+            hap1_allele: Vec::with_capacity(cap),
+            hap2_allele: Vec::with_capacity(cap),
+        }
+    }
+}
+
 impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     pub fn new(packed_ref: &'a PackedRefView<RefSpace>, params: &ModelParams, config: BeamConfig) -> Self {
         Self {
@@ -316,6 +334,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
 
         let mut trie = HistoryTrie::new();
+        let mut scratch = BeamScratch::new(self.config.switch_candidates.max(4));
         let mut beam: Vec<BeamPath> = self.init_beam(active_pool);
 
         let n_calls = condensed.call_sites.len();
@@ -326,7 +345,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             let call = &condensed.call_sites[i];
 
             // Segment consistency repair.
-            beam = self.apply_segment_constraints(&beam, segment, active_pool, call.switch_cost);
+            beam = self.apply_segment_constraints(
+                &beam,
+                segment,
+                active_pool,
+                call.switch_cost,
+                &mut scratch,
+            );
             if beam.is_empty() {
                 beam = self.init_beam(active_pool);
             }
@@ -351,6 +376,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     &mut best_local_unswapped,
                     &mut best_local_swapped,
                     i,
+                    &mut scratch,
                 );
             }
             self.prune_and_collapse(&mut next);
@@ -359,7 +385,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
 
         // Apply trailing segment constraints
         if let Some(last_seg) = condensed.segments.get(n_calls) {
-            beam = self.apply_segment_constraints(&beam, last_seg, active_pool, 0);
+            beam = self.apply_segment_constraints(
+                &beam,
+                last_seg,
+                active_pool,
+                0,
+                &mut scratch,
+            );
             if beam.is_empty() {
                 beam = self.init_beam(active_pool);
             }
@@ -432,16 +464,29 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         segment: &crate::data::condensed::CondensedSegment,
         active_pool: &ActivePool,
         switch_cost: i32,
+        scratch: &mut BeamScratch,
     ) -> Vec<BeamPath> {
         if !segment.any_constraint {
             return beam.to_vec();
         }
         let mut out: Vec<BeamPath> = Vec::with_capacity(beam.len());
         for path in beam {
-            let hap1_candidates = self.repair_hap(path.hap1, &segment.mask, active_pool, switch_cost);
-            let hap2_candidates = self.repair_hap(path.hap2, &segment.mask, active_pool, switch_cost);
-            for (h1, c1) in &hap1_candidates {
-                for (h2, c2) in &hap2_candidates {
+            self.repair_hap_into(
+                path.hap1,
+                &segment.mask,
+                active_pool,
+                switch_cost,
+                &mut scratch.hap1_candidates,
+            );
+            self.repair_hap_into(
+                path.hap2,
+                &segment.mask,
+                active_pool,
+                switch_cost,
+                &mut scratch.hap2_candidates,
+            );
+            for (h1, c1) in scratch.hap1_candidates.iter() {
+                for (h2, c2) in scratch.hap2_candidates.iter() {
                     out.push(BeamPath {
                         hap1: *h1,
                         hap2: *h2,
@@ -457,14 +502,15 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         self.prune_inplace(out)
     }
 
-    fn repair_hap(
+    fn repair_hap_into(
         &self,
         hap: usize,
         mask: &[u64],
         active_pool: &ActivePool,
         switch_cost: i32,
-    ) -> Vec<(usize, i32)> {
-        let mut out: Vec<(usize, i32)> = Vec::new();
+        out: &mut Vec<(usize, i32)>,
+    ) {
+        out.clear();
         let hap_ok = mask_bit_is_set(mask, hap);
         if hap_ok {
             out.push((hap, 0));
@@ -493,7 +539,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             // allow staying with penalty
             out.push((hap, switch_cost * 2));
         }
-        out
     }
 
     fn expand_call_site(
@@ -506,15 +551,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         best_unswapped: &mut [i32],
         best_swapped: &mut [i32],
         call_idx: usize,
+        scratch: &mut BeamScratch,
     ) {
         let a1 = call.a1;
         let a2 = call.a2;
 
         if call.fixed {
-            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, best_unswapped, best_swapped, call_idx);
+            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, best_unswapped, best_swapped, call_idx, scratch);
         } else {
-            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, best_unswapped, best_swapped, call_idx);
-            self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out, best_unswapped, best_swapped, call_idx);
+            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, best_unswapped, best_swapped, call_idx, scratch);
+            self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out, best_unswapped, best_swapped, call_idx, scratch);
         }
     }
 
@@ -531,25 +577,28 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         best_unswapped: &mut [i32],
         best_swapped: &mut [i32],
         call_idx: usize,
+        scratch: &mut BeamScratch,
     ) {
-        let hap1_candidates = self.repair_hap_for_allele(
+        self.repair_hap_for_allele_into(
             path.hap1,
             call.marker,
             hap1_al,
             call.fixed,
             active_pool,
             call.switch_cost,
+            &mut scratch.hap1_allele,
         );
-        let hap2_candidates = self.repair_hap_for_allele(
+        self.repair_hap_for_allele_into(
             path.hap2,
             call.marker,
             hap2_al,
             call.fixed,
             active_pool,
             call.switch_cost,
+            &mut scratch.hap2_allele,
         );
-        for (h1, c1, e1) in &hap1_candidates {
-            for (h2, c2, e2) in &hap2_candidates {
+        for (h1, c1, e1) in scratch.hap1_allele.iter() {
+            for (h2, c2, e2) in scratch.hap2_allele.iter() {
                 let history = trie.push(path.history, swapped);
                 let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
                 let flip_penalty = if swapped != path.last_swapped { call.flip_cost } else { 0 };
@@ -575,7 +624,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
     }
 
-    fn repair_hap_for_allele(
+    fn repair_hap_for_allele_into(
         &self,
         hap: usize,
         marker: MarkerIdx,
@@ -583,8 +632,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         fixed: bool,
         active_pool: &ActivePool,
         switch_cost: i32,
-    ) -> Vec<(usize, i32, i32)> {
-        let mut out: Vec<(usize, i32, i32)> = Vec::new();
+        out: &mut Vec<(usize, i32, i32)>,
+    ) {
+        out.clear();
         let marker_idx = marker.as_usize();
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         if matches {
@@ -595,7 +645,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     out.push((h, switch_cost, self.costs.match_cost));
                 }
             }
-            return out;
+            return;
         }
         if fixed {
             // For phased anchors, scan the full pool to ensure we honor the fixed allele.
@@ -610,7 +660,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             if out.is_empty() {
                 out.push((hap, 0, self.costs.mismatch_cost));
             }
-            return out;
+            return;
         }
         // Try switching to matching haps
         for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
@@ -634,7 +684,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
         // Always allow staying with a mismatch cost to avoid forced switching.
         out.push((hap, 0, self.costs.mismatch_cost));
-        out
     }
 
     #[inline]
