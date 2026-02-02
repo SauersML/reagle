@@ -2606,7 +2606,7 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    let mut target_positions: std::collections::HashSet<(crate::data::ChromIdx, u32)> =
+                    let mut target_positions: std::collections::HashSet<(String, u32)> =
                         std::collections::HashSet::with_capacity(
                             target_window.genotypes.n_markers(),
                         );
@@ -2615,13 +2615,24 @@ impl crate::pipelines::ImputationPipeline {
                             .genotypes
                             .markers()
                             .marker(MarkerIdx::new(m as u32));
-                        target_positions.insert((marker.chrom, marker.pos));
+                        let chrom_name = target_window
+                            .genotypes
+                            .markers()
+                            .chrom_name(marker.chrom)
+                            .unwrap_or("");
+                        target_positions
+                            .insert((normalize_chrom_local(chrom_name).to_string(), marker.pos));
                     }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
                         let ref_marker =
                             ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
+                        let ref_chrom = ref_window
+                            .markers
+                            .chrom_name(ref_marker.chrom)
+                            .unwrap_or("");
+                        let ref_key = (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
                         let is_present = target_idx.is_some()
-                            || target_positions.contains(&(ref_marker.chrom, ref_marker.pos));
+                            || target_positions.contains(&ref_key);
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
@@ -2830,7 +2841,7 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    let mut target_positions: std::collections::HashSet<(crate::data::ChromIdx, u32)> =
+                    let mut target_positions: std::collections::HashSet<(String, u32)> =
                         std::collections::HashSet::with_capacity(
                             target_window.genotypes.n_markers(),
                         );
@@ -2839,13 +2850,24 @@ impl crate::pipelines::ImputationPipeline {
                             .genotypes
                             .markers()
                             .marker(MarkerIdx::new(m as u32));
-                        target_positions.insert((marker.chrom, marker.pos));
+                        let chrom_name = target_window
+                            .genotypes
+                            .markers()
+                            .chrom_name(marker.chrom)
+                            .unwrap_or("");
+                        target_positions
+                            .insert((normalize_chrom_local(chrom_name).to_string(), marker.pos));
                     }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
                         let ref_marker =
                             ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
+                        let ref_chrom = ref_window
+                            .markers
+                            .chrom_name(ref_marker.chrom)
+                            .unwrap_or("");
+                        let ref_key = (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
                         let is_present = target_idx.is_some()
-                            || target_positions.contains(&(ref_marker.chrom, ref_marker.pos));
+                            || target_positions.contains(&ref_key);
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
