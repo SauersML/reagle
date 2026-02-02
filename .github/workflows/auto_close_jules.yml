@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   check-and-close:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Check and close PR if criteria met
         uses: actions/github-script@v7

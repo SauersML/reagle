@@ -30,7 +30,7 @@ jobs:
 
   # Job 2: Prepare test data (runs in parallel with build)
   prepare-data:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     env:
       KEEP_PHASED: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_phased == true }}
     steps:
@@ -81,7 +81,7 @@ jobs:
   # Job 2b: Prepare 5% chr22 data
   prepare-profile-data:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.phasing_only == true) }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     env:
       KEEP_PHASED: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_phased == true }}
     steps:
@@ -129,7 +129,7 @@ jobs:
   # Job 3: Run Beagle imputation (depends on prepare-data)
   impute-beagle:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.phasing_only == true) }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: prepare-data
     steps:
       - uses: actions/checkout@v4
@@ -161,7 +161,7 @@ jobs:
   # Job 3b: Run Beagle imputation (5% of chr22)
   impute-beagle-profile:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.phasing_only == true) }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: prepare-profile-data
     steps:
       - uses: actions/checkout@v4
@@ -203,7 +203,7 @@ jobs:
   # Job 4: Run Reagle imputation (builds and runs on same runner)
   impute-reagle:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.phasing_only == true) }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: [prepare-data]
     env:
       RUSTFLAGS: "-C target-cpu=native"
@@ -264,7 +264,7 @@ jobs:
   # Job 4b: Run Reagle imputation (5% of chr22)
   impute-reagle-profile:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.phasing_only == true) }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: [prepare-profile-data]
     env:
       RUSTFLAGS: "-C target-cpu=native"
@@ -322,7 +322,7 @@ jobs:
 
   # Job 4c: Phasing comparison (Reagle vs EagleImp vs SHAPEIT5)
   phasing-compare:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: [prepare-data]
     env:
       RUSTFLAGS: "-C target-cpu=native"
@@ -401,7 +401,7 @@ jobs:
         needs.impute-beagle.result == 'success' &&
         needs.impute-reagle.result == 'success'
       }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: [impute-beagle, impute-reagle]
     steps:
       - uses: actions/checkout@v4
@@ -466,7 +466,7 @@ jobs:
         needs.impute-beagle-profile.result == 'success' &&
         needs.impute-reagle-profile.result == 'success'
       }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: [impute-beagle-profile, impute-reagle-profile]
     steps:
       - uses: actions/checkout@v4

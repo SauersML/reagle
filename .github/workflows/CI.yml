@@ -13,7 +13,7 @@ on:
 
 jobs:
   build-java:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
 
@@ -33,7 +33,7 @@ jobs:
       run: jar cfe beagle.jar main.Main -C build/java .
 
   build-rust:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
 
