@@ -1913,6 +1913,30 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             })?;
 
             let packed_ref = PackedRefView::build(&target_gt, &ref_gt, alignment);
+
+            // Compute allele frequencies for TMRCA-aware beam scoring.
+            // For each hi-freq marker, compute (freq_allele0, freq_allele1) from reference.
+            let hi_freq_allele_freqs: Option<Vec<(f32, f32)>> = {
+                let n_ref_haps = packed_ref.n_ref_haps();
+                if n_ref_haps > 0 {
+                    Some(hi_freq_to_orig.iter().map(|&orig_m| {
+                        let mut count0 = 0u32;
+                        let mut count1 = 0u32;
+                        for h in 0..n_ref_haps {
+                            match packed_ref.ref_allele_targ(orig_m, h) {
+                                Some(0) => count0 += 1,
+                                Some(1) => count1 += 1,
+                                _ => {}
+                            }
+                        }
+                        let total = (count0 + count1).max(1) as f32;
+                        (count0 as f32 / total, count1 as f32 / total)
+                    }).collect())
+                } else {
+                    None
+                }
+            };
+
             let beam_config = BeamConfig::default();
         let beam_index = PbwtBeamIndex::build(
             &ref_gt,
@@ -1999,6 +2023,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         sp,
                         &hi_freq_to_orig,
                         &hi_freq_gen_positions,
+                        hi_freq_allele_freqs.as_deref(),
                         &packed_ref,
                         &self.params,
                     );
@@ -2693,6 +2718,28 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             );
             let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
 
+            // Compute allele frequencies for TMRCA-aware switch costs
+            let hi_freq_allele_freqs: Option<Vec<(f32, f32)>> = {
+                let n_ref_haps = packed_ref.n_ref_haps();
+                if n_ref_haps > 0 {
+                    Some(hi_freq_to_orig.iter().map(|&orig_m| {
+                        let mut count0 = 0u32;
+                        let mut count1 = 0u32;
+                        for h in 0..n_ref_haps {
+                            match packed_ref.ref_allele_targ(orig_m, h) {
+                                Some(0) => count0 += 1,
+                                Some(1) => count1 += 1,
+                                _ => {}
+                            }
+                        }
+                        let total = (count0 + count1).max(1) as f32;
+                        (count0 as f32 / total, count1 as f32 / total)
+                    }).collect())
+                } else {
+                    None
+                }
+            };
+
             let threaded_haps_vec = self.build_phasing_prescan_states(
                 target_gt,
                 &geno,
@@ -2728,6 +2775,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         sp,
                         &hi_freq_to_orig,
                         &hi_freq_gen_positions,
+                        hi_freq_allele_freqs.as_deref(),
                         &packed_ref,
                         &self.params,
                     );

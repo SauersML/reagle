@@ -697,10 +697,18 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         call_idx: usize,
         scratch: &mut BeamScratch,
     ) {
+        // Get allele frequencies for TMRCA-aware scoring.
+        let (hap1_freq, hap2_freq) = if swapped {
+            (call.a2_freq, call.a1_freq)
+        } else {
+            (call.a1_freq, call.a2_freq)
+        };
+
         self.repair_hap_for_allele_into(
             path.hap1,
             call.marker,
             hap1_al,
+            hap1_freq,
             call.fixed,
             active_pool,
             call.switch_cost,
@@ -711,6 +719,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             path.hap2,
             call.marker,
             hap2_al,
+            hap2_freq,
             call.fixed,
             active_pool,
             call.switch_cost,
@@ -748,6 +757,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         hap: usize,
         marker: MarkerIdx,
         targ_allele: u8,
+        targ_freq: f32,
         fixed: bool,
         active_pool: &ActivePool,
         switch_cost: i32,
@@ -756,13 +766,42 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     ) {
         out.clear();
         let marker_idx = marker.as_usize();
+
+        // LLR-based costs (optimal under Li-Stephens copying model):
+        //
+        // The log-likelihood ratio compares P(X|donor) vs P(X|null=population).
+        // For emission at marker m with target allele X:
+        //   LLR = log(P(X|donor)) - log(π(X))
+        //
+        // As costs (negative log-likelihood), we want:
+        //   match_cost(m) = -log(1-ε) + log(π(X))
+        //   mismatch_cost(m) = -log(ε) + log(π(X))
+        //
+        // The log(π(X)) term is the MAF adjustment. When π(X) is small (rare allele):
+        //   - log(π(X)) is negative, reducing cost → rare matches count more
+        //   - This is exactly what coalescent theory predicts
+        //
+        // Use f64 to avoid overflow, then saturate to i32.
+        let freq_adjustment = (targ_freq.max(1e-9) as f64).ln() * 1_000_000.0;
+        let effective_match_cost = ((self.costs.match_cost as f64) + freq_adjustment)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        let effective_mismatch_cost = ((self.costs.mismatch_cost as f64) + freq_adjustment)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+
+        // Switch cost: recombination penalty is already encoded in switch_cost.
+        // The optimal switch criterion compares LLR gain vs recombination penalty.
+        // No additional MAF term needed here - it's in the emission costs.
+        let effective_switch_cost = switch_cost;
+
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         if matches {
-            out.push((hap, 0, self.costs.match_cost));
+            out.push((hap, 0, effective_match_cost));
             // also allow a limited switch to a strong candidate for future-proofing
             for &h in active_pool.list().iter().rev().take(1) {
                 if h != hap && self.ref_allele_matches(marker_idx, h, targ_allele) {
-                    out.push((h, switch_cost, self.costs.match_cost));
+                    out.push((h, effective_switch_cost, effective_match_cost));
                 }
             }
             return;
@@ -771,21 +810,21 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             // For phased anchors, scan the full pool to ensure we honor the fixed allele.
             for &h in active_pool.list().iter().rev() {
                 if self.ref_allele_matches(marker_idx, h, targ_allele) {
-                    out.push((h, switch_cost, self.costs.match_cost));
+                    out.push((h, effective_switch_cost, effective_match_cost));
                     if out.len() >= self.config.switch_candidates {
                         break;
                     }
                 }
             }
             if out.is_empty() {
-                out.push((hap, 0, self.costs.mismatch_cost));
+                out.push((hap, 0, effective_mismatch_cost));
             }
             return;
         }
         // Try switching to matching haps
         for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
             if self.ref_allele_matches(marker_idx, h, targ_allele) {
-                out.push((h, switch_cost, self.costs.match_cost));
+                out.push((h, effective_switch_cost, effective_match_cost));
             }
             if out.len() >= self.config.switch_candidates {
                 break;
@@ -795,7 +834,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             sample_even_into(active_pool.list(), self.config.switch_candidates, spread);
             for &h in spread.iter() {
                 if self.ref_allele_matches(marker_idx, h, targ_allele) {
-                    out.push((h, switch_cost, self.costs.match_cost));
+                    out.push((h, effective_switch_cost, effective_match_cost));
                 }
                 if out.len() >= self.config.switch_candidates {
                     break;
@@ -803,7 +842,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
         }
         // Always allow staying with a mismatch cost to avoid forced switching.
-        out.push((hap, 0, self.costs.mismatch_cost));
+        // Mismatch cost is MAF-dependent: rare allele mismatch is more surprising.
+        out.push((hap, 0, effective_mismatch_cost));
     }
 
     #[inline]

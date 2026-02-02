@@ -113,6 +113,17 @@ impl PbwtQueryAllele {
     pub fn value(self) -> u8 {
         self.0
     }
+
+    /// Returns the allele value (0 or 1) if this is a valid allele query,
+    /// or None if it's a wildcard or missing.
+    #[inline]
+    pub fn as_allele(self) -> Option<u8> {
+        if self.0 <= 1 {
+            Some(self.0)
+        } else {
+            None
+        }
+    }
 }
 
 impl PbwtStrictAllele {

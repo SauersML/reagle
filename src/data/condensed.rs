@@ -20,6 +20,10 @@ pub struct CallSite {
     pub hi_idx: usize,
     pub a1: u8,
     pub a2: u8,
+    /// Frequency of allele a1 in the reference panel (for TMRCA-aware scoring).
+    pub a1_freq: f32,
+    /// Frequency of allele a2 in the reference panel (for TMRCA-aware scoring).
+    pub a2_freq: f32,
     pub switch_cost: i32,
     pub flip_cost: i32,
     pub fixed: bool,
@@ -33,10 +37,13 @@ pub struct CondensedTarget {
 
 impl CondensedTarget {
     /// Build condensed target for a single sample on hi-freq marker subset.
+    ///
+    /// `allele_freqs` contains (freq_allele0, freq_allele1) for each hi-freq marker.
     pub fn build<RefSpace>(
         sample_phase: &SamplePhase,
         hi_freq_to_orig: &[usize],
         hi_freq_gen_positions: &[f64],
+        allele_freqs: Option<&[(f32, f32)]>,
         packed_ref: &PackedRefView<RefSpace>,
         params: &ModelParams,
     ) -> Self {
@@ -80,11 +87,25 @@ impl CondensedTarget {
                     switch_cost.max(1_000_000)
                 };
 
+                // Get allele frequencies (default to 0.5 if not available).
+                let (a1_freq, a2_freq) = allele_freqs
+                    .and_then(|af| af.get(hi_idx))
+                    .map(|&(f0, f1)| {
+                        // Map target allele to reference frequency.
+                        // a1/a2 are 0 or 1, so f0 is freq of allele 0, f1 is freq of allele 1.
+                        let fa1 = if a1 == 0 { f0 } else { f1 };
+                        let fa2 = if a2 == 0 { f0 } else { f1 };
+                        (fa1.max(1e-6), fa2.max(1e-6))
+                    })
+                    .unwrap_or((0.5, 0.5));
+
                 call_sites.push(CallSite {
                     marker,
                     hi_idx,
                     a1,
                     a2,
+                    a1_freq,
+                    a2_freq,
                     switch_cost,
                     flip_cost,
                     fixed,
@@ -99,6 +120,7 @@ impl CondensedTarget {
             let seg = build_segment_mask(
                 sample_phase,
                 hi_freq_to_orig,
+                allele_freqs,
                 prev_hi,
                 cs.hi_idx,
                 packed_ref,
@@ -111,6 +133,7 @@ impl CondensedTarget {
         let trailing = build_segment_mask(
             sample_phase,
             hi_freq_to_orig,
+            allele_freqs,
             prev_hi,
             hi_freq_to_orig.len(),
             packed_ref,
@@ -155,6 +178,8 @@ impl CondensedTarget {
                 hi_idx: cs.hi_idx,
                 a1: cs.a1,
                 a2: cs.a2,
+                a1_freq: cs.a1_freq,
+                a2_freq: cs.a2_freq,
                 switch_cost,
                 flip_cost,
                 fixed: cs.fixed,
@@ -169,9 +194,23 @@ impl CondensedTarget {
     }
 }
 
+/// For segment mask constraints, we only hard-constrain on *minor* allele homozygotes.
+///
+/// Information-theoretic justification: a homozygous site for allele a provides
+/// information I(a) = -log₂(p(a)) bits about donor compatibility.
+///
+/// - When p(a) > 0.5 (major allele): I(a) < 1 bit. Most reference haplotypes match,
+///   so the constraint provides minimal discrimination and risks over-pruning.
+///
+/// - When p(a) < 0.5 (minor allele): I(a) > 1 bit. Fewer reference haplotypes match,
+///   so the constraint provides meaningful discrimination.
+///
+/// The p = 0.5 boundary is the information-theory neutral point, not a tuned threshold.
+
 fn build_segment_mask<RefSpace>(
     sample_phase: &SamplePhase,
     hi_freq_to_orig: &[usize],
+    allele_freqs: Option<&[(f32, f32)]>,
     start_hi: usize,
     end_hi: usize,
     packed_ref: &PackedRefView<RefSpace>,
@@ -192,13 +231,24 @@ fn build_segment_mask<RefSpace>(
             continue;
         }
         if a1 == a2 {
-            if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
-                mask_and_inplace(&mut mask, &tmp);
-                any_constraint = true;
+            // Only constrain on minor allele homozygotes (p < 0.5).
+            // Major allele homozygotes (p > 0.5) provide < 1 bit of information.
+            let allele_freq = allele_freqs
+                .and_then(|af| af.get(hi_idx))
+                .map(|&(f0, f1)| if a1 == 0 { f0 } else { f1 })
+                .unwrap_or(0.5);
+
+            // Constrain only if this is the minor allele (provides > 1 bit of info)
+            if allele_freq < 0.5 {
+                if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
+                    mask_and_inplace(&mut mask, &tmp);
+                    any_constraint = true;
+                }
             }
         } else if a1 <= 1 && a2 <= 1 {
             // If heterozygous and phased, constrain segment to match either allele.
             // This anchors local consistency across phased hets.
+            // For hets, both alleles must be present, so we always constrain.
             if !sample_phase.is_unphased(orig_m) {
                 let mut ok = false;
                 if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
