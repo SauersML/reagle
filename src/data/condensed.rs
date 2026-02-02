@@ -11,6 +11,7 @@ use crate::model::parameters::ModelParams;
 #[derive(Clone, Debug)]
 pub struct CondensedSegment {
     pub mask: Vec<u64>,
+    pub any_constraint: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +135,7 @@ fn build_segment_mask<RefSpace>(
     mask_all_ones(&mut mask, packed_ref.n_ref_haps());
 
     let mut tmp: Vec<u64> = vec![0u64; n_words];
+    let mut tmp2: Vec<u64> = vec![0u64; n_words];
     let mut any_constraint = false;
 
     for hi_idx in start_hi..end_hi {
@@ -148,6 +150,25 @@ fn build_segment_mask<RefSpace>(
                 mask_and_inplace(&mut mask, &tmp);
                 any_constraint = true;
             }
+        } else if a1 <= 1 && a2 <= 1 {
+            // If heterozygous and phased, constrain segment to match either allele.
+            // This anchors local consistency across phased hets.
+            if !sample_phase.is_unphased(orig_m) {
+                let mut ok = false;
+                if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
+                    ok = true;
+                }
+                if packed_ref.fill_match_mask(orig_m, a2, &mut tmp2) {
+                    ok = true;
+                }
+                if ok {
+                    for i in 0..mask.len().min(tmp.len()).min(tmp2.len()) {
+                        tmp[i] |= tmp2[i];
+                    }
+                    mask_and_inplace(&mut mask, &tmp);
+                    any_constraint = true;
+                }
+            }
         }
     }
 
@@ -155,5 +176,5 @@ fn build_segment_mask<RefSpace>(
         mask_all_ones(&mut mask, packed_ref.n_ref_haps());
     }
 
-    CondensedSegment { mask }
+    CondensedSegment { mask, any_constraint }
 }

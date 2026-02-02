@@ -100,7 +100,6 @@ pub struct BeamPath {
     pub last_swapped: bool,
     pub history_bits: u64,
     pub history_len: u8,
-    pub last_fixed: u8, // 0 = none, 1 = false, 2 = true
 }
 
 #[derive(Clone, Debug)]
@@ -418,7 +417,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     last_swapped: false,
                     history_bits: 0,
                     history_len: 0,
-                    last_fixed: 0,
                 });
                 if beam.len() >= self.config.beam_width {
                     return beam;
@@ -435,6 +433,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         switch_cost: i32,
     ) -> Vec<BeamPath> {
+        if !segment.any_constraint {
+            return beam.to_vec();
+        }
         let mut out: Vec<BeamPath> = Vec::with_capacity(beam.len());
         for path in beam {
             let hap1_candidates = self.repair_hap(path.hap1, &segment.mask, active_pool, switch_cost);
@@ -449,7 +450,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         last_swapped: path.last_swapped,
                         history_bits: path.history_bits,
                         history_len: path.history_len,
-                        last_fixed: path.last_fixed,
                     });
                 }
             }
@@ -532,12 +532,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         best_swapped: &mut [i32],
         call_idx: usize,
     ) {
-        if path.last_fixed != 0 {
-            let fixed_swapped = path.last_fixed == 2;
-            if swapped != fixed_swapped {
-                return;
-            }
-        }
         let hap1_candidates = self.repair_hap_for_allele(
             path.hap1,
             call.marker,
@@ -559,13 +553,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 let history = trie.push(path.history, swapped);
                 let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
                 let flip_penalty = if swapped != path.last_swapped { call.flip_cost } else { 0 };
-                let anchor_penalty = if path.last_fixed == 0 {
-                    0
-                } else {
-                    let fixed_swapped = path.last_fixed == 2;
-                    if swapped != fixed_swapped { call.flip_cost } else { 0 }
-                };
-                let score = score_no_flip + flip_penalty + anchor_penalty;
+                let score = score_no_flip + flip_penalty;
                 if swapped {
                     if score_no_flip < best_swapped[call_idx] {
                         best_swapped[call_idx] = score_no_flip;
@@ -574,11 +562,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     best_unswapped[call_idx] = score_no_flip;
                 }
                 let (history_bits, history_len) = push_history_bits(path.history_bits, path.history_len, swapped);
-                let last_fixed = if call.fixed {
-                    if swapped { 2 } else { 1 }
-                } else {
-                    path.last_fixed
-                };
                 out.push(BeamPath {
                     hap1: *h1,
                     hap2: *h2,
@@ -587,7 +570,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     last_swapped: swapped,
                     history_bits,
                     history_len,
-                    last_fixed,
                 });
             }
         }
