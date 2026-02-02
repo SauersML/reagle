@@ -671,11 +671,30 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         if haps.is_empty() {
             return;
         }
-        let mut set: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(haps.len());
+        let m = marker as i32;
+        if haps.len() <= 32 {
+            for (pos, hap) in self.ppa.iter().enumerate() {
+                let h = hap.to_usize() as u32;
+                let mut found = false;
+                for &cand in haps {
+                    if cand == h {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    let start = self.div.get(pos).copied().unwrap_or(m);
+                    let len = (m - start).max(0) as f32;
+                    out.push((h, pos, len));
+                }
+            }
+            return;
+        }
+        let mut set: std::collections::HashSet<u32> =
+            std::collections::HashSet::with_capacity(haps.len());
         for &h in haps {
             set.insert(h);
         }
-        let m = marker as i32;
         for (pos, hap) in self.ppa.iter().enumerate() {
             let h = hap.to_usize() as u32;
             if set.contains(&h) {
