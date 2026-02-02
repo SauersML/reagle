@@ -68,6 +68,7 @@ use crate::utils::telemetry::{Stage, TelemetryBlackboard};
 use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
+const HEURISTIC_MAX_MARKERS: usize = 500;
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
@@ -6690,10 +6691,113 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    // Initialize path with starting states from standard neighbor finding
+    // This gives the first iteration something to work with
+    let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
+    if initial_neighbors.is_empty() {
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MosaicPaths {
+                path1: Vec::new(),
+                path2: Vec::new(),
+            },
+        );
+    }
+
+    // Current set of neighbors (reused across markers within an MCMC step)
+    let mut neighbors = initial_neighbors;
+
+    // Inline heuristic: scan pairs of top neighbors to find a good starting pair
+    // This breaks symmetry and avoids "Mosaic Traps" where H1/H2 get stuck in local optima.
+    let mut heuristic_paths: Option<MosaicPaths> = None;
+
+    if initial_paths.is_none() && n_markers <= HEURISTIC_MAX_MARKERS && !neighbors.is_empty() {
+        let scan_count = neighbors.len().min(16);
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_pair: Option<(u32, u32)> = None;
+        let mut informative_markers = 0usize;
+
+        for m in 0..n_markers {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            if a1 != 255 && a2 != 255 {
+                informative_markers += 1;
+            }
+        }
+
+        if informative_markers > 0 {
+            for i in 0..scan_count {
+                let h1 = neighbors[i];
+                for j in 0..i {
+                    let h2 = neighbors[j];
+                    let mut score = 0.0f32;
+
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 && a2 == 255 { continue; }
+
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 { continue; }
+
+                        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                        let compatible = if is_het {
+                            (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                        } else {
+                            let obs = if a1 != 255 { a1 } else { a2 };
+                            r1 == obs || r2 == obs
+                        };
+
+                        if compatible {
+                            score += 1.0;
+                        } else {
+                            score -= 1.0;
+                        }
+                    }
+
+                    if score > best_score {
+                        best_score = score;
+                        best_pair = Some((h1, h2));
+                    }
+                }
+            }
+
+            if best_score >= 0.9 * (informative_markers as f32) {
+                if let Some((mut h1, mut h2)) = best_pair {
+                    // Enforce canonical orientation
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 != 255 && a2 != 255 && a1 != a2 {
+                            let ref1 = phase_ibs.allele(m, h1);
+                            let ref2 = phase_ibs.allele(m, h2);
+                            if ref1 != 255 && ref2 != 255 {
+                                if ref1 > ref2 {
+                                    std::mem::swap(&mut h1, &mut h2);
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    heuristic_paths = Some(MosaicPaths {
+                        path1: vec![h1; n_markers],
+                        path2: vec![h2; n_markers],
+                    });
+                }
+            }
+        }
+    }
+
+    let start_paths_ref = initial_paths.or(heuristic_paths.as_ref());
+
     // Seed alleles from initial paths if available (from heuristic)
     // This ensures MCMC starts in a high-probability region rather than drifting
     // from a random start.
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths_ref {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             for m in 0..n_markers {
                 let a1 = seq1[m];
@@ -6724,21 +6828,6 @@ fn sample_dynamic_mcmc(
         }
     }
 
-    // Initialize path with starting states from standard neighbor finding
-    // This gives the first iteration something to work with
-    let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
-    if initial_neighbors.is_empty() {
-        return (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            MosaicPaths {
-                path1: Vec::new(),
-                path2: Vec::new(),
-            },
-        );
-    }
-
     // Separate paths for H1 and H2 to avoid cross-talk in Gibbs sampling
     // Store reference hap IDs (for persistence) and local state indices (per step)
     let mut path1_ref = vec![0u32; n_markers];
@@ -6747,11 +6836,9 @@ fn sample_dynamic_mcmc(
     let mut path2_idx = vec![0u32; n_markers];
     let mut fixed_allele = vec![255u8; n_markers];
 
-    // Current set of neighbors (reused across markers within an MCMC step)
-    let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    if let Some(paths) = start_paths_ref {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
