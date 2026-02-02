@@ -568,6 +568,17 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
 
             // Call site branching (phase decisions)
             let mut next: Vec<BeamPath> = Vec::with_capacity(self.config.beam_width * 2);
+            let mut best_score = i32::MAX;
+            for p in &beam {
+                if p.score < best_score {
+                    best_score = p.score;
+                }
+            }
+            let cutoff = if self.config.prune_tolerance > 0 {
+                best_score.saturating_add(self.config.prune_tolerance)
+            } else {
+                i32::MAX
+            };
             for path in &beam {
                 self.expand_call_site(
                     path,
@@ -578,6 +589,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     &mut logsum_unswapped,
                     &mut logsum_swapped,
                     i,
+                    cutoff,
                     &mut scratch,
                 );
             }
@@ -851,16 +863,17 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         logsum_unswapped: &mut [f64],
         logsum_swapped: &mut [f64],
         call_idx: usize,
+        cutoff: i32,
         scratch: &mut BeamScratch,
     ) {
         let a1 = call.a1;
         let a2 = call.a2;
 
         if call.fixed {
-            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, scratch);
+            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, cutoff, scratch);
         } else {
-            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, scratch);
-            self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, scratch);
+            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, cutoff, scratch);
+            self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, cutoff, scratch);
         }
     }
 
@@ -877,6 +890,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         logsum_unswapped: &mut [f64],
         logsum_swapped: &mut [f64],
         call_idx: usize,
+        cutoff: i32,
         scratch: &mut BeamScratch,
     ) {
         // Get allele frequencies for TMRCA-aware scoring.
@@ -942,15 +956,17 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     logsum_unswapped[call_idx] = logaddexp(logsum_unswapped[call_idx], logp);
                 }
                 let (history_bits, history_len) = push_history_bits(path.history_bits, path.history_len, swapped);
-                out.push(BeamPath {
-                    hap1: *h1,
-                    hap2: *h2,
-                    score,
-                    history,
-                    last_swapped: swapped,
-                    history_bits,
-                    history_len,
-                });
+                if score <= cutoff {
+                    out.push(BeamPath {
+                        hap1: *h1,
+                        hap2: *h2,
+                        score,
+                        history,
+                        last_swapped: swapped,
+                        history_bits,
+                        history_len,
+                    });
+                }
             }
         }
     }
