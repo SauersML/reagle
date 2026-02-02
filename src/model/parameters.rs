@@ -74,7 +74,8 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let raw_intensity = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = raw_intensity.min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -244,7 +245,8 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // Multiply by 100.0 to convert from cM^-1 (since sum_gen_dist is in cM) to Morgan^-1
+        Some((100.0 * self.sum_expected_switches / self.sum_gen_dist) as f32)
     }
 
     /// Estimate mismatch probability
@@ -325,11 +327,30 @@ mod tests {
 
     #[test]
     fn test_recomb_intensity_formula() {
-        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
+        let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
+        // Should be 0.04 * 100_000 / 1000 = 4.0
+        let expected = 0.04 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_recomb_intensity_clamping() {
+        // High Ne should trigger clamping
+        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
+        // Formula gives 40.0, but should clamp to 5.0
+        assert!((params.recomb_intensity - ModelParams::MAX_RECOMB_INTENSITY).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_param_estimates_scaling() {
+        let mut estimates = ParamEstimates::new();
+        // 1 switch in 1 Morgan (100 cM)
+        estimates.add_switch(100.0, 1.0);
+
+        let rate = estimates.recomb_intensity().unwrap();
+        // Rate should be 1.0 (switches per Morgan)
+        assert!((rate - 1.0).abs() < 0.0001);
     }
 
     #[test]
