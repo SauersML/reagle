@@ -36,20 +36,13 @@ impl Default for BeamConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct BeamCosts {
-    pub match_cost: i32,
-    pub mismatch_cost: i32,
     pub p_err: f64,
 }
 
 impl BeamCosts {
     pub fn from_params(params: &ModelParams) -> Self {
         let p_err = params.p_mismatch.max(1e-9).min(1.0 - 1e-9);
-        let p_ok = (1.0 - p_err).max(1e-9);
-        let match_cost = (-p_ok.ln() * 1_000_000.0).round() as i32;
-        let mismatch_cost = (-p_err.ln() * 1_000_000.0).round() as i32;
         Self {
-            match_cost,
-            mismatch_cost,
             p_err: p_err as f64,
         }
     }
