@@ -68,6 +68,11 @@ jobs:
       run: |
         cargo build --verbose
 
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bcftools tabix curl
+
     - name: Run Rust Tests
       run: |
         cargo test --release --verbose

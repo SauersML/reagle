@@ -408,6 +408,51 @@ fn build_record_index(records: &[ParsedRecord]) -> HashMap<(String, u64), usize>
         .collect()
 }
 
+fn build_record_index_multi(records: &[ParsedRecord]) -> HashMap<(String, u64), Vec<usize>> {
+    let mut idx: HashMap<(String, u64), Vec<usize>> = HashMap::new();
+    for (i, rec) in records.iter().enumerate() {
+        idx.entry((rec.chrom.clone(), rec.pos)).or_default().push(i);
+    }
+    idx
+}
+
+fn match_record_by_alleles<'a>(
+    idx: &HashMap<(String, u64), Vec<usize>>,
+    records: &'a [ParsedRecord],
+    chrom: &str,
+    pos: u64,
+    ref_allele: &str,
+    alt_alleles: &[String],
+) -> Option<(&'a ParsedRecord, bool)> {
+    let candidates = idx.get(&(chrom.to_string(), pos))?;
+    if alt_alleles.len() == 1 {
+        let alt = &alt_alleles[0];
+        for &i in candidates {
+            let rec = records.get(i)?;
+            if rec.alt_alleles.len() != 1 {
+                continue;
+            }
+            let rec_alt = &rec.alt_alleles[0];
+            if rec.ref_allele == ref_allele && rec_alt == alt {
+                return Some((rec, false));
+            }
+            if rec.ref_allele == *alt && rec_alt == ref_allele {
+                return Some((rec, true));
+            }
+        }
+        None
+    } else {
+        for &i in candidates {
+            let rec = records.get(i)?;
+            if rec.ref_allele == ref_allele && rec.alt_alleles == alt_alleles {
+                return Some((rec, false));
+            }
+        }
+        None
+    }
+}
+
+
 /// Count phase switches between two phased genotype vectors
 ///
 /// A phase switch occurs when the haplotype assignment flips relative
@@ -4255,15 +4300,17 @@ fn test_dosage_by_distance_from_genotyped() {
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
     let (_, truth_records) = parse_vcf(&truth_path);
-    let truth_map: HashMap<u64, &ParsedRecord> = truth_records.iter().map(|r| (r.pos, r)).collect();
-    let truth_idx = build_record_index(&truth_records);
+    let truth_idx = build_record_index_multi(&truth_records);
+    let rust_idx = build_record_index_multi(&rust_records);
 
     // Find genotyped marker positions
-    let genotyped_positions: Vec<u64> = java_records
+    let mut genotyped_positions: Vec<u64> = java_records
         .iter()
         .filter(|r| !r.info.contains_key("IMP"))
         .map(|r| r.pos)
         .collect();
+    genotyped_positions.sort_unstable();
+    genotyped_positions.dedup();
 
     println!(
         "Found {} genotyped markers, {} total markers",
@@ -4275,7 +4322,18 @@ fn test_dosage_by_distance_from_genotyped() {
     // pos, distance, mean_abs_error_java, mean_abs_error_rust per marker
     let mut distance_data: Vec<(u64, u64, f64, f64)> = Vec::new();
 
-    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+    for j_rec in &java_records {
+        let Some((r_rec, rust_swap)) = match_record_by_alleles(
+            &rust_idx,
+            &rust_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let _ = rust_swap;
         let is_imputed = j_rec.info.contains_key("IMP");
 
         let distance = if is_imputed {
@@ -4294,18 +4352,18 @@ fn test_dosage_by_distance_from_genotyped() {
             0 // Genotyped marker
         };
 
-        let truth_rec = match truth_map.get(&j_rec.pos) {
-            Some(r) => *r,
-            None => continue,
+        let Some((truth_rec, truth_swap)) = match_record_by_alleles(
+            &truth_idx,
+            &truth_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
         };
-        let swap_java = truth_idx
-            .get(&(j_rec.chrom.clone(), j_rec.pos))
-            .and_then(|i| truth_records.get(*i))
-            .and_then(|t| is_biallelic_swap(t, j_rec));
-        let swap_rust = truth_idx
-            .get(&(r_rec.chrom.clone(), r_rec.pos))
-            .and_then(|i| truth_records.get(*i))
-            .and_then(|t| is_biallelic_swap(t, r_rec));
+        let swap_java = truth_swap;
+        let swap_rust = truth_swap;
 
         let mut java_err = 0.0;
         let mut rust_err = 0.0;
@@ -4319,17 +4377,25 @@ fn test_dosage_by_distance_from_genotyped() {
             if s >= truth_rec.genotypes.len() {
                 continue;
             }
-            let truth_ds = match gt_to_dosage(&truth_rec.genotypes[s].gt) {
-                Some(ds) => ds,
-                None => continue,
+            let Some((a0, a1)) = gt_to_alleles(&truth_rec.genotypes[s].gt) else {
+                continue;
             };
-            let mut java_ds = j_gt.ds.or_else(|| gt_to_dosage(&j_gt.gt));
-            let mut rust_ds = r_gt.ds.or_else(|| gt_to_dosage(&r_gt.gt));
-            if let (Some(ds), Some(true)) = (java_ds, swap_java) {
-                java_ds = Some(map_ds_for_swap(ds, true));
+            let truth_ds = (a0 as f64) + (a1 as f64);
+            let mut java_ds = j_gt.ds.or_else(|| {
+                gt_to_alleles(&j_gt.gt).map(|(b0, b1)| (b0 as f64) + (b1 as f64))
+            });
+            let mut rust_ds = r_gt.ds.or_else(|| {
+                gt_to_alleles(&r_gt.gt).map(|(b0, b1)| (b0 as f64) + (b1 as f64))
+            });
+            if let Some(ds) = java_ds {
+                if swap_java {
+                    java_ds = Some(map_ds_for_swap(ds, true));
+                }
             }
-            if let (Some(ds), Some(true)) = (rust_ds, swap_rust) {
-                rust_ds = Some(map_ds_for_swap(ds, true));
+            if let Some(ds) = rust_ds {
+                if swap_rust {
+                    rust_ds = Some(map_ds_for_swap(ds, true));
+                }
             }
             let (Some(j_ds), Some(r_ds)) = (java_ds, rust_ds) else {
                 continue;
@@ -5881,13 +5947,11 @@ fn run_imputation_vs_ground_truth_comparison(source: &TestDataSource) {
 
     // Load ground truth from full target
     let (_, truth_records) = parse_vcf(&source.target_vcf);
-    let truth_by_pos: HashMap<u64, &ParsedRecord> =
-        truth_records.iter().map(|r| (r.pos, r)).collect();
+    let truth_idx = build_record_index_multi(&truth_records);
 
     // Load sparse target to know which positions were masked
     let (_, sparse_records) = parse_vcf(&source.target_sparse_vcf);
-    let sparse_positions: std::collections::HashSet<u64> =
-        sparse_records.iter().map(|r| r.pos).collect();
+    let sparse_idx = build_record_index_multi(&sparse_records);
 
     // Run Rust imputation
     let rust_out = work_dir.path().join("rust_imp");
@@ -5915,33 +5979,167 @@ fn run_imputation_vs_ground_truth_comparison(source: &TestDataSource) {
     let (_, java_records) = parse_vcf(&java_vcf);
 
     // Helper to count large errors
-    let count_large_errors = |records: &[ParsedRecord]| -> usize {
+    let count_large_errors = |records: &[ParsedRecord]| -> (usize, HashMap<(String, u64, String, String), usize>) {
         let mut count = 0;
+        let mut by_marker: HashMap<(String, u64, String, String), usize> = HashMap::new();
         for rec in records {
-            if sparse_positions.contains(&rec.pos) {
+            if match_record_by_alleles(
+                &sparse_idx,
+                &sparse_records,
+                &rec.chrom,
+                rec.pos,
+                &rec.ref_allele,
+                &rec.alt_alleles,
+            )
+            .is_some()
+            {
                 continue;
             }
-            let Some(truth_rec) = truth_by_pos.get(&rec.pos) else {
+            let Some((truth_rec, truth_swap)) = match_record_by_alleles(
+                &truth_idx,
+                &truth_records,
+                &rec.chrom,
+                rec.pos,
+                &rec.ref_allele,
+                &rec.alt_alleles,
+            ) else {
                 continue;
             };
+            if rec.alt_alleles.len() != 1 {
+                continue;
+            }
             for (imp_gt, truth_gt) in rec.genotypes.iter().zip(truth_rec.genotypes.iter()) {
-                let imputed_ds = imp_gt.ds.unwrap_or(0.0);
-                let true_ds = gt_to_dosage(&truth_gt.gt).unwrap_or(0.0);
-                if (imputed_ds - true_ds).abs() >= 0.9 {
+                let Some((a0, a1)) = gt_to_alleles(&truth_gt.gt) else {
+                    continue;
+                };
+                let imputed_ds = imp_gt.ds.or_else(|| {
+                    gt_to_alleles(&imp_gt.gt).map(|(b0, b1)| (b0 as f64) + (b1 as f64))
+                });
+                let Some(ds) = imputed_ds else {
+                    continue;
+                };
+                let ds = map_ds_for_swap(ds, truth_swap);
+                let true_ds = (a0 as f64) + (a1 as f64);
+                if (ds - true_ds).abs() >= 0.9 {
                     count += 1;
+                    by_marker
+                        .entry((
+                            rec.chrom.clone(),
+                            rec.pos,
+                            rec.ref_allele.clone(),
+                            rec.alt_alleles[0].clone(),
+                        ))
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
                 }
             }
         }
-        count
+        (count, by_marker)
     };
 
-    let rust_large_errors = count_large_errors(&rust_records);
-    let java_large_errors = count_large_errors(&java_records);
+    let (rust_large_errors, rust_by_marker) = count_large_errors(&rust_records);
+    let (java_large_errors, java_by_marker) = count_large_errors(&java_records);
 
     eprintln!(
         "[{}] Large errors (≥0.9): Rust={}, Java={}",
         source.name, rust_large_errors, java_large_errors
     );
+
+    let mut rust_only: Vec<((String, u64, String, String), usize)> = rust_by_marker
+        .iter()
+        .filter(|(k, _)| !java_by_marker.contains_key(*k))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    rust_only.sort_by(|a, b| b.1.cmp(&a.1));
+    if !rust_only.is_empty() {
+        eprintln!(
+            "[{}] Rust-only large-error markers (showing up to 5):",
+            source.name
+        );
+        for (i, (key, count)) in rust_only.iter().take(5).enumerate() {
+            eprintln!(
+                "  {}: {}:{} {}>{} count={}",
+                i + 1,
+                key.0,
+                key.1,
+                key.2,
+                key.3,
+                count
+            );
+        }
+        let (key, _) = &rust_only[0];
+        let (chrom, pos, ref_a, alt_a) = key;
+        let rust_idx = build_record_index_multi(&rust_records);
+        let java_idx = build_record_index_multi(&java_records);
+        if let Some((truth_rec, truth_swap)) = match_record_by_alleles(
+            &truth_idx,
+            &truth_records,
+            chrom,
+            *pos,
+            ref_a,
+            &[alt_a.clone()],
+        ) {
+            let rust_rec = match_record_by_alleles(
+                &rust_idx,
+                &rust_records,
+                chrom,
+                *pos,
+                ref_a,
+                &[alt_a.clone()],
+            )
+            .map(|(r, _)| r);
+            let java_rec = match_record_by_alleles(
+                &java_idx,
+                &java_records,
+                chrom,
+                *pos,
+                ref_a,
+                &[alt_a.clone()],
+            )
+            .map(|(r, _)| r);
+            if let (Some(rust_rec), Some(java_rec)) = (rust_rec, java_rec) {
+                eprintln!(
+                    "[{}] Rust-only marker detail {}:{} {}>{}",
+                    source.name, chrom, pos, ref_a, alt_a
+                );
+                for (s, ((truth_gt, rust_gt), java_gt)) in truth_rec
+                    .genotypes
+                    .iter()
+                    .zip(rust_rec.genotypes.iter())
+                    .zip(java_rec.genotypes.iter())
+                    .enumerate()
+                {
+                    let Some((a0, a1)) = gt_to_alleles(&truth_gt.gt) else {
+                        continue;
+                    };
+                    let truth_ds = (a0 as f64) + (a1 as f64);
+                    let rust_ds = rust_gt.ds.or_else(|| {
+                        gt_to_alleles(&rust_gt.gt).map(|(b0, b1)| (b0 as f64) + (b1 as f64))
+                    });
+                    let java_ds = java_gt.ds.or_else(|| {
+                        gt_to_alleles(&java_gt.gt).map(|(b0, b1)| (b0 as f64) + (b1 as f64))
+                    });
+                    let Some(r_ds) = rust_ds else { continue; };
+                    let Some(j_ds) = java_ds else { continue; };
+                    let r_ds = map_ds_for_swap(r_ds, truth_swap);
+                    let j_ds = map_ds_for_swap(j_ds, truth_swap);
+                    let r_err = (r_ds - truth_ds).abs();
+                    let j_err = (j_ds - truth_ds).abs();
+                    if r_err >= 0.9 && j_err < 0.9 {
+                        eprintln!(
+                            "  sample {} truth={} rust_ds={:.3} java_ds={:.3} rust_gt={} java_gt={}",
+                            s,
+                            truth_gt.gt,
+                            r_ds,
+                            j_ds,
+                            rust_gt.gt,
+                            java_gt.gt
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     assert!(
         rust_large_errors <= java_large_errors,

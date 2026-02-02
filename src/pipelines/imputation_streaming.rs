@@ -1064,6 +1064,7 @@ fn compute_per_window_cap(
     n_threads: usize,
     safe_bytes_per_thread: u64,
     force_full_panel: bool,
+    desired_cap: Option<usize>,
 ) -> usize {
     let mut per_window_cap_window = if force_full_panel {
         n_ref_haps.max(1)
@@ -1088,8 +1089,13 @@ fn compute_per_window_cap(
         }
         cap
     };
-    let cap = n_ref_haps.max(1);
-    per_window_cap_window = per_window_cap_window.min(cap).max(1);
+    let mut cap = n_ref_haps.max(1);
+    if let Some(requested) = desired_cap {
+        cap = requested.max(1).min(n_ref_haps.max(1));
+        per_window_cap_window = cap;
+    } else {
+        per_window_cap_window = per_window_cap_window.min(cap).max(1);
+    }
     per_window_cap_window
 }
 
@@ -1102,6 +1108,7 @@ fn prepare_reference_data(
     n_threads: usize,
     safe_bytes_per_thread: u64,
     force_full_panel: bool,
+    desired_cap: Option<usize>,
 ) -> Result<ReferenceData> {
     let memory_budget = if available_bytes == 0 {
         0u64
@@ -1186,6 +1193,7 @@ fn prepare_reference_data(
                 n_threads,
                 safe_bytes_per_thread,
                 force_full_panel,
+                desired_cap,
             );
             per_window_caps.push(per_window_cap_window);
 
@@ -2369,6 +2377,11 @@ impl crate::pipelines::ImputationPipeline {
             bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPrescan);
             bb.set_op("Imputation prescan: reference prep");
         }
+        let desired_cap = if self.config.imp_states > 0 {
+            Some(self.config.imp_states)
+        } else {
+            None
+        };
         let ref_data = prepare_reference_data(
             &ref_path,
             &streaming_config,
@@ -2378,6 +2391,7 @@ impl crate::pipelines::ImputationPipeline {
             n_threads,
             safe_bytes_per_thread,
             prescan_force_full_panel,
+            desired_cap,
         )?;
 
         match &ref_data {

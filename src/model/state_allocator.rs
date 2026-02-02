@@ -282,6 +282,14 @@ pub fn allocate_lms_sparse(
             intervals_by_hap: Vec::new(),
         };
     }
+    let per_window_min = per_window_caps.iter().copied().min().unwrap_or(0);
+    if per_window_min >= n && total_budget >= n.saturating_mul(w) {
+        let intervals_by_hap = candidate_haps
+            .iter()
+            .map(|&h| (h, vec![(0u32, w as u32)]))
+            .collect();
+        return WindowAllocation { intervals_by_hap };
+    }
     let mut intervals_by_hap: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
     let mut counts = vec![0usize; w];
     let mut z_w = vec![0.0f32; w]; // log(1)
