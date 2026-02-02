@@ -244,7 +244,7 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        Some((100.0 * self.sum_expected_switches / self.sum_gen_dist) as f32)
     }
 
     /// Estimate mismatch probability
