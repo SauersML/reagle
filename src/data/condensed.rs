@@ -175,17 +175,18 @@ impl CondensedTarget {
         // Build segments between call sites (including leading/trailing).
         let mut prev_hi = 0usize;
         for cs in call_sites.iter() {
+            let end_hi = (cs.hi_idx + 1).min(hi_freq_to_orig.len());
             let seg = build_segment_mask(
                 sample_phase,
                 hi_freq_to_orig,
                 allele_freqs,
                 prev_hi,
-                cs.hi_idx,
+                end_hi,
                 packed_ref,
                 n_words,
             );
             segments.push(seg);
-            prev_hi = cs.hi_idx + 1;
+            prev_hi = end_hi;
         }
         // trailing segment after last call site
         let trailing = build_segment_mask(
