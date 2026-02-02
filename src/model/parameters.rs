@@ -48,7 +48,7 @@ impl ModelParams {
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
     /// Maximum recombination intensity
-    pub const MAX_RECOMB_INTENSITY: f32 = 5.0;
+    pub const MAX_RECOMB_INTENSITY: f32 = 15.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
@@ -244,7 +244,8 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // Convert cM^-1 to Morgan^-1 by multiplying by 100.0
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability
@@ -383,5 +384,16 @@ mod tests {
 
         assert!((e1.sum_gen_dist - 0.8).abs() < 0.0001);
         assert_eq!(e1.n_switch_obs(), 2);
+    }
+
+    #[test]
+    fn test_param_estimates_recomb_intensity_scaling() {
+        let mut e = ParamEstimates::new();
+        // 1 switch over 1.0 cM genetic distance
+        // Intensity should be 1 switch / 0.01 Morgans = 100 switches / Morgan
+        e.add_switch(1.0, 1.0);
+
+        let intensity = e.recomb_intensity().unwrap();
+        assert!((intensity - 100.0).abs() < 0.001, "Expected 100.0, got {}", intensity);
     }
 }
