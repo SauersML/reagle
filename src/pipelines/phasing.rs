@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -78,8 +78,8 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_FORCE_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -6747,6 +6747,103 @@ fn sample_dynamic_mcmc(
     let mut path2_idx = vec![0u32; n_markers];
     let mut fixed_allele = vec![255u8; n_markers];
 
+    // INLINE HEURISTIC: Pairwise consistency check for small windows
+    // Used to initialize H1/H2 paths if no external paths provided
+    if n_markers <= 500 && initial_paths.is_none() {
+        let informative_markers = het_positions.len() as f32;
+        if informative_markers > 0.0 {
+            let threshold = 0.9 * informative_markers;
+            let check_limit = 16.min(initial_neighbors.len());
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_pair = (0, 0);
+
+            for i in 0..check_limit {
+                let h1 = initial_neighbors[i];
+                for j in 0..i {
+                    let h2 = initial_neighbors[j];
+
+                    let mut score = 0.0f32;
+                    // Score consistency with seq1/seq2
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 || a2 == 255 { continue; }
+
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 { continue; }
+
+                        let compatible = if a1 != a2 {
+                            // Het
+                            (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                        } else {
+                            // Hom
+                            r1 == a1 && r2 == a2
+                        };
+
+                        if compatible {
+                             score += 1.0;
+                        } else {
+                             score -= 1.0;
+                        }
+                    }
+
+                    if score > best_score {
+                        best_score = score;
+                        best_pair = (i, j);
+                    }
+                }
+            }
+
+            if best_score >= threshold {
+                let h1_idx = initial_neighbors[best_pair.0];
+                let h2_idx = initial_neighbors[best_pair.1];
+
+                // Determine orientation to minimize mismatches against seq1
+                let mut direct_matches = 0;
+                let mut flip_matches = 0;
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    if a1 == 255 { continue; }
+                    let r1 = phase_ibs.allele(m, h1_idx);
+                    let r2 = phase_ibs.allele(m, h2_idx);
+
+                    if r1 == a1 { direct_matches += 1; }
+                    if r2 == a1 { flip_matches += 1; }
+                }
+
+                let (final_h1, final_h2) = if direct_matches >= flip_matches {
+                    (h1_idx, h2_idx)
+                } else {
+                    (h2_idx, h1_idx)
+                };
+
+                // Initialize alleles
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+
+                    // If homozygous or missing, use genotype (already set).
+                    // If het, use reference alleles if possible.
+                    if a1 != 255 && a2 != 255 && a1 != a2 {
+                         let r1 = phase_ibs.allele(m, final_h1);
+                         let r2 = phase_ibs.allele(m, final_h2);
+
+                         // If ref alleles match the genotype alleles (in either order), use ref phase
+                         if (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1) {
+                             h1_alleles[m] = r1;
+                             h2_alleles[m] = r2;
+                         }
+                    }
+                }
+
+                // Initialize paths (used for MCMC neighbors)
+                path1_ref.fill(final_h1);
+                path2_ref.fill(final_h2);
+            }
+        }
+    }
+
     // Current set of neighbors (reused across markers within an MCMC step)
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
@@ -7638,7 +7735,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
 
-    if !has_anchor {
+    if !has_anchor && start_paths.is_none() {
         let flipped_paths =
             if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
                 Some(MosaicPaths {

@@ -2211,6 +2211,8 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
             "1",
             "--nthreads",
             "1",
+            "--ne",
+            "1000",
         ],
     )
     .expect("Rust phasing failed (low states)");
@@ -2231,6 +2233,8 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
             "1",
             "--nthreads",
             "1",
+            "--ne",
+            "1000",
         ],
     )
     .expect("Rust phasing failed (high states)");
