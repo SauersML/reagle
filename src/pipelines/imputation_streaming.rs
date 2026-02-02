@@ -3067,17 +3067,21 @@ impl crate::pipelines::ImputationPipeline {
             let chrom = ref_markers
                 .marker(MarkerIdx::new(0))
                 .chrom;
+            let min_cluster_cm = (self.config.cluster as f64).max(1e-8);
             if let Some(gen_map) = gen_maps.get(chrom) {
-                // External map: use Beagle-style minimum distance derived from the map.
-                crate::data::genetic_map::MarkerMap::create(ref_markers, gen_map)
+                // External map: enforce a minimum distance based on the cluster
+                // parameter to avoid near-zero recombination in dense regions.
+                crate::data::genetic_map::MarkerMap::from_gen_map_with_min_dist(
+                    ref_markers,
+                    gen_map,
+                    min_cluster_cm,
+                )
             } else {
-                // No external map: use linear map (1 cM per Mb) with a tiny
-                // minimum distance to avoid zero genetic distance. This mirrors
-                // Beagle's MIN_CM_DIST behavior without inflating recombination.
-                let min_dist = 1e-7_f64;
+                // No external map: use linear map (1 cM per Mb) with a minimum
+                // distance derived from the cluster parameter.
                 crate::data::genetic_map::MarkerMap::from_positions_with_min_dist(
                     ref_markers,
-                    min_dist,
+                    min_cluster_cm,
                 )
             }
         };
@@ -3234,7 +3238,19 @@ impl crate::pipelines::ImputationPipeline {
 
         let target_samples = target_win.samples_arc();
         let target_pl_matrix = target_pl.unwrap_or(target_win);
-        let err_rate = self.params.p_mismatch.clamp(1e-6, 0.5);
+        let genotyped_fraction = (alignment
+            .ref_to_target
+            .iter()
+            .filter(|v| v.is_some())
+            .count() as f32
+            / n_ref_markers.max(1) as f32)
+            .clamp(0.0, 1.0);
+        let err_floor = if genotyped_fraction < 0.01 {
+            0.005f32
+        } else {
+            self.params.p_mismatch
+        };
+        let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let build_input_probs_pair = |hap1: HapIdx, hap2: HapIdx, sample_idx: usize| -> (TargetAlleleProbs, TargetAlleleProbs) {
             let mut offsets1 = Vec::with_capacity(n_ref_markers + 1);
             let mut offsets2 = Vec::with_capacity(n_ref_markers + 1);
@@ -3749,7 +3765,6 @@ impl crate::pipelines::ImputationPipeline {
                             error_rate,
                             prior_marker_idx,
                             state_priors.as_deref(),
-                            plan.n_ref_haps,
                             &ref_allele_freqs,
                             ws,
                         )
@@ -3770,7 +3785,7 @@ impl crate::pipelines::ImputationPipeline {
                     (posteriors, next_priors, stats)
                 };
 
-                let prior_error = (*prior_error_rate).clamp(1e-6, 0.5);
+                let prior_error = (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5);
                 let (mut post1_full, mut p1_out, stats1) =
                     process_haplotype(h1_idx, priors_h1, &input_probs_h1, prior_error);
                 let (mut post2_full, mut p2_out, stats2) =

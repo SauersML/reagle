@@ -20,6 +20,57 @@ pub struct EmStats {
     pub informative_sites: f64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::transition_only_forward_update;
+
+    #[test]
+    fn test_recomb_mass_subset_sums_to_one() {
+        let transition_haps = 50usize;
+        let recomb_rate = 0.02f32;
+
+        let mut fwd = vec![1.0 / transition_haps as f32; transition_haps];
+
+        let fwd_sum: f32 = fwd.iter().sum();
+        transition_only_forward_update(&mut fwd, fwd_sum, recomb_rate, transition_haps);
+
+        let sum: f32 = fwd.iter().sum();
+        println!(
+            "[subset mass] n_states={} r={:.4} sum={:.6}",
+            transition_haps, recomb_rate, sum
+        );
+
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "Expected subset mass 1.0, got {:.6}",
+            sum
+        );
+    }
+
+    #[test]
+    fn test_recomb_mass_full_panel_sums_to_one() {
+        let n_total = 200usize;
+        let n_states = 200usize;
+        let recomb_rate = 0.02f32;
+
+        let mut fwd = vec![1.0 / n_states as f32; n_states];
+        let fwd_sum: f32 = fwd.iter().sum();
+        transition_only_forward_update(&mut fwd, fwd_sum, recomb_rate, n_states);
+
+        let sum: f32 = fwd.iter().sum();
+        println!(
+            "[full-panel mass] n_states={} n_total={} r={:.4} sum={:.6}",
+            n_states, n_total, recomb_rate, sum
+        );
+
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "Expected full-panel mass 1.0, got {:.6}",
+            sum
+        );
+    }
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 
@@ -654,7 +705,7 @@ fn transition_only_forward_update(
     fwd: &mut [f32],
     fwd_sum: f32,
     recomb_rate: f32,
-    total_ref_haps: usize,
+    transition_haps: usize,
 ) -> f32 {
     if fwd.is_empty() {
         return 0.0;
@@ -664,8 +715,8 @@ fn transition_only_forward_update(
     }
     let denom = fwd_sum.max(1e-30);
     let scale = (1.0 - recomb_rate) / denom;
-    let shift = if total_ref_haps > 0 {
-        recomb_rate / total_ref_haps as f32
+    let shift = if transition_haps > 0 {
+        recomb_rate / transition_haps as f32
     } else {
         0.0
     };
@@ -682,7 +733,7 @@ fn transition_only_forward_update(
 fn transition_only_backward_update(
     bwd: &mut [f32],
     recomb_rate: f32,
-    total_ref_haps: usize,
+    transition_haps: usize,
 ) {
     if bwd.is_empty() || recomb_rate <= 0.0 {
         return;
@@ -691,8 +742,8 @@ fn transition_only_backward_update(
     for v in bwd.iter() {
         sum += *v;
     }
-    let shift = if total_ref_haps > 0 {
-        (recomb_rate / total_ref_haps as f32) * sum
+    let shift = if transition_haps > 0 {
+        (recomb_rate / transition_haps as f32) * sum
     } else {
         0.0
     };
@@ -733,7 +784,6 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
-    total_ref_haps: usize,
     ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
     ws: &mut ImputeWorkspace,
 ) -> (Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats) {
@@ -742,14 +792,12 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    let transition_haps = active_states.max(1);
     if active_states > 0 {
         // Li-Stephens transition for full panel:
-        //   P(switch to h_j) = r / N
-        // For subset K (with abyss), modeled switch mass is:
-        //   sum_{j in K} r/N = r * K/N
-        // Remaining mass r * (N-K)/N represents recombination to unmodeled haplotypes (abyss).
-        // Therefore we keep weights=1.0 (no scaling). Scaling by N/K would force a
-        // closed-universe model that consumes all recombination mass inside K.
+        //   P(switch to h_j) = r / K
+        // We condition the HMM on the active subset, so recombination mass is
+        // fully distributed inside K (closed-universe).
         ws.weights.fill(1.0);
     }
 
@@ -810,7 +858,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                         &mut ws.fwd[..active_states],
                         fwd_sum,
                         recomb_rate,
-                        total_ref_haps.max(1),
+                        transition_haps,
                     );
                 } else {
                     let ref_alleles = refresh_ref_alleles(
@@ -833,7 +881,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                                 &mut ws.fwd,
                                 fwd_sum,
                                 recomb_rate,
-                                total_ref_haps.max(1),
+                                transition_haps,
                                 &ws.weights,
                                 &ws.emissions,
                                 active_states,
@@ -849,7 +897,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                             &mut ws.fwd,
                             fwd_sum,
                             recomb_rate,
-                            total_ref_haps.max(1),
+                            transition_haps,
                             &ws.weights,
                             &ws.emissions,
                             active_states,
@@ -993,7 +1041,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                     transition_only_backward_update(
                         &mut ws.bwd[..active_states],
                         recomb_rate,
-                        total_ref_haps.max(1),
+                        transition_haps,
                     );
                 } else {
                     fill_emissions(
@@ -1037,8 +1085,8 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                     }
                     let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
                     let scale = (1.0 - recomb_rate) / c_t;
-                    let shift = if total_ref_haps > 0 {
-                        (recomb_rate / total_ref_haps as f32) * (emit_beta_sum / c_t)
+                    let shift = if transition_haps > 0 {
+                        (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
                     } else {
                         0.0
                     };
@@ -1072,7 +1120,6 @@ fn run_impute_hmm_seqcoded<Space>(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
-    total_ref_haps: usize,
     ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
     ws: &mut ImputeWorkspace,
 ) -> (Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats) {
@@ -1081,6 +1128,7 @@ fn run_impute_hmm_seqcoded<Space>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    let transition_haps = active_states.max(1);
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
@@ -1132,7 +1180,7 @@ fn run_impute_hmm_seqcoded<Space>(
                         &mut ws.fwd[..active_states],
                         fwd_sum,
                         recomb_rate,
-                        total_ref_haps.max(1),
+                        transition_haps,
                     );
                 } else {
                     let _ = fill_pattern_emissions(
@@ -1153,7 +1201,7 @@ fn run_impute_hmm_seqcoded<Space>(
                                 &mut ws.fwd,
                                 fwd_sum,
                                 recomb_rate,
-                                total_ref_haps.max(1),
+                                transition_haps,
                                 &ws.weights,
                                 &ws.emissions,
                                 active_states,
@@ -1169,7 +1217,7 @@ fn run_impute_hmm_seqcoded<Space>(
                             &mut ws.fwd,
                             fwd_sum,
                             recomb_rate,
-                            total_ref_haps.max(1),
+                            transition_haps,
                             &ws.weights,
                             &ws.emissions,
                             active_states,
@@ -1307,7 +1355,7 @@ fn run_impute_hmm_seqcoded<Space>(
                     transition_only_backward_update(
                         &mut ws.bwd[..active_states],
                         recomb_rate,
-                        total_ref_haps.max(1),
+                        transition_haps,
                     );
                 } else {
                     let mismatch_prob = fill_pattern_emissions(
@@ -1353,8 +1401,8 @@ fn run_impute_hmm_seqcoded<Space>(
                     }
                     let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
                     let scale = (1.0 - recomb_rate) / c_t;
-                    let shift = if total_ref_haps > 0 {
-                        (recomb_rate / total_ref_haps as f32) * (emit_beta_sum / c_t)
+                    let shift = if transition_haps > 0 {
+                        (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
                     } else {
                         0.0
                     };
@@ -1388,7 +1436,6 @@ fn run_impute_hmm_dict<Space>(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
-    total_ref_haps: usize,
     ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
     ws: &mut ImputeWorkspace,
 ) -> (Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats) {
@@ -1397,6 +1444,7 @@ fn run_impute_hmm_dict<Space>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    let transition_haps = active_states.max(1);
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
@@ -1440,7 +1488,7 @@ fn run_impute_hmm_dict<Space>(
                         &mut ws.fwd[..active_states],
                         fwd_sum,
                         recomb_rate,
-                        total_ref_haps.max(1),
+                        transition_haps,
                     );
                 } else {
                     let col = &ref_columns[m];
@@ -1469,7 +1517,7 @@ fn run_impute_hmm_dict<Space>(
                                 &mut ws.fwd,
                                 fwd_sum,
                                 recomb_rate,
-                                total_ref_haps.max(1),
+                                transition_haps,
                                 &ws.weights,
                                 &ws.emissions,
                                 active_states,
@@ -1485,7 +1533,7 @@ fn run_impute_hmm_dict<Space>(
                             &mut ws.fwd,
                             fwd_sum,
                             recomb_rate,
-                            total_ref_haps.max(1),
+                            transition_haps,
                             &ws.weights,
                             &ws.emissions,
                             active_states,
@@ -1624,7 +1672,7 @@ fn run_impute_hmm_dict<Space>(
                     transition_only_backward_update(
                         &mut ws.bwd[..active_states],
                         recomb_rate,
-                        total_ref_haps.max(1),
+                        transition_haps,
                     );
                 } else {
                     let mismatch_prob = fill_pattern_emissions(
@@ -1670,8 +1718,8 @@ fn run_impute_hmm_dict<Space>(
                     }
                     let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
                     let scale = (1.0 - recomb_rate) / c_t;
-                    let shift = if total_ref_haps > 0 {
-                        (recomb_rate / total_ref_haps as f32) * (emit_beta_sum / c_t)
+                    let shift = if transition_haps > 0 {
+                        (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
                     } else {
                         0.0
                     };
@@ -1708,7 +1756,6 @@ pub fn run_impute_hmm<Space>(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
-    total_ref_haps: usize,
     ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
     ws: &mut ImputeWorkspace,
 ) -> (Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats) {
@@ -1721,7 +1768,6 @@ pub fn run_impute_hmm<Space>(
             error_rate,
             prior_marker_idx,
             state_priors,
-            total_ref_haps,
             ref_allele_freqs,
             ws,
         );
@@ -1746,7 +1792,6 @@ pub fn run_impute_hmm<Space>(
             error_rate,
             prior_marker_idx,
             state_priors,
-            total_ref_haps,
             ref_allele_freqs,
             ws,
         );
@@ -1771,7 +1816,6 @@ pub fn run_impute_hmm<Space>(
             error_rate,
             prior_marker_idx,
             state_priors,
-            total_ref_haps,
             ref_allele_freqs,
             ws,
         );
@@ -1796,7 +1840,6 @@ pub fn run_impute_hmm<Space>(
             error_rate,
             prior_marker_idx,
             state_priors,
-            total_ref_haps,
             ref_allele_freqs,
             ws,
         );
@@ -1824,7 +1867,6 @@ pub fn run_impute_hmm<Space>(
             error_rate,
             prior_marker_idx,
             state_priors,
-            total_ref_haps,
             ref_allele_freqs,
             ws,
         );
@@ -1838,7 +1880,6 @@ pub fn run_impute_hmm<Space>(
         error_rate,
         prior_marker_idx,
         state_priors,
-        total_ref_haps,
         ref_allele_freqs,
         ws,
     )

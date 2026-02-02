@@ -8664,6 +8664,9 @@ mod tests {
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
         pipeline.params =
             ModelParams::for_phasing(ref_gt.n_haplotypes() + 2, 10000.0, Some(0.0001));
+        pipeline
+            .params
+            .set_n_states(pipeline.config.phase_states.min(ref_gt.n_haplotypes()));
 
         let threaded = pipeline
             .build_phasing_prescan_states(
@@ -8680,6 +8683,16 @@ mod tests {
             .expect("prescan");
 
         let th = &threaded[0];
+        let expected_states = pipeline
+            .config
+            .phase_states
+            .min(ref_gt.n_haplotypes())
+            .max(1);
+        assert_eq!(
+            th.n_states(),
+            expected_states,
+            "ThreadedHaps state count should match phase_states cap"
+        );
         let mut state_buf = vec![CombinedHapId::from(0u32); th.n_states()];
         let offset = target_geno.n_haps() as u32;
         let mut expected: Vec<u32> = (0..ref_gt.n_haplotypes())
@@ -9226,6 +9239,9 @@ mod tests {
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
         pipeline.params =
             ModelParams::for_phasing(ref_gt.n_haplotypes() + 2, 10000.0, Some(0.0001));
+        pipeline
+            .params
+            .set_n_states(pipeline.config.phase_states.min(ref_gt.n_haplotypes()));
 
         let threaded = pipeline
             .build_phasing_prescan_states(
@@ -9241,6 +9257,16 @@ mod tests {
             )
             .expect("prescan");
         let th = &threaded[0];
+        let expected_states = pipeline
+            .config
+            .phase_states
+            .min(ref_gt.n_haplotypes())
+            .max(1);
+        assert_eq!(
+            th.n_states(),
+            expected_states,
+            "ThreadedHaps state count should match phase_states cap"
+        );
         let mut state_buf = vec![CombinedHapId::from(0u32); th.n_states()];
         let offset = target_geno.n_haps() as u32;
         let mut expected: Vec<u32> = (0..ref_gt.n_haplotypes())

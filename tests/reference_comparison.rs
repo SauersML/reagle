@@ -2873,6 +2873,84 @@ fn run_rust_imputation(
     pipeline.run()
 }
 
+/// Helper to run Rust imputation pipeline with a custom error rate.
+fn run_rust_imputation_with_err(
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    err: f32,
+) -> reagle::Result<()> {
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+        "--gp",
+        "--err",
+        &err.to_string(),
+    ]);
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
+/// Helper to run Rust imputation pipeline with a custom Ne.
+fn run_rust_imputation_with_ne(
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    ne: i64,
+) -> reagle::Result<()> {
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+        "--gp",
+        "--ne",
+        &ne.to_string(),
+    ]);
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
+/// Helper to run Rust imputation pipeline with a custom cluster size.
+fn run_rust_imputation_with_cluster(
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    cluster: f32,
+) -> reagle::Result<()> {
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+        "--gp",
+        "--cluster",
+        &cluster.to_string(),
+    ]);
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
 /// Helper to run Rust imputation pipeline with map/window settings.
 fn run_rust_imputation_with_map(
     gt_path: &Path,
@@ -6287,6 +6365,348 @@ fn test_imputed_af_collapse_against_java() {
         collapse.is_empty(),
         "AF collapse detected for {} imputed markers",
         collapse.len()
+    );
+}
+
+/// Test: AF collapse should diminish when mismatch error rate increases.
+#[test]
+#[serial]
+fn test_imputed_af_collapse_sensitivity_to_err() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    println!("\n{}", "=".repeat(70));
+    println!("=== AF Collapse Sensitivity to Err (Rust vs Java) ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &test_files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", target_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+
+    let rust_low_out = work_dir.path().join("rust_err_low");
+    let rust_high_out = work_dir.path().join("rust_err_high");
+    run_rust_imputation_with_err(&target_vcf, &ref_vcf, &rust_low_out, 42, 1e-4)
+        .expect("Rust imputation failed (low err)");
+    run_rust_imputation_with_err(&target_vcf, &ref_vcf, &rust_high_out, 42, 1e-2)
+        .expect("Rust imputation failed (high err)");
+
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_low_records) = parse_vcf(&work_dir.path().join("rust_err_low.vcf.gz"));
+    let (_, rust_high_records) = parse_vcf(&work_dir.path().join("rust_err_high.vcf.gz"));
+    let rust_low_idx = build_record_index_multi(&rust_low_records);
+    let rust_high_idx = build_record_index_multi(&rust_high_records);
+
+    let mut collapse_low = 0usize;
+    let mut collapse_high = 0usize;
+    for j_rec in &java_records {
+        if !j_rec.info.contains_key("IMP") {
+            continue;
+        }
+        let java_af: f64 = j_rec
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if java_af < 0.05 {
+            continue;
+        }
+        let Some((r_low, _)) = match_record_by_alleles(
+            &rust_low_idx,
+            &rust_low_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let Some((r_high, _)) = match_record_by_alleles(
+            &rust_high_idx,
+            &rust_high_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let rust_low_af: f64 = r_low
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let rust_high_af: f64 = r_high
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if rust_low_af <= 0.01 {
+            collapse_low += 1;
+        }
+        if rust_high_af <= 0.01 {
+            collapse_high += 1;
+        }
+    }
+
+    println!(
+        "AF collapse counts: err=1e-4 -> {}, err=1e-2 -> {}",
+        collapse_low, collapse_high
+    );
+
+    assert!(
+        collapse_high < collapse_low,
+        "AF collapse did not improve with higher err: low={}, high={}",
+        collapse_low,
+        collapse_high
+    );
+}
+
+/// Test: AF collapse should diminish when recombination rate increases (higher Ne).
+#[test]
+#[serial]
+fn test_imputed_af_collapse_sensitivity_to_ne() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    println!("\n{}", "=".repeat(70));
+    println!("=== AF Collapse Sensitivity to Ne (Rust vs Java) ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &test_files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", target_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+
+    let rust_low_out = work_dir.path().join("rust_ne_low");
+    let rust_high_out = work_dir.path().join("rust_ne_high");
+    run_rust_imputation_with_ne(&target_vcf, &ref_vcf, &rust_low_out, 42, 10000)
+        .expect("Rust imputation failed (low ne)");
+    run_rust_imputation_with_ne(&target_vcf, &ref_vcf, &rust_high_out, 42, 200000)
+        .expect("Rust imputation failed (high ne)");
+
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_low_records) = parse_vcf(&work_dir.path().join("rust_ne_low.vcf.gz"));
+    let (_, rust_high_records) = parse_vcf(&work_dir.path().join("rust_ne_high.vcf.gz"));
+    let rust_low_idx = build_record_index_multi(&rust_low_records);
+    let rust_high_idx = build_record_index_multi(&rust_high_records);
+
+    let mut collapse_low = 0usize;
+    let mut collapse_high = 0usize;
+    for j_rec in &java_records {
+        if !j_rec.info.contains_key("IMP") {
+            continue;
+        }
+        let java_af: f64 = j_rec
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if java_af < 0.05 {
+            continue;
+        }
+        let Some((r_low, _)) = match_record_by_alleles(
+            &rust_low_idx,
+            &rust_low_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let Some((r_high, _)) = match_record_by_alleles(
+            &rust_high_idx,
+            &rust_high_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let rust_low_af: f64 = r_low
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let rust_high_af: f64 = r_high
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if rust_low_af <= 0.01 {
+            collapse_low += 1;
+        }
+        if rust_high_af <= 0.01 {
+            collapse_high += 1;
+        }
+    }
+
+    println!(
+        "AF collapse counts: ne=10000 -> {}, ne=200000 -> {}",
+        collapse_low, collapse_high
+    );
+
+    assert!(
+        collapse_high < collapse_low,
+        "AF collapse did not improve with higher ne: low={}, high={}",
+        collapse_low,
+        collapse_high
+    );
+}
+
+/// Test: AF collapse should diminish when minimum cluster distance increases.
+#[test]
+#[serial]
+fn test_imputed_af_collapse_sensitivity_to_cluster() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    println!("\n{}", "=".repeat(70));
+    println!("=== AF Collapse Sensitivity to Cluster (Rust vs Java) ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &test_files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", target_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+
+    let rust_low_out = work_dir.path().join("rust_cluster_low");
+    let rust_high_out = work_dir.path().join("rust_cluster_high");
+    run_rust_imputation_with_cluster(&target_vcf, &ref_vcf, &rust_low_out, 42, 0.005)
+        .expect("Rust imputation failed (cluster low)");
+    run_rust_imputation_with_cluster(&target_vcf, &ref_vcf, &rust_high_out, 42, 0.1)
+        .expect("Rust imputation failed (cluster high)");
+
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_low_records) = parse_vcf(&work_dir.path().join("rust_cluster_low.vcf.gz"));
+    let (_, rust_high_records) = parse_vcf(&work_dir.path().join("rust_cluster_high.vcf.gz"));
+    let rust_low_idx = build_record_index_multi(&rust_low_records);
+    let rust_high_idx = build_record_index_multi(&rust_high_records);
+
+    let mut collapse_low = 0usize;
+    let mut collapse_high = 0usize;
+    for j_rec in &java_records {
+        if !j_rec.info.contains_key("IMP") {
+            continue;
+        }
+        let java_af: f64 = j_rec
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if java_af < 0.05 {
+            continue;
+        }
+        let Some((r_low, _)) = match_record_by_alleles(
+            &rust_low_idx,
+            &rust_low_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let Some((r_high, _)) = match_record_by_alleles(
+            &rust_high_idx,
+            &rust_high_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let rust_low_af: f64 = r_low
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let rust_high_af: f64 = r_high
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if rust_low_af <= 0.01 {
+            collapse_low += 1;
+        }
+        if rust_high_af <= 0.01 {
+            collapse_high += 1;
+        }
+    }
+
+    println!(
+        "AF collapse counts: cluster=0.005 -> {}, cluster=0.1 -> {}",
+        collapse_low, collapse_high
+    );
+
+    assert!(
+        collapse_high < collapse_low,
+        "AF collapse did not improve with larger cluster: low={}, high={}",
+        collapse_low,
+        collapse_high
     );
 }
 
