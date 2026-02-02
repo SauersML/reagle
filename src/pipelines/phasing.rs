@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -78,8 +78,9 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_FORCE_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -9129,7 +9130,7 @@ mod tests {
                     .partial_cmp(&dense_merge_buffer[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let take = PBWT_FORCE_TOP_HAPS.min(touched_indices.len());
+            let take = 32.min(touched_indices.len());
             for &h in touched_indices.iter().take(take) {
                 if !selected.contains(&h) {
                     selected.push(h);
@@ -9197,7 +9198,7 @@ mod tests {
                 }
                 let mut idxs: Vec<usize> = (0..n_ref_haps).collect();
                 idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
-                let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
+                let take = 512.min(idxs.len());
                 for &h in idxs.iter().take(take) {
                     if !selected.contains(&h) {
                         selected.push(h);
