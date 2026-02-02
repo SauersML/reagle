@@ -80,6 +80,7 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 8;
 const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -6751,7 +6752,102 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    let mut heuristic_paths: Option<MosaicPaths> = None;
+    if initial_paths.is_none() && n_markers <= HEURISTIC_MAX_MARKERS {
+        let candidates = if neighbors.len() > 16 {
+            &neighbors[..16]
+        } else {
+            &neighbors
+        };
+
+        if candidates.len() >= 2 {
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_pair = (0, 0);
+            let mut best_flipped = false;
+            let mut informative_markers = 0usize;
+
+            for m in 0..n_markers {
+                if seq1[m] != 255 && seq2[m] != 255 {
+                    informative_markers += 1;
+                }
+            }
+
+            if informative_markers > 0 {
+                let threshold = 0.9 * informative_markers as f32;
+
+                for (i, &h1) in candidates.iter().enumerate() {
+                    for (j, &h2) in candidates.iter().enumerate() {
+                        if i >= j {
+                            continue;
+                        }
+
+                        let mut score_direct = 0i32;
+                        let mut score_flip = 0i32;
+
+                        for m in 0..n_markers {
+                            let a1 = seq1[m];
+                            let a2 = seq2[m];
+                            if a1 == 255 || a2 == 255 {
+                                continue;
+                            }
+
+                            let r1 = phase_ibs.allele(m, h1);
+                            let r2 = phase_ibs.allele(m, h2);
+                            if r1 == 255 || r2 == 255 {
+                                continue;
+                            }
+
+                            if r1 == a1 && r2 == a2 {
+                                score_direct += 1;
+                            } else {
+                                score_direct -= 1;
+                            }
+
+                            if r1 == a2 && r2 == a1 {
+                                score_flip += 1;
+                            } else {
+                                score_flip -= 1;
+                            }
+                        }
+
+                        let (max_score, flipped) = if score_flip > score_direct {
+                            (score_flip, true)
+                        } else {
+                            (score_direct, false)
+                        };
+
+                        if max_score as f32 > best_score {
+                            best_score = max_score as f32;
+                            best_pair = (h1, h2);
+                            best_flipped = flipped;
+                        }
+                    }
+                }
+
+                if best_score > threshold {
+                    let (h1, h2) = best_pair;
+                    let (p1, p2) = if best_flipped { (h2, h1) } else { (h1, h2) };
+                    heuristic_paths = Some(MosaicPaths {
+                        path1: vec![p1; n_markers],
+                        path2: vec![p2; n_markers],
+                    });
+                    tracing::debug!(
+                        "[dynamic_mcmc] heuristic init: markers={} informative={} score={:.1} pair=({},{}) flipped={}",
+                        n_markers,
+                        informative_markers,
+                        best_score,
+                        h1,
+                        h2,
+                        best_flipped
+                    );
+                }
+            }
+        }
+    }
+
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
