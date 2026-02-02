@@ -111,20 +111,6 @@ impl CondensedTarget {
         );
         segments.push(trailing);
 
-        if call_sites.is_empty() {
-            // No hets: still create one segment covering all.
-            if segments.is_empty() {
-                let seg = build_segment_mask(
-                    sample_phase,
-                    hi_freq_to_orig,
-                    0,
-                    hi_freq_to_orig.len(),
-                    packed_ref,
-                    n_words,
-                );
-                segments.push(seg);
-            }
-        }
 
         Self { segments, call_sites }
     }

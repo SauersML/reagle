@@ -135,6 +135,24 @@ impl ActivePool {
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
+
+    pub fn promote(&mut self, hap: usize) {
+        if hap >= self.n_ref {
+            return;
+        }
+        let w = hap / 64;
+        let b = hap % 64;
+        if ((self.bitset[w] >> b) & 1) == 0 {
+            self.add(hap);
+            return;
+        }
+        if let Some(pos) = self.list.iter().position(|&h| h == hap) {
+            if pos + 1 != self.list.len() {
+                let h = self.list.remove(pos);
+                self.list.push(h);
+            }
+        }
+    }
 }
 
 pub trait BeamInjector {
@@ -432,9 +450,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         switch_cost: i32,
     ) -> Vec<(usize, i32)> {
         let mut out: Vec<(usize, i32)> = Vec::new();
-        if mask_bit_is_set(mask, hap) {
+        let hap_ok = mask_bit_is_set(mask, hap);
+        if hap_ok {
             out.push((hap, 0));
-            return out;
         }
         // switch to most recently injected candidates first
         for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
@@ -445,7 +463,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 break;
             }
         }
-        if mask_bit_is_set(mask, hap) && out.len() < 2 {
+        if hap_ok && out.len() < 2 {
             // allow a limited exploratory switch even if current hap is consistent
             for &h in active_pool.list().iter().rev().take(2) {
                 if h != hap && mask_bit_is_set(mask, h) {

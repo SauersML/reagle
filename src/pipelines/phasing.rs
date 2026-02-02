@@ -1976,7 +1976,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 }
                 scored.sort_by(|a, b| b.0.cmp(&a.0));
                 for &(_, h) in scored.iter().take(4) {
-                    active_pool.add(h);
+                    active_pool.promote(h);
                 }
 
                     let condensed = CondensedTarget::build(
