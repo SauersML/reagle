@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -78,8 +78,8 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_FORCE_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -7182,7 +7182,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
+    let threshold = 0.9 * (informative as f32);
     if best_score < threshold || n_markers > 500 {
         return None;
     }
@@ -7666,8 +7666,37 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
+        // Chain alignment: check if chain 2 is anti-aligned with chain 1
+        // Centered probability dot product: sum((p1 - 0.5) * (p2 - 0.5))
+        let mut dot_product = 0.0f32;
+        let mut aligned_obs = 0usize;
+
         for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
+            if obs_counts[i] > 0 && obs_counts2[i] > 0 {
+                let p1 = (swap_counts[i] as f32 + 0.5) / (obs_counts[i] as f32 + 1.0);
+                let p2 = (swap_counts2[i] as f32 + 0.5) / (obs_counts2[i] as f32 + 1.0);
+                dot_product += (p1 - 0.5) * (p2 - 0.5);
+                aligned_obs += 1;
+            }
+        }
+
+        let flip_chain2 = dot_product < 0.0;
+        if aligned_obs > 0 {
+            tracing::debug!(
+                "Mosaic chain alignment: dot_product={:.4} ({} sites), flip={}",
+                dot_product,
+                aligned_obs,
+                flip_chain2
+            );
+        }
+
+        for i in 0..het_positions.len() {
+            let s2 = if flip_chain2 {
+                obs_counts2[i].saturating_sub(swap_counts2[i])
+            } else {
+                swap_counts2[i]
+            };
+            swap_counts[i] = swap_counts[i].saturating_add(s2);
             obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
         }
     }
