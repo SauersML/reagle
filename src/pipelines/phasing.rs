@@ -7666,8 +7666,31 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
+        let mut dot_prod = 0.0f32;
+        let mut n_overlap = 0usize;
         for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
+            if obs_counts[i] > 0 && obs_counts2[i] > 0 {
+                let p1 = (swap_counts[i] as f32) / (obs_counts[i] as f32);
+                let p2 = (swap_counts2[i] as f32) / (obs_counts2[i] as f32);
+                let c1 = p1 - 0.5;
+                let c2 = p2 - 0.5;
+                dot_prod += c1 * c2;
+                n_overlap += 1;
+            }
+        }
+
+        let flip_second_chain = n_overlap > 0 && dot_prod < 0.0;
+        if flip_second_chain {
+            eprintln!("[mosaic] flipping secondary chain (dot_prod={:.4})", dot_prod);
+        }
+
+        for i in 0..het_positions.len() {
+            let s2 = if flip_second_chain {
+                obs_counts2[i].saturating_sub(swap_counts2[i])
+            } else {
+                swap_counts2[i]
+            };
+            swap_counts[i] = swap_counts[i].saturating_add(s2);
             obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
         }
     }
