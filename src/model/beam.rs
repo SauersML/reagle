@@ -17,6 +17,7 @@ pub struct BeamConfig {
     pub switch_candidates: usize,
     pub inject_interval: usize,
     pub inject_k: usize,
+    pub active_pool_ttl: u32,
     pub collapse_gap: i32,
     pub prune_tolerance: i32,
 }
@@ -28,6 +29,7 @@ impl Default for BeamConfig {
             switch_candidates: 8,
             inject_interval: 8,
             inject_k: 16,
+            active_pool_ttl: 0,
             collapse_gap: 5_000_000, // in fixed-point cost units
             prune_tolerance: 30_000_000,
         }
@@ -81,6 +83,7 @@ pub struct ActivePool {
     n_ref: usize,
     list: Vec<usize>,
     bitset: Vec<u64>,
+    last_seen: Vec<u32>,
     pbwt_cluster0: Vec<u16>,
     pbwt_cluster1: Vec<u16>,
     pbwt_cluster_size0: Vec<f32>,
@@ -98,6 +101,7 @@ impl ActivePool {
             n_ref,
             list: Vec::new(),
             bitset: vec![0u64; n_words],
+            last_seen: vec![0u32; n_ref],
             pbwt_cluster0: vec![u16::MAX; n_ref],
             pbwt_cluster1: vec![u16::MAX; n_ref],
             pbwt_cluster_size0: vec![0.0; n_ref],
@@ -120,6 +124,14 @@ impl ActivePool {
         }
         self.bitset[w] |= 1u64 << b;
         self.list.push(hap);
+    }
+
+    pub fn touch(&mut self, hap: usize, version: u32) {
+        if hap >= self.n_ref {
+            return;
+        }
+        self.last_seen[hap] = version;
+        self.add(hap);
     }
 
     pub fn list(&self) -> &[usize] {
@@ -146,6 +158,28 @@ impl ActivePool {
                 self.list.push(h);
             }
         }
+    }
+
+    pub fn sweep(&mut self, version: u32, max_age: u32) {
+        if self.list.is_empty() {
+            return;
+        }
+        let mut write = 0usize;
+        for i in 0..self.list.len() {
+            let hap = self.list[i];
+            let age = version.saturating_sub(self.last_seen[hap]);
+            if age <= max_age {
+                if write != i {
+                    self.list[write] = hap;
+                }
+                write += 1;
+            } else {
+                let w = hap / 64;
+                let b = hap % 64;
+                self.bitset[w] &= !(1u64 << b);
+            }
+        }
+        self.list.truncate(write);
     }
 
     #[inline]
@@ -448,14 +482,14 @@ impl<'a> BeamInjector for PbwtInjector<'a> {
         if let Some(list) = self.index.donor_meta0[idx].as_ref() {
             for m in list.iter().take(self.k) {
                 let hap = m.hap as usize;
-                active_pool.add(hap);
+                active_pool.touch(hap, version);
                 active_pool.set_pbwt_meta(0, hap, m.cluster_id, m.cluster_size, m.match_len_markers, version);
             }
         }
         if let Some(list) = self.index.donor_meta1[idx].as_ref() {
             for m in list.iter().take(self.k) {
                 let hap = m.hap as usize;
-                active_pool.add(hap);
+                active_pool.touch(hap, version);
                 active_pool.set_pbwt_meta(1, hap, m.cluster_id, m.cluster_size, m.match_len_markers, version);
             }
         }
@@ -558,6 +592,14 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             } else if self.beam_collapsed(&beam) {
                 injector.maybe_inject(i, call.hi_idx, call.marker, active_pool);
             }
+            let ttl = if self.config.active_pool_ttl > 0 {
+                self.config.active_pool_ttl
+            } else if inject_interval > 0 {
+                (inject_interval.saturating_mul(4)) as u32
+            } else {
+                16
+            };
+            active_pool.sweep(call.hi_idx as u32, ttl);
 
             // Call site branching (phase decisions)
             let mut next: Vec<BeamPath> = Vec::with_capacity(self.config.beam_width * 2);
@@ -1363,9 +1405,13 @@ fn sample_even_into(list: &[usize], n: usize, out: &mut Vec<usize>) {
 }
 
 fn push_history_bits(prev_bits: u64, prev_len: u8, swapped: bool) -> (u64, u8) {
-    const HISTORY_BITS: u8 = 32;
+    const HISTORY_BITS: u8 = 64;
     let bit = if swapped { 1u64 } else { 0u64 };
-    let bits = ((prev_bits << 1) | bit) & ((1u64 << HISTORY_BITS) - 1);
+    let bits = if HISTORY_BITS >= 64 {
+        (prev_bits << 1) | bit
+    } else {
+        ((prev_bits << 1) | bit) & ((1u64 << HISTORY_BITS) - 1)
+    };
     let len = if prev_len < HISTORY_BITS { prev_len + 1 } else { HISTORY_BITS };
     (bits, len)
 }
