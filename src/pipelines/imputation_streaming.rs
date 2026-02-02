@@ -3969,7 +3969,21 @@ impl crate::pipelines::ImputationPipeline {
                         let w = (sm_total_info[hap_idx] / min_info_nats).clamp(0.0, 1.0);
                         if n_alleles <= 2 {
                             let donor_mean = if donor_candidates.is_empty() {
-                                freq_prior
+                                let donor = current_donor[hap_idx];
+                                let allele = col.get(HapIdx::new(donor));
+                                if allele <= 1 {
+                                    allele as f32
+                                } else {
+                                    freq_prior
+                                }
+                            } else if w >= 0.5 {
+                                let donor = current_donor[hap_idx];
+                                let allele = col.get(HapIdx::new(donor));
+                                if allele <= 1 {
+                                    allele as f32
+                                } else {
+                                    freq_prior
+                                }
                             } else {
                                 let mut alt_sum = 0u32;
                                 for &cand in &donor_candidates {
@@ -4322,6 +4336,11 @@ impl crate::pipelines::ImputationPipeline {
                     hap1_posts = posts;
                     p1_out = out;
                     update_error_rate(&stats, prior_error_rate);
+                } else if has_priors_h1 {
+                    if let Some(p) = priors_h1 {
+                        hap1_posts = posts_from_priors(p);
+                        p1_out = p.clone();
+                    }
                 } else {
                     let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
                     if total > 0 {
@@ -4350,6 +4369,11 @@ impl crate::pipelines::ImputationPipeline {
                     hap2_posts = posts;
                     p2_out = out;
                     update_error_rate(&stats, prior_error_rate);
+                } else if has_priors_h2 {
+                    if let Some(p) = priors_h2 {
+                        hap2_posts = posts_from_priors(p);
+                        p2_out = p.clone();
+                    }
                 } else {
                     let total: u32 = donors_h2.iter().map(|(_, c)| *c).sum();
                     if total > 0 {
