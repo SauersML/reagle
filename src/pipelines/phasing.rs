@@ -7666,8 +7666,29 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
+        // Align chain 2 to chain 1 to prevent cancellation of symmetric modes
+        let mut dot_prod = 0i64;
         for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
+            if obs_counts[i] > 0 && obs_counts2[i] > 0 {
+                // Centered vote: (2*swap - obs). Positive = Swap, Negative = No Swap.
+                let v1 = (2 * swap_counts[i] as i64) - obs_counts[i] as i64;
+                let v2 = (2 * swap_counts2[i] as i64) - obs_counts2[i] as i64;
+                dot_prod += v1 * v2;
+            }
+        }
+
+        let flip_chain2 = dot_prod < 0;
+        if flip_chain2 {
+            tracing::debug!("Flipping secondary chain (dot_prod={})", dot_prod);
+        }
+
+        for i in 0..het_positions.len() {
+            let s2 = if flip_chain2 {
+                obs_counts2[i].saturating_sub(swap_counts2[i])
+            } else {
+                swap_counts2[i]
+            };
+            swap_counts[i] = swap_counts[i].saturating_add(s2);
             obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
         }
     }

@@ -910,7 +910,7 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
 }
 
 #[test]
-fn test_symmetric_evidence_phase_confidence_low() {
+fn test_symmetric_evidence_phase_resolved() {
     let n_markers = 40;
     let n_ref_haps = 100;
     let hero_idx = 99;
@@ -979,28 +979,39 @@ fn test_symmetric_evidence_phase_confidence_low() {
     );
 
     let mut sum = 0.0f32;
-    let mut max = 0.0f32;
+    let mut min = 1.0f32;
     for m in 0..n_markers {
         let conf = phased.sample_phase_confidence_f32(MarkerIdx::new(m as u32), 0);
         sum += conf;
-        if conf > max {
-            max = conf;
+        if conf < min {
+            min = conf;
         }
     }
     let mean = sum / n_markers as f32;
     println!(
-        "[uninformative phase confidence] mean={:.3} max={:.3}",
-        mean, max
+        "[symmetric phase resolved] mean={:.3} min={:.3}",
+        mean, min
     );
 
+    // DEBUG: Print actual phased haplotypes
+    let mut h1 = Vec::new();
+    let mut h2 = Vec::new();
+    for m in 0..n_markers {
+        h1.push(phased.allele(MarkerIdx::new(m as u32), reagle::data::haplotype::HapIdx::new(0)));
+        h2.push(phased.allele(MarkerIdx::new(m as u32), reagle::data::haplotype::HapIdx::new(1)));
+    }
+    println!("H1: {:?}", h1);
+    println!("H2: {:?}", h2);
+
     assert!(
-        mean < 0.6,
-        "Expected low mean phase confidence under symmetric evidence; mean={:.3}",
+        mean > 0.9,
+        "Expected high mean phase confidence after alignment; mean={:.3}",
         mean
     );
-    assert!(
-        max < 0.9,
-        "Expected no highly confident markers under symmetric evidence; max={:.3}",
-        max
-    );
+
+    // Check for valid haplotypes (Hero or Anti-Hero), NOT chimeras
+    let is_hero = h1.iter().enumerate().all(|(i, &a)| a == (i % 2) as u8);
+    let is_anti = h1.iter().enumerate().all(|(i, &a)| a == 1 - (i % 2) as u8);
+
+    assert!(is_hero || is_anti, "Output haplotype is chimeric (neither Hero nor Anti)! H1: {:?}", h1);
 }
