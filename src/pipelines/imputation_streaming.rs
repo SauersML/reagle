@@ -3971,8 +3971,9 @@ impl crate::pipelines::ImputationPipeline {
                 let total_info_h2 = sm_total_info[h2_idx.as_usize()].max(1e-9);
                 let conf_ratio_h1 = sm_low_conf_weighted[h1_idx.as_usize()] / total_info_h1;
                 let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
-                let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < 15.0;
-                let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < 15.0;
+                let min_info_nats = (plan.n_ref_haps as f32).ln() * 1.5;
+                let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < min_info_nats;
+                let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < min_info_nats;
                 let donors_h1 = &sm_donor_counts[h1_idx.as_usize()];
                 let donors_h2 = &sm_donor_counts[h2_idx.as_usize()];
                 // SM_MATCH_LOW_CONF_FRAC now means: fraction of *information* that was confused
