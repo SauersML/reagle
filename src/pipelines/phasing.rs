@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -79,7 +79,7 @@ const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -7182,7 +7182,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
+    let threshold = 0.9 * (informative as f32);
     if best_score < threshold || n_markers > 500 {
         return None;
     }
@@ -7666,8 +7666,36 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
+        // Chain alignment: if chains are anti-aligned (dot product < 0), flip the second chain
+        let mut dot_prod = 0.0f64;
         for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
+            if obs_counts[i] > 0 && obs_counts2[i] > 0 {
+                let v1 = (swap_counts[i] as f64) - 0.5 * (obs_counts[i] as f64);
+                let v2 = (swap_counts2[i] as f64) - 0.5 * (obs_counts2[i] as f64);
+                dot_prod += v1 * v2;
+            }
+        }
+
+        let flip_chain2 = dot_prod < 0.0;
+        if flip_chain2 {
+            tracing::debug!(
+                dot_prod,
+                "chains anti-aligned, flipping chain 2 votes"
+            );
+        } else {
+            tracing::debug!(
+                dot_prod,
+                "chains aligned, merging directly"
+            );
+        }
+
+        for i in 0..het_positions.len() {
+            let s2 = if flip_chain2 {
+                obs_counts2[i].saturating_sub(swap_counts2[i])
+            } else {
+                swap_counts2[i]
+            };
+            swap_counts[i] = swap_counts[i].saturating_add(s2);
             obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
         }
     }
