@@ -48,7 +48,7 @@ impl ModelParams {
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
     /// Maximum recombination intensity
-    pub const MAX_RECOMB_INTENSITY: f32 = 5.0;
+    pub const MAX_RECOMB_INTENSITY: f32 = 5000.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
@@ -244,7 +244,10 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // sum_gen_dist is in cM, but recomb_intensity is in switches/Morgan.
+        // 1 Morgan = 100 cM.
+        // Ratio is switches/cM. We need switches/Morgan, so multiply by 100.
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability
