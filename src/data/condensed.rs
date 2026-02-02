@@ -20,6 +20,8 @@ pub struct CallSite {
     pub a1: u8,
     pub a2: u8,
     pub switch_cost: i32,
+    pub flip_cost: i32,
+    pub fixed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,17 +54,24 @@ impl CondensedTarget {
             if a1 == 255 || a2 == 255 {
                 continue;
             }
-            if a1 != a2 && a1 <= 1 && a2 <= 1 && sample_phase.is_unphased(orig_m) {
+            if a1 != a2 && a1 <= 1 && a2 <= 1 {
                 let marker = MarkerIdx::new(orig_m as u32);
                 let pos = hi_freq_gen_positions.get(hi_idx).copied().unwrap_or(0.0);
                 let switch_cost = if let Some(prev_pos) = last_call_pos {
                     let dist = (pos - prev_pos).max(0.0);
-                    let p_switch = params.p_recomb(dist).max(1e-12);
-                    // fixed-point cost
-                    (-p_switch.ln() * 1_000_000.0).round() as i32
+                    // Use log-odds cost so "stay" is the implicit baseline.
+                    let p_switch = params.p_recomb(dist).clamp(1e-12, 0.5 - 1e-12);
+                    let odds = p_switch / (1.0 - p_switch);
+                    (-odds.ln() * 1_000_000.0).round() as i32
                 } else {
                     0
                 };
+                let flip_cost = if switch_cost == 0 {
+                    250_000
+                } else {
+                    switch_cost.max(250_000)
+                };
+                let fixed = !sample_phase.is_unphased(orig_m);
 
                 call_sites.push(CallSite {
                     marker,
@@ -70,6 +79,8 @@ impl CondensedTarget {
                     a1,
                     a2,
                     switch_cost,
+                    flip_cost,
+                    fixed,
                 });
                 last_call_pos = Some(pos);
             }

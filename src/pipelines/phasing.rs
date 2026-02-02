@@ -1914,7 +1914,13 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
             let packed_ref = PackedRefView::build(&target_gt, &ref_gt, alignment);
             let beam_config = BeamConfig::default();
-            let beam_index = PbwtBeamIndex::build(&ref_gt, alignment, &hi_freq_to_orig, beam_config.inject_k);
+        let beam_index = PbwtBeamIndex::build(
+            &ref_gt,
+            alignment,
+            &hi_freq_to_orig,
+            beam_config.inject_k,
+            beam_config.inject_interval,
+        );
             let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
 
             let threaded_haps_vec = self.build_phasing_prescan_states(
@@ -1938,15 +1944,40 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let mut tmp = vec![crate::model::types::CombinedHapId::from(0u32); threaded_haps_vec[s].n_states()];
                     let th = &threaded_haps_vec[s];
                     th.materialize_at(0, &mut tmp);
-                    for id in tmp {
-                        let hid = id.as_u32() as usize;
-                        if hid >= n_target_haps {
-                            let ref_id = hid - n_target_haps;
-                            if ref_id < packed_ref.n_ref_haps() {
-                                active_pool.add(ref_id);
+                for id in tmp {
+                    let hid = id.as_u32() as usize;
+                    if hid >= n_target_haps {
+                        let ref_id = hid - n_target_haps;
+                        if ref_id < packed_ref.n_ref_haps() {
+                            active_pool.add(ref_id);
+                        }
+                    }
+                }
+
+                // Re-rank: push best matching reference haps to the end so they are prioritized.
+                let mut scored: Vec<(i32, usize)> = Vec::with_capacity(active_pool.list().len());
+                for &h in active_pool.list() {
+                    let mut score = 0i32;
+                    for &m in hi_freq_to_orig.iter() {
+                        let a1 = sp.allele1(m);
+                        let a2 = sp.allele2(m);
+                        if a1 == 255 || a2 == 255 {
+                            continue;
+                        }
+                        if let Some(r) = packed_ref.ref_allele_targ(m, h) {
+                            if a1 == a2 {
+                                score += if r == a1 { 2 } else { -2 };
+                            } else {
+                                score += if r == a1 || r == a2 { 1 } else { -1 };
                             }
                         }
                     }
+                    scored.push((score, h));
+                }
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+                for &(_, h) in scored.iter().take(4) {
+                    active_pool.add(h);
+                }
 
                     let condensed = CondensedTarget::build(
                         sp,
@@ -2558,8 +2589,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             let packed_ref = PackedRefView::build(&target_gt, &ref_gt, alignment);
             let beam_config = BeamConfig::default();
-            let beam_index =
-                PbwtBeamIndex::build(&ref_gt, alignment, &hi_freq_to_orig, beam_config.inject_k);
+            let beam_index = PbwtBeamIndex::build(
+                &ref_gt,
+                alignment,
+                &hi_freq_to_orig,
+                beam_config.inject_k,
+                beam_config.inject_interval,
+            );
             let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
 
             let threaded_haps_vec = self.build_phasing_prescan_states(

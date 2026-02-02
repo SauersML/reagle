@@ -95,6 +95,7 @@ pub struct BeamPath {
     pub hap2: usize,
     pub score: i32,
     pub history: HistoryIdx,
+    pub last_swapped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -143,8 +144,9 @@ pub trait BeamInjector {
 
 /// PBWT-based dynamic injection (per marker).
 pub struct PbwtBeamIndex {
-    pub donors0: Vec<Vec<u32>>, // hi-freq marker idx -> donor hap ids for allele 0
-    pub donors1: Vec<Vec<u32>>, // hi-freq marker idx -> donor hap ids for allele 1
+    pub donors0: Vec<Option<Vec<u32>>>, // hi-freq marker idx -> donor hap ids for allele 0
+    pub donors1: Vec<Option<Vec<u32>>>, // hi-freq marker idx -> donor hap ids for allele 1
+    pub inject_interval: usize,
 }
 
 impl PbwtBeamIndex {
@@ -153,27 +155,33 @@ impl PbwtBeamIndex {
         alignment: &MarkerAlignment<AnyMarkerSpace, RefSpace>,
         hi_freq_to_orig: &[usize],
         k: usize,
+        inject_interval: usize,
     ) -> Self {
         let n_ref = ref_gt.n_haplotypes();
         let mut pbwt = ReferencePbwt::new(n_ref);
-        let mut donors0: Vec<Vec<u32>> = Vec::with_capacity(hi_freq_to_orig.len());
-        let mut donors1: Vec<Vec<u32>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut donors0: Vec<Option<Vec<u32>>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut donors1: Vec<Option<Vec<u32>>> = Vec::with_capacity(hi_freq_to_orig.len());
 
         let mut ref_alleles: Vec<u8> = vec![0u8; n_ref];
         for (hi_idx, &orig_m) in hi_freq_to_orig.iter().enumerate() {
+            if inject_interval == 0 || (hi_idx % inject_interval) != 0 {
+                donors0.push(None);
+                donors1.push(None);
+                continue;
+            }
             let r_idx = match alignment.target_to_ref.get(orig_m).and_then(|v| *v) {
                 Some(r) => r,
                 None => {
-                    donors0.push(Vec::new());
-                    donors1.push(Vec::new());
+                    donors0.push(None);
+                    donors1.push(None);
                     continue;
                 }
             };
             let marker = ref_gt.marker(r_idx);
             let n_alleles = marker.n_alleles();
             if n_alleles != 2 {
-                donors0.push(Vec::new());
-                donors1.push(Vec::new());
+                donors0.push(None);
+                donors1.push(None);
                 continue;
             }
 
@@ -213,11 +221,11 @@ impl PbwtBeamIndex {
             let mut d1: Vec<u32> = Vec::new();
             pbwt.select_donors_into(&beams[0], k, &mut d0);
             pbwt.select_donors_into(&beams[1], k, &mut d1);
-            donors0.push(d0);
-            donors1.push(d1);
+            donors0.push(Some(d0));
+            donors1.push(Some(d1));
         }
 
-        Self { donors0, donors1 }
+        Self { donors0, donors1, inject_interval }
     }
 }
 
@@ -239,11 +247,19 @@ impl<'a> BeamInjector for PbwtInjector<'a> {
         if hi_idx >= self.index.donors0.len() {
             return;
         }
-        for &d in self.index.donors0[hi_idx].iter().take(self.k) {
-            active_pool.add(d as usize);
+        let mut idx = hi_idx;
+        if self.index.donors0[idx].is_none() && self.index.inject_interval > 0 {
+            idx = hi_idx - (hi_idx % self.index.inject_interval);
         }
-        for &d in self.index.donors1[hi_idx].iter().take(self.k) {
-            active_pool.add(d as usize);
+        if let Some(list) = self.index.donors0[idx].as_ref() {
+            for &d in list.iter().take(self.k) {
+                active_pool.add(d as usize);
+            }
+        }
+        if let Some(list) = self.index.donors1[idx].as_ref() {
+            for &d in list.iter().take(self.k) {
+                active_pool.add(d as usize);
+            }
         }
     }
 }
@@ -270,6 +286,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &mut ActivePool,
         injector: &mut I,
     ) {
+        if self.packed_ref.n_ref_haps() == 0 {
+            return;
+        }
         if active_pool.is_empty() {
             active_pool.add(0);
         }
@@ -278,6 +297,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let mut beam: Vec<BeamPath> = self.init_beam(active_pool);
 
         let n_calls = condensed.call_sites.len();
+        let mut best_local_unswapped: Vec<i32> = vec![i32::MAX; n_calls];
+        let mut best_local_swapped: Vec<i32> = vec![i32::MAX; n_calls];
         for i in 0..n_calls {
             let segment = &condensed.segments[i];
             let call = &condensed.call_sites[i];
@@ -289,7 +310,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
 
             // Dynamic injection on collapse or interval.
-            if i % self.config.inject_interval == 0 {
+            let inject_interval = self.config.inject_interval;
+            if inject_interval > 0 && (i % inject_interval) == 0 {
                 injector.maybe_inject(i, call.hi_idx, call.marker, active_pool);
             } else if self.beam_collapsed(&beam) {
                 injector.maybe_inject(i, call.hi_idx, call.marker, active_pool);
@@ -298,7 +320,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             // Call site branching (phase decisions)
             let mut next: Vec<BeamPath> = Vec::with_capacity(self.config.beam_width * 2);
             for path in &beam {
-                self.expand_call_site(path, call, active_pool, &mut trie, &mut next);
+                self.expand_call_site(
+                    path,
+                    call,
+                    active_pool,
+                    &mut trie,
+                    &mut next,
+                    &mut best_local_unswapped,
+                    &mut best_local_swapped,
+                    i,
+                );
             }
             self.prune(&mut next);
             beam = next;
@@ -323,7 +354,27 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     sample_phase.swap_alleles(m);
                 }
                 sample_phase.mark_phased(m);
-                sample_phase.set_phase_confidence(m, 1.0);
+                let conf = if call.fixed {
+                    1.0
+                } else {
+                    let l0 = best_local_unswapped[i];
+                    let l1 = best_local_swapped[i];
+                    if l0 == i32::MAX || l1 == i32::MAX {
+                        0.5
+                    } else {
+                        let (best_score, alt_score) = if l0 <= l1 { (l0, l1) } else { (l1, l0) };
+                        let gap = alt_score.saturating_sub(best_score);
+                        let scale = 1_000_000i32;
+                        if gap <= 0 {
+                            0.5
+                        } else if gap >= scale {
+                            1.0
+                        } else {
+                            0.5 + (gap as f32 / scale as f32) * 0.5
+                        }
+                    }
+                };
+                sample_phase.set_phase_confidence(m, conf);
             }
         }
     }
@@ -333,11 +384,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let top = active_pool.list();
         let k = (self.config.beam_width as f32).sqrt().ceil() as usize;
         let n = k.min(top.len()).max(1);
-        for i in 0..n {
-            for j in 0..n {
-                let hap1 = top[i];
-                let hap2 = top[j];
-                beam.push(BeamPath { hap1, hap2, score: 0, history: HistoryIdx(0) });
+        let picks = sample_even(top, n);
+        for i in 0..picks.len() {
+            for j in 0..picks.len() {
+                let hap1 = picks[i];
+                let hap2 = picks[j];
+                beam.push(BeamPath { hap1, hap2, score: 0, history: HistoryIdx(0), last_swapped: false });
                 if beam.len() >= self.config.beam_width {
                     return beam;
                 }
@@ -364,6 +416,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         hap2: *h2,
                         score: path.score + *c1 + *c2,
                         history: path.history,
+                        last_swapped: path.last_swapped,
                     });
                 }
             }
@@ -383,13 +436,24 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             out.push((hap, 0));
             return out;
         }
-        // switch to first consistent candidates
-        for &h in active_pool.list().iter().take(self.config.switch_candidates) {
+        // switch to most recently injected candidates first
+        for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
             if mask_bit_is_set(mask, h) {
                 out.push((h, switch_cost));
             }
             if out.len() >= self.config.switch_candidates {
                 break;
+            }
+        }
+        if mask_bit_is_set(mask, hap) && out.len() < 2 {
+            // allow a limited exploratory switch even if current hap is consistent
+            for &h in active_pool.list().iter().rev().take(2) {
+                if h != hap && mask_bit_is_set(mask, h) {
+                    out.push((h, switch_cost));
+                }
+                if out.len() >= self.config.switch_candidates {
+                    break;
+                }
             }
         }
         if out.is_empty() {
@@ -406,14 +470,19 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         trie: &mut HistoryTrie,
         out: &mut Vec<BeamPath>,
+        best_unswapped: &mut [i32],
+        best_swapped: &mut [i32],
+        call_idx: usize,
     ) {
         let a1 = call.a1;
         let a2 = call.a2;
 
-        // orientation: a1 on hap1, a2 on hap2
-        self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out);
-        // swapped orientation
-        self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out);
+        if call.fixed {
+            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, best_unswapped, best_swapped, call_idx);
+        } else {
+            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, best_unswapped, best_swapped, call_idx);
+            self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out, best_unswapped, best_swapped, call_idx);
+        }
     }
 
     fn expand_orientation(
@@ -426,17 +495,31 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         trie: &mut HistoryTrie,
         out: &mut Vec<BeamPath>,
+        best_unswapped: &mut [i32],
+        best_swapped: &mut [i32],
+        call_idx: usize,
     ) {
         let hap1_candidates = self.repair_hap_for_allele(path.hap1, call.marker, hap1_al, active_pool, call.switch_cost);
         let hap2_candidates = self.repair_hap_for_allele(path.hap2, call.marker, hap2_al, active_pool, call.switch_cost);
         for (h1, c1, e1) in &hap1_candidates {
             for (h2, c2, e2) in &hap2_candidates {
                 let history = trie.push(path.history, swapped);
+                let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
+                if swapped {
+                    if score_no_flip < best_swapped[call_idx] {
+                        best_swapped[call_idx] = score_no_flip;
+                    }
+                } else if score_no_flip < best_unswapped[call_idx] {
+                    best_unswapped[call_idx] = score_no_flip;
+                }
+                let flip_penalty = if swapped != path.last_swapped { call.flip_cost } else { 0 };
+                let score = score_no_flip + flip_penalty;
                 out.push(BeamPath {
                     hap1: *h1,
                     hap2: *h2,
-                    score: path.score + *c1 + *c2 + *e1 + *e2,
+                    score,
                     history,
+                    last_swapped: swapped,
                 });
             }
         }
@@ -455,15 +538,32 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         if matches {
             out.push((hap, 0, self.costs.match_cost));
+            // also allow a limited switch to a strong candidate for future-proofing
+            for &h in active_pool.list().iter().rev().take(1) {
+                if h != hap && self.ref_allele_matches(marker_idx, h, targ_allele) {
+                    out.push((h, switch_cost, self.costs.match_cost));
+                }
+            }
             return out;
         }
         // Try switching to matching haps
-        for &h in active_pool.list().iter().take(self.config.switch_candidates) {
+        for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
             if self.ref_allele_matches(marker_idx, h, targ_allele) {
                 out.push((h, switch_cost, self.costs.match_cost));
             }
             if out.len() >= self.config.switch_candidates {
                 break;
+            }
+        }
+        if out.len() < self.config.switch_candidates {
+            let spread = sample_even(active_pool.list(), self.config.switch_candidates);
+            for &h in spread.iter() {
+                if self.ref_allele_matches(marker_idx, h, targ_allele) {
+                    out.push((h, switch_cost, self.costs.match_cost));
+                }
+                if out.len() >= self.config.switch_candidates {
+                    break;
+                }
             }
         }
         if out.is_empty() {
@@ -505,6 +605,23 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             if p.score < best { best = p.score; }
             if p.score > worst { worst = p.score; }
         }
-        (worst - best) > self.config.collapse_gap
+        (worst - best) < self.config.collapse_gap
     }
+}
+
+fn sample_even(list: &[usize], n: usize) -> Vec<usize> {
+    if list.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    let n = n.min(list.len());
+    if n == list.len() {
+        return list.to_vec();
+    }
+    let step = list.len() as f64 / n as f64;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let idx = (i as f64 * step).floor() as usize;
+        out.push(list[idx.min(list.len() - 1)]);
+    }
+    out
 }
