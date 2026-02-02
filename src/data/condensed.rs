@@ -66,12 +66,18 @@ impl CondensedTarget {
                 } else {
                     0
                 };
-                let flip_cost = if switch_cost == 0 {
-                    250_000
-                } else {
-                    switch_cost.max(250_000)
-                };
                 let fixed = !sample_phase.is_unphased(orig_m);
+                let flip_cost = if fixed {
+                    if switch_cost == 0 {
+                        250_000
+                    } else {
+                        switch_cost.max(250_000)
+                    }
+                } else if switch_cost == 0 {
+                    1_000_000
+                } else {
+                    switch_cost.max(1_000_000)
+                };
 
                 call_sites.push(CallSite {
                     marker,
