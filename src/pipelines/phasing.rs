@@ -7183,7 +7183,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         return None;
     }
     let threshold = 0.5 * (informative as f32);
-    if best_score < threshold || n_markers > 500 {
+    if best_score < threshold || n_markers > 2000 {
         return None;
     }
 
