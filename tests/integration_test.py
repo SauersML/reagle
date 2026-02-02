@@ -3057,6 +3057,32 @@ def stage_metrics():
         print("Run 'beagle' and/or 'reagle' stages first.")
         sys.exit(1)
 
+    # Report chr/pos overlap across truth + imputed (ignore REF/ALT)
+    def _pos_set_all(vcf_path):
+        sites = set()
+        cmd = f"bcftools query -f '%CHROM\\t%POS\\n' {vcf_path}"
+        for line in _stream_vcf_lines(cmd):
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                chrom, pos = parts[0], parts[1]
+                sites.add((chrom, pos))
+        return sites
+
+    truth_positions = _pos_set_all(str(paths['truth_vcf']))
+    beagle_positions = _pos_set_all(results['beagle']) if results['beagle'] else set()
+    reagle_positions = _pos_set_all(results['reagle']) if results['reagle'] else set()
+
+    if truth_positions:
+        if results['beagle']:
+            missing_beagle = truth_positions - beagle_positions
+            print(f"\n⚠️  Truth sites not present in BEAGLE (chr/pos only): {len(missing_beagle):,}")
+        if results['reagle']:
+            missing_reagle = truth_positions - reagle_positions
+            print(f"⚠️  Truth sites not present in REAGLE (chr/pos only): {len(missing_reagle):,}")
+        if results['beagle'] and results['reagle']:
+            overlap_three = truth_positions & beagle_positions & reagle_positions
+            print(f"✅ Intersection of TRUTH ∩ BEAGLE ∩ REAGLE (chr/pos only): {len(overlap_three):,}")
+
     # Calculate metrics
     print("\n" + "=" * 60)
     print("Calculating accuracy metrics...")
