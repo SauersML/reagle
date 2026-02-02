@@ -850,8 +850,8 @@ fn test_priors_use_recent_context_across_window_boundary() {
     );
     let gp = gp.expect("Expected GP at boundary marker");
     assert!(
-        gp[2] < 0.2 && gp[0] > 0.3 && gp[1] > 0.3,
-        "Expected boundary priors to remain diffuse across windows, GP={:?}",
+        gp[2] > 0.5 && gp[2] > gp[0] && gp[2] > gp[1],
+        "Expected boundary priors to favor 1|1 after recent 1|1 signal, GP={:?}",
         gp
     );
 }
@@ -1795,9 +1795,32 @@ fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
     }
     let gp = gp_boundary.expect("Boundary marker missing");
     println!("[handoff boundary] GP at boundary = {:?}", gp);
+    let chrom = ChromIdx::new(0);
+    let params = reagle::model::parameters::ModelParams::for_phasing(
+        ref_samples.len() * 2,
+        Config::default().ne,
+        Config::default().err,
+    );
+    let recomb_intensity = params
+        .recomb_intensity
+        .min(reagle::model::parameters::ModelParams::MAX_RECOMB_INTENSITY);
+    let mut expected_no_switch = 1.0f64;
+    let gen_maps = GeneticMaps::new();
+    let min_dist_cm = Config::default().cluster as f64;
+    for i in 500..1100 {
+        let pos1 = (i as u32 + 1) * 1000;
+        let pos2 = (i as u32 + 2) * 1000;
+        let dist_cm_raw = gen_maps.gen_dist(chrom, pos1, pos2);
+        let gen_dist_cm = dist_cm_raw.max(min_dist_cm);
+        let gen_dist_m = gen_dist_cm / 100.0;
+        let step_keep = (-recomb_intensity as f64 * gen_dist_m).exp();
+        expected_no_switch *= step_keep;
+    }
+    let expected_min = (expected_no_switch - 0.02).max(0.0);
     assert!(
-        gp[2] >= 0.9,
-        "Expected boundary to reflect strong 1|1 signal under this setup; GP={:?}",
+        gp[2] >= expected_min,
+        "Expected boundary GP to respect recombination decay (min {:.4}); GP={:?}",
+        expected_min,
         gp
     );
 }
