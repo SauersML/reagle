@@ -19,7 +19,7 @@ jobs:
   # ============================================================================
   prepare_data:
     name: Prepare Profiling Data (5% of chr22)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: .
@@ -73,7 +73,7 @@ jobs:
 
   benchmark:
     name: Performance Benchmarks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: .
@@ -122,7 +122,7 @@ jobs:
 
   profile:
     name: Tracing Profile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: prepare_data
     defaults:
       run:
@@ -286,7 +286,7 @@ jobs:
   # ============================================================================
   pprof_flamegraph:
     name: Pprof Flamegraph (on 5% subset)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: prepare_data
     defaults:
       run:
@@ -354,7 +354,7 @@ jobs:
 
   release_tests_no_run:
     name: Cargo Test --release (no run)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 

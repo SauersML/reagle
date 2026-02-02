@@ -21,7 +21,7 @@ on:
 jobs:
   # Job 0: Determine which chromosomes to test
   setup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       chromosomes: ${{ steps.set-matrix.outputs.chromosomes }}
     steps:
@@ -48,7 +48,7 @@ jobs:
   # Job 1: Build Reagle binary
   build:
     needs: setup
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -82,7 +82,7 @@ jobs:
   # Job 2: Prepare data for each chromosome (Run once per chromosome)
   prepare-data:
     needs: setup
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -119,7 +119,7 @@ jobs:
   # REUSE: Downloads prepared data from prepare-data job.
   impute:
     name: Impute ${{ matrix.tool }} chr${{ matrix.chromosome }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: [setup, build, prepare-data]
     strategy:
       fail-fast: false
@@ -171,7 +171,7 @@ jobs:
   # Job 4: Calculate metrics for each tool/chromosome
   analyze:
     name: Metrics ${{ matrix.tool }} chr${{ matrix.chromosome }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: [setup, impute] # (Indirectly needs prepare-data logic via data download)
     strategy:
       fail-fast: false
@@ -211,7 +211,7 @@ jobs:
 
   # Job 4: Aggregate all chromosome metrics
   summary:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: analyze
     steps:
       - uses: actions/checkout@v4
