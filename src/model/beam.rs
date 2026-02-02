@@ -43,6 +43,7 @@ impl Default for BeamConfig {
 pub struct BeamCosts {
     pub match_cost: i32,
     pub mismatch_cost: i32,
+    pub p_err: f64,
 }
 
 impl BeamCosts {
@@ -54,6 +55,7 @@ impl BeamCosts {
         Self {
             match_cost,
             mismatch_cost,
+            p_err: p_err as f64,
         }
     }
 }
@@ -845,39 +847,26 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         out.clear();
         let marker_idx = marker.as_usize();
 
-        // LLR-based costs (optimal under Li-Stephens copying model):
-        //
-        // The log-likelihood ratio compares P(X|donor) vs P(X|null=population).
-        // For emission at marker m with target allele X:
-        //   LLR = log(P(X|donor)) - log(π(X))
-        //
-        // As costs (negative log-likelihood), we ADD the information content -log(π(X)):
-        //   match_cost(m) = base_match + (-log(π(X)))
-        //   mismatch_cost(m) = base_mismatch + (-log(π(X)))
-        //
-        // For rare alleles (small π): -log(π(X)) is large and positive, so:
-        //   - Match cost increases slightly, but matches become more valuable relative to mismatches
-        //   - Mismatch cost increases significantly, making rare allele errors very costly
-        //
-        // This is exactly what coalescent theory predicts: rare alleles are more genealogically
-        // informative, so getting them wrong should be penalized more heavily.
-        //
-        // Use f64 to avoid overflow, then saturate to i32.
-        let info_content = -(targ_freq.max(1e-9) as f64).ln() * 1_000_000.0;
-        let effective_match_cost = ((self.costs.match_cost as f64) + info_content)
+        // Emission costs using a Li-Stephens-style mixture:
+        //   P(X|donor match) = (1 - theta) + theta * pi(X)
+        //   P(X|donor mismatch) = theta * pi(X)
+        // This makes rare alleles strongly penalize mismatches.
+        let pi = targ_freq.max(1e-9) as f64;
+        let theta = self.costs.p_err.max(1e-9).min(1.0 - 1e-9);
+        let p_match = (1.0 - theta) + theta * pi;
+        let p_mismatch = theta * pi;
+        let effective_match_cost = (-(p_match.ln()) * 1_000_000.0)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-        let effective_mismatch_cost = ((self.costs.mismatch_cost as f64) + info_content)
+        let effective_mismatch_cost = (-(p_mismatch.ln()) * 1_000_000.0)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-        let pbwt_cost = self.pbwt_emission_cost(pbwt_match_len, pbwt_density);
-        let effective_match_cost = effective_match_cost.saturating_add(pbwt_cost);
-        let effective_mismatch_cost = effective_mismatch_cost.saturating_add(pbwt_cost);
 
         // Switch cost: recombination penalty is already encoded in switch_cost.
         // The optimal switch criterion compares LLR gain vs recombination penalty.
         // No additional MAF term needed here - it's in the emission costs.
-        let effective_switch_cost = switch_cost;
+        let pbwt_switch_cost = self.pbwt_switch_cost(pbwt_match_len, pbwt_density);
+        let effective_switch_cost = switch_cost.saturating_add(pbwt_switch_cost);
 
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         if matches {
@@ -931,11 +920,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     }
 
     #[inline]
-    fn pbwt_emission_cost(&self, match_len: f32, density: f32) -> i32 {
+    fn pbwt_switch_cost(&self, match_len: f32, density: f32) -> i32 {
         let len_term = (1.0 + match_len.max(0.0) as f64).ln();
         let density_term = (1.0 + density.max(0.0) as f64).ln();
-        let cost = (self.config.pbwt_density_weight as f64 * density_term)
-            - (self.config.pbwt_len_weight as f64 * len_term);
+        let cost = (self.config.pbwt_len_weight as f64 * len_term)
+            - (self.config.pbwt_density_weight as f64 * density_term);
         cost.round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32
     }
