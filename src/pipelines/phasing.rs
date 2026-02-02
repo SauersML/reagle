@@ -68,6 +68,7 @@ use crate::utils::telemetry::{Stage, TelemetryBlackboard};
 use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
+const HEURISTIC_MAX_MARKERS: usize = 500;
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
