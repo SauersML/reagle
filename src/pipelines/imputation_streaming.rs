@@ -3379,6 +3379,8 @@ impl crate::pipelines::ImputationPipeline {
             self.params.p_mismatch
         };
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
+        let overlap_size = 1000.min(output_end);
+        let overlap_start = output_end.saturating_sub(overlap_size);
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,
                                       sample_idx: usize|
@@ -3768,10 +3770,10 @@ impl crate::pipelines::ImputationPipeline {
 
                 normalize_probs(&mut aligned1);
                 normalize_probs(&mut aligned2);
-                if !is_uniform(&aligned1) {
+                if !is_uniform(&aligned1) && ref_m >= overlap_start {
                     last_info1 = Some(ref_m);
                 }
-                if !is_uniform(&aligned2) {
+                if !is_uniform(&aligned2) && ref_m >= overlap_start {
                     last_info2 = Some(ref_m);
                 }
 
@@ -4111,7 +4113,7 @@ impl crate::pipelines::ImputationPipeline {
                 let donors_h2 = &sm_donor_counts[h2_idx.as_usize()];
                 // SM_MATCH_LOW_CONF_FRAC now means: fraction of *information* that was confused
                 let use_hmm_h1 = if has_priors_h1 {
-                    true
+                    last_info_h1.is_some()
                 } else if no_info_h1 {
                     false
                 } else {
@@ -4120,7 +4122,7 @@ impl crate::pipelines::ImputationPipeline {
                         || donors_h1.len() < SM_MATCH_MIN_DONORS
                 };
                 let use_hmm_h2 = if has_priors_h2 {
-                    true
+                    last_info_h2.is_some()
                 } else if no_info_h2 {
                     false
                 } else {
@@ -4198,39 +4200,64 @@ impl crate::pipelines::ImputationPipeline {
                                         donors: &[(RefHapId, u32)]|
                  -> Vec<RefHapId> {
                     let mut out: Vec<RefHapId> = Vec::new();
+                    let mut seen: std::collections::HashSet<RefHapId> = std::collections::HashSet::new();
+
                     if let Some(p) = priors {
                         for id in p.ids() {
-                            out.push(RefHapId::new(id.0));
-                            if out.len() >= per_window_cap_local {
-                                break;
+                            let hap = RefHapId::new(id.0);
+                            if seen.insert(hap) {
+                                out.push(hap);
+                                if out.len() >= per_window_cap_local {
+                                    return out;
+                                }
                             }
                         }
                     }
+
                     let mut sorted = donors.to_vec();
                     sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                    for (hap, _) in sorted.iter().take(per_window_cap_local) {
-                        out.push(*hap);
-                    }
-                    if let Some(core) = plan.core_states.get(hap_idx.as_usize()) {
-                        for &hap in core {
-                            out.push(hap);
+                    for (hap, _) in sorted.iter() {
+                        if seen.insert(*hap) {
+                            out.push(*hap);
                             if out.len() >= per_window_cap_local {
-                                break;
+                                return out;
                             }
                         }
                     }
-                    out.sort_unstable_by_key(|h| h.as_u32());
-                    out.dedup();
-                    if out.is_empty() {
-                        if let Some(full) = full_states.as_ref() {
-                            out.extend_from_slice(full);
-                        } else if let Some(states) = state_haps_by_hap.get(hap_idx.as_usize()) {
-                            out.extend_from_slice(states);
+
+                    if let Some(core) = plan.core_states.get(hap_idx.as_usize()) {
+                        for &hap in core {
+                            if seen.insert(hap) {
+                                out.push(hap);
+                                if out.len() >= per_window_cap_local {
+                                    return out;
+                                }
+                            }
                         }
                     }
-                    if out.len() > per_window_cap_local {
-                        out.truncate(per_window_cap_local);
+
+                    if out.is_empty() {
+                        if let Some(full) = full_states.as_ref() {
+                            for &hap in full {
+                                if seen.insert(hap) {
+                                    out.push(hap);
+                                    if out.len() >= per_window_cap_local {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else if let Some(states) = state_haps_by_hap.get(hap_idx.as_usize()) {
+                            for &hap in states {
+                                if seen.insert(hap) {
+                                    out.push(hap);
+                                    if out.len() >= per_window_cap_local {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
+
                     out
                 };
 
@@ -4270,14 +4297,32 @@ impl crate::pipelines::ImputationPipeline {
                             let mapper = TransitionMatrix::build(&prev_states, &state_haps);
                             mapper.map(p.probs()).into_vec()
                         };
-                        if mapped.iter().all(|v| !v.is_finite() || *v <= 0.0) && !warned_empty_map {
+                        let mut sum = 0.0f32;
+                        for v in mapped.iter() {
+                            if v.is_finite() && *v > 0.0 {
+                                sum += *v;
+                            }
+                        }
+                        if sum <= 0.0 && !warned_empty_map {
                             warn!(
                                 "State handoff mapped to empty priors for window {} (state set mismatch)",
                                 window_idx
                             );
                             warned_empty_map = true;
                         }
-                        Some(mapped)
+                        if sum <= 0.0 {
+                            return None;
+                        }
+                        let inv = 1.0 / sum;
+                        let prior_floor = 1e-3f32;
+                        let uniform = 1.0 / state_haps.len().max(1) as f32;
+                        let mut blended = Vec::with_capacity(mapped.len());
+                        for v in mapped {
+                            let mut p = v * inv;
+                            p = (1.0 - prior_floor) * p + prior_floor * uniform;
+                            blended.push(p);
+                        }
+                        Some(blended)
                     });
 
                     let (posteriors, state_post, stats) = LOCAL_WORKSPACE.with(|cell| {
