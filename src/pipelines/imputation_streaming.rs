@@ -3757,6 +3757,7 @@ impl crate::pipelines::ImputationPipeline {
         let n_target_haps = n_target_samples * 2;
         let mut sm_posts_by_hap: Vec<Vec<AllelePosteriors>> =
             vec![Vec::with_capacity(output_markers); n_target_haps];
+        let min_info_nats = (plan.n_ref_haps as f32).ln() * 1.5;
         // Information-weighted confusion: weight donor instability by -log(π(X))
         // This is optimal Li-Stephens scoring: rare allele switches are more informative
         let mut sm_low_conf_weighted: Vec<f32> = vec![0.0; n_target_haps];
@@ -3921,10 +3922,11 @@ impl crate::pipelines::ImputationPipeline {
                 );
                 if store {
                     let ap = if target_allele == 255 {
-                        // Missing target: use donor ensemble (soft) to avoid hard-calling
+                        // Missing target: blend donor ensemble with ref prior based on information.
+                        let w = (sm_total_info[hap_idx] / min_info_nats).clamp(0.0, 1.0);
                         if n_alleles <= 2 {
-                            if donor_candidates.is_empty() {
-                                AllelePosteriors::Biallelic(freq_prior)
+                            let donor_mean = if donor_candidates.is_empty() {
+                                freq_prior
                             } else {
                                 let mut alt_sum = 0u32;
                                 for &cand in &donor_candidates {
@@ -3933,31 +3935,66 @@ impl crate::pipelines::ImputationPipeline {
                                         alt_sum += 1;
                                     }
                                 }
-                                let p_alt = alt_sum as f32 / donor_candidates.len() as f32;
-                                AllelePosteriors::Biallelic(p_alt.clamp(1e-6, 1.0 - 1e-6))
-                            }
+                                alt_sum as f32 / donor_candidates.len() as f32
+                            };
+                            let p_alt = (w * donor_mean + (1.0 - w) * freq_prior)
+                                .clamp(1e-6, 1.0 - 1e-6);
+                            AllelePosteriors::Biallelic(p_alt)
                         } else {
-                            let mut probs = vec![0.0f32; n_alleles.max(1)];
+                            let mut donor_probs = vec![0.0f32; n_alleles.max(1)];
                             if donor_candidates.is_empty() {
                                 let uniform = 1.0 / n_alleles.max(1) as f32;
-                                for p in &mut probs {
+                                for p in &mut donor_probs {
                                     *p = uniform;
                                 }
                             } else {
                                 for &cand in &donor_candidates {
                                     let allele = col.get(HapIdx::new(cand));
                                     if (allele as usize) < n_alleles {
-                                        probs[allele as usize] += 1.0;
+                                        donor_probs[allele as usize] += 1.0;
                                     }
                                 }
                                 let denom = donor_candidates.len() as f32;
                                 if denom > 0.0 {
-                                    for p in &mut probs {
+                                    for p in &mut donor_probs {
                                         *p /= denom;
                                     }
                                 }
                             }
-                            AllelePosteriors::Multiallelic(probs)
+                            let mut prior_probs = vec![0.0f32; n_alleles.max(1)];
+                            if let Some(freqs) = ref_allele_freqs.get(ref_m) {
+                                let mut sum = 0.0f32;
+                                for (i, p) in prior_probs.iter_mut().enumerate() {
+                                    *p = freqs.get(i).copied().unwrap_or(0.0);
+                                    sum += *p;
+                                }
+                                if sum > 0.0 {
+                                    for p in &mut prior_probs {
+                                        *p /= sum;
+                                    }
+                                } else {
+                                    let uniform = 1.0 / n_alleles.max(1) as f32;
+                                    for p in &mut prior_probs {
+                                        *p = uniform;
+                                    }
+                                }
+                            } else {
+                                let uniform = 1.0 / n_alleles.max(1) as f32;
+                                for p in &mut prior_probs {
+                                    *p = uniform;
+                                }
+                            }
+                            for i in 0..prior_probs.len() {
+                                donor_probs[i] = (w * donor_probs[i] + (1.0 - w) * prior_probs[i])
+                                    .max(0.0);
+                            }
+                            let sum: f32 = donor_probs.iter().sum();
+                            if sum > 0.0 {
+                                for p in &mut donor_probs {
+                                    *p /= sum;
+                                }
+                            }
+                            AllelePosteriors::Multiallelic(donor_probs)
                         }
                     } else {
                         let allele = col.get(HapIdx::new(donor));
@@ -4007,7 +4044,6 @@ impl crate::pipelines::ImputationPipeline {
                 let total_info_h2 = sm_total_info[h2_idx.as_usize()].max(1e-9);
                 let conf_ratio_h1 = sm_low_conf_weighted[h1_idx.as_usize()] / total_info_h1;
                 let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
-                let min_info_nats = (plan.n_ref_haps as f32).ln() * 1.5;
                 let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < min_info_nats;
                 let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < min_info_nats;
                 let donors_h1 = &sm_donor_counts[h1_idx.as_usize()];
