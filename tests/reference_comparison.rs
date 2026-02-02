@@ -2687,6 +2687,69 @@ fn decompress_vcf_for_rust(gz_path: &Path, work_dir: &Path) -> PathBuf {
     vcf_path
 }
 
+/// Write a VCF with uniform GL values for the first `max_markers` records.
+fn write_vcf_with_uniform_gl(src_gz: &Path, dst_vcf: &Path, max_markers: usize) {
+    let output = Command::new("gzip")
+        .args(["-dc", src_gz.to_str().unwrap()])
+        .output()
+        .expect("Failed to decompress VCF");
+    assert!(output.status.success(), "gzip decompression failed");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut out = String::new();
+    let mut has_gl_header = false;
+    let mut marker_count = 0usize;
+    for line in text.lines() {
+        if line.starts_with("##FORMAT=<ID=GL") {
+            has_gl_header = true;
+        }
+        if line.starts_with("#CHROM") && !has_gl_header {
+            out.push_str("##FORMAT=<ID=GL,Number=G,Type=Float,Description=\"Genotype likelihoods\">\n");
+            has_gl_header = true;
+        }
+        if line.starts_with('#') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if marker_count < max_markers {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 9 {
+                out.push_str(line);
+                out.push('\n');
+                marker_count += 1;
+                continue;
+            }
+            let format_fields: Vec<&str> = parts[8].split(':').collect();
+            let has_gl = format_fields.iter().any(|f| *f == "GL");
+            let mut new_parts: Vec<String> = Vec::with_capacity(parts.len());
+            for (i, field) in parts.iter().enumerate() {
+                if i == 8 {
+                    if has_gl {
+                        new_parts.push(field.to_string());
+                    } else {
+                        new_parts.push(format!("{}:GL", field));
+                    }
+                } else if i >= 9 {
+                    if has_gl {
+                        new_parts.push(field.to_string());
+                    } else {
+                        new_parts.push(format!("{}:0,0,0", field));
+                    }
+                } else {
+                    new_parts.push(field.to_string());
+                }
+            }
+            out.push_str(&new_parts.join("\t"));
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+        marker_count += 1;
+    }
+    fs::write(dst_vcf, out).expect("Write modified VCF");
+}
+
 /// Find chrom/min/max positions from a gzipped VCF.
 fn vcf_min_max_pos(vcf_gz: &Path) -> (String, u64, u64) {
     let output = Command::new("gzip")
@@ -4057,8 +4120,8 @@ fn test_dosage_genotyped_vs_imputed() {
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
     let (_, truth_records) = parse_vcf(&truth_path);
-    let truth_idx = build_record_index_multi(&truth_records);
     let rust_idx = build_record_index_multi(&rust_records);
+    let truth_idx = build_record_index_multi(&truth_records);
     // Separate genotyped and imputed markers
     let mut genotyped_java_dr2: Vec<(u64, f64)> = Vec::new();
     let mut genotyped_rust_dr2: Vec<(u64, f64)> = Vec::new();
@@ -4501,8 +4564,8 @@ fn test_dosage_by_distance_from_genotyped() {
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
     let (_, truth_records) = parse_vcf(&truth_path);
-    let truth_idx = build_record_index_multi(&truth_records);
     let rust_idx = build_record_index_multi(&rust_records);
+    let truth_idx = build_record_index_multi(&truth_records);
 
     // Find genotyped marker positions
     let mut genotyped_positions: Vec<u64> = java_records
@@ -6021,31 +6084,116 @@ fn test_gl_confidence_affects_emission() {
     use reagle::io::vcf::VcfReader;
 
     let beagle = setup_test_files();
-    let (mut reader, file) = VcfReader::open(&beagle.target_sparse_vcf).unwrap();
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let target_low_conf = work_dir.path().join("target_sparse_uniform_gl.vcf");
+    write_vcf_with_uniform_gl(&beagle.target_sparse_vcf, &target_low_conf, 50);
+    let (mut reader, file) = VcfReader::open(&target_low_conf).unwrap();
     let gt = reader.read_all(file).unwrap();
 
-    // Find markers with low-confidence genotypes (uniform GL)
-    let mut low_conf_markers = Vec::new();
+    // Identify low- and high-confidence marker positions from input GL/PL.
+    let mut low_conf_positions = Vec::new();
+    let mut high_conf_positions = Vec::new();
     for m in 0..gt.n_markers().min(200) {
+        let mut min_conf = 1.0f32;
+        let mut max_conf = 0.0f32;
         for s in 0..gt.n_samples() {
             let conf = gt.sample_confidence_f32(MarkerIdx::new(m as u32), s);
-            // Confidence < 0.8 indicates uncertain genotype
-            if conf < 0.8 {
-                low_conf_markers.push((m, s, conf));
-                break;
+            if conf < min_conf {
+                min_conf = conf;
+            }
+            if conf > max_conf {
+                max_conf = conf;
+            }
+        }
+        if min_conf < 0.8 {
+            low_conf_positions.push(gt.markers().marker(MarkerIdx::new(m as u32)).pos);
+        }
+        if max_conf >= 0.95 {
+            high_conf_positions.push(gt.markers().marker(MarkerIdx::new(m as u32)).pos);
+        }
+    }
+
+    if low_conf_positions.is_empty() || high_conf_positions.is_empty() {
+        println!(
+            "Skipping calibration check: low_conf_positions={}, high_conf_positions={}",
+            low_conf_positions.len(),
+            high_conf_positions.len()
+        );
+        return;
+    }
+
+    // Run Rust imputation to get GP for calibration assessment.
+    let rust_out = work_dir.path().join("rust_imp");
+    let target_vcf = target_low_conf.clone();
+    let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.as_ref());
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345).expect("Rust imputation failed");
+
+    let truth_path = work_dir.path().join("target_full.vcf.gz");
+    fs::copy(&beagle.target_vcf, &truth_path).expect("Copy full target VCF");
+    let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
+    let (_, rust_records) = parse_vcf(&rust_vcf);
+    let (_, truth_records) = parse_vcf(&truth_path);
+    let rust_by_pos: std::collections::HashMap<u64, &ParsedRecord> =
+        rust_records.iter().map(|r| (r.pos, r)).collect();
+    let truth_by_pos: std::collections::HashMap<u64, &ParsedRecord> =
+        truth_records.iter().map(|r| (r.pos, r)).collect();
+
+    let mut low_brier_sum = 0.0f64;
+    let mut low_brier_n = 0usize;
+    let mut high_brier_sum = 0.0f64;
+    let mut high_brier_n = 0usize;
+
+    let low_set: std::collections::HashSet<u64> =
+        low_conf_positions.into_iter().map(|p| p as u64).collect();
+    let high_set: std::collections::HashSet<u64> =
+        high_conf_positions.into_iter().map(|p| p as u64).collect();
+
+    for (pos_set, sum, count) in [
+        (&low_set, &mut low_brier_sum, &mut low_brier_n),
+        (&high_set, &mut high_brier_sum, &mut high_brier_n),
+    ] {
+        for pos in pos_set.iter().copied() {
+            let Some(r_rec) = rust_by_pos.get(&pos) else {
+                continue;
+            };
+            let Some(truth_rec) = truth_by_pos.get(&pos) else {
+                continue;
+            };
+            for (s, r_gt) in r_rec.genotypes.iter().enumerate() {
+                if s >= truth_rec.genotypes.len() {
+                    continue;
+                }
+                let Some(gp) = r_gt.gp else {
+                    continue;
+                };
+                let truth_gt = &truth_rec.genotypes[s].gt;
+                let bs = calculate_brier_score(gp, truth_gt);
+                *sum += bs;
+                *count += 1;
             }
         }
     }
 
-    // We should have some low-confidence markers in sparse data
-    assert!(
-        !low_conf_markers.is_empty(),
-        "Sparse target should have low-confidence genotypes"
+    let low_brier = if low_brier_n > 0 {
+        low_brier_sum / low_brier_n as f64
+    } else {
+        0.0
+    };
+    let high_brier = if high_brier_n > 0 {
+        high_brier_sum / high_brier_n as f64
+    } else {
+        0.0
+    };
+
+    println!(
+        "Brier scores: low_conf={:.4} (n={}), high_conf={:.4} (n={})",
+        low_brier, low_brier_n, high_brier, high_brier_n
     );
 
-    // The emission calculation should use confidence to scale the penalty.
-    // Currently it doesn't - this is a design gap.
-    // When implemented, low-confidence markers should not decimate haplotypes.
+    assert!(
+        low_brier > high_brier,
+        "Low-confidence markers should have worse (higher) Brier score than high-confidence markers"
+    );
 }
 
 // Note: test_single_mismatch_not_catastrophic was moved to unit tests in imputation.rs
