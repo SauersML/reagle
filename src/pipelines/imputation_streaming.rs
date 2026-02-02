@@ -2606,8 +2606,23 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
+                    let mut target_positions: std::collections::HashSet<(crate::data::ChromIdx, u32)> =
+                        std::collections::HashSet::with_capacity(
+                            target_window.genotypes.n_markers(),
+                        );
+                    for m in 0..target_window.genotypes.n_markers() {
+                        let marker = target_window
+                            .genotypes
+                            .markers()
+                            .marker(MarkerIdx::new(m as u32));
+                        target_positions.insert((marker.chrom, marker.pos));
+                    }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        window_quality.set_imputed(ref_m, target_idx.is_none());
+                        let ref_marker =
+                            ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
+                        let is_present = target_idx.is_some()
+                            || target_positions.contains(&(ref_marker.chrom, ref_marker.pos));
+                        window_quality.set_imputed(ref_m, !is_present);
                     }
 
                     let window_results = self.run_imputation_window_streaming(
@@ -2815,8 +2830,23 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
+                    let mut target_positions: std::collections::HashSet<(crate::data::ChromIdx, u32)> =
+                        std::collections::HashSet::with_capacity(
+                            target_window.genotypes.n_markers(),
+                        );
+                    for m in 0..target_window.genotypes.n_markers() {
+                        let marker = target_window
+                            .genotypes
+                            .markers()
+                            .marker(MarkerIdx::new(m as u32));
+                        target_positions.insert((marker.chrom, marker.pos));
+                    }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        window_quality.set_imputed(ref_m, target_idx.is_none());
+                        let ref_marker =
+                            ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
+                        let is_present = target_idx.is_some()
+                            || target_positions.contains(&(ref_marker.chrom, ref_marker.pos));
+                        window_quality.set_imputed(ref_m, !is_present);
                     }
 
                     let window_results = self.run_imputation_window_streaming(
