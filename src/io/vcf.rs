@@ -1390,70 +1390,74 @@ impl VcfWriter {
 
         let get_posteriors_ref = get_posteriors.as_ref();
         let get_genotype_posteriors_ref = get_genotype_posteriors.as_ref();
-        let n_markers = end.saturating_sub(start);
-        let mut lines: Vec<String> = vec![String::new(); n_markers];
-        lines.par_iter_mut().enumerate().for_each(|(idx, line)| {
-            let m = start + idx;
-            let marker_idx = MarkerIdx::new(m as u32);
-            let marker = markers.marker(marker_idx);
-            let n_alleles = 1 + marker.alt_alleles.len();
-            let mut line_buf = String::with_capacity(n_samples * 50 + 200);
-            let mut ryu_buf = ryu::Buffer::new();
+        let chunk_size = 4096usize.max(1);
+        let mut chunk_start = start;
+        while chunk_start < end {
+            let chunk_end = (chunk_start + chunk_size).min(end);
+            let chunk_len = chunk_end - chunk_start;
+            let mut lines: Vec<String> = vec![String::new(); chunk_len];
+            lines.par_iter_mut().enumerate().for_each(|(idx, line)| {
+                let m = chunk_start + idx;
+                let marker_idx = MarkerIdx::new(m as u32);
+                let marker = markers.marker(marker_idx);
+                let n_alleles = 1 + marker.alt_alleles.len();
+                let mut line_buf = String::with_capacity(n_samples * 50 + 200);
+                let mut ryu_buf = ryu::Buffer::new();
 
-            let stats = quality.get(m);
-            let info_field = if let Some(stats) = stats {
-                let mut info_str = String::with_capacity(64);
-                if n_alleles > 1 {
-                    info_str.push_str("DR2=");
-                    for a in 1..n_alleles {
-                        if a > 1 {
-                            info_str.push(',');
+                let stats = quality.get(m);
+                let info_field = if let Some(stats) = stats {
+                    let mut info_str = String::with_capacity(64);
+                    if n_alleles > 1 {
+                        info_str.push_str("DR2=");
+                        for a in 1..n_alleles {
+                            if a > 1 {
+                                info_str.push(',');
+                            }
+                            let v = format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf);
+                            info_str.push_str(&v);
                         }
-                        let v = format_f32_4dp(stats.dr2(a) as f32, &mut ryu_buf);
-                        info_str.push_str(&v);
-                    }
-                    info_str.push_str(";AF=");
-                    for a in 1..n_alleles {
-                        if a > 1 {
-                            info_str.push(',');
+                        info_str.push_str(";AF=");
+                        for a in 1..n_alleles {
+                            if a > 1 {
+                                info_str.push(',');
+                            }
+                            let v = format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf);
+                            info_str.push_str(&v);
                         }
-                        let v = format_f32_4dp(stats.allele_freq(a) as f32, &mut ryu_buf);
-                        info_str.push_str(&v);
                     }
-                }
-                if stats.is_imputed {
-                    if !info_str.is_empty() {
-                        info_str.push(';');
+                    if stats.is_imputed {
+                        if !info_str.is_empty() {
+                            info_str.push(';');
+                        }
+                        info_str.push_str("IMP");
                     }
-                    info_str.push_str("IMP");
-                }
-                if info_str.is_empty() {
-                    ".".to_string()
+                    if info_str.is_empty() {
+                        ".".to_string()
+                    } else {
+                        info_str
+                    }
                 } else {
-                    info_str
-                }
-            } else {
-                ".".to_string()
-            };
+                    ".".to_string()
+                };
 
-            use std::fmt::Write;
-            write!(
-                line_buf,
-                "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
-                markers.chrom_name(marker.chrom).unwrap_or("."),
-                marker.pos,
-                marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
-                marker.ref_allele,
-                marker
-                    .alt_alleles
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                info_field,
-                format_str
-            )
-            .unwrap();
+                use std::fmt::Write;
+                write!(
+                    line_buf,
+                    "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}",
+                    markers.chrom_name(marker.chrom).unwrap_or("."),
+                    marker.pos,
+                    marker.id.as_ref().map(|s| s.as_ref()).unwrap_or("."),
+                    marker.ref_allele,
+                    marker
+                        .alt_alleles
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    info_field,
+                    format_str
+                )
+                .unwrap();
 
             for s in 0..n_samples {
                 let ds = get_dosage(m, s);
@@ -1634,13 +1638,15 @@ impl VcfWriter {
             }
             line_buf.push('\n');
             *line = line_buf;
-        });
+            });
 
-        for line in lines.into_iter() {
-            self.writer.write_all(line.as_bytes())?;
-            if let Some(bb) = telemetry {
-                bb.add_markers(1);
+            for line in lines.into_iter() {
+                self.writer.write_all(line.as_bytes())?;
+                if let Some(bb) = telemetry {
+                    bb.add_markers(1);
+                }
             }
+            chunk_start = chunk_end;
         }
         Ok(())
     }

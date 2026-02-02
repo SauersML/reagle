@@ -6196,6 +6196,147 @@ fn test_gl_confidence_affects_emission() {
     );
 }
 
+/// Test: Detect AF collapse where Rust imputes near-zero ALT frequency
+/// while Java reports a non-trivial ALT frequency.
+#[test]
+#[serial]
+fn test_imputed_af_collapse_against_java() {
+    let (sources, test_files) = get_all_data_sources();
+    assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
+    println!("\n{}", "=".repeat(70));
+    println!("=== Imputed AF Collapse Check (Rust vs Java) ===");
+    println!("{}", "=".repeat(70));
+
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_path = work_dir.path().join("ref.vcf.gz");
+    fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
+    let target_path = work_dir.path().join("target_sparse.vcf.gz");
+    fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+
+    let java_out = work_dir.path().join("java_out");
+    let java_output = run_beagle(
+        &test_files.beagle_jar,
+        &[
+            ("ref", ref_path.to_str().unwrap()),
+            ("gt", target_path.to_str().unwrap()),
+            ("out", java_out.to_str().unwrap()),
+            ("seed", "42"),
+            ("gp", "true"),
+        ],
+        work_dir.path(),
+    );
+    assert!(java_output.status.success(), "Java BEAGLE failed");
+
+    let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
+    let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
+    let rust_out = work_dir.path().join("rust_out");
+    let rust_result = run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 42);
+    assert!(
+        rust_result.is_ok(),
+        "Rust imputation failed: {:?}",
+        rust_result.err()
+    );
+
+    let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
+    let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+    let rust_idx = build_record_index_multi(&rust_records);
+
+    let mut collapse: Vec<(u64, f64, f64)> = Vec::new();
+    for j_rec in &java_records {
+        if !j_rec.info.contains_key("IMP") {
+            continue;
+        }
+        let Some((r_rec, _)) = match_record_by_alleles(
+            &rust_idx,
+            &rust_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let java_af: f64 = j_rec
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let rust_af: f64 = r_rec
+            .info
+            .get("AF")
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if java_af >= 0.05 && rust_af <= 0.01 {
+            collapse.push((j_rec.pos, java_af, rust_af));
+        }
+    }
+
+    if !collapse.is_empty() {
+        println!(
+            "Found {} imputed markers with AF collapse (Java>=0.05, Rust<=0.01)",
+            collapse.len()
+        );
+        for (pos, j_af, r_af) in collapse.iter().take(10) {
+            println!("  pos={} java_af={:.4} rust_af={:.4}", pos, j_af, r_af);
+        }
+    }
+
+    assert!(
+        collapse.is_empty(),
+        "AF collapse detected for {} imputed markers",
+        collapse.len()
+    );
+}
+
+/// Test: Ensure imputed markers in Rust output carry non-degenerate GP values.
+#[test]
+#[serial]
+fn test_imputed_gp_not_degenerate() {
+    let beagle = setup_test_files();
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let rust_out = work_dir.path().join("rust_imp");
+    let target_vcf = decompress_vcf_for_rust(&beagle.target_sparse_vcf, work_dir.as_ref());
+    let ref_vcf = decompress_vcf_for_rust(&beagle.ref_vcf, work_dir.as_ref());
+    run_rust_imputation(&target_vcf, &ref_vcf, &rust_out, 12345).expect("Rust imputation failed");
+
+    let rust_vcf = work_dir.path().join("rust_imp.vcf.gz");
+    let (_, rust_records) = parse_vcf(&rust_vcf);
+    let mut degenerate = 0usize;
+    let mut total = 0usize;
+
+    for rec in &rust_records {
+        if !rec.info.contains_key("IMP") {
+            continue;
+        }
+        for gt in &rec.genotypes {
+            total += 1;
+            let Some(gp) = gt.gp else {
+                degenerate += 1;
+                continue;
+            };
+            let sum: f64 = gp.iter().sum();
+            let max = gp.iter().cloned().fold(0.0f64, f64::max);
+            if sum <= 0.0 || max <= 0.0 {
+                degenerate += 1;
+            }
+        }
+    }
+
+    println!(
+        "Imputed GP degenerate: {}/{}",
+        degenerate,
+        total.max(1)
+    );
+
+    assert!(
+        degenerate == 0,
+        "Found {} degenerate GP entries in imputed markers",
+        degenerate
+    );
+}
+
 // Note: test_single_mismatch_not_catastrophic was moved to unit tests in imputation.rs
 // because it requires access to internal functions marked #[cfg(test)]
 
