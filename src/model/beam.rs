@@ -297,6 +297,7 @@ struct BeamScratch {
     hap2_candidates: Vec<(usize, i32)>,
     hap1_allele: Vec<(usize, i32, i32)>,
     hap2_allele: Vec<(usize, i32, i32)>,
+    spread: Vec<usize>,
 }
 
 impl BeamScratch {
@@ -306,6 +307,7 @@ impl BeamScratch {
             hap2_candidates: Vec::with_capacity(cap),
             hap1_allele: Vec::with_capacity(cap),
             hap2_allele: Vec::with_capacity(cap),
+            spread: Vec::with_capacity(cap),
         }
     }
 }
@@ -587,6 +589,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             active_pool,
             call.switch_cost,
             &mut scratch.hap1_allele,
+            &mut scratch.spread,
         );
         self.repair_hap_for_allele_into(
             path.hap2,
@@ -596,6 +599,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             active_pool,
             call.switch_cost,
             &mut scratch.hap2_allele,
+            &mut scratch.spread,
         );
         for (h1, c1, e1) in scratch.hap1_allele.iter() {
             for (h2, c2, e2) in scratch.hap2_allele.iter() {
@@ -633,6 +637,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         switch_cost: i32,
         out: &mut Vec<(usize, i32, i32)>,
+        spread: &mut Vec<usize>,
     ) {
         out.clear();
         let marker_idx = marker.as_usize();
@@ -672,7 +677,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
         }
         if out.len() < self.config.switch_candidates {
-            let spread = sample_even(active_pool.list(), self.config.switch_candidates);
+            sample_even_into(active_pool.list(), self.config.switch_candidates, spread);
             for &h in spread.iter() {
                 if self.ref_allele_matches(marker_idx, h, targ_allele) {
                     out.push((h, switch_cost, self.costs.match_cost));
@@ -784,6 +789,24 @@ fn sample_even(list: &[usize], n: usize) -> Vec<usize> {
         out.push(list[idx.min(list.len() - 1)]);
     }
     out
+}
+
+fn sample_even_into(list: &[usize], n: usize, out: &mut Vec<usize>) {
+    out.clear();
+    if list.is_empty() || n == 0 {
+        return;
+    }
+    let n = n.min(list.len());
+    if n == list.len() {
+        out.extend_from_slice(list);
+        return;
+    }
+    let step = list.len() as f64 / n as f64;
+    out.reserve(n);
+    for i in 0..n {
+        let idx = (i as f64 * step).floor() as usize;
+        out.push(list[idx.min(list.len() - 1)]);
+    }
 }
 
 fn push_history_bits(prev_bits: u64, prev_len: u8, swapped: bool) -> (u64, u8) {
