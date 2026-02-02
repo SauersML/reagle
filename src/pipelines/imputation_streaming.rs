@@ -3921,8 +3921,44 @@ impl crate::pipelines::ImputationPipeline {
                 );
                 if store {
                     let ap = if target_allele == 255 {
-                        // Missing target: fall back to population prior to avoid hard-calling
-                        AllelePosteriors::Biallelic(freq_prior)
+                        // Missing target: use donor ensemble (soft) to avoid hard-calling
+                        if n_alleles <= 2 {
+                            if donor_candidates.is_empty() {
+                                AllelePosteriors::Biallelic(freq_prior)
+                            } else {
+                                let mut alt_sum = 0u32;
+                                for &cand in &donor_candidates {
+                                    let allele = col.get(HapIdx::new(cand));
+                                    if allele == 1 {
+                                        alt_sum += 1;
+                                    }
+                                }
+                                let p_alt = alt_sum as f32 / donor_candidates.len() as f32;
+                                AllelePosteriors::Biallelic(p_alt.clamp(1e-6, 1.0 - 1e-6))
+                            }
+                        } else {
+                            let mut probs = vec![0.0f32; n_alleles.max(1)];
+                            if donor_candidates.is_empty() {
+                                let uniform = 1.0 / n_alleles.max(1) as f32;
+                                for p in &mut probs {
+                                    *p = uniform;
+                                }
+                            } else {
+                                for &cand in &donor_candidates {
+                                    let allele = col.get(HapIdx::new(cand));
+                                    if (allele as usize) < n_alleles {
+                                        probs[allele as usize] += 1.0;
+                                    }
+                                }
+                                let denom = donor_candidates.len() as f32;
+                                if denom > 0.0 {
+                                    for p in &mut probs {
+                                        *p /= denom;
+                                    }
+                                }
+                            }
+                            AllelePosteriors::Multiallelic(probs)
+                        }
                     } else {
                         let allele = col.get(HapIdx::new(donor));
                         allele_to_posterior(n_alleles, allele)
