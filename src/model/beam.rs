@@ -1019,6 +1019,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             (pbwt_match_len.max(0.0), pbwt_density.max(0.0), u16::MAX)
         };
         let pbwt_switch_cost = self.pbwt_switch_cost(match_len_morgans, cluster_size, dist_morgans, false);
+        // Note: pbwt_switch_cost already incorporates genetic distance via the
+        // coalescent stay/switch model, so we do not add the global switch_cost
+        // here to avoid double-counting recombination distance.
 
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         if matches {
@@ -1033,7 +1036,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     let effective_switch_cost = if same_cluster {
                         0
                     } else {
-                        switch_cost.saturating_add(pbwt_switch_cost)
+                        pbwt_switch_cost
                     };
                     out.push((h, effective_switch_cost, effective_match_cost));
                 }
@@ -1051,7 +1054,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     let effective_switch_cost = if same_cluster {
                         0
                     } else {
-                        switch_cost.saturating_add(pbwt_switch_cost)
+                        pbwt_switch_cost
                     };
                     out.push((h, effective_switch_cost, effective_match_cost));
                     if out.len() >= self.config.switch_candidates {
@@ -1074,7 +1077,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 let effective_switch_cost = if same_cluster {
                     0
                 } else {
-                    switch_cost.saturating_add(pbwt_switch_cost)
+                    pbwt_switch_cost
                 };
                 out.push((h, effective_switch_cost, effective_match_cost));
             }
@@ -1093,7 +1096,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     let effective_switch_cost = if same_cluster {
                         0
                     } else {
-                        switch_cost.saturating_add(pbwt_switch_cost)
+                        pbwt_switch_cost
                     };
                     out.push((h, effective_switch_cost, effective_match_cost));
                 }
