@@ -48,7 +48,7 @@ impl ModelParams {
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
     /// Maximum recombination intensity
-    pub const MAX_RECOMB_INTENSITY: f32 = 5.0;
+    pub const MAX_RECOMB_INTENSITY: f32 = 15.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
@@ -244,7 +244,8 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // Multiply by 100 to convert from per-cM to per-Morgan
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability
@@ -325,11 +326,24 @@ mod tests {
 
     #[test]
     fn test_recomb_intensity_formula() {
-        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
+        // Use reduced Ne to keep intensity within reasonable bounds (< 15.0)
+        let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
+        // Should be 0.04 * 100_000 / 1000 = 4.0
+        let expected = 0.04 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_param_estimates_recomb_intensity_scaling() {
+        let mut estimates = ParamEstimates::new();
+        // 1 switch over 1 cM distance
+        estimates.add_switch(1.0, 1.0);
+
+        // Intensity = (switches / cM) * 100 = (1/1) * 100 = 100.0
+        // This validates the scaling from cM to Morgan
+        let intensity = estimates.recomb_intensity().unwrap();
+        assert!((intensity - 100.0).abs() < 0.001);
     }
 
     #[test]
