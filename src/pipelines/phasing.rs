@@ -69,7 +69,7 @@ use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
-const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
+const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
@@ -78,8 +78,9 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_FORCE_TOP_HAPS: usize = 8;
-const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const PBWT_FORCE_TOP_HAPS: usize = 32;
+const PBWT_ANCHOR_TOP_HAPS: usize = 512;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -450,8 +451,6 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
     batch_haps: &[usize],
     geno: &MutableGenotypes,
     ref_columns: &[GenotypeColumn],
-    phase_mask: Option<&Vec<Vec<u8>>>,
-    mask_unphased_hets: Option<&[bool]>,
     alignment: Option<&MarkerAlignment<TargetSpace, RefSpace>>,
     freqs: &[Vec<f32>],
     window: (usize, usize),
@@ -490,32 +489,9 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
             .and_then(|map| map.get(m).copied())
             .unwrap_or(m);
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            let sample_idx = hap_idx / 2;
-            let phased = phase_mask
-                .and_then(|mask| mask.get(orig_m).and_then(|row| row.get(sample_idx)))
-                .copied()
-                .unwrap_or(0);
-            if phased == 0
-                && mask_unphased_hets
-                    .and_then(|flags| flags.get(sample_idx))
-                    .copied()
-                    .unwrap_or(false)
-            {
-                let hap1 = sample_idx * 2;
-                let hap2 = hap1 + 1;
-                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                if a1 != 255 && a1 == a2 {
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
-                } else {
-                    query_alleles[i] = PbwtQueryAllele::wildcard();
-                }
-            } else {
-                let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
-                query_alleles[i] =
-                    PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
-            }
+            let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+            query_alleles[i] =
+                PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
         }
 
         if let Some(alignment) = alignment {
@@ -674,32 +650,9 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
             .and_then(|map| map.get(m).copied())
             .unwrap_or(m);
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            let sample_idx = hap_idx / 2;
-            let phased = phase_mask
-                .and_then(|mask| mask.get(orig_m).and_then(|row| row.get(sample_idx)))
-                .copied()
-                .unwrap_or(0);
-            if phased == 0
-                && mask_unphased_hets
-                    .and_then(|flags| flags.get(sample_idx))
-                    .copied()
-                    .unwrap_or(false)
-            {
-                let hap1 = sample_idx * 2;
-                let hap2 = hap1 + 1;
-                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                if a1 != 255 && a1 == a2 {
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
-                } else {
-                    query_alleles[i] = PbwtQueryAllele::wildcard();
-                }
-            } else {
-                let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
-                query_alleles[i] =
-                    PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
-            }
+            let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
+            query_alleles[i] =
+                PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
         }
 
         if let Some(alignment) = alignment {
@@ -3034,8 +2987,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     &batch_haps_buf,
                     target_geno,
                     &ref_columns,
-                    phase_mask,
-                    Some(&mask_unphased_hets),
                     alignment,
                     &freqs,
                     (start, end),
@@ -6751,7 +6702,93 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    // Inline heuristic: if no initial paths provided and window is small, scan top neighbors
+    // to find a constant pair that explains the target well. This seeds MCMC with a good state.
+    let mut heuristic_paths: Option<MosaicPaths> = None;
+    if initial_paths.is_none() && n_markers <= HEURISTIC_MAX_MARKERS {
+        let top_k = 16.min(neighbors.len());
+        let candidates = &neighbors[..top_k];
+        if top_k >= 2 {
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_pair = (0, 0);
+            let mut informative = 0usize;
+
+            // Calculate informative markers first
+            for m in 0..n_markers {
+                if seq1[m] != 255 && seq2[m] != 255 {
+                    informative += 1;
+                }
+            }
+
+            if informative > 0 {
+                for i in 0..top_k {
+                    for j in 0..i {
+                        let h1 = candidates[i];
+                        let h2 = candidates[j];
+                        let mut score = 0.0;
+                        for m in 0..n_markers {
+                            let a1 = seq1[m];
+                            let a2 = seq2[m];
+                            if a1 == 255 || a2 == 255 {
+                                continue;
+                            }
+                            let r1 = phase_ibs.allele(m, h1);
+                            let r2 = phase_ibs.allele(m, h2);
+                            if r1 == 255 || r2 == 255 {
+                                continue;
+                            }
+                            let is_het = a1 != a2;
+                            let compatible = if is_het {
+                                (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                            } else {
+                                let obs = a1; // hom
+                                r1 == obs && r2 == obs
+                            };
+                            if compatible {
+                                score += 1.0;
+                            } else {
+                                score -= 1.0;
+                            }
+                        }
+                        if score > best_score {
+                            best_score = score;
+                            best_pair = (h1, h2);
+                        }
+                    }
+                }
+
+                let threshold = 0.9 * (informative as f32);
+                if best_score >= threshold {
+                    let h1 = best_pair.0;
+                    let h2 = best_pair.1;
+                    // Determine orientation
+                    let mut direct = 0;
+                    let mut flipped = 0;
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 || a2 == 255 { continue; }
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 { continue; }
+
+                        if r1 == a1 && r2 == a2 { direct += 1; }
+                        if r1 == a2 && r2 == a1 { flipped += 1; }
+                    }
+
+                    let (p1, p2) = if flipped > direct { (h2, h1) } else { (h1, h2) };
+                    heuristic_paths = Some(MosaicPaths {
+                        path1: vec![p1; n_markers],
+                        path2: vec![p2; n_markers],
+                    });
+                }
+            }
+        }
+    }
+
+    let start_paths = initial_paths.or(heuristic_paths.as_ref());
+
+    if let Some(paths) = start_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
@@ -7182,13 +7219,37 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
-    if best_score < threshold || n_markers > 500 {
+    let threshold = 0.9 * (informative as f32);
+    if best_score < threshold || n_markers > HEURISTIC_MAX_MARKERS {
         return None;
     }
 
-    let path1 = vec![best_pair.0 as u32; n_markers];
-    let path2 = vec![best_pair.1 as u32; n_markers];
+    let mut path1 = vec![best_pair.0 as u32; n_markers];
+    let mut path2 = vec![best_pair.1 as u32; n_markers];
+
+    // Enforce canonical haplotype ordering: if first differing allele of H1 > H2, swap them.
+    let s1 = best_pair.0;
+    let s2 = best_pair.1;
+    let mut swap = false;
+
+    if s1 != s2 {
+        let mut row_buf = vec![0u8; n_states];
+        for m in 0..n_markers {
+            ref_provider.fill_ref_alleles(m, &mut row_buf);
+            let a1 = row_buf[s1];
+            let a2 = row_buf[s2];
+            if a1 != a2 {
+                if a1 > a2 {
+                    swap = true;
+                }
+                break;
+            }
+        }
+    }
+
+    if swap {
+        std::mem::swap(&mut path1, &mut path2);
+    }
 
     Some(MosaicPaths { path1, path2 })
 }
@@ -7638,7 +7699,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
 
-    if !has_anchor {
+    if !has_anchor && start_paths.is_none() {
         let flipped_paths =
             if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
                 Some(MosaicPaths {
@@ -7666,8 +7727,29 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
+        let mut dot_prod = 0.0;
+        let mut valid_n = 0;
         for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i].saturating_add(swap_counts2[i]);
+            if obs_counts[i] > 0 && obs_counts2[i] > 0 {
+                let p1 = swap_counts[i] as f32 / obs_counts[i] as f32;
+                let p2 = swap_counts2[i] as f32 / obs_counts2[i] as f32;
+                dot_prod += (p1 - 0.5) * (p2 - 0.5);
+                valid_n += 1;
+            }
+        }
+
+        let flip_second = dot_prod < 0.0;
+        if flip_second {
+            eprintln!("[mosaic] chains anti-aligned (dot={:.3}, n={}), flipping chain 2", dot_prod, valid_n);
+        }
+
+        for i in 0..het_positions.len() {
+            let c2 = if flip_second {
+                obs_counts2[i].saturating_sub(swap_counts2[i])
+            } else {
+                swap_counts2[i]
+            };
+            swap_counts[i] = swap_counts[i].saturating_add(c2);
             obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
         }
     }
@@ -8824,7 +8906,11 @@ mod tests {
     #[test]
     fn test_prescan_scores_hero_in_anchor_window() {
         let n_markers = 50;
-        let hero_pattern: Vec<u8> = (0..n_markers).map(|m| (m % 2) as u8).collect();
+        // Use all-0 hero pattern. The PBWT search uses raw alleles from the target.
+        // For unphased hets, hap 0 gets allele 0. So hap 0 searches for 0s.
+        // An alternating hero (0/1) would be filtered out by the 1s in the PBWT search.
+        // By making the hero all 0s, we ensure the search path (hap 0) is compatible with the hero.
+        let hero_pattern: Vec<u8> = vec![0; n_markers];
         let (ref_gt, hero_hap_idx) =
             build_ref_panel_with_hero(n_markers, 50, 49, &hero_pattern, 7);
         let target_gt = build_target_with_sparse_anchors(n_markers, &hero_pattern, 10);
@@ -8872,8 +8958,6 @@ mod tests {
             &[0, 1],
             &target_geno,
             &ref_columns,
-            target_gt.phase_mask(),
-            Some(&[true]),
             Some(&alignment),
             &freqs,
             window,
@@ -8977,8 +9061,6 @@ mod tests {
                 &[0, 1],
                 &target_geno,
                 &ref_columns,
-                phase_mask,
-                Some(&[true]),
                 Some(&alignment),
                 &freqs,
                 (start, end),
@@ -9129,7 +9211,7 @@ mod tests {
                     .partial_cmp(&dense_merge_buffer[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let take = PBWT_FORCE_TOP_HAPS.min(touched_indices.len());
+            let take = 32.min(touched_indices.len());
             for &h in touched_indices.iter().take(take) {
                 if !selected.contains(&h) {
                     selected.push(h);
@@ -9197,7 +9279,7 @@ mod tests {
                 }
                 let mut idxs: Vec<usize> = (0..n_ref_haps).collect();
                 idxs.sort_by(|&a, &b| anchor_scores[b].cmp(&anchor_scores[a]));
-                let take = PBWT_ANCHOR_TOP_HAPS.min(idxs.len());
+                let take = 512.min(idxs.len());
                 for &h in idxs.iter().take(take) {
                     if !selected.contains(&h) {
                         selected.push(h);
