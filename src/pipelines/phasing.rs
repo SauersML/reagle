@@ -6751,7 +6751,131 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
-    if let Some(paths) = initial_paths {
+    let mut heuristic_paths: Option<MosaicPaths> = None;
+    if initial_paths.is_none() && n_markers <= 500 {
+        let candidate_neighbors = &neighbors[..neighbors.len().min(16)];
+        let mut informative_markers = 0usize;
+        for m in 0..n_markers {
+            if seq1[m] != 255 || seq2[m] != 255 {
+                informative_markers += 1;
+            }
+        }
+
+        if informative_markers > 0 {
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_pair = None;
+
+            for (i, &h1) in candidate_neighbors.iter().enumerate() {
+                for (j, &h2) in candidate_neighbors.iter().enumerate() {
+                    if j > i {
+                        continue;
+                    }
+                    let mut score = 0.0;
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 && a2 == 255 {
+                            continue;
+                        }
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 {
+                            continue;
+                        }
+                        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                        let compatible = if is_het {
+                            (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                        } else {
+                            let obs = if a1 != 255 { a1 } else { a2 };
+                            r1 == obs && r2 == obs
+                        };
+                        if compatible {
+                            score += 1.0;
+                        } else {
+                            score -= 1.0;
+                        }
+                    }
+                    if score > best_score {
+                        best_score = score;
+                        best_pair = Some((h1, h2));
+                    }
+                }
+            }
+
+            if best_score >= 0.9 * (informative_markers as f32) {
+                if let Some((h1, h2)) = best_pair {
+                    // Determine orientation
+                    let mut score_direct = 0;
+                    let mut score_flip = 0;
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        if a1 == 255 && a2 == 255 {
+                            continue;
+                        }
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == 255 || r2 == 255 {
+                            continue;
+                        }
+                        if a1 != 255 {
+                            if r1 == a1 {
+                                score_direct += 1;
+                            } else {
+                                score_direct -= 1;
+                            }
+                            if r2 == a1 {
+                                score_flip += 1;
+                            } else {
+                                score_flip -= 1;
+                            }
+                        }
+                        if a2 != 255 {
+                            if r2 == a2 {
+                                score_direct += 1;
+                            } else {
+                                score_direct -= 1;
+                            }
+                            if r1 == a2 {
+                                score_flip += 1;
+                            } else {
+                                score_flip -= 1;
+                            }
+                        }
+                    }
+
+                    let (final_h1, final_h2) = if score_flip > score_direct {
+                        (h2, h1)
+                    } else {
+                        (h1, h2)
+                    };
+
+                    let p1 = vec![final_h1; n_markers];
+                    let p2 = vec![final_h2; n_markers];
+
+                    // Update alleles
+                    for m in 0..n_markers {
+                        let r1 = phase_ibs.allele(m, final_h1);
+                        let r2 = phase_ibs.allele(m, final_h2);
+                        if r1 != 255 {
+                            h1_alleles[m] = r1;
+                        }
+                        if r2 != 255 {
+                            h2_alleles[m] = r2;
+                        }
+                    }
+                    heuristic_paths = Some(MosaicPaths {
+                        path1: p1,
+                        path2: p2,
+                    });
+                }
+            }
+        }
+    }
+
+    let paths_to_use = initial_paths.or(heuristic_paths.as_ref());
+
+    if let Some(paths) = paths_to_use {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
