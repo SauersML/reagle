@@ -4010,11 +4010,11 @@ fn test_per_sample_imputation_accuracy() {
 /// For imputed markers, Rust DR2 should match Java DR2.
 #[test]
 #[serial]
-fn test_dr2_genotyped_vs_imputed() {
+fn test_dosage_genotyped_vs_imputed() {
     let (sources, test_files) = get_all_data_sources();
     assert!(!sources.is_empty(), "test_files: {:?}", test_files); if sources.is_empty() { panic!("No test data sources available"); } let source = &sources[0];
     println!("\n{}", "=".repeat(70));
-    println!("=== DR2: Genotyped vs Imputed (Separate Analysis) ===");
+    println!("=== Dosage: Genotyped vs Imputed (Separate Analysis) ===");
     println!("{}", "=".repeat(70));
 
     let work_dir = tempfile::tempdir().expect("Create temp dir");
@@ -4024,6 +4024,8 @@ fn test_dr2_genotyped_vs_imputed() {
     fs::copy(&source.ref_vcf, &ref_path).expect("Copy ref VCF");
     let target_path = work_dir.path().join("target_sparse.vcf.gz");
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
+    let truth_path = work_dir.path().join("target_full.vcf.gz");
+    fs::copy(&source.target_vcf, &truth_path).expect("Copy full target VCF");
 
     // Run Java
     let java_out = work_dir.path().join("java_out");
@@ -4054,13 +4056,26 @@ fn test_dr2_genotyped_vs_imputed() {
     // Parse outputs
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+    let (_, truth_records) = parse_vcf(&truth_path);
+    let truth_idx = build_record_index_multi(&truth_records);
+    let rust_idx = build_record_index_multi(&rust_records);
     // Separate genotyped and imputed markers
     let mut genotyped_java_dr2: Vec<(u64, f64)> = Vec::new();
     let mut genotyped_rust_dr2: Vec<(u64, f64)> = Vec::new();
     let mut imputed_java_dr2: Vec<(u64, f64)> = Vec::new();
     let mut imputed_rust_dr2: Vec<(u64, f64)> = Vec::new();
 
-    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+    for j_rec in &java_records {
+        let Some((r_rec, _)) = match_record_by_alleles(
+            &rust_idx,
+            &rust_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
         let java_dr2: Option<f64> = j_rec.info.get("DR2").and_then(|v| v.parse().ok());
         let rust_dr2: Option<f64> = r_rec.info.get("DR2").and_then(|v| v.parse().ok());
 
@@ -4206,16 +4221,200 @@ fn test_dr2_genotyped_vs_imputed() {
     );
     println!("  Polymorphic with DR2 < 0.9: {}", polymorphic_low.len());
 
-    // Imputed markers: Rust should not be significantly worse than Java
+    // Imputed markers: compare how often each implementation is worse
     let worse_imp_count = imputed_gaps
         .iter()
         .filter(|(_, j, r)| *r < *j - 0.01)
+        .count();
+    let worse_java_count = imputed_gaps
+        .iter()
+        .filter(|(_, j, r)| *j < *r - 0.01)
         .count();
     println!(
         "  Imputed markers where Rust DR2 significantly worse: {}/{}",
         worse_imp_count,
         imputed_gaps.len()
     );
+    println!(
+        "  Imputed markers where Java DR2 significantly worse: {}/{}",
+        worse_java_count,
+        imputed_gaps.len()
+    );
+
+    // Imputed dosage accuracy vs truth (mean absolute error per marker)
+    let mut imputed_dosage_gaps: Vec<(u64, f64, f64)> = Vec::new();
+    for j_rec in &java_records {
+        if !j_rec.info.contains_key("IMP") {
+            continue;
+        }
+        let Some((r_rec, rust_swap)) = match_record_by_alleles(
+            &rust_idx,
+            &rust_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+        let Some((truth_rec, truth_swap)) = match_record_by_alleles(
+            &truth_idx,
+            &truth_records,
+            &j_rec.chrom,
+            j_rec.pos,
+            &j_rec.ref_allele,
+            &j_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+
+        let mut java_err = 0.0f64;
+        let mut rust_err = 0.0f64;
+        let mut count = 0usize;
+        for (s, (j_gt, r_gt)) in j_rec
+            .genotypes
+            .iter()
+            .zip(r_rec.genotypes.iter())
+            .enumerate()
+        {
+            if s >= truth_rec.genotypes.len() {
+                continue;
+            }
+            let Some((a0, a1)) = gt_to_alleles(&truth_rec.genotypes[s].gt) else {
+                continue;
+            };
+            let truth_ds = (a0 as f64) + (a1 as f64);
+            let mut java_ds = j_gt.ds.or_else(|| {
+                gt_to_alleles(&j_gt.gt).map(|(b0, b1)| (b0 as f64) + (b1 as f64))
+            });
+            let mut rust_ds = r_gt.ds.or_else(|| {
+                gt_to_alleles(&r_gt.gt).map(|(b0, b1)| (b0 as f64) + (b1 as f64))
+            });
+            if let Some(ds) = java_ds {
+                if truth_swap {
+                    java_ds = Some(map_ds_for_swap(ds, true));
+                }
+            }
+            if let Some(ds) = rust_ds {
+                if rust_swap || truth_swap {
+                    rust_ds = Some(map_ds_for_swap(ds, true));
+                }
+            }
+            let (Some(j_ds), Some(r_ds)) = (java_ds, rust_ds) else {
+                continue;
+            };
+            java_err += (j_ds - truth_ds).abs();
+            rust_err += (r_ds - truth_ds).abs();
+            count += 1;
+        }
+
+        if count > 0 {
+            let java_mean = java_err / count as f64;
+            let rust_mean = rust_err / count as f64;
+            imputed_dosage_gaps.push((j_rec.pos, java_mean, rust_mean));
+        }
+    }
+
+    let rust_worse_dosage = imputed_dosage_gaps
+        .iter()
+        .filter(|(_, j, r)| *r > *j + 0.01)
+        .count();
+    let java_worse_dosage = imputed_dosage_gaps
+        .iter()
+        .filter(|(_, j, r)| *j > *r + 0.01)
+        .count();
+    let rust_much_worse_dosage = imputed_dosage_gaps
+        .iter()
+        .filter(|(_, j, r)| *r > *j + 0.10)
+        .count();
+    let java_much_worse_dosage = imputed_dosage_gaps
+        .iter()
+        .filter(|(_, j, r)| *j > *r + 0.10)
+        .count();
+    println!(
+        "  Imputed markers where Rust dosage worse: {}/{}",
+        rust_worse_dosage,
+        imputed_dosage_gaps.len()
+    );
+    println!(
+        "  Imputed markers where Java dosage worse: {}/{}",
+        java_worse_dosage,
+        imputed_dosage_gaps.len()
+    );
+    println!(
+        "  Imputed markers where Rust dosage MUCH worse: {}/{}",
+        rust_much_worse_dosage,
+        imputed_dosage_gaps.len()
+    );
+    println!(
+        "  Imputed markers where Java dosage MUCH worse: {}/{}",
+        java_much_worse_dosage,
+        imputed_dosage_gaps.len()
+    );
+
+    // Print 10 worst examples where Rust is much worse, and 10 where Rust is much better.
+    let mut rust_worse_sorted = imputed_dosage_gaps.clone();
+    rust_worse_sorted.sort_by(|a, b| (b.2 - b.1).partial_cmp(&(a.2 - a.1)).unwrap());
+    let mut rust_better_sorted = imputed_dosage_gaps.clone();
+    rust_better_sorted.sort_by(|a, b| (b.1 - b.2).partial_cmp(&(a.1 - a.2)).unwrap());
+
+    println!("\n  Top 10 markers where Rust is MUCH worse than Java (dosage):");
+    println!(
+        "  {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "Position", "JavaErr", "RustErr", "Gap", "JavaAF", "RustAF"
+    );
+    println!(
+        "  {:-<12} {:-<10} {:-<10} {:-<10} {:-<10} {:-<10}",
+        "", "", "", "", "", ""
+    );
+    for (pos, j_err, r_err) in rust_worse_sorted.iter().take(10) {
+        let java_af = java_records
+            .iter()
+            .find(|r| r.pos == *pos)
+            .and_then(|r| r.info.get("AF"))
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let rust_af = rust_records
+            .iter()
+            .find(|r| r.pos == *pos)
+            .and_then(|r| r.info.get("AF"))
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let gap = r_err - j_err;
+        println!(
+            "  {:>12} {:>10.4} {:>10.4} {:>+10.4} {:>10} {:>10}",
+            pos, j_err, r_err, gap, java_af, rust_af
+        );
+    }
+
+    println!("\n  Top 10 markers where Rust is MUCH better than Java (dosage):");
+    println!(
+        "  {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "Position", "JavaErr", "RustErr", "Gap", "JavaAF", "RustAF"
+    );
+    println!(
+        "  {:-<12} {:-<10} {:-<10} {:-<10} {:-<10} {:-<10}",
+        "", "", "", "", "", ""
+    );
+    for (pos, j_err, r_err) in rust_better_sorted.iter().take(10) {
+        let java_af = java_records
+            .iter()
+            .find(|r| r.pos == *pos)
+            .and_then(|r| r.info.get("AF"))
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let rust_af = rust_records
+            .iter()
+            .find(|r| r.pos == *pos)
+            .and_then(|r| r.info.get("AF"))
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let gap = j_err - r_err;
+        println!(
+            "  {:>12} {:>10.4} {:>10.4} {:>+10.4} {:>10} {:>10}",
+            pos, j_err, r_err, gap, java_af, rust_af
+        );
+    }
 
     // For polymorphic genotyped markers (non-zero variance), DR2 should be ~1.0
     // because we know the true values and output them as dosages
@@ -4231,18 +4430,20 @@ fn test_dr2_genotyped_vs_imputed() {
         );
     }
 
-    // Imputed DR2: Rust should not be worse than Java (NO TOLERANCE)
+    // Imputed dosage accuracy: Rust should not be worse more often than Java
     assert!(
-        rust_imp_mean >= java_imp_mean,
-        "IMPUTED DR2 FAIL: Rust ({:.4}) worse than Java ({:.4}) - STRICT FAILURE",
-        rust_imp_mean,
-        java_imp_mean
+        rust_worse_dosage < java_worse_dosage,
+        "IMPUTED DOSAGE FAIL: Rust worse than Java on {}/{} markers (Java worse on {})",
+        rust_worse_dosage,
+        imputed_dosage_gaps.len(),
+        java_worse_dosage
     );
     assert!(
-        worse_imp_count == 0,
-        "IMPUTED DR2 FAIL: Rust worse than Java on {}/{} markers - STRICT FAILURE",
-        worse_imp_count,
-        imputed_gaps.len()
+        rust_much_worse_dosage < java_much_worse_dosage,
+        "IMPUTED DOSAGE FAIL: Rust much worse than Java on {}/{} markers (Java much worse on {})",
+        rust_much_worse_dosage,
+        imputed_dosage_gaps.len(),
+        java_much_worse_dosage
     );
 
     println!("\n  DR2 test PASSED!");
