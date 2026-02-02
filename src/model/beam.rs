@@ -548,9 +548,14 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let mut trie = HistoryTrie::new();
         let mut scratch = BeamScratch::new(self.config.switch_candidates.max(4));
 
-        // Principled initialization: seed beam with both orientations at first call site.
-        let mut beam: Vec<BeamPath> = if let Some(first_call) = condensed.call_sites.first() {
-            self.init_beam_with_alleles(active_pool, first_call.marker, first_call.a1, first_call.a2)
+        // Prefer an unfixed call site for initialization so both orientations are informative.
+        let init_call = condensed
+            .call_sites
+            .iter()
+            .find(|call| !call.fixed)
+            .or_else(|| condensed.call_sites.first());
+        let mut beam: Vec<BeamPath> = if let Some(call) = init_call {
+            self.init_beam_with_alleles(active_pool, call.marker, call.a1, call.a2)
         } else {
             self.init_beam(active_pool)
         };
