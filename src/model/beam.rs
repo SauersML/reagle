@@ -92,6 +92,8 @@ impl HistoryTrie {
 pub struct BeamPath {
     pub hap1: usize,
     pub hap2: usize,
+    pub cluster1: u16,
+    pub cluster2: u16,
     pub score: i32,
     pub history: HistoryIdx,
     pub last_swapped: bool,
@@ -682,6 +684,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 beam.push(BeamPath {
                     hap1,
                     hap2,
+                    cluster1: u16::MAX,
+                    cluster2: u16::MAX,
                     score: 0,
                     history: HistoryIdx(0),
                     last_swapped: false,
@@ -748,6 +752,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 beam.push(BeamPath {
                     hap1: h1,
                     hap2: h2,
+                    cluster1: u16::MAX,
+                    cluster2: u16::MAX,
                     score: 0,
                     history: HistoryIdx(0),
                     last_swapped: false,
@@ -769,6 +775,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 beam.push(BeamPath {
                     hap1: h1,
                     hap2: h2,
+                    cluster1: u16::MAX,
+                    cluster2: u16::MAX,
                     score: 0,
                     history: HistoryIdx(0),
                     last_swapped: true,
@@ -819,6 +827,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     out.push(BeamPath {
                         hap1: *h1,
                         hap2: *h2,
+                        cluster1: u16::MAX,
+                        cluster2: u16::MAX,
                         score: path.score + *c1 + *c2,
                         history: path.history,
                         last_swapped: path.last_swapped,
@@ -974,9 +984,19 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 }
                 let (history_bits, history_len) = push_history_bits(path.history_bits, path.history_len, swapped);
                 if score <= cutoff {
+                    let c1 = active_pool
+                        .pbwt_meta(hap1_al, *h1, pbwt_version as u32)
+                        .map(|m| m.cluster_id)
+                        .unwrap_or(u16::MAX);
+                    let c2 = active_pool
+                        .pbwt_meta(hap2_al, *h2, pbwt_version as u32)
+                        .map(|m| m.cluster_id)
+                        .unwrap_or(u16::MAX);
                     out.push(BeamPath {
                         hap1: *h1,
                         hap2: *h2,
+                        cluster1: c1,
+                        cluster2: c2,
                         score,
                         history,
                         last_swapped: swapped,
@@ -1205,10 +1225,20 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
 
         // Collapse identical states (hap1, hap2, history fingerprint, last_swapped).
+        let cluster_key = |cluster: u16, hap: usize| -> u32 {
+            if cluster != u16::MAX {
+                cluster as u32
+            } else {
+                0x8000_0000u32 | (hap as u32 & 0x7FFF_FFFF)
+            }
+        };
         beam.sort_unstable_by(|a, b| {
-            a.hap1
-                .cmp(&b.hap1)
-                .then(a.hap2.cmp(&b.hap2))
+            let a1 = cluster_key(a.cluster1, a.hap1);
+            let b1 = cluster_key(b.cluster1, b.hap1);
+            let a2 = cluster_key(a.cluster2, a.hap2);
+            let b2 = cluster_key(b.cluster2, b.hap2);
+            a1.cmp(&b1)
+                .then(a2.cmp(&b2))
                 .then(a.history_bits.cmp(&b.history_bits))
                 .then(a.history_len.cmp(&b.history_len))
                 .then(a.last_swapped.cmp(&b.last_swapped))
@@ -1218,8 +1248,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         for i in 1..beam.len() {
             let prev = &beam[write - 1];
             let curr = &beam[i];
-            let same = prev.hap1 == curr.hap1
-                && prev.hap2 == curr.hap2
+            let same = cluster_key(prev.cluster1, prev.hap1) == cluster_key(curr.cluster1, curr.hap1)
+                && cluster_key(prev.cluster2, prev.hap2) == cluster_key(curr.cluster2, curr.hap2)
                 && prev.history_bits == curr.history_bits
                 && prev.history_len == curr.history_len
                 && prev.last_swapped == curr.last_swapped;
