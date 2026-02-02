@@ -121,6 +121,52 @@ impl CondensedTarget {
 
         Self { segments, call_sites }
     }
+
+    pub fn reversed(
+        &self,
+        hi_freq_gen_positions: &[f64],
+        params: &ModelParams,
+    ) -> Self {
+        let mut call_sites_rev: Vec<CallSite> = Vec::with_capacity(self.call_sites.len());
+        let mut last_pos: Option<f64> = None;
+        for cs in self.call_sites.iter().rev() {
+            let pos = hi_freq_gen_positions.get(cs.hi_idx).copied().unwrap_or(0.0);
+            let switch_cost = if let Some(prev_pos) = last_pos {
+                let dist = (pos - prev_pos).abs();
+                let p_switch = params.p_recomb(dist).clamp(1e-12, 0.5 - 1e-12);
+                let odds = p_switch / (1.0 - p_switch);
+                (-odds.ln() * 1_000_000.0).round() as i32
+            } else {
+                0
+            };
+            let flip_cost = if cs.fixed {
+                if switch_cost == 0 {
+                    250_000
+                } else {
+                    switch_cost.max(250_000)
+                }
+            } else if switch_cost == 0 {
+                1_000_000
+            } else {
+                switch_cost.max(1_000_000)
+            };
+            call_sites_rev.push(CallSite {
+                marker: cs.marker,
+                hi_idx: cs.hi_idx,
+                a1: cs.a1,
+                a2: cs.a2,
+                switch_cost,
+                flip_cost,
+                fixed: cs.fixed,
+            });
+            last_pos = Some(pos);
+        }
+        let segments_rev: Vec<CondensedSegment> = self.segments.iter().rev().cloned().collect();
+        CondensedTarget {
+            segments: segments_rev,
+            call_sites: call_sites_rev,
+        }
+    }
 }
 
 fn build_segment_mask<RefSpace>(

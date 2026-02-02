@@ -103,6 +103,12 @@ pub struct BeamPath {
 }
 
 #[derive(Clone, Debug)]
+pub struct BeamPosteriors {
+    pub decisions: Vec<bool>,
+    pub p_swapped: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ActivePool {
     n_ref: usize,
     list: Vec<usize>,
@@ -327,9 +333,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         sample_phase: &mut SamplePhase,
         active_pool: &mut ActivePool,
         injector: &mut I,
-    ) {
+    ) -> BeamPosteriors {
         if self.packed_ref.n_ref_haps() == 0 {
-            return;
+            return BeamPosteriors {
+                decisions: Vec::new(),
+                p_swapped: Vec::new(),
+            };
         }
         if active_pool.is_empty() {
             active_pool.add(0);
@@ -337,11 +346,17 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
 
         let mut trie = HistoryTrie::new();
         let mut scratch = BeamScratch::new(self.config.switch_candidates.max(4));
-        let mut beam: Vec<BeamPath> = self.init_beam(active_pool);
+
+        // Principled initialization: seed beam with both orientations at first call site.
+        let mut beam: Vec<BeamPath> = if let Some(first_call) = condensed.call_sites.first() {
+            self.init_beam_with_alleles(active_pool, first_call.marker, first_call.a1, first_call.a2)
+        } else {
+            self.init_beam(active_pool)
+        };
 
         let n_calls = condensed.call_sites.len();
-        let mut best_local_unswapped: Vec<i32> = vec![i32::MAX; n_calls];
-        let mut best_local_swapped: Vec<i32> = vec![i32::MAX; n_calls];
+        let mut logsum_unswapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
+        let mut logsum_swapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         for i in 0..n_calls {
             let segment = &condensed.segments[i];
             let call = &condensed.call_sites[i];
@@ -355,7 +370,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 &mut scratch,
             );
             if beam.is_empty() {
-                beam = self.init_beam(active_pool);
+                beam = self.init_beam_with_alleles(active_pool, call.marker, call.a1, call.a2);
+                if beam.is_empty() {
+                    beam = self.init_beam(active_pool);
+                }
             }
 
             // Dynamic injection on collapse or interval.
@@ -375,8 +393,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     active_pool,
                     &mut trie,
                     &mut next,
-                    &mut best_local_unswapped,
-                    &mut best_local_swapped,
+                    &mut logsum_unswapped,
+                    &mut logsum_swapped,
                     i,
                     &mut scratch,
                 );
@@ -403,6 +421,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         if let Some(best) = beam.iter().min_by_key(|p| p.score).cloned() {
             let mut phases = Vec::new();
             trie.reconstruct(best.history, &mut phases);
+            if phases.len() < n_calls {
+                phases.resize(n_calls, false);
+            }
+            let p_swapped = compute_swap_posteriors(&logsum_swapped, &logsum_unswapped);
             for (i, phase_swapped) in phases.iter().enumerate() {
                 let call = &condensed.call_sites[i];
                 let m = call.marker.as_usize();
@@ -410,24 +432,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     sample_phase.swap_alleles(m);
                 }
                 sample_phase.mark_phased(m);
-                let conf = if call.fixed {
-                    1.0
-                } else {
-                    let l0 = best_local_unswapped[i];
-                    let l1 = best_local_swapped[i];
-                    if l0 == i32::MAX || l1 == i32::MAX {
-                        0.5
-                    } else {
-                    let (best_score, alt_score) = if l0 <= l1 { (l0, l1) } else { (l1, l0) };
-                    let gap = (alt_score - best_score).max(0) as f32;
-                    let temp = 2_000_000.0f32;
-                    let p = 1.0 / (1.0 + (gap / temp).exp());
-                    p.max(0.0).min(1.0)
-                }
-            };
+                let p = p_swapped.get(i).copied().unwrap_or(0.5);
+                let conf = if *phase_swapped { p } else { 1.0 - p };
                 sample_phase.set_phase_confidence(m, conf);
             }
+            return BeamPosteriors { decisions: phases, p_swapped };
         }
+        BeamPosteriors { decisions: Vec::new(), p_swapped: vec![0.5; n_calls] }
     }
 
     fn init_beam(&self, active_pool: &ActivePool) -> Vec<BeamPath> {
@@ -471,6 +482,97 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 }
             }
         }
+        beam
+    }
+
+    /// Principled beam initialization: seed with haplotypes matching both alleles.
+    /// This ensures the prior over orientations is uniform when evidence is symmetric.
+    fn init_beam_with_alleles(
+        &self,
+        active_pool: &ActivePool,
+        marker: MarkerIdx,
+        a1: u8,
+        a2: u8,
+    ) -> Vec<BeamPath> {
+        let list = active_pool.list();
+        if list.is_empty() {
+            return Vec::new();
+        }
+
+        let marker_idx = marker.as_usize();
+        let mut match_a1: Vec<usize> = Vec::new();
+        let mut match_a2: Vec<usize> = Vec::new();
+
+        // Partition haplotypes by which allele they carry.
+        for &h in list {
+            if self.ref_allele_matches(marker_idx, h, a1) {
+                match_a1.push(h);
+            }
+            if self.ref_allele_matches(marker_idx, h, a2) {
+                match_a2.push(h);
+            }
+        }
+
+        // Fallback: if no matches for an allele, use the full pool.
+        if match_a1.is_empty() {
+            match_a1 = list.to_vec();
+        }
+        if match_a2.is_empty() {
+            match_a2 = list.to_vec();
+        }
+
+        let k = (self.config.beam_width as f32).sqrt().ceil() as usize;
+        let n1 = k.min(match_a1.len()).max(1);
+        let n2 = k.min(match_a2.len()).max(1);
+
+        let picks_a1 = sample_even(&match_a1, n1);
+        let picks_a2 = sample_even(&match_a2, n2);
+
+        let mut beam = Vec::with_capacity(self.config.beam_width);
+        let half_width = self.config.beam_width / 2;
+
+        // Orientation 0|1: hap1 carries a1, hap2 carries a2.
+        for &h1 in &picks_a1 {
+            for &h2 in &picks_a2 {
+                beam.push(BeamPath {
+                    hap1: h1,
+                    hap2: h2,
+                    score: 0,
+                    history: HistoryIdx(0),
+                    last_swapped: false,
+                    history_bits: 0,
+                    history_len: 0,
+                });
+                if beam.len() >= half_width {
+                    break;
+                }
+            }
+            if beam.len() >= half_width {
+                break;
+            }
+        }
+
+        // Orientation 1|0: hap1 carries a2, hap2 carries a1.
+        for &h1 in &picks_a2 {
+            for &h2 in &picks_a1 {
+                beam.push(BeamPath {
+                    hap1: h1,
+                    hap2: h2,
+                    score: 0,
+                    history: HistoryIdx(0),
+                    last_swapped: true,
+                    history_bits: 1,
+                    history_len: 1,
+                });
+                if beam.len() >= self.config.beam_width {
+                    break;
+                }
+            }
+            if beam.len() >= self.config.beam_width {
+                break;
+            }
+        }
+
         beam
     }
 
@@ -564,8 +666,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         trie: &mut HistoryTrie,
         out: &mut Vec<BeamPath>,
-        best_unswapped: &mut [i32],
-        best_swapped: &mut [i32],
+        logsum_unswapped: &mut [f64],
+        logsum_swapped: &mut [f64],
         call_idx: usize,
         scratch: &mut BeamScratch,
     ) {
@@ -573,10 +675,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let a2 = call.a2;
 
         if call.fixed {
-            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, best_unswapped, best_swapped, call_idx, scratch);
+            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, scratch);
         } else {
-            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, best_unswapped, best_swapped, call_idx, scratch);
-            self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out, best_unswapped, best_swapped, call_idx, scratch);
+            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, scratch);
+            self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, scratch);
         }
     }
 
@@ -590,8 +692,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         trie: &mut HistoryTrie,
         out: &mut Vec<BeamPath>,
-        best_unswapped: &mut [i32],
-        best_swapped: &mut [i32],
+        logsum_unswapped: &mut [f64],
+        logsum_swapped: &mut [f64],
         call_idx: usize,
         scratch: &mut BeamScratch,
     ) {
@@ -621,12 +723,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
                 let flip_penalty = if swapped != path.last_swapped { call.flip_cost } else { 0 };
                 let score = score_no_flip + flip_penalty;
+                let logp = -(score_no_flip as f64) / 1_000_000.0;
                 if swapped {
-                    if score_no_flip < best_swapped[call_idx] {
-                        best_swapped[call_idx] = score_no_flip;
-                    }
-                } else if score_no_flip < best_unswapped[call_idx] {
-                    best_unswapped[call_idx] = score_no_flip;
+                    logsum_swapped[call_idx] = logaddexp(logsum_swapped[call_idx], logp);
+                } else {
+                    logsum_unswapped[call_idx] = logaddexp(logsum_unswapped[call_idx], logp);
                 }
                 let (history_bits, history_len) = push_history_bits(path.history_bits, path.history_len, swapped);
                 out.push(BeamPath {
@@ -829,4 +930,42 @@ fn push_history_bits(prev_bits: u64, prev_len: u8, swapped: bool) -> (u64, u8) {
     let bits = ((prev_bits << 1) | bit) & ((1u64 << HISTORY_BITS) - 1);
     let len = if prev_len < HISTORY_BITS { prev_len + 1 } else { HISTORY_BITS };
     (bits, len)
+}
+
+#[inline]
+fn logaddexp(a: f64, b: f64) -> f64 {
+    if a.is_infinite() && a.is_sign_negative() {
+        return b;
+    }
+    if b.is_infinite() && b.is_sign_negative() {
+        return a;
+    }
+    let m = if a > b { a } else { b };
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(logsum_swapped.len());
+    for i in 0..logsum_swapped.len() {
+        let ls = logsum_swapped[i];
+        let lu = logsum_unswapped.get(i).copied().unwrap_or(f64::NEG_INFINITY);
+        if ls.is_infinite() && lu.is_infinite() {
+            out.push(0.5);
+            continue;
+        }
+        if ls.is_infinite() || lu.is_infinite() {
+            out.push(0.5);
+            continue;
+        }
+        let m = if ls > lu { ls } else { lu };
+        let ps = (ls - m).exp();
+        let pu = (lu - m).exp();
+        let denom = ps + pu;
+        if denom <= 0.0 {
+            out.push(0.5);
+        } else {
+            out.push((ps / denom).clamp(0.0, 1.0) as f32);
+        }
+    }
+    out
 }
