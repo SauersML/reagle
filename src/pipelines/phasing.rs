@@ -80,6 +80,7 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 8;
 const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
