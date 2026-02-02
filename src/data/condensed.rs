@@ -32,6 +32,8 @@ pub struct CallSite {
     pub pbwt_density_a1: f32,
     /// PBWT-derived density proxy for allele a2 (count of candidate haps).
     pub pbwt_density_a2: f32,
+    /// Genetic distance to previous call site (Morgans).
+    pub dist_morgans: f32,
     pub switch_cost: i32,
     pub flip_cost: i32,
     pub fixed: bool,
@@ -74,8 +76,12 @@ impl CondensedTarget {
             if a1 != a2 && a1 <= 1 && a2 <= 1 {
                 let marker = MarkerIdx::new(orig_m as u32);
                 let pos = hi_freq_gen_positions.get(hi_idx).copied().unwrap_or(0.0);
-                let switch_cost = if let Some(prev_pos) = last_call_pos {
-                    let dist = (pos - prev_pos).max(0.0);
+                let dist = if let Some(prev_pos) = last_call_pos {
+                    (pos - prev_pos).max(0.0)
+                } else {
+                    0.0
+                };
+                let switch_cost = if dist > 0.0 {
                     // Use log-odds cost so "stay" is the implicit baseline.
                     let p_switch = params.p_recomb(dist).clamp(1e-12, 0.5 - 1e-12);
                     let odds = p_switch / (1.0 - p_switch);
@@ -127,6 +133,21 @@ impl CondensedTarget {
                         (l1, l2, d1, d2)
                     })
                     .unwrap_or((0.0, 0.0, 0.0, 0.0));
+                let local_step = if hi_idx > 0 && hi_idx + 1 < hi_freq_gen_positions.len() {
+                    let left = (hi_freq_gen_positions[hi_idx] - hi_freq_gen_positions[hi_idx - 1])
+                        .abs();
+                    let right =
+                        (hi_freq_gen_positions[hi_idx + 1] - hi_freq_gen_positions[hi_idx]).abs();
+                    (left + right) * 0.5
+                } else if hi_idx > 0 {
+                    (hi_freq_gen_positions[hi_idx] - hi_freq_gen_positions[hi_idx - 1]).abs()
+                } else if hi_idx + 1 < hi_freq_gen_positions.len() {
+                    (hi_freq_gen_positions[hi_idx + 1] - hi_freq_gen_positions[hi_idx]).abs()
+                } else {
+                    0.0
+                };
+                let pbwt_len_a1 = pbwt_len_a1 * local_step as f32;
+                let pbwt_len_a2 = pbwt_len_a2 * local_step as f32;
 
                 call_sites.push(CallSite {
                     marker,
@@ -139,6 +160,7 @@ impl CondensedTarget {
                     pbwt_len_a2,
                     pbwt_density_a1,
                     pbwt_density_a2,
+                    dist_morgans: dist as f32,
                     switch_cost,
                     flip_cost,
                     fixed,
@@ -187,8 +209,12 @@ impl CondensedTarget {
         let mut last_pos: Option<f64> = None;
         for cs in self.call_sites.iter().rev() {
             let pos = hi_freq_gen_positions.get(cs.hi_idx).copied().unwrap_or(0.0);
-            let switch_cost = if let Some(prev_pos) = last_pos {
-                let dist = (pos - prev_pos).abs();
+            let dist = if let Some(prev_pos) = last_pos {
+                (pos - prev_pos).abs()
+            } else {
+                0.0
+            };
+            let switch_cost = if dist > 0.0 {
                 let p_switch = params.p_recomb(dist).clamp(1e-12, 0.5 - 1e-12);
                 let odds = p_switch / (1.0 - p_switch);
                 (-odds.ln() * 1_000_000.0).round() as i32
@@ -217,6 +243,7 @@ impl CondensedTarget {
                 pbwt_len_a2: cs.pbwt_len_a2,
                 pbwt_density_a1: cs.pbwt_density_a1,
                 pbwt_density_a2: cs.pbwt_density_a2,
+                dist_morgans: dist as f32,
                 switch_cost,
                 flip_cost,
                 fixed: cs.fixed,

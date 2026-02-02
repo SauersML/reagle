@@ -19,8 +19,6 @@ pub struct BeamConfig {
     pub inject_k: usize,
     pub collapse_gap: i32,
     pub prune_tolerance: i32,
-    pub pbwt_len_weight: i32,
-    pub pbwt_density_weight: i32,
 }
 
 impl Default for BeamConfig {
@@ -32,9 +30,6 @@ impl Default for BeamConfig {
             inject_k: 16,
             collapse_gap: 5_000_000, // in fixed-point cost units
             prune_tolerance: 30_000_000,
-            // Fixed-point weights for PBWT-derived terms (ln(1+x) scaled by 1e6).
-            pbwt_len_weight: 200_000,
-            pbwt_density_weight: 100_000,
         }
     }
 }
@@ -779,6 +774,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             hap1_freq,
             if swapped { call.pbwt_len_a2 } else { call.pbwt_len_a1 },
             if swapped { call.pbwt_density_a2 } else { call.pbwt_density_a1 },
+            call.dist_morgans,
             call.fixed,
             active_pool,
             call.switch_cost,
@@ -792,6 +788,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             hap2_freq,
             if swapped { call.pbwt_len_a1 } else { call.pbwt_len_a2 },
             if swapped { call.pbwt_density_a1 } else { call.pbwt_density_a2 },
+            call.dist_morgans,
             call.fixed,
             active_pool,
             call.switch_cost,
@@ -838,6 +835,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         targ_freq: f32,
         pbwt_match_len: f32,
         pbwt_density: f32,
+        dist_morgans: f32,
         fixed: bool,
         active_pool: &ActivePool,
         switch_cost: i32,
@@ -847,10 +845,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         out.clear();
         let marker_idx = marker.as_usize();
 
-        // Emission costs using a Li-Stephens-style mixture:
-        //   P(X|donor match) = (1 - theta) + theta * pi(X)
-        //   P(X|donor mismatch) = theta * pi(X)
-        // This makes rare alleles strongly penalize mismatches.
+        // Emission costs (Li–Stephens mixture, explicit rare-allele behavior):
+        //   P(X|match) = (1-θ) + θ·π(X)
+        //   P(X|mismatch) = θ·π(X)
+        // So as π(X) → 0, mismatches become exponentially costly while matches
+        // retain the (1-θ) mass.
         let pi = targ_freq.max(1e-9) as f64;
         let theta = self.costs.p_err.max(1e-9).min(1.0 - 1e-9);
         let p_match = (1.0 - theta) + theta * pi;
@@ -865,7 +864,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         // Switch cost: recombination penalty is already encoded in switch_cost.
         // The optimal switch criterion compares LLR gain vs recombination penalty.
         // No additional MAF term needed here - it's in the emission costs.
-        let pbwt_switch_cost = self.pbwt_switch_cost(pbwt_match_len, pbwt_density);
+        let pbwt_switch_cost = self.pbwt_switch_cost(pbwt_match_len, pbwt_density, dist_morgans);
         let effective_switch_cost = switch_cost.saturating_add(pbwt_switch_cost);
 
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
@@ -920,12 +919,33 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     }
 
     #[inline]
-    fn pbwt_switch_cost(&self, match_len: f32, density: f32) -> i32 {
-        let len_term = (1.0 + match_len.max(0.0) as f64).ln();
-        let density_term = (1.0 + density.max(0.0) as f64).ln();
-        let cost = (self.config.pbwt_len_weight as f64 * len_term)
-            - (self.config.pbwt_density_weight as f64 * density_term);
-        cost.round()
+    fn pbwt_switch_cost(&self, match_len_morgans: f32, density: f32, dist_morgans: f32) -> i32 {
+        // Coalescent-based stay probability from PBWT match length:
+        //   prior: t ~ Exp(1) over TMRCA (coalescent units)
+        //   L | t ~ Exp(rate = 2t)  =>  t | L ~ Gamma(α=2, β=1+2L)
+        //   P(stay | L, d) = E[exp(-2 t d)] = (β / (β + 2d))^α
+        // Switch odds = P(switch)/P(stay), cost = -ln(odds).
+        let l = match_len_morgans.max(0.0) as f64;
+        let d = dist_morgans.max(0.0) as f64;
+        let beta = 1.0 + 2.0 * l;
+        let denom = beta + 2.0 * d;
+        let p_stay = if denom > 0.0 {
+            (beta / denom).powi(2)
+        } else {
+            0.0
+        };
+        let p_stay = p_stay.clamp(1e-12, 1.0 - 1e-12);
+        let p_switch = (1.0 - p_stay).clamp(1e-12, 1.0 - 1e-12);
+        let switch_odds = p_switch / p_stay;
+        let mut cost = -switch_odds.ln();
+        // Density prior (cluster multiplicity): picking one donor from K
+        // equally plausible candidates adds +log K to the cost.
+        let k = density.max(0.0) as f64;
+        if k > 0.0 {
+            cost += (1.0 + k).ln();
+        }
+        (cost * 1_000_000.0)
+            .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32
     }
 
