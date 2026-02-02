@@ -33,8 +33,6 @@ pub struct ModelParams {
     /// Initial likelihood ratio threshold
     pub initial_lr: f32,
 
-    /// Phasing stiffness multiplier (>= 1.0 tightens switch penalty)
-    pub phasing_stiffness: f32,
 }
 
 impl ModelParams {
@@ -66,7 +64,6 @@ impl ModelParams {
             iterations: Self::DEFAULT_ITERATIONS,
             lr_threshold: f32::INFINITY,
             initial_lr: Self::DEFAULT_INITIAL_LR,
-            phasing_stiffness: 1.0,
         }
     }
 
@@ -90,7 +87,6 @@ impl ModelParams {
             iterations: Self::DEFAULT_ITERATIONS,
             lr_threshold: f32::INFINITY, // Set per iteration
             initial_lr: Self::DEFAULT_INITIAL_LR,
-            phasing_stiffness: 1.0,
         }
     }
 
@@ -146,11 +142,7 @@ impl ModelParams {
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
         let gen_dist_m = gen_dist_cm / 100.0;
-        let p_standard = (-f64::exp_m1(c * gen_dist_m)) as f64;
-        let stiffness = self.phasing_stiffness.max(1.0) as f64;
-        let p = (p_standard / stiffness)
-            .min(0.5)
-            .max(Self::MIN_RECOMB_PROB as f64) as f32;
+        let p = (-f64::exp_m1(c * gen_dist_m)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
@@ -181,12 +173,6 @@ impl ModelParams {
         self.n_states = n_states;
     }
 
-    /// Set phasing stiffness (>= 1.0 tightens switch penalty)
-    pub fn set_phasing_stiffness(&mut self, stiffness: f32) {
-        if stiffness.is_finite() && stiffness >= 1.0 {
-            self.phasing_stiffness = stiffness;
-        }
-    }
 }
 
 impl Default for ModelParams {
