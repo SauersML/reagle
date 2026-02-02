@@ -115,6 +115,14 @@ pub struct ActivePool {
     n_ref: usize,
     list: Vec<usize>,
     bitset: Vec<u64>,
+    pbwt_cluster0: Vec<u16>,
+    pbwt_cluster1: Vec<u16>,
+    pbwt_cluster_size0: Vec<f32>,
+    pbwt_cluster_size1: Vec<f32>,
+    pbwt_match_len0: Vec<f32>,
+    pbwt_match_len1: Vec<f32>,
+    pbwt_version0: Vec<u32>,
+    pbwt_version1: Vec<u32>,
 }
 
 impl ActivePool {
@@ -124,6 +132,14 @@ impl ActivePool {
             n_ref,
             list: Vec::new(),
             bitset: vec![0u64; n_words],
+            pbwt_cluster0: vec![u16::MAX; n_ref],
+            pbwt_cluster1: vec![u16::MAX; n_ref],
+            pbwt_cluster_size0: vec![0.0; n_ref],
+            pbwt_cluster_size1: vec![0.0; n_ref],
+            pbwt_match_len0: vec![0.0; n_ref],
+            pbwt_match_len1: vec![0.0; n_ref],
+            pbwt_version0: vec![u32::MAX; n_ref],
+            pbwt_version1: vec![u32::MAX; n_ref],
         }
     }
 
@@ -165,6 +181,75 @@ impl ActivePool {
             }
         }
     }
+
+    #[inline]
+    pub fn set_pbwt_meta(
+        &mut self,
+        allele: u8,
+        hap: usize,
+        cluster_id: u16,
+        cluster_size: f32,
+        match_len_markers: f32,
+        version: u32,
+    ) {
+        if hap >= self.n_ref {
+            return;
+        }
+        if allele == 0 {
+            self.pbwt_cluster0[hap] = cluster_id;
+            self.pbwt_cluster_size0[hap] = cluster_size;
+            self.pbwt_match_len0[hap] = match_len_markers;
+            self.pbwt_version0[hap] = version;
+        } else if allele == 1 {
+            self.pbwt_cluster1[hap] = cluster_id;
+            self.pbwt_cluster_size1[hap] = cluster_size;
+            self.pbwt_match_len1[hap] = match_len_markers;
+            self.pbwt_version1[hap] = version;
+        }
+    }
+
+    #[inline]
+    pub fn pbwt_meta(&self, allele: u8, hap: usize, version: u32) -> Option<PbwtMeta> {
+        if hap >= self.n_ref {
+            return None;
+        }
+        if allele == 0 {
+            if self.pbwt_version0[hap] != version {
+                return None;
+            }
+            let cluster_id = self.pbwt_cluster0[hap];
+            if cluster_id == u16::MAX {
+                return None;
+            }
+            return Some(PbwtMeta {
+                cluster_id,
+                cluster_size: self.pbwt_cluster_size0[hap],
+                match_len_markers: self.pbwt_match_len0[hap],
+            });
+        }
+        if allele == 1 {
+            if self.pbwt_version1[hap] != version {
+                return None;
+            }
+            let cluster_id = self.pbwt_cluster1[hap];
+            if cluster_id == u16::MAX {
+                return None;
+            }
+            return Some(PbwtMeta {
+                cluster_id,
+                cluster_size: self.pbwt_cluster_size1[hap],
+                match_len_markers: self.pbwt_match_len1[hap],
+            });
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PbwtMeta {
+    pub cluster_id: u16,
+    pub cluster_size: f32,
+    pub match_len_markers: f32,
 }
 
 pub trait BeamInjector {
@@ -174,13 +259,17 @@ pub trait BeamInjector {
 
 /// PBWT-based dynamic injection (per marker).
 pub struct PbwtBeamIndex {
-    pub donors0: Vec<Option<Vec<u32>>>, // hi-freq marker idx -> donor hap ids for allele 0
-    pub donors1: Vec<Option<Vec<u32>>>, // hi-freq marker idx -> donor hap ids for allele 1
-    pub match_len0: Vec<Option<f32>>, // hi-freq marker idx -> mean match length for allele 0
-    pub match_len1: Vec<Option<f32>>, // hi-freq marker idx -> mean match length for allele 1
-    pub density0: Vec<Option<f32>>,   // hi-freq marker idx -> density proxy for allele 0
-    pub density1: Vec<Option<f32>>,   // hi-freq marker idx -> density proxy for allele 1
+    pub donor_meta0: Vec<Option<Vec<PbwtDonorMeta>>>, // hi-freq marker idx -> donor meta for allele 0
+    pub donor_meta1: Vec<Option<Vec<PbwtDonorMeta>>>, // hi-freq marker idx -> donor meta for allele 1
     pub inject_interval: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PbwtDonorMeta {
+    pub hap: u32,
+    pub cluster_id: u16,
+    pub cluster_size: f32,
+    pub match_len_markers: f32,
 }
 
 impl PbwtBeamIndex {
@@ -193,45 +282,29 @@ impl PbwtBeamIndex {
     ) -> Self {
         let n_ref = ref_gt.n_haplotypes();
         let mut pbwt = ReferencePbwt::new(n_ref);
-        let mut donors0: Vec<Option<Vec<u32>>> = Vec::with_capacity(hi_freq_to_orig.len());
-        let mut donors1: Vec<Option<Vec<u32>>> = Vec::with_capacity(hi_freq_to_orig.len());
-        let mut match_len0: Vec<Option<f32>> = Vec::with_capacity(hi_freq_to_orig.len());
-        let mut match_len1: Vec<Option<f32>> = Vec::with_capacity(hi_freq_to_orig.len());
-        let mut density0: Vec<Option<f32>> = Vec::with_capacity(hi_freq_to_orig.len());
-        let mut density1: Vec<Option<f32>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut donor_meta0: Vec<Option<Vec<PbwtDonorMeta>>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut donor_meta1: Vec<Option<Vec<PbwtDonorMeta>>> = Vec::with_capacity(hi_freq_to_orig.len());
 
         let mut ref_alleles: Vec<u8> = vec![0u8; n_ref];
         for (hi_idx, &orig_m) in hi_freq_to_orig.iter().enumerate() {
             if inject_interval == 0 || (hi_idx % inject_interval) != 0 {
-                donors0.push(None);
-                donors1.push(None);
-                match_len0.push(None);
-                match_len1.push(None);
-                density0.push(None);
-                density1.push(None);
+                donor_meta0.push(None);
+                donor_meta1.push(None);
                 continue;
             }
             let r_idx = match alignment.target_to_ref.get(orig_m).and_then(|v| *v) {
                 Some(r) => r,
                 None => {
-                    donors0.push(None);
-                    donors1.push(None);
-                    match_len0.push(None);
-                    match_len1.push(None);
-                    density0.push(None);
-                    density1.push(None);
+                    donor_meta0.push(None);
+                    donor_meta1.push(None);
                     continue;
                 }
             };
             let marker = ref_gt.marker(r_idx);
             let n_alleles = marker.n_alleles();
             if n_alleles != 2 {
-                donors0.push(None);
-                donors1.push(None);
-                match_len0.push(None);
-                match_len1.push(None);
-                density0.push(None);
-                density1.push(None);
+                donor_meta0.push(None);
+                donor_meta1.push(None);
                 continue;
             }
 
@@ -271,53 +344,101 @@ impl PbwtBeamIndex {
             let mut d1: Vec<u32> = Vec::new();
             pbwt.select_donors_into(&beams[0], k, &mut d0);
             pbwt.select_donors_into(&beams[1], k, &mut d1);
-            donors0.push(Some(d0));
-            donors1.push(Some(d1));
-
-            let (ml0, ml1) = pbwt.mean_match_len_by_allele(&ref_alleles, hi_idx);
-            match_len0.push(Some(ml0));
-            match_len1.push(Some(ml1));
-            let dens0 = beam_span(&beams[0]) as f32;
-            let dens1 = beam_span(&beams[1]) as f32;
-            density0.push(Some(dens0));
-            density1.push(Some(dens1));
+            let mut union: Vec<u32> = Vec::with_capacity(d0.len() + d1.len());
+            union.extend_from_slice(&d0);
+            for &h in &d1 {
+                if !union.contains(&h) {
+                    union.push(h);
+                }
+            }
+            let mut pos_lens: Vec<(u32, usize, f32)> = Vec::new();
+            pbwt.collect_positions_and_lens(hi_idx, &union, &mut pos_lens);
+            let mut pos_len_map: std::collections::HashMap<u32, (usize, f32)> =
+                std::collections::HashMap::with_capacity(pos_lens.len());
+            for (h, pos, len) in pos_lens {
+                pos_len_map.insert(h, (pos, len));
+            }
+            let meta0 = build_donor_meta(&d0, &beams[0], &pos_len_map);
+            let meta1 = build_donor_meta(&d1, &beams[1], &pos_len_map);
+            donor_meta0.push(Some(meta0));
+            donor_meta1.push(Some(meta1));
         }
 
         Self {
-            donors0,
-            donors1,
-            match_len0,
-            match_len1,
-            density0,
-            density1,
+            donor_meta0,
+            donor_meta1,
             inject_interval,
         }
     }
 
     pub fn stats_for_hi(&self, hi_idx: usize) -> (f32, f32, f32, f32) {
         let mut idx = hi_idx;
-        if idx >= self.match_len0.len() {
+        if idx >= self.donor_meta0.len() {
             return (0.0, 0.0, 0.0, 0.0);
         }
-        if self.match_len0[idx].is_none() && self.inject_interval > 0 {
+        if self.donor_meta0[idx].is_none() && self.inject_interval > 0 {
             idx = hi_idx - (hi_idx % self.inject_interval);
         }
-        let len0 = self.match_len0.get(idx).and_then(|v| *v).unwrap_or(0.0);
-        let len1 = self.match_len1.get(idx).and_then(|v| *v).unwrap_or(0.0);
-        let den0 = self.density0.get(idx).and_then(|v| *v).unwrap_or(0.0);
-        let den1 = self.density1.get(idx).and_then(|v| *v).unwrap_or(0.0);
+        let (len0, den0) = mean_meta(self.donor_meta0.get(idx).and_then(|v| v.as_ref()));
+        let (len1, den1) = mean_meta(self.donor_meta1.get(idx).and_then(|v| v.as_ref()));
         (len0, len1, den0, den1)
     }
 }
 
-fn beam_span(beam: &RankBeam) -> u32 {
-    let mut total = 0u32;
-    for &(l, r) in beam.intervals() {
-        if r > l {
-            total = total.saturating_add(r - l);
+fn find_cluster(beam: &RankBeam, pos: usize) -> (u16, f32) {
+    for (idx, &(l, r)) in beam.intervals().iter().enumerate() {
+        let l = l as usize;
+        let r = r as usize;
+        if pos >= l && pos < r {
+            let size = (r - l) as f32;
+            return (idx as u16, size);
         }
     }
-    total
+    (u16::MAX, 0.0)
+}
+
+fn build_donor_meta(
+    donors: &[u32],
+    beam: &RankBeam,
+    pos_len_map: &std::collections::HashMap<u32, (usize, f32)>,
+) -> Vec<PbwtDonorMeta> {
+    let mut out = Vec::with_capacity(donors.len());
+    for &hap in donors {
+        if let Some((pos, len)) = pos_len_map.get(&hap).copied() {
+            let (cluster_id, cluster_size) = find_cluster(beam, pos);
+            out.push(PbwtDonorMeta {
+                hap,
+                cluster_id,
+                cluster_size,
+                match_len_markers: len,
+            });
+        } else {
+            out.push(PbwtDonorMeta {
+                hap,
+                cluster_id: u16::MAX,
+                cluster_size: 0.0,
+                match_len_markers: 0.0,
+            });
+        }
+    }
+    out
+}
+
+fn mean_meta(meta: Option<&Vec<PbwtDonorMeta>>) -> (f32, f32) {
+    let Some(list) = meta else {
+        return (0.0, 0.0);
+    };
+    if list.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_len = 0.0f32;
+    let mut sum_den = 0.0f32;
+    for m in list {
+        sum_len += m.match_len_markers;
+        sum_den += m.cluster_size;
+    }
+    let n = list.len() as f32;
+    (sum_len / n, sum_den / n)
 }
 
 pub struct PbwtInjector<'a> {
@@ -335,21 +456,26 @@ impl<'a> PbwtInjector<'a> {
 impl<'a> BeamInjector for PbwtInjector<'a> {
     fn maybe_inject(&mut self, call_site_idx: usize, hi_idx: usize, marker: MarkerIdx, active_pool: &mut ActivePool) {
         let _ = (call_site_idx, marker);
-        if hi_idx >= self.index.donors0.len() {
+        if hi_idx >= self.index.donor_meta0.len() {
             return;
         }
         let mut idx = hi_idx;
-        if self.index.donors0[idx].is_none() && self.index.inject_interval > 0 {
+        if self.index.donor_meta0[idx].is_none() && self.index.inject_interval > 0 {
             idx = hi_idx - (hi_idx % self.index.inject_interval);
         }
-        if let Some(list) = self.index.donors0[idx].as_ref() {
-            for &d in list.iter().take(self.k) {
-                active_pool.add(d as usize);
+        let version = idx as u32;
+        if let Some(list) = self.index.donor_meta0[idx].as_ref() {
+            for m in list.iter().take(self.k) {
+                let hap = m.hap as usize;
+                active_pool.add(hap);
+                active_pool.set_pbwt_meta(0, hap, m.cluster_id, m.cluster_size, m.match_len_markers, version);
             }
         }
-        if let Some(list) = self.index.donors1[idx].as_ref() {
-            for &d in list.iter().take(self.k) {
-                active_pool.add(d as usize);
+        if let Some(list) = self.index.donor_meta1[idx].as_ref() {
+            for m in list.iter().take(self.k) {
+                let hap = m.hap as usize;
+                active_pool.add(hap);
+                active_pool.set_pbwt_meta(1, hap, m.cluster_id, m.cluster_size, m.match_len_markers, version);
             }
         }
     }
@@ -766,6 +892,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         } else {
             (call.a1_freq, call.a2_freq)
         };
+        let pbwt_version = if self.config.inject_interval > 0 {
+            call.hi_idx - (call.hi_idx % self.config.inject_interval)
+        } else {
+            call.hi_idx
+        };
 
         self.repair_hap_for_allele_into(
             path.hap1,
@@ -775,6 +906,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             if swapped { call.pbwt_len_a2 } else { call.pbwt_len_a1 },
             if swapped { call.pbwt_density_a2 } else { call.pbwt_density_a1 },
             call.dist_morgans,
+            call.pbwt_step_morgans,
+            pbwt_version as u32,
             call.fixed,
             active_pool,
             call.switch_cost,
@@ -789,6 +922,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             if swapped { call.pbwt_len_a1 } else { call.pbwt_len_a2 },
             if swapped { call.pbwt_density_a1 } else { call.pbwt_density_a2 },
             call.dist_morgans,
+            call.pbwt_step_morgans,
+            pbwt_version as u32,
             call.fixed,
             active_pool,
             call.switch_cost,
@@ -836,6 +971,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         pbwt_match_len: f32,
         pbwt_density: f32,
         dist_morgans: f32,
+        pbwt_step_morgans: f32,
+        pbwt_version: u32,
         fixed: bool,
         active_pool: &ActivePool,
         switch_cost: i32,
@@ -861,11 +998,18 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
 
-        // Switch cost: recombination penalty is already encoded in switch_cost.
-        // The optimal switch criterion compares LLR gain vs recombination penalty.
-        // No additional MAF term needed here - it's in the emission costs.
-        let pbwt_switch_cost = self.pbwt_switch_cost(pbwt_match_len, pbwt_density, dist_morgans);
-        let effective_switch_cost = switch_cost.saturating_add(pbwt_switch_cost);
+        let allele = targ_allele;
+        let meta_curr = active_pool.pbwt_meta(allele, hap, pbwt_version);
+        let (match_len_morgans, cluster_size, cluster_id) = if let Some(meta) = meta_curr {
+            (
+                (meta.match_len_markers * pbwt_step_morgans).max(0.0),
+                meta.cluster_size.max(0.0),
+                meta.cluster_id,
+            )
+        } else {
+            (pbwt_match_len.max(0.0), pbwt_density.max(0.0), u16::MAX)
+        };
+        let pbwt_switch_cost = self.pbwt_switch_cost(match_len_morgans, cluster_size, dist_morgans, false);
 
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         if matches {
@@ -873,6 +1017,15 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             // also allow a limited switch to a strong candidate for future-proofing
             for &h in active_pool.list().iter().rev().take(1) {
                 if h != hap && self.ref_allele_matches(marker_idx, h, targ_allele) {
+                    let same_cluster = active_pool
+                        .pbwt_meta(allele, h, pbwt_version)
+                        .map(|m| m.cluster_id == cluster_id)
+                        .unwrap_or(false);
+                    let effective_switch_cost = if same_cluster {
+                        0
+                    } else {
+                        switch_cost.saturating_add(pbwt_switch_cost)
+                    };
                     out.push((h, effective_switch_cost, effective_match_cost));
                 }
             }
@@ -882,6 +1035,15 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             // For phased anchors, scan the full pool to ensure we honor the fixed allele.
             for &h in active_pool.list().iter().rev() {
                 if self.ref_allele_matches(marker_idx, h, targ_allele) {
+                    let same_cluster = active_pool
+                        .pbwt_meta(allele, h, pbwt_version)
+                        .map(|m| m.cluster_id == cluster_id)
+                        .unwrap_or(false);
+                    let effective_switch_cost = if same_cluster {
+                        0
+                    } else {
+                        switch_cost.saturating_add(pbwt_switch_cost)
+                    };
                     out.push((h, effective_switch_cost, effective_match_cost));
                     if out.len() >= self.config.switch_candidates {
                         break;
@@ -896,6 +1058,15 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         // Try switching to matching haps
         for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
             if self.ref_allele_matches(marker_idx, h, targ_allele) {
+                let same_cluster = active_pool
+                    .pbwt_meta(allele, h, pbwt_version)
+                    .map(|m| m.cluster_id == cluster_id)
+                    .unwrap_or(false);
+                let effective_switch_cost = if same_cluster {
+                    0
+                } else {
+                    switch_cost.saturating_add(pbwt_switch_cost)
+                };
                 out.push((h, effective_switch_cost, effective_match_cost));
             }
             if out.len() >= self.config.switch_candidates {
@@ -906,6 +1077,15 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             sample_even_into(active_pool.list(), self.config.switch_candidates, spread);
             for &h in spread.iter() {
                 if self.ref_allele_matches(marker_idx, h, targ_allele) {
+                    let same_cluster = active_pool
+                        .pbwt_meta(allele, h, pbwt_version)
+                        .map(|m| m.cluster_id == cluster_id)
+                        .unwrap_or(false);
+                    let effective_switch_cost = if same_cluster {
+                        0
+                    } else {
+                        switch_cost.saturating_add(pbwt_switch_cost)
+                    };
                     out.push((h, effective_switch_cost, effective_match_cost));
                 }
                 if out.len() >= self.config.switch_candidates {
@@ -919,7 +1099,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     }
 
     #[inline]
-    fn pbwt_switch_cost(&self, match_len_morgans: f32, density: f32, dist_morgans: f32) -> i32 {
+    fn pbwt_switch_cost(
+        &self,
+        match_len_morgans: f32,
+        density: f32,
+        dist_morgans: f32,
+        same_cluster: bool,
+    ) -> i32 {
         // Coalescent-based stay probability from PBWT match length:
         //   prior: t ~ Exp(1) over TMRCA (coalescent units)
         //   L | t ~ Exp(rate = 2t)  =>  t | L ~ Gamma(α=2, β=1+2L)
@@ -937,6 +1123,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let p_stay = p_stay.clamp(1e-12, 1.0 - 1e-12);
         let p_switch = (1.0 - p_stay).clamp(1e-12, 1.0 - 1e-12);
         let switch_odds = p_switch / p_stay;
+        if same_cluster {
+            return 0;
+        }
         let mut cost = -switch_odds.ln();
         // Density prior (cluster multiplicity): picking one donor from K
         // equally plausible candidates adds +log K to the cost.

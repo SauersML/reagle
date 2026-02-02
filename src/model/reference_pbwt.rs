@@ -687,6 +687,31 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         (mean0, mean1)
     }
 
+    pub fn collect_positions_and_lens(
+        &self,
+        marker: usize,
+        haps: &[u32],
+        out: &mut Vec<(u32, usize, f32)>,
+    ) {
+        out.clear();
+        if haps.is_empty() {
+            return;
+        }
+        let mut set: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(haps.len());
+        for &h in haps {
+            set.insert(h);
+        }
+        let m = marker as i32;
+        for (pos, hap) in self.ppa.iter().enumerate() {
+            let h = hap.to_usize() as u32;
+            if set.contains(&h) {
+                let start = self.div.get(pos).copied().unwrap_or(m);
+                let len = (m - start).max(0) as f32;
+                out.push((h, pos, len));
+            }
+        }
+    }
+
 }
 
 pub enum ReferencePbwt {
@@ -770,6 +795,18 @@ impl ReferencePbwt {
         match self {
             Self::U16(inner) => inner.mean_match_len_by_allele(ref_alleles, marker),
             Self::U32(inner) => inner.mean_match_len_by_allele(ref_alleles, marker),
+        }
+    }
+
+    pub fn collect_positions_and_lens(
+        &self,
+        marker: usize,
+        haps: &[u32],
+        out: &mut Vec<(u32, usize, f32)>,
+    ) {
+        match self {
+            Self::U16(inner) => inner.collect_positions_and_lens(marker, haps, out),
+            Self::U32(inner) => inner.collect_positions_and_lens(marker, haps, out),
         }
     }
 

@@ -34,6 +34,8 @@ pub struct CallSite {
     pub pbwt_density_a2: f32,
     /// Genetic distance to previous call site (Morgans).
     pub dist_morgans: f32,
+    /// Local genetic step per marker (Morgans).
+    pub pbwt_step_morgans: f32,
     pub switch_cost: i32,
     pub flip_cost: i32,
     pub fixed: bool,
@@ -161,6 +163,7 @@ impl CondensedTarget {
                     pbwt_density_a1,
                     pbwt_density_a2,
                     dist_morgans: dist as f32,
+                    pbwt_step_morgans: local_step as f32,
                     switch_cost,
                     flip_cost,
                     fixed,
@@ -232,6 +235,20 @@ impl CondensedTarget {
             } else {
                 switch_cost.max(1_000_000)
             };
+            let hi_idx = cs.hi_idx;
+            let local_step = if hi_idx > 0 && hi_idx + 1 < hi_freq_gen_positions.len() {
+                let left = (hi_freq_gen_positions[hi_idx] - hi_freq_gen_positions[hi_idx - 1])
+                    .abs();
+                let right =
+                    (hi_freq_gen_positions[hi_idx + 1] - hi_freq_gen_positions[hi_idx]).abs();
+                (left + right) * 0.5
+            } else if hi_idx > 0 {
+                (hi_freq_gen_positions[hi_idx] - hi_freq_gen_positions[hi_idx - 1]).abs()
+            } else if hi_idx + 1 < hi_freq_gen_positions.len() {
+                (hi_freq_gen_positions[hi_idx + 1] - hi_freq_gen_positions[hi_idx]).abs()
+            } else {
+                0.0
+            };
             call_sites_rev.push(CallSite {
                 marker: cs.marker,
                 hi_idx: cs.hi_idx,
@@ -244,6 +261,7 @@ impl CondensedTarget {
                 pbwt_density_a1: cs.pbwt_density_a1,
                 pbwt_density_a2: cs.pbwt_density_a2,
                 dist_morgans: dist as f32,
+                pbwt_step_morgans: local_step as f32,
                 switch_cost,
                 flip_cost,
                 fixed: cs.fixed,
