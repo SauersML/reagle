@@ -179,7 +179,6 @@ impl CondensedTarget {
             let seg = build_segment_mask(
                 sample_phase,
                 hi_freq_to_orig,
-                allele_freqs,
                 prev_hi,
                 end_hi,
                 packed_ref,
@@ -192,7 +191,6 @@ impl CondensedTarget {
         let trailing = build_segment_mask(
             sample_phase,
             hi_freq_to_orig,
-            allele_freqs,
             prev_hi,
             hi_freq_to_orig.len(),
             packed_ref,
@@ -293,7 +291,6 @@ impl CondensedTarget {
 fn build_segment_mask<RefSpace>(
     sample_phase: &SamplePhase,
     hi_freq_to_orig: &[usize],
-    allele_freqs: Option<&[(f32, f32)]>,
     start_hi: usize,
     end_hi: usize,
     packed_ref: &PackedRefView<RefSpace>,
@@ -316,11 +313,6 @@ fn build_segment_mask<RefSpace>(
         if a1 == a2 {
             // Only constrain on minor allele homozygotes (p < 0.5).
             // Major allele homozygotes (p > 0.5) provide < 1 bit of information.
-            let allele_freq = allele_freqs
-                .and_then(|af| af.get(hi_idx))
-                .map(|&(f0, f1)| if a1 == 0 { f0 } else { f1 })
-                .unwrap_or(0.5);
-
             if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
                 mask_and_inplace(&mut mask, &tmp);
                 any_constraint = true;

@@ -1629,6 +1629,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // Initialize parameters based on TOTAL haplotype count (target + ref)
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
+        self.params.set_phasing_stiffness(self.config.phasing_stiffness);
         self.params
             .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
 
@@ -2458,6 +2459,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
+        self.params.set_phasing_stiffness(self.config.phasing_stiffness);
         self.params
             .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
 

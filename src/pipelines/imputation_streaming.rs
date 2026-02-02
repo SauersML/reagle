@@ -2511,6 +2511,8 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        // Imputation uses standard recombination parameters (no phasing stiffness).
+        self.params.set_phasing_stiffness(1.0);
         self.params.recomb_intensity = self
             .params
             .recomb_intensity

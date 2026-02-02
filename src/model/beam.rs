@@ -350,7 +350,7 @@ impl PbwtBeamIndex {
             }
             let mut pos_lens: Vec<(u32, usize, f32)> = Vec::new();
             pbwt.collect_positions_and_lens(hi_idx, &union, &mut pos_lens);
-            let mut select_longest = |donors: &mut Vec<u32>| {
+            let select_longest = |donors: &mut Vec<u32>| {
                 donors.sort_unstable_by(|a, b| {
                     let la = pos_lens
                         .iter()
@@ -944,7 +944,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             pbwt_version as u32,
             call.fixed,
             active_pool,
-            call.switch_cost,
             &mut scratch.hap1_allele,
             &mut scratch.spread,
         );
@@ -960,7 +959,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             pbwt_version as u32,
             call.fixed,
             active_pool,
-            call.switch_cost,
             &mut scratch.hap2_allele,
             &mut scratch.spread,
         );
@@ -1021,7 +1019,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         pbwt_version: u32,
         fixed: bool,
         active_pool: &ActivePool,
-        switch_cost: i32,
         out: &mut Vec<(usize, i32, i32)>,
         spread: &mut Vec<usize>,
     ) {

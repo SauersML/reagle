@@ -78,6 +78,10 @@ pub struct Config {
     #[arg(long, default_value = "0.002")]
     pub rare: f32,
 
+    /// Phasing stiffness multiplier (>= 1.0 tightens switch penalty)
+    #[arg(long = "phasing-stiffness", default_value = "5.0")]
+    pub phasing_stiffness: f32,
+
     // ============ Imputation Parameters ============
     /// Impute ungenotyped markers
     #[arg(long, default_value = "true")]
@@ -171,6 +175,7 @@ impl Default for Config {
             mcmc_lr_samples: 32,
             phase_states: 0,
             rare: 0.002,
+            phasing_stiffness: 5.0,
             impute: true,
             imp_states: 1600,
             imp_segment: 6.0,
