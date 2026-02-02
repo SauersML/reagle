@@ -170,6 +170,28 @@ pub fn mask_all_ones(mask: &mut [u64], n_haps: usize) {
 #[inline]
 pub fn mask_and_inplace(dst: &mut [u64], src: &[u64]) {
     let n = dst.len().min(src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                use std::arch::x86_64::{__m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_storeu_si256};
+                let chunks = n / 4;
+                let dst_ptr = dst.as_mut_ptr() as *mut __m256i;
+                let src_ptr = src.as_ptr() as *const __m256i;
+                for i in 0..chunks {
+                    let a = _mm256_loadu_si256(dst_ptr.add(i));
+                    let b = _mm256_loadu_si256(src_ptr.add(i));
+                    let c = _mm256_and_si256(a, b);
+                    _mm256_storeu_si256(dst_ptr.add(i), c);
+                }
+                let start = chunks * 4;
+                for i in start..n {
+                    dst[i] &= src[i];
+                }
+                return;
+            }
+        }
+    }
     for i in 0..n {
         dst[i] &= src[i];
     }
